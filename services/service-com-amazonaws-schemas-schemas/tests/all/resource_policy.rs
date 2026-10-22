@@ -78,85 +78,105 @@ fn is_opaque_id_shaped(value: &str) -> bool {
 struct PolicyCase {
     case: &'static str,
     document: String,
+    /// The bytes the store keeps and every read reports: the document's JSON content,
+    /// re-encoded — insignificant whitespace gone, member order kept. Written out per
+    /// row rather than computed, so a row states what the rule produces.
+    stored: String,
 }
 
 /// The table: rows differ along what the round-trip rule generalises over — the size,
-/// nesting, member count, key order, whitespace and alphabet of the JSON document.
-/// Every row is a JSON object, which is what a resource-based policy document is.
+/// nesting, member count, key order, whitespace, escaping, number form and alphabet of
+/// the JSON document. Every row is a JSON object, which is what a resource-based policy
+/// document is.
+///
+/// Every row's two texts are written out, never rendered by `serde_json`: what a caller
+/// sends is bytes of its own choosing, and what the store keeps is what the rule
+/// produces from them.
 fn policy_cases() -> Vec<PolicyCase> {
     vec![
         PolicyCase {
             case: "the smallest JSON object there is",
             document: "{}".to_string(),
+            stored: "{}".to_string(),
         },
         PolicyCase {
-            case: "a single-statement policy",
-            document: json!({
-                "Version": "2012-10-17",
-                "Statement": [{
-                    "Sid": "AllowDescribe",
-                    "Effect": "Allow",
-                    "Principal": { "AWS": "000000000000" },
-                    "Action": ["schemas:DescribeRegistry"],
-                    "Resource": "arn:aws:schemas:us-west-2:000000000000:registry/demo"
-                }]
-            })
-            .to_string(),
+            case: "a single-statement policy, spaced as a renderer leaves it",
+            document: r#"{"Version": "2012-10-17", "Statement": [{"Sid": "AllowDescribe", "Effect": "Allow", "Principal": {"AWS": "000000000000"}, "Action": ["schemas:DescribeRegistry"], "Resource": "arn:aws:schemas:us-west-2:000000000000:registry/demo"}]}"#.to_string(),
+            stored: r#"{"Version":"2012-10-17","Statement":[{"Sid":"AllowDescribe","Effect":"Allow","Principal":{"AWS":"000000000000"},"Action":["schemas:DescribeRegistry"],"Resource":"arn:aws:schemas:us-west-2:000000000000:registry/demo"}]}"#.to_string(),
         },
         PolicyCase {
             case: "two statements, a list principal and a condition",
-            document: json!({
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Principal": { "AWS": ["000000000000", "000000000001"] },
-                        "Action": "schemas:*",
-                        "Resource": "*",
-                        "Condition": { "StringEquals": { "aws:PrincipalOrgID": "o-abc123" } }
-                    },
-                    {
-                        "Effect": "Deny",
-                        "Principal": "*",
-                        "Action": ["schemas:DeleteRegistry", "schemas:DeleteSchema"],
-                        "Resource": "*"
-                    }
-                ]
-            })
+            document: r#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {"AWS": ["000000000000", "000000000001"]},
+      "Action": "schemas:*",
+      "Resource": "*",
+      "Condition": {"StringEquals": {"aws:PrincipalOrgID": "o-abc123"}}
+    },
+    {
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": ["schemas:DeleteRegistry", "schemas:DeleteSchema"],
+      "Resource": "*"
+    }
+  ]
+}"#
             .to_string(),
+            stored: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":["000000000000","000000000001"]},"Action":"schemas:*","Resource":"*","Condition":{"StringEquals":{"aws:PrincipalOrgID":"o-abc123"}}},{"Effect":"Deny","Principal":"*","Action":["schemas:DeleteRegistry","schemas:DeleteSchema"],"Resource":"*"}]}"#.to_string(),
         },
         PolicyCase {
             case: "pretty-printed, with newlines and tabs between tokens",
             document: "{\n\t\"Version\" : \"2012-10-17\",\n\t\"Statement\" : [ ]\n}".to_string(),
+            stored: r#"{"Version":"2012-10-17","Statement":[]}"#.to_string(),
         },
         PolicyCase {
             case: "keys in an order no renderer would choose, with non-ASCII text",
             document: "{\"Statement\":[],\"Sid\":\"caf\u{e9} \u{2014} \u{30b9}\u{30ad}\u{30fc}\u{30de}\",\"Version\":\"2012-10-17\"}"
                 .to_string(),
+            // The order is the caller's, and it is kept: re-encoding a document is not
+            // reordering it. Non-ASCII text is kept as the text it is, not escaped.
+            stored: "{\"Statement\":[],\"Sid\":\"caf\u{e9} \u{2014} \u{30b9}\u{30ad}\u{30fc}\u{30de}\",\"Version\":\"2012-10-17\"}"
+                .to_string(),
+        },
+        PolicyCase {
+            case: "an escaped character that needs no escape",
+            document: r#"{ "Sid" : "\u0041llow" }"#.to_string(),
+            stored: r#"{"Sid":"Allow"}"#.to_string(),
+        },
+        PolicyCase {
+            // A number is kept as the VALUE it denotes, not as the digits that denoted
+            // it: an integer round-trips exactly, however long, and a fractional
+            // literal is re-encoded from the double it parses to — the same arithmetic
+            // every JSON reader on the round trip applies to it.
+            case: "numbers: an integer past 64 signed bits, and more digits than a double holds",
+            document: r#"{"Big": 12345678901234567890, "Small": -7, "Precise": 1.0000000000000000001, "Exponent": 1e2}"#.to_string(),
+            stored: r#"{"Big":12345678901234567890,"Small":-7,"Precise":1.0,"Exponent":100.0}"#
+                .to_string(),
         },
         PolicyCase {
             case: "a document of several kilobytes",
-            document: json!({
-                "Version": "2012-10-17",
-                "Statement": [{
-                    "Effect": "Allow",
-                    "Principal": { "AWS": "000000000000" },
-                    "Action": "schemas:DescribeRegistry",
-                    "Resource": "*",
-                    "Sid": "x".repeat(8_000)
-                }]
-            })
-            .to_string(),
+            document: format!(
+                r#"{{"Version": "2012-10-17", "Statement": [{{"Effect": "Allow", "Sid": "{}"}}]}}"#,
+                "x".repeat(8_000)
+            ),
+            stored: format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Sid":"{}"}}]}}"#,
+                "x".repeat(8_000)
+            ),
         },
     ]
 }
 
-/// RULE: a successful `PutResourcePolicy` persists the document it was given
-/// verbatim under the named registry and reports it with a revision id; every later
-/// `GetResourcePolicy` of that registry reports the same document and the same
-/// revision id, for as long as nothing writes the policy again.
+/// RULE: a successful `PutResourcePolicy` answers the document it was handed and the
+/// revision it minted, and persists that document's JSON CONTENT under the named
+/// registry — insignificant whitespace gone, member order and values kept; every later
+/// `GetResourcePolicy` of that registry reports those stored bytes and the same revision
+/// id, for as long as nothing writes the policy again.
 #[tokio::test]
-async fn a_stored_policy_reads_back_verbatim_with_a_stable_revision() {
+async fn a_stored_policy_reads_back_as_its_json_content_with_a_stable_revision() {
     let emulator = Emulator::new();
     let registry = "policy-registry";
     create_registry(&emulator, registry).await;
@@ -172,7 +192,7 @@ async fn a_stored_policy_reads_back_verbatim_with_a_stable_revision() {
         assert_eq!(
             policy_of(&put),
             case.document,
-            "case {:?}: PutResourcePolicy must report the document it stored",
+            "case {:?}: the write must answer the document it was handed",
             case.case
         );
         let revision = revision_of(&put);
@@ -189,7 +209,7 @@ async fn a_stored_policy_reads_back_verbatim_with_a_stable_revision() {
         );
 
         // Two reads in a row: the policy is reported from the store, so a read does
-        // not move the revision on.
+        // not move the revision on and does not re-render the document again.
         for read in 0..2 {
             let got = get_policy(&emulator, Some(registry)).await;
             assert_eq!(
@@ -199,7 +219,7 @@ async fn a_stored_policy_reads_back_verbatim_with_a_stable_revision() {
             );
             assert_eq!(
                 policy_of(&got),
-                case.document,
+                case.stored,
                 "case {:?} (read {read}): GetResourcePolicy must report the stored document",
                 case.case
             );
@@ -210,6 +230,23 @@ async fn a_stored_policy_reads_back_verbatim_with_a_stable_revision() {
                 case.case
             );
         }
+
+        // And the stored form is a FIXED POINT: writing back what a read reported
+        // stores and reports exactly the same bytes, so a caller that round-trips a
+        // policy sees no drift.
+        let again = put_policy(&emulator, Some(registry), &case.stored, None).await;
+        assert_eq!(
+            policy_of(&again),
+            case.stored,
+            "case {:?}: writing back what a read reported must change nothing",
+            case.case
+        );
+        assert_eq!(
+            policy_of(&get_policy(&emulator, Some(registry)).await),
+            case.stored,
+            "case {:?}: and the read after it reports the same bytes again",
+            case.case
+        );
     }
 }
 

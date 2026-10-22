@@ -6,11 +6,15 @@
 //! `Type`, inferred from the sampled events — each `Events` entry parsed as JSON and
 //! the sample unified into one description (a member every event carries is
 //! `required`, a position seen as several types widens or falls back to the empty
-//! schema, a position also seen as `null` is nullable in the dialect's spelling).
+//! schema, a position also seen as `null` is nullable in the dialect's spelling, every
+//! sampled number is a `number`) — and written as the document AWS writes: a nested
+//! object hoisted into its own named schema under `components/schemas` and referred to
+//! with `$ref`, the root schema first, and each schema's keywords in AWS's order.
 //!
 //! Every case drives the real wire path: a signed `restJson1` request through
 //! `MultiServiceRouter::dispatch`, exactly as the production router serves it. The
-//! recorded corpus case (one event, `OpenApi3`) is ONE row of the tables below.
+//! recorded corpus case (one event with a nested `detail`, `OpenApi3`) is ONE row of
+//! the tables below.
 
 use std::sync::Arc;
 
@@ -138,13 +142,17 @@ impl Answer {
     }
 }
 
-/// The inferred schema inside a document, whichever dialect carries it.
+/// The inferred schema inside a document, whichever dialect carries it, with every
+/// `$ref` it carries resolved.
 ///
 /// OpenAPI keeps a schema under `components/schemas`; a JSON Schema document IS the
 /// schema, so its envelope keywords are what has to come off.
 fn inferred(document: &Value, dialect: &str) -> Value {
     match dialect {
-        "OpenApi3" => document["components"]["schemas"][ROOT_SCHEMA_NAME].clone(),
+        "OpenApi3" => {
+            let root = document["components"]["schemas"][ROOT_SCHEMA_NAME].clone();
+            resolved(document, &root)
+        }
         "JSONSchemaDraft4" => {
             let mut node: Map<String, Value> = document
                 .as_object()
@@ -155,6 +163,51 @@ fn inferred(document: &Value, dialect: &str) -> Value {
             Value::Object(node)
         }
         other => panic!("no such Type: {other}"),
+    }
+}
+
+/// The prefix of a reference into an OpenAPI document's own schemas.
+const COMPONENT_REF_PREFIX: &str = "#/components/schemas/";
+
+/// `node` with every `$ref` it carries replaced by the schema that reference names.
+///
+/// An OpenAPI document hoists each nested object into its own named schema and refers
+/// to it with `$ref`, so what a member holds is a reference. The tables below state
+/// what the SAMPLE showed at a position, which is what the reference resolves to; the
+/// hoisting itself is asserted on its own, in
+/// [`a_nested_object_is_hoisted_into_its_own_named_schema`].
+fn resolved(document: &Value, node: &Value) -> Value {
+    match node {
+        Value::Object(members) => {
+            if let Some(reference) = members.get("$ref").and_then(Value::as_str) {
+                assert_eq!(
+                    members.len(),
+                    1,
+                    "a reference has no sibling keywords in OpenAPI 3.0, got {node:?}"
+                );
+                let name = reference.strip_prefix(COMPONENT_REF_PREFIX).unwrap_or_else(|| {
+                    panic!("a reference must point into this document's schemas: {reference}")
+                });
+                let target = document["components"]["schemas"][name].clone();
+                assert!(
+                    target.is_object(),
+                    "the reference {reference} must name a schema this document carries, \
+                     which holds {:?}",
+                    document["components"]["schemas"]
+                );
+                return resolved(document, &target);
+            }
+            Value::Object(
+                members
+                    .iter()
+                    .map(|(name, value)| (name.clone(), resolved(document, value)))
+                    .collect(),
+            )
+        }
+        Value::Array(items) => {
+            Value::Array(items.iter().map(|item| resolved(document, item)).collect())
+        }
+        other => other.clone(),
     }
 }
 
@@ -206,11 +259,13 @@ async fn the_document_envelope_is_the_one_the_requested_type_defines() {
     );
 
     // Whichever envelope carries it, the inferred schema is the same: the dialect
-    // decides the wrapping, the sample decides the shape.
+    // decides the wrapping, the sample decides the shape. `required` is in the order
+    // AWS lists it in, which is neither the sample's nor alphabetical (see the
+    // `in_required_order` unit test, pinned against the schemas AWS publishes).
     let expected = json!({
         "type": "object",
-        "required": ["id", "size"],
-        "properties": {"id": {"type": "string"}, "size": {"type": "integer"}},
+        "required": ["size", "id"],
+        "properties": {"id": {"type": "string"}, "size": {"type": "number"}},
     });
     for dialect in TYPE_VALUES {
         let document = emulator
@@ -248,9 +303,9 @@ async fn each_sampled_json_value_becomes_its_schema_type() {
             json!("2024-05-17T01:02:03+02:00"),
             json!({"type": "string", "format": "date-time"}),
         ),
-        ("integer", json!(7), json!({"type": "integer"})),
-        ("negative integer", json!(-7), json!({"type": "integer"})),
-        ("zero", json!(0), json!({"type": "integer"})),
+        ("integer", json!(7), json!({"type": "number"})),
+        ("negative integer", json!(-7), json!({"type": "number"})),
+        ("zero", json!(0), json!({"type": "number"})),
         ("fractional number", json!(1.5), json!({"type": "number"})),
         ("boolean", json!(true), json!({"type": "boolean"})),
         (
@@ -276,7 +331,7 @@ async fn each_sampled_json_value_becomes_its_schema_type() {
         (
             "nested array",
             json!([[1]]),
-            json!({"type": "array", "items": {"type": "array", "items": {"type": "integer"}}}),
+            json!({"type": "array", "items": {"type": "array", "items": {"type": "number"}}}),
         ),
         (
             "nested object",
@@ -390,7 +445,7 @@ async fn a_member_is_required_only_when_every_event_carries_it() {
         );
         assert_eq!(
             schema["properties"],
-            json!({"a": {"type": "integer"}, "b": {"type": "integer"}}),
+            json!({"a": {"type": "number"}, "b": {"type": "number"}}),
             "case {dialect}/nothing in common: both members are still properties, got {:?}",
             schema["properties"]
         );
@@ -452,7 +507,7 @@ async fn disagreeing_events_are_unified_into_one_schema() {
             json!({
                 "type": "object",
                 "required": ["a"],
-                "properties": {"a": {"type": "integer"}, "b": {"type": "string"}},
+                "properties": {"a": {"type": "number"}, "b": {"type": "string"}},
             }),
         ),
     ];
@@ -482,20 +537,20 @@ async fn a_nullable_position_is_spelled_the_dialects_way() {
     // Rows: each scalar and each container type, seen beside a `null`.
     let cases: Vec<(&str, Value, &str, Value)> = vec![
         ("string", json!("x"), "string", json!({"type": "string"})),
-        ("integer", json!(1), "integer", json!({"type": "integer"})),
+        ("integer", json!(1), "number", json!({"type": "number"})),
         ("number", json!(1.5), "number", json!({"type": "number"})),
         ("boolean", json!(true), "boolean", json!({"type": "boolean"})),
         (
             "array",
             json!([1]),
             "array",
-            json!({"items": {"type": "integer"}}),
+            json!({"items": {"type": "number"}}),
         ),
         (
             "object",
             json!({"a": 1}),
             "object",
-            json!({"required": ["a"], "properties": {"a": {"type": "integer"}}}),
+            json!({"required": ["a"], "properties": {"a": {"type": "number"}}}),
         ),
     ];
 
@@ -727,6 +782,205 @@ async fn a_discovered_schema_round_trips_through_create_and_describe() {
             described.str_at("Type"),
             *dialect,
             "case {dialect}: the stored schema keeps the discovered dialect"
+        );
+    }
+}
+
+/// RULE: how many distinct objects one request may ask the inference to describe is
+/// bounded — each one becomes a named schema in the document — and a sample past the
+/// bound is refused with HTTP 400 before the document is written, while one at the bound
+/// is served. The sample's SIZE is the model's own bound, enforced before the handler
+/// runs.
+#[tokio::test]
+async fn a_sample_past_what_one_request_may_ask_for_is_refused() {
+    let emulator = Emulator::new();
+
+    // The bound is the service's own constant, read from where it is declared, so these
+    // rows cannot drift from it.
+    let max_schemas = service_com_amazonaws_schemas_schemas::state::MAX_INFERRED_SCHEMAS;
+
+    /// One event describing `nested` distinct nested objects beside the root.
+    fn event_describing(nested: usize) -> String {
+        let members: Vec<String> = (0..nested)
+            .map(|index| format!(r#""m{index}":{{"v":1}}"#))
+            .collect();
+        format!("{{{}}}", members.join(","))
+    }
+
+    // Rows: well under the bound, each side of it, and the same shape repeated across
+    // two events (which describes it once, not twice). The last row is the model's own
+    // bound on an entry's length, which the framework refuses before the handler.
+    for (case, events, expected) in [
+        ("one object", vec![event_describing(0)], 200),
+        (
+            "one schema under the cap",
+            vec![event_describing(max_schemas - 2)],
+            200,
+        ),
+        (
+            "exactly at the cap",
+            vec![event_describing(max_schemas - 1)],
+            200,
+        ),
+        (
+            "one schema past the cap",
+            vec![event_describing(max_schemas)],
+            400,
+        ),
+        (
+            "far past the cap",
+            vec![event_describing(max_schemas * 4)],
+            400,
+        ),
+        (
+            "the same shape in two events counts once",
+            vec![
+                event_describing(max_schemas - 1),
+                event_describing(max_schemas - 1),
+            ],
+            200,
+        ),
+        (
+            "an entry past the length the model allows one",
+            vec![format!(r#"{{"m":"{}"}}"#, "x".repeat(100_001))],
+            400,
+        ),
+    ] {
+        let answer = emulator.discover_raw(&events, "OpenApi3").await;
+        assert_eq!(
+            answer.status, expected,
+            "case {case:?}: expected {expected}, got {} {:?}",
+            answer.status,
+            answer.body.get("Message").or(answer.body.get("__type"))
+        );
+        if expected == 400 {
+            assert!(
+                answer.body.get("Content").is_none(),
+                "case {case:?}: a refusal carries no Content"
+            );
+        }
+    }
+}
+
+/// RULE: a nested object is a schema of its own — hoisted into `components/schemas`
+/// under the name of the member it sits at and referred to from that member with
+/// `$ref`, so a client generating code from the document gets a reusable type per
+/// nested object. OpenAPI is where that mechanism lives; a draft-04 document has no
+/// components section and keeps the nested object inline.
+#[tokio::test]
+async fn a_nested_object_is_hoisted_into_its_own_named_schema() {
+    let emulator = Emulator::new();
+
+    // Rows: the member names the schema is named after — one word, several words in
+    // each separator a JSON member name takes, and a name already in upper case.
+    for (member, schema_name) in [
+        ("detail", "Detail"),
+        ("order", "Order"),
+        ("order-line", "OrderLine"),
+        ("order_line_item", "OrderLineItem"),
+        ("DETAIL", "DETAIL"),
+    ] {
+        let nested = json!({"count": 1, "label": "x"});
+        let events = [json!({member: nested.clone()})];
+        let expected_nested = json!({
+            "type": "object",
+            "required": ["count", "label"],
+            "properties": {"count": {"type": "number"}, "label": {"type": "string"}},
+        });
+
+        let document = emulator
+            .discover(&events, "OpenApi3")
+            .await
+            .document(&format!("OpenApi3/{member}"));
+        let reference = json!({"$ref": format!("#/components/schemas/{schema_name}")});
+        assert_eq!(
+            document["components"]["schemas"][ROOT_SCHEMA_NAME]["properties"][member], reference,
+            "case OpenApi3/{member}: the member must refer to its own schema, got {:?}",
+            document["components"]["schemas"][ROOT_SCHEMA_NAME]["properties"][member]
+        );
+        assert_eq!(
+            document["components"]["schemas"][schema_name], expected_nested,
+            "case OpenApi3/{member}: expected the hoisted schema {expected_nested:?}, got {:?}",
+            document["components"]["schemas"][schema_name]
+        );
+
+        // draft-04 carries the same shape, inline.
+        let draft4 = emulator
+            .discover(&events, "JSONSchemaDraft4")
+            .await
+            .document(&format!("JSONSchemaDraft4/{member}"));
+        assert_eq!(
+            draft4["properties"][member], expected_nested,
+            "case JSONSchemaDraft4/{member}: a draft-04 document keeps the nested object \
+             inline, got {:?}",
+            draft4["properties"][member]
+        );
+    }
+}
+
+/// RULE: the document is the PRODUCT of this operation — clients hash it, diff it and
+/// feed it to code generators — so it is written as AWS writes it, byte for byte: each
+/// row below states the whole `Content` one sample yields, which pins the hoisting, the
+/// member order within each schema, the order of the schemas themselves and the typing
+/// together.
+#[tokio::test]
+async fn the_document_is_written_as_aws_writes_it() {
+    let emulator = Emulator::new();
+
+    // Rows: a flat event; the recorded corpus case (an event whose `detail` is a
+    // nested object holding an integral value); the same sample as draft-04, which has
+    // no components section; a nested object two levels down (whose inner schema is
+    // written before the outer one that refers to it, as the schemas AWS publishes
+    // are); and an array of objects, whose element schema is hoisted under the array's
+    // own member name.
+    //
+    // `required` is in the order AWS lists it in — see the `in_required_order` unit
+    // test, pinned against the `AWSEvent` envelope of the schemas AWS publishes — which
+    // is why it is neither the sample's order nor alphabetical.
+    let cases: Vec<(&str, Vec<Value>, &str, &str)> = vec![
+        (
+            "a flat event",
+            vec![json!({"id": "a1", "size": 3})],
+            "OpenApi3",
+            r##"{"openapi":"3.0.0","info":{"version":"1.0.0","title":"Event"},"paths":{},"components":{"schemas":{"Event":{"type":"object","required":["size","id"],"properties":{"id":{"type":"string"},"size":{"type":"number"}}}}}}"##,
+        ),
+        (
+            "an event whose detail is a nested object",
+            vec![json!({"detail": {"count": 3}, "id": "a1", "name": "n"})],
+            "OpenApi3",
+            r##"{"openapi":"3.0.0","info":{"version":"1.0.0","title":"Event"},"paths":{},"components":{"schemas":{"Event":{"type":"object","required":["name","detail","id"],"properties":{"detail":{"$ref":"#/components/schemas/Detail"},"id":{"type":"string"},"name":{"type":"string"}}},"Detail":{"type":"object","required":["count"],"properties":{"count":{"type":"number"}}}}}}"##,
+        ),
+        (
+            "that sample as a draft-04 document",
+            vec![json!({"detail": {"count": 3}, "id": "a1", "name": "n"})],
+            "JSONSchemaDraft4",
+            r##"{"$schema":"http://json-schema.org/draft-04/schema#","title":"Event","type":"object","required":["name","detail","id"],"properties":{"detail":{"type":"object","required":["count"],"properties":{"count":{"type":"number"}}},"id":{"type":"string"},"name":{"type":"string"}}}"##,
+        ),
+        (
+            "an object two levels down",
+            vec![json!({"a": {"b": {"c": 1}}})],
+            "OpenApi3",
+            r##"{"openapi":"3.0.0","info":{"version":"1.0.0","title":"Event"},"paths":{},"components":{"schemas":{"Event":{"type":"object","required":["a"],"properties":{"a":{"$ref":"#/components/schemas/A"}}},"B":{"type":"object","required":["c"],"properties":{"c":{"type":"number"}}},"A":{"type":"object","required":["b"],"properties":{"b":{"$ref":"#/components/schemas/B"}}}}}}"##,
+        ),
+        (
+            "an array of objects",
+            vec![json!({"lines": [{"sku": "a"}, {"sku": "b", "qty": 2}]})],
+            "OpenApi3",
+            r##"{"openapi":"3.0.0","info":{"version":"1.0.0","title":"Event"},"paths":{},"components":{"schemas":{"Event":{"type":"object","required":["lines"],"properties":{"lines":{"type":"array","items":{"$ref":"#/components/schemas/Lines"}}}},"Lines":{"type":"object","required":["sku"],"properties":{"qty":{"type":"number"},"sku":{"type":"string"}}}}}}"##,
+        ),
+    ];
+
+    for (case, events, schema_type, expected) in cases {
+        let answer = emulator.discover(&events, schema_type).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case}: expected 200, got {} {:?}",
+            answer.status, answer.body
+        );
+        let content = answer.str_at("Content");
+        assert_eq!(
+            content, expected,
+            "case {case}: expected {expected}, got {content}"
         );
     }
 }

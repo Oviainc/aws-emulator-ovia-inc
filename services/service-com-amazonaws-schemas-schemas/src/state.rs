@@ -104,11 +104,52 @@ pub struct Registry {
 /// A registry's resource-based policy and the revision it is at.
 #[derive(Debug, Clone)]
 pub struct ResourcePolicy {
-    /// The policy document, stored exactly as the caller sent it.
+    /// The policy document, as [`canonical_json`] encodes what the caller sent.
     pub document: String,
     /// The revision this policy is at, minted by
     /// [`ComAmazonawsSchemasSchemasState::mint_policy_revision_id`] on every write.
     pub revision_id: String,
+}
+
+/// The bytes a policy document is stored and reported as: the document re-encoded as
+/// JSON, with its insignificant whitespace gone and its member order kept.
+///
+/// A resource policy travels as an opaque JSON DOCUMENT (`Policy` is modelled
+/// `@mediaType("application/json")`), and the service that takes one parses it and
+/// writes it back out: what a later read reports is the document's JSON content, not
+/// the byte-for-byte text the caller's renderer happened to produce. So a document
+/// indented or spaced by one caller reads back the same as the same document sent
+/// compact by another, and a caller that hashes or diffs a policy round-trip — the
+/// standard way to detect drift — sees no change.
+///
+/// Encoded by streaming the reader straight into the writer, so the members keep the
+/// order the caller wrote them in; an intermediate [`serde_json::Value`] would sort
+/// them, which would reorder a document rather than re-encode it.
+///
+/// What a re-encode does NOT keep is the LITERAL a number was written as: a number
+/// reaches the writer as the value the reader read, so `1e2` comes back `100.0` and a
+/// literal with more digits than a double holds comes back rounded to one. The VALUE a
+/// policy denotes is kept; its spelling is not. Keeping the spelling too would mean
+/// turning on `serde_json`'s arbitrary-precision mode, which is a feature of the crate
+/// as a whole and would change how every other service in this workspace reads and
+/// writes a JSON number — a far larger change than a policy's digits are worth, and one
+/// no recording asks for (a resource-based policy is statements of strings; the fixed
+/// point `tests/all/resource_policy.rs` pins holds for every form a policy actually
+/// carries).
+///
+/// `Err` carries what made the value unreadable, for a value that is not JSON at all.
+pub fn canonical_json(document: &str) -> Result<String, String> {
+    let mut encoded: Vec<u8> = Vec::with_capacity(document.len());
+    let mut reader = ::serde_json::Deserializer::from_str(document);
+    {
+        let mut writer = ::serde_json::Serializer::new(&mut encoded);
+        ::serde_transcode::transcode(&mut reader, &mut writer)
+            .map_err(|error| error.to_string())?;
+    }
+    // One document, not a stream of them: anything after the first value makes the
+    // value unreadable rather than being silently dropped.
+    reader.end().map_err(|error| error.to_string())?;
+    String::from_utf8(encoded).map_err(|error| error.to_string())
 }
 
 impl Registry {
@@ -1322,6 +1363,33 @@ pub const MAX_PAGE_SIZE: usize = 100;
 /// no retry of it will succeed. The number is the emulator's own bound, not a
 /// published AWS limit, and is set high enough that no ordinary search meets it.
 pub const MAX_KEYWORDS_PER_SEARCH: usize = 10;
+
+/// The most named schemas one inferred document may carry — one per object position
+/// the sample shows, plus the root.
+///
+/// The model bounds the sample itself: `Events` is `@length(min: 1, max: 10)` and an
+/// entry is `@length(min: 1, max: 100000)`
+/// (`smithy_query(query="shape", shape="__listOfGetDiscoveredSchemaVersionItemInput")`),
+/// so the framework refuses more than a megabyte of sampled events before any handler
+/// runs. What that does NOT bound is how many distinct OBJECTS a sample of that size
+/// describes — a bare `{"m":{}}` is a dozen bytes — and each one becomes a named schema
+/// the document holds, names and writes. A thousand distinct shapes in one sample is
+/// already past anything a schema a client generates code from describes.
+///
+/// Refused past the cap with `BadRequestException` (HTTP 400), as the other bounds of
+/// this service are: the request cannot be served as asked, so no retry of it will
+/// succeed. The emulator's own bound, not a published AWS limit.
+pub const MAX_INFERRED_SCHEMAS: usize = 1_000;
+
+/// Refuse a sample that would describe more schemas than one document may carry. Names
+/// the member, the bound and what the sample showed — never the sample itself, which is
+/// the caller's data.
+pub fn too_many_inferred_schemas(named: usize) -> BadRequestException {
+    bad_request(format!(
+        "Events describe {named} distinct objects, but an inferred schema document \
+         carries at most {MAX_INFERRED_SCHEMAS}."
+    ))
+}
 
 /// The page size to serve a request whose `Limit` member is `limit`.
 ///

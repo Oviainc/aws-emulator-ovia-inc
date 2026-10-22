@@ -378,9 +378,12 @@ async fn a_deleted_resource_policy_is_gone_from_every_later_read() {
 
     // Rows: documents differing along what the rule generalises over — size, nesting,
     // member count and whitespace. Each row gets its own registry, so a row cannot
-    // see another's policy.
-    let documents: Vec<(&str, String)> = vec![
-        ("the smallest JSON object there is", "{}".to_string()),
+    // see another's policy. The third element is the bytes a READ reports where they
+    // differ from the bytes sent: the store keeps a policy document's JSON CONTENT, so
+    // insignificant whitespace is gone from it (the rule `resource_policy.rs` pins);
+    // every other row here is already compact and reads back as it was sent.
+    let documents: Vec<(&str, String, Option<String>)> = vec![
+        ("the smallest JSON object there is", "{}".to_string(), None),
         (
             "a single-statement policy",
             json!({
@@ -394,10 +397,12 @@ async fn a_deleted_resource_policy_is_gone_from_every_later_read() {
                 }]
             })
             .to_string(),
+            None,
         ),
         (
             "pretty-printed, with newlines and tabs",
             "{\n\t\"Version\" : \"2012-10-17\",\n\t\"Statement\" : [ ]\n}".to_string(),
+            Some(r#"{"Version":"2012-10-17","Statement":[]}"#.to_string()),
         ),
         (
             "a document of several kilobytes",
@@ -412,11 +417,12 @@ async fn a_deleted_resource_policy_is_gone_from_every_later_read() {
                 }]
             })
             .to_string(),
+            None,
         ),
     ];
 
     let mut revisions = Vec::new();
-    for (index, (case, document)) in documents.iter().enumerate() {
+    for (index, (case, document, read_as)) in documents.iter().enumerate() {
         let registry = format!("policy-registry-{index}");
         create_registry(&emulator, &registry).await;
 
@@ -438,7 +444,7 @@ async fn a_deleted_resource_policy_is_gone_from_every_later_read() {
         let got = emulator.call("GET", &policy_uri(Some(&registry)), None).await;
         assert_eq!(
             got.str_at("Policy"),
-            *document,
+            *read_as.as_ref().unwrap_or(document),
             "case {case:?}: the policy must be readable before the delete"
         );
 

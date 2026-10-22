@@ -44,6 +44,13 @@ impl Emulator {
         self.call_signed_for(REGION, method, uri, body).await
     }
 
+    /// This emulator's router, for a suite that needs to serve it on a SOCKET rather
+    /// than drive it in process — the framing headers a response carries are written
+    /// by the HTTP layer, which an in-process dispatch never reaches.
+    pub(crate) fn router(&self) -> MultiServiceRouter {
+        self.router.clone()
+    }
+
     pub(crate) async fn call_signed_for(
         &self,
         region: &str,
@@ -70,14 +77,19 @@ impl Emulator {
             .expect("a well-formed test request");
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
-        // The exception SHAPE name travels in this header; the error body's own `Code`
-        // member carries the service's code for the condition. A suite that asserts
-        // one against the other needs both, so the harness keeps the header.
-        let error_type = response
+        // Every response header, the framing ones an answer with no body is asserted on
+        // and `x-amzn-errortype` (where the exception SHAPE name travels, which a suite
+        // asserts against the error body's own `Code` member) among them.
+        let headers = response
             .headers()
-            .get("x-amzn-errortype")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_ascii_lowercase(),
+                    String::from_utf8_lossy(value.as_bytes()).to_string(),
+                )
+            })
+            .collect();
         let raw = response.body().clone();
         let body = if raw.is_empty() {
             Value::Null
@@ -91,8 +103,9 @@ impl Emulator {
         };
         Answer {
             status,
+            headers,
             body,
-            error_type,
+            raw,
         }
     }
 }
@@ -101,12 +114,21 @@ impl Emulator {
 #[derive(Debug)]
 pub(crate) struct Answer {
     pub(crate) status: u16,
+    /// Every response header, by lower-case name.
+    pub(crate) headers: BTreeMap<String, String>,
     pub(crate) body: Value,
-    /// The `x-amzn-errortype` header, where the exception shape name travels.
-    pub(crate) error_type: Option<String>,
+    /// The response body as it came off the wire, before any parsing: an answer with
+    /// no body has none, which is not the same thing as a body that parsed to null.
+    pub(crate) raw: bytes::Bytes,
 }
 
 impl Answer {
+    /// The value of one response header, by name (case-insensitive).
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .get(&name.to_ascii_lowercase())
+            .map(String::as_str)
+    }
     /// The wire error code a client branches on, as restJson1 renders it.
     pub(crate) fn error_code(&self) -> String {
         self.body
@@ -122,8 +144,7 @@ impl Answer {
     /// The exception shape name the `x-amzn-errortype` header carries, with any
     /// `#`-qualified namespace and any `:`-suffixed URI dropped, as a client reads it.
     pub(crate) fn error_type(&self) -> String {
-        self.error_type
-            .as_deref()
+        self.header("x-amzn-errortype")
             .unwrap_or("<no x-amzn-errortype>")
             .rsplit('#')
             .next()

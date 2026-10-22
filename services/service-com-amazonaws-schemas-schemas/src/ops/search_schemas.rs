@@ -2,9 +2,20 @@
 
 //! @op SearchSchemas
 //!
-//! Reports the schemas of ONE registry whose own text includes the requested
-//! keywords, one page at a time. A pure read: it selects over what the creates
-//! persisted and writes nothing.
+//! Reports the schemas of ONE registry that the requested keywords match, one page at
+//! a time. A pure read: it selects over what the creates persisted and writes nothing.
+//!
+//! ## What a keyword matches
+//!
+//! A keyword search is a search of the schema REGISTRY's index, not a grep of the
+//! stored documents: what a schema is indexed under is the event it describes — the
+//! event `source` and `detail-type` the schema document declares, which an EventBridge
+//! schema records in the `x-amazon-events-source` / `x-amazon-events-detail-type`
+//! extensions of its root component (every schema AWS publishes in `aws.events`
+//! carries both; see [`crate::state::aws_managed_schemas`]). A schema that declares
+//! neither — a document a caller wrote by hand and created in a registry of their own —
+//! is indexed under nothing, so no keyword selects it, and neither the schema's name
+//! nor the rest of its document text is searched.
 //!
 //! ## Shape of an operation
 //!
@@ -201,14 +212,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         // The scan is LAZY: `page_by_key` pulls from this filter only until the page
-        // is full plus one, so a search that finds its page early stops there. The
-        // fold buffer below is allocated ONCE for the whole scan and reused for each
-        // schema, so matching allocates nothing per schema.
-        let mut folded = String::new();
+        // is full plus one, so a search that finds its page early stops there.
         let matching = registry
             .schemas
             .iter()
-            .filter(|(_, schema)| includes_every_keyword(schema, &keywords, &mut folded));
+            .filter(|(_, schema)| matches_every_keyword(schema, &keywords));
         let page = crate::state::page_by_key(
             matching,
             &selection,
@@ -266,35 +274,80 @@ fn keywords_of(raw: &str) -> Vec<String> {
         .collect()
 }
 
-/// Whether a schema "includes" every one of `keywords`.
+/// Whether `keywords` match a schema.
 ///
-/// A schema's own text is its name together with the content of every version this
-/// service holds for it: the name identifies the schema and the content is the schema
-/// document whose parts a keyword names. Keywords match as substrings and
-/// case-insensitively — a search is not a lookup by exact name — and ALL of them must
-/// occur, so adding a keyword only ever narrows the result.
-///
-/// `folded` is a scratch buffer the caller owns: the schema's text is folded into it
-/// once per schema (not once per keyword) and its capacity is reused across the scan,
-/// so a search allocates nothing per schema and matches with the standard library's
-/// linear substring search rather than a quadratic hand-rolled fold. The number of
-/// passes over it is bounded by `crate::state::MAX_KEYWORDS_PER_SEARCH`.
-fn includes_every_keyword(
-    schema: &crate::state::Schema,
-    keywords: &[String],
-    folded: &mut String,
-) -> bool {
-    if keywords.is_empty() {
-        return true;
+/// A schema is selected when EVERY requested keyword occurs in one of the event
+/// keywords the schema declares ([`declared_event_keywords`]), matched
+/// case-insensitively as a substring — a search is not a lookup by exact value, and
+/// adding a keyword only ever narrows the result. A schema that declares no event
+/// keyword at all is indexed under nothing, so a search never selects it, whatever (or
+/// nothing) the request asks for.
+fn matches_every_keyword(schema: &crate::state::Schema, keywords: &[String]) -> bool {
+    let declared = declared_event_keywords(schema);
+    if declared.is_empty() {
+        return false;
     }
-    folded.clear();
-    folded.extend(schema.name.chars().flat_map(char::to_lowercase));
-    for version in schema.versions.values() {
-        folded.push('\n');
-        folded.extend(version.content.chars().flat_map(char::to_lowercase));
-    }
-    keywords.iter().all(|keyword| folded.contains(keyword.as_str()))
+    keywords
+        .iter()
+        .all(|keyword| declared.iter().any(|value| value.contains(keyword.as_str())))
 }
+
+/// The event keywords a schema declares, folded to lower case: the event `source` and
+/// `detail-type` its document records, which is what the registry indexes a schema
+/// under.
+///
+/// EventBridge records them as the `x-amazon-events-source` and
+/// `x-amazon-events-detail-type` extensions of the document's event component. They are
+/// read from the stored document of EVERY version this service holds for the schema and
+/// wherever in the document they sit — the extensions are a property of a component, and
+/// which component is the event one differs between a discovered document and a
+/// converted one — so a schema whose later version declares another source is found
+/// under both. Folded ONCE per schema here rather than once per keyword at the match.
+/// A document that is not JSON declares nothing: the content of a stored version is
+/// whatever `CreateSchema` accepted for the type it was created as.
+fn declared_event_keywords(schema: &crate::state::Schema) -> Vec<String> {
+    let mut declared: Vec<String> = Vec::new();
+    for version in schema.versions.values() {
+        let Ok(document) = ::serde_json::from_str::<::serde_json::Value>(&version.content) else {
+            continue;
+        };
+        collect_event_keywords(&document, &mut declared);
+    }
+    declared
+}
+
+/// Collect every event keyword `document` declares, at any depth, folded to lower case.
+///
+/// Depth is bounded by `serde_json`'s own nesting limit, which refused the document
+/// before `CreateSchema` stored it, and breadth by
+/// [`crate::state::MAX_STORED_CONTENT_BYTES`].
+fn collect_event_keywords(document: &::serde_json::Value, declared: &mut Vec<String>) {
+    match document {
+        ::serde_json::Value::Object(members) => {
+            for (name, value) in members {
+                if EVENT_KEYWORD_EXTENSIONS.contains(&name.as_str()) {
+                    if let Some(value) = value.as_str() {
+                        declared.push(value.to_lowercase());
+                    }
+                }
+                collect_event_keywords(value, declared);
+            }
+        }
+        ::serde_json::Value::Array(items) => {
+            for item in items {
+                collect_event_keywords(item, declared);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The document members that carry a schema's event keywords: the EventBridge
+/// extensions naming the event's source and detail type.
+const EVENT_KEYWORD_EXTENSIONS: &[&str] = &[
+    "x-amazon-events-source",
+    "x-amazon-events-detail-type",
+];
 
 #[cfg(test)]
 mod tests {
@@ -317,6 +370,44 @@ mod tests {
             assert_eq!(
                 parsed, expected,
                 "case {raw:?}: expected {expected:?}, got {parsed:?}"
+            );
+        }
+    }
+
+    /// Every schema AWS publishes declares the event it describes, so a search of the
+    /// published registry has something to select on — and what it declares is the
+    /// event's source and detail type, not the schema's own name.
+    #[test]
+    fn a_published_schema_declares_the_event_it_describes() {
+        let state = crate::state::ComAmazonawsSchemasSchemasState::default();
+        let registry = &state.registries[crate::state::AWS_MANAGED_REGISTRY];
+        assert!(
+            !registry.schemas.is_empty(),
+            "the published registry must hold schemas to search over"
+        );
+        for (schema_name, schema) in &registry.schemas {
+            let declared = declared_event_keywords(schema);
+            assert_eq!(
+                declared.len(),
+                2,
+                "case {schema_name:?}: a published schema declares its event's source \
+                 and detail type, got {declared:?}"
+            );
+            assert!(
+                declared.iter().all(|value| value != schema_name),
+                "case {schema_name:?}: the schema's name is not what it is indexed \
+                 under, got {declared:?}"
+            );
+            // Every published source is under the `aws.` prefix, so this one keyword
+            // selects each of them.
+            assert!(
+                matches_every_keyword(schema, &keywords_of("AWS.")),
+                "case {schema_name:?}: a keyword of its source must select it, \
+                 declared {declared:?}"
+            );
+            assert!(
+                !matches_every_keyword(schema, &keywords_of("no-event-says-this")),
+                "case {schema_name:?}: a keyword nothing declares must not select it"
             );
         }
     }

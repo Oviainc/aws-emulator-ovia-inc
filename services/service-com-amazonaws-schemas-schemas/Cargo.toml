@@ -20,6 +20,13 @@ tokio = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
+# `Serialize` for the ordered JSON document `GetDiscoveredSchema` writes, whose member
+# order is part of the document.
+serde = { workspace = true }
+# Re-encodes a JSON document straight from a `serde_json` reader into a `serde_json`
+# writer, which is how a stored resource policy is normalised without its member order
+# being sorted away by an intermediate `serde_json::Value`.
+serde-transcode = "1.1"
 tracing = { workspace = true }
 # Opaque, query-string-safe encoding for the `NextToken` the listing operations mint.
 hex = { workspace = true }
