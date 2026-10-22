@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateQueue
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateQueue`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateQueue::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a queue id and ARN under its parent cluster, persists the record in
+//! [`crate::state`], and answers from the STORED record — `GetQueue` and `ListQueues`
+//! read the same one back.
 //!
 //! ## Shape of an operation
 //!
@@ -187,18 +181,224 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateQueue` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateQueueErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateQueue"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateQueueErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the PCS emulator holds no state on this engine".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `queueName` carries the same lookahead `@pattern` as every other PCS resource
+        // name, which the boundary validator cannot compile.
+        if let Some(message) = crate::state::resource_name_violation("queueName", &input.queue_name)
+        {
+            return Err(CreateQueueErrorModeled::ValidationException(
+                crate::state::field_validation("queueName", message),
+            )
+            .into());
+        }
+
+        // The caller-sized lists this create would PERSIST. The model bounds neither
+        // `ComputeNodeGroupConfigurationList` nor the Slurm settings list, so one
+        // request could otherwise size one stored record arbitrarily. `tags` needs no
+        // entry: `RequestTagMap` is modelled `@length(min: 1, max: 200)` with bounded
+        // keys and values, enforced at the boundary.
+        let slurm = input.slurm_configuration.as_ref();
+        let stored_lists: [(&str, usize); 2] = [
+            (
+                "computeNodeGroupConfigurations",
+                input
+                    .compute_node_group_configurations
+                    .as_ref()
+                    .map_or(0, Vec::len),
+            ),
+            (
+                "slurmConfiguration.slurmCustomSettings",
+                slurm.map_or(0, |slurm| {
+                    slurm.slurm_custom_settings.as_ref().map_or(0, Vec::len)
+                }),
+            ),
+        ];
+        for (member, entries) in stored_lists {
+            if let Some(message) = crate::state::stored_list_violation(member, entries) {
+                return Err(CreateQueueErrorModeled::ValidationException(
+                    crate::state::field_validation(member, message),
+                )
+                .into());
+            }
+        }
+
+        let mut state = state.lock();
+        state.settle();
+
+        let Some(cluster_id) = state.cluster_id_for(&input.cluster_identifier) else {
+            return Err(CreateQueueErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no cluster identified by {}", input.cluster_identifier),
+                    resource_id: input.cluster_identifier.clone(),
+                    resource_type: "cluster".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // An `@idempotencyToken` retry returns the first call's result and has no
+        // further effect. The token is remembered with the cluster the first call
+        // created the queue in, so a retry naming a DIFFERENT cluster cannot slip past
+        // the replay and create a second queue: it conflicts.
+        if let Some(remembered) = state
+            .remembered_create(Self::NAME, input.client_token.as_ref())
+            .cloned()
+        {
+            let first = (remembered.cluster_id.as_deref() == Some(cluster_id.as_str()))
+                .then(|| {
+                    state
+                        .clusters
+                        .get(&cluster_id)
+                        .and_then(|cluster| cluster.queues.get(&remembered.resource_id))
+                })
+                .flatten();
+            let Some(first) = first else {
+                return Err(CreateQueueErrorModeled::ConflictException(ConflictException {
+                    message: format!(
+                        "clientToken was already used to create queue {}",
+                        remembered.resource_id
+                    ),
+                    resource_id: remembered.resource_id,
+                    resource_type: "queue".to_string(),
+                })
+                .into());
+            };
+            return Ok(CreateQueueOutput {
+                queue: Some(first.to_api()),
+            });
+        }
+
+        let Some(cluster) = state.clusters.get(&cluster_id) else {
+            return Err(CreateQueueErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the cluster disappeared while it was being read".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // PCS adds a queue to a cluster that is ACTIVE; one that is still provisioning,
+        // or on its way out, cannot take one.
+        if cluster.status != crate::state::STATUS_ACTIVE {
+            return Err(CreateQueueErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "cluster {} is in {} status, not {}",
+                    cluster.id,
+                    cluster.status,
+                    crate::state::STATUS_ACTIVE
+                ),
+                resource_id: cluster.id.clone(),
+                resource_type: "cluster".to_string(),
+            })
+            .into());
+        }
+
+        if let Some(existing) = cluster
+            .queues
+            .values()
+            .find(|queue| queue.name == input.queue_name)
+        {
+            return Err(CreateQueueErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "a queue named {} already exists in cluster {}",
+                    input.queue_name, cluster.id
+                ),
+                resource_id: existing.id.clone(),
+                resource_type: "queue".to_string(),
+            })
+            .into());
+        }
+
+        // The cluster's ceiling, answered the way PCS answers a reached queue quota.
+        if cluster.queues.len() >= crate::state::MAX_QUEUES_PER_CLUSTER {
+            return Err(CreateQueueErrorModeled::ServiceQuotaExceededException(
+                crate::state::quota_exceeded("queue", crate::state::MAX_QUEUES_PER_CLUSTER),
+            )
+            .into());
+        }
+
+        // A queue assigns jobs to compute node groups of its own cluster, so a
+        // configuration naming one the cluster does not hold cannot be stored.
+        let configurations = input.compute_node_group_configurations.unwrap_or_default();
+        for configuration in &configurations {
+            let Some(named) = configuration.compute_node_group_id.as_deref() else {
+                continue;
+            };
+            if cluster.compute_node_group(named).is_none() {
+                return Err(CreateQueueErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "cluster {} has no compute node group identified by {named}",
+                            cluster.id
+                        ),
+                        resource_id: named.to_string(),
+                        resource_type: "computenodegroup".to_string(),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let (seq, id) = state.mint_id();
+        let region = crate::state::request_region(ctx);
+        let now = crate::state::now_date_time();
+        let Some(cluster) = state.clusters.get_mut(&cluster_id) else {
+            return Err(CreateQueueErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the cluster disappeared while it was being written".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let record = crate::state::QueueRecord {
+            seq,
+            arn: crate::state::queue_arn(&region, &cluster.id, &id),
+            id: id.clone(),
+            name: input.queue_name,
+            cluster_id: cluster.id.clone(),
+            status: crate::state::STATUS_CREATING.to_string(),
+            created_at: now,
+            modified_at: now,
+            compute_node_group_configurations: configurations,
+            slurm_configuration: input.slurm_configuration.map(Into::into),
+            error_info: Vec::new(),
+            tags: input.tags.unwrap_or_default(),
+            pending: Some(crate::state::Pending::in_a_span(
+                crate::state::PendingChange::Activate,
+            )),
+        };
+        cluster.queues.insert(id.clone(), record);
+        state.remember_create(
+            Self::NAME,
+            input.client_token.as_ref(),
+            Some(&cluster_id),
+            &id,
+        );
+
+        // Answered from the STORED record, so a create and a later read cannot differ.
+        let Some(stored) = state
+            .clusters
+            .get(&cluster_id)
+            .and_then(|cluster| cluster.queues.get(&id))
+        else {
+            return Err(CreateQueueErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the queue was not persisted".to_string(),
+                },
+            )
+            .into());
+        };
+        Ok(CreateQueueOutput {
+            queue: Some(stored.to_api()),
+        })
     }
 }
