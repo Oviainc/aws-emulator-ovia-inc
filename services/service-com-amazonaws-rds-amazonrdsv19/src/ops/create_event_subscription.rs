@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEventSubscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEventSubscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation persists a new RDS event notification subscription in
+//! this service's store, which is what `DescribeEventSubscriptions` reports. It is the
+//! ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEventSubscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -200,18 +197,276 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEventSubscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEventSubscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEventSubscription"))
+        // An event subscription belongs to the region it was created in — its ARN is
+        // scoped to it and `DescribeEventSubscriptions` lists that region's subscriptions
+        // — so the region the request was signed for is half of this record's key.
+        let region =
+            crate::state::request_region(ctx).map_err(CreateEventSubscriptionError::validation)?;
+        let name = input.subscription_name;
+
+        // Every value this request names is checked BEFORE the store is touched, so a
+        // request this service refuses leaves no subscription behind for a later describe
+        // to find.
+        crate::state::check_subscription_name(&name)
+            .map_err(CreateEventSubscriptionError::invalid_parameter_value)?;
+        // "This operation requires a topic Amazon Resource Name (ARN) created by either
+        // the RDS console, the SNS console, or the SNS API": a value that is not an SNS
+        // topic ARN names no topic at all, which is the modelled `SNSInvalidTopicFault`
+        // ("SNS has responded that there is a problem with the SNS topic specified").
+        if let Err(message) = crate::state::check_sns_topic_arn(&input.sns_topic_arn) {
+            return Err(CreateEventSubscriptionErrorModeled::SNSInvalidTopicFault(
+                SNSInvalidTopicFault {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        let source_type = input.source_type;
+        if let Some(source_type) = &source_type {
+            crate::state::check_event_subscription_source_type(source_type)
+                .map_err(CreateEventSubscriptionError::invalid_parameter_value)?;
+        }
+        let event_categories = input.event_categories.unwrap_or_default();
+        let source_ids = input.source_ids.unwrap_or_default();
+        let tags = input.tags.unwrap_or_default();
+        // Every list this request carries is BOUNDED before anything is resolved, scanned
+        // or stored. None of these members publishes a bound of its own, and all three are
+        // stored, so the caps are this emulator's — the same reason `check_filter_terms`
+        // caps a describe's filter terms. `SourceIds` is capped before the resolution
+        // below, which scans the stored resources of its source type once per entry: that
+        // scan is the product of this count and the per-region record quota, and it runs
+        // with this service's one state lock held.
+        crate::state::check_request_list_len(
+            "SourceIds",
+            source_ids.len(),
+            crate::state::MAX_SOURCE_IDS_PER_REQUEST,
+        )
+        .map_err(CreateEventSubscriptionError::invalid_parameter_value)?;
+        crate::state::check_request_list_len(
+            "EventCategories",
+            event_categories.len(),
+            crate::state::MAX_EVENT_CATEGORIES_PER_REQUEST,
+        )
+        .map_err(CreateEventSubscriptionError::invalid_parameter_value)?;
+        for category in &event_categories {
+            crate::state::check_stored_text(
+                "EventCategories",
+                category,
+                crate::state::MAX_EVENT_CATEGORY_LEN,
+            )
+            .map_err(CreateEventSubscriptionError::invalid_parameter_value)?;
+        }
+        crate::state::check_tags(&tags)
+            .map_err(CreateEventSubscriptionError::invalid_parameter_value)?;
+        // `EventCategories` is "a list of event categories for a particular source type
+        // (SourceType) that you want to subscribe to", and `SourceIds`'s own constraints
+        // say "If SourceIds are supplied, SourceType must also be provided": neither
+        // list can be resolved without the source type they belong to.
+        let Some(source_type) = source_type else {
+            if !event_categories.is_empty() || !source_ids.is_empty() {
+                return Err(CreateEventSubscriptionError::invalid_parameter_combination(
+                    "SourceType must be provided when EventCategories or SourceIds is \
+                     supplied: both name values of one source type",
+                ));
+            }
+            return self.insert(
+                region,
+                name,
+                input.sns_topic_arn,
+                None,
+                Vec::new(),
+                Vec::new(),
+                input.enabled,
+                tags,
+            );
+        };
+        // A category the source type does not publish names no event, which is the
+        // modelled `SubscriptionCategoryNotFoundFault` ("The supplied category does not
+        // exist").
+        if let Err(message) = crate::state::check_event_categories(&source_type, &event_categories)
+        {
+            return Err(
+                CreateEventSubscriptionErrorModeled::SubscriptionCategoryNotFoundFault(
+                    SubscriptionCategoryNotFoundFault {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+        // "An identifier must begin with a letter and must contain only ASCII letters,
+        // digits, and hyphens. It can't end with a hyphen or contain two consecutive
+        // hyphens" — the rule the identifier members of this service share.
+        for source_id in &source_ids {
+            crate::state::check_identifier("SourceIds", source_id, MAX_SOURCE_ID_LEN)
+                .map_err(CreateEventSubscriptionError::invalid_parameter_value)?;
+        }
+
+        self.insert(
+            region,
+            name,
+            input.sns_topic_arn,
+            Some(source_type),
+            source_ids,
+            event_categories,
+            input.enabled,
+            tags,
+        )
+    }
+}
+
+/// The longest `SourceIds` entry this operation accepts: the bound the identifier members
+/// of this service publish for the resources that member names
+/// (`DBInstanceIdentifier`, `DBSnapshotIdentifier`, `DBClusterIdentifier` — 255).
+const MAX_SOURCE_ID_LEN: usize = 255;
+
+/// The source types whose resources THIS service holds records of, with the stored
+/// identifiers each one's `SourceIds` entries resolve against.
+///
+/// `SourceIds`'s constraints bind an entry to one resource type per source type ("If the
+/// source type is a DB instance, a `DBInstanceIdentifier` value must be supplied"), so an
+/// entry that names no such resource is the modelled `SourceNotFoundFault` ("The requested
+/// source could not be found"). The other published source types name resources this
+/// service holds none of — DB clusters, DB parameter groups, DB security groups, DB
+/// cluster snapshots, proxies, zero-ETL integrations, custom engine versions and
+/// blue/green deployments, whose creates are all still scaffolded — so an entry for one of
+/// them is accepted rather than refused for a record this service could never have.
+fn stored_source_ids(
+    store: &crate::state::ComAmazonawsRdsAmazonrdsv19State,
+    region: &str,
+    source_type: &str,
+) -> Option<Vec<String>> {
+    match source_type {
+        "db-instance" => Some(
+            store
+                .instances_in(region)
+                .into_iter()
+                .map(|instance| instance.identifier.clone())
+                .collect(),
+        ),
+        "db-snapshot" => Some(
+            store
+                .snapshots_in(region)
+                .into_iter()
+                .map(|snapshot| snapshot.snapshot_identifier.clone())
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateEventSubscription<Eng> {
+    /// Persist the subscription the request asked for, once every value it names has been
+    /// resolved: the duplicate-name check, the region's quota and the sources it names are
+    /// all read from the store under one lock, so a refused request stores nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn insert(
+        &self,
+        region: String,
+        name: String,
+        sns_topic_arn: String,
+        source_type: Option<String>,
+        source_ids: Vec<String>,
+        event_categories: Vec<String>,
+        enabled: Option<bool>,
+        tags: Vec<Tag>,
+    ) -> Result<CreateEventSubscriptionOutput, CreateEventSubscriptionError> {
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router
+        // builds; 501 is the honest answer, never a fabricated subscription.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                <Self as smithy_server_runtime::Operation>::NAME,
+            ));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // Each `SourceIds` entry is resolved against the stored resources of its source
+        // type: a subscription whose source does not exist is one no event could ever
+        // match.
+        if let Some(source_type) = &source_type {
+            if let Some(stored) = stored_source_ids(&store, &region, source_type) {
+                if let Some(missing) = source_ids
+                    .iter()
+                    .find(|source_id| !stored.contains(source_id))
+                {
+                    return Err(CreateEventSubscriptionErrorModeled::SourceNotFoundFault(
+                        SourceNotFoundFault {
+                            message: Some(format!(
+                                "{source_type} {missing} not found in {region}"
+                            )),
+                        },
+                    )
+                    .into());
+                }
+            }
+        }
+        // RDS is regional: only the region the request was signed for is in scope, so one
+        // name can be a different subscription in each region. A second create under a
+        // name the region already holds is the modelled already-exists fault rather than
+        // a silent overwrite of the first.
+        let key = (region.clone(), name.clone());
+        if store.event_subscriptions.contains_key(&key) {
+            return Err(
+                CreateEventSubscriptionErrorModeled::SubscriptionAlreadyExistFault(
+                    SubscriptionAlreadyExistFault {
+                        // The wording this fault carries, which names no subscription:
+                        // "The supplied subscription name already exists."
+                        message: Some("Subscription already exists".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The region's event subscription quota, and the number of regions this store
+        // keeps records for at all: the store cannot be grown without bound, and the
+        // modelled fault says exactly this ("You have reached the maximum number of event
+        // subscriptions").
+        if store.event_subscriptions_in(&region).len()
+            >= crate::state::EVENT_SUBSCRIPTION_QUOTA_PER_REGION
+            || !store.has_room_for_region(&region)
+        {
+            return Err(
+                CreateEventSubscriptionErrorModeled::EventSubscriptionQuotaExceededFault(
+                    EventSubscriptionQuotaExceededFault {
+                        message: Some(format!(
+                            "the request would exceed the allowed number of event \
+                             subscriptions ({} per region, in at most {} regions)",
+                            crate::state::EVENT_SUBSCRIPTION_QUOTA_PER_REGION,
+                            crate::state::MAX_REGIONS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let record = crate::state::EventSubscriptionRecord::active(
+            name.clone(),
+            region,
+            sns_topic_arn,
+            // `SubscriptionCreationTime` is the instant this subscription was created,
+            // which the model types as a STRING: rendered in the ISO-8601 form the
+            // service's timestamp members carry, from the clock rather than the request.
+            crate::state::now_as_wire_timestamp()
+                .fmt(::aws_smithy_types::date_time::Format::DateTime)
+                .unwrap_or_default(),
+            source_type,
+            source_ids,
+            event_categories,
+            // "Specifies whether to activate the subscription. If the event notification
+            // subscription isn't activated, the subscription is created but not active."
+            // A request that says nothing gets an activated subscription, which is what
+            // the real service creates.
+            enabled.unwrap_or(true),
+            tags,
+        );
+        let event_subscription = record.to_wire();
+        store.event_subscriptions.insert(key, record);
+
+        Ok(CreateEventSubscriptionOutput {
+            event_subscription: Some(event_subscription),
+        })
     }
 }
