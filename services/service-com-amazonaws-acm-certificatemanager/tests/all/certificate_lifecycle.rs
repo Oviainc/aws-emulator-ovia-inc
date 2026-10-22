@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
+use service_com_amazonaws_acm_certificatemanager::state;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region the test signs for; ARNs the service mints must carry it.
@@ -50,13 +51,38 @@ type TagCase<'a> = (&'a str, Value, Vec<(&'a str, &'a str)>);
 
 /// A router serving only this service, over its own engine.
 pub(crate) fn router() -> MultiServiceRouter {
+    router_with_engine().0
+}
+
+/// A router serving only this service, beside the engine it serves from — so a test
+/// that must observe the transient `PENDING_VALIDATION` state can pin the instant the
+/// validation outcome falls due instead of racing the wall clock.
+pub(crate) fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
-        service_com_amazonaws_acm_certificatemanager::EmulatedService::new(engine),
+        service_com_amazonaws_acm_certificatemanager::EmulatedService::new(Arc::clone(&engine)),
     );
-    router
+    (router, engine)
+}
+
+/// Hold every stored certificate in `PENDING_VALIDATION` for the rest of the test by
+/// moving the instant its validation outcome falls due an hour out.
+///
+/// This writes only the due instant the emulator itself stores; the transition is
+/// still materialised by `materialize_due` on the next request, exactly as in
+/// production. A test about the pending state therefore cannot be made flaky by the
+/// [`state::VALIDATION_SETTLE_DELAY`] span elapsing mid-test.
+pub(crate) fn hold_pending_validations(engine: &Arc<engine::InMemoryEngine>) {
+    let store = engine.state::<state::ComAmazonawsAcmCertificatemanagerState>();
+    let mut store = store.lock();
+    let held = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+    for certificate in store.certificates.values_mut() {
+        if let Some(pending) = certificate.pending_validation.as_mut() {
+            pending.due_at = held;
+        }
+    }
 }
 
 /// Call one operation, signed for [`REGION`], and return `(status, body)`.
@@ -222,7 +248,7 @@ async fn describe_reports_what_request_certificate_stored() {
         ("defaults.example.co", &[], None, None),
     ];
 
-    let router = router();
+    let (router, engine) = router_with_engine();
     for (domain, sans, method, algorithm) in cases {
         let case = format!("{domain} {method:?} {algorithm:?}");
         let mut body = json!({ "DomainName": domain });
@@ -237,6 +263,10 @@ async fn describe_reports_what_request_certificate_stored() {
         }
 
         let arn = request_certificate(&router, &body).await;
+        // This case is about the record a request creates, so the certificate is held
+        // in the status a request puts it in rather than racing the clock-owed
+        // validation outcome.
+        hold_pending_validations(&engine);
         let prefix = format!("arn:aws:acm:{REGION}:{ACCOUNT}:certificate/");
         let id = arn.strip_prefix(&prefix).unwrap_or_else(|| {
             panic!("case {case}: expected an ARN starting {prefix}, got {arn:?}")
@@ -806,7 +836,7 @@ async fn tags_round_trip_through_the_certificate_record() {
 /// `MaxItems` whose `NextToken` resumes exactly where the previous page stopped.
 #[tokio::test]
 async fn list_certificates_filters_sorts_and_pages_the_store() {
-    let router = router();
+    let (router, engine) = router_with_engine();
     let domains = [
         "a.example.com",
         "b.example.com",
@@ -824,6 +854,9 @@ async fn list_certificates_filters_sorts_and_pages_the_store() {
             .await,
         );
     }
+    // Filtering, ordering and paging are asserted against one fixed set of statuses,
+    // so the certificates are held in the status the requests put them in.
+    hold_pending_validations(&engine);
 
     let unfiltered = list_all_arns(&router, &json!({})).await;
     let mut sorted_created = created.clone();

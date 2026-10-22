@@ -21,6 +21,8 @@ mod db_instance_envelope;
 mod db_instances;
 #[path = "all/docdb_query_surface.rs"]
 mod docdb_query_surface;
+#[path = "all/existence_and_parameter_guards.rs"]
+mod existence_and_parameter_guards;
 #[path = "all/not_found_paths.rs"]
 mod not_found_paths;
 #[path = "all/option_group_options.rs"]

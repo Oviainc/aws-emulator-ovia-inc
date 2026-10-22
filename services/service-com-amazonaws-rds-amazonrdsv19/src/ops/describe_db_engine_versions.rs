@@ -223,7 +223,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let page = crate::state::paginate(matching, input.marker.as_deref(), page_size);
+        // A `Marker` no prior page issued is refused rather than resynchronised: see
+        // `crate::state::paginate`.
+        let page = crate::state::paginate(matching, input.marker.as_deref(), page_size)
+            .map_err(DescribeDBEngineVersionsError::invalid_parameter_value)?;
         Ok(DescribeDBEngineVersionsOutput {
             marker: page.next_marker,
             db_engine_versions: Some(page.items),
@@ -1586,11 +1589,10 @@ pub(crate) fn engine_facts(engine: &str) -> Option<&'static EngineFacts> {
 ///   request names none;
 /// * a value naming an available version of that engine (case-insensitively) — that
 ///   version;
-/// * any other value — read as the major version it starts with, longest prefix first,
-///   and resolved to that major version's default available version: this is what
-///   serves a request naming only a major version (`8.0`, `16`), and a value inside a
-///   major version this service does not publish resolves to the version it does;
-/// * a value no available major version prefixes — `Err`.
+/// * a value naming a published MAJOR version (`8.0`, `16`) — that major version's
+///   default available version, which is what serves a request naming only the major
+///   version;
+/// * any other value — `Err`: it names no version this service can provision.
 ///
 /// `Ok(None)` means the catalogue publishes no AVAILABLE version for `engine` at all
 /// (a `custom-*` engine, whose versions a customer creates, or a value that is not an
@@ -1618,22 +1620,21 @@ pub(crate) fn resolve_version(
     {
         return Ok(Some(exact));
     }
-    let mut prefix = Some(requested);
-    while let Some(candidate) = prefix {
-        let within: Vec<&'static CatalogVersion> = available
-            .iter()
-            .copied()
-            .filter(|entry| entry.major_engine_version.eq_ignore_ascii_case(candidate))
-            .collect();
-        if !within.is_empty() {
-            return Ok(Some(default_version_of(&within)));
-        }
-        prefix = candidate.rsplit_once('.').map(|(head, _)| head);
+    // A value that names a MAJOR version this service publishes resolves to that major
+    // version's default: naming only the major version (`8.0`, `16`) is what RDS lets a
+    // request do. A value that is neither an available version NOR a published major
+    // version names no version this service can provision — `8.0.99` is not `8.0` — so
+    // it is refused rather than quietly moved onto a version the caller did not ask
+    // for, which is what the real service answers for it.
+    let within: Vec<&'static CatalogVersion> = available
+        .iter()
+        .copied()
+        .filter(|entry| entry.major_engine_version.eq_ignore_ascii_case(requested))
+        .collect();
+    if !within.is_empty() {
+        return Ok(Some(default_version_of(&within)));
     }
-    Err(format!(
-        "invalid value '{requested}' for EngineVersion: cannot find version \
-         '{requested}' for {engine}"
-    ))
+    Err(format!("Cannot find version {requested} for {engine}"))
 }
 
 /// The version `entries` resolves to: the engine's own default, else the default of the
@@ -1667,6 +1668,24 @@ pub(crate) fn catalogue() -> impl Iterator<Item = (usize, &'static CatalogVersio
         .iter()
         .enumerate()
         .filter_map(|(index, entry)| engine_facts(entry.engine).map(|facts| (index, entry, facts)))
+}
+
+/// Whether the catalogue carries `major_engine_version` for `engine`, at the
+/// major-version granularity the option group operations take
+/// (`CreateOptionGroup$MajorEngineVersion`).
+///
+/// `pub(crate)` because an operation that takes a `MajorEngineVersion` must resolve it
+/// against the SAME catalogue this operation reports: a major version no entry of that
+/// engine carries is one this service publishes no version for, so an option group
+/// cannot be associated with it. Engine names are matched case-insensitively, the way
+/// the describe operations match them.
+pub(crate) fn offers_major_engine_version(engine: &str, major_engine_version: &str) -> bool {
+    CATALOG.iter().any(|entry| {
+        entry.engine.eq_ignore_ascii_case(engine)
+            && entry
+                .major_engine_version
+                .eq_ignore_ascii_case(major_engine_version)
+    })
 }
 
 /// Whether `entry` is in the report this request asks for.

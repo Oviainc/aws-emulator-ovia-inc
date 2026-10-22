@@ -8,6 +8,11 @@
 //! `SortBy`/`SortOrder` ordering, and `MaxItems` paging with a `NextToken` that
 //! resumes where the previous page stopped.
 //!
+//! Reporting, not mutating: the only write it makes is
+//! [`crate::state::ComAmazonawsAcmCertificatemanagerState::materialize_due`], which
+//! applies the validation outcomes the clock already owed at this instant — so a
+//! status filter selects on the statuses the certificates are actually in.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -200,7 +205,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(decode_next_token)
             .transpose()?;
 
-        let store = state.lock();
+        let mut store = state.lock();
+        // The statuses this page filters and reports are the ones the clock has
+        // already made due, so a `CertificateStatuses` filter and a `DescribeCertificate`
+        // of the same certificate cannot disagree.
+        store.materialize_due(::std::time::SystemTime::now());
 
         // The order this response is built in: `CREATED_AT` with the ARN as the
         // tie-break when the request asked for it, else the store's own ARN order.

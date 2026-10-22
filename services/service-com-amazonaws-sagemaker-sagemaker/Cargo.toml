@@ -23,15 +23,14 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-# Hex codec for ListModels' opaque NextToken (the page boundary, encoded).
+# Hex codec for ListModels' opaque NextToken (the page boundary, encoded) and for
+# rendering the hex id a lineage entity's ARN carries.
 hex = { workspace = true }
+# Digest behind `state::mint_lineage_entity_id`, the server-generated artifact id.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

@@ -6,8 +6,10 @@
 //! seeded catalog in [`crate::state`], one page at a time.
 //!
 //! `MaxResults` is the page size and `NextToken` resumes where the previous page
-//! stopped; the last page carries no `NextToken`. A token this service did not issue
-//! is refused with `InvalidPaginationTokenException`.
+//! stopped; the last page carries no `NextToken`. A caller that names no
+//! `MaxResults` gets the WHOLE catalog in one page (`MaxResults`' 1..100 range
+//! bounds what a caller may ask for, not what the service returns unasked). A token
+//! this service did not issue is refused with `InvalidPaginationTokenException`.
 //!
 //! The catalog is seeded in `ComAmazonawsServicequotasServicequotasv20190624State::default`
 //! and never mutated, so this operation only reads.

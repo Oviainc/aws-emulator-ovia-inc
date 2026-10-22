@@ -4,6 +4,11 @@
 //! IMPLEMENTED: reads the stored certificate record named by `CertificateArn` and
 //! projects it into a `CertificateDetail`.
 //!
+//! Reporting, not mutating: the only write it makes is
+//! [`crate::state::ComAmazonawsAcmCertificatemanagerState::materialize_due`], which
+//! applies the validation outcome the clock already owed a pending certificate at
+//! this instant whether or not anybody polled for it.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -162,8 +167,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A pure read: the record is projected, never touched.
-        let store = state.lock();
+        // A read of one record, except for the outcomes the clock already owes: a
+        // certificate whose validation fell due before this call is reported as it
+        // stands now, which is what makes a poll for a terminal status terminate.
+        let mut store = state.lock();
+        store.materialize_due(::std::time::SystemTime::now());
         let Some(certificate) = store.certificates.get(&input.certificate_arn) else {
             return Err(DescribeCertificateErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {

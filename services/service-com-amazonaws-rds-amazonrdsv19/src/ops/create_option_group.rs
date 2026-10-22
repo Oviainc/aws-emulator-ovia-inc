@@ -155,6 +155,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(CreateOptionGroupError::validation)?;
         crate::state::check_option_group_engine_name(&input.engine_name)
             .map_err(CreateOptionGroupError::validation)?;
+        // `MajorEngineVersion` names "the major version of the engine that this option
+        // group should be associated with", so it is resolved against the SAME
+        // engine-version catalogue `DescribeDBEngineVersions` reports: a major version
+        // that engine has no entry for is a combination this service cannot associate,
+        // and the group must not be persisted under it. This runs BEFORE the store is
+        // touched, so a request that is wrong in its parameters leaves nothing behind.
+        crate::state::check_major_engine_version(&input.engine_name, &input.major_engine_version)
+            .map_err(CreateOptionGroupError::invalid_parameter_combination)?;
 
         // No store means this service was mounted on an engine it has no state in,
         // so it cannot serve the operation at all. Unreachable with the engine the
