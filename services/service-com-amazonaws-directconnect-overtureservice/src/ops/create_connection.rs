@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -225,18 +216,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConnection"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateConnectionErrorModeled::DirectConnectServerException(
+                DirectConnectServerException {
+                    message: Some(
+                        "the Direct Connect store is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let tags = input.tags.unwrap_or_default();
+        // The tag-count ceiling is checked FIRST, so it bounds the per-tag work
+        // every later check does on a caller-chosen list length.
+        if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(CreateConnectionErrorModeled::TooManyTagsException(
+                TooManyTagsException {
+                    message: Some(format!(
+                        "{} tags were supplied; a Direct Connect resource accepts at most {}",
+                        tags.len(),
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    )),
+                },
+            )
+            .into());
+        }
+        if let Some(duplicate) = crate::state::first_duplicate_tag_key(&tags) {
+            return Err(CreateConnectionErrorModeled::DuplicateTagKeysException(
+                DuplicateTagKeysException {
+                    message: Some(format!("Tag key {duplicate} was specified more than once")),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        store.settle_due_transitions();
+
+        // The emulator's own memory ceiling for this store (not an AWS quota):
+        // reclaim what the clock has already torn down, and refuse rather than
+        // grow past the ceiling.
+        if !crate::state::ComAmazonawsDirectconnectOvertureserviceState::has_room(
+            store.connections.len(),
+        ) {
+            store.reclaim_deleted();
+        }
+        if !crate::state::ComAmazonawsDirectconnectOvertureserviceState::has_room(
+            store.connections.len(),
+        ) {
+            return Err(CreateConnectionErrorModeled::DirectConnectClientException(
+                DirectConnectClientException {
+                    message: Some(format!(
+                        "this emulator holds at most {} connections; delete one before creating another",
+                        crate::state::MAX_RECORDS_PER_STORE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `lagId` asks for the connection to be allocated on the endpoint that
+        // hosts that LAG. No LAG can exist in this store (`CreateLag` is still
+        // scaffolded), so the id names nothing and the request is refused rather
+        // than stored with a dangling reference.
+        if let Some(lag_id) = &input.lag_id {
+            return Err(CreateConnectionErrorModeled::DirectConnectClientException(
+                DirectConnectClientException {
+                    message: Some(format!("LAG ID {lag_id} does not exist")),
+                },
+            )
+            .into());
+        }
+
+        let connection_id = store.next_id("dxcon");
+        let connection = crate::state::Connection {
+            connection_id: connection_id.clone(),
+            connection_name: input.connection_name,
+            // `requested` is what `Connection$connectionState` documents as "the
+            // initial state of a standard connection"; it stays there "until the
+            // Letter of Authorization (LOA) is sent to the customer", which is a
+            // call (`DescribeLoa`), not an elapsed interval — so no transition is
+            // owed to the clock here.
+            connection_state: "requested".to_string(),
+            location: input.location.clone(),
+            bandwidth: input.bandwidth.clone(),
+            region: crate::state::request_region(&ctx.parts().headers),
+            owner_account: ::engine::emulator_account_id().to_string(),
+            // A dedicated connection is a whole port, so it carries no VLAN tag
+            // of its own: `Connection$vlan` defaults to 0 and the VLANs live on
+            // the virtual interfaces provisioned over it.
+            vlan: 0,
+            lag_id: None,
+            provider_name: input.provider_name,
+            billing_mode: input.billing_mode,
+            mac_sec_capable: input.request_mac_sec.unwrap_or(false),
+            jumbo_frame_capable: crate::state::bandwidth_supports_jumbo_frames(&input.bandwidth),
+            // A standalone connection lands on one Direct Connect logical device,
+            // so it has no second device to fail over to; redundancy comes from
+            // the LAG this connection is not part of.
+            has_logical_redundancy: "no".to_string(),
+            aws_device: crate::state::device_id(&input.location, &format!("device/{connection_id}")),
+            aws_device_v2: crate::state::device_id(
+                &input.location,
+                &format!("device/{connection_id}"),
+            ),
+            aws_logical_device_id: crate::state::device_id(
+                &input.location,
+                &format!("logical/{connection_id}"),
+            ),
+            loa_issue_time: None,
+            tags,
+            due: None,
+        };
+
+        let output = crate::connection_output!(CreateConnectionOutput, &connection);
+        store.connections.insert(connection_id, connection);
+        Ok(output)
     }
 }

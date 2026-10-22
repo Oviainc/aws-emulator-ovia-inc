@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRevision
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRevision`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRevision::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a revision of an existing data set — a fresh `Id` and `Arn`,
+//! `Finalized` and `Revoked` false — and attaches it to that data set in state, so
+//! `ListDataSetRevisions` returns it. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +169,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRevision` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRevisionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRevision"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateRevisionErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+            .into());
+        };
+
+        // `Comment` is modelled `length 0..16384`, so the boundary validator already
+        // bounds it. `Tags` is only `MapOf__string`, so its size is bounded here.
+        if let Err(message) = crate::state::bound_tags(input.tags.as_ref()) {
+            return Err(CreateRevisionErrorModeled::ValidationException(
+                crate::state::invalid_request(message),
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx);
+        let revision_id = crate::state::mint_id();
+        let created_at = crate::state::now();
+
+        let stored = {
+            let mut store = state.lock();
+            let Some(data_set) = store.data_sets.get_mut(&input.data_set_id) else {
+                return Err(CreateRevisionErrorModeled::ResourceNotFoundException(
+                    crate::state::data_set_not_found(&input.data_set_id),
+                )
+                .into());
+            };
+            // The revisions a data set may hold are bounded. This operation models no
+            // `ServiceLimitExceededException`, so the refusal is its modelled
+            // `ValidationException` naming the limit rather than an error AWS does
+            // not declare for it.
+            if data_set.revisions.len() >= crate::state::MAX_REVISIONS_PER_DATA_SET {
+                return Err(CreateRevisionErrorModeled::ValidationException(
+                    crate::state::invalid_request(format!(
+                        "{} is {}, and this data set already holds that many revisions",
+                        crate::state::LIMIT_REVISIONS_PER_DATA_SET,
+                        crate::state::MAX_REVISIONS_PER_DATA_SET
+                    )),
+                )
+                .into());
+            }
+            let record = crate::state::Revision {
+                arn: crate::state::revision_arn(&region, &data_set.id, &revision_id),
+                id: revision_id.clone(),
+                data_set_id: data_set.id.clone(),
+                comment: input.comment,
+                // A fresh revision is open for assets and has not been revoked; both
+                // members are modelled `@default: false`.
+                finalized: false,
+                revoked: false,
+                revocation_comment: None,
+                revoked_at: None,
+                source_id: None,
+                tags: input.tags.unwrap_or_default(),
+                created_at,
+                updated_at: created_at,
+            };
+            data_set.revision_order.push(revision_id.clone());
+            let stored = record.clone();
+            data_set.revisions.insert(revision_id, record);
+            stored
+        };
+
+        Ok(CreateRevisionOutput {
+            arn: Some(stored.arn),
+            comment: stored.comment,
+            created_at: Some(stored.created_at),
+            data_set_id: Some(stored.data_set_id),
+            finalized: stored.finalized,
+            id: Some(stored.id),
+            source_id: stored.source_id,
+            tags: (!stored.tags.is_empty()).then_some(stored.tags),
+            updated_at: Some(stored.updated_at),
+            revocation_comment: stored.revocation_comment,
+            revoked: stored.revoked,
+            revoked_at: stored.revoked_at,
+        })
     }
 }

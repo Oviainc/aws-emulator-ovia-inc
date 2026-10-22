@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEnvironment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEnvironment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEnvironment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates and PERSISTS an environment: the id, ARN, activation code and timestamps are
+//! minted here, once, and every later read projects the stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +176,178 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEnvironment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEnvironmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEnvironment"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateEnvironmentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the thinclient environment store is unavailable".to_string()),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // `desktopType` is the service segment of `desktopArn`, which the model's
+        // `DesktopType` enum constrains to a WorkSpaces, WorkSpaces Secure Browser
+        // or AppStream 2.0 desktop. An ARN naming anything else has no desktop type,
+        // so the request is refused rather than stored.
+        let Some(desktop_type) = crate::state::desktop_type_from_desktop_arn(&input.desktop_arn)
+        else {
+            return Err(CreateEnvironmentErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "desktopArn must name a desktop of one of {:?}; '{}' names none of them",
+                        DESKTOP_TYPE_VALUES, input.desktop_arn
+                    )),
+                    reason: Some("fieldValidationFailed".to_string()),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "desktopArn".to_string(),
+                        message: format!(
+                            "the ARN's service must be one of {DESKTOP_TYPE_VALUES:?}"
+                        ),
+                    }]),
+                },
+            )
+            .into());
+        };
+
+        // `tags` is modelled as `TagsMap` with no length, so the tagging limits are
+        // applied here, before anything is stored.
+        if let Some(tags) = &input.tags {
+            if let Err(message) = crate::state::bound_tags(tags, tags.len()) {
+                return Err(CreateEnvironmentErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message.clone()),
+                        reason: Some("fieldValidationFailed".to_string()),
+                        field_list: Some(vec![ValidationExceptionField {
+                            name: "tags".to_string(),
+                            message,
+                        }]),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let fingerprint = crate::state::CreateEnvironmentFingerprint {
+            name: input.name.clone(),
+            desktop_arn: input.desktop_arn.clone(),
+            desktop_endpoint: input.desktop_endpoint.clone(),
+            software_set_update_schedule: input.software_set_update_schedule.clone(),
+            software_set_update_mode: input.software_set_update_mode.clone(),
+            desired_software_set_id: input.desired_software_set_id.clone(),
+            kms_key_arn: input.kms_key_arn.clone(),
+            maintenance_window: crate::state::maintenance_window_key(
+                input.maintenance_window.as_ref(),
+            ),
+            tags: crate::state::sorted_pairs(input.tags.as_ref()),
+            device_creation_tags: crate::state::sorted_pairs(input.device_creation_tags.as_ref()),
+        };
+
+        let mut store = state.lock();
+
+        // `clientToken` makes the call idempotent: a replay returns the environment
+        // the first call minted, and a replay carrying DIFFERENT parameters is a
+        // conflict rather than a second environment.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(recorded) = store.create_tokens.get(token).cloned() {
+                if recorded.fingerprint != fingerprint {
+                    return Err(CreateEnvironmentErrorModeled::ConflictException(
+                        ConflictException {
+                            message: Some(format!(
+                                "clientToken '{token}' was already used with different parameters"
+                            )),
+                            resource_id: Some(recorded.environment_id),
+                            resource_type: Some(
+                                crate::state::ENVIRONMENT_RESOURCE_TYPE.to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+                if let Some(existing) = store.environments.get(&recorded.environment_id) {
+                    return Ok(CreateEnvironmentOutput {
+                        environment: Some(existing.to_summary()),
+                    });
+                }
+            }
+        }
+
+        // The store is bounded: past its quota a create is refused rather than
+        // adding another record. `ServiceQuotaExceededException` is the modelled
+        // refusal for exactly this, and `DeleteEnvironment` releases a record (with
+        // its id, activation code, tags and tokens), so the store shrinks again.
+        if store.environments.len() >= crate::state::ENVIRONMENT_QUOTA {
+            return Err(CreateEnvironmentErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {} environments",
+                        crate::state::ENVIRONMENT_QUOTA
+                    )),
+                    // The quota is per account, so the account is what reached it.
+                    resource_id: Some(::engine::emulator_account_id().to_string()),
+                    resource_type: Some(crate::state::ENVIRONMENT_RESOURCE_TYPE.to_string()),
+                    service_code: Some(crate::state::ARN_SERVICE.to_string()),
+                    // Named for what it bounds: an AWS quota code is an identifier
+                    // Service Quotas issues, which this emulator does not model and
+                    // so must not invent one of.
+                    quota_code: Some("EnvironmentsPerAccount".to_string()),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::region_from_request(ctx.parts());
+        let seq = store.next_seq();
+        let now = store.next_timestamp_millis();
+        let id = store.mint_environment_id();
+        let activation_code = store.mint_activation_code();
+        let arn = ::engine::emulator_arn(
+            crate::state::ARN_SERVICE,
+            &region,
+            &format!("environment/{id}"),
+        );
+
+        let environment = crate::state::StoredEnvironment {
+            seq,
+            id: id.clone(),
+            arn: arn.clone(),
+            name: input.name,
+            desktop_arn: input.desktop_arn,
+            desktop_endpoint: input.desktop_endpoint,
+            desktop_type: desktop_type.to_string(),
+            activation_code,
+            registered_devices_count: 0,
+            software_set_update_schedule: input.software_set_update_schedule,
+            software_set_update_mode: input.software_set_update_mode,
+            desired_software_set_id: input.desired_software_set_id,
+            pending_software_set_id: None,
+            pending_software_set_version: None,
+            software_set_compliance_status: None,
+            maintenance_window: input.maintenance_window,
+            kms_key_arn: input.kms_key_arn,
+            device_creation_tags: input.device_creation_tags.unwrap_or_default(),
+            created_at_millis: now,
+            updated_at_millis: now,
+        };
+
+        let summary = environment.to_summary();
+        store.environment_order.push(id.clone());
+        store.environments.insert(id.clone(), environment);
+        store
+            .tags
+            .insert(arn, input.tags.unwrap_or_default());
+        if let Some(token) = input.client_token {
+            store.create_tokens.insert(
+                token,
+                crate::state::CreateEnvironmentToken {
+                    environment_id: id,
+                    fingerprint,
+                },
+            );
+        }
+
+        Ok(CreateEnvironmentOutput {
+            environment: Some(summary),
+        })
     }
 }

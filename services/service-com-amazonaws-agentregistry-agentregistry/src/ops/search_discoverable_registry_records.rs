@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SearchDiscoverableRegistryRecords
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SearchDiscoverableRegistryRecords`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SearchDiscoverableRegistryRecords::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -90,6 +81,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::RegistryRecord;
+use ::aws_smithy_types::Document;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -163,18 +157,377 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SearchDiscoverableRegistryRecords` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchDiscoverableRegistryRecordsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SearchDiscoverableRegistryRecords"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                SearchDiscoverableRegistryRecordsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the Agent Registry store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let state = state.lock();
+
+        // The bounds the model puts on this request, enforced here so the work this
+        // handler does is explicitly limited by the request's own modelled limits
+        // (the boundary validator refuses a violation before `handle` runs; these
+        // checks keep the bound local and readable rather than implicit). With
+        // `registryIds` pinned to one, the candidate set is one registry's records.
+        if input.registry_ids.len() != REGISTRY_IDS_PER_REQUEST {
+            return Err(field_validation(
+                "registryIds",
+                &format!(
+                    "exactly {REGISTRY_IDS_PER_REQUEST} registry identifier must be supplied, got {}.",
+                    input.registry_ids.len()
+                ),
+            ));
+        }
+
+        // The model declares `maxResults` with `@range{min:1,max:20}` and
+        // `@default: 10`. The generated input carries it as a plain `i32`, so an
+        // absent member and an explicit `0` are indistinguishable here; the modelled
+        // `@range` already refuses an explicit `0` at the boundary (pinned by the
+        // refusal table in `tests/all/discovery_read_path.rs`), so a zero reaching
+        // this handler means the member was not populated and is served at the
+        // documented default.
+        let requested = if input.max_results == 0 {
+            DEFAULT_MAX_RESULTS
+        } else {
+            input.max_results
+        };
+        if !(MIN_MAX_RESULTS..=MAX_MAX_RESULTS).contains(&requested) {
+            return Err(field_validation(
+                "maxResults",
+                &format!(
+                    "{requested} is outside the valid range {MIN_MAX_RESULTS} through {MAX_MAX_RESULTS}."
+                ),
+            ));
+        }
+        let max_results = usize::try_from(requested).unwrap_or(MAX_MAX_RESULTS as usize);
+        let query = input.search_query.to_lowercase();
+
+        // Validate the metadata filter ONCE, before any record is read: whether the
+        // request is well formed cannot depend on how many records the store holds.
+        if let Some(filters) = filter_expression(input.filters.as_ref()) {
+            validate_filter(filters).map_err(filter_validation)?;
+        }
+
+        let mut ranked: Vec<(usize, RegistryRecordSummary)> = Vec::new();
+        for registry_id in &input.registry_ids {
+            let Some(registry) = state.registry(registry_id) else {
+                return Err(
+                    SearchDiscoverableRegistryRecordsErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!("Registry {registry_id} was not found.")),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            for record in registry.discoverable_records() {
+                if !matches_metadata_filter(input.filters.as_ref(), record)? {
+                    continue;
+                }
+                let Some(rank) = relevance(record, &query) else {
+                    continue;
+                };
+                ranked.push((rank, record.summary()));
+            }
+        }
+
+        // "ordered by relevance": the most specific field the query matched first.
+        // `sort_by_key` is stable, so records of equal relevance keep the registry's
+        // own record-id order and a repeated search answers in the same order.
+        ranked.sort_by_key(|(rank, _)| *rank);
+        ranked.truncate(max_results);
+
+        Ok(SearchDiscoverableRegistryRecordsOutput {
+            registry_records: ranked.into_iter().map(|(_, summary)| summary).collect(),
+        })
     }
+}
+
+/// `SearchDiscoverableRegistryRecordsRequest$registryIds` is modelled
+/// `@length{min:1,max:1}` — "Currently, you must specify exactly one registry
+/// identifier". This is what bounds the candidate set to one registry's records.
+const REGISTRY_IDS_PER_REQUEST: usize = 1;
+
+/// `SearchDiscoverableRegistryRecordsRequest$maxResults` is modelled
+/// `@range{min:1,max:20}` with `@default: 10` — "Valid values are 1 through 20.
+/// The default value is 10."
+const MIN_MAX_RESULTS: i32 = 1;
+const MAX_MAX_RESULTS: i32 = 20;
+const DEFAULT_MAX_RESULTS: i32 = 10;
+
+/// How deep a `$and`/`$or` nesting a metadata filter may reach before it is
+/// refused. A document arrives from the request, so the recursion that walks it is
+/// bounded rather than trusted.
+const MAX_FILTER_DEPTH: usize = 10;
+
+/// How many terms one filter object, or branches one `$and`/`$or` array, may carry.
+/// Bounds the breadth of the walk the way [`MAX_FILTER_DEPTH`] bounds its depth.
+const MAX_FILTER_TERMS: usize = 100;
+
+/// The `customMetadata.{key}` form the `filters` member's own doc documents.
+const CUSTOM_METADATA_PREFIX: &str = "customMetadata.";
+
+/// The record fields a metadata filter may name: the scalar members of
+/// `RegistryRecordSummary`, the shape this operation returns.
+const FILTERABLE_RECORD_FIELDS: &[&str] = &[
+    "registryArn",
+    "recordArn",
+    "recordId",
+    "name",
+    "displayName",
+    "description",
+    "recordType",
+    "recordVersion",
+    "status",
+];
+
+/// How relevant `record` is to `query` (lower is more relevant), or `None` when it
+/// does not match at all.
+///
+/// The rank is the position of the first stored text field the query occurs in,
+/// most specific first: the record's `name`, then its `displayName`, then its
+/// `description`. An empty `searchQuery` matches every discoverable record, all at
+/// the same rank.
+fn relevance(record: &RegistryRecord, query: &str) -> Option<usize> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let fields = [
+        Some(record.name.as_str()),
+        record.display_name.as_deref(),
+        record.description.as_deref(),
+    ];
+    fields
+        .into_iter()
+        .position(|field| field.is_some_and(|text| text.to_lowercase().contains(query)))
+}
+
+/// A value a metadata filter can compare against: the member's doc says custom
+/// metadata "[v]alues are strings (maximum 128 characters) or booleans".
+#[derive(Debug, PartialEq, Eq)]
+enum FilterValue {
+    Text(String),
+    Bool(bool),
+}
+
+impl FilterValue {
+    /// The filter value a request document carries, or `None` for a JSON value
+    /// outside the documented string/boolean set.
+    fn from_document(document: &Document) -> Option<Self> {
+        match document {
+            Document::String(text) => Some(Self::Text(text.clone())),
+            Document::Bool(flag) => Some(Self::Bool(*flag)),
+            _ => None,
+        }
+    }
+}
+
+/// The filter expression the request carries, or `None` when it names none.
+fn filter_expression(filters: Option<&Document>) -> Option<&Document> {
+    match filters {
+        None | Some(Document::Null) => None,
+        Some(expression) => Some(expression),
+    }
+}
+
+/// Refuse a filter expression the documented grammar does not admit, WITHOUT
+/// reading any record — so whether a request is well formed never depends on how
+/// many records the store happens to hold.
+fn validate_filter(expression: &Document) -> Result<(), String> {
+    walk(expression, None, 0).map(|_| ())
+}
+
+/// Whether `record` satisfies the request's optional metadata filter.
+fn matches_metadata_filter(
+    filters: Option<&Document>,
+    record: &RegistryRecord,
+) -> Result<bool, SearchDiscoverableRegistryRecordsError> {
+    match filter_expression(filters) {
+        None => Ok(true),
+        Some(expression) => walk(expression, Some(record), 0).map_err(filter_validation),
+    }
+}
+
+/// Walk one metadata filter expression, evaluating it against `record` when one is
+/// given and validating it alone when none is.
+///
+/// The grammar is the one the `filters` member documents: the field-level
+/// operators `$eq`, `$ne` and `$in`, and the logical operators `$and` and `$or`.
+/// Several keys in one object are conjunctive, as `$and` spelled implicitly. Every
+/// term is walked — the walk never short-circuits on a term that does not hold —
+/// so a malformed term is refused wherever it sits in the expression.
+fn walk(
+    expression: &Document,
+    record: Option<&RegistryRecord>,
+    depth: usize,
+) -> Result<bool, String> {
+    if depth > MAX_FILTER_DEPTH {
+        return Err(format!(
+            "the filter expression nests deeper than the {MAX_FILTER_DEPTH} levels this service evaluates."
+        ));
+    }
+    let Document::Object(entries) = expression else {
+        return Err("a filter expression must be a JSON object.".to_string());
+    };
+    if entries.len() > MAX_FILTER_TERMS {
+        return Err(format!(
+            "a filter expression carries at most {MAX_FILTER_TERMS} terms, got {}.",
+            entries.len()
+        ));
+    }
+    let mut holds = true;
+    for (key, value) in entries {
+        holds &= match key.as_str() {
+            "$and" => {
+                let mut all = true;
+                for branch in branches(key, value)? {
+                    all &= walk(branch, record, depth + 1)?;
+                }
+                all
+            }
+            "$or" => {
+                let mut any = false;
+                for branch in branches(key, value)? {
+                    any |= walk(branch, record, depth + 1)?;
+                }
+                any
+            }
+            field => field_matches(field, value, record)?,
+        };
+    }
+    Ok(holds)
+}
+
+/// The branches of a `$and` / `$or`, which must be a bounded array of expressions.
+fn branches<'a>(operator: &str, value: &'a Document) -> Result<&'a Vec<Document>, String> {
+    let Document::Array(branches) = value else {
+        return Err(format!("{operator} takes an array of filter expressions."));
+    };
+    if branches.len() > MAX_FILTER_TERMS {
+        return Err(format!(
+            "{operator} takes at most {MAX_FILTER_TERMS} filter expressions, got {}.",
+            branches.len()
+        ));
+    }
+    Ok(branches)
+}
+
+/// Whether `field` is one a metadata filter may name.
+fn validate_field_name(field: &str) -> Result<(), String> {
+    let custom_metadata_key = field
+        .strip_prefix(CUSTOM_METADATA_PREFIX)
+        .is_some_and(|key| !key.is_empty());
+    if custom_metadata_key || FILTERABLE_RECORD_FIELDS.contains(&field) {
+        return Ok(());
+    }
+    Err(format!(
+        "'{field}' is not a filterable field; name one of {} or a {CUSTOM_METADATA_PREFIX}{{key}} field.",
+        FILTERABLE_RECORD_FIELDS.join(", ")
+    ))
+}
+
+/// The stored value of the field a filter names, or `None` when this record does
+/// not carry it. The field name is validated by [`validate_field_name`] first.
+fn field_value(record: &RegistryRecord, field: &str) -> Option<FilterValue> {
+    if let Some(key) = field.strip_prefix(CUSTOM_METADATA_PREFIX) {
+        let Some(Document::Object(metadata)) = record.custom_metadata.as_ref() else {
+            return None;
+        };
+        return metadata.get(key).and_then(FilterValue::from_document);
+    }
+    let text = match field {
+        "registryArn" => Some(record.registry_arn.as_str()),
+        "recordArn" => Some(record.record_arn.as_str()),
+        "recordId" => Some(record.record_id.as_str()),
+        "name" => Some(record.name.as_str()),
+        "displayName" => record.display_name.as_deref(),
+        "description" => record.description.as_deref(),
+        "recordType" => Some(record.record_type.as_str()),
+        "recordVersion" => Some(record.record_version.as_str()),
+        "status" => Some(record.status.as_str()),
+        // Unreachable: the field name is validated before this is reached.
+        _ => None,
+    };
+    text.map(|value| FilterValue::Text(value.to_string()))
+}
+
+/// Whether the field-level operator object `value` holds for `field` on `record`,
+/// validating the operators and operands whether or not a record is given.
+///
+/// A field this record does not carry satisfies `$ne` and fails `$eq` / `$in`.
+fn field_matches(
+    field: &str,
+    value: &Document,
+    record: Option<&RegistryRecord>,
+) -> Result<bool, String> {
+    validate_field_name(field)?;
+    let Document::Object(operators) = value else {
+        return Err(format!(
+            "'{field}' takes an object naming one of $eq, $ne or $in."
+        ));
+    };
+    if operators.is_empty() || operators.len() > MAX_FILTER_TERMS {
+        return Err(format!(
+            "'{field}' takes an object naming between 1 and {MAX_FILTER_TERMS} of $eq, $ne or $in."
+        ));
+    }
+    let stored = record.and_then(|record| field_value(record, field));
+    let mut holds = true;
+    for (operator, operand) in operators {
+        holds &= match operator.as_str() {
+            "$eq" => stored.as_ref() == scalar_operand(operator, operand)?.as_ref(),
+            "$ne" => stored.as_ref() != scalar_operand(operator, operand)?.as_ref(),
+            "$in" => {
+                let Document::Array(candidates) = operand else {
+                    return Err("$in takes an array of strings or booleans.".to_string());
+                };
+                if candidates.is_empty() || candidates.len() > MAX_FILTER_TERMS {
+                    return Err(format!(
+                        "$in takes between 1 and {MAX_FILTER_TERMS} values, got {}.",
+                        candidates.len()
+                    ));
+                }
+                let mut wanted = Vec::with_capacity(candidates.len());
+                for candidate in candidates {
+                    wanted.push(FilterValue::from_document(candidate).ok_or_else(|| {
+                        "$in takes an array of strings or booleans.".to_string()
+                    })?);
+                }
+                stored.as_ref().is_some_and(|value| wanted.contains(value))
+            }
+            unsupported => {
+                return Err(format!(
+                    "'{unsupported}' is not a supported operator; use $eq, $ne or $in."
+                ))
+            }
+        };
+    }
+    Ok(holds)
+}
+
+/// The single string or boolean operand `$eq` / `$ne` compares against.
+fn scalar_operand(operator: &str, operand: &Document) -> Result<Option<FilterValue>, String> {
+    FilterValue::from_document(operand)
+        .map(Some)
+        .ok_or_else(|| format!("{operator} takes a string or a boolean."))
+}
+
+/// A 400 `ValidationException` refusing the request's `filters` member.
+fn filter_validation(message: String) -> SearchDiscoverableRegistryRecordsError {
+    field_validation("filters", &message)
+}
+
+/// A 400 `ValidationException` naming the member that failed and why, in this
+/// service's own modelled error shape.
+fn field_validation(member: &str, message: &str) -> SearchDiscoverableRegistryRecordsError {
+    SearchDiscoverableRegistryRecordsErrorModeled::ValidationException(
+        crate::state::field_validation(member, message),
+    )
+    .into()
 }

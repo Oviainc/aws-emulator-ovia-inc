@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutRecord
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutRecord`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutRecord::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Appends one record to the target stream's buffer and answers the `RecordId` it was
+//! stored under.
 //!
 //! ## Shape of an operation
 //!
@@ -188,18 +182,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutRecord` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutRecordErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutRecord"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable through the router: it mounts every service on one shared
+            // `InMemoryEngine`. A store this operation cannot reach is a server-side
+            // failure, which is what this operation's 503 says.
+            return Err(PutRecordErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some(
+                        "the Firehose stream store is not reachable from this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let _ = ctx;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.materialise_due(now);
+
+        // One lookup resolves the stream, refuses it if it is not accepting data, and
+        // mints the id the record is stored under — so no id is ever handed out for a
+        // record that was not stored.
+        let (record_id, encrypted) =
+            match store.ingest_record(&input.delivery_stream_name, input.record.data, now) {
+                Ok(stored) => stored,
+                Err(crate::state::StreamRefusal::NoSuchStream) => {
+                    return Err(no_such_stream(&input.delivery_stream_name))
+                }
+                Err(crate::state::StreamRefusal::NotActive(status)) => {
+                    return Err(stream_not_active(&input.delivery_stream_name, status))
+                }
+            };
+
+        // A single put has no per-record channel to report a buffer with no room in, so
+        // the whole request is refused with the modelled 503.
+        let Some(record_id) = record_id else {
+            return Err(at_capacity(&input.delivery_stream_name));
+        };
+
+        Ok(PutRecordOutput {
+            record_id,
+            encrypted: Some(encrypted),
+        })
     }
+}
+
+/// No stream of that name exists.
+fn no_such_stream(name: &str) -> PutRecordError {
+    PutRecordErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("Firehose stream {name} not found")),
+    })
+    .into()
+}
+
+/// The stream exists but is not accepting data.
+///
+/// The model does not say WHICH exception a put to a non-`ACTIVE` stream raises; of the
+/// ones this operation declares, `ResourceNotFoundException` is the client error for a
+/// stream that is not available to the caller, so the status is named in the message.
+fn stream_not_active(name: &str, status: &str) -> PutRecordError {
+    PutRecordErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!(
+            "Firehose stream {name} is in status {status}; it accepts data only in status ACTIVE"
+        )),
+    })
+    .into()
+}
+
+/// The stream's buffer has no room for the record.
+///
+/// This is what the modelled 503 says: "The service is unavailable. Back off and retry
+/// the operation. If you continue to see the exception, throughput limits for the Firehose
+/// stream may have been exceeded." The emulator holds buffered records in its own heap,
+/// so its budget (`crate::state::MAX_BUFFERED_BYTES_PER_STREAM` and friends) is the limit
+/// a caller runs into here, and this is the answer the real service gives for one.
+fn at_capacity(name: &str) -> PutRecordError {
+    PutRecordErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
+        message: Some(format!(
+            "Firehose stream {name} cannot buffer more data; back off and retry"
+        )),
+    })
+    .into()
 }

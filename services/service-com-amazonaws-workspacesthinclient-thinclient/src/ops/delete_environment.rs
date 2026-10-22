@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteEnvironment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteEnvironment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteEnvironment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the environment, and its tags, from state. A retry carrying the same
+//! `clientToken` reports the original success; any other call naming a record that is
+//! not there answers 404.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +148,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteEnvironment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteEnvironmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteEnvironment"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteEnvironmentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the thinclient environment store is unavailable".to_string()),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+
+        // A replayed delete (same `clientToken`, same id) reports the success the
+        // first call already gave, rather than a 404 for the record it removed.
+        if let Some(token) = input.client_token.as_deref() {
+            if store.delete_tokens.get(token) == Some(&input.id) {
+                return Ok(DeleteEnvironmentOutput {});
+            }
+        }
+
+        // Releasing the record also drops its tags, its id, its activation code
+        // and the create tokens that named it, so the store shrinks back.
+        if store.release_environment(&input.id).is_none() {
+            return Err(DeleteEnvironmentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("environment '{}' was not found", input.id)),
+                    resource_id: Some(input.id.clone()),
+                    resource_type: Some(crate::state::ENVIRONMENT_RESOURCE_TYPE.to_string()),
+                },
+            )
+            .into());
+        }
+        if let Some(token) = input.client_token {
+            store.record_delete_token(token, input.id);
+        }
+
+        Ok(DeleteEnvironmentOutput {})
     }
 }

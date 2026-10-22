@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDeliveryStreams
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDeliveryStreams`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDeliveryStreams::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the names in [`crate::state`], alphabetically, honouring `Limit`,
+//! `ExclusiveStartDeliveryStreamName` and the optional `DeliveryStreamType` filter.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +144,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDeliveryStreams` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDeliveryStreamsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDeliveryStreams"))
+        // Unreachable through the router, which mounts every service on one shared
+        // `InMemoryEngine`; this operation models no error at all to report it with.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListDeliveryStreams",
+            ));
+        };
+        let _ = ctx;
+
+        let mut store = state.lock();
+        // Reporting only: applies the transitions the clock had already made due.
+        store.materialise_due(::std::time::SystemTime::now());
+
+        // "This parameter is optional. If this parameter is omitted, Firehose streams of
+        // all types are returned."
+        let type_filter = input.delivery_stream_type.as_deref();
+        // "will start with the Firehose stream whose name comes alphabetically immediately
+        // after the name you specify"
+        let start_after = input.exclusive_start_delivery_stream_name.as_deref();
+        let limit = input
+            .limit
+            .map_or(DEFAULT_LIMIT, |limit| usize::try_from(limit).unwrap_or(0));
+
+        // The register is name-keyed and ordered, so the page is a prefix of the matching
+        // names: take `limit` of them and then look only for whether a further one exists,
+        // rather than materialising every match.
+        let mut matching = store
+            .streams
+            .values()
+            .filter(|stream| type_filter.is_none_or(|wanted| stream.stream_type == wanted))
+            .filter(|stream| start_after.is_none_or(|start| stream.name.as_str() > start));
+        let delivery_stream_names: Vec<String> = matching
+            .by_ref()
+            .take(limit)
+            .map(|stream| stream.name.clone())
+            .collect();
+        let has_more_delivery_streams = matching.next().is_some();
+
+        Ok(ListDeliveryStreamsOutput {
+            has_more_delivery_streams,
+            delivery_stream_names,
+        })
     }
 }
+
+/// `Limit`: "The maximum number of Firehose streams to list. The default value is 10."
+const DEFAULT_LIMIT: usize = 10;

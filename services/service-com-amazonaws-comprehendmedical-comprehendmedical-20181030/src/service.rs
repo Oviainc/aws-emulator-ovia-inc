@@ -41,7 +41,7 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, ViolationKind,
 };
 use std::sync::Arc;
 
@@ -96,17 +96,51 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // Amazon Comprehend Medical does not answer `ValidationException` for a bad
+        // value: its client-input error is `InvalidRequestException` ("The request that
+        // you made is invalid"), which every operation in the model declares, and text
+        // longer than the limit has its own error, `TextSizeLimitExceededException`
+        // ("The size of the text you submitted exceeds the size limit"). Both are
+        // modelled 400s, which is the status the framework renders a refusal with, so
+        // only the code and the message change here.
+        let Refusal::Invalid(violations) = refusal else {
+            // An authentication refusal keeps the framework's 403 wording.
+            return None;
+        };
+        let members = violations
+            .iter()
+            .map(|violation| violation.path.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let text_too_long = violations.iter().any(|violation| {
+            // The violation path names the member as the validator walks it, whose
+            // casing follows the schema's member name rather than the wire name.
+            violation
+                .path
+                .split('.')
+                .next_back()
+                .is_some_and(|member| member.eq_ignore_ascii_case("text"))
+                && matches!(violation.kind, ViolationKind::MaxLength(_))
+        });
+        Some(if text_too_long {
+            Refused {
+                code: "TextSizeLimitExceededException".to_string(),
+                message: format!(
+                    "The size of the text you submitted exceeds the size limit. Reduce the size \
+                     of the text or use a smaller document and then retry your request. \
+                     Offending member(s): {members}."
+                ),
+            }
+        } else {
+            Refused {
+                code: "InvalidRequestException".to_string(),
+                message: format!(
+                    "The request that you made is invalid: member(s) {members} did not satisfy \
+                     the constraints this service declares. Check your request to determine why \
+                     it's invalid and then retry the request."
+                ),
+            }
+        })
     }
 
     fn override_routing_error(

@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one key from the store under an `If-Match` check against the store's current
+//! `ETag`, then answers the recomputed counts and the store's NEW version. The
+//! operation is `@idempotent`: a key the store does not hold leaves the same end state
+//! and still succeeds, and like every accepted mutation it advances the version, so the
+//! `If-Match` the caller just spent cannot be replayed. The `If-Match` comparison
+//! happens against a READ-ONLY resolution of the store, so a refused request does not
+//! even materialise its record.
+//!
+//! ## Authorization is not modelled
+//!
+//! The emulator verifies request signatures, but no key value store resource policy is
+//! stored anywhere, so the modelled `AccessDeniedException` (403) is never produced by
+//! this operation. That is a deliberate partial implementation, not an oversight: do
+//! not write a test that depends on a 403 from here.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +159,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteKey"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteKeyErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the key value store state is unavailable".to_string()),
+            })
+        })?;
+        let mut guard = state.lock();
+
+        // Resolve the store READ-ONLY first and compare `If-Match` against its current
+        // version — the initial version when no record is held yet — so a request
+        // refused here mutates nothing at all, not even the store map.
+        let current_version = match guard.store(&input.kvs_arn) {
+            Err(_) => {
+                return Err(DeleteKeyErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "'{}' is not the ARN of a CloudFront key value store",
+                            input.kvs_arn
+                        )),
+                    },
+                )
+                .into())
+            }
+            Ok(Some(store)) => store.etag.clone(),
+            Ok(None) => crate::state::initial_etag(&input.kvs_arn),
+        };
+        if input.if_match != current_version {
+            return Err(DeleteKeyErrorModeled::ConflictException(ConflictException {
+                message: Some(
+                    "the If-Match version does not match the current version of the Key Value Store"
+                        .to_string(),
+                ),
+            })
+            .into());
+        }
+
+        let store = guard
+            .store_mut(&input.kvs_arn, now)
+            .map_err(|error| match error {
+                crate::state::StoreError::NotAKeyValueStoreArn => {
+                    DeleteKeyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                        message: Some(format!(
+                            "'{}' is not the ARN of a CloudFront key value store",
+                            input.kvs_arn
+                        )),
+                    })
+                }
+                crate::state::StoreError::StoreLimitReached => {
+                    DeleteKeyErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: Some(format!(
+                                "this emulator holds at most {} key value stores",
+                                crate::state::MAX_STORES
+                            )),
+                        },
+                    )
+                }
+            })?;
+
+        // One delete is one pending change — the same path `PutKey` and `UpdateKeys`
+        // take. A delete only ever shrinks the store, so no quota can be crossed here.
+        let changes = crate::state::PendingChanges::from([(input.key.as_str(), None)]);
+        store.apply(&changes);
+        store.commit(now);
+        let output = DeleteKeyOutput {
+            item_count: store.item_count(),
+            total_size_in_bytes: store.total_size_in_bytes(),
+            e_tag: store.etag.clone(),
+        };
+        // Attribution for the accepted mutation: the ARN, the resulting counts and the
+        // new version only.
+        ::tracing::debug!(
+            kvs_arn = %input.kvs_arn,
+            item_count = output.item_count,
+            total_size_in_bytes = output.total_size_in_bytes,
+            etag = %output.e_tag,
+            "DeleteKey applied"
+        );
+        Ok(output)
     }
 }

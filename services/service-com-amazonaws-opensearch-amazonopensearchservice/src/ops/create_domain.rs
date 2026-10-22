@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDomain
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDomain`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDomain::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: persists a [`crate::state::Domain`] record keyed by domain name and
+//! answers with the `DomainStatus` projection of the stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -147,6 +140,22 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::BTreeMap;
+
+use crate::state::{
+    domain_arn, domain_endpoint, domain_id, stored_advanced_security_options, stored_aiml_options,
+    stored_auto_tune_options, stored_automated_snapshot_pause_options,
+    stored_identity_center_options, stored_vpc_options, Domain, DEFAULT_ENGINE_MODE,
+    DEFAULT_ENGINE_VERSION, DEFAULT_USE_CASE, DOMAIN_QUOTA, OPT_ACCESS_POLICIES,
+    OPT_ADVANCED_OPTIONS, OPT_ADVANCED_SECURITY_OPTIONS, OPT_AIML_OPTIONS,
+    OPT_AUTOMATED_SNAPSHOT_PAUSE_OPTIONS, OPT_AUTO_TUNE_OPTIONS, OPT_CLUSTER_CONFIG,
+    OPT_COGNITO_OPTIONS, OPT_DEPLOYMENT_STRATEGY_OPTIONS, OPT_DOMAIN_ENDPOINT_OPTIONS,
+    OPT_EBS_OPTIONS, OPT_ENCRYPTION_AT_REST_OPTIONS, OPT_ENGINE_MODE, OPT_ENGINE_VERSION,
+    OPT_IDENTITY_CENTER_OPTIONS, OPT_IP_ADDRESS_TYPE, OPT_LOG_PUBLISHING_OPTIONS,
+    OPT_NODE_TO_NODE_ENCRYPTION_OPTIONS, OPT_OFF_PEAK_WINDOW_OPTIONS, OPT_SNAPSHOT_OPTIONS,
+    OPT_SOFTWARE_UPDATE_OPTIONS, OPT_USE_CASE, OPT_VPC_OPTIONS, PROCESSING_STATUS_CREATING,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -221,18 +230,193 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDomain` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDomainErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let name = input.domain_name;
+
+        let mut store = state.lock();
+
+        // "Domain names are unique across the domains owned by an account within an
+        // Amazon Web Services Region" (`CreateDomainRequest$DomainName`), so a second
+        // create of the same name is the modelled already-exists refusal, not a second
+        // record.
+        if store.domains.contains_key(&name) {
+            return Err(CreateDomainErrorModeled::ResourceAlreadyExistsException(
+                ResourceAlreadyExistsException {
+                    message: Some(format!("Domain already exists: {name}")),
+                },
+            )
+            .into());
+        }
+
+        // The store is bounded: past its quota a create is refused rather than adding
+        // another record. `LimitExceededException` is the modelled refusal for "trying
+        // to create more than the allowed number of resources".
+        if store.domains.len() >= DOMAIN_QUOTA {
+            return Err(CreateDomainErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {DOMAIN_QUOTA} domains in {region}"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let suffix = store.mint_endpoint_suffix();
+        let engine_version = input
+            .engine_version
+            .unwrap_or_else(|| DEFAULT_ENGINE_VERSION.to_string());
+
+        let mut domain = Domain {
+            domain_id: domain_id(&name),
+            domain_name: name.clone(),
+            arn: domain_arn(&name, &region),
+            engine_version,
+            engine_mode: input
+                .engine_mode
+                .unwrap_or_else(|| DEFAULT_ENGINE_MODE.to_string()),
+            use_case: input
+                .use_case
+                .unwrap_or_else(|| DEFAULT_USE_CASE.to_string()),
+            endpoint: domain_endpoint(&name, &suffix, &region),
+            // `DomainStatus$Created` is the creation REQUEST's outcome: the domain now
+            // exists. Whether its configuration is live is `Processing`, below.
+            created: true,
+            deleted: false,
+            processing: false,
+            processing_status: PROCESSING_STATUS_CREATING.to_string(),
+            processing_until: None,
+            cluster_config: input.cluster_config.unwrap_or_default(),
+            ebs_options: input.ebs_options,
+            access_policies: input.access_policies,
+            ip_address_type: input.ip_address_type,
+            snapshot_options: input.snapshot_options,
+            vpc_options: input.vpc_options.map(stored_vpc_options),
+            cognito_options: input.cognito_options,
+            encryption_at_rest_options: input.encryption_at_rest_options,
+            node_to_node_encryption_options: input.node_to_node_encryption_options,
+            advanced_options: input
+                .advanced_options
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<BTreeMap<String, String>>(),
+            log_publishing_options: input
+                .log_publishing_options
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            domain_endpoint_options: input.domain_endpoint_options,
+            advanced_security_options: input
+                .advanced_security_options
+                .map(stored_advanced_security_options),
+            identity_center_options: input
+                .identity_center_options
+                .map(stored_identity_center_options),
+            auto_tune_options: input.auto_tune_options.map(stored_auto_tune_options),
+            off_peak_window_options: input.off_peak_window_options,
+            software_update_options: input.software_update_options,
+            aiml_options: input.aiml_options.map(stored_aiml_options),
+            deployment_strategy_options: input.deployment_strategy_options,
+            automated_snapshot_pause_options: input
+                .automated_snapshot_pause_options
+                .map(stored_automated_snapshot_pause_options),
+            tags: input.tag_list.unwrap_or_default(),
+            created_at: now,
+            updated_at: now,
+            option_versions: BTreeMap::new(),
+        };
+
+        // Every option the new domain holds a value for starts at revision 1, so
+        // `DescribeDomainConfig` reports a real `OptionStatus` for it and a later
+        // update bumps it from there. An option the request carried no value for gets
+        // no revision, and no `DomainConfig` container either.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDomain"))
+        // The five unconditional ones always have a value: the engine version, the use
+        // case and the engine mode default when omitted, the cluster configuration is
+        // `DomainStatus`'s required container, and the advanced options are a map that
+        // is empty rather than absent.
+        for option in [
+            OPT_ENGINE_VERSION,
+            OPT_CLUSTER_CONFIG,
+            OPT_ADVANCED_OPTIONS,
+            OPT_USE_CASE,
+            OPT_ENGINE_MODE,
+        ] {
+            domain.touch(option, now);
+        }
+        for (option, supplied) in [
+            (OPT_EBS_OPTIONS, domain.ebs_options.is_some()),
+            (OPT_ACCESS_POLICIES, domain.access_policies.is_some()),
+            (OPT_IP_ADDRESS_TYPE, domain.ip_address_type.is_some()),
+            (OPT_SNAPSHOT_OPTIONS, domain.snapshot_options.is_some()),
+            (OPT_VPC_OPTIONS, domain.vpc_options.is_some()),
+            (OPT_COGNITO_OPTIONS, domain.cognito_options.is_some()),
+            (
+                OPT_ENCRYPTION_AT_REST_OPTIONS,
+                domain.encryption_at_rest_options.is_some(),
+            ),
+            (
+                OPT_NODE_TO_NODE_ENCRYPTION_OPTIONS,
+                domain.node_to_node_encryption_options.is_some(),
+            ),
+            (
+                OPT_LOG_PUBLISHING_OPTIONS,
+                !domain.log_publishing_options.is_empty(),
+            ),
+            (
+                OPT_DOMAIN_ENDPOINT_OPTIONS,
+                domain.domain_endpoint_options.is_some(),
+            ),
+            (
+                OPT_ADVANCED_SECURITY_OPTIONS,
+                domain.advanced_security_options.is_some(),
+            ),
+            (
+                OPT_IDENTITY_CENTER_OPTIONS,
+                domain.identity_center_options.is_some(),
+            ),
+            (OPT_AUTO_TUNE_OPTIONS, domain.auto_tune_options.is_some()),
+            (
+                OPT_OFF_PEAK_WINDOW_OPTIONS,
+                domain.off_peak_window_options.is_some(),
+            ),
+            (
+                OPT_SOFTWARE_UPDATE_OPTIONS,
+                domain.software_update_options.is_some(),
+            ),
+            (OPT_AIML_OPTIONS, domain.aiml_options.is_some()),
+            (
+                OPT_DEPLOYMENT_STRATEGY_OPTIONS,
+                domain.deployment_strategy_options.is_some(),
+            ),
+            (
+                OPT_AUTOMATED_SNAPSHOT_PAUSE_OPTIONS,
+                domain.automated_snapshot_pause_options.is_some(),
+            ),
+        ] {
+            if supplied {
+                domain.touch(option, now);
+            }
+        }
+
+        // A domain is not settled the instant the create returns: the clock owes it an
+        // `Active` configuration once the provisioning span has passed. Set AFTER the
+        // revisions, because `touch` moves `updated_at` — the options a create sets are
+        // exactly the ones the provisioning in flight is applying, so each reports
+        // `OptionState::Processing` until it settles.
+        domain.begin_processing(PROCESSING_STATUS_CREATING, now);
+
+        store.domains.insert(name.clone(), domain);
+        let stored = store
+            .domains
+            .get(&name)
+            .ok_or_else(crate::state::state_unavailable)?;
+        Ok(CreateDomainOutput {
+            domain_status: Some(stored.to_status()),
+        })
     }
 }

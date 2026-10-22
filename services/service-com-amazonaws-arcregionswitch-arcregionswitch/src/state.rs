@@ -1,11 +1,485 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-arcregionswitch-arcregionswitch service.
+//!
+//! Everything a handler persists about a Region switch plan and its executions lives
+//! here, behind the engine lock, together with the projections that turn a stored
+//! record into the modelled shapes (`Plan`, `AbbreviatedPlan`) the API reports. Handlers
+//! never build those shapes from the request: they build them from the record.
+//!
+//! # Every store here is bounded
+//!
+//! This process is a developer's emulator that authenticates nobody, so a caller that
+//! can reach it must not be able to grow its memory without limit. Each of the three
+//! maps below has an explicit ceiling and a stated release path, and every insert goes
+//! through the method that enforces it:
+//!
+//! | store | ceiling | release |
+//! |---|---|---|
+//! | [`ComAmazonawsArcregionswitchArcregionswitchState::plans`] | [`MAX_PLANS`] | `DeletePlan`, or the request is refused |
+//! | [`ComAmazonawsArcregionswitchArcregionswitchState::executions`] | [`MAX_EXECUTIONS_PER_PLAN`] per plan | the oldest terminal execution is evicted; deleting the plan drops them all |
+//! | [`ComAmazonawsArcregionswitchArcregionswitchState::client_tokens`] | [`MAX_CLIENT_TOKENS`] | the oldest record is evicted (FIFO) |
+//!
+//! Per-request cost is independent of how much is stored, too: [`settle`] walks only the
+//! transitions whose deadline has passed, through the
+//! [`ComAmazonawsArcregionswitchArcregionswitchState::due_transitions`] index, never the
+//! whole execution map.
+//!
+//! [`settle`]: ComAmazonawsArcregionswitchArcregionswitchState::settle
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, SystemTime};
+
+use ::aws_smithy_types::DateTime;
+
+use crate::ops::types::{AbbreviatedPlan, ExecutionEvent, Plan, StepState};
+
+/// How long after `StartPlanExecution` the clock owes an execution its outcome.
+///
+/// AWS documents no duration for it, so this is the emulator's own choice, inside the
+/// project's 250-750 ms band for a transition the clock owes: a caller that reads the
+/// execution straight after starting it still observes `pending`, and its state errors.
+pub const EXECUTION_START_SPAN: Duration = Duration::from_millis(500);
+
+/// The state an execution reaches once [`EXECUTION_START_SPAN`] has passed, from the
+/// model's `ExecutionState` enum.
+///
+/// It is the service's modelled FAILURE state, and it is the honest one: a Region switch
+/// workflow's execution blocks drive other services' resources (Lambda, ECS, Auto
+/// Scaling, RDS, Route 53, ARC routing controls), which this emulator does not run, so
+/// nothing performed the work. Reporting `completed` would claim an outcome nothing
+/// produced, and staying `inProgress` for ever would report a run that is not running
+/// AND never release the plan. Failing with [`UNSUPPORTED_EXECUTION_REASON`] recorded on
+/// the execution's events says what happened and frees the plan.
+pub const FAILED: &str = "failed";
+
+/// Why a plan execution fails in this emulator, recorded on the `executionFailed` event
+/// `ListPlanExecutionEvents` reports, so a caller is told rather than left guessing.
+pub const UNSUPPORTED_EXECUTION_REASON: &str =
+    "This emulator does not run a Region switch workflow's execution blocks, which drive \
+     other services' resources, so no step of this plan execution was performed.";
+
+/// The `ExecutionEventType` recorded when an execution is created.
+pub const EVENT_EXECUTION_PENDING: &str = "executionPending";
+
+/// The `ExecutionEventType` recorded when an execution reaches [`FAILED`].
+pub const EVENT_EXECUTION_FAILED: &str = "executionFailed";
+
+/// The most plans this emulator stores. Not an AWS quota — AWS publishes its own, which
+/// this does not claim to reproduce — but the ceiling that keeps an unauthenticated
+/// caller from growing the store without limit. `CreatePlan` refuses past it, and
+/// `DeletePlan` is the release path.
+pub const MAX_PLANS: usize = 500;
+
+/// The most executions this emulator keeps per plan. Reaching it evicts the oldest
+/// execution that has reached a state it never leaves; if none has, `StartPlanExecution`
+/// is refused. (One plan can hold only one non-terminal execution at a time, so this
+/// ceiling is what bounds the history that accumulates behind it.)
+pub const MAX_EXECUTIONS_PER_PLAN: usize = 50;
+
+/// The most `clientToken` records this emulator keeps. Reaching it evicts the oldest
+/// recorded token, so the idempotency cache cannot accumulate without bound; a caller
+/// whose token was evicted is answered as a fresh request rather than a replay.
+pub const MAX_CLIENT_TOKENS: usize = 2_048;
+
+/// The `ExecutionState` values an execution never leaves, from the model's
+/// `ExecutionState` enum
+/// (`smithy_query(query="shape", shape="ExecutionState", model_path="services/service-com-amazonaws-arcregionswitch-arcregionswitch/smithy-model/com-amazonaws-arcregionswitch-arcregionswitch.json")`).
+/// Every other value — `pending`, `inProgress`, `pausedByFailedStep`,
+/// `pausedByOperator`, `pendingManualApproval` — is a state the execution can still
+/// move out of, so it still holds the plan.
+pub const TERMINAL_EXECUTION_STATES: &[&str] = &[
+    "canceled",
+    "completed",
+    "completedMonitoringApplicationHealth",
+    "completedWithExceptions",
+    FAILED,
+    "planExecutionTimedOut",
+];
+
+/// The page size a paginated operation of this service serves.
+///
+/// Both `ListPlans` and `GetPlanExecution`/`ListPlanExecutionEvents` constrain
+/// `maxResults` to `@range(1..100)`; an absent one asks for as many as that range allows.
+/// One helper so the rule is written once.
+pub fn page_size(requested: Option<i32>) -> usize {
+    const MAX_PAGE_SIZE: i32 = 100;
+    let clamped = requested.unwrap_or(MAX_PAGE_SIZE).clamp(1, MAX_PAGE_SIZE);
+    usize::try_from(clamped).unwrap_or(1)
+}
+
+/// A Region switch plan as this emulator persists it: the modelled resource plus the
+/// bookkeeping that is not part of the `Plan` shape.
+#[derive(Debug, Clone)]
+pub struct StoredPlan {
+    /// The plan as the API reports it. `version` is NOT kept here — it is derived from
+    /// [`StoredPlan::revision`], so there is one source of truth for it.
+    pub plan: Plan,
+    /// How many times the plan has been written. Rendered as the plan's `version`.
+    pub revision: u64,
+    /// The tags supplied for the plan, kept for `ListTagsForResource`/`TagResource`.
+    pub tags: BTreeMap<String, String>,
+    /// The ids of the executions started against this plan, oldest first. Bounded by
+    /// [`MAX_EXECUTIONS_PER_PLAN`].
+    pub executions: Vec<String>,
+    /// The execution currently holding the plan, while it is in a non-terminal state.
+    pub active_execution: Option<String>,
+}
+
+impl StoredPlan {
+    /// The plan's `version`, derived from how many times it has been written.
+    pub fn version(&self) -> String {
+        self.revision.to_string()
+    }
+
+    /// The `Plan` shape for this record.
+    pub fn as_plan(&self) -> Plan {
+        let mut plan = self.plan.clone();
+        plan.version = Some(self.version());
+        plan
+    }
+
+    /// The `AbbreviatedPlan` projection `ListPlans` reports.
+    pub fn as_abbreviated_plan(&self) -> AbbreviatedPlan {
+        AbbreviatedPlan {
+            arn: self.plan.arn.clone(),
+            owner: self.plan.owner.clone(),
+            name: self.plan.name.clone(),
+            regions: self.plan.regions.clone(),
+            recovery_approach: self.plan.recovery_approach.clone(),
+            primary_region: self.plan.primary_region.clone(),
+            version: Some(self.version()),
+            updated_at: self.plan.updated_at,
+            description: self.plan.description.clone(),
+            execution_role: Some(self.plan.execution_role.clone()),
+            active_plan_execution: self.active_execution.clone(),
+            recovery_time_objective_minutes: self.plan.recovery_time_objective_minutes,
+        }
+    }
+
+    /// The plan's other Region: a plan carries exactly two (`RegionList`, len 2..2), so
+    /// the Region that is not `region` is unique when `region` is one of them.
+    pub fn counterpart_region(&self, region: &str) -> Option<String> {
+        self.plan.regions.iter().find(|r| *r != region).cloned()
+    }
+}
+
+/// One execution of a plan, as this emulator persists it.
+#[derive(Debug, Clone)]
+pub struct StoredExecution {
+    pub plan_arn: String,
+    pub execution_id: String,
+    /// The plan `version` this execution was started against.
+    pub plan_version: String,
+    pub comment: Option<String>,
+    pub mode: String,
+    pub action: String,
+    pub execution_state: String,
+    pub execution_region: String,
+    pub activate_region: Option<String>,
+    pub deactivate_region: Option<String>,
+    pub recovery_execution_id: Option<String>,
+    pub start_time: DateTime,
+    pub end_time: Option<DateTime>,
+    pub updated_at: DateTime,
+    pub step_states: Vec<StepState>,
+    /// The execution's events, oldest first, as `ListPlanExecutionEvents` reports them.
+    /// Bounded by the step count of the workflow the execution runs plus the two
+    /// lifecycle events, so it cannot grow per request.
+    pub events: Vec<ExecutionEvent>,
+    /// When the clock owes this execution its outcome; `None` once it has one.
+    pub outcome_due_at: Option<SystemTime>,
+}
+
+impl StoredExecution {
+    /// Whether the execution has reached a state it never leaves, so the plan is free.
+    pub fn is_terminal(&self) -> bool {
+        TERMINAL_EXECUTION_STATES.contains(&self.execution_state.as_str())
+    }
+}
+
+/// What a `clientToken` recorded, so a replay of `StartPlanExecution` returns the first
+/// execution and a reuse with different parameters is refused.
+#[derive(Debug, Clone)]
+pub struct TokenRecord {
+    /// The request parameters the token was first used with.
+    pub fingerprint: String,
+    pub plan_arn: String,
+    pub execution_id: String,
+    /// Where this record sits in the FIFO that bounds the token cache.
+    pub recorded_at: u64,
+}
 
 /// Per-service state for com-amazonaws-arcregionswitch-arcregionswitch. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsArcregionswitchArcregionswitchState {
-    // TODO: add service-specific state fields
+    /// Plans by ARN, at most [`MAX_PLANS`] of them. A `BTreeMap` so `ListPlans` pages in
+    /// a stable order and a token can simply name the ARN to resume from.
+    pub plans: BTreeMap<String, StoredPlan>,
+    /// Executions by `(plan ARN, executionId)`, at most [`MAX_EXECUTIONS_PER_PLAN`] per
+    /// plan.
+    pub executions: BTreeMap<(String, String), StoredExecution>,
+    /// `clientToken` -> the execution it started, at most [`MAX_CLIENT_TOKENS`] of them.
+    pub client_tokens: BTreeMap<String, TokenRecord>,
+    /// The FIFO order of `client_tokens`, as `recorded_at -> clientToken`, so the oldest
+    /// record can be evicted in log time instead of by scanning the cache.
+    client_token_order: BTreeMap<u64, String>,
+    /// The clock-owed transitions still outstanding, as
+    /// `(due instant, plan ARN, executionId)`. Sorted by deadline, so [`Self::settle`]
+    /// touches only what is actually due.
+    due_transitions: BTreeSet<(SystemTime, String, String)>,
+    /// Monotonic seed for the ids this service mints and for the token FIFO.
+    seed: u64,
+}
+
+impl ComAmazonawsArcregionswitchArcregionswitchState {
+    /// The next value of this store's monotonic id seed.
+    pub fn next_seed(&mut self) -> u64 {
+        self.seed += 1;
+        self.seed
+    }
+
+    /// Apply the state changes the clock already made due at `now`.
+    ///
+    /// Only clock-owed work: an execution whose outcome was owed at `now` even if nobody
+    /// had called. EVERY handler runs this first — the reporting ones included, which is
+    /// what keeps them from disagreeing with the mutating ones about what the current
+    /// state is — and it costs only the transitions that are due, never a walk of the
+    /// store.
+    ///
+    /// The outcome is [`FAILED`] with [`UNSUPPORTED_EXECUTION_REASON`] on an
+    /// `executionFailed` event: nothing ran the workflow's execution blocks, so this is
+    /// the service's modelled failure state and it RELEASES the plan — the plan becomes
+    /// deletable again and can be executed again.
+    pub fn settle(&mut self, now: SystemTime) {
+        while let Some(next) = self.due_transitions.pop_first() {
+            if next.0 > now {
+                self.due_transitions.insert(next);
+                break;
+            }
+            let (due, plan_arn, execution_id) = next;
+            let key = (plan_arn, execution_id);
+            let at = DateTime::from(due);
+            let Some(execution) = self.executions.get_mut(&key) else {
+                continue;
+            };
+            execution.execution_state = FAILED.to_string();
+            execution.updated_at = at;
+            execution.end_time = Some(at);
+            execution.outcome_due_at = None;
+            self.push_event(
+                &key,
+                EVENT_EXECUTION_FAILED,
+                Some(UNSUPPORTED_EXECUTION_REASON.to_string()),
+                at,
+            );
+            // The execution has reached a state it never leaves, so it no longer holds
+            // the plan.
+            if let Some(plan) = self.plans.get_mut(&key.0) {
+                if plan.active_execution.as_ref() == Some(&key.1) {
+                    plan.active_execution = None;
+                }
+            }
+        }
+    }
+
+    /// Append one event to an execution's timeline, chained to the one before it.
+    pub fn push_event(
+        &mut self,
+        key: &(String, String),
+        event_type: &str,
+        error: Option<String>,
+        at: DateTime,
+    ) {
+        let event_id = format!(
+            "{:016x}",
+            self.next_seed().wrapping_mul(EXECUTION_ID_MULTIPLIER)
+        );
+        if let Some(execution) = self.executions.get_mut(key) {
+            let previous_event_id = execution.events.last().map(|event| event.event_id.clone());
+            execution.events.push(ExecutionEvent {
+                timestamp: Some(at),
+                r#type: Some(event_type.to_string()),
+                step_name: None,
+                execution_block_type: None,
+                resources: None,
+                error,
+                description: None,
+                event_id,
+                previous_event_id,
+            });
+        }
+    }
+
+    /// Store `execution` against its plan, registering the transition the clock owes it
+    /// and opening its event timeline.
+    ///
+    /// The caller must have made room with [`Self::room_for_execution`] first.
+    pub fn insert_execution(&mut self, execution: StoredExecution) {
+        let key = (execution.plan_arn.clone(), execution.execution_id.clone());
+        let started_at = execution.start_time;
+        if let Some(due) = execution.outcome_due_at {
+            self.due_transitions
+                .insert((due, key.0.clone(), key.1.clone()));
+        }
+        if let Some(plan) = self.plans.get_mut(&key.0) {
+            plan.executions.push(key.1.clone());
+            plan.active_execution = Some(key.1.clone());
+        }
+        self.executions.insert(key.clone(), execution);
+        self.push_event(&key, EVENT_EXECUTION_PENDING, None, started_at);
+    }
+
+    /// Make room for one more execution of `plan_arn`, and report whether there is any.
+    ///
+    /// Under [`MAX_EXECUTIONS_PER_PLAN`] there is nothing to do. At it, the oldest
+    /// execution that has reached a state it never leaves is dropped; if none has, there
+    /// is no room and the caller refuses the request.
+    pub fn room_for_execution(&mut self, plan_arn: &str) -> bool {
+        // The common path reads the list by reference and allocates nothing; only a plan
+        // at the ceiling pays for collecting its candidate ids.
+        let at_ceiling = self
+            .plans
+            .get(plan_arn)
+            .is_some_and(|plan| plan.executions.len() >= MAX_EXECUTIONS_PER_PLAN);
+        if !at_ceiling {
+            return true;
+        }
+        let recorded: Vec<String> = self
+            .plans
+            .get(plan_arn)
+            .map(|plan| plan.executions.clone())
+            .unwrap_or_default();
+        let evictable = recorded.into_iter().find(|execution_id| {
+            self.executions
+                .get(&(plan_arn.to_string(), execution_id.clone()))
+                .is_some_and(StoredExecution::is_terminal)
+        });
+        let Some(evictable) = evictable else {
+            return false;
+        };
+        self.forget_execution(plan_arn, &evictable);
+        true
+    }
+
+    /// Record `token` as having started `execution_id`, evicting the oldest record once
+    /// the cache is at [`MAX_CLIENT_TOKENS`].
+    pub fn record_client_token(
+        &mut self,
+        token: String,
+        fingerprint: String,
+        plan_arn: String,
+        execution_id: String,
+    ) {
+        while self.client_tokens.len() >= MAX_CLIENT_TOKENS {
+            let Some((_, evicted)) = self.client_token_order.pop_first() else {
+                break;
+            };
+            self.client_tokens.remove(&evicted);
+        }
+        let recorded_at = self.next_seed();
+        self.client_token_order.insert(recorded_at, token.clone());
+        self.client_tokens.insert(
+            token,
+            TokenRecord {
+                fingerprint,
+                plan_arn,
+                execution_id,
+                recorded_at,
+            },
+        );
+    }
+
+    /// Drop one execution and everything that points at it.
+    fn forget_execution(&mut self, plan_arn: &str, execution_id: &str) {
+        let key = (plan_arn.to_string(), execution_id.to_string());
+        if let Some(execution) = self.executions.remove(&key) {
+            if let Some(due) = execution.outcome_due_at {
+                self.due_transitions
+                    .remove(&(due, key.0.clone(), key.1.clone()));
+            }
+        }
+        if let Some(plan) = self.plans.get_mut(plan_arn) {
+            plan.executions.retain(|id| id != execution_id);
+            if plan.active_execution.as_deref() == Some(execution_id) {
+                plan.active_execution = None;
+            }
+        }
+        self.forget_tokens_for(|record| record.execution_id == execution_id);
+    }
+
+    /// Drop a plan and everything recorded against it, so nothing outlives the plan it
+    /// belongs to.
+    pub fn forget_plan(&mut self, plan_arn: &str) {
+        self.plans.remove(plan_arn);
+        self.executions.retain(|(arn, _), _| arn != plan_arn);
+        self.due_transitions.retain(|(_, arn, _)| arn != plan_arn);
+        self.forget_tokens_for(|record| record.plan_arn == plan_arn);
+    }
+
+    /// Drop every token record `doomed` selects, from the cache and from its FIFO.
+    fn forget_tokens_for(&mut self, doomed: impl Fn(&TokenRecord) -> bool) {
+        let mut orders = Vec::new();
+        self.client_tokens.retain(|_, record| {
+            if doomed(record) {
+                orders.push(record.recorded_at);
+                false
+            } else {
+                true
+            }
+        });
+        for order in orders {
+            self.client_token_order.remove(&order);
+        }
+    }
+}
+
+/// The base-36 digits a plan ARN's suffix is drawn from: `[a-z0-9]`, as `PlanArn`'s
+/// pattern requires.
+const BASE36_DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+
+/// How many distinct 6-character base-36 suffixes there are.
+const PLAN_SUFFIX_SPACE: u64 = 36u64.pow(6);
+
+/// Scrambles the seed so successive plans do not get visibly consecutive suffixes.
+/// Odd and not a multiple of three, hence coprime with `36^6 = 2^12 * 3^12`, so
+/// `seed -> suffix` is injective and two plans never collide on one suffix.
+const PLAN_SUFFIX_MULTIPLIER: u64 = 2_654_435_761;
+
+/// Scrambles the seed into an execution id. Odd, so multiplication modulo 2^64 is a
+/// bijection and two executions never share an id.
+const EXECUTION_ID_MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// The 6-character suffix a plan ARN ends in, minted from the store's seed.
+pub fn plan_arn_suffix(seed: u64) -> String {
+    // `(seed % SPACE) * MULTIPLIER` is at most 2176782335 * 2654435761 < u64::MAX, so
+    // the product is exact and the reduction below is a true modular multiplication.
+    let mut value = (seed % PLAN_SUFFIX_SPACE) * PLAN_SUFFIX_MULTIPLIER % PLAN_SUFFIX_SPACE;
+    let mut digits = [b'0'; 6];
+    for slot in digits.iter_mut().rev() {
+        *slot = BASE36_DIGITS[(value % 36) as usize];
+        value /= 36;
+    }
+    String::from_utf8(digits.to_vec()).expect("base-36 digits are ASCII")
+}
+
+/// The ARN for a plan: `arn:aws:arc-region-switch::<account>:plan/<name>:<suffix>`, as
+/// `PlanArn`'s pattern requires (the Region segment is empty — the plan is global).
+pub fn plan_arn(name: &str, seed: u64) -> String {
+    ::engine::emulator_arn(
+        "arc-region-switch",
+        "",
+        &format!("plan/{name}:{}", plan_arn_suffix(seed)),
+    )
+}
+
+/// The id for an execution: `<region>/<16 hex digits>`, the form `RecoveryExecutionId`'s
+/// pattern gives a prior execution's id, minted from the store's seed.
+pub fn execution_id(region: &str, seed: u64) -> String {
+    format!(
+        "{region}/{:016x}",
+        seed.wrapping_mul(EXECUTION_ID_MULTIPLIER)
+    )
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

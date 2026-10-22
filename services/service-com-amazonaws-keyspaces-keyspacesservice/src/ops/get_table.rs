@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTable`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports one table from [`crate::state`] — exactly what `CreateTable`
+//! stored, plus the status the clock has settled it into. This is the ONLY file to touch
+//! for `GetTable`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The paragraphs below are the scaffold's own notes on how an operation is shaped and
+//! how it reaches state; they still describe this file.
 //!
 //! ## Shape of an operation
 //!
@@ -187,18 +184,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTable"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetTableErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "Amazon Keyspaces could not reach its state store for this request."
+                        .to_string(),
+                ),
+            })
+        })?;
+        let region = crate::state::request_region(ctx);
+
+        let mut store = state.lock();
+        // Reporting, not mutating: `settle` only materialises the status changes the clock
+        // had already made due at this instant, so this report shows what any caller would
+        // have seen now whether or not anybody read the table.
+        store.settle(::std::time::SystemTime::now());
+
+        let Some(keyspace) = store.keyspaces.get(&input.keyspace_name) else {
+            return Err(GetTableErrorModeled::ResourceNotFoundException(
+                crate::state::keyspace_not_found(&region, &input.keyspace_name),
+            )
+            .into());
+        };
+        let Some(table) = keyspace.tables.get(&input.table_name) else {
+            return Err(GetTableErrorModeled::ResourceNotFoundException(
+                crate::state::table_not_found(&region, &input.keyspace_name, &input.table_name),
+            )
+            .into());
+        };
+
+        Ok(GetTableOutput {
+            keyspace_name: table.keyspace_name.clone(),
+            table_name: table.table_name.clone(),
+            resource_arn: table.resource_arn.clone(),
+            creation_timestamp: Some(::aws_smithy_types::DateTime::from(
+                table.creation_timestamp,
+            )),
+            status: Some(table.status.clone()),
+            schema_definition: Some(table.schema_definition.clone()),
+            capacity_specification: Some(CapacitySpecificationSummary {
+                throughput_mode: table.capacity_specification.throughput_mode.clone(),
+                read_capacity_units: table.capacity_specification.read_capacity_units,
+                write_capacity_units: table.capacity_specification.write_capacity_units,
+                // Only an UpdateTable that switches a provisioned table to
+                // PAY_PER_REQUEST sets this; a table created in a mode was never
+                // updated into it.
+                last_update_to_pay_per_request_timestamp: None,
+            }),
+            encryption_specification: Some(table.encryption_specification.clone()),
+            point_in_time_recovery: Some(PointInTimeRecoverySummary {
+                status: table.point_in_time_recovery.status.clone(),
+                // The earliest point a restore can target is when continuous backups
+                // began, which for a table created with PITR enabled is its creation.
+                earliest_restorable_timestamp: (table.point_in_time_recovery.status
+                    == crate::state::POINT_IN_TIME_RECOVERY_ENABLED)
+                    .then(|| ::aws_smithy_types::DateTime::from(table.creation_timestamp)),
+            }),
+            ttl: table.ttl.clone(),
+            default_time_to_live: table.default_time_to_live,
+            comment: table.comment.clone(),
+            client_side_timestamps: table.client_side_timestamps.clone(),
+            // A replica summary, a stream ARN, CDC and warm throughput are reported by
+            // the operations that configure them (UpdateTable, RestoreTable), which are
+            // still scaffolded; a table this slice created has none of them.
+            replica_specifications: None,
+            latest_stream_arn: None,
+            cdc_specification: None,
+            warm_throughput_specification: None,
+        })
     }
 }

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeACLs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeACLs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeACLs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reads the ACLs [`crate::state`] holds, deriving each one's `Clusters`
+//! from the clusters currently referencing it, and pages them with
+//! `MaxResults`/`NextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -146,20 +140,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeACLs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeACLsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeACLs"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in a mounted emulator (the router hands every service the
+            // one shared `InMemoryEngine`); this operation models no server fault, so
+            // the request is refused rather than answered with a canned ACL list.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the MemoryDB store is unreachable on this engine",
+            ));
+        };
+        if input.max_results.is_some_and(|max| max < 1) {
+            // The same refusal `DescribeClusters` makes for a page size below 1; this
+            // operation's model declares no `InvalidParameterValueException`, so the
+            // framework's 400 `ValidationException` carries it.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "MaxResults must be at least 1.",
+            ));
+        }
+        let mut state = state.lock();
+        // The only write a describe makes: the `creating` -> `active` transition the
+        // clock already owed at this instant.
+        state.settle(std::time::Instant::now());
+
+        let entries: Vec<(String, ACL)> = match input.acl_name.as_deref() {
+            Some(name) => {
+                if !state.acls.contains_key(name) {
+                    return Err(DescribeACLsErrorModeled::ACLNotFoundFault(ACLNotFoundFault {
+                        message: Some(format!("ACL {name} not found.")),
+                    })
+                    .into());
+                }
+                let clusters = state.clusters_using_acl(name);
+                let acl = &state.acls[name];
+                vec![(acl.name.clone(), acl.to_api(clusters))]
+            }
+            None => {
+                // ONE pass over the clusters builds every ACL's membership, so
+                // listing N ACLs does not scan the clusters N times.
+                let mut membership = state.acl_membership();
+                state
+                    .acls
+                    .values()
+                    .map(|acl| {
+                        let clusters = membership
+                            .remove(acl.name.as_str())
+                            .unwrap_or_default();
+                        (acl.name.clone(), acl.to_api(clusters))
+                    })
+                    .collect()
+            }
+        };
+
+        let (ac_ls, next_token) = crate::state::paginate(
+            entries,
+            crate::state::page_limit(input.max_results),
+            input.next_token.as_deref(),
+        )
+        .ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(
+                "NextToken does not name a position in this listing.",
+            )
+        })?;
+        Ok(DescribeACLsOutput {
+            ac_ls: Some(ac_ls),
+            next_token,
+        })
     }
 }

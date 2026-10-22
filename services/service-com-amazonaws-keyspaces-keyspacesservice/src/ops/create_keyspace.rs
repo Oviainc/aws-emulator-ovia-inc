@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateKeyspace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateKeyspace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: inserts a keyspace into [`crate::state`] and answers with the ARN it
+//! minted for it. This is the ONLY file to touch for `CreateKeyspace`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateKeyspace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The paragraphs below are the scaffold's own notes on how an operation is shaped and
+//! how it reaches state; they still describe this file.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +160,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateKeyspace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateKeyspaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateKeyspace"))
+        // `keyspaceName`'s length and pattern are modelled, so the boundary validator has
+        // already refused a malformed name with 400 `ValidationException` before this
+        // handler runs. What is left here is what the model cannot state.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateKeyspaceErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "Amazon Keyspaces could not reach its state store for this request."
+                        .to_string(),
+                ),
+            })
+        })?;
+        let region = crate::state::request_region(ctx);
+
+        let (replication_strategy, replication_regions) =
+            crate::state::resolve_replication(input.replication_specification.as_ref(), &region)
+                .map_err(|message| {
+                    CreateKeyspaceErrorModeled::ValidationException(ValidationException {
+                        message: Some(message),
+                    })
+                })?;
+
+        let mut store = state.lock();
+        store.settle(::std::time::SystemTime::now());
+
+        // "keyspace names must be unique within each Region": a create of a name already
+        // taken is the `ConflictException` the model declares for this operation. Checked
+        // BEFORE the cap below (as `create_table` checks its own duplicate first), because
+        // a name that is already taken adds no entry, so the cap is not what refuses it.
+        if store.keyspaces.contains_key(&input.keyspace_name) {
+            return Err(CreateKeyspaceErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Keyspace '{}' already exists in Region '{region}'.",
+                    input.keyspace_name
+                )),
+            })
+            .into());
+        }
+
+        // The store grows by one keyspace per call and lives for the life of the process,
+        // so the growth is capped; past the cap the service answers the quota error it
+        // models rather than accepting another entry.
+        if store.keyspaces.len() >= crate::state::MAX_KEYSPACES {
+            return Err(CreateKeyspaceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "the number of keyspaces would exceed the limit of {}",
+                        crate::state::MAX_KEYSPACES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let resource_arn = crate::state::keyspace_arn(&region, &input.keyspace_name);
+        store.keyspaces.insert(
+            input.keyspace_name.clone(),
+            crate::state::Keyspace {
+                name: input.keyspace_name,
+                resource_arn: resource_arn.clone(),
+                replication_strategy,
+                replication_regions,
+                tags: input.tags.unwrap_or_default(),
+                tables: ::std::collections::BTreeMap::new(),
+            },
+        );
+
+        Ok(CreateKeyspaceOutput { resource_arn })
     }
 }

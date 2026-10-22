@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTable`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: records a table under its keyspace in [`crate::state`] and answers with
+//! the ARN it minted for it. This is the ONLY file to touch for `CreateTable`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Four input members are NOT served here and are refused with a 501 that says so rather
+//! than stored and forgotten: `autoScalingSpecification`, `replicaSpecifications`,
+//! `cdcSpecification` and `warmThroughputSpecification`, each of which is reported by an
+//! operation that is still scaffolded.
+//!
+//! The paragraphs below are the scaffold's own notes on how an operation is shaped and
+//! how it reaches state; they still describe this file.
 //!
 //! ## Shape of an operation
 //!
@@ -227,18 +228,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTable"))
+        // The names, and `schemaDefinition`'s required non-empty `allColumns` /
+        // `partitionKeys`, are modelled, so the boundary validator has already refused a
+        // request that breaks one with 400 `ValidationException`. What is left here is
+        // what the model cannot state.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateTableErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "Amazon Keyspaces could not reach its state store for this request."
+                        .to_string(),
+                ),
+            })
+        })?;
+        let region = crate::state::request_region(ctx);
+
+        // Members this slice cannot serve faithfully yet. Each is reported by an
+        // operation that is still scaffolded — `autoScalingSpecification` by
+        // `GetTableAutoScalingSettings`, the other three by `GetTable`'s replica, CDC and
+        // warm-throughput summaries — so accepting them would mean storing a request and
+        // never answering for it. Answer the honest 501 instead, worded so it is not
+        // counted as "CreateTable is a stub": the operation IS implemented, this part of
+        // its surface is not.
+        let unimplemented: Vec<&str> = [
+            ("autoScalingSpecification", input.auto_scaling_specification.is_some()),
+            ("replicaSpecifications", input.replica_specifications.is_some()),
+            ("cdcSpecification", input.cdc_specification.is_some()),
+            (
+                "warmThroughputSpecification",
+                input.warm_throughput_specification.is_some(),
+            ),
+        ]
+        .iter()
+        .filter(|(_, present)| *present)
+        .map(|(name, _)| *name)
+        .collect();
+        if !unimplemented.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::NotImplemented(
+                crate::scaffolded::NotImplemented {
+                    message: format!(
+                        "CreateTable is implemented in this emulator, but not its {} \
+                         member(s): omit them, or the table would be stored with settings \
+                         no operation here can report.",
+                        unimplemented.join(", ")
+                    ),
+                },
+            ));
+        }
+
+        let invalid = |message: String| -> CreateTableError {
+            CreateTableErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+            .into()
+        };
+        crate::state::validate_schema(&input.schema_definition).map_err(invalid)?;
+        let capacity_specification =
+            crate::state::resolve_capacity(input.capacity_specification).map_err(invalid)?;
+        let encryption_specification =
+            crate::state::resolve_encryption(input.encryption_specification).map_err(invalid)?;
+        let point_in_time_recovery = input.point_in_time_recovery.unwrap_or(PointInTimeRecovery {
+            status: crate::state::DEFAULT_POINT_IN_TIME_RECOVERY_STATUS.to_string(),
+        });
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        let Some(keyspace) = store.keyspaces.get_mut(&input.keyspace_name) else {
+            return Err(CreateTableErrorModeled::ResourceNotFoundException(
+                crate::state::keyspace_not_found(&region, &input.keyspace_name),
+            )
+            .into());
+        };
+
+        // "Within a keyspace, table names must be unique."
+        if keyspace.tables.contains_key(&input.table_name) {
+            return Err(CreateTableErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Table '{}.{}' already exists.",
+                    input.keyspace_name, input.table_name
+                )),
+            })
+            .into());
+        }
+
+        // The store grows by one table per call and lives for the life of the process, so
+        // the growth is capped; past the cap the service answers the quota error it models
+        // rather than accepting another entry.
+        if keyspace.tables.len() >= crate::state::MAX_TABLES_PER_KEYSPACE {
+            return Err(CreateTableErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "the number of tables in keyspace '{}' would exceed the limit of {}",
+                        input.keyspace_name,
+                        crate::state::MAX_TABLES_PER_KEYSPACE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let resource_arn =
+            crate::state::table_arn(&region, &input.keyspace_name, &input.table_name);
+        let settles_at = now + crate::state::TRANSIENT_STATUS_SPAN;
+        keyspace.tables.insert(
+            input.table_name.clone(),
+            crate::state::Table {
+                keyspace_name: input.keyspace_name,
+                table_name: input.table_name,
+                resource_arn: resource_arn.clone(),
+                creation_timestamp: now,
+                // "CreateTable is an asynchronous operation. When the request is received,
+                // the status of the table is set to CREATING. ... You can start using a
+                // table when the status is ACTIVE." The clock owes the ACTIVE transition
+                // one span from now; `settle` materialises it, and nothing sleeps for it.
+                status: crate::state::TABLE_STATUS_CREATING.to_string(),
+                status_due_at: Some(settles_at),
+                schema_definition: input.schema_definition,
+                capacity_specification,
+                encryption_specification,
+                point_in_time_recovery,
+                ttl: input.ttl,
+                default_time_to_live: input.default_time_to_live,
+                comment: input.comment,
+                client_side_timestamps: input.client_side_timestamps,
+                tags: input.tags.unwrap_or_default(),
+            },
+        );
+        // The clock now owes this table its ACTIVE transition; tell the store the earliest
+        // instant at which `settle` has to look at the tables again.
+        store.note_transition_due(settles_at);
+
+        Ok(CreateTableOutput { resource_arn })
     }
 }

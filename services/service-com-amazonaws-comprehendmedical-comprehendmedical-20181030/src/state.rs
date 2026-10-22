@@ -1,11 +1,299 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-comprehendmedical-comprehendmedical-20181030 service.
+//!
+//! The asynchronous detection/inference operations of Amazon Comprehend Medical all
+//! share one record shape ([`AsyncJob`]) and one status machine ([`JobStatus`]), so both
+//! live here rather than in any one operation's file: the entities-detection family is
+//! implemented today and the ICD-10-CM / RxNorm / SNOMED CT / PHI families reuse these
+//! structures when they are implemented.
+
+use std::collections::{BTreeMap, HashMap};
+
+use ::aws_smithy_types::DateTime;
+
+use crate::ops::types::{
+    ComprehendMedicalAsyncJobProperties, InputDataConfig, OutputDataConfig,
+};
+
+/// The version this emulator reports for the model behind an entities-detection job.
+/// The model documents the shape of the value ("The version number looks like X.X.X"),
+/// not a particular version, so one constant is the single source for every job record.
+pub const ENTITIES_MODEL_VERSION: &str = "2.0.0";
+
+/// How long after `StartEntitiesDetectionV2Job` a job leaves `SUBMITTED`.
+///
+/// A started job is reported in a non-terminal status, so the move out of it is a
+/// transition the clock owes rather than something a caller triggers. The span is
+/// deliberately non-zero: a caller that describes or stops the job straight after
+/// starting it still observes `SUBMITTED`.
+pub const JOB_SUBMITTED_SPAN_SECS: f64 = 0.3;
+
+/// How long a job stays `IN_PROGRESS` before the clock owes its terminal status.
+pub const JOB_RUNNING_SPAN_SECS: f64 = 0.3;
+
+/// How long after `StopEntitiesDetectionV2Job` a job leaves `STOP_REQUESTED` for
+/// `STOPPED`. Non-zero for the same reason as [`JOB_SUBMITTED_SPAN_SECS`]: a caller
+/// that describes the job straight after asking for the stop sees `STOP_REQUESTED`.
+pub const JOB_STOPPING_SPAN_SECS: f64 = 0.3;
+
+/// How long job metadata is kept before it is dropped, which is what the modelled
+/// `ExpirationTime` reports: "The date and time that job metadata is deleted from the
+/// server. […] After the metadata is deleted, the job will no longer appear in the
+/// results of the `ListEntitiesDetectionV2Job` […] operation." AWS publishes no value
+/// for the span itself, so this one is the emulator's own choice.
+pub const JOB_METADATA_RETENTION_SECS: f64 = 90.0 * 24.0 * 60.0 * 60.0;
+
+/// The status of an asynchronous job, as the model's `JobStatus` enum defines it.
+///
+/// The wire spellings in [`JobStatus::as_wire`] are exactly the members of
+/// `JOB_STATUS_VALUES` (`crate::ops::types::JOB_STATUS_VALUES`, generated from the
+/// model's `JobStatus` enum).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobStatus {
+    Submitted,
+    InProgress,
+    Completed,
+    PartialSuccess,
+    Failed,
+    StopRequested,
+    Stopped,
+}
+
+impl JobStatus {
+    /// This status as the model spells it on the wire.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Submitted => "SUBMITTED",
+            Self::InProgress => "IN_PROGRESS",
+            Self::Completed => "COMPLETED",
+            Self::PartialSuccess => "PARTIAL_SUCCESS",
+            Self::Failed => "FAILED",
+            Self::StopRequested => "STOP_REQUESTED",
+            Self::Stopped => "STOPPED",
+        }
+    }
+
+    /// The status a wire value names, or `None` when it names none.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        [
+            Self::Submitted,
+            Self::InProgress,
+            Self::Completed,
+            Self::PartialSuccess,
+            Self::Failed,
+            Self::StopRequested,
+            Self::Stopped,
+        ]
+        .into_iter()
+        .find(|status| status.as_wire() == value)
+    }
+
+    /// Whether the job has finished: a terminal status never changes again, so a
+    /// stop request against it is a no-op.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::PartialSuccess | Self::Failed | Self::Stopped
+        )
+    }
+}
+
+/// Wall-clock now, in epoch seconds — the clock every job time is measured on.
+pub fn now_epoch_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since_epoch| since_epoch.as_secs_f64())
+        .unwrap_or_default()
+}
+
+/// A stored timestamp as epoch seconds, for comparing it with [`now_epoch_secs`] and
+/// with a filter's bound.
+pub fn epoch_secs(at: &DateTime) -> f64 {
+    at.as_secs_f64()
+}
+
+/// Epoch seconds as the modelled timestamp type.
+pub fn date_time(epoch_secs: f64) -> DateTime {
+    DateTime::from_secs_f64(epoch_secs)
+}
+
+/// One asynchronous job, holding exactly what the start call was given plus the status
+/// the clock has moved it to.
+#[derive(Debug, Clone)]
+pub struct AsyncJob {
+    pub job_id: String,
+    pub job_name: Option<String>,
+    pub job_status: JobStatus,
+    pub message: Option<String>,
+    pub submit_time: DateTime,
+    pub end_time: Option<DateTime>,
+    pub expiration_time: Option<DateTime>,
+    pub input_data_config: InputDataConfig,
+    pub output_data_config: OutputDataConfig,
+    pub language_code: String,
+    pub data_access_role_arn: String,
+    pub manifest_file_path: Option<String>,
+    pub kms_key: Option<String>,
+    pub model_version: String,
+    pub client_request_token: Option<String>,
+    /// When a caller asked for the stop, which is what the move to `STOPPED` is due
+    /// from. `None` until a stop is requested.
+    pub stop_requested_time: Option<DateTime>,
+}
+
+impl AsyncJob {
+    /// Materialise every status change the clock already owes at `now`.
+    ///
+    /// This is called by the reporting operations (describe, list) and before a stop
+    /// request is applied: each transition was due at a fixed instant whether or not
+    /// anybody called, so applying it on read changes nothing a later caller would
+    /// otherwise have seen.
+    ///
+    /// The terminal status of a started job is `FAILED`: running the job means reading
+    /// the input documents from the Amazon S3 location the caller named and writing
+    /// analysed output back, and this emulator serves no object storage for batch jobs,
+    /// so no document is ever read and no output is ever written. The job therefore ends
+    /// in the modelled failure state with a `Message` that says exactly that, rather
+    /// than reporting a `COMPLETED` run that nothing performed.
+    pub fn advance(&mut self, now: f64) {
+        let submitted_at = epoch_secs(&self.submit_time);
+
+        if self.job_status == JobStatus::Submitted && now >= submitted_at + JOB_SUBMITTED_SPAN_SECS
+        {
+            self.job_status = JobStatus::InProgress;
+        }
+
+        if self.job_status == JobStatus::InProgress {
+            let due = submitted_at + JOB_SUBMITTED_SPAN_SECS + JOB_RUNNING_SPAN_SECS;
+            if now >= due {
+                self.job_status = JobStatus::Failed;
+                self.end_time = Some(date_time(due));
+                self.message = Some(self.unreadable_input_message());
+            }
+        }
+
+        if self.job_status == JobStatus::StopRequested {
+            if let Some(requested_at) = self.stop_requested_time.as_ref().map(epoch_secs) {
+                let due = requested_at + JOB_STOPPING_SPAN_SECS;
+                if now >= due {
+                    self.job_status = JobStatus::Stopped;
+                    self.end_time = Some(date_time(due));
+                }
+            }
+        }
+    }
+
+    /// Record that a caller asked for this job to stop. A job already in a terminal
+    /// status is left alone — it finished before the stop could take effect.
+    pub fn request_stop(&mut self, now: f64) {
+        if self.job_status.is_terminal() || self.job_status == JobStatus::StopRequested {
+            return;
+        }
+        self.job_status = JobStatus::StopRequested;
+        self.stop_requested_time = Some(date_time(now));
+        self.message = Some("The job was stopped at the request of the caller.".to_string());
+    }
+
+    /// Whether this job's metadata has been kept past its `ExpirationTime`.
+    pub fn is_expired(&self, now: f64) -> bool {
+        self.expiration_time
+            .as_ref()
+            .is_some_and(|at| now >= epoch_secs(at))
+    }
+
+    /// This job as the modelled `ComprehendMedicalAsyncJobProperties`, which is what
+    /// both describe and list report.
+    pub fn to_properties(&self) -> ComprehendMedicalAsyncJobProperties {
+        ComprehendMedicalAsyncJobProperties {
+            job_id: Some(self.job_id.clone()),
+            job_name: self.job_name.clone(),
+            job_status: Some(self.job_status.as_wire().to_string()),
+            message: self.message.clone(),
+            submit_time: Some(self.submit_time),
+            end_time: self.end_time,
+            expiration_time: self.expiration_time,
+            input_data_config: Some(self.input_data_config.clone()),
+            output_data_config: Some(self.output_data_config.clone()),
+            language_code: Some(self.language_code.clone()),
+            data_access_role_arn: Some(self.data_access_role_arn.clone()),
+            manifest_file_path: self.manifest_file_path.clone(),
+            kms_key: self.kms_key.clone(),
+            model_version: Some(self.model_version.clone()),
+        }
+    }
+
+    /// Why a started job fails: the input it was pointed at was never read.
+    fn unreadable_input_message(&self) -> String {
+        let input_key = self.input_data_config.s3_key.as_deref().unwrap_or("");
+        let output_key = self.output_data_config.s3_key.as_deref().unwrap_or("");
+        format!(
+            "Could not read the input documents from s3://{}/{}: this emulator does not serve \
+             object storage for asynchronous batch jobs, so no document was analyzed and no \
+             output was written to s3://{}/{}.",
+            self.input_data_config.s3_bucket,
+            input_key,
+            self.output_data_config.s3_bucket,
+            output_key,
+        )
+    }
+}
 
 /// Per-service state for com-amazonaws-comprehendmedical-comprehendmedical-20181030. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsComprehendmedicalComprehendmedical20181030State {
-    // TODO: add service-specific state fields
+    /// The entities-detection (V2) jobs, keyed by `JobId`. A minted id begins with the
+    /// submit time (see [`Self::mint_job_id`]), so the map's key order IS submit order,
+    /// which is the order `ListEntitiesDetectionV2Jobs` pages through.
+    pub entities_detection_v2_jobs: BTreeMap<String, AsyncJob>,
+    /// `ClientRequestToken` -> the `JobId` it created, so repeating a start call with
+    /// one token returns the first job instead of creating a second.
+    pub idempotency_tokens: HashMap<String, String>,
+    /// Distinguishes two jobs minted within the same microsecond.
+    pub next_job_seq: u64,
+}
+
+impl ComAmazonawsComprehendmedicalComprehendmedical20181030State {
+    /// A fresh `JobId`: 32 lowercase hex characters, within the modelled length
+    /// (1..32) and pattern. The leading 16 characters are the submit time in
+    /// microseconds and the trailing 16 a sequence number, so ids sort in submit order
+    /// and two jobs started in the same microsecond still differ.
+    ///
+    /// The time prefix is clamped into the cast's own domain rather than left to a
+    /// saturating `as` conversion: a clock that answered a non-finite or negative value
+    /// would otherwise land every id on prefix 0 and break the key-order-is-submit-order
+    /// invariant pagination reads. Uniqueness does not depend on the clock — the
+    /// sequence number carries it — so the clamp degrades ordering, never identity.
+    pub fn mint_job_id(&mut self, now: f64) -> String {
+        let seq = self.next_job_seq;
+        self.next_job_seq = self.next_job_seq.wrapping_add(1);
+        /// The largest microsecond prefix the 16 hex characters hold.
+        const MAX_MICROS: f64 = u64::MAX as f64;
+        let micros = if now.is_finite() {
+            (now * 1_000_000.0).clamp(0.0, MAX_MICROS) as u64
+        } else {
+            0
+        };
+        format!("{micros:016x}{seq:016x}")
+    }
+
+    /// Drop the jobs whose metadata has been kept past its `ExpirationTime`, which the
+    /// model says stops them appearing in a list, along with the request tokens that
+    /// named them. Expiry is due at an instant fixed when the job was created, so
+    /// materialising it on a read is not a mutation.
+    pub fn expire_jobs(&mut self, now: f64) {
+        let dropped_tokens: Vec<String> = self
+            .entities_detection_v2_jobs
+            .values()
+            .filter(|job| job.is_expired(now))
+            .filter_map(|job| job.client_request_token.clone())
+            .collect();
+        for token in dropped_tokens {
+            self.idempotency_tokens.remove(&token);
+        }
+        self.entities_detection_v2_jobs
+            .retain(|_, job| !job.is_expired(now));
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

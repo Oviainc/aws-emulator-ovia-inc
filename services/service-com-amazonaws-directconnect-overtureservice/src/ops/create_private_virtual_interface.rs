@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePrivateVirtualInterface
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePrivateVirtualInterface`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePrivateVirtualInterface::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -237,18 +228,273 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePrivateVirtualInterface` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePrivateVirtualInterfaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePrivateVirtualInterface"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreatePrivateVirtualInterfaceErrorModeled::DirectConnectServerException(
+                    DirectConnectServerException {
+                        message: Some(
+                            "the Direct Connect store is unavailable on this engine".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let requested = input.new_private_virtual_interface;
+        let client_error = |message: String| -> Self::Error {
+            CreatePrivateVirtualInterfaceErrorModeled::DirectConnectClientException(
+                DirectConnectClientException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        };
+
+        let tags = requested.tags.unwrap_or_default();
+        // The tag-count ceiling is checked FIRST, so it bounds the per-tag work
+        // every later check does on a caller-chosen list length.
+        if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(CreatePrivateVirtualInterfaceErrorModeled::TooManyTagsException(
+                TooManyTagsException {
+                    message: Some(format!(
+                        "{} tags were supplied; a Direct Connect resource accepts at most {}",
+                        tags.len(),
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    )),
+                },
+            )
+            .into());
+        }
+        if let Some(duplicate) = crate::state::first_duplicate_tag_key(&tags) {
+            return Err(
+                CreatePrivateVirtualInterfaceErrorModeled::DuplicateTagKeysException(
+                    DuplicateTagKeysException {
+                        message: Some(format!("Tag key {duplicate} was specified more than once")),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        if !crate::state::virtual_interface_name_is_valid(&requested.virtual_interface_name) {
+            return Err(client_error(format!(
+                "virtualInterfaceName {} is not valid: use at most {} of the characters a-z, 0-9 and a hyphen (-)",
+                requested.virtual_interface_name,
+                crate::state::MAX_VIRTUAL_INTERFACE_NAME_LEN
+            )));
+        }
+
+        // The MTU `NewPrivateVirtualInterface$mtu` documents: "The supported
+        // values are 1500 and 8500. The default value is 1500."
+        let mtu = requested.mtu.unwrap_or(crate::state::DEFAULT_VIRTUAL_INTERFACE_MTU);
+        if !crate::state::SUPPORTED_VIRTUAL_INTERFACE_MTUS.contains(&mtu) {
+            return Err(client_error(format!(
+                "mtu {mtu} is not supported; the supported values are {:?}",
+                crate::state::SUPPORTED_VIRTUAL_INTERFACE_MTUS
+            )));
+        }
+
+        // `asnLong` wins when both are given: "If you provide a value in the same
+        // API call for both asn and asnLong, the API will only accept the value
+        // for asnLong." A 4-byte `asnLong` is reported back as `0` in the legacy
+        // `asn` member; a 2-byte ASN is reported in both.
+        let (asn, asn_long) = match requested.asn_long {
+            Some(asn_long) => {
+                if !(1..=crate::state::MAX_ASN_LONG).contains(&asn_long) {
+                    return Err(client_error(format!(
+                        "asnLong {asn_long} is not valid; the valid range is from 1 to {}",
+                        crate::state::MAX_ASN_LONG
+                    )));
+                }
+                (
+                    // "When using a 4-byte asnLong, the API response returns 0
+                    // for the legacy asn attribute since 4-byte ASN values
+                    // exceed the maximum supported value of 2,147,483,647."
+                    if asn_long <= crate::state::MAX_LEGACY_ASN {
+                        i32::try_from(asn_long).unwrap_or(0)
+                    } else {
+                        0
+                    },
+                    Some(asn_long),
+                )
+            }
+            None => {
+                let asn = i64::from(requested.asn);
+                if !(1..=crate::state::MAX_ASN).contains(&asn) {
+                    return Err(client_error(format!(
+                        "asn {asn} is not valid; the valid values are 1-{}",
+                        crate::state::MAX_ASN
+                    )));
+                }
+                (requested.asn, Some(asn))
+            }
+        };
+
+        // A private virtual interface terminates on exactly one gateway.
+        match (
+            &requested.virtual_gateway_id,
+            &requested.direct_connect_gateway_id,
+        ) {
+            (Some(_), Some(_)) => {
+                return Err(client_error(
+                    "specify either virtualGatewayId or directConnectGatewayId, not both"
+                        .to_string(),
+                ))
+            }
+            (None, None) => {
+                return Err(client_error(
+                    "specify either virtualGatewayId or directConnectGatewayId".to_string(),
+                ))
+            }
+            // A Direct Connect gateway is this service's own resource, so an id
+            // naming none in this store names nothing at all
+            // (`CreateDirectConnectGateway` is still scaffolded). A virtual
+            // private gateway belongs to Amazon EC2, so its id is carried as the
+            // caller supplied it.
+            (None, Some(gateway_id)) => {
+                return Err(client_error(format!(
+                    "Direct Connect gateway ID {gateway_id} does not exist"
+                )))
+            }
+            (Some(_), None) => {}
+        }
+
+        let mut store = state.lock();
+        store.settle_due_transitions();
+
+        // The emulator's own memory ceiling for this store (not an AWS quota):
+        // reclaim what the clock has already torn down, then refuse with the
+        // modelled limit error rather than grow past the ceiling.
+        if !crate::state::ComAmazonawsDirectconnectOvertureserviceState::has_room(
+            store.virtual_interfaces.len(),
+        ) {
+            store.reclaim_deleted();
+        }
+        if !crate::state::ComAmazonawsDirectconnectOvertureserviceState::has_room(
+            store.virtual_interfaces.len(),
+        ) {
+            return Err(
+                CreatePrivateVirtualInterfaceErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "this emulator holds at most {} virtual interfaces; delete one before creating another",
+                            crate::state::MAX_RECORDS_PER_STORE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let Some(connection) = store.connections.get(&input.connection_id) else {
+            return Err(client_error(format!(
+                "Connection ID {} does not exist",
+                input.connection_id
+            )));
+        };
+        if connection.connection_state == "deleting" || connection.connection_state == "deleted" {
+            return Err(client_error(format!(
+                "Connection ID {} is {} and cannot host a virtual interface",
+                input.connection_id, connection.connection_state
+            )));
+        }
+        if mtu > crate::state::DEFAULT_VIRTUAL_INTERFACE_MTU && !connection.jumbo_frame_capable {
+            return Err(client_error(format!(
+                "Connection ID {} does not support jumbo frames, so mtu {mtu} cannot be used",
+                input.connection_id
+            )));
+        }
+        let (connection_id, location, region, aws_device_v2, aws_logical_device_id, jumbo) = (
+            connection.connection_id.clone(),
+            connection.location.clone(),
+            connection.region.clone(),
+            connection.aws_device_v2.clone(),
+            connection.aws_logical_device_id.clone(),
+            connection.jumbo_frame_capable,
+        );
+
+        // The VLAN is the 802.1Q tag that separates virtual interfaces on one
+        // port, so two live interfaces on a connection cannot share it.
+        let vlan_clash = store
+            .interfaces_of(&connection_id)
+            .into_iter()
+            .find(|interface| {
+                interface.vlan == requested.vlan && interface.virtual_interface_state != "deleted"
+            })
+            .map(|interface| interface.virtual_interface_id.clone());
+        if let Some(clash) = vlan_clash {
+            return Err(client_error(format!(
+                "VLAN {} is already in use on connection {connection_id} by virtual interface {clash}",
+                requested.vlan
+            )));
+        }
+
+        let address_family = requested.address_family.unwrap_or_else(|| "ipv4".to_string());
+        let virtual_interface_id = store.next_id("dxvif");
+        // AWS assigns the peering addresses when the caller supplies none; the
+        // IPv4 pair comes from the 169.254.0.0/16 link-local range.
+        let (amazon_address, customer_address) = match (
+            requested.amazon_address,
+            requested.customer_address,
+            address_family.as_str(),
+        ) {
+            (Some(amazon), Some(customer), _) => (Some(amazon), Some(customer)),
+            (amazon, customer, "ipv4") => {
+                let (default_amazon, default_customer) =
+                    crate::state::link_local_peering_addresses(store.id_counter);
+                (
+                    Some(amazon.unwrap_or(default_amazon)),
+                    Some(customer.unwrap_or(default_customer)),
+                )
+            }
+            (amazon, customer, _) => (amazon, customer),
+        };
+
+        let interface = crate::state::VirtualInterface {
+            virtual_interface_id: virtual_interface_id.clone(),
+            connection_id,
+            owner_account: ::engine::emulator_account_id().to_string(),
+            virtual_interface_name: requested.virtual_interface_name,
+            virtual_interface_type: "private".to_string(),
+            // "pending: A virtual interface is in this state from the time that
+            // it is created until the virtual interface is ready to forward
+            // traffic." Readiness is what the clock owes here.
+            virtual_interface_state: "pending".to_string(),
+            vlan: requested.vlan,
+            asn,
+            asn_long,
+            amazon_side_asn: None,
+            auth_key: requested.auth_key,
+            amazon_address,
+            customer_address,
+            address_family,
+            mtu,
+            jumbo_frame_capable: jumbo,
+            virtual_gateway_id: requested.virtual_gateway_id,
+            direct_connect_gateway_id: None,
+            // Route filter prefixes are advertised on a PUBLIC virtual interface;
+            // a private one carries none. BGP peers are minted by `CreateBgpPeer`,
+            // which is still scaffolded, so none exists yet.
+            route_filter_prefixes: Vec::new(),
+            bgp_peers: Vec::new(),
+            location,
+            region,
+            aws_device_v2,
+            aws_logical_device_id,
+            site_link_enabled: requested.enable_site_link.unwrap_or(false),
+            tags,
+            due: Some(crate::state::DueTransition {
+                at: std::time::Instant::now() + crate::state::TRANSITION_DELAY,
+                to: "available".to_string(),
+            }),
+        };
+
+        let output = crate::virtual_interface_output!(CreatePrivateVirtualInterfaceOutput, &interface);
+        store
+            .virtual_interfaces
+            .insert(virtual_interface_id, interface);
+        Ok(output)
     }
 }
