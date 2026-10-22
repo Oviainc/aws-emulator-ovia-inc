@@ -2170,9 +2170,10 @@ impl ComAmazonawsSagemakerSagemakerState {
 }
 
 // ---------------------------------------------------------------------------
-// The AI-benchmarking workload-configuration slice: `CreateAIWorkloadConfig` and
-// `DescribeAIWorkloadConfig`. Kept together at the end of this module, rather than
-// spread through the blocks above, so this one resource kind reads as one slice.
+// The AI-benchmarking workload-configuration slice: `CreateAIWorkloadConfig`,
+// `DescribeAIWorkloadConfig` and the `DeleteAIWorkloadConfig` that releases the record.
+// Kept together at the end of this module, rather than spread through the blocks above,
+// so this one resource kind reads as one slice.
 // ---------------------------------------------------------------------------
 
 /// The ARN resource kind an AI workload configuration carries, i.e. the `<kind>` in
@@ -2184,6 +2185,13 @@ pub const AI_WORKLOAD_CONFIG_KIND: &str = "ai-workload-config";
 /// See [`MODEL_QUOTA`]. Bounds the AI workload configuration store the same way, and is
 /// what `CreateAIWorkloadConfig` answers `ResourceLimitExceeded` past.
 pub const AI_WORKLOAD_CONFIG_QUOTA: usize = 1_000;
+
+/// Why a reader or the delete could not resolve an AI workload configuration, named once
+/// here so `DescribeAIWorkloadConfig` and `DeleteAIWorkloadConfig` refuse an unknown name
+/// with the same sentence, naming the ARN they could not resolve.
+pub fn ai_workload_config_not_found(arn: &str) -> String {
+    format!("Could not find AI workload config \"{arn}\".")
+}
 
 /// An AI workload configuration created by `CreateAIWorkloadConfig`, as
 /// `DescribeAIWorkloadConfig` replays it.

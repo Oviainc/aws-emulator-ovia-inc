@@ -161,7 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
             return Err(DescribeAIWorkloadConfigErrorModeled::ResourceNotFound(
                 ResourceNotFound {
-                    message: Some(format!("Could not find AI workload config \"{arn}\".")),
+                    message: Some(crate::state::ai_workload_config_not_found(&arn)),
                 },
             )
             .into());

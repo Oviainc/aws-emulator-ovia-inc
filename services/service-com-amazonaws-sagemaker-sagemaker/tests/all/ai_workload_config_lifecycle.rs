@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end wire tests for SageMaker's AI workload configuration slice:
-//! `CreateAIWorkloadConfig` and the `DescribeAIWorkloadConfig` that replays it.
+//! `CreateAIWorkloadConfig`, the `DescribeAIWorkloadConfig` that replays it and the
+//! `DeleteAIWorkloadConfig` that releases it.
 //!
 //! Every case goes over the wire (`POST /` with `X-Amz-Target: SageMaker.<Op>`,
 //! `awsJson1_1`) through the same `MultiServiceRouter` the production router uses, so
@@ -10,8 +11,10 @@
 //! The tests assert RULES over a TABLE of inputs rather than one recorded call: the ARN
 //! form for every region and name shape; the create/describe round trip for every
 //! combination of the optional members (dataset channels, inline workload spec, tags);
-//! the refusal of a name already in use; and the refusal of a read of a name that was
-//! never created.
+//! the refusal of a name already in use; the refusal of a read of a name that was never
+//! created; and, for the delete, that it answers the stored ARN, makes the name unreadable
+//! and reusable, touches no other configuration, and is refused as not found whenever the
+//! name names nothing — including a second delete of a name it just released.
 
 use std::sync::Arc;
 
@@ -579,6 +582,301 @@ async fn distinct_names_are_distinct_resources() {
                 row.case,
                 described.get(member)
             );
+        }
+    }
+}
+
+/// RULE: a delete releases the stored configuration and answers the ARN that
+/// configuration carried, so afterwards the name reads back as not found and is free for
+/// a new create — whatever members the released configuration held and whichever Region
+/// the caller signed for.
+#[tokio::test]
+async fn delete_releases_the_config_and_answers_its_stored_arn() {
+    // Rows differ along the axes the rule generalises over: the members the released
+    // configuration carried (the round-trip table), the Region the ARN was minted in, and
+    // the name's shape (both published bounds of `AIEntityName`'s `len 1..63`, from
+    // smithy_query shape=AIEntityName).
+    let regions = ["us-east-1", "eu-west-1", "ap-southeast-2"];
+    let names = [
+        "a",
+        "wlc-to-delete",
+        "a234567890123456789012345678901234567890123456789012345678901b",
+    ];
+
+    for row in round_trip_rows() {
+        for (index, region) in regions.iter().enumerate() {
+            let name = names[index % names.len()];
+            let emulator = Emulator::new();
+            let case = format!("{} region={region} name={name}", row.case);
+
+            let (status, created) = emulator
+                .call_in(region, "CreateAIWorkloadConfig", &create_body(name, &row.members))
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the create to answer 200, got {status} with {created:?}"
+            );
+            let arn = str_field(&created, "AIWorkloadConfigArn");
+
+            let (status, deleted) = emulator
+                .call_in(
+                    region,
+                    "DeleteAIWorkloadConfig",
+                    &json!({ "AIWorkloadConfigName": name }),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected DeleteAIWorkloadConfig to answer 200, got {status} \
+                 with {deleted:?}"
+            );
+            assert_eq!(
+                str_field(&deleted, "AIWorkloadConfigArn"),
+                arn,
+                "case {case:?}: expected the delete to answer the ARN the create minted \
+                 ({arn}), got {deleted:?}"
+            );
+
+            // The record is gone: the read that replayed it is now refused.
+            let (status, read_back) = emulator
+                .call_in(
+                    region,
+                    "DescribeAIWorkloadConfig",
+                    &json!({ "AIWorkloadConfigName": name }),
+                )
+                .await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected a read after the delete to answer 400, got {status} \
+                 with {read_back:?}"
+            );
+            assert_eq!(
+                error_code(&read_back),
+                "ResourceNotFound",
+                "case {case:?}: expected the modelled ResourceNotFound code after the delete, \
+                 got {read_back:?}"
+            );
+
+            // And the name is free again: a new create under it is accepted (no
+            // `ResourceInUse`) and reads back with its OWN members, not the released ones.
+            let remade = json!({
+                "AIWorkloadConfigName": name,
+                "AIWorkloadConfigs": { "WorkloadSpec": { "Inline": "concurrency: 7\n" } },
+            });
+            let (status, recreated) = emulator
+                .call_in(region, "CreateAIWorkloadConfig", &remade)
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the name to be reusable after the delete, got {status} \
+                 with {recreated:?}"
+            );
+            assert_eq!(
+                str_field(&recreated, "AIWorkloadConfigArn"),
+                arn,
+                "case {case:?}: expected the re-created configuration to carry the same ARN \
+                 form, got {recreated:?}"
+            );
+            let (status, described) = emulator
+                .call_in(
+                    region,
+                    "DescribeAIWorkloadConfig",
+                    &json!({ "AIWorkloadConfigName": name }),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the re-created configuration to read back, got {status} \
+                 with {described:?}"
+            );
+            assert_eq!(
+                described.get("AIWorkloadConfigs"),
+                remade.get("AIWorkloadConfigs"),
+                "case {case:?}: expected the re-created configuration's own members, got {:?}",
+                described.get("AIWorkloadConfigs")
+            );
+            assert_eq!(
+                described.get("DatasetConfig"),
+                None,
+                "case {case:?}: expected no member of the released configuration to survive, \
+                 got {:?}",
+                described.get("DatasetConfig")
+            );
+        }
+    }
+}
+
+/// RULE: a delete naming a configuration that does not exist is refused with
+/// `ResourceNotFound` — it is not idempotent, so a second delete of a name it just
+/// released is refused too — and the refusal releases nothing else.
+#[tokio::test]
+async fn deleting_a_name_that_names_nothing_is_refused() {
+    let emulator = Emulator::new();
+    for name in ["present", "keeper"] {
+        let (status, created) = emulator
+            .call(
+                "CreateAIWorkloadConfig",
+                &json!({ "AIWorkloadConfigName": name }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case setup name={name:?}: expected the create to answer 200, got {status} \
+             with {created:?}"
+        );
+    }
+
+    // Rows differ along the ways a name can name nothing: never created, a prefix of one
+    // that was, a suffix, a case variant (names are matched exactly), and an extended one.
+    for name in ["absent", "pres", "resent", "PRESENT", "present1"] {
+        let (status, body) = emulator
+            .call(
+                "DeleteAIWorkloadConfig",
+                &json!({ "AIWorkloadConfigName": name }),
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "case name={name:?}: expected HTTP 400 for a delete of a name that was never \
+             created, got {status} with {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFound",
+            "case name={name:?}: expected the modelled ResourceNotFound code, got {body:?}"
+        );
+    }
+
+    // The first delete of an existing name succeeds; the SECOND is refused, because the
+    // name no longer names a configuration.
+    let (status, deleted) = emulator
+        .call(
+            "DeleteAIWorkloadConfig",
+            &json!({ "AIWorkloadConfigName": "present" }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case name=\"present\" first delete: expected 200, got {status} with {deleted:?}"
+    );
+    let (status, again) = emulator
+        .call(
+            "DeleteAIWorkloadConfig",
+            &json!({ "AIWorkloadConfigName": "present" }),
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "case name=\"present\" second delete: expected HTTP 400, got {status} with {again:?}"
+    );
+    assert_eq!(
+        error_code(&again),
+        "ResourceNotFound",
+        "case name=\"present\" second delete: expected the modelled ResourceNotFound code, \
+         got {again:?}"
+    );
+
+    // Every refusal above left the other configuration alone.
+    let (status, keeper) = emulator
+        .call(
+            "DescribeAIWorkloadConfig",
+            &json!({ "AIWorkloadConfigName": "keeper" }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case name=\"keeper\": expected the untouched configuration to still read back, \
+         got {status} with {keeper:?}"
+    );
+}
+
+/// RULE: a delete releases exactly the configuration it names — every other name keeps
+/// its own record, with its own ARN and its own members.
+#[tokio::test]
+async fn delete_releases_only_the_configuration_it_names() {
+    let emulator = Emulator::new();
+    let rows = round_trip_rows();
+
+    for (index, row) in rows.iter().enumerate() {
+        let name = format!("wlc{index}");
+        let (status, created) = emulator
+            .call("CreateAIWorkloadConfig", &create_body(&name, &row.members))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: expected create {name} to answer 200, got {status} with {created:?}",
+            row.case
+        );
+    }
+
+    // Delete each configuration in turn; after each one, every name not yet deleted still
+    // reads back with its own ARN and members, and every name already deleted is refused.
+    for (deleted_index, row) in rows.iter().enumerate() {
+        let target = format!("wlc{deleted_index}");
+        let (status, deleted) = emulator
+            .call(
+                "DeleteAIWorkloadConfig",
+                &json!({ "AIWorkloadConfigName": target }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: expected delete {target} to answer 200, got {status} with {deleted:?}",
+            row.case
+        );
+        assert_eq!(
+            str_field(&deleted, "AIWorkloadConfigArn"),
+            format!("arn:aws:sagemaker:us-east-1:{ACCOUNT}:ai-workload-config/{target}"),
+            "case {:?}: expected delete {target} to answer {target}'s own ARN, got {deleted:?}",
+            row.case
+        );
+
+        for (index, other) in rows.iter().enumerate() {
+            let name = format!("wlc{index}");
+            let (status, body) = emulator
+                .call(
+                    "DescribeAIWorkloadConfig",
+                    &json!({ "AIWorkloadConfigName": name }),
+                )
+                .await;
+            if index <= deleted_index {
+                assert_eq!(
+                    status, 400,
+                    "case {:?}: expected the deleted {name} to be refused, got {status} \
+                     with {body:?}",
+                    other.case
+                );
+                assert_eq!(
+                    error_code(&body),
+                    "ResourceNotFound",
+                    "case {:?}: expected ResourceNotFound for the deleted {name}, got {body:?}",
+                    other.case
+                );
+            } else {
+                assert_eq!(
+                    status, 200,
+                    "case {:?}: expected the surviving {name} to read back, got {status} \
+                     with {body:?}",
+                    other.case
+                );
+                assert_eq!(
+                    str_field(&body, "AIWorkloadConfigArn"),
+                    format!("arn:aws:sagemaker:us-east-1:{ACCOUNT}:ai-workload-config/{name}"),
+                    "case {:?}: expected {name}'s own ARN, got {body:?}",
+                    other.case
+                );
+                let expected = create_body(&name, &other.members);
+                for member in ["DatasetConfig", "AIWorkloadConfigs"] {
+                    assert_eq!(
+                        body.get(member),
+                        expected.get(member),
+                        "case {:?}: expected {name}'s own {member} to survive the delete of \
+                         {target}, got {:?}",
+                        other.case,
+                        body.get(member)
+                    );
+                }
+            }
         }
     }
 }
