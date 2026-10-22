@@ -7,7 +7,10 @@
 //! trace, and every reader (`BatchGetTraces`, `GetTraceSummaries`) recomputes
 //! its answer from those stored documents — nothing is echoed from the request
 //! that stored them. Groups are a keyed map plus an ARN index, so `GetGroup`
-//! resolves a group by either selector.
+//! resolves a group by either selector. Indexing rules are a fixed, seeded
+//! keyed map: the account's `Default` rule exists before the first call, and
+//! `UpdateIndexingRule` rewrites its configuration in place for
+//! `GetIndexingRules` to report.
 //!
 //! The segment-document schema this module parses is the one `PutTraceSegments`
 //! documents (`smithy_query(query="doc",shape="PutTraceSegments")`): `name`,
@@ -17,7 +20,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::ops::types::{Group, GroupSummary, InsightsConfiguration};
+use crate::ops::types::{
+    Group, GroupSummary, IndexingRule, IndexingRuleValue, InsightsConfiguration,
+    ProbabilisticRuleValue,
+};
 
 /// The region an ARN carries when the request's SigV4 scope names none.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -77,6 +83,27 @@ pub const MAX_TRACES: usize = 1_000;
 /// The most groups the store keeps; `CreateGroup` past this is refused.
 pub const MAX_GROUPS: usize = 250;
 
+/// The indexing rule every account already holds, before any call.
+///
+/// Transaction Search ships one rule, named `Default`, and this service's model
+/// publishes no operation that creates or deletes an indexing rule
+/// (`smithy_query(query="list_operations")` has only `GetIndexingRules` and
+/// `UpdateIndexingRule`), so this is the only name [`IndexingRuleStore`] holds.
+pub const DEFAULT_INDEXING_RULE_NAME: &str = "Default";
+
+/// The `DesiredSamplingPercentage` the [`DEFAULT_INDEXING_RULE_NAME`] rule
+/// carries until `UpdateIndexingRule` rewrites it: the 1% of spans Transaction
+/// Search indexes out of the box.
+pub const DEFAULT_INDEXING_SAMPLING_PERCENTAGE: f64 = 1.0;
+
+/// The largest `DesiredSamplingPercentage` an indexing rule accepts.
+///
+/// `ProbabilisticRuleValueUpdate$DesiredSamplingPercentage` targets
+/// `NullableDouble` and the model states no range, but the member is documented
+/// as a "sampling percentage of traceIds": a percentage outside 0..=100 names no
+/// sampling rate, so it is refused rather than stored.
+pub const MAX_SAMPLING_PERCENTAGE: f64 = 100.0;
+
 /// The most trace ids one `BatchGetTraces` call accepts.
 ///
 /// `TraceIdList` carries no modelled length bound, and every requested id that
@@ -104,6 +131,117 @@ pub struct ComAmazonawsXrayAwsxrayState {
     pub group_seq: u64,
     /// Ingest counter, stamped on a trace so the oldest can be evicted.
     pub ingest_seq: u64,
+    /// The account's indexing rules, which `GetIndexingRules` reports and
+    /// `UpdateIndexingRule` rewrites.
+    pub indexing_rules: IndexingRuleStore,
+}
+
+/// The indexing rules this service holds, keyed by rule name.
+///
+/// The set of rules is FIXED: X-Ray models no create and no delete for one, so
+/// the store is seeded with [`DEFAULT_INDEXING_RULE_NAME`] at construction and
+/// only ever has a rule's configuration rewritten under it. That is why a read
+/// never has to materialise anything — the `Default` rule is there before the
+/// first call, exactly as it is on a fresh account.
+#[derive(Debug)]
+pub struct IndexingRuleStore {
+    rules: BTreeMap<String, IndexingRuleRecord>,
+}
+
+impl Default for IndexingRuleStore {
+    fn default() -> Self {
+        let record = IndexingRuleRecord {
+            name: DEFAULT_INDEXING_RULE_NAME.to_string(),
+            modified_at_secs: now_epoch_secs(),
+            desired_sampling_percentage: DEFAULT_INDEXING_SAMPLING_PERCENTAGE,
+        };
+        Self {
+            rules: BTreeMap::from([(record.name.clone(), record)]),
+        }
+    }
+}
+
+impl IndexingRuleStore {
+    /// Every stored rule, in rule-name order.
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &IndexingRuleRecord> {
+        self.rules.values()
+    }
+
+    /// The stored rules from `name` onward, in rule-name order — what a page
+    /// resumed from a `NextToken` starts at.
+    pub fn iter_from(&self, name: &str) -> impl Iterator<Item = &IndexingRuleRecord> {
+        self.rules
+            .range::<str, _>((
+                ::std::ops::Bound::Included(name),
+                ::std::ops::Bound::Unbounded,
+            ))
+            .map(|(_, rule)| rule)
+    }
+
+    /// Whether a rule of this exact name is stored.
+    pub fn contains(&self, name: &str) -> bool {
+        self.rules.contains_key(name)
+    }
+
+    /// Rewrite the named rule's probabilistic configuration and restamp its
+    /// `ModifiedAt`, answering the stored record — or `None` when no rule of
+    /// that name exists, which is what `ResourceNotFoundException` reports.
+    ///
+    /// The store neither grows nor shrinks here: an unknown name is refused
+    /// rather than created, because X-Ray has no operation that adds a rule.
+    pub fn update_probabilistic(
+        &mut self,
+        name: &str,
+        desired_sampling_percentage: f64,
+    ) -> Option<&IndexingRuleRecord> {
+        let record = self.rules.get_mut(name)?;
+        record.desired_sampling_percentage = desired_sampling_percentage;
+        record.modified_at_secs = now_epoch_secs();
+        Some(record)
+    }
+}
+
+/// One indexing rule, as stored. `GetIndexingRules` and `UpdateIndexingRule`
+/// both answer from this record, never from the request that wrote it.
+#[derive(Debug, Clone)]
+pub struct IndexingRuleRecord {
+    /// The rule's name.
+    pub name: String,
+    /// When the rule was last modified, in whole seconds of epoch time —
+    /// `IndexingRule$ModifiedAt` is documented "in Unix time seconds".
+    pub modified_at_secs: i64,
+    /// The configured `DesiredSamplingPercentage`.
+    pub desired_sampling_percentage: f64,
+}
+
+impl IndexingRuleRecord {
+    /// This record as the modelled `IndexingRule`.
+    ///
+    /// `ActualSamplingPercentage` is "applied sampling percentage of traceIds",
+    /// which AWS may hold below the configured one "to ensure completeness of
+    /// data". This emulator ingests through `PutTraceSegments` and applies no
+    /// such limit, so the applied percentage IS the configured one.
+    pub fn to_indexing_rule(&self) -> IndexingRule {
+        IndexingRule {
+            name: Some(self.name.clone()),
+            modified_at: Some(::aws_smithy_types::DateTime::from_secs(
+                self.modified_at_secs,
+            )),
+            rule: Some(IndexingRuleValue::Probabilistic(ProbabilisticRuleValue {
+                desired_sampling_percentage: self.desired_sampling_percentage,
+                actual_sampling_percentage: Some(self.desired_sampling_percentage),
+            })),
+        }
+    }
+}
+
+/// The current instant in whole seconds of epoch time.
+pub fn now_epoch_secs() -> i64 {
+    ::std::time::SystemTime::now()
+        .duration_since(::std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
+        })
 }
 
 /// One trace: every segment document submitted under a single `trace_id`.
