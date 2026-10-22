@@ -23,6 +23,14 @@
 //!    `ValidationException` (400) with `ValidationExceptionType` `INVALID_POLICY`; a
 //!    policy longer than the modeled `PolicyText` maximum is refused, and one of exactly
 //!    that length is accepted.
+//! 5. A not-found names the resource type that is MISSING in `ResourceTypeNotFound`,
+//!    whose enum is CHANNEL_GROUP | CHANNEL | ORIGIN_ENDPOINT | HARVEST_JOB — one value
+//!    per level of the address — and leaves the member unset when the endpoint is present
+//!    and only its policy is absent, since no enum value names a policy.
+//! 6. The CDN authorization a policy carries is bounded by the MODEL —
+//!    `CdnIdentifierSecretArns` is `@length 1..100` — so a list at the bound is stored and
+//!    read back whole, while an empty one and one past the bound are refused (400,
+//!    naming the member) with nothing stored.
 
 use std::sync::Arc;
 
@@ -820,6 +828,176 @@ async fn deleting_the_endpoint_discards_its_policy() {
         assert_eq!(
             status, 404,
             "case {label:?}: a recreated endpoint must carry no policy, got {status} {body}"
+        );
+    }
+}
+
+/// RULE 5 — a 404 says WHICH resource is missing in `ResourceTypeNotFound`, one value per
+/// level of the address, and says nothing there when only the policy is absent.
+#[tokio::test]
+async fn a_not_found_names_the_resource_type_that_is_missing() {
+    let emulator = Emulator::new();
+    emulator.create_endpoint("rt-grp", "rt-chn", "rt-ep").await;
+
+    // (label, group, channel, endpoint, the `ResourceTypeNotFound` the answer must carry).
+    // The enum's values come from the model's `ResourceTypeNotFound` shape; the last row
+    // is the one absence no value names, so the member must be left out entirely.
+    let cases = [
+        (
+            "unknown channel group",
+            "rt-missing",
+            "rt-chn",
+            "rt-ep",
+            Some("CHANNEL_GROUP"),
+        ),
+        (
+            "unknown channel",
+            "rt-grp",
+            "rt-missing",
+            "rt-ep",
+            Some("CHANNEL"),
+        ),
+        (
+            "unknown origin endpoint",
+            "rt-grp",
+            "rt-chn",
+            "rt-missing",
+            Some("ORIGIN_ENDPOINT"),
+        ),
+        (
+            "an endpoint that carries no policy",
+            "rt-grp",
+            "rt-chn",
+            "rt-ep",
+            None,
+        ),
+    ];
+
+    for (label, group, channel, endpoint, expected) in cases {
+        let (status, body) = emulator.get_policy(group, channel, endpoint).await;
+        assert_eq!(
+            status, 404,
+            "case {label:?}: the get expected 404, got {status} {body}"
+        );
+        assert_eq!(
+            body.get("ResourceTypeNotFound").and_then(Value::as_str),
+            expected,
+            "case {label:?}: expected ResourceTypeNotFound {expected:?}, got {body}"
+        );
+
+        // The write answers the same way wherever the address does not resolve. The last
+        // row is the one address where a put must SUCCEED, so it is not asserted here.
+        if expected.is_none() {
+            continue;
+        }
+        let (status, body) = emulator
+            .put_policy(
+                group,
+                channel,
+                endpoint,
+                json!({"Policy": r#"{"Statement":[]}"#}),
+            )
+            .await;
+        assert_eq!(
+            status, 404,
+            "case {label:?}: the put expected 404, got {status} {body}"
+        );
+        assert_eq!(
+            body.get("ResourceTypeNotFound").and_then(Value::as_str),
+            expected,
+            "case {label:?}: the put must name the same missing resource type, got {body}"
+        );
+    }
+}
+
+/// RULE 6 — the CDN authorization a policy carries is bounded by the MODEL:
+/// `CdnIdentifierSecretArns` is `@length 1..100`, so at the bound the put is stored and
+/// read back whole, and past it the request is refused (400 `ValidationException`, naming
+/// the member and its bound) with the stored policy left as it was.
+#[tokio::test]
+async fn the_cdn_secret_list_a_policy_carries_is_bounded() {
+    let emulator = Emulator::new();
+    emulator.create_endpoint("sec-grp", "sec-chn", "sec-ep").await;
+
+    let secrets = |count: usize| -> Value {
+        let arns: Vec<String> = (0..count)
+            .map(|index| {
+                format!("arn:aws:secretsmanager:us-west-2:123456789012:secret:cdn-auth-{index}")
+            })
+            .collect();
+        json!({
+            "CdnIdentifierSecretArns": arns,
+            // `SecretsRoleArn` is modelled `@length 20..2048`, so the role ARN is a real
+            // one rather than a placeholder.
+            "SecretsRoleArn": "arn:aws:iam::123456789012:role/MediaPackageCdnAuth",
+        })
+    };
+    // The bound on `com.amazonaws.mediapackagev2#CdnIdentifierSecretArns` itself
+    // (`@length(min: 1, max: 100)`), not a number this emulator chose.
+    let max = 100usize;
+    let policy = r#"{"Statement":[]}"#;
+
+    // One secret (the list's modelled minimum), a middling count, and the bound: all
+    // stored, and reported back in the order they were submitted.
+    for count in [1usize, max / 2, max] {
+        let cdn_auth = secrets(count);
+        let (status, body) = emulator
+            .put_policy(
+                "sec-grp",
+                "sec-chn",
+                "sec-ep",
+                json!({"Policy": policy, "CdnAuthConfiguration": cdn_auth.clone()}),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {count} secrets: a list within the bound expected 200, got {status} {body}"
+        );
+        let (status, read) = emulator.get_policy("sec-grp", "sec-chn", "sec-ep").await;
+        assert_eq!(
+            status, 200,
+            "case {count} secrets: the get expected 200, got {status} {read}"
+        );
+        assert_eq!(
+            read["CdnAuthConfiguration"], cdn_auth,
+            "case {count} secrets: the whole CDN authorization must be stored, got {read}"
+        );
+    }
+
+    let at_bound = secrets(max);
+    // One past the bound, and an empty list — the list's modelled MINIMUM is one entry.
+    for count in [max + 1, 0] {
+        let (status, body) = emulator
+            .put_policy(
+                "sec-grp",
+                "sec-chn",
+                "sec-ep",
+                json!({"Policy": policy, "CdnAuthConfiguration": secrets(count)}),
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {count} secrets: a list outside the modelled bound expected 400, got \
+             {status} {body}"
+        );
+        assert_eq!(
+            error_type(&body),
+            "ValidationException",
+            "case {count} secrets: expected ValidationException, got {body}"
+        );
+        assert!(
+            error_message(&body).contains("cdnIdentifierSecretArns"),
+            "case {count} secrets: the refusal must name the member it is about, got {body}"
+        );
+
+        let (status, read) = emulator.get_policy("sec-grp", "sec-chn", "sec-ep").await;
+        assert_eq!(
+            status, 200,
+            "case {count} secrets: the get expected 200, got {status} {read}"
+        );
+        assert_eq!(
+            read["CdnAuthConfiguration"], at_bound,
+            "case {count} secrets: a refused put must store nothing, got {read}"
         );
     }
 }
