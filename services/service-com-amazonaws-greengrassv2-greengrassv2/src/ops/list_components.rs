@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListComponents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListComponents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListComponents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the components persisted for this account, newest version first per
+//! component, paged by an opaque cursor.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +147,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListComponents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListComponentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListComponents"))
+        let _ = ctx;
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(ListComponentsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the greengrassv2 state store is unavailable".to_string(),
+                    retry_after_seconds: 1,
+                },
+            )
+            .into());
+        };
+
+        // PRIVATE is the scope Greengrass lists when the caller names none: the
+        // components this account published. A PUBLIC listing enumerates the
+        // components AWS publishes, of which this emulator holds none.
+        let scope = input.scope.as_deref().unwrap_or(st::SCOPE_PRIVATE);
+        if !COMPONENT_VISIBILITY_SCOPE_VALUES.contains(&scope) {
+            return Err(ListComponentsErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "scope must be one of {}; got {scope}.",
+                    COMPONENT_VISIBILITY_SCOPE_VALUES.join(", ")
+                ),
+                reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                fields: Some(vec![ValidationExceptionField {
+                    name: "scope".to_string(),
+                    message: format!("{scope} is not a ComponentVisibilityScope value."),
+                }]),
+            })
+            .into());
+        }
+
+        let page_size = usize::try_from(
+            input
+                .max_results
+                .unwrap_or(st::MAX_PAGE_SIZE)
+                .clamp(1, st::MAX_PAGE_SIZE),
+        )
+        .unwrap_or(1);
+
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match st::decode_cursor(token) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(ListComponentsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: "nextToken is not a token this service issued.".to_string(),
+                            reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                            fields: Some(vec![ValidationExceptionField {
+                                name: "nextToken".to_string(),
+                                message: "the cursor could not be decoded".to_string(),
+                            }]),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        let store = state.lock();
+
+        // `components` is keyed by component name, so iterating it is already the
+        // stable order a cursor can resume in — and a resumed page seeks straight
+        // to its key rather than re-scanning the components before it.
+        let entries: Box<dyn Iterator<Item = &st::ComponentEntry>> = match resume_at.as_deref() {
+            Some(from) => Box::new(
+                store
+                    .components
+                    .range(from.to_string()..)
+                    .map(|(_, entry)| entry),
+            ),
+            None => Box::new(store.components.values()),
+        };
+
+        let mut components: Vec<Component> = Vec::new();
+        let mut next_token = None;
+        for component in entries {
+            let Some(latest) = component.latest_version(scope) else {
+                continue;
+            };
+            if components.len() == page_size {
+                // This component begins the next page, so its key is the cursor.
+                next_token = Some(st::encode_cursor(&component.name));
+                break;
+            }
+            components.push(Component {
+                arn: Some(component.name_arn.clone()),
+                component_name: Some(component.name.clone()),
+                latest_version: Some(ComponentLatestVersion {
+                    arn: Some(latest.arn.clone()),
+                    component_version: Some(latest.component_version.clone()),
+                    creation_timestamp: Some(st::to_datetime(latest.creation_timestamp)),
+                    description: latest.description.clone(),
+                    publisher: latest.publisher.clone(),
+                    platforms: (!latest.platforms.is_empty()).then(|| latest.platforms.clone()),
+                }),
+            });
+        }
+
+        Ok(ListComponentsOutput {
+            components: Some(components),
+            next_token,
+        })
     }
 }

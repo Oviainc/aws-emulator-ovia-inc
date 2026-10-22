@@ -91,6 +91,21 @@ pub const STATUS_IN_REVIEW: &str = "IN_REVIEW";
 /// The terminal `BenefitApplicationStatus` of a cancelled application.
 pub const STATUS_CANCELED: &str = "CANCELED";
 
+/// The `BenefitApplicationStatus` a submitted application carries while AWS waits on the
+/// partner. No operation in this slice puts an application into it — AWS's own review
+/// workflow does — so it is named here only because [`RECALLABLE_STATUSES`] is defined
+/// over the statuses a *submitted* application can carry, not over one example of them.
+pub const STATUS_ACTION_REQUIRED: &str = "ACTION_REQUIRED";
+
+/// The statuses `RecallBenefitApplication` returns to draft.
+///
+/// A recall takes back an application that has been SUBMITTED and that AWS has not
+/// finished with: `PENDING_SUBMISSION` was never submitted, and `APPROVED`, `REJECTED`
+/// and `CANCELED` are terminal, so a recall from any of those is refused with the
+/// modelled `ConflictException`. The six `BenefitApplicationStatus` values are
+/// `crate::ops::types::BENEFIT_APPLICATION_STATUS_VALUES`.
+pub const RECALLABLE_STATUSES: &[&str] = &[STATUS_IN_REVIEW, STATUS_ACTION_REQUIRED];
+
 /// The two `BenefitStatus` values the model declares (see
 /// `crate::ops::types::BENEFIT_STATUS_VALUES`).
 pub const BENEFIT_STATUS_ACTIVE: &str = "ACTIVE";
@@ -273,6 +288,15 @@ pub struct BenefitApplication {
     /// THIS revision, so a retry sees the first call's response even if the application
     /// has been updated since.
     pub created_revision: u64,
+    /// The `ClientToken` of the recall that put this application back into
+    /// `PENDING_SUBMISSION`, if one did and it is still in draft.
+    ///
+    /// `RecallBenefitApplication` documents its `ClientToken` as what makes the recall
+    /// idempotent, so a retry carrying the token of the recall still in effect answers
+    /// success and changes nothing. One token per application, so it is bounded by the
+    /// application count; a fresh submission makes the application recallable again, at
+    /// which point the token no longer matches a recall in effect.
+    pub recall_client_token: Option<String>,
     pub associated_resources: Vec<String>,
     pub partner_contacts: Vec<Contact>,
     pub file_details: Vec<FileDetail>,
@@ -300,8 +324,30 @@ impl BenefitApplication {
         self.updated_at_millis = bump_millis(self.updated_at_millis, now_millis);
     }
 
+    /// Whether a recall may take this application back to draft: true exactly for the
+    /// statuses in [`RECALLABLE_STATUSES`].
+    pub fn is_recallable(&self) -> bool {
+        RECALLABLE_STATUSES.contains(&self.status.as_str())
+    }
+
+    /// Whether `client_token` is the token of the recall that is still in effect on this
+    /// application — i.e. a retry of that same recall, which must change nothing.
+    ///
+    /// Takes the token itself, never an `Option`, so a request that carries none cannot
+    /// be read as a retry of a recall that never happened: the caller passes a token only
+    /// when the request has one.
+    pub fn is_recall_retry(&self, client_token: &str) -> bool {
+        self.status == STATUS_PENDING_SUBMISSION
+            && self.recall_client_token.as_deref() == Some(client_token)
+    }
+
     /// Record a content change: bump the revision and advance `UpdatedAt`.
+    ///
+    /// Any content change also ENDS a recall's idempotency window: the record the recall
+    /// left has moved on, so replaying that recall must not answer as a retry of it. A
+    /// recall itself records its token after calling this.
     pub fn revise(&mut self, now_millis: i64) {
+        self.recall_client_token = None;
         self.revision = self.revision.saturating_add(1);
         self.touch(now_millis);
     }

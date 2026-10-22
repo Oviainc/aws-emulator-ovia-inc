@@ -8,6 +8,8 @@ Issue-Commit: ace69a9d3348e9c8c81d3eff309bd15ea7c6e8c3
 
 # Implement ecr GetAccountSetting: unimplemented scaffold stub
 
+> _Update (fix of `20261022T002237Z-ecr-putaccountsetting-stub.md`): the handler now EXISTS. `GetAccountSetting` is the reader the `PutAccountSetting` round-trip is proved through, so it was implemented in that change: `src/ops/get_account_setting.rs` reports the setting from `state::...State::account_settings` (or its documented default), refuses a name this registry does not serve with `InvalidParameterException`, and its `//! SCAFFOLDED, NOT IMPLEMENTED:` census line is gone. What is still open here is only this issue's own two recorded units about invalid names: they were NOT replayed by that fix (it replays only its own unit), so the error shape and wording they expect are unchecked against the implemented handler — check them before changing it._
+
 > _Note: this issue was identified against the code base at commit `ace69a9d3348e9c8c81d3eff309bd15ea7c6e8c3`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

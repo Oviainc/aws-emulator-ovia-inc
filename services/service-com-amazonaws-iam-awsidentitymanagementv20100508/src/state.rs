@@ -3,9 +3,9 @@
 //! Engine state for the com-amazonaws-iam-awsidentitymanagementv20100508 service.
 //!
 //! This module owns the persisted IAM entities plus the small helpers every
-//! user-lifecycle handler needs (name keying, ARN building, id minting, opaque
-//! pagination markers). Handlers reach it through [`service_state`]; they never
-//! keep a second copy of a resource.
+//! handler needs (name keying, ARN building, id minting, policy-document checks,
+//! opaque pagination markers). Handlers reach it through [`service_state`]; they
+//! never keep a second copy of a resource.
 
 use std::collections::BTreeMap;
 
@@ -46,7 +46,7 @@ pub const MAX_ROLE_NAME_CHARACTERS: usize = 64;
 /// How many IAM roles one account may hold. AWS's "IAM and STS quotas" page gives
 /// the quota "Roles in an account: 1,000", and a create past it is refused with
 /// `LimitExceededException`, whose documentation says "the error message describes
-/// the limit exceeded".
+/// the limit exceeded". It is also what stops the role map growing without end.
 pub const MAX_ROLES_PER_ACCOUNT: usize = 1_000;
 
 /// The maximum session duration, in seconds, a role created without one carries.
@@ -66,6 +66,11 @@ pub const MAX_USERS_PER_ACCOUNT: usize = 5_000;
 /// exceed 2,048 characters"; a put that would carry the user past it is refused
 /// with `LimitExceededException`.
 pub const MAX_USER_INLINE_POLICY_CHARACTERS: usize = 2_048;
+
+/// The tag-key prefix AWS reserves. "Tagging IAM resources" (IAM User Guide):
+/// "You cannot create tag keys that begin with `aws:` because this prefix is
+/// reserved for Amazon Web Services use."
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 
 /// How many base32 characters follow the prefix in a minted unique id.
 const UNIQUE_ID_SUFFIX_LEN: usize = 17;
@@ -265,4 +270,39 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsIamAwsidentitymanagementv20100508State>)
+}
+
+/// The reserved tag key among `keys`, if any — the lowest one, so the refusal names
+/// the same key however the request's tags were ordered.
+/// See [`RESERVED_TAG_KEY_PREFIX`].
+pub fn reserved_tag_key<'a, I: IntoIterator<Item = &'a str>>(keys: I) -> Option<&'a str> {
+    let prefix = RESERVED_TAG_KEY_PREFIX.as_bytes();
+    keys.into_iter()
+        .filter(|key| {
+            let key = key.as_bytes();
+            key.len() >= prefix.len() && key[..prefix.len()].eq_ignore_ascii_case(prefix)
+        })
+        .min()
+}
+
+/// Whether `document` is an IAM policy document.
+///
+/// An IAM policy document is a JSON object whose top-level elements are `Version`
+/// and `Id` (both optional) and `Statement` (required) — the IAM JSON policy
+/// grammar. So a document that does not parse, is not an object, or carries no
+/// `Statement` is not a policy, and the operation taking it is refused with the
+/// modelled `MalformedPolicyDocumentException`.
+///
+/// Validation deliberately stops at that top level: the grammar BELOW `Statement`
+/// is not checked here, so a 200 from an operation taking a policy document is the
+/// claim "stored", not "every statement is valid IAM". Deepening it is its own
+/// change. This is the ONE definition of the rule, shared by every operation that
+/// accepts a policy document (`PutUserPolicy`'s inline policy, `CreateRole`'s trust
+/// policy).
+pub fn is_policy_document(document: &str) -> bool {
+    ::serde_json::from_str::<::serde_json::Value>(document).is_ok_and(|document| {
+        document
+            .as_object()
+            .is_some_and(|document| document.contains_key("Statement"))
+    })
 }

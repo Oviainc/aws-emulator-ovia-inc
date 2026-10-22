@@ -19,5 +19,7 @@ mod harness;
 mod not_found_contract;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/validation_messages.rs"]
+mod validation_messages;
 #[path = "all/workload_catalogue.rs"]
 mod workload_catalogue;
