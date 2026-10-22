@@ -18,10 +18,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The region most requests below are signed for. Deliberately NOT the emulator's
 /// `us-east-1` default, so an ARN that ignored the request's SigV4 scope would show up.
-const SIGNING_REGION: &str = "us-west-2";
+pub(crate) const SIGNING_REGION: &str = "us-west-2";
 
 /// The canonical account id every emulated ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
+pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// How many hex digits follow the prefix of a generated b2bi resource id, per the
 /// `p-<17 hex>` ids in this service's own Smithy model examples.
@@ -29,7 +29,7 @@ const ID_HEX_DIGITS: usize = 17;
 
 /// A router with one b2bi service on one shared engine — what `build_router` assembles,
 /// narrowed to the service under test.
-fn b2bi_router() -> MultiServiceRouter {
+pub(crate) fn b2bi_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.register_service(service_com_amazonaws_b2bi_b2bi::EmulatedService::new(engine));
@@ -37,7 +37,7 @@ fn b2bi_router() -> MultiServiceRouter {
 }
 
 /// Invoke one operation and return `(status, body)`.
-async fn call_signed_for(
+pub(crate) async fn call_signed_for(
     router: &MultiServiceRouter,
     region: &str,
     operation: &str,
@@ -71,17 +71,17 @@ async fn call_signed_for(
 }
 
 /// Invoke one operation signed for [`SIGNING_REGION`].
-async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
     call_signed_for(router, SIGNING_REGION, operation, body).await
 }
 
 /// The wire error code (`__type`) of an error body.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body["__type"].as_str().unwrap_or("<no __type>").to_string()
 }
 
 /// A string member, or `""` when absent.
-fn text(body: &Value, member: &str) -> String {
+pub(crate) fn text(body: &Value, member: &str) -> String {
     body[member].as_str().unwrap_or_default().to_string()
 }
 
@@ -105,7 +105,7 @@ type CapabilityCase<'a> = (&'a str, &'a str, &'a str, Option<&'a str>, Option<Va
 
 /// A valid `CapabilityConfiguration` for tests that only need capabilities to exist.
 /// Member names are the union/structure members of `com.amazonaws.b2bi#CapabilityConfiguration`.
-fn capability_configuration(transaction_set: &str, version: &str) -> Value {
+pub(crate) fn capability_configuration(transaction_set: &str, version: &str) -> Value {
     json!({
         "edi": {
             "type": { "x12Details": { "transactionSet": transaction_set, "version": version } },

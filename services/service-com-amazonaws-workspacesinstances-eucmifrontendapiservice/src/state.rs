@@ -72,6 +72,41 @@ pub const DEFAULT_BILLING_MODE: &str = "HOURLY";
 /// `MaxResults`: the modelled maximum for that member (`range 1..25`).
 pub const DEFAULT_MAX_RESULTS: usize = 25;
 
+/// The AWS Regions this emulator reports from `ListRegions` as supporting
+/// WorkSpaces Instances, in ascending `RegionName` order.
+///
+/// SOURCE: AWS's published Region availability for the Amazon WorkSpaces family in
+/// the `aws` (commercial) partition — the Region table behind "Amazon WorkSpaces
+/// Instances endpoints and quotas". The model itself enumerates nothing: `Region`
+/// carries a free `RegionName` string (`^[-0-9a-z]{1,31}$`) and the service's
+/// endpoint rule set is partition-templated
+/// (`smithy_query(query="shape",shape="Region")`), so there is no modelled list to
+/// project. Membership is era- and partition-dependent at AWS — a Region that gets
+/// the service is added there — so, exactly as the catalog in the Backup slice does,
+/// this list is a set this emulator OWNS: it is the Regions this emulator supports,
+/// and `ListRegions` reports it rather than inventing one of its own. Regions in the
+/// GovCloud and China partitions are deliberately absent: this emulator serves the
+/// commercial partition.
+///
+/// Kept SORTED and free of duplicates: `ListRegions` reports it in this order, whole,
+/// so the order a caller observes is this one.
+pub const SUPPORTED_REGIONS: &[&str] = &[
+    "af-south-1",
+    "ap-northeast-1",
+    "ap-northeast-2",
+    "ap-south-1",
+    "ap-southeast-1",
+    "ap-southeast-2",
+    "ca-central-1",
+    "eu-central-1",
+    "eu-west-1",
+    "eu-west-2",
+    "il-central-1",
+    "sa-east-1",
+    "us-east-1",
+    "us-west-2",
+];
+
 /// One WorkSpace Instance, as created by `CreateWorkspaceInstance`.
 #[derive(Debug, Clone)]
 pub struct WorkspaceInstanceRecord {
