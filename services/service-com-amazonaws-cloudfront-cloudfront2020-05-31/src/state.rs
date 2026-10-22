@@ -25,8 +25,13 @@
 //! later caller sees.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
+// NOTE: the three error shapes this module's message constructors below build
+// (`DistributionAlreadyExists`, `PreconditionFailed`, `InvalidArgument`) are named at
+// their use sites through their full `crate::ops::types::` path rather than added to
+// this list, which every operation added to this service edits.
 use crate::ops::types::{
     ActiveTrustedKeyGroups, ActiveTrustedSigners, AllowedMethods, CacheBehavior, CacheBehaviors,
     CachedMethods, CustomErrorResponse, CustomErrorResponses, CustomOriginConfig,
@@ -940,10 +945,9 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
                         distribution: existing.to_distribution(),
                     });
                 }
-                return Err(CreateRefusal::DistributionAlreadyExists(format!(
-                    "The caller reference {caller_reference} is already associated with \
-                     distribution {existing_id}"
-                )));
+                return Err(CreateRefusal::DistributionAlreadyExists(
+                    distribution_already_exists_message(&existing_id),
+                ));
             }
         }
 
@@ -1674,13 +1678,20 @@ fn resolve_viewer_certificate(certificate: Option<ViewerCertificate>) -> ViewerC
 
 /// The `InconsistentQuantities` message for one wrapper whose `Quantity` disagrees with
 /// the length of its `Items`, or `None` when the two agree.
+///
+/// The sentence is CloudFront's own for this refusal, built from the request: it names
+/// the wrapper, the `Quantity` the request stated and the number of `Items` it actually
+/// carried, in that order — "The specified quantity of <wrapper> (<stated>) does not
+/// match the actual quantity supplied (<carried>)." The model's doc text for the shape
+/// ("The value of Quantity and the size of Items don't match.") describes the condition
+/// rather than the message the service sends.
 fn quantity_disagreement(label: &str, quantity: i32, len: usize) -> Option<String> {
     if i64::from(quantity) == i64::try_from(len).unwrap_or(i64::MAX) {
         return None;
     }
     Some(format!(
-        "The value of Quantity and the size of Items don't match: {label} states Quantity \
-         {quantity} but carries {len} items"
+        "The specified quantity of {label} ({quantity}) does not match the actual quantity \
+         supplied ({len})."
     ))
 }
 
@@ -1983,18 +1994,81 @@ pub fn batch_path_count(batch: &InvalidationBatch) -> usize {
     items_len(&batch.paths.items)
 }
 
+/// `NoSuchDistribution`'s message: the sentence the model states on the shape itself,
+/// "The specified distribution does not exist."
+pub const NO_SUCH_DISTRIBUTION_MESSAGE: &str = "The specified distribution does not exist.";
+
+/// `NoSuchInvalidation`'s message: the sentence the model states on the shape itself,
+/// "The specified invalidation does not exist."
+pub const NO_SUCH_INVALIDATION_MESSAGE: &str = "The specified invalidation does not exist.";
+
+/// `PreconditionFailed`'s message, as CloudFront sends it: "The request failed because it
+/// didn't meet the preconditions in one or more request-header fields."
+///
+/// The model's doc text for the shape states the condition ("The precondition in one or
+/// more of the request fields evaluated to `false`."); this is the sentence the service
+/// puts on the wire. Either way it is fixed service text that names no request value: a
+/// caller learns WHICH precondition failed from the `If-Match` it sent, not from a
+/// version token echoed back to it.
+pub const PRECONDITION_FAILED_MESSAGE: &str =
+    "The request failed because it didn't meet the preconditions in one or more \
+     request-header fields.";
+
+/// The sentence `DistributionAlreadyExists` carries, up to the distribution the caller
+/// reference is already associated with, which CloudFront names at the end of it.
+const DISTRIBUTION_ALREADY_EXISTS_PREFIX: &str =
+    "The caller reference that you are using to create a distribution is associated with \
+     another distribution. Already exists: ";
+
+/// `InvalidArgument`'s message for a `MaxItems` a page size cannot be taken from.
+///
+/// One sentence for every unusable value — a value that is no integer at all, zero, or a
+/// negative one — because it states the CONSTRAINT on the parameter rather than the
+/// value that broke it: "MaxItems must be a non-zero positive integer."
+pub const MAX_ITEMS_INVALID_MESSAGE: &str = "MaxItems must be a non-zero positive integer.";
+
 /// The modelled `NoSuchDistribution` for a distribution id the store does not hold.
-pub fn no_such_distribution(id: &str) -> NoSuchDistribution {
+///
+/// The id is NOT in the message: CloudFront's sentence for this refusal is fixed service
+/// text, and the caller already knows which distribution it asked for.
+pub fn no_such_distribution() -> NoSuchDistribution {
     NoSuchDistribution {
-        message: Some(format!("The specified distribution does not exist: {id}")),
+        message: Some(NO_SUCH_DISTRIBUTION_MESSAGE.to_string()),
     }
 }
 
 /// The modelled `NoSuchInvalidation` for an invalidation id a distribution does not
-/// hold.
-pub fn no_such_invalidation(id: &str) -> NoSuchInvalidation {
+/// hold. Fixed service text, for the same reason [`no_such_distribution`] is.
+pub fn no_such_invalidation() -> NoSuchInvalidation {
     NoSuchInvalidation {
-        message: Some(format!("The specified invalidation does not exist: {id}")),
+        message: Some(NO_SUCH_INVALIDATION_MESSAGE.to_string()),
+    }
+}
+
+/// The modelled `PreconditionFailed` for an `If-Match` that is a well-formed version
+/// token but not the current one.
+pub fn precondition_failed() -> crate::ops::types::PreconditionFailed {
+    crate::ops::types::PreconditionFailed {
+        message: Some(PRECONDITION_FAILED_MESSAGE.to_string()),
+    }
+}
+
+/// The sentence `DistributionAlreadyExists` carries: CloudFront's own wording, up to the
+/// distribution the caller reference is already associated with, which it names at the
+/// end — the one piece of request-derived detail in it, and the one a caller cannot work
+/// out for itself.
+///
+/// A message rather than the shape, because the create path this service shares between
+/// `CreateDistribution` and `CreateDistributionWithTags` reports its refusals as
+/// [`CreateRefusal`], which each operation then lifts into its own modelled error.
+pub fn distribution_already_exists_message(existing_id: &str) -> String {
+    format!("{DISTRIBUTION_ALREADY_EXISTS_PREFIX}{existing_id}")
+}
+
+/// The modelled `InvalidArgument` for a `MaxItems` value no page size can be taken from.
+pub fn invalid_max_items() -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(MAX_ITEMS_INVALID_MESSAGE.to_string()),
     }
 }
 
@@ -2016,6 +2090,47 @@ pub fn key_value_store_already_exists(name: &str) -> EntityAlreadyExists {
             "A key value store with the name {name} already exists in this account"
         )),
     }
+}
+
+/// Mint the request id ONE response names the request it answers with — the `RequestId`
+/// element of this service's `<ErrorResponse>` envelope (`crate::service::envelope`).
+///
+/// 8-4-4-4-12 lowercase hex, the form an AWS request id takes and the same form
+/// [`ComAmazonawsCloudfrontCloudfront20200531State::allocate_key_value_store_id`] renders
+/// an id in. The VALUE is per-response and is not a requirement: nothing can predict it
+/// and no caller may depend on a particular one. What it must do is name ONE response, so
+/// it is drawn from a per-process counter run through [`scramble`] — the bijection every
+/// token this service mints is drawn through, so two responses never carry the same id —
+/// mixed with the instant the response was answered, so two runs of this emulator do not
+/// mint the same sequence. It is an identifier for correlation, never a secret: nothing
+/// authenticates with it.
+///
+/// A free function rather than a mint on the store: a failure the request boundary
+/// refused never reaches a handler, so the envelope that answers it has no state to reach.
+pub fn new_request_id() -> String {
+    static MINTED: AtomicU64 = AtomicU64::new(0);
+
+    let counter = MINTED.fetch_add(1, Ordering::Relaxed);
+    let since_epoch = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let instant = since_epoch
+        .as_secs()
+        .wrapping_mul(1_000_000_000)
+        .wrapping_add(u64::from(since_epoch.subsec_nanos()));
+    // The high half is a bijection of the counter alone, which is what makes two ids
+    // minted in the same nanosecond differ; the low half carries the instant.
+    let high = scramble(counter);
+    let low = scramble(instant ^ scramble(counter.wrapping_add(1)));
+    let hex = format!("{high:016x}{low:016x}");
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 /// Mix a counter so consecutive values render as unrelated tokens.
@@ -2092,6 +2207,29 @@ mod tests {
                 "case allocate_key_value_store_id: expected lowercase hex, got {id:?}"
             );
             assert!(seen.insert(id.clone()), "case {id:?}: the mint repeated an id");
+        }
+    }
+
+    /// A minted request id has the shape an AWS request id takes and names ONE response:
+    /// the envelope's whole requirement is that a failure can be correlated, so two
+    /// responses must never carry the same id.
+    #[test]
+    fn minted_request_ids_are_distinct_and_shaped() {
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..10_000 {
+            let id = new_request_id();
+            let widths: Vec<usize> = id.split('-').map(str::len).collect();
+            assert_eq!(
+                widths,
+                vec![8, 4, 4, 4, 12],
+                "case new_request_id: expected 8-4-4-4-12 groups, got {id:?}"
+            );
+            assert!(
+                id.bytes()
+                    .all(|b| b == b'-' || (b.is_ascii_hexdigit() && !b.is_ascii_uppercase())),
+                "case new_request_id: expected lowercase hex, got {id:?}"
+            );
+            assert!(seen.insert(id.clone()), "case {id:?}: the mint repeated a request id");
         }
     }
 
