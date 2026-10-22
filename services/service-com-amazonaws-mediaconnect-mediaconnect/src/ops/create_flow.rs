@@ -109,10 +109,12 @@ use crate::state::SERVICE_NAMESPACE;
 const NETWORK_INTERFACE_TYPE_ENA: &str = "ena";
 
 /// Refuse the request with the service's own client-input error, `BadRequestException`
-/// (HTTP 400): "thrown if the request contains a semantic error".
-fn bad_request(message: impl Into<String>) -> CreateFlowError {
+/// (HTTP 400): "thrown if the request contains a semantic error". `detail` states what was
+/// unacceptable; the message carries it inside this service's refusal envelope
+/// ([`crate::state::validation_failed_message`]).
+fn bad_request(detail: impl Into<String>) -> CreateFlowError {
     CreateFlowErrorModeled::BadRequestException(BadRequestException {
-        message: message.into(),
+        message: crate::state::validation_failed_message(&detail.into()),
     })
     .into()
 }

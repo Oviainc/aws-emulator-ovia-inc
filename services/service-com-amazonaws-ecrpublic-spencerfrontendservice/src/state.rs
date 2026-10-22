@@ -10,6 +10,9 @@
 //!
 //! * the ARN / URI forms every repository carries ([`StoredRepository`] is built once,
 //!   by `CreateRepository`, and read back verbatim by every reporting operation);
+//! * the repository policy document ([`StoredRepository::policy_text`]) that
+//!   `SetRepositoryPolicy` writes and `GetRepositoryPolicy` / `DeleteRepositoryPolicy`
+//!   read back;
 //! * the `sha256:` manifest digest ([`manifest_digest`]) that `PutImage` keys an image
 //!   by and `DescribeImages` / `BatchDeleteImage` resolve against;
 //! * what a manifest references ([`manifest_content`]), which is what an image's
@@ -195,6 +198,13 @@ pub struct StoredRepository {
     pub catalog_data: RepositoryCatalogData,
     /// Resource tags, keyed by tag key.
     pub tags: BTreeMap<String, String>,
+    /// The repository policy document, exactly as `SetRepositoryPolicy` supplied it, or
+    /// `None` while this repository carries no policy.
+    ///
+    /// `RepositoryPolicyText` is modelled as an opaque string, so the document is stored
+    /// and reported byte for byte: `GetRepositoryPolicy` documents that "the policy text
+    /// will be in JSON format", not that the service reformats it.
+    pub policy_text: Option<String>,
     /// Images keyed by `imageDigest`, so `DescribeImages` pages in digest order.
     pub images: BTreeMap<String, StoredImage>,
     /// `imageTag` -> `imageDigest`, so a tag-keyed `ImageIdentifier` resolves to a

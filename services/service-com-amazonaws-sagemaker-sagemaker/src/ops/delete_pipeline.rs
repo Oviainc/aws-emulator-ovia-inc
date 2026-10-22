@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePipeline
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeletePipeline`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeletePipeline::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: starts the removal of the pipeline `crate::state` holds under the
+//! requested name — the record reports `PipelineStatus` `Deleting` until the clock
+//! owes its disappearance (`crate::state::PIPELINE_DELETED_AFTER`) — and refuses a name
+//! it does not hold with the modelled `ResourceNotFound`. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +142,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeletePipeline` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeletePipelineErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeletePipeline"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // A removal the clock already owed has happened by now, so a second delete of
+        // the same pipeline reports it as gone rather than re-driving it.
+        store.settle_pipeline_deletions(now);
+
+        let Some(pipeline) = store.pipelines.get_mut(&input.pipeline_name) else {
+            let arn = crate::state::resource_arn(
+                &crate::state::request_region(ctx),
+                "pipeline",
+                &input.pipeline_name,
+            );
+            return Err(DeletePipelineErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!("Pipeline {arn} does not exist.")),
+            })
+            .into());
+        };
+        let arn = pipeline.arn.clone();
+        // Deleting is asynchronous: the pipeline moves to `Deleting` now and is gone
+        // once the clock owes its removal. A delete of a pipeline already being
+        // deleted answers the same ARN and moves nothing — the first call's removal
+        // instant stands, so repeating the call cannot postpone it.
+        if pipeline.removal_due_at.is_none() {
+            pipeline.status = crate::state::PIPELINE_STATUS_DELETING.to_string();
+            pipeline.last_modified_time = now;
+            pipeline.removal_due_at = Some(now + crate::state::PIPELINE_DELETED_AFTER);
+        }
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(DeletePipelineOutput {
+            pipeline_arn: Some(arn),
+        })
     }
 }
