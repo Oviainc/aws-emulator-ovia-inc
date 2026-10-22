@@ -25,5 +25,7 @@ mod recording_configuration_list;
 mod signing_name_routing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/stream_key_lifecycle.rs"]
+mod stream_key_lifecycle;
 #[path = "all/stream_key_read.rs"]
 mod stream_key_read;

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteStreamKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteStreamKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteStreamKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Drops one persisted stream key, named by its own ARN, so it can no longer be used
+//! to stream: afterwards `GetStreamKey` answers 404 for that ARN and `ListStreamKeys`
+//! no longer reports it.
+//!
+//! Deleting a key that is not persisted is the modelled 404, so a repeated delete of
+//! one ARN succeeds exactly once.
 //!
 //! ## Shape of an operation
 //!
@@ -105,10 +103,14 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteStreamKeyOutput {
 // here — hence the `DeleteStreamKeyError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ivs#DeleteStreamKey")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.ivs#DeleteStreamKey",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum DeleteStreamKeyErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    InternalServerException(InternalServerException),
     PendingVerification(PendingVerification),
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
@@ -165,18 +167,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteStreamKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteStreamKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteStreamKey"))
+        // A malformed ARN never reaches here: `DeleteStreamKeyRequest$arn` carries the
+        // modelled `StreamKeyArn` pattern, which the framework's constraint walk
+        // refuses with a 400 `ValidationException` before `handle` runs.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteStreamKeyErrorModeled::InternalServerException(InternalServerException {
+                exception_message: Some("the IVS store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        // The removal IS this operation, so a key the store does not hold cannot be
+        // deleted: that is the modelled 404, never a silent success. A second delete
+        // of the same ARN takes exactly that path.
+        let mut store = state.lock();
+        if store.stream_keys.remove(&input.arn).is_none() {
+            return Err(DeleteStreamKeyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    exception_message: Some(format!("stream key {} does not exist", input.arn)),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        Ok(DeleteStreamKeyOutput)
     }
 }
