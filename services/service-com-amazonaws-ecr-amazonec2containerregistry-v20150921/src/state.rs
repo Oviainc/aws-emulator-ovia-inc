@@ -52,6 +52,13 @@ pub const MAX_IMAGES_PER_REPOSITORY: usize = 1_000;
 /// push that introduces a tag the repository did not carry.
 pub const MAX_TAGS_PER_REPOSITORY: usize = 10_000;
 
+/// See [`MAX_REPOSITORIES`]. This one bounds `pull_time_update_exclusions`, which grows
+/// by one entry per `RegisterPullTimeUpdateExclusion` naming a principal the registry
+/// does not already exclude; past it a register is refused with the
+/// `LimitExceededException` that operation models. AWS publishes no fixed quota for
+/// pull time update exclusions, so this is the emulator's own bound.
+pub const MAX_PULL_TIME_UPDATE_EXCLUSIONS: usize = 1_000;
+
 /// The `ImageStatus` of an image in standard storage. Every image this emulator
 /// stores is in standard storage (moving one to archive is `UpdateImageStorageClass`,
 /// still a 501 stub), so every stored image reports `ACTIVE`.
@@ -281,6 +288,12 @@ pub struct ComAmazonawsEcrAmazonec2containerregistryV20150921State {
     /// Repositories by name. A `BTreeMap` so every listing — and therefore every
     /// pagination token — has one deterministic order.
     pub repositories: BTreeMap<String, Repo>,
+    /// The registry's pull time update exclusion list: the IAM principal ARN of every
+    /// principal whose image pulls ECR does not record a pull time for, mapped to when
+    /// its exclusion was registered. Keyed by the ARN — one exclusion per principal is
+    /// what makes a second register of the same principal a duplicate — and a
+    /// `BTreeMap` so listing and its pagination tokens have one deterministic order.
+    pub pull_time_update_exclusions: BTreeMap<String, SystemTime>,
 }
 
 impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
