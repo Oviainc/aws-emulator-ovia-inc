@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMicrovmImage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMicrovmImage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMicrovmImage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a MicroVM image: one [`crate::state::MicrovmImage`] keyed by `name`, holding
+//! its first [`crate::state::MicrovmImageVersion`]. The build is asynchronous, so the
+//! image is persisted `CREATING` with the version's completion instant recorded; a later
+//! read materialises `CREATED` once the clock has made it due.
 //!
 //! ## Shape of an operation
 //!
@@ -151,6 +147,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    ComAmazonawsLambdamicrovmsLambdamicrovmsState as ServiceState, MicrovmImage,
+    MicrovmImageVersion, MintedResource,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -225,18 +226,181 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMicrovmImage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMicrovmImageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMicrovmImage"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(unavailable());
+        };
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::Instant::now();
+        let created_at = crate::state::now_datetime();
+
+        let mut store = state.lock();
+        store.materialize_due(now);
+
+        // `clientToken`: "If you retry a request that completed successfully using the
+        // same client token, the operation returns the successful response without
+        // performing any further actions."
+        if let Some((image, version)) = replayed(&store, input.client_token.as_deref()) {
+            return Ok(output_of(image, version));
+        }
+
+        // `name` "Must be unique within the AWS account."
+        if store.images.contains_key(&input.name) {
+            return Err(CreateMicrovmImageErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "a MicroVM image named {} already exists in this account",
+                    input.name
+                )),
+                resource_id: Some(input.name.clone()),
+                resource_type: Some("MicrovmImage".to_string()),
+            })
+            .into());
+        }
+
+        // The account's image quota: the modelled 402 rather than an unbounded store.
+        if store.images.len() >= crate::state::MAX_MICROVM_IMAGES {
+            return Err(CreateMicrovmImageErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "this account already holds its limit of {} MicroVM images",
+                        crate::state::MAX_MICROVM_IMAGES
+                    )),
+                    resource_id: Some(input.name.clone()),
+                    resource_type: Some("MicrovmImage".to_string()),
+                    service_code: Some("lambda".to_string()),
+                    quota_code: None,
+                },
+            )
+            .into());
+        }
+
+        let image_arn = crate::state::microvm_image_arn(&region, &input.name);
+        let image_version = "1".to_string();
+        let tags = crate::state::sorted_map(input.tags);
+
+        let version = MicrovmImageVersion {
+            image_version: image_version.clone(),
+            state: crate::state::VERSION_STATE_IN_PROGRESS.to_string(),
+            status: crate::state::VERSION_STATUS_INACTIVE.to_string(),
+            base_image_arn: input.base_image_arn,
+            base_image_version: input.base_image_version,
+            build_role_arn: input.build_role_arn,
+            description: input.description,
+            code_artifact: input.code_artifact,
+            logging: input.logging,
+            egress_network_connectors: input.egress_network_connectors.unwrap_or_default(),
+            cpu_configurations: input.cpu_configurations.unwrap_or_default(),
+            resources: input.resources.unwrap_or_default(),
+            additional_os_capabilities: input.additional_os_capabilities.unwrap_or_default(),
+            hooks: input.hooks,
+            environment_variables: crate::state::sorted_map(input.environment_variables),
+            created_at,
+            updated_at: None,
+            tags: tags.clone(),
+            // The build is asynchronous: the version completes, and with it the
+            // image's CREATING -> CREATED move, once the clock makes it due.
+            build_due_at: Some(now + crate::state::IMAGE_BUILD_SPAN),
+        };
+
+        let mut versions = ::std::collections::BTreeMap::new();
+        versions.insert(image_version.clone(), version);
+
+        store.arn_index.insert(image_arn.clone(), input.name.clone());
+        store.images.insert(
+            input.name.clone(),
+            MicrovmImage {
+                image_arn: image_arn.clone(),
+                name: input.name.clone(),
+                state: crate::state::IMAGE_STATE_CREATING.to_string(),
+                created_at,
+                updated_at: None,
+                latest_active_image_version: None,
+                latest_failed_image_version: None,
+                tags,
+                versions,
+            },
+        );
+        if let Some(token) = input.client_token {
+            store.record_minted(
+                "CreateMicrovmImage",
+                &token,
+                MintedResource::Image {
+                    image_arn,
+                    image_version: image_version.clone(),
+                },
+                now,
+            );
+        }
+
+        // The response is the PERSISTED record, read back out of the store.
+        let Some((image, version)) = stored(&store, &input.name, &image_version) else {
+            return Err(unavailable());
+        };
+        Ok(output_of(image, version))
+    }
+}
+
+/// The modelled server error for a store this handler cannot reach.
+fn unavailable() -> CreateMicrovmImageError {
+    CreateMicrovmImageErrorModeled::InternalServerException(InternalServerException {
+        message: Some("the MicroVM image store is unavailable".to_string()),
+        retry_after_seconds: None,
+    })
+    .into()
+}
+
+/// The image and version `client_token` already minted, if it minted one.
+///
+/// The replay returns what the token minted whatever the retried request now carries:
+/// this service models no idempotent-parameter-mismatch error, so a retry whose body
+/// differs is answered with the original record rather than with an unmodelled error.
+fn replayed<'a>(
+    store: &'a ServiceState,
+    client_token: Option<&str>,
+) -> Option<(&'a MicrovmImage, &'a MicrovmImageVersion)> {
+    let MintedResource::Image {
+        image_arn,
+        image_version,
+    } = store.minted_by("CreateMicrovmImage", client_token)?
+    else {
+        return None;
+    };
+    let image = store.image(image_arn)?;
+    Some((image, image.versions.get(image_version)?))
+}
+
+/// The persisted image named `name` together with one of its versions.
+fn stored<'a>(
+    store: &'a ServiceState,
+    name: &str,
+    image_version: &str,
+) -> Option<(&'a MicrovmImage, &'a MicrovmImageVersion)> {
+    let image = store.images.get(name)?;
+    Some((image, image.versions.get(image_version)?))
+}
+
+/// The modelled response for a stored image and one of its versions.
+fn output_of(image: &MicrovmImage, version: &MicrovmImageVersion) -> CreateMicrovmImageOutput {
+    CreateMicrovmImageOutput {
+        image_arn: image.image_arn.clone(),
+        name: image.name.clone(),
+        state: image.state.clone(),
+        latest_active_image_version: image.latest_active_image_version.clone(),
+        latest_failed_image_version: image.latest_failed_image_version.clone(),
+        created_at: image.created_at,
+        base_image_arn: version.base_image_arn.clone(),
+        base_image_version: version.base_image_version.clone(),
+        build_role_arn: version.build_role_arn.clone(),
+        description: version.description.clone(),
+        code_artifact: version.code_artifact.clone(),
+        logging: version.logging.clone(),
+        egress_network_connectors: crate::state::wire_list(&version.egress_network_connectors),
+        cpu_configurations: crate::state::wire_list(&version.cpu_configurations),
+        resources: crate::state::wire_list(&version.resources),
+        additional_os_capabilities: crate::state::wire_list(&version.additional_os_capabilities),
+        hooks: version.hooks.clone(),
+        environment_variables: crate::state::wire_map(&version.environment_variables),
+        tags: crate::state::wire_map(&image.tags),
+        updated_at: image.updated_at,
+        image_version: version.image_version.clone(),
     }
 }

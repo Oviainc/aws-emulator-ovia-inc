@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RunMicrovm
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RunMicrovm`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RunMicrovm::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Resolves the image the request names, then mints and persists one
+//! [`crate::state::Microvm`]. The MicroVM is persisted `PENDING` with the instant its
+//! provisioning completes recorded; a later read materialises `RUNNING` once the clock
+//! has made it due.
 //!
 //! ## Shape of an operation
 //!
@@ -129,6 +125,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    ComAmazonawsLambdamicrovmsLambdamicrovmsState as ServiceState, Microvm, MintedResource,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -204,18 +204,225 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RunMicrovm` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RunMicrovmErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RunMicrovm"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(unavailable());
+        };
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::Instant::now();
+        let started_at = crate::state::now_datetime();
+
+        let mut store = state.lock();
+        store.materialize_due(now);
+
+        // `clientToken` replay returns the MicroVM that token already minted.
+        if let Some(vm) = replayed(&store, input.client_token.as_deref()) {
+            return Ok(output_of(vm));
+        }
+
+        let Some(image_name) = store.resolve_image_name(&input.image_identifier) else {
+            return Err(image_not_found(&input.image_identifier));
+        };
+
+        // The account's concurrent-MicroVM quota: the modelled 402 rather than an
+        // unbounded store.
+        if store.active_microvm_count() >= crate::state::MAX_ACTIVE_MICROVMS {
+            return Err(RunMicrovmErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "this account already runs its limit of {} concurrent MicroVMs",
+                        crate::state::MAX_ACTIVE_MICROVMS
+                    )),
+                    resource_id: Some(input.image_identifier.clone()),
+                    resource_type: Some("Microvm".to_string()),
+                    service_code: Some("lambda".to_string()),
+                    quota_code: None,
+                },
+            )
+            .into());
+        }
+        let Some(image) = store.images.get(&image_name) else {
+            return Err(unavailable());
+        };
+        let image_arn = image.image_arn.clone();
+        // A MicroVM runs a BUILT image version: either the one the caller named or
+        // the image's current active one.
+        let image_version = match input.image_version.as_deref() {
+            Some(requested) => match image.versions.get(requested) {
+                Some(version) if version.status == crate::state::VERSION_STATUS_ACTIVE => {
+                    requested.to_string()
+                }
+                Some(version) => {
+                    return Err(conflict(
+                        format!(
+                            "version {requested} of MicroVM image {} is not active (build state {})",
+                            image.name, version.state
+                        ),
+                        &image_arn,
+                    ));
+                }
+                None => {
+                    return Err(version_not_found(&image_arn, requested));
+                }
+            },
+            None => match image.latest_active_image_version.clone() {
+                Some(active) => active,
+                None => {
+                    return Err(conflict(
+                        format!(
+                            "MicroVM image {} has no active version yet (image state {})",
+                            image.name, image.state
+                        ),
+                        &image_arn,
+                    ));
+                }
+            },
+        };
+
+        // `maximumDurationInSeconds` is modelled `@range(min: 1, max: 28800)`: the
+        // boundary validator refuses anything outside it before this handler runs, and
+        // this refuses it again, so an out-of-range value can never become a lifetime.
+        let maximum_duration_in_seconds = input
+            .maximum_duration_in_seconds
+            .unwrap_or(crate::state::DEFAULT_MAXIMUM_DURATION_IN_SECONDS);
+        // The refusal and the conversion share one check, so no value that failed it
+        // can reach the stored lifetime.
+        let maximum_duration = match u64::try_from(maximum_duration_in_seconds) {
+            Ok(seconds)
+                if (crate::state::MIN_MAXIMUM_DURATION_IN_SECONDS
+                    ..=crate::state::MAX_MAXIMUM_DURATION_IN_SECONDS)
+                    .contains(&maximum_duration_in_seconds) =>
+            {
+                seconds
+            }
+            _ => return Err(duration_out_of_range(maximum_duration_in_seconds)),
+        };
+
+        let microvm_id = store.next_microvm_id();
+        let microvm_arn = crate::state::microvm_arn(&region, &microvm_id);
+        let endpoint = crate::state::microvm_endpoint(&region, &microvm_id);
+        store
+            .microvm_arn_index
+            .insert(microvm_arn.clone(), microvm_id.clone());
+        store.microvms.insert(
+            microvm_id.clone(),
+            Microvm {
+                microvm_id: microvm_id.clone(),
+                microvm_arn,
+                state: crate::state::MICROVM_STATE_PENDING.to_string(),
+                endpoint,
+                image_arn,
+                image_version,
+                execution_role_arn: input.execution_role_arn,
+                idle_policy: input.idle_policy,
+                logging: input.logging,
+                maximum_duration_in_seconds,
+                started_at,
+                terminated_at: None,
+                state_reason: None,
+                ingress_network_connectors: input.ingress_network_connectors.unwrap_or_default(),
+                egress_network_connectors: input.egress_network_connectors.unwrap_or_default(),
+                // "The MicroVM starts in PENDING state and transitions to RUNNING
+                // once provisioning completes."
+                provision_due_at: Some(now + crate::state::MICROVM_PROVISION_SPAN),
+                terminate_due_at: None,
+                expiry_due_at: Some(now + ::std::time::Duration::from_secs(maximum_duration)),
+                reclaim_due_at: None,
+            },
+        );
+        if let Some(token) = input.client_token {
+            store.record_minted(
+                "RunMicrovm",
+                &token,
+                MintedResource::Microvm {
+                    microvm_id: microvm_id.clone(),
+                },
+                now,
+            );
+        }
+
+        // The response is the PERSISTED record, read back out of the store.
+        let Some(vm) = store.microvms.get(&microvm_id) else {
+            return Err(unavailable());
+        };
+        Ok(output_of(vm))
+    }
+}
+
+/// The modelled server error for a store this handler cannot reach.
+fn unavailable() -> RunMicrovmError {
+    RunMicrovmErrorModeled::InternalServerException(InternalServerException {
+        message: Some("the MicroVM store is unavailable".to_string()),
+        retry_after_seconds: None,
+    })
+    .into()
+}
+
+/// 404: no image matches the `imageIdentifier`.
+fn image_not_found(identifier: &str) -> RunMicrovmError {
+    RunMicrovmErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: format!("no MicroVM image matches the identifier {identifier}"),
+        resource_type: Some("MicrovmImage".to_string()),
+        resource_id: Some(identifier.to_string()),
+    })
+    .into()
+}
+
+/// 404: the image exists but carries no such `imageVersion`.
+fn version_not_found(image_arn: &str, image_version: &str) -> RunMicrovmError {
+    RunMicrovmErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: format!("MicroVM image {image_arn} has no version {image_version}"),
+        resource_type: Some("MicrovmImageVersion".to_string()),
+        resource_id: Some(format!("{image_arn}:{image_version}")),
+    })
+    .into()
+}
+
+/// 409: the image's current state does not allow running a MicroVM from it.
+fn conflict(message: String, image_arn: &str) -> RunMicrovmError {
+    RunMicrovmErrorModeled::ConflictException(ConflictException {
+        message: Some(message),
+        resource_id: Some(image_arn.to_string()),
+        resource_type: Some("MicrovmImage".to_string()),
+    })
+    .into()
+}
+
+/// 400: `maximumDurationInSeconds` outside the range the member documents.
+fn duration_out_of_range(value: i32) -> RunMicrovmError {
+    RunMicrovmErrorModeled::ValidationException(ValidationException {
+        message: Some(format!(
+            "maximumDurationInSeconds must be between {} and {}, got {value}",
+            crate::state::MIN_MAXIMUM_DURATION_IN_SECONDS,
+            crate::state::MAX_MAXIMUM_DURATION_IN_SECONDS
+        )),
+    })
+    .into()
+}
+
+/// The MicroVM `client_token` already minted, if it minted one.
+fn replayed<'a>(store: &'a ServiceState, client_token: Option<&str>) -> Option<&'a Microvm> {
+    let MintedResource::Microvm { microvm_id } = store.minted_by("RunMicrovm", client_token)?
+    else {
+        return None;
+    };
+    store.microvms.get(microvm_id)
+}
+
+/// The modelled response for a stored MicroVM.
+fn output_of(vm: &Microvm) -> RunMicrovmOutput {
+    RunMicrovmOutput {
+        microvm_id: vm.microvm_id.clone(),
+        state: vm.state.clone(),
+        endpoint: vm.endpoint.clone(),
+        image_arn: vm.image_arn.clone(),
+        image_version: vm.image_version.clone(),
+        execution_role_arn: vm.execution_role_arn.clone(),
+        idle_policy: vm.idle_policy.clone(),
+        maximum_duration_in_seconds: vm.maximum_duration_in_seconds,
+        started_at: vm.started_at,
+        terminated_at: vm.terminated_at,
+        state_reason: vm.state_reason.clone(),
+        ingress_network_connectors: crate::state::wire_list(&vm.ingress_network_connectors),
+        egress_network_connectors: crate::state::wire_list(&vm.egress_network_connectors),
     }
 }

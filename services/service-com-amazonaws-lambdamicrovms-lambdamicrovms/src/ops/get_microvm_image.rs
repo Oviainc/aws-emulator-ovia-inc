@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMicrovmImage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMicrovmImage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMicrovmImage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the persisted [`crate::state::MicrovmImage`] the `imageIdentifier` names, by
+//! name or by ARN, after materialising any build the clock has already made due.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +156,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMicrovmImage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMicrovmImageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMicrovmImage"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetMicrovmImageErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the MicroVM image store is unavailable".to_string()),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let _ = ctx;
+
+        let mut store = state.lock();
+        store.materialize_due(::std::time::Instant::now());
+
+        let Some(image) = store.image(&input.image_identifier) else {
+            return Err(GetMicrovmImageErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "no MicroVM image matches the identifier {}",
+                        input.image_identifier
+                    ),
+                    resource_type: Some("MicrovmImage".to_string()),
+                    resource_id: Some(input.image_identifier.clone()),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetMicrovmImageOutput {
+            image_arn: image.image_arn.clone(),
+            name: image.name.clone(),
+            state: image.state.clone(),
+            latest_active_image_version: image.latest_active_image_version.clone(),
+            latest_failed_image_version: image.latest_failed_image_version.clone(),
+            created_at: image.created_at,
+            tags: crate::state::wire_map(&image.tags),
+            updated_at: image.updated_at,
+        })
     }
 }

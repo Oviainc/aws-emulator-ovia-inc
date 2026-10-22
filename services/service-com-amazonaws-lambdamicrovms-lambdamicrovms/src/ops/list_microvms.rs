@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMicrovms
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMicrovms`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMicrovms::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages through the persisted MicroVMs in creation order, honouring the
+//! `imageIdentifier` / `imageVersion` filters and the `@paginated` contract
+//! (`maxResults` caps the page; a `nextToken` is returned, and accepted, while more
+//! remain).
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +151,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMicrovms` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMicrovmsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMicrovms"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListMicrovmsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the MicroVM store is unavailable".to_string()),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let _ = ctx;
+
+        let mut store = state.lock();
+        store.materialize_due(::std::time::Instant::now());
+
+        // The `imageIdentifier` filter names an image, by name or ARN; filtering on
+        // one that does not exist is a 404, not an empty page.
+        let image_arn_filter = match input.image_identifier.as_deref() {
+            Some(identifier) => match store.image(identifier) {
+                Some(image) => Some(image.image_arn.clone()),
+                None => {
+                    return Err(ListMicrovmsErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: format!(
+                                "no MicroVM image matches the identifier {identifier}"
+                            ),
+                            resource_type: Some("MicrovmImage".to_string()),
+                            resource_id: Some(identifier.to_string()),
+                        },
+                    )
+                    .into());
+                }
+            },
+            None => None,
+        };
+
+        let after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_token(token)?),
+            None => None,
+        };
+        // `maxResults` carries `@range(min: 1, max: 50)`, which the boundary validator
+        // has already enforced; the clamp is a second line of defence, so a page size
+        // can never be zero or unbounded however the value arrived.
+        let page_size = input
+            .max_results
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(crate::state::MAX_LIST_PAGE)
+            .clamp(1, crate::state::MAX_LIST_PAGE);
+
+        let matching = store.microvms.values().filter(|vm| {
+            image_arn_filter
+                .as_deref()
+                .is_none_or(|arn| vm.image_arn == arn)
+                && input
+                    .image_version
+                    .as_deref()
+                    .is_none_or(|version| vm.image_version == version)
+        });
+        // `microvmId`s sort in creation order, so "after this id" is a stable cursor
+        // even when MicroVMs are added between pages.
+        let mut remaining = matching.filter(|vm| match after.as_deref() {
+            Some(cursor) => vm.microvm_id.as_str() > cursor,
+            None => true,
+        });
+
+        let items: Vec<MicrovmItem> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(|vm| MicrovmItem {
+                microvm_id: vm.microvm_id.clone(),
+                state: vm.state.clone(),
+                image_arn: vm.image_arn.clone(),
+                image_version: vm.image_version.clone(),
+                started_at: vm.started_at,
+            })
+            .collect();
+
+        // A `nextToken` is returned only when the page did not exhaust the matches.
+        let next_token = match (items.last(), remaining.next()) {
+            (Some(last), Some(_)) => Some(encode_token(&last.microvm_id)),
+            _ => None,
+        };
+
+        Ok(ListMicrovmsOutput { next_token, items })
     }
+}
+
+/// The marker every `nextToken` this operation issues carries, so a token the service
+/// did not mint is refused rather than silently positioning the listing.
+const TOKEN_MARKER: &str = "ListMicrovms/1:";
+
+/// The opaque `nextToken` for a cursor: the last `microvmId` of the page served.
+fn encode_token(microvm_id: &str) -> String {
+    ::hex::encode(format!("{TOKEN_MARKER}{microvm_id}").as_bytes())
+}
+
+/// The cursor a `nextToken` carries. A token this service did not mint is refused
+/// with the modelled 400 rather than silently restarting or skipping the listing.
+fn decode_token(token: &str) -> Result<String, ListMicrovmsError> {
+    ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|decoded| {
+            decoded
+                .strip_prefix(TOKEN_MARKER)
+                .map(::std::string::ToString::to_string)
+        })
+        .ok_or_else(|| {
+            ListMicrovmsErrorModeled::ValidationException(ValidationException {
+                message: Some("nextToken is not a pagination token this service issued".to_string()),
+            })
+            .into()
+        })
 }
