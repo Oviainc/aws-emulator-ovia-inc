@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBranch
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBranch`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBranch::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -197,20 +188,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBranch` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBranchErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBranch"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateBranchErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the Amplify emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        let created = crate::state::now();
+        let mut store = state.lock();
+
+        // A branch only exists as part of an app, so an unknown `appId` is a 404
+        // rather than an app created on the way.
+        let app = store.apps.get_mut(&input.app_id).ok_or_else(|| {
+            CreateBranchErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!("App {} not found", input.app_id)),
+            })
+        })?;
+
+        // `branchName` identifies a branch within its app, so a second create under
+        // the same name is refused rather than silently replacing the first branch.
+        if app.branches.contains_key(&input.branch_name) {
+            return Err(CreateBranchErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "Branch {} already exists on app {}",
+                    input.branch_name, input.app_id
+                )),
+            })
+            .into());
+        }
+
+        // The quota is enforced BEFORE the branch is built or stored, so a refused
+        // create leaves the app exactly as it was and one app's branch map cannot
+        // grow without limit.
+        if app.branches.len() >= MAX_BRANCHES_PER_APP {
+            return Err(CreateBranchErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Number of branches exceeds the limit of {MAX_BRANCHES_PER_APP} for app {}",
+                        input.app_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let branch = Branch {
+            branch_arn: format!("{}/branches/{}", app.app.app_arn, input.branch_name),
+            // `displayName` "is used as the default domain prefix", and a branch's
+            // default domain prefix is its own name.
+            display_name: input.display_name.unwrap_or_else(|| input.branch_name.clone()),
+            branch_name: input.branch_name,
+            description: input.description.unwrap_or_default(),
+            tags: input.tags,
+            stage: input.stage.unwrap_or_else(|| DEFAULT_STAGE.to_string()),
+            enable_notification: input.enable_notification.unwrap_or(false),
+            create_time: created,
+            update_time: created,
+            environment_variables: input.environment_variables.unwrap_or_default(),
+            enable_auto_build: input.enable_auto_build.unwrap_or(false),
+            enable_skew_protection: input.enable_skew_protection,
+            // A branch carries a custom domain once a domain association assigns it
+            // one; a new branch has none.
+            custom_domains: Vec::new(),
+            framework: input.framework.unwrap_or_default(),
+            // Jobs are what build a branch, and a new branch has never been built:
+            // no active job, and none in its history.
+            active_job_id: String::new(),
+            total_number_of_jobs: "0".to_string(),
+            enable_basic_auth: input.enable_basic_auth.unwrap_or(false),
+            enable_performance_mode: input.enable_performance_mode,
+            // The thumbnail is a screenshot of a deployed branch.
+            thumbnail_url: None,
+            basic_auth_credentials: input.basic_auth_credentials,
+            build_spec: input.build_spec,
+            ttl: input.ttl.unwrap_or_else(|| DEFAULT_TTL_SECONDS.to_string()),
+            associated_resources: None,
+            enable_pull_request_preview: input.enable_pull_request_preview.unwrap_or(false),
+            pull_request_environment_name: input.pull_request_environment_name,
+            // Both are set only on a branch Amplify created FOR a pull request.
+            destination_branch: None,
+            source_branch: None,
+            backend_environment_arn: input.backend_environment_arn,
+            backend: input.backend,
+            compute_role_arn: input.compute_role_arn,
+        };
+
+        app.branches
+            .insert(branch.branch_name.clone(), branch.clone());
+
+        Ok(CreateBranchOutput { branch })
     }
 }
+
+/// The stage a branch created without one carries.
+///
+/// `Stage` is modelled `BETA | DEVELOPMENT | EXPERIMENTAL | PRODUCTION |
+/// PULL_REQUEST` (`smithy_query(query="shape",shape="Stage")`) and `Branch$stage` is
+/// @required, so a branch created without one still has to carry a value from that
+/// closed set; `DEVELOPMENT` is the one that claims nothing about a deployment.
+const DEFAULT_STAGE: &str = "DEVELOPMENT";
+
+/// The content TTL, in seconds, a branch created without one carries.
+///
+/// CHOSEN, not documented: `TTL` is modelled `length 0..32, pattern ^\d*$` with no
+/// default, so this emulator picks the shortest useful cache lifetime rather than
+/// leaving the @required member empty.
+const DEFAULT_TTL_SECONDS: u32 = 5;
+
+/// How many branches one app may hold at once, past which `CreateBranch` answers the
+/// modelled `LimitExceededException` (HTTP 429, "A resource could not be created
+/// because service quotas were exceeded").
+///
+/// AWS Amplify's published service quotas give "Branches per app" a default of 50 (an
+/// adjustable quota), which is also the page bound `ListBranches` models, so that is
+/// the bound this emulator enforces: one app's branch map cannot grow without limit,
+/// and the refusal is the one a real account past its quota gets.
+const MAX_BRANCHES_PER_APP: usize = 50;

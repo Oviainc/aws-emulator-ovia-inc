@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRelationships
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRelationships`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRelationships::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: a pure READ — it pages over the relationships in [`crate::state`],
+//! honouring the equality filters, the optional sort and `maxResults`, and hands out
+//! an opaque `nextToken` that resumes the same scan.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +153,177 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRelationships` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRelationshipsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRelationships"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListRelationshipsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the service is not mounted on a state-bearing engine".into(),
+                },
+            )
+            .into());
+        };
+
+        // Each `programManagementAccountIdentifiers` entry is an id or an ARN;
+        // the filter compares bare ids, so each is resolved first and one that is
+        // neither is refused rather than silently dropped.
+        let mut parent_ids: Option<Vec<String>> = None;
+        if let Some(identifiers) = input.program_management_account_identifiers.as_ref() {
+            let mut resolved = Vec::with_capacity(identifiers.len());
+            for identifier in identifiers {
+                let Some(id) = crate::state::resolve_identifier(
+                    identifier,
+                    crate::state::PROGRAM_MANAGEMENT_ACCOUNT_ID_PREFIX,
+                ) else {
+                    return Err(refusal(
+                        "programManagementAccountIdentifiers",
+                        format!(
+                            "Value '{identifier}' at \
+                             'programManagementAccountIdentifiers.member' failed to satisfy \
+                             constraint: Member must be a program management account id or ARN"
+                        ),
+                    ));
+                };
+                resolved.push(id.to_string());
+            }
+            parent_ids = Some(resolved);
+        }
+
+        // `sort` is optional; when present the model fixes both of its members to
+        // a value set, so a value outside one is refused rather than ignored.
+        if let Some(sort) = input.sort.as_ref() {
+            if !LIST_RELATIONSHIPS_SORT_NAME_VALUES.contains(&sort.sort_by.as_str()) {
+                return Err(refusal(
+                    "sort.sortBy",
+                    format!(
+                        "Value '{}' at 'sort.sortBy' failed to satisfy constraint: Member must \
+                         satisfy enum value set: [{}]",
+                        sort.sort_by,
+                        LIST_RELATIONSHIPS_SORT_NAME_VALUES.join(", ")
+                    ),
+                ));
+            }
+            if !SORT_ORDER_VALUES.contains(&sort.sort_order.as_str()) {
+                return Err(refusal(
+                    "sort.sortOrder",
+                    format!(
+                        "Value '{}' at 'sort.sortOrder' failed to satisfy constraint: Member must \
+                         satisfy enum value set: [{}]",
+                        sort.sort_order,
+                        SORT_ORDER_VALUES.join(", ")
+                    ),
+                ));
+            }
+        }
+
+        let filters = crate::state::RelationshipFilters {
+            catalog: input.catalog.clone(),
+            associated_account_ids: input.associated_account_ids.clone(),
+            association_types: input.association_types.clone(),
+            display_names: input.display_names.clone(),
+            program_management_account_ids: parent_ids,
+        };
+        let descending = input
+            .sort
+            .as_ref()
+            .is_some_and(|sort| sort.sort_order == "Descending");
+        let sorted = input.sort.is_some();
+
+        // The page token carries the filters and the sort it was taken with, so
+        // resuming a walk with different ones is refused rather than answered
+        // with a page of a different result set.
+        let filter_fingerprint = crate::state::fingerprint(&(&filters, sorted, descending));
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let Some(cursor) = crate::state::decode_page_token(token) else {
+                    return Err(refusal(
+                        "nextToken",
+                        format!(
+                            "Value '{token}' at 'nextToken' failed to satisfy constraint: Member \
+                             must be a token returned by a previous ListRelationships call"
+                        ),
+                    ));
+                };
+                if cursor.filter_fingerprint != filter_fingerprint {
+                    return Err(refusal(
+                        "nextToken",
+                        "Value at 'nextToken' failed to satisfy constraint: Member must be a \
+                         token returned for the same filters and sort"
+                            .to_string(),
+                    ));
+                }
+                cursor.offset
+            }
+        };
+
+        // `maxResults` is modelled `@default: 20` with `@range(min: 1, max: 100)`,
+        // so the boundary normally fills it in. Clamped to at least one here as
+        // well: a zero page would return nothing while still carrying a token
+        // whose offset never advances, so a walk would never terminate.
+        let max_results = if input.max_results == 0 {
+            crate::state::DEFAULT_MAX_RESULTS
+        } else {
+            input.max_results
+        };
+        let page_size = usize::try_from(max_results).unwrap_or(1).max(1);
+
+        let mut guard = state.lock();
+        // The only write a reporting operation may make: materialise what the
+        // clock already owed.
+        guard.advance_clock();
+
+        let mut matching: Vec<&crate::state::Relationship> = guard
+            .relationships
+            .iter_in_order()
+            .filter(|relationship| filters.matches(relationship))
+            .collect();
+        if sorted {
+            // The model's only `ListRelationshipsSortName` is `UpdatedAt`. The
+            // sort is stable, so relationships sharing an `updatedAt` keep their
+            // creation order and a page boundary never duplicates or skips one.
+            matching.sort_by(|left, right| {
+                let key = |relationship: &crate::state::Relationship| {
+                    (
+                        relationship.updated_at.secs(),
+                        relationship.updated_at.subsec_nanos(),
+                    )
+                };
+                if descending {
+                    key(right).cmp(&key(left))
+                } else {
+                    key(left).cmp(&key(right))
+                }
+            });
+        }
+
+        // One extra record is taken: its presence is what says another page
+        // exists, and the token resumes exactly where this page stopped.
+        let window: Vec<RelationshipSummary> = matching
+            .into_iter()
+            .skip(offset)
+            .take(page_size.saturating_add(1))
+            .map(crate::state::Relationship::to_summary)
+            .collect();
+        let has_more = window.len() > page_size;
+        let items: Vec<RelationshipSummary> = window.into_iter().take(page_size).collect();
+        let next_token = has_more.then(|| {
+            crate::state::encode_page_token(&crate::state::PageCursor {
+                offset: offset + items.len(),
+                filter_fingerprint,
+            })
+        });
+
+        Ok(ListRelationshipsOutput {
+            items: Some(items),
+            next_token,
+        })
     }
+}
+
+/// Refuse `member` with the modelled `ValidationException` (HTTP 400).
+fn refusal(member: &str, message: String) -> ListRelationshipsError {
+    ListRelationshipsErrorModeled::ValidationException(crate::state::validation_exception(
+        member, message,
+    ))
+    .into()
 }

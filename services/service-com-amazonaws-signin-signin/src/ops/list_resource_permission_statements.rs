@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResourcePermissionStatements
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResourcePermissionStatements`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResourcePermissionStatements::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the stored permission statements as `PermissionStatementSummary`, in mint
+//! order, each carrying the condition keys its put supplied:
+//! `@paginated(items: permissionStatements)`, so a page is cut at `maxResults` and
+//! `nextToken` carries the statement id the next page resumes at — absent on the last
+//! page.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +157,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResourcePermissionStatements` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResourcePermissionStatementsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResourcePermissionStatements"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListResourcePermissionStatementsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        error: crate::state::SERVER_ERROR_CODE.to_string(),
+                        message: "the signin permission statement store is unavailable"
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `maxResults` is modelled `@range(min: 1, max: 100)` and the boundary
+        // validator refused anything outside it before this handler ran, so the only
+        // case left is an absent value: serve the largest page the model allows. The
+        // `clamp` states that invariant rather than correcting a caller — a value
+        // reaching here outside the range is a validator bug, which the debug
+        // assertion surfaces instead of silently repairing.
+        let requested = input
+            .max_results
+            .unwrap_or(crate::state::STATEMENT_PAGE_LIMIT);
+        debug_assert!(
+            (1..=crate::state::STATEMENT_PAGE_LIMIT).contains(&requested),
+            "maxResults {requested} should have been refused at the boundary"
+        );
+        let page_size = usize::try_from(requested.clamp(1, crate::state::STATEMENT_PAGE_LIMIT))
+            .expect("a page size clamped into 1..=100 fits in usize");
+
+        let store = state.lock();
+
+        // The token is the statement id the next page starts at. Its own pattern
+        // `^[-a-zA-Z0-9+=/_]*$` is wider than the ids this service mints, so a token
+        // this operation never issued is refused with the modelled
+        // `ValidationException` rather than served as a page of somebody else's
+        // choosing.
+        if let Some(token) = input.next_token.as_deref() {
+            if !store.is_issued_pagination_token(token) {
+                return Err(
+                    ListResourcePermissionStatementsErrorModeled::ValidationException(
+                        crate::state::validation_failed(format!(
+                            "nextToken {token:?} is not a token returned by \
+                             ListResourcePermissionStatements"
+                        )),
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let mut permission_statements = Vec::with_capacity(page_size);
+        let mut next_token = None;
+        for (statement_id, statement) in &store.permission_statements {
+            // Resume at the first id at or after the token, so a page is still served
+            // when the statement the token named was deleted meanwhile.
+            if input
+                .next_token
+                .as_deref()
+                .is_some_and(|token| statement_id.as_str() < token)
+            {
+                continue;
+            }
+            if permission_statements.len() == page_size {
+                next_token = Some(statement_id.clone());
+                break;
+            }
+            permission_statements.push(statement.to_summary());
+        }
+
+        Ok(ListResourcePermissionStatementsOutput {
+            permission_statements,
+            next_token,
+        })
     }
 }

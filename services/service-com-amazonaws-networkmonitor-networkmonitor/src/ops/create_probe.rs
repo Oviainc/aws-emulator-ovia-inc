@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateProbe
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateProbe`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateProbe::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a `probeId`, attaches the probe record to the stored monitor in
+//! [`crate::state`], and answers from the record it stored. A repeat carrying
+//! the same `clientToken` replays the first probe rather than minting a second.
 //!
 //! ## Shape of an operation
 //!
@@ -140,6 +135,42 @@ impl From<CreateProbeErrorModeled> for CreateProbeError {
     }
 }
 
+/// This service's `ValidationException` (HTTP 400), carrying `message`.
+///
+/// Used for the probe rules the model documents in prose but its constraints
+/// cannot express — see [`crate::state::build_probe`].
+fn validation(message: String) -> CreateProbeError {
+    CreateProbeErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// This operation's answer, read out of the STORED probe record.
+pub(crate) fn output_for(probe: &crate::state::Probe) -> CreateProbeOutput {
+    CreateProbeOutput {
+        probe_id: Some(probe.probe_id.clone()),
+        probe_arn: Some(probe.probe_arn.clone()),
+        source_arn: probe.source_arn.clone(),
+        destination: probe.destination.clone(),
+        destination_port: probe.destination_port,
+        protocol: probe.protocol.clone(),
+        packet_size: probe.packet_size,
+        address_family: Some(probe.address_family.clone()),
+        vpc_id: probe.vpc_id.clone(),
+        state: Some(probe.state.clone()),
+        created_at: Some(::aws_smithy_types::DateTime::from(probe.created_at)),
+        modified_at: Some(::aws_smithy_types::DateTime::from(probe.modified_at)),
+        tags: Some(
+            probe
+                .tags
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        ),
+    }
+}
+
 /// The `CreateProbe` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -176,18 +207,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateProbe` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateProbeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateProbe"))
+        // `monitorName`'s `@pattern` and every `probe` member's own constraints
+        // are refused by the framework BEFORE this handler runs.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateProbeErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the networkmonitor monitor store is unavailable".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        // Both `tags` and `probe.tags` are documented as the pairs assigned to
+        // the probe, so the probe gets their union; the one nested in `probe`
+        // is the more specific, so it wins a key both name.
+        let mut tags: ::std::collections::BTreeMap<String, String> =
+            input.tags.unwrap_or_default().into_iter().collect();
+        tags.extend(input.probe.tags.unwrap_or_default());
+        let spec = crate::state::ProbeSpec {
+            source_arn: input.probe.source_arn,
+            destination: input.probe.destination,
+            destination_port: input.probe.destination_port,
+            protocol: input.probe.protocol,
+            packet_size: input.probe.packet_size,
+            tags,
+        };
+
+        let mut store = state.lock();
+        store.prune_client_tokens(now);
+
+        // A repeat carrying the same idempotency token is a RETRY: it replays
+        // the probe that token already minted rather than minting a second one.
+        if let Some(token) = input.client_token.as_deref() {
+            let replayed = store
+                .client_tokens
+                .get(token)
+                .filter(|record| record.monitor_name == input.monitor_name)
+                .and_then(|record| record.probe_id.clone());
+            if let Some(probe) = replayed.and_then(|probe_id| {
+                store
+                    .monitors
+                    .get(&input.monitor_name)
+                    .and_then(|monitor| monitor.probes.get(&probe_id))
+            }) {
+                return Ok(output_for(probe));
+            }
+        }
+
+        if !store.monitors.contains_key(&input.monitor_name) {
+            return Err(CreateProbeErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("monitor {} does not exist", input.monitor_name)),
+                },
+            )
+            .into());
+        }
+        let probe_count = store
+            .monitors
+            .get(&input.monitor_name)
+            .map_or(0, |monitor| monitor.probes.len());
+        if probe_count >= crate::state::MAX_PROBES_PER_MONITOR {
+            return Err(CreateProbeErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "this emulator keeps at most {} probes per monitor",
+                        crate::state::MAX_PROBES_PER_MONITOR
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let probe_id = store.next_probe_id(now);
+        let probe = crate::state::build_probe(spec, probe_id, &region, now).map_err(validation)?;
+        let probe_id = probe.probe_id.clone();
+        let monitor = store.monitors.get_mut(&input.monitor_name).ok_or_else(|| {
+            CreateProbeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(format!("monitor {} does not exist", input.monitor_name)),
+            })
+        })?;
+        monitor.probes.insert(probe_id.clone(), probe);
+        // The monitor changed: it now holds a probe, so it is owed the
+        // `PENDING` -> `ACTIVE` transition and its `modifiedAt` moves.
+        monitor.modified_at = now;
+        monitor.schedule_activation(now);
+
+        if let Some(token) = input.client_token {
+            store.client_tokens.insert(
+                token,
+                crate::state::ClientTokenRecord {
+                    monitor_name: input.monitor_name.clone(),
+                    probe_id: Some(probe_id.clone()),
+                    recorded_at: now,
+                },
+            );
+        }
+        // Answered from the STORED probe, so what the caller is told is what a
+        // later `GetMonitor` lists.
+        let stored = store
+            .monitors
+            .get(&input.monitor_name)
+            .and_then(|monitor| monitor.probes.get(&probe_id))
+            .ok_or_else(|| {
+                CreateProbeErrorModeled::InternalServerException(InternalServerException {
+                    message: Some(format!("probe {probe_id} was not stored")),
+                })
+            })?;
+        Ok(output_for(stored))
     }
 }

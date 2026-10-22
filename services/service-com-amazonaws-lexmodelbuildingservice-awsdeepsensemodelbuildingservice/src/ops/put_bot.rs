@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutBot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutBot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutBot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: the bot is written to this service's store under `$LATEST` (and, when
+//! `createVersion` is set, published as the next numbered version), its build status is
+//! derived from `processBehavior` and the intents it references, and the response is read
+//! back out of the store.
 //!
 //! ## Shape of an operation
 //!
@@ -227,6 +222,165 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use crate::state::{
+    bound_chars, bound_entries, checksum_mismatch, checksum_on_create, BotRecord,
+    ComAmazonawsLexmodelbuildingserviceAwsdeepsensemodelbuildingserviceState as Store,
+    BUILD_DURATION, DEFAULT_DETECT_SENTIMENT, DEFAULT_IDLE_SESSION_TTL_SECONDS, LATEST_VERSION,
+    MAX_BOTS, MAX_INTENTS_PER_BOT, MAX_STRING_CHARS, MAX_VERSIONS, PROCESS_BEHAVIOR_BUILD,
+    PROCESS_BEHAVIOR_SAVE, STATUS_BUILDING, STATUS_FAILED, STATUS_NOT_BUILT,
+};
+
+/// Refuse a request whose unbounded members would grow the store without limit.
+///
+/// `description` (0..200), `tags` (0..200) and every `messages` list (1..15) carry a
+/// modelled `length`, so the boundary validator has already refused those before this
+/// handler runs. `IntentList` carries none, and `voiceId` and `checksum` are plain
+/// strings, so they are bounded here.
+fn bound_input(input: &PutBotInput) -> Result<(), String> {
+    if let Some(intents) = &input.intents {
+        bound_entries("intents", intents.len(), MAX_INTENTS_PER_BOT)?;
+    }
+    for (member, value) in [("voiceId", &input.voice_id), ("checksum", &input.checksum)] {
+        if let Some(value) = value {
+            bound_chars(member, value, MAX_STRING_CHARS)?;
+        }
+    }
+    Ok(())
+}
+
+/// The build outcome a write lands the bot in: its `status`, its `failureReason`, and —
+/// for a build that is under way — the instant that build is due to finish.
+///
+/// `processBehavior=SAVE` saves without building, so the bot is `NOT_BUILT`. `BUILD` (the
+/// default when the member is absent) builds it: a bot whose `intents` cannot be resolved
+/// to stored intent versions cannot be built, so it lands in `FAILED` with the reason;
+/// anything else starts in `BUILDING` and the clock owes it `READY`.
+fn build_outcome(
+    store: &Store,
+    behavior: &str,
+    intents: &[Intent],
+    now: SystemTime,
+) -> (String, Option<String>, Option<SystemTime>) {
+    if behavior == PROCESS_BEHAVIOR_SAVE {
+        return (STATUS_NOT_BUILT.to_string(), None, None);
+    }
+    match unbuildable_reason(store, intents) {
+        Some(reason) => (STATUS_FAILED.to_string(), Some(reason), None),
+        None => (
+            STATUS_BUILDING.to_string(),
+            None,
+            Some(now + BUILD_DURATION),
+        ),
+    }
+}
+
+/// Why this bot cannot be built, or `None` when it can.
+///
+/// A bot with no intents has nothing to understand — "when you create a bot with the
+/// minimum information, the bot is created or updated but Amazon Lex returns the response
+/// FAILED. You can build the bot after you add one or more intents" — and an `intents`
+/// entry that names no stored intent version cannot be compiled into the bot either.
+fn unbuildable_reason(store: &Store, intents: &[Intent]) -> Option<String> {
+    if intents.is_empty() {
+        return Some(
+            "A bot cannot be built until it has at least one intent; add one or more \
+             intents and build the bot again"
+                .to_string(),
+        );
+    }
+    intents
+        .iter()
+        .find(|intent| !store.intent_version_exists(&intent.intent_name, &intent.intent_version))
+        .map(|intent| {
+            format!(
+                "The intent {} version {} does not exist",
+                intent.intent_name, intent.intent_version
+            )
+        })
+}
+
+/// Publish the `$LATEST` version of the bot named `name` as the next numbered version,
+/// and answer that version's number.
+///
+/// The number comes from the bot's own `next_version` counter, so versions are handed out
+/// `1`, `2`, `3`, … per bot and a number is never reused. The snapshot is a version in
+/// its own right: it gets its own checksum and its own creation date.
+fn publish_version(
+    store: &mut Store,
+    name: &str,
+    now: ::aws_smithy_types::DateTime,
+) -> Result<Option<String>, PutBotError> {
+    // `versions` counts `$LATEST` too, so `MAX_VERSIONS` numbered versions means
+    // `MAX_VERSIONS + 1` entries.
+    let versions = store.bots.get(name).map_or(0, |entry| entry.versions.len());
+    if versions > MAX_VERSIONS {
+        return Err(PutBotErrorModeled::LimitExceededException(LimitExceededException {
+            retry_after_seconds: None,
+            message: Some(format!(
+                "Limit Exceeded: this emulator publishes at most {MAX_VERSIONS} versions of a bot"
+            )),
+        })
+        .into());
+    }
+    let number = {
+        let entry = store
+            .bots
+            .get_mut(name)
+            .ok_or_else(crate::state::state_unavailable)?;
+        entry.next_version = entry.next_version.wrapping_add(1);
+        entry.next_version.to_string()
+    };
+    let checksum = store.mint_checksum("bot", name, &number);
+    let entry = store
+        .bots
+        .get_mut(name)
+        .ok_or_else(crate::state::state_unavailable)?;
+    let mut snapshot = entry
+        .versions
+        .get(LATEST_VERSION)
+        .cloned()
+        .ok_or_else(crate::state::state_unavailable)?;
+    snapshot.version = number.clone();
+    snapshot.checksum = checksum;
+    snapshot.created_date = now;
+    snapshot.last_updated_date = now;
+    entry.versions.insert(number.clone(), snapshot);
+    Ok(Some(number))
+}
+
+/// The `PutBot` body for a stored bot revision and the tags of the bot it belongs to.
+///
+/// Every member is read off the record, the server-computed ones (`status`,
+/// `failureReason`, `version`, `checksum`, the two dates) included, so the body can only
+/// report what was persisted. `createVersion` is set by the caller of this function: it
+/// reports what THIS call did, not anything about the record.
+fn bot_output(record: &BotRecord, tags: &[Tag]) -> PutBotOutput {
+    PutBotOutput {
+        name: Some(record.name.clone()),
+        description: record.description.clone(),
+        intents: (!record.intents.is_empty()).then(|| record.intents.clone()),
+        enable_model_improvements: record.enable_model_improvements,
+        nlu_intent_confidence_threshold: record.nlu_intent_confidence_threshold,
+        clarification_prompt: record.clarification_prompt.clone(),
+        abort_statement: record.abort_statement.clone(),
+        status: Some(record.status.clone()),
+        failure_reason: record.failure_reason.clone(),
+        last_updated_date: Some(record.last_updated_date),
+        created_date: Some(record.created_date),
+        idle_session_ttl_in_seconds: Some(record.idle_session_ttl_in_seconds),
+        voice_id: record.voice_id.clone(),
+        checksum: Some(record.checksum.clone()),
+        version: Some(record.version.clone()),
+        locale: Some(record.locale.clone()),
+        child_directed: Some(record.child_directed),
+        create_version: Some(false),
+        detect_sentiment: Some(record.detect_sentiment),
+        tags: (!tags.is_empty()).then(|| tags.to_vec()),
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -299,18 +453,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutBot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutBotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutBot"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // Nothing caller-sized reaches the store unchecked: the request's unbounded
+        // members are bounded first, before the store lock is taken at all.
+        bound_input(&input).map_err(|message| {
+            PutBotErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+        })?;
+
+        let wall_clock = SystemTime::now();
+        let now = ::aws_smithy_types::DateTime::from(wall_clock);
+        let name = input.name.clone();
+        let create_version = input.create_version.unwrap_or(false);
+        let mut store = state.lock();
+
+        // The conditional write `checksum` expresses: blank on a create, and the stored
+        // revision's own checksum on an update.
+        let (created_date, is_create) = {
+            let existing = store
+                .bots
+                .get(&name)
+                .and_then(|entry| entry.versions.get(LATEST_VERSION));
+            match (existing, input.checksum.as_deref()) {
+                (None, Some(_)) => {
+                    return Err(PutBotErrorModeled::BadRequestException(BadRequestException {
+                        message: Some(checksum_on_create("bot", &name)),
+                    })
+                    .into());
+                }
+                (Some(record), supplied) if supplied != Some(record.checksum.as_str()) => {
+                    return Err(PutBotErrorModeled::PreconditionFailedException(
+                        PreconditionFailedException {
+                            message: Some(checksum_mismatch("bot", &name, supplied)),
+                        },
+                    )
+                    .into());
+                }
+                _ => {}
+            }
+            // An update keeps the creation date of the record it replaces; a create
+            // stamps both dates with this instant.
+            (
+                existing.map_or(now, |record| record.created_date),
+                existing.is_none(),
+            )
+        };
+
+        if is_create && store.bots.len() >= MAX_BOTS {
+            return Err(PutBotErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    retry_after_seconds: None,
+                    message: Some(format!(
+                        "Limit Exceeded: this emulator stores at most {MAX_BOTS} bots"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let intents = input.intents.unwrap_or_default();
+        let behavior = input
+            .process_behavior
+            .as_deref()
+            .unwrap_or(PROCESS_BEHAVIOR_BUILD);
+        let (status, failure_reason, build_due_at) =
+            build_outcome(&store, behavior, &intents, wall_clock);
+
+        // A write REPLACES the `$LATEST` version rather than merging into it: the fields
+        // in the request replace the existing values, and a member the request omits is
+        // removed from the record — except `idleSessionTTLInSeconds` and the privacy
+        // settings, which are set to their default values.
+        let checksum = store.mint_checksum("bot", &name, LATEST_VERSION);
+        let latest = BotRecord {
+            name: name.clone(),
+            description: input.description,
+            intents,
+            enable_model_improvements: input.enable_model_improvements,
+            nlu_intent_confidence_threshold: input.nlu_intent_confidence_threshold,
+            clarification_prompt: input.clarification_prompt,
+            abort_statement: input.abort_statement,
+            status,
+            failure_reason,
+            idle_session_ttl_in_seconds: input
+                .idle_session_ttl_in_seconds
+                .unwrap_or(DEFAULT_IDLE_SESSION_TTL_SECONDS),
+            voice_id: input.voice_id,
+            locale: input.locale,
+            child_directed: input.child_directed,
+            detect_sentiment: input.detect_sentiment.unwrap_or(DEFAULT_DETECT_SENTIMENT),
+            version: LATEST_VERSION.to_string(),
+            checksum,
+            created_date,
+            last_updated_date: now,
+            build_due_at,
+        };
+        let entry = store.bots.entry(name.clone()).or_default();
+        if is_create {
+            // "You can only add tags when you create a bot, you can't use the PutBot
+            // operation to update the tags on a bot. To update tags, use the TagResource
+            // operation." So an update leaves the stored tags as they are.
+            entry.tags = input.tags.unwrap_or_default();
+        }
+        entry.versions.insert(LATEST_VERSION.to_string(), latest);
+
+        // `createVersion` publishes a numbered version of what was just written, which
+        // the model documents as the same thing `CreateBotVersion` does, and which
+        // `GetBot` reads back under its number.
+        let published = if create_version {
+            publish_version(&mut store, &name, now)?
+        } else {
+            None
+        };
+
+        // Read the body back OUT of the store, so the response can only report what was
+        // persisted. The body describes `$LATEST` even when a numbered version was
+        // published, the way `PutIntentResponse$checksum` is documented ("Checksum of the
+        // $LATEST version … created or updated"): that is also the checksum the caller
+        // needs for its next conditional write.
+        let entry = store
+            .bots
+            .get(&name)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let record = entry
+            .versions
+            .get(LATEST_VERSION)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut output = bot_output(record, &entry.tags);
+        // True if a new version of the bot was created; false when `createVersion` was
+        // not specified in the request.
+        output.create_version = Some(published.is_some());
+        Ok(output)
     }
 }

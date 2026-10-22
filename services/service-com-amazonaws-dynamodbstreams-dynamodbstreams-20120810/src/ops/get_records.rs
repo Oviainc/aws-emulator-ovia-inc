@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRecords
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRecords`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRecords::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: resolves the opaque `ShardIterator` token against [`crate::state`],
+//! returns the records at the position it names (honouring `Limit`) and mints the
+//! token for the position after them. An unknown or retired token is
+//! `ExpiredIteratorException`; a caught-up open shard is an empty `Records` list with
+//! a still-usable `NextShardIterator`.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +171,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRecords` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRecordsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRecords"))
+        // The iterator handed in is NOT consumed or advanced: a shard iterator names
+        // an immutable position, so replaying one re-reads the same records. What this
+        // call mints is the NEXT position's token, which the spec says it returns.
+        let _ = ctx;
+        let now = std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetRecordsErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the DynamoDB Streams store is unavailable".to_string()),
+            })
+        })?;
+        let mut guard = state.lock();
+        // Everything the clock already owes: records past the 24 hour retention limit
+        // are trimmed and iterators past their 15 minute lifetime are retired, whether
+        // or not anybody called.
+        guard.materialize_due_expiries(now);
+
+        let cursor = guard
+            .iterator(&input.shard_iterator)
+            .cloned()
+            .ok_or_else(|| {
+                GetRecordsErrorModeled::ExpiredIteratorException(ExpiredIteratorException {
+                    message: Some(
+                        "The shard iterator is not valid or has expired; a shard iterator \
+                         expires 15 minutes after it is retrieved"
+                            .to_string(),
+                    ),
+                })
+            })?;
+
+        // `Limit`'s declared range (1..) is enforced at the boundary; the documented
+        // ceiling of 1000 records is not modelled, so it is applied here.
+        let limit = usize::try_from(
+            input
+                .limit
+                .unwrap_or(crate::state::MAX_GET_RECORDS_LIMIT)
+                .clamp(1, crate::state::MAX_GET_RECORDS_LIMIT),
+        )
+        .unwrap_or(1);
+
+        let (records, next_position, shard_drained) = {
+            let stream = guard.stream(&cursor.stream_arn).ok_or_else(|| {
+                GetRecordsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(format!(
+                        "Requested resource not found: Stream: {} not found",
+                        cursor.stream_arn
+                    )),
+                })
+            })?;
+            let shard = stream.shard(&cursor.shard_id).ok_or_else(|| {
+                GetRecordsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(format!(
+                        "Requested resource not found: Shard: {} not found in stream {}",
+                        cursor.shard_id, cursor.stream_arn
+                    )),
+                })
+            })?;
+            // The record this iterator points at was trimmed after the iterator was
+            // handed out, so it would read past the oldest retained record.
+            if cursor.next_position < shard.trim_horizon() {
+                return Err(GetRecordsErrorModeled::TrimmedDataAccessException(
+                    TrimmedDataAccessException {
+                        message: Some(format!(
+                            "The shard iterator points past the oldest retained record of shard \
+                             {}",
+                            cursor.shard_id
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            let view_type = stream.stream_view_type;
+            // "GetRecords can retrieve a maximum of 1 MB of data or 1000 stream
+            // records, whichever comes first": the record count is capped by
+            // `limit`, and the payload by the records' own `SizeBytes`. A record
+            // larger than the whole budget still goes out alone, so a page is never
+            // empty while records are waiting.
+            let mut batch: Vec<Record> = Vec::new();
+            let mut batch_bytes: i64 = 0;
+            for record in shard.records_from(cursor.next_position, limit) {
+                let next_bytes = batch_bytes.saturating_add(record.size_bytes);
+                if !batch.is_empty() && next_bytes > crate::state::MAX_GET_RECORDS_BYTES {
+                    break;
+                }
+                batch_bytes = next_bytes;
+                batch.push(wire_record(record, view_type));
+            }
+            let next_position = cursor.next_position + batch.len() as u64;
+            // "If set to null, the shard has been closed and the requested iterator
+            // will not return any more data." An OPEN shard always yields a usable
+            // next iterator, even when the reader is caught up.
+            let drained = !shard.is_open() && next_position >= shard.appended();
+            (batch, next_position, drained)
+        };
+
+        let next_shard_iterator = (!shard_drained).then(|| {
+            guard.mint_iterator(&cursor.stream_arn, &cursor.shard_id, next_position, now)
+        });
+
+        Ok(GetRecordsOutput {
+            records: Some(records),
+            next_shard_iterator,
+        })
+    }
+}
+
+/// One stored record rendered as the modelled `Record`.
+///
+/// `NewImage`/`OldImage` are already stored per the stream's `StreamViewType` (a
+/// `KEYS_ONLY` stream persists neither), so this never has to decide what to hide.
+fn wire_record(
+    record: &crate::state::StoredRecord,
+    view_type: crate::state::StreamViewType,
+) -> Record {
+    Record {
+        event_id: Some(record.event_id.clone()),
+        event_name: Some(record.event_name.as_str().to_string()),
+        event_version: Some(record.event_version.clone()),
+        event_source: Some(record.event_source.clone()),
+        aws_region: Some(record.aws_region.clone()),
+        dynamodb: Some(StreamRecord {
+            approximate_creation_date_time: Some(::aws_smithy_types::DateTime::from_millis(
+                crate::state::epoch_millis(record.approximate_creation_date_time),
+            )),
+            keys: Some(record.keys.clone()),
+            new_image: record.new_image.clone(),
+            old_image: record.old_image.clone(),
+            sequence_number: Some(record.sequence_number.clone()),
+            size_bytes: Some(record.size_bytes),
+            stream_view_type: Some(view_type.as_str().to_string()),
+        }),
+        // `userIdentity` is set only for an item the Time to Live process deleted;
+        // nothing in this emulator expires items yet, so it stays absent.
+        user_identity: None,
     }
 }

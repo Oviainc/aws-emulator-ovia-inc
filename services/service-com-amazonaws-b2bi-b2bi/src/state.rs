@@ -1,11 +1,167 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-b2bi-b2bi service.
+//!
+//! The service's three primary resources — Profile, Capability and Partnership — are
+//! persisted here, under the single shared engine, so a create is observable by every
+//! later Get/List/Delete. Each collection keeps BOTH a `HashMap` keyed by the resource's
+//! generated id (the lookup every Get/Delete does) and a `Vec` of ids in insertion
+//! order (the stable enumeration the `@paginated` List operations page through).
+
+use std::collections::{HashMap, VecDeque};
+
+use crate::ops::types::{CapabilityConfiguration, CapabilityOptions, S3Location, Tag};
+
+/// The region an emulated ARN carries when the request's SigV4 scope does not name one
+/// (the emulator's documented default — see `engine::emulator_arn`).
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// Wording for the `InternalServerException` a handler answers when the engine it was
+/// constructed from is not the shared `InMemoryEngine` (so no store is reachable).
+pub const STATE_UNAVAILABLE: &str = "the b2bi service store is unavailable";
+
+/// The value of the modelled `Logging` enum that turns a profile's logging on.
+pub const LOGGING_ENABLED: &str = "ENABLED";
+
+/// How many hex digits follow the resource-type prefix in a generated id.
+///
+/// 17, matching the `profileId` / `capabilityId` / `partnershipId` / `tradingPartnerId`
+/// values in this service's own Smithy model examples (`p-<17 hex>`), and well inside
+/// the modelled `len 1..64` / `^[a-zA-Z0-9_-]+$` constraint on every one of those ids.
+const ID_HEX_DIGITS: usize = 17;
+
+/// The page size a List operation uses when the caller names no `maxResults`: the top of
+/// the modelled `MaxResults` range (`range 1..100`).
+pub const MAX_PAGE_SIZE: usize = 100;
+
+/// The most records one of this service's three stores holds.
+///
+/// Bounds the memory one emulator process can be made to hold through repeated creates:
+/// a create is reachable without a verified caller, so without a ceiling every call
+/// would add a resident record for good. Each create refuses past this bound with the
+/// modelled `ServiceQuotaExceededException` rather than growing further, which also
+/// bounds the per-request work the List operations do under the state lock (their filter
+/// and token-resume scans walk at most this many ids).
+pub const MAX_RECORDS_PER_STORE: usize = 1_000;
+
+/// The most `@idempotencyToken` replays remembered at once.
+///
+/// Each distinct caller-chosen `clientToken` adds one entry, so the map is capped and
+/// the oldest entry is evicted first
+/// ([`ComAmazonawsB2biB2biState::record_idempotency`]); deleting a resource also drops
+/// the entries that pointed at it
+/// ([`ComAmazonawsB2biB2biState::forget_idempotency_for`]), so the map has a release
+/// path as well as a ceiling.
+pub const MAX_IDEMPOTENCY_ENTRIES: usize = 10_000;
+
+/// A customer profile: the private network a partnership is created under.
+#[derive(Debug, Clone)]
+pub struct Profile {
+    pub profile_id: String,
+    pub profile_arn: String,
+    pub name: String,
+    pub email: Option<String>,
+    pub phone: String,
+    pub business_name: String,
+    pub logging: String,
+    pub log_group_name: Option<String>,
+    pub created_at: ::aws_smithy_types::DateTime,
+    pub modified_at: Option<::aws_smithy_types::DateTime>,
+    pub tags: Vec<Tag>,
+}
+
+/// A capability: the EDI processing a partnership references by id.
+#[derive(Debug, Clone)]
+pub struct Capability {
+    pub capability_id: String,
+    pub capability_arn: String,
+    pub name: String,
+    pub r#type: String,
+    pub configuration: CapabilityConfiguration,
+    /// `Option`, not `Vec`: the modelled member is optional, so an absent
+    /// `instructionsDocuments` must read back absent rather than as an empty list.
+    pub instructions_documents: Option<Vec<S3Location>>,
+    pub created_at: ::aws_smithy_types::DateTime,
+    pub modified_at: Option<::aws_smithy_types::DateTime>,
+    pub tags: Vec<Tag>,
+}
+
+/// A partnership: one trading partner, under a profile, bound to a set of capabilities.
+#[derive(Debug, Clone)]
+pub struct Partnership {
+    pub partnership_id: String,
+    pub partnership_arn: String,
+    pub profile_id: String,
+    pub name: String,
+    pub email: String,
+    pub phone: Option<String>,
+    pub capabilities: Vec<String>,
+    pub capability_options: Option<CapabilityOptions>,
+    pub trading_partner_id: String,
+    pub created_at: ::aws_smithy_types::DateTime,
+    pub modified_at: Option<::aws_smithy_types::DateTime>,
+    pub tags: Vec<Tag>,
+}
 
 /// Per-service state for com-amazonaws-b2bi-b2bi. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsB2biB2biState {
-    // TODO: add service-specific state fields
+    pub profiles: HashMap<String, Profile>,
+    /// `profiles` in creation order, so `ListProfiles` paging is stable across calls.
+    pub profile_order: Vec<String>,
+    pub capabilities: HashMap<String, Capability>,
+    /// `capabilities` in creation order, for `ListCapabilities` paging.
+    pub capability_order: Vec<String>,
+    pub partnerships: HashMap<String, Partnership>,
+    /// `partnerships` in creation order, for `ListPartnerships` paging.
+    pub partnership_order: Vec<String>,
+    /// `@idempotencyToken` replay: [`idempotency_key`] -> the id of the resource the
+    /// first call with that token created. Bounded by [`MAX_IDEMPOTENCY_ENTRIES`].
+    pub idempotency: HashMap<String, String>,
+    /// The order [`idempotency`](Self::idempotency)'s keys were recorded in, so the
+    /// oldest is the one evicted once the map is full.
+    pub idempotency_order: VecDeque<String>,
+}
+
+impl ComAmazonawsB2biB2biState {
+    /// Whether the profile store is below [`MAX_RECORDS_PER_STORE`].
+    pub fn accepts_another_profile(&self) -> bool {
+        self.profiles.len() < MAX_RECORDS_PER_STORE
+    }
+
+    /// Whether the capability store is below [`MAX_RECORDS_PER_STORE`].
+    pub fn accepts_another_capability(&self) -> bool {
+        self.capabilities.len() < MAX_RECORDS_PER_STORE
+    }
+
+    /// Whether the partnership store is below [`MAX_RECORDS_PER_STORE`].
+    pub fn accepts_another_partnership(&self) -> bool {
+        self.partnerships.len() < MAX_RECORDS_PER_STORE
+    }
+
+    /// Remember that `key` minted `id`, evicting the oldest remembered token once
+    /// [`MAX_IDEMPOTENCY_ENTRIES`] are held — so a caller cannot grow this map without
+    /// limit by sending a fresh `clientToken` on every request.
+    pub fn record_idempotency(&mut self, key: String, id: &str) {
+        if self.idempotency.insert(key.clone(), id.to_string()).is_none() {
+            self.idempotency_order.push_back(key);
+        }
+        while self.idempotency_order.len() > MAX_IDEMPOTENCY_ENTRIES {
+            if let Some(oldest) = self.idempotency_order.pop_front() {
+                self.idempotency.remove(&oldest);
+            }
+        }
+    }
+
+    /// Drop every remembered token that minted `id`, called when `id`'s resource is
+    /// deleted: a replay of that token mints a fresh resource anyway, so keeping the
+    /// entry would hold memory for a resource that no longer exists.
+    pub fn forget_idempotency_for(&mut self, id: &str) {
+        self.idempotency.retain(|_, minted| minted != id);
+        let remembered = &self.idempotency;
+        self.idempotency_order
+            .retain(|key| remembered.contains_key(key));
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -17,4 +173,102 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsB2biB2biState>)
+}
+
+/// The key a `clientToken` is remembered under, scoped by resource type.
+///
+/// Scoped because the three creates each carry their own `@idempotencyToken` and a
+/// caller may reuse one token value across them; an unscoped map would hand
+/// `CreatePartnership` the profile that `CreateProfile` created under the same token.
+pub fn idempotency_key(resource_type: &str, client_token: &str) -> String {
+    format!("{resource_type}#{client_token}")
+}
+
+/// The current wall-clock instant, as the modelled `CreatedDate`/`ModifiedDate` timestamp.
+pub fn now() -> ::aws_smithy_types::DateTime {
+    ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now())
+}
+
+/// The region this request was signed for, for the ARNs the response carries.
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// A fresh, system-generated resource id of the form `<prefix>-<17 hex digits>`.
+///
+/// Unpredictable (a per-process-seeded hasher over a process-wide sequence number and
+/// the clock) so ids are not guessable, and `taken` is consulted by the caller to
+/// guarantee the id is not already in use.
+pub fn new_resource_id(prefix: &str) -> String {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Distinguishes two ids minted inside one clock tick.
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    /// Odd 64-bit constant (the golden-ratio mix used by `hashbrown`) so the low and
+    /// high halves of the digest see different inputs.
+    const MIX: u64 = 0x9e37_79b9_7f4a_7c15;
+
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let nanos = ::std::time::SystemTime::now()
+        .duration_since(::std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or_default();
+
+    let seed = ::std::collections::hash_map::RandomState::new();
+    let mut high = seed.build_hasher();
+    high.write_u64(sequence);
+    high.write_u64(nanos);
+    let mut low = seed.build_hasher();
+    low.write_u64(nanos);
+    low.write_u64(sequence.wrapping_mul(MIX));
+
+    let digits = format!("{:016x}{:016x}", high.finish(), low.finish());
+    format!("{prefix}-{}", &digits[..ID_HEX_DIGITS])
+}
+
+/// Why a `nextToken` was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidPageToken;
+
+/// The opaque `nextToken` that resumes an enumeration at `id`.
+fn encode_page_token(id: &str) -> String {
+    ::hex::encode(id)
+}
+
+/// One page of `ids`, plus the token that resumes after it.
+///
+/// `next_token` is the token a previous page returned; `max_results` is the caller's
+/// page size (already held to the modelled `1..100` range by the boundary validator).
+/// A token that does not decode is refused; one that decodes to an id no longer in
+/// `ids` (its resource was deleted between pages) ends the enumeration with an empty
+/// page, rather than refusing a token this service really did issue.
+pub fn paginate(
+    ids: &[String],
+    next_token: Option<&str>,
+    max_results: Option<i32>,
+) -> Result<(Vec<String>, Option<String>), InvalidPageToken> {
+    let start = match next_token {
+        None => 0,
+        Some(token) => {
+            let resume_at = ::hex::decode(token)
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .ok_or(InvalidPageToken)?;
+            match ids.iter().position(|id| *id == resume_at) {
+                Some(index) => index,
+                None => return Ok((Vec::new(), None)),
+            }
+        }
+    };
+
+    let page_size = max_results
+        .map(|requested| (requested.max(1) as usize).min(MAX_PAGE_SIZE))
+        .unwrap_or(MAX_PAGE_SIZE);
+    let end = start.saturating_add(page_size).min(ids.len());
+    let page = ids[start..end].to_vec();
+    let next = ids.get(end).map(|id| encode_page_token(id));
+    Ok((page, next))
 }

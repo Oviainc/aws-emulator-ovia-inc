@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteMonitor
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteMonitor`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteMonitor::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the monitor record — and the probes it holds — from
+//! [`crate::state`], so a later `GetMonitor` is `ResourceNotFoundException` and
+//! `ListMonitors` no longer includes it. An unknown name is
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +138,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteMonitor` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteMonitorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteMonitor"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteMonitorErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the networkmonitor monitor store is unavailable".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+        // Removing the monitor removes the probes it holds with it: the probes
+        // live INSIDE the record, so there is no orphan left behind.
+        if store.monitors.remove(&input.monitor_name).is_none() {
+            return Err(DeleteMonitorErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("monitor {} does not exist", input.monitor_name)),
+                },
+            )
+            .into());
+        }
+        // The idempotency records that named it replay nothing now, so drop
+        // them rather than leaving a token pointing at a monitor that is gone.
+        store
+            .client_tokens
+            .retain(|_, record| record.monitor_name != input.monitor_name);
+        Ok(DeleteMonitorOutput {})
     }
 }

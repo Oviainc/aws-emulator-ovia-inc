@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateHsm
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateHsm`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateHsm::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Provisions an HSM: allocates its `hsm-<8 hex>` id, ENI, serial number and subnet
+//! placement, persists an [`crate::state::Hsm`] record carrying every member the
+//! request supplied, and answers with the ARN. A create that repeats a `ClientToken`
+//! this service has already served answers with the ARN it minted then.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +168,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateHsm` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateHsmErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateHsm"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal_error)?;
+
+        // The model's `IpAddress` pattern bounds each octet's DIGIT COUNT only, so an
+        // out-of-range address reaches the handler. Refuse it the way the service
+        // refuses any invalid parameter.
+        for (member, value) in [("EniIp", &input.eni_ip), ("SyslogIp", &input.syslog_ip)] {
+            if let Some(value) = value.as_deref() {
+                if !crate::state::is_ipv4_address(value) {
+                    return Err(invalid_request(member));
+                }
+            }
+        }
+
+        let mut state = state.lock();
+
+        // An idempotent retry: the model's own doc for `ClientToken` is "A user-defined
+        // token to ensure idempotence. Subsequent calls to this operation with the same
+        // token will be ignored", so the second call provisions nothing and reports the
+        // ARN of the HSM the first one created.
+        if let Some(existing) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| state.hsm_for_client_token(token))
+        {
+            return Ok(CreateHsmOutput {
+                hsm_arn: Some(existing),
+            });
+        }
+
+        if state.hsms.len() >= crate::state::MAX_HSMS {
+            return Err(CreateHsmErrorModeled::CloudHsmServiceException(
+                CloudHsmServiceException {
+                    message: Some(format!(
+                        "this emulator holds at most {} HSMs: delete one before creating another",
+                        crate::state::MAX_HSMS
+                    )),
+                    retryable: false,
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let seq = state.next_hsm_sequence();
+        let hsm_id = crate::state::hsm_id_for(seq);
+        let arn = crate::state::hsm_arn(&region, &hsm_id);
+        let placement = crate::state::subnet_placement(&input.subnet_id, &region);
+        let created_at = ::std::time::SystemTime::now();
+        let created_epoch = crate::state::epoch_seconds(created_at);
+
+        let record = crate::state::Hsm {
+            hsm_arn: arn.clone(),
+            hsm_id,
+            serial_number: crate::state::serial_number_for(seq),
+            status: crate::state::HSM_STATUS_PENDING.to_string(),
+            // Nothing to report beyond the status itself while provisioning runs.
+            status_details: None,
+            availability_zone: placement.availability_zone,
+            eni_id: crate::state::eni_id_for(seq),
+            eni_ip: Some(
+                input
+                    .eni_ip
+                    .clone()
+                    .unwrap_or_else(|| crate::state::default_eni_ip_for(seq)),
+            ),
+            subnet_id: input.subnet_id.clone(),
+            vpc_id: placement.vpc_id,
+            iam_role_arn: input.iam_role_arn.clone(),
+            external_id: input.external_id.clone(),
+            syslog_ip: input.syslog_ip.clone(),
+            ssh_public_key: input.ssh_key.clone(),
+            ssh_key_last_updated: created_epoch.clone(),
+            subscription_type: input.subscription_type.clone(),
+            subscription_start_date: created_epoch,
+            // The subscription is open-ended until the HSM is deleted.
+            subscription_end_date: None,
+            vendor_name: crate::state::HSM_VENDOR_NAME.to_string(),
+            hsm_type: crate::state::HSM_TYPE.to_string(),
+            software_version: crate::state::HSM_SOFTWARE_VERSION.to_string(),
+            // A `CreateHsm` HSM is uninitialized: no server certificate has been
+            // registered and no partition created on it yet.
+            server_cert_uri: None,
+            server_cert_last_updated: None,
+            partitions: Vec::new(),
+            provisioned_at: created_at + crate::state::PROVISIONING_DELAY,
+        };
+
+        if let Some(token) = input.client_token {
+            state.hsm_client_tokens.insert(token, arn.clone());
+        }
+        state.hsms.insert(arn.clone(), record);
+
+        Ok(CreateHsmOutput { hsm_arn: Some(arn) })
     }
+}
+
+/// The failure for a request mounted on an engine that holds no store for this
+/// service: a server-side fault, reported with the modelled 500 rather than a
+/// fabricated success.
+fn internal_error() -> CreateHsmError {
+    CreateHsmErrorModeled::CloudHsmInternalException(CloudHsmInternalException {
+        message: Some("the CloudHSM store is unavailable".to_string()),
+        retryable: false,
+    })
+    .into()
+}
+
+/// The modelled refusal for a member whose value the model's own constraints cannot
+/// reject. `InvalidRequestException` is what the service answers when "one or more of
+/// the request parameters are not valid"
+/// (`smithy_query(query="shape",shape="InvalidRequestException")`).
+fn invalid_request(member: &str) -> CreateHsmError {
+    CreateHsmErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(format!("{member} must be a valid IPv4 address")),
+        retryable: false,
+    })
+    .into()
 }

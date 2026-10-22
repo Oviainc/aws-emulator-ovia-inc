@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a Profile, persists it, and reports every output member read
+//! back off the persisted record. A repeated `ClientToken` reports the Profile that
+//! token already minted instead of creating a second one.
 //!
 //! ## Shape of an operation
 //!
@@ -93,10 +87,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-route53profiles-route53
 // here — hence the `CreateProfileError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.route53profiles#CreateProfile")]
+// `InternalServiceErrorException` is widened in through `extra_errors`: the SERVICE
+// models it (`AssociateResourceToProfile` declares it) but this operation does not
+// list it, and it is the only server-side failure this handler can hit — the service
+// mounted on an engine that holds no store for it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.route53profiles#CreateProfile",
+    extra_errors = ["InternalServiceErrorException"]
+)]
 #[derive(Debug)]
 pub enum CreateProfileErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    InternalServiceErrorException(InternalServiceErrorException),
     InvalidParameterException(InvalidParameterException),
     LimitExceededException(LimitExceededException),
     ThrottlingException(ThrottlingException),
@@ -154,18 +156,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateProfile"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateProfileErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some(crate::state::NO_STORE.to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // `ClientToken` is `@idempotencyToken`: a repeat of a request already served
+        // reports the SAME Profile instead of creating a second one.
+        if let Some(id) = store.client_tokens.get(&input.client_token).cloned() {
+            if let Some(existing) = store.profiles.get(&id) {
+                return Ok(CreateProfileOutput {
+                    profile: Some(crate::state::profile_shape(existing)),
+                });
+            }
+        }
+
+        // The store is bounded: once it is full a further create is refused with the
+        // operation's own `LimitExceededException` rather than growing the emulator's
+        // heap. Checked AFTER the idempotency lookup, so a repeat of a request already
+        // served still answers from the store at the ceiling.
+        if store.profiles.len() >= crate::state::MAX_PROFILES {
+            return Err(CreateProfileErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The maximum number of Profiles ({}) has already been created.",
+                        crate::state::MAX_PROFILES
+                    )),
+                    resource_type: Some(crate::state::PROFILE_RESOURCE_TYPE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let id = store.mint_profile_id();
+        let now = ::std::time::SystemTime::now();
+        let profile = crate::state::Profile {
+            arn: crate::state::profile_arn(&region, &id),
+            id: id.clone(),
+            name: input.name,
+            owner_id: ::engine::emulator_account_id().to_string(),
+            // A Profile this call creates is empty, so there is nothing left to build:
+            // AWS hands it back in the terminal `COMPLETE` status, with no pending
+            // transition owed.
+            status: crate::state::STATUS_COMPLETE.to_string(),
+            status_message: None,
+            // A freshly created Profile is owned by this account and shared with nobody.
+            share_status: crate::state::SHARE_STATUS_NOT_SHARED.to_string(),
+            creation_time: now,
+            modification_time: now,
+            client_token: input.client_token.clone(),
+        };
+        let arn = profile.arn.clone();
+        store.record_client_token(input.client_token, &id);
+        store.record_tags(&arn, input.tags.unwrap_or_default());
+        // Insert, then report from the record now in the store.
+        let stored = store.profiles.entry(id).or_insert(profile);
+        Ok(CreateProfileOutput {
+            profile: Some(crate::state::profile_shape(stored)),
+        })
     }
 }

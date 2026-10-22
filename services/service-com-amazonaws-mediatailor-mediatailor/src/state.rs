@@ -2,11 +2,275 @@
 
 //! Engine state for the com-amazonaws-mediatailor-mediatailor service.
 
+use std::collections::{BTreeMap, HashMap};
+
+use crate::ops::types::*;
+
+/// The number of playback configurations this emulator will hold at once.
+///
+/// A real account's playback configurations are limited per Region through
+/// Service Quotas. This emulator does not reproduce that figure, so the number
+/// here is CHOSEN: its purpose is that the store cannot grow without bound on
+/// request-chosen names, and that the ceiling is reached through the service's
+/// modelled client error rather than by exhausting memory. Capacity is released
+/// by `DeletePlaybackConfiguration`, as on the real service, and replacing an
+/// existing configuration never consumes more.
+pub const MAX_PLAYBACK_CONFIGURATIONS: usize = 500;
+
+/// The number of tags one resource holds: AWS's documented tagging limit of 50
+/// tags per resource. `PutPlaybackConfiguration` and `TagResource` refuse a
+/// request that would leave a resource above it.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The length of a tag key: AWS's documented tagging limit of 128 characters.
+pub const MAX_TAG_KEY_LENGTH: usize = 128;
+
+/// The length of a tag value: AWS's documented tagging limit of 256 characters.
+pub const MAX_TAG_VALUE_LENGTH: usize = 256;
+
+/// The number of dynamic variables one configuration carries aliases for, and
+/// the number of aliases under one variable.
+///
+/// `ConfigurationAliasesRequest` is a caller-sized map of caller-sized maps and
+/// the model declares no `length` constraint on either, so both figures are
+/// CHOSEN: their purpose is that one stored configuration cannot grow without
+/// bound. They are far above any real configuration's alias set.
+pub const MAX_CONFIGURATION_ALIAS_VARIABLES: usize = 50;
+/// See [`MAX_CONFIGURATION_ALIAS_VARIABLES`].
+pub const MAX_ALIASES_PER_VARIABLE: usize = 100;
+
+/// `AdDecisionServerUrl`'s documented maximum: "The maximum length is 25,000
+/// characters."
+pub const MAX_AD_DECISION_SERVER_URL_LENGTH: usize = 25_000;
+
+/// `VideoContentSourceUrl`'s documented maximum: "The maximum length is 512
+/// characters."
+pub const MAX_VIDEO_CONTENT_SOURCE_URL_LENGTH: usize = 512;
+
+/// The largest page `ListPlaybackConfigurations` serves, and the page size it
+/// applies when the request names none: `MaxResults`' modelled `range 1..100`,
+/// whose maximum is also the documented default ("The default value is 100.").
+/// The handler clamps to it itself rather than relying on boundary validation.
+pub const MAX_PAGE_SIZE: usize = 100;
+
 /// Per-service state for com-amazonaws-mediatailor-mediatailor. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsMediatailorMediatailorState {
-    // TODO: add service-specific state fields
+    /// Every playback configuration this emulator holds, keyed by its `Name` —
+    /// the identifier `PUT /playbackConfiguration` creates it under and every
+    /// other playback-configuration route addresses it by. A `BTreeMap` so
+    /// `ListPlaybackConfigurations` walks the configurations in one stable order
+    /// and a continuation token can name the page boundary.
+    pub playback_configurations: BTreeMap<String, PlaybackConfigurationRecord>,
+    /// The tags of every taggable resource, keyed by resource ARN. This is the
+    /// SINGLE source of truth for tags: `TagResource`/`UntagResource`/
+    /// `ListTagsForResource` read and write it, `PutPlaybackConfiguration` seeds
+    /// it from the request's `Tags`, and the playback-configuration reads render
+    /// their `Tags` member from it — so a tag written through either surface is
+    /// visible through both.
+    pub tags_by_arn: BTreeMap<String, BTreeMap<String, String>>,
 }
+
+impl ComAmazonawsMediatailorMediatailorState {
+    /// The tags of `arn` as the wire shape renders them, or `None` when the
+    /// resource carries no tags (an absent `Tags` member, not an empty object).
+    pub fn tags_of(&self, arn: &str) -> Option<HashMap<String, String>> {
+        self.tags_by_arn
+            .get(arn)
+            .filter(|tags| !tags.is_empty())
+            .map(|tags| {
+                tags.iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            })
+    }
+
+    /// Whether a configuration named `name` can be stored: either it is already
+    /// stored (a replacement, which consumes no further capacity) or the store
+    /// is below [`MAX_PLAYBACK_CONFIGURATIONS`].
+    pub fn can_hold_configuration(&self, name: &str) -> bool {
+        self.playback_configurations.contains_key(name)
+            || self.playback_configurations.len() < MAX_PLAYBACK_CONFIGURATIONS
+    }
+
+    /// Whether `arn` names a resource this emulator currently holds, so the
+    /// tagging operations can refuse an ARN that addresses nothing.
+    ///
+    /// Only the playback configuration is implemented so far; an ARN naming any
+    /// other MediaTailor resource type addresses nothing yet, and an ARN this
+    /// service does not own is not a resource of this service at all.
+    pub fn taggable_resource_exists(&self, arn: &str) -> bool {
+        playback_configuration_name_from_arn(arn)
+            .is_some_and(|name| self.playback_configurations.contains_key(name))
+    }
+}
+
+/// Why a tag set cannot be stored, or `None` when it can.
+///
+/// Checked against the set that WOULD be stored — the replacement set on the
+/// Put path, the merge result on the `TagResource` path — so the stored set is
+/// bounded in both the number of tags and the size of each one however it was
+/// written. The caller words the refusal with its own modelled error.
+pub fn tag_set_violation(tags: &BTreeMap<String, String>) -> Option<String> {
+    if tags.len() > MAX_TAGS_PER_RESOURCE {
+        return Some(format!(
+            "a resource holds at most {MAX_TAGS_PER_RESOURCE} tags, and this request would leave it with {}",
+            tags.len()
+        ));
+    }
+    for (key, value) in tags {
+        if key.chars().count() > MAX_TAG_KEY_LENGTH {
+            return Some(format!(
+                "a tag key is at most {MAX_TAG_KEY_LENGTH} characters: {key}"
+            ));
+        }
+        if value.chars().count() > MAX_TAG_VALUE_LENGTH {
+            return Some(format!(
+                "the value of tag {key} is at most {MAX_TAG_VALUE_LENGTH} characters"
+            ));
+        }
+    }
+    None
+}
+
+/// The configuration name a playback-configuration ARN addresses, or `None`
+/// when `arn` is not a MediaTailor playback-configuration ARN.
+///
+/// The ARN form is the one `PutPlaybackConfiguration` mints:
+/// `arn:aws:mediatailor:<region>:<account>:playbackConfiguration/<Name>`, with
+/// `mediatailor` the service's modelled `arnNamespace`.
+pub fn playback_configuration_name_from_arn(arn: &str) -> Option<&str> {
+    let mut fields = arn.splitn(6, ':');
+    let (Some("arn"), Some(_partition), Some("mediatailor"), Some(_region), Some(_account), Some(resource)) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return None;
+    };
+    resource
+        .strip_prefix("playbackConfiguration/")
+        .filter(|name| !name.is_empty())
+}
+
+/// One persisted playback configuration: the members the request carried, plus
+/// the fields the service derives when it mints the configuration (its ARN and
+/// its playback/session/manifest endpoint prefixes) and the log settings the
+/// logging operations own.
+///
+/// `Tags` is deliberately NOT here: tags live once, in
+/// [`ComAmazonawsMediatailorMediatailorState::tags_by_arn`], keyed by this
+/// record's `arn`.
+#[derive(Debug, Clone, Default)]
+pub struct PlaybackConfigurationRecord {
+    pub name: String,
+    pub arn: String,
+    pub ad_decision_server_url: Option<String>,
+    pub video_content_source_url: Option<String>,
+    pub slate_ad_url: Option<String>,
+    pub transcode_profile_name: Option<String>,
+    pub insertion_mode: String,
+    pub personalization_threshold_seconds: Option<i32>,
+    pub cdn_configuration: Option<CdnConfiguration>,
+    pub dash_configuration: Option<DashConfiguration>,
+    pub hls_configuration: Option<HlsConfiguration>,
+    pub manifest_processing_rules: Option<ManifestProcessingRules>,
+    pub avail_suppression: Option<AvailSuppression>,
+    pub bumper: Option<Bumper>,
+    pub configuration_aliases: Option<HashMap<String, HashMap<String, String>>>,
+    pub live_pre_roll_configuration: Option<LivePreRollConfiguration>,
+    pub ad_conditioning_configuration: Option<AdConditioningConfiguration>,
+    pub ad_decision_server_configuration: Option<AdDecisionServerConfiguration>,
+    pub yield_optimization_configuration: Option<YieldOptimizationConfiguration>,
+    pub function_mapping: Option<HashMap<String, String>>,
+    pub ads_personalization_timeouts: Option<AdsPersonalizationTimeouts>,
+    pub ads_personalization_concurrency: Option<AdsPersonalizationConcurrency>,
+    pub beaconing_configuration: Option<BeaconingConfiguration>,
+    /// Owned by the logging operations, not by `PutPlaybackConfiguration`: a
+    /// later Put over the same name carries it forward unchanged.
+    pub log_configuration: LogConfiguration,
+    pub playback_endpoint_prefix: String,
+    pub dual_stack_playback_endpoint_prefix: String,
+    pub session_initialization_endpoint_prefix: String,
+    pub dual_stack_session_initialization_endpoint_prefix: String,
+}
+
+/// Renders a stored configuration into one of the three identical wire shapes
+/// the model declares for it.
+///
+/// `PutPlaybackConfigurationResponse`, `GetPlaybackConfigurationResponse` and
+/// the `PlaybackConfiguration` list item carry the SAME member set, so every
+/// one of them is the stored record viewed through a different generated
+/// struct. Implementing one rendering for all three is what keeps the Put
+/// response, the Get response and the list item from drifting apart.
+pub trait PlaybackConfigurationView: Sized {
+    fn from_record(
+        record: &PlaybackConfigurationRecord,
+        tags: Option<HashMap<String, String>>,
+    ) -> Self;
+}
+
+macro_rules! impl_playback_configuration_view {
+    ($($shape:ty),+ $(,)?) => {
+        $(impl PlaybackConfigurationView for $shape {
+            fn from_record(
+                record: &PlaybackConfigurationRecord,
+                tags: Option<HashMap<String, String>>,
+            ) -> Self {
+                Self {
+                    name: Some(record.name.clone()),
+                    playback_configuration_arn: Some(record.arn.clone()),
+                    ad_decision_server_url: record.ad_decision_server_url.clone(),
+                    video_content_source_url: record.video_content_source_url.clone(),
+                    slate_ad_url: record.slate_ad_url.clone(),
+                    transcode_profile_name: record.transcode_profile_name.clone(),
+                    insertion_mode: record.insertion_mode.clone(),
+                    personalization_threshold_seconds: record.personalization_threshold_seconds,
+                    cdn_configuration: record.cdn_configuration.clone(),
+                    dash_configuration: record.dash_configuration.clone(),
+                    hls_configuration: record.hls_configuration.clone(),
+                    manifest_processing_rules: record.manifest_processing_rules.clone(),
+                    avail_suppression: record.avail_suppression.clone(),
+                    bumper: record.bumper.clone(),
+                    configuration_aliases: record.configuration_aliases.clone(),
+                    live_pre_roll_configuration: record.live_pre_roll_configuration.clone(),
+                    ad_conditioning_configuration: record.ad_conditioning_configuration.clone(),
+                    ad_decision_server_configuration: record
+                        .ad_decision_server_configuration
+                        .clone(),
+                    yield_optimization_configuration: record
+                        .yield_optimization_configuration
+                        .clone(),
+                    function_mapping: record.function_mapping.clone(),
+                    ads_personalization_timeouts: record.ads_personalization_timeouts.clone(),
+                    ads_personalization_concurrency: record.ads_personalization_concurrency.clone(),
+                    beaconing_configuration: record.beaconing_configuration.clone(),
+                    log_configuration: Some(record.log_configuration.clone()),
+                    playback_endpoint_prefix: Some(record.playback_endpoint_prefix.clone()),
+                    dual_stack_playback_endpoint_prefix: Some(
+                        record.dual_stack_playback_endpoint_prefix.clone(),
+                    ),
+                    session_initialization_endpoint_prefix: Some(
+                        record.session_initialization_endpoint_prefix.clone(),
+                    ),
+                    dual_stack_session_initialization_endpoint_prefix: Some(
+                        record.dual_stack_session_initialization_endpoint_prefix.clone(),
+                    ),
+                    tags,
+                }
+            }
+        })+
+    };
+}
+
+impl_playback_configuration_view!(
+    PutPlaybackConfigurationOutput,
+    GetPlaybackConfigurationOutput,
+    PlaybackConfiguration,
+);
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateThingShadow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateThingShadow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateThingShadow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Merges one update into the stored shadow document and answers with the document
+//! that merge produced: `state.desired` / `state.reported` as merged, a derived
+//! `state.delta`, the per-leaf `metadata`, the incremented `version` and the accepted
+//! `timestamp`. Never the request echoed back.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +155,188 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateThingShadow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateThingShadowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateThingShadow"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateThingShadowErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the thing-shadow store is unavailable".to_string()),
+            })
+        })?;
+
+        if input.payload.len() > crate::state::MAX_SHADOW_DOCUMENT_BYTES {
+            return Err(UpdateThingShadowErrorModeled::RequestEntityTooLargeException(
+                RequestEntityTooLargeException {
+                    message: Some(format!(
+                        "the state document is {} bytes; the maximum state document size is {} bytes",
+                        input.payload.len(),
+                        crate::state::MAX_SHADOW_DOCUMENT_BYTES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A shadow document is UTF-8 JSON. Bytes that are not UTF-8 at all are an
+        // encoding this service does not support (415); bytes that are UTF-8 but not a
+        // well-formed state document are an invalid request (400).
+        let text = ::std::str::from_utf8(&input.payload).map_err(|error| {
+            UpdateThingShadowErrorModeled::UnsupportedDocumentEncodingException(
+                UnsupportedDocumentEncodingException {
+                    message: Some(format!(
+                        "the state document must be UTF-8 encoded JSON: {error}"
+                    )),
+                },
+            )
+        })?;
+        let document: ::serde_json::Value = ::serde_json::from_str(text).map_err(|error| {
+            UpdateThingShadowErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(format!("the state document is not valid JSON: {error}")),
+            })
+        })?;
+        let document = document.as_object().ok_or_else(|| {
+            UpdateThingShadowErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some("the state document must be a JSON object".to_string()),
+            })
+        })?;
+
+        let state_node = document
+            .get("state")
+            .and_then(::serde_json::Value::as_object)
+            .ok_or_else(|| {
+                UpdateThingShadowErrorModeled::InvalidRequestException(InvalidRequestException {
+                    message: Some(
+                        "the state document must carry a 'state' object naming 'desired' \
+                         and/or 'reported'"
+                            .to_string(),
+                    ),
+                })
+            })?;
+        // `delta` is derived by the service from the other two, so a client may only
+        // write `desired` and `reported`.
+        if let Some(unknown) = state_node
+            .keys()
+            .find(|key| key.as_str() != "desired" && key.as_str() != "reported")
+        {
+            return Err(UpdateThingShadowErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "the 'state' node may only carry 'desired' and 'reported', not '{unknown}'"
+                    )),
+                },
+            )
+            .into());
+        }
+        let desired = state_node.get("desired");
+        let reported = state_node.get("reported");
+        if desired.is_none() && reported.is_none() {
+            return Err(UpdateThingShadowErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(
+                        "the 'state' node must carry 'desired' and/or 'reported'".to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+        for (name, section) in [("desired", desired), ("reported", reported)] {
+            if section.is_some_and(|section| !section.is_object()) {
+                return Err(UpdateThingShadowErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(format!("the '{name}' node must be a JSON object")),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // An update may carry the version it expects to be updating, which makes the
+        // write conditional on nobody having updated the document since.
+        let expected_version = match document.get("version") {
+            None | Some(::serde_json::Value::Null) => None,
+            Some(version) => Some(version.as_i64().ok_or_else(|| {
+                UpdateThingShadowErrorModeled::InvalidRequestException(InvalidRequestException {
+                    message: Some("the 'version' node must be a number".to_string()),
+                })
+            })?),
+        };
+
+        let key = crate::state::shadow_key(&input.thing_name, input.shadow_name.as_deref());
+        let mut guard = state.lock();
+        // A shadow that does not exist yet is at version 0, so its first update may
+        // state `version: 0` and any other expectation conflicts.
+        let stored_version = guard.shadows.get(&key).map_or(0, |shadow| shadow.version);
+        if let Some(expected) = expected_version {
+            if expected != stored_version {
+                return Err(UpdateThingShadowErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(format!(
+                            "the update expects version {expected} but the document is at \
+                             version {stored_version}"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Both halves of the key come from the request, so a caller must not be able
+        // to name a new shadow per call forever. An update of a shadow that is
+        // already stored never trips this; deleting one frees the slot.
+        if !guard.shadows.contains_key(&key) && guard.shadows.len() >= crate::state::MAX_SHADOWS {
+            return Err(UpdateThingShadowErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "this emulator stores at most {} shadow documents; delete a shadow \
+                         before creating another",
+                        crate::state::MAX_SHADOWS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The merge is applied to a COPY first: the state-document quota bounds the
+        // ACCUMULATED document, not one request, so an update whose result would
+        // exceed it has to be refused without having changed what is stored.
+        let timestamp_secs = crate::state::now_secs();
+        let mut merged = guard.shadows.get(&key).cloned().unwrap_or_default();
+        merged.apply(desired, reported, timestamp_secs);
+        merged.version = stored_version + 1;
+        merged.timestamp_secs = timestamp_secs;
+        let accepted = merged.document();
+        let state_bytes = accepted
+            .get("state")
+            .map_or(0, |state| state.to_string().len());
+        if state_bytes > crate::state::MAX_SHADOW_DOCUMENT_BYTES {
+            return Err(UpdateThingShadowErrorModeled::RequestEntityTooLargeException(
+                RequestEntityTooLargeException {
+                    message: Some(format!(
+                        "the update would leave a state document of {state_bytes} bytes; the \
+                         maximum state document size is {} bytes",
+                        crate::state::MAX_SHADOW_DOCUMENT_BYTES
+                    )),
+                },
+            )
+            .into());
+        }
+        let serialized =
+            ::serde_json::to_vec(&accepted).expect("a shadow document serializes to JSON");
+        if serialized.len() > crate::state::MAX_STORED_SHADOW_BYTES {
+            return Err(UpdateThingShadowErrorModeled::RequestEntityTooLargeException(
+                RequestEntityTooLargeException {
+                    message: Some(format!(
+                        "the update would leave a stored document of {} bytes; the maximum \
+                         stored document size is {} bytes",
+                        serialized.len(),
+                        crate::state::MAX_STORED_SHADOW_BYTES
+                    )),
+                },
+            )
+            .into());
+        }
+        guard.shadows.insert(key, merged);
+
+        Ok(UpdateThingShadowOutput {
+            payload: Some(serialized),
+        })
     }
 }

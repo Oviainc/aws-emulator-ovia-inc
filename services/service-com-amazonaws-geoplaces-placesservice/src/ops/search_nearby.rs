@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SearchNearby
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SearchNearby`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SearchNearby::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Searches the seeded place catalog in [`crate::state`] around a position and
+//! pages the matches nearest first — the same records GetPlace, Geocode,
+//! ReverseGeocode and SearchText answer from.
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +179,228 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SearchNearby` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchNearbyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SearchNearby"))
+        // `ctx` carries request metadata only; this operation reads none of it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(SearchNearbyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Geo Places catalog is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // Modeled input constraints, enforced here too so an in-process caller is
+        // held to the same contract as a client on the wire.
+        for invalid in [
+            crate::state::check_max_results(input.max_results),
+            crate::state::check_query_radius(input.query_radius),
+            crate::state::check_language(input.language.as_deref()),
+            crate::state::check_political_view(input.political_view.as_deref()),
+        ] {
+            if let Err(invalid) = invalid {
+                return Err(SearchNearbyErrorModeled::ValidationException(invalid).into());
+            }
+        }
+
+        // The modeled `len 2..2` is refused at the boundary; this keeps an
+        // in-process caller to the same contract instead of guessing a position.
+        let Some(query_position) = crate::state::position(&input.query_position) else {
+            return Err(SearchNearbyErrorModeled::ValidationException(
+                crate::state::validation_exception(
+                    crate::state::REASON_FIELD_VALIDATION_FAILED,
+                    "QueryPosition",
+                    "QueryPosition must hold exactly two values, [longitude, latitude]",
+                ),
+            )
+            .into());
+        };
+
+        // With a radius, every place within it; without one, no distance bound — so
+        // the nearest places, up to `MaxResults`.
+        let mut candidates = state.nearby(query_position, input.query_radius);
+
+        let filter = input.filter.as_ref();
+        if let Some(values) = filter.and_then(|filter| filter.bounding_box.as_deref()) {
+            let Some(area) = crate::state::bounding_box(values) else {
+                return Err(SearchNearbyErrorModeled::ValidationException(
+                    crate::state::validation_exception(
+                        crate::state::REASON_FIELD_VALIDATION_FAILED,
+                        "Filter.BoundingBox",
+                        "BoundingBox must hold exactly four values, \
+                         [west, south, east, north]",
+                    ),
+                )
+                .into());
+            };
+            candidates.retain(|candidate| state.places[candidate.index].within_bounding_box(area));
+        }
+        if let Some(filter) = filter {
+            // Each inclusion list keeps only the places it names; each exclusion list
+            // drops the places it names.
+            if let Some(countries) = crate::state::non_empty(filter.include_countries.as_deref()) {
+                candidates
+                    .retain(|candidate| state.places[candidate.index].in_countries(countries));
+            }
+            if let Some(categories) =
+                crate::state::non_empty(filter.include_categories.as_deref())
+            {
+                candidates
+                    .retain(|candidate| state.places[candidate.index].has_category(categories));
+            }
+            if let Some(categories) =
+                crate::state::non_empty(filter.exclude_categories.as_deref())
+            {
+                candidates
+                    .retain(|candidate| !state.places[candidate.index].has_category(categories));
+            }
+            if let Some(chains) =
+                crate::state::non_empty(filter.include_business_chains.as_deref())
+            {
+                candidates
+                    .retain(|candidate| state.places[candidate.index].has_business_chain(chains));
+            }
+            if let Some(chains) =
+                crate::state::non_empty(filter.exclude_business_chains.as_deref())
+            {
+                candidates
+                    .retain(|candidate| !state.places[candidate.index].has_business_chain(chains));
+            }
+            if let Some(food_types) =
+                crate::state::non_empty(filter.include_food_types.as_deref())
+            {
+                candidates
+                    .retain(|candidate| state.places[candidate.index].has_food_type(food_types));
+            }
+            if let Some(food_types) =
+                crate::state::non_empty(filter.exclude_food_types.as_deref())
+            {
+                candidates
+                    .retain(|candidate| !state.places[candidate.index].has_food_type(food_types));
+            }
+        }
+
+        // A `NextToken` belongs to the query that issued it, so the query travels
+        // inside the token as a fingerprint.
+        let fingerprint = crate::state::query_fingerprint(&[
+            (
+                "QueryPosition",
+                format!("{},{}", query_position[0], query_position[1]),
+            ),
+            (
+                "QueryRadius",
+                input
+                    .query_radius
+                    .map(|radius| radius.to_string())
+                    .unwrap_or_default(),
+            ),
+            (
+                "Filter",
+                filter.map(filter_fingerprint).unwrap_or_default(),
+            ),
+        ]);
+
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                match crate::state::decode_page_token(token, Self::NAME, &fingerprint) {
+                    Some(offset) => offset,
+                    None => {
+                        return Err(SearchNearbyErrorModeled::ValidationException(
+                            crate::state::validation_exception(
+                                crate::state::REASON_CANNOT_PARSE,
+                                "NextToken",
+                                "NextToken is not a pagination token issued by a previous \
+                                 SearchNearby call with the same parameters",
+                            ),
+                        )
+                        .into())
+                    }
+                }
+            }
+        };
+
+        let page_size = input
+            .max_results
+            .unwrap_or(crate::state::DEFAULT_MAX_RESULTS)
+            .clamp(1, crate::state::MAX_RESULTS_CEILING) as usize;
+        let page = crate::state::take_page(
+            Self::NAME,
+            &fingerprint,
+            &candidates,
+            offset,
+            page_size,
+        );
+
+        let features = input.additional_features.as_deref().unwrap_or_default();
+        let wants = |feature: &str| features.iter().any(|asked| asked == feature);
+        let political_view = match state.political_view(input.political_view.as_deref()) {
+            Ok(political_view) => political_view,
+            Err(invalid) => {
+                return Err(SearchNearbyErrorModeled::ValidationException(invalid).into())
+            }
+        };
+
+        let result_items = page
+            .items
+            .iter()
+            .map(|candidate| {
+                let place = &state.places[candidate.index];
+                SearchNearbyResultItem {
+                    place_id: place.place_id.clone(),
+                    place_type: place.place_type.clone(),
+                    title: place.title.clone(),
+                    address: Some(place.address.to_modeled()),
+                    position: Some(place.position_modeled()),
+                    distance: candidate.distance,
+                    map_view: Some(place.map_view_modeled()),
+                    categories: place.categories_modeled(),
+                    food_types: place.food_types_modeled(),
+                    business_chains: place.business_chains_modeled(),
+                    opening_hours: place.opening_hours_modeled(),
+                    // An additional feature is reported only when the request asks
+                    // for it.
+                    contacts: wants(crate::state::FEATURE_CONTACT)
+                        .then(|| place.contacts_modeled())
+                        .flatten(),
+                    access_points: wants(crate::state::FEATURE_ACCESS)
+                        .then(|| place.access_points_modeled())
+                        .flatten(),
+                    time_zone: wants(crate::state::FEATURE_TIME_ZONE)
+                        .then(|| place.time_zone_modeled())
+                        .flatten(),
+                    political_view: political_view.clone(),
+                    ..SearchNearbyResultItem::default()
+                }
+            })
+            .collect();
+
+        Ok(SearchNearbyOutput {
+            pricing_bucket: state.pricing_bucket(Self::NAME, input.intended_use.as_deref()),
+            result_items: Some(result_items),
+            next_token: page.next_token,
+        })
     }
+}
+
+/// The filter, canonicalized for the page token's fingerprint: one entry per
+/// dimension the filter declares, in the order the model declares them.
+fn filter_fingerprint(filter: &SearchNearbyFilter) -> String {
+    let dimension = |values: Option<&Vec<String>>| values.cloned().unwrap_or_default().join(",");
+    [
+        dimension(filter.include_countries.as_ref()),
+        dimension(filter.include_categories.as_ref()),
+        dimension(filter.exclude_categories.as_ref()),
+        dimension(filter.include_business_chains.as_ref()),
+        dimension(filter.exclude_business_chains.as_ref()),
+        dimension(filter.include_food_types.as_ref()),
+        dimension(filter.exclude_food_types.as_ref()),
+        filter
+            .bounding_box
+            .as_ref()
+            .map(|values| values.iter().map(f64::to_string).collect::<Vec<_>>().join(","))
+            .unwrap_or_default(),
+    ]
+    .join("|")
 }

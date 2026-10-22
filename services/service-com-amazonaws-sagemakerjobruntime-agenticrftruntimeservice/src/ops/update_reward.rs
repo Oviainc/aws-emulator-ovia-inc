@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateReward
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateReward`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateReward::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -127,6 +118,25 @@ impl From<UpdateRewardErrorModeled> for UpdateRewardError {
 /// [`smithy_server_runtime::Operation`]. Generic over the engine type `Eng`, so this
 /// crate names no concrete engine type: a migrated service that needs state picks a
 /// concrete engine where it mounts the service, not here.
+/// This operation's own modelled 409 `ConflictException`.
+fn conflict(message: String) -> UpdateRewardError {
+    UpdateRewardErrorModeled::ConflictException(ConflictException { message }).into()
+}
+
+/// Whether two reward lists are the same submission.
+///
+/// Compared on the bit pattern of each score so the comparison is total: two
+/// lists are the same submission when they are the same length and every score
+/// is bit-identical, which keeps a replayed list with a `NaN` score equal to
+/// itself.
+fn same_rewards(recorded: &[f64], requested: &[f64]) -> bool {
+    recorded.len() == requested.len()
+        && recorded
+            .iter()
+            .zip(requested)
+            .all(|(left, right)| left.to_bits() == right.to_bits())
+}
+
 pub struct UpdateReward<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
@@ -157,18 +167,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateReward` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRewardErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateReward"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateRewardErrorModeled::InternalServiceError(InternalServiceError {
+                    message: "the AgenticRFT runtime emulator has no state store".to_string(),
+                })
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+        let Some(trajectory) = guard.trajectory_mut(&input.job_arn, &input.trajectory_id) else {
+            return Err(UpdateRewardErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "Trajectory {} was not found for job {}.",
+                        input.trajectory_id, input.job_arn
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // "Call this operation after CompleteRollout": a trajectory that has not
+        // been sealed is not eligible for reward submission yet.
+        let Some(completion_status) = trajectory.completion_status else {
+            return Err(conflict(format!(
+                "Trajectory {} is in {} status; call CompleteRollout before UpdateReward.",
+                input.trajectory_id,
+                trajectory.status.as_str()
+            )));
+        };
+        // Only the `ready` terminal status is "sealed and eligible for reward
+        // submission"; `failed` is "a terminal state, no further processing".
+        if !completion_status.accepts_reward() {
+            return Err(conflict(format!(
+                "Trajectory {} was completed with Status {}, which is terminal and accepts no \
+                 rewards.",
+                input.trajectory_id,
+                completion_status.as_str()
+            )));
+        }
+
+        match &trajectory.rewards {
+            // Not rewarded yet: record the scores and transition the trajectory to
+            // reward-received status.
+            None => {
+                trajectory.rewards = Some(input.rewards.clone());
+                trajectory.status = crate::state::TrajectoryStatus::RewardReceived;
+                trajectory.update_reward_token = input.client_token.clone();
+                trajectory.updated_at = now;
+                Ok(UpdateRewardOutput {})
+            }
+            // `@idempotent`: resubmitting the SAME scores changes nothing and
+            // succeeds again.
+            Some(recorded) if same_rewards(recorded, &input.rewards) => Ok(UpdateRewardOutput {}),
+            // Anything that would CHANGE the recorded scores conflicts with the
+            // trajectory's current state.
+            Some(recorded) => Err(conflict(format!(
+                "Trajectory {} is already in {} status with {} reward value(s); they cannot be \
+                 replaced with {} value(s).",
+                input.trajectory_id,
+                trajectory.status.as_str(),
+                recorded.len(),
+                input.rewards.len()
+            ))),
+        }
     }
 }

@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op Query
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `Query`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reads the items of one partition out of the stored table, in sort
+//! key order (descending when `ScanIndexForward=false`), with `Count`/`ScannedCount`
+//! and `LastEvaluatedKey` computed from the result.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`Query::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The key conditions come either from `KeyConditionExpression` (with
+//! `ExpressionAttributeNames`/`ExpressionAttributeValues`) or from the legacy
+//! `KeyConditions` map: both reduce to equality on the partition key optionally
+//! ANDed with one `=`/`<`/`<=`/`>`/`>=`/`BETWEEN`/`begins_with` comparison on the
+//! sort key. The expression grammar is parsed here — it is DynamoDB's own, so there
+//! is no third-party parser for it — by [`parse_key_condition_expression`].
+//!
+//! Secondary indexes, result filters (`FilterExpression`, `QueryFilter`) and
+//! projections are refused with the scaffold's 501 and filed as their own gap
+//! issues. `ConsistentRead` needs no handling beyond its effect on
+//! `ConsumedCapacity`: this store has one copy of each item.
+//!
+//! Every size a request can choose here is bounded: the expression's length, token
+//! count and parenthesis nesting (see [`tokenize`] and [`Parser`]), and the page the
+//! response carries ([`MAX_PAGE_BYTES`]), so one `Query` cannot drive unbounded work
+//! or an unbounded response.
 //!
 //! ## Shape of an operation
 //!
@@ -317,18 +328,710 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `Query` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(QueryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("Query"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
+
+        if let Some(member) = unsupported_member(&input) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "Query with {member}"
+            )));
+        }
+        // "ALL_ATTRIBUTES - Returns all of the item attributes from the specified
+        // table" is the default for a table query; COUNT "returns the number of
+        // matching items, rather than the matching items themselves"
+        // (`Query$Select`). The projected forms need an index or a projection, which
+        // this slice does not serve.
+        let count_only = match input.select.as_deref() {
+            None | Some("ALL_ATTRIBUTES") => false,
+            Some("COUNT") => true,
+            Some(other) => {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                    "Query with Select {other}"
+                )))
+            }
+        };
+
+        let comparisons = key_comparisons(&input).map_err(lift)?;
+
+        let mut store = state.lock();
+        store.apply_due_transitions(now);
+        let table = store.active_table(&name, now).map_err(lift)?;
+        let condition = KeyCondition::resolve(table, comparisons).map_err(lift)?;
+
+        // One partition's items are contiguous in the store and already in sort-key
+        // order, so this is a range scan rather than a table walk.
+        let lower = crate::state::ItemKey {
+            partition: condition.partition.clone(),
+            sort: None,
+        };
+        let mut matched: Vec<(&crate::state::ItemKey, &crate::state::Item)> = Vec::new();
+        for (key, item) in table.items.range(lower..) {
+            if key.partition != condition.partition {
+                break;
+            }
+            if condition.matches(key).map_err(lift)? {
+                matched.push((key, item));
+            }
+        }
+
+        let forward = input.scan_index_forward.unwrap_or(true);
+        if !forward {
+            matched.reverse();
+        }
+        if let Some(start) = input.exclusive_start_key.as_ref() {
+            let resumed = table.key_of_key_map(start).map_err(lift)?;
+            if resumed.partition != condition.partition {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "The provided starting key does not match the key condition's partition key",
+                ));
+            }
+            // "Use this value to start a new operation, EXCLUDING this value in the
+            // new request" (`Query$LastEvaluatedKey`): resume strictly after the key
+            // the previous page stopped on, in the direction being scanned.
+            matched.retain(|(key, _)| {
+                if forward {
+                    **key > resumed
+                } else {
+                    **key < resumed
+                }
+            });
+        }
+
+        // The page stops at the caller's `Limit`, and in any case at the service's
+        // own 1 MB page budget: "A single Query operation can retrieve a maximum of
+        // 1 MB of data" (`Query$Limit`'s doc and "Paginating table query results").
+        // A request that names no Limit therefore cannot pull a whole partition into
+        // one response, and the page is bounded BEFORE any item is cloned.
+        let available = matched.len();
+        let limit = input
+            .limit
+            .map_or(available, |limit| usize::try_from(limit).unwrap_or(0));
+        let mut page_size: i64 = 0;
+        let mut page = 0usize;
+        for (_, item) in matched.iter().take(limit) {
+            // The first item always fits, the way DynamoDB always returns at least
+            // one item it found.
+            if page > 0 && page_size >= MAX_PAGE_BYTES {
+                break;
+            }
+            page_size = page_size.saturating_add(crate::state::item_size(item));
+            page += 1;
+        }
+        let truncated = available > page;
+        matched.truncate(page);
+
+        let last_evaluated_key = if truncated {
+            matched.last().map(|(_, item)| table.key_attributes(item))
+        } else {
+            None
+        };
+        let items: Vec<crate::state::Item> =
+            matched.iter().map(|(_, item)| (*item).clone()).collect();
+        // Nothing is filtered out after the key conditions (FilterExpression is not
+        // served here), so every item examined is an item returned: "If you did not
+        // use a filter in the request, then Count and ScannedCount are the same"
+        // (`Query$Count`).
+        let count = i32::try_from(items.len()).unwrap_or(i32::MAX);
+
+        Ok(QueryOutput {
+            items: if count_only { None } else { Some(items) },
+            count,
+            scanned_count: count,
+            last_evaluated_key,
+            consumed_capacity: crate::state::consumed_capacity(
+                input.return_consumed_capacity.as_deref(),
+                &name,
+                crate::state::read_capacity_units(
+                    page_size,
+                    input.consistent_read.unwrap_or(false),
+                ),
+            ),
+        })
+    }
+}
+
+/// The most data one page of a `Query` response carries: "A single Query operation
+/// can retrieve a maximum of 1 MB of data" (`Query$Limit` and "Paginating table query
+/// results"). A page that stops here reports a `LastEvaluatedKey`, so the caller
+/// pages on, and one request cannot amplify into a response the size of a partition.
+const MAX_PAGE_BYTES: i64 = 1024 * 1024;
+
+/// The most a `KeyConditionExpression` may carry: "Maximum length of any expression
+/// string is 4 KB" ("Service, Account, and Table Quotas"), and derived ceilings on
+/// the tokens and the parenthesis nesting that 4 KB can express. All three are the
+/// bound on the work one request can ask the parser below for.
+const MAX_EXPRESSION_BYTES: usize = 4096;
+const MAX_EXPRESSION_TOKENS: usize = 1024;
+const MAX_EXPRESSION_DEPTH: usize = 16;
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> QueryError {
+    QueryErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// Lift a store refusal into this operation's error channel.
+fn lift(error: crate::state::RequestError) -> QueryError {
+    match error {
+        crate::state::RequestError::NotFound(message) => {
+            QueryErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(message),
+            })
+            .into()
+        }
+        crate::state::RequestError::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
+    }
+}
+
+/// The first input member present that this slice does not serve, if any.
+fn unsupported_member(input: &QueryInput) -> Option<&'static str> {
+    if input.index_name.is_some() {
+        return Some("IndexName");
+    }
+    if input.filter_expression.is_some() {
+        return Some("FilterExpression");
+    }
+    if input.query_filter.as_ref().is_some_and(|map| !map.is_empty()) {
+        return Some("QueryFilter");
+    }
+    if input.projection_expression.is_some() {
+        return Some("ProjectionExpression");
+    }
+    if input
+        .attributes_to_get
+        .as_ref()
+        .is_some_and(|names| !names.is_empty())
+    {
+        return Some("AttributesToGet");
+    }
+    None
+}
+
+/// A comparison one key condition makes against one attribute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Operator {
+    Equal,
+    LessThan,
+    LessOrEqual,
+    GreaterThan,
+    GreaterOrEqual,
+    Between,
+    BeginsWith,
+}
+
+impl Operator {
+    /// How the condition reads in an expression, for a refusal message.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Equal => "=",
+            Self::LessThan => "<",
+            Self::LessOrEqual => "<=",
+            Self::GreaterThan => ">",
+            Self::GreaterOrEqual => ">=",
+            Self::Between => "BETWEEN",
+            Self::BeginsWith => "begins_with",
+        }
+    }
+
+    /// The number of operands the condition takes.
+    fn operands(self) -> usize {
+        if self == Self::Between {
+            2
+        } else {
+            1
+        }
+    }
+}
+
+/// One resolved key condition: an attribute, a comparison, and its operand values.
+#[derive(Debug, Clone)]
+struct Comparison {
+    attribute: String,
+    operator: Operator,
+    operands: Vec<AttributeValue>,
+}
+
+/// The key conditions a `Query` runs, encoded against the table's key schema.
+struct KeyCondition {
+    partition: crate::state::AttributeValueKey,
+    sort: Option<(Operator, Vec<crate::state::AttributeValueKey>)>,
+}
+
+impl KeyCondition {
+    /// Bind the comparisons to the table's key attributes: exactly one equality on
+    /// the partition key, and at most one comparison on the sort key.
+    fn resolve(
+        table: &crate::state::Table,
+        comparisons: Vec<Comparison>,
+    ) -> Result<Self, crate::state::RequestError> {
+        let partition_name = table.partition_key_name().to_string();
+        let sort_name = table.sort_key_name().map(ToString::to_string);
+        let mut partition = None;
+        let mut sort = None;
+        for comparison in comparisons {
+            if comparison.operands.len() != comparison.operator.operands() {
+                return Err(crate::state::RequestError::Validation(format!(
+                    "Invalid key condition: {} on {} takes {} value(s), got {}",
+                    comparison.operator.as_str(),
+                    comparison.attribute,
+                    comparison.operator.operands(),
+                    comparison.operands.len()
+                )));
+            }
+            let encoded = comparison
+                .operands
+                .iter()
+                .map(|value| table.key_value(&comparison.attribute, value))
+                .collect::<Result<Vec<_>, _>>()?;
+            if comparison.attribute == partition_name {
+                if comparison.operator != Operator::Equal {
+                    return Err(crate::state::RequestError::Validation(format!(
+                        "Query key condition not supported: the partition key {partition_name} \
+                         must be compared with =, not {}",
+                        comparison.operator.as_str()
+                    )));
+                }
+                if partition.is_some() {
+                    return Err(crate::state::RequestError::Validation(format!(
+                        "Invalid key condition: the partition key {partition_name} is \
+                         constrained more than once"
+                    )));
+                }
+                partition = encoded.into_iter().next();
+            } else if Some(comparison.attribute.as_str()) == sort_name.as_deref() {
+                if sort.is_some() {
+                    return Err(crate::state::RequestError::Validation(format!(
+                        "Invalid key condition: the sort key {} is constrained more than once",
+                        comparison.attribute
+                    )));
+                }
+                sort = Some((comparison.operator, encoded));
+            } else {
+                return Err(crate::state::RequestError::Validation(format!(
+                    "Query key condition not supported: {} is not a key attribute of this table",
+                    comparison.attribute
+                )));
+            }
+        }
+        let partition = partition.ok_or_else(|| {
+            crate::state::RequestError::Validation(format!(
+                "Query key condition not supported: the partition key {partition_name} must be \
+                 constrained with ="
+            ))
+        })?;
+        Ok(Self { partition, sort })
+    }
+
+    /// Whether a stored key satisfies the sort-key comparison (its partition is
+    /// already known to match).
+    fn matches(&self, key: &crate::state::ItemKey) -> Result<bool, crate::state::RequestError> {
+        let Some((operator, operands)) = self.sort.as_ref() else {
+            return Ok(true);
+        };
+        let Some(actual) = key.sort.as_ref() else {
+            return Ok(false);
+        };
+        let first = &operands[0];
+        Ok(match operator {
+            Operator::Equal => actual == first,
+            Operator::LessThan => actual < first,
+            Operator::LessOrEqual => actual <= first,
+            Operator::GreaterThan => actual > first,
+            Operator::GreaterOrEqual => actual >= first,
+            Operator::Between => actual >= first && actual <= &operands[1],
+            Operator::BeginsWith => begins_with(actual, first)?,
+        })
+    }
+}
+
+/// `begins_with (sortKeyName, :sortkeyval)` — "true if the sort key value begins
+/// with a particular operand" (`Query$KeyConditionExpression`). A prefix is only
+/// meaningful for a string or binary sort key.
+fn begins_with(
+    actual: &crate::state::AttributeValueKey,
+    prefix: &crate::state::AttributeValueKey,
+) -> Result<bool, crate::state::RequestError> {
+    match (actual, prefix) {
+        (crate::state::AttributeValueKey::S(value), crate::state::AttributeValueKey::S(prefix)) => {
+            Ok(value.starts_with(prefix.as_str()))
+        }
+        (crate::state::AttributeValueKey::B(value), crate::state::AttributeValueKey::B(prefix)) => {
+            Ok(value.starts_with(prefix.as_slice()))
+        }
+        _ => Err(crate::state::RequestError::Validation(
+            "Invalid operator used in KeyConditionExpression: begins_with requires a string or \
+             binary sort key"
+                .to_string(),
+        )),
+    }
+}
+
+/// The key conditions this request states, from `KeyConditionExpression` or from the
+/// legacy `KeyConditions` map — "Either the KeyConditions or KeyConditionExpression
+/// parameter must be specified", and never both.
+fn key_comparisons(input: &QueryInput) -> Result<Vec<Comparison>, crate::state::RequestError> {
+    let legacy = input
+        .key_conditions
+        .as_ref()
+        .filter(|conditions| !conditions.is_empty());
+    match (input.key_condition_expression.as_deref(), legacy) {
+        (Some(_), Some(_)) => Err(crate::state::RequestError::Validation(
+            "Can not use both KeyConditions and KeyConditionExpression in one request".to_string(),
+        )),
+        (Some(expression), None) => parse_key_condition_expression(
+            expression,
+            input.expression_attribute_names.as_ref(),
+            input.expression_attribute_values.as_ref(),
+        ),
+        (None, Some(conditions)) => conditions
+            .iter()
+            .map(|(attribute, condition)| legacy_comparison(attribute, condition))
+            .collect(),
+        (None, None) => Err(crate::state::RequestError::Validation(
+            "Either the KeyConditions or KeyConditionExpression parameter must be specified"
+                .to_string(),
+        )),
+    }
+}
+
+/// One entry of the legacy `KeyConditions` map. "For KeyConditions, only the
+/// following comparison operators are supported: EQ | LE | LT | GE | GT |
+/// BEGINS_WITH | BETWEEN" (the `Condition` doc).
+fn legacy_comparison(
+    attribute: &str,
+    condition: &Condition,
+) -> Result<Comparison, crate::state::RequestError> {
+    let operator = match condition.comparison_operator.as_str() {
+        "EQ" => Operator::Equal,
+        "LT" => Operator::LessThan,
+        "LE" => Operator::LessOrEqual,
+        "GT" => Operator::GreaterThan,
+        "GE" => Operator::GreaterOrEqual,
+        "BETWEEN" => Operator::Between,
+        "BEGINS_WITH" => Operator::BeginsWith,
+        other => {
+            return Err(crate::state::RequestError::Validation(format!(
+                "Unsupported operator on KeyConditions: {other} must be one of EQ, LE, LT, GE, \
+                 GT, BEGINS_WITH or BETWEEN"
+            )))
+        }
+    };
+    Ok(Comparison {
+        attribute: attribute.to_string(),
+        operator,
+        operands: condition.attribute_value_list.clone().unwrap_or_default(),
+    })
+}
+
+/// One lexical token of a key condition expression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Token {
+    /// An attribute name, either written out or an `#alias` placeholder.
+    Name(String),
+    /// A `:placeholder` for an `ExpressionAttributeValues` entry.
+    Value(String),
+    Compare(Operator),
+    And,
+    Between,
+    BeginsWith,
+    Open,
+    Close,
+    Comma,
+}
+
+/// Split a key condition expression into tokens.
+///
+/// The expression is caller-supplied, so its size is bounded before any work is
+/// done on it: "Maximum length of any expression string is 4 KB" ("Service, Account,
+/// and Table Quotas"), and a token count ceiling bounds the token vector a 4 KB
+/// expression can produce. Both refusals are the ordinary `ValidationException`.
+fn tokenize(expression: &str) -> Result<Vec<Token>, crate::state::RequestError> {
+    if expression.len() > MAX_EXPRESSION_BYTES {
+        return Err(crate::state::RequestError::Validation(format!(
+            "Invalid KeyConditionExpression: an expression may be at most \
+             {MAX_EXPRESSION_BYTES} bytes, got {}",
+            expression.len()
+        )));
+    }
+    let bytes: Vec<char> = expression.chars().collect();
+    let mut tokens = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        if tokens.len() >= MAX_EXPRESSION_TOKENS {
+            return Err(crate::state::RequestError::Validation(format!(
+                "Invalid KeyConditionExpression: an expression may hold at most \
+                 {MAX_EXPRESSION_TOKENS} tokens"
+            )));
+        }
+        let character = bytes[at];
+        match character {
+            c if c.is_whitespace() => at += 1,
+            '(' => {
+                tokens.push(Token::Open);
+                at += 1;
+            }
+            ')' => {
+                tokens.push(Token::Close);
+                at += 1;
+            }
+            ',' => {
+                tokens.push(Token::Comma);
+                at += 1;
+            }
+            '=' => {
+                tokens.push(Token::Compare(Operator::Equal));
+                at += 1;
+            }
+            '<' | '>' => {
+                let followed_by_equals = bytes.get(at + 1) == Some(&'=');
+                let operator = match (character, followed_by_equals) {
+                    ('<', false) => Operator::LessThan,
+                    ('<', true) => Operator::LessOrEqual,
+                    (_, false) => Operator::GreaterThan,
+                    (_, true) => Operator::GreaterOrEqual,
+                };
+                tokens.push(Token::Compare(operator));
+                at += if followed_by_equals { 2 } else { 1 };
+            }
+            ':' | '#' => {
+                let start = at;
+                at += 1;
+                while at < bytes.len() && is_identifier_char(bytes[at]) {
+                    at += 1;
+                }
+                let text: String = bytes[start..at].iter().collect();
+                if text.len() < 2 {
+                    return Err(invalid_expression(expression));
+                }
+                tokens.push(if character == ':' {
+                    Token::Value(text)
+                } else {
+                    Token::Name(text)
+                });
+            }
+            c if is_identifier_char(c) => {
+                let start = at;
+                while at < bytes.len() && is_identifier_char(bytes[at]) {
+                    at += 1;
+                }
+                let text: String = bytes[start..at].iter().collect();
+                if text.eq_ignore_ascii_case("AND") {
+                    tokens.push(Token::And);
+                } else if text.eq_ignore_ascii_case("BETWEEN") {
+                    tokens.push(Token::Between);
+                } else if text.eq_ignore_ascii_case("begins_with") {
+                    tokens.push(Token::BeginsWith);
+                } else {
+                    tokens.push(Token::Name(text));
+                }
+            }
+            _ => return Err(invalid_expression(expression)),
+        }
+    }
+    if tokens.is_empty() {
+        return Err(invalid_expression(expression));
+    }
+    Ok(tokens)
+}
+
+fn is_identifier_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '_' || character == '.' || character == '-'
+}
+
+fn invalid_expression(expression: &str) -> crate::state::RequestError {
+    crate::state::RequestError::Validation(format!(
+        "Invalid KeyConditionExpression: syntax error; {expression}"
+    ))
+}
+
+/// Parse a `KeyConditionExpression` into its comparisons.
+///
+/// The grammar is DynamoDB's own (`Query$KeyConditionExpression`): one or more
+/// comparisons joined by `AND`, each optionally parenthesised, where a comparison is
+/// `name <op> :value`, `name BETWEEN :low AND :high`, or
+/// `begins_with (name, :prefix)`. `#alias` names resolve through
+/// `ExpressionAttributeNames` and `:placeholder` values through
+/// `ExpressionAttributeValues`.
+fn parse_key_condition_expression(
+    expression: &str,
+    names: Option<&std::collections::HashMap<String, String>>,
+    values: Option<&std::collections::HashMap<String, AttributeValue>>,
+) -> Result<Vec<Comparison>, crate::state::RequestError> {
+    let tokens = tokenize(expression)?;
+    let mut parser = Parser {
+        tokens: &tokens,
+        at: 0,
+        depth: 0,
+        expression,
+        names,
+        values,
+    };
+    let comparisons = parser.conjunction()?;
+    if parser.at != tokens.len() {
+        return Err(invalid_expression(expression));
+    }
+    Ok(comparisons)
+}
+
+/// Recursive-descent parser over the tokens of one key condition expression.
+///
+/// The only rule that descends is a parenthesised group, and `depth` caps how far it
+/// may: the nesting is caller-chosen, so without the cap the number of stack frames
+/// would be too (and a stack overflow aborts the process rather than failing one
+/// request). The vendored JSON and XML decoders bound their own nesting the same way.
+struct Parser<'a> {
+    tokens: &'a [Token],
+    at: usize,
+    depth: usize,
+    expression: &'a str,
+    names: Option<&'a std::collections::HashMap<String, String>>,
+    values: Option<&'a std::collections::HashMap<String, AttributeValue>>,
+}
+
+impl Parser<'_> {
+    fn peek(&self) -> Option<&Token> {
+        self.tokens.get(self.at)
+    }
+
+    fn take(&mut self) -> Result<Token, crate::state::RequestError> {
+        let token = self
+            .peek()
+            .cloned()
+            .ok_or_else(|| invalid_expression(self.expression))?;
+        self.at += 1;
+        Ok(token)
+    }
+
+    fn expect(&mut self, expected: &Token) -> Result<(), crate::state::RequestError> {
+        if self.take()? == *expected {
+            Ok(())
+        } else {
+            Err(invalid_expression(self.expression))
+        }
+    }
+
+    /// `conjunction := primary (AND primary)*`
+    fn conjunction(&mut self) -> Result<Vec<Comparison>, crate::state::RequestError> {
+        let mut comparisons = self.primary()?;
+        while self.peek() == Some(&Token::And) {
+            self.at += 1;
+            comparisons.extend(self.primary()?);
+        }
+        Ok(comparisons)
+    }
+
+    /// `primary := '(' conjunction ')' | comparison`
+    ///
+    /// The one recursive rule, bounded by [`MAX_EXPRESSION_DEPTH`] so the number of
+    /// frames a request can drive is a constant rather than the number of `(`
+    /// characters it sends.
+    fn primary(&mut self) -> Result<Vec<Comparison>, crate::state::RequestError> {
+        if self.peek() == Some(&Token::Open) {
+            if self.depth >= MAX_EXPRESSION_DEPTH {
+                return Err(crate::state::RequestError::Validation(format!(
+                    "Invalid KeyConditionExpression: an expression may nest at most \
+                     {MAX_EXPRESSION_DEPTH} levels of parentheses"
+                )));
+            }
+            self.at += 1;
+            self.depth += 1;
+            let inner = self.conjunction();
+            self.depth -= 1;
+            let inner = inner?;
+            self.expect(&Token::Close)?;
+            return Ok(inner);
+        }
+        Ok(vec![self.comparison()?])
+    }
+
+    /// `comparison := name <op> :value | name BETWEEN :low AND :high
+    ///              | begins_with '(' name ',' :prefix ')'`
+    fn comparison(&mut self) -> Result<Comparison, crate::state::RequestError> {
+        match self.take()? {
+            Token::BeginsWith => {
+                self.expect(&Token::Open)?;
+                let attribute = self.attribute()?;
+                self.expect(&Token::Comma)?;
+                let prefix = self.value()?;
+                self.expect(&Token::Close)?;
+                Ok(Comparison {
+                    attribute,
+                    operator: Operator::BeginsWith,
+                    operands: vec![prefix],
+                })
+            }
+            Token::Name(name) => {
+                let attribute = self.resolve_name(&name)?;
+                match self.take()? {
+                    Token::Compare(operator) => {
+                        let operand = self.value()?;
+                        Ok(Comparison {
+                            attribute,
+                            operator,
+                            operands: vec![operand],
+                        })
+                    }
+                    Token::Between => {
+                        let low = self.value()?;
+                        self.expect(&Token::And)?;
+                        let high = self.value()?;
+                        Ok(Comparison {
+                            attribute,
+                            operator: Operator::Between,
+                            operands: vec![low, high],
+                        })
+                    }
+                    _ => Err(invalid_expression(self.expression)),
+                }
+            }
+            _ => Err(invalid_expression(self.expression)),
+        }
+    }
+
+    /// An attribute name token, resolved through `ExpressionAttributeNames`.
+    fn attribute(&mut self) -> Result<String, crate::state::RequestError> {
+        match self.take()? {
+            Token::Name(name) => self.resolve_name(&name),
+            _ => Err(invalid_expression(self.expression)),
+        }
+    }
+
+    /// A `:placeholder` token, resolved through `ExpressionAttributeValues`.
+    fn value(&mut self) -> Result<AttributeValue, crate::state::RequestError> {
+        match self.take()? {
+            Token::Value(placeholder) => self
+                .values
+                .and_then(|values| values.get(&placeholder))
+                .cloned()
+                .ok_or_else(|| {
+                    crate::state::RequestError::Validation(format!(
+                        "ExpressionAttributeValues contains no value for {placeholder}"
+                    ))
+                }),
+            _ => Err(invalid_expression(self.expression)),
+        }
+    }
+
+    /// `#alias` resolves through `ExpressionAttributeNames`; any other name is the
+    /// attribute name itself.
+    fn resolve_name(&self, token: &str) -> Result<String, crate::state::RequestError> {
+        match token.strip_prefix('#') {
+            None => Ok(token.to_string()),
+            Some(_) => self
+                .names
+                .and_then(|names| names.get(token))
+                .cloned()
+                .ok_or_else(|| {
+                    crate::state::RequestError::Validation(format!(
+                        "ExpressionAttributeNames contains no name for {token}"
+                    ))
+                }),
+        }
     }
 }

@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTable`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: starts the table's deletion and reports its final
+//! `TableDescription` with `TableStatus=DELETING`. Deletion is asynchronous, so the
+//! table (and its items) are removed once [`crate::state::STATUS_TRANSITION`] has
+//! elapsed: until then `DescribeTable` reports `DELETING` and every item operation
+//! answers `ResourceNotFoundException`, and afterwards so does `DescribeTable`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A table that is still `CREATING` is refused with `ResourceInUseException` — "You
+//! tried to delete a table currently in the CREATING state" (the
+//! `ResourceInUseException` doc) — while a table already `DELETING` is reported back
+//! as it stands, because "If table is already in the DELETING state, no error is
+//! returned".
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +170,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTable"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
+
+        let mut store = state.lock();
+        store.apply_due_transitions(now);
+        let table = store
+            .tables
+            .get_mut(&name)
+            .ok_or_else(|| lift(crate::state::RequestError::NotFound(format!(
+                "Requested resource not found: Table: {name} not found"
+            ))))?;
+
+        match table.status(now) {
+            crate::state::TableStatus::Creating => {
+                return Err(DeleteTableErrorModeled::ResourceInUseException(
+                    ResourceInUseException {
+                        message: Some(format!(
+                            "Attempt to change a resource which is still in use: Table is being \
+                             created: {name}"
+                        )),
+                    },
+                )
+                .into())
+            }
+            crate::state::TableStatus::Deleting => {
+                // "If table is already in the DELETING state, no error is returned"
+                // (the doc below): a retried DeleteTable reports the table as it
+                // stands and leaves the removal already owed by the clock alone.
+                return Ok(DeleteTableOutput {
+                    table_description: Some(table.describe(now)),
+                });
+            }
+            crate::state::TableStatus::Active => {}
+        }
+        if table.deletion_protection_enabled {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Table {name} cannot be deleted because deletion protection is enabled"
+            )));
+        }
+
+        // The clock owes the removal; the response reports the table as it stands at
+        // this instant, which is DELETING.
+        table.removed_at = Some(now + crate::state::STATUS_TRANSITION);
+        let description = table.describe(now);
+
+        Ok(DeleteTableOutput {
+            table_description: Some(description),
+        })
+    }
+}
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> DeleteTableError {
+    DeleteTableErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// Lift a store refusal into this operation's error channel.
+fn lift(error: crate::state::RequestError) -> DeleteTableError {
+    match error {
+        crate::state::RequestError::NotFound(message) => {
+            DeleteTableErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(message),
+            })
+            .into()
+        }
+        crate::state::RequestError::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
     }
 }

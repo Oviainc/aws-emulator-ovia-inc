@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMonitor
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMonitor`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMonitor::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the monitor record [`crate::state`] holds under this name, probes
+//! included. The one write it performs is the `PENDING` -> `ACTIVE` transition
+//! the clock already made due ([`crate::state::ComAmazonawsNetworkmonitorNetworkmonitorState::settle_monitor`]):
+//! that transition was owed at its due instant whether or not anybody called,
+//! so settling it before reporting changes nothing a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -123,6 +120,31 @@ impl From<GetMonitorErrorModeled> for GetMonitorError {
     }
 }
 
+/// The modelled `Probe` a stored probe record reports as.
+pub(crate) fn probe_of(probe: &crate::state::Probe) -> Probe {
+    Probe {
+        probe_id: Some(probe.probe_id.clone()),
+        probe_arn: Some(probe.probe_arn.clone()),
+        source_arn: probe.source_arn.clone(),
+        destination: probe.destination.clone(),
+        destination_port: probe.destination_port,
+        protocol: probe.protocol.clone(),
+        packet_size: probe.packet_size,
+        address_family: Some(probe.address_family.clone()),
+        vpc_id: probe.vpc_id.clone(),
+        state: Some(probe.state.clone()),
+        created_at: Some(::aws_smithy_types::DateTime::from(probe.created_at)),
+        modified_at: Some(::aws_smithy_types::DateTime::from(probe.modified_at)),
+        tags: Some(
+            probe
+                .tags
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        ),
+    }
+}
+
 /// The `GetMonitor` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -159,18 +181,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMonitor` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMonitorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMonitor"))
+        let _ = ctx;
+        // `monitorName`'s `@pattern` and length bound are refused by the
+        // framework BEFORE this handler runs, so a name that reaches here is
+        // one the service could have stored.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetMonitorErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the networkmonitor monitor store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        store.settle_monitor(&input.monitor_name, now);
+        let monitor = store.monitors.get(&input.monitor_name).ok_or_else(|| {
+            GetMonitorErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(format!("monitor {} does not exist", input.monitor_name)),
+            })
+        })?;
+
+        Ok(GetMonitorOutput {
+            monitor_arn: monitor.monitor_arn.clone(),
+            monitor_name: monitor.monitor_name.clone(),
+            state: monitor.state.clone(),
+            aggregation_period: monitor.aggregation_period,
+            tags: Some(
+                monitor
+                    .tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+            // The stored probe map IS this list, so a probe cannot be attached
+            // to the monitor and missing from what the monitor reports.
+            probes: Some(monitor.probes.values().map(probe_of).collect()),
+            created_at: ::aws_smithy_types::DateTime::from(monitor.created_at),
+            modified_at: ::aws_smithy_types::DateTime::from(monitor.modified_at),
+        })
     }
 }

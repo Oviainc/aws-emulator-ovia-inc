@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEnvironment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEnvironment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEnvironment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints an environment record in this service's store and answers with the ARN it
+//! stored, so a later `GetEnvironment` / `ListEnvironments` / `ListTagsForResource`
+//! cannot disagree with what this call returned. The environment starts `CREATING` and
+//! the clock owes it `AVAILABLE` one `crate::state::TRANSITION_SPAN` later.
 //!
 //! ## Shape of an operation
 //!
@@ -263,18 +259,169 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEnvironment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEnvironmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEnvironment"))
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+
+        // `NetworkConfiguration` is `@required`, but both of its members are optional in
+        // the model, so the boundary validator passes a configuration that names neither.
+        // An environment cannot be placed without the subnets and security groups its
+        // workers run in, so this is a bad request, not a 501.
+        let subnet_ids = input
+            .network_configuration
+            .subnet_ids
+            .clone()
+            .unwrap_or_default();
+        let security_group_ids = input
+            .network_configuration
+            .security_group_ids
+            .clone()
+            .unwrap_or_default();
+        if subnet_ids.is_empty() {
+            return Err(validation(
+                "NetworkConfiguration.SubnetIds must name the subnets the environment runs in",
+            ));
+        }
+        if security_group_ids.is_empty() {
+            return Err(validation(
+                "NetworkConfiguration.SecurityGroupIds must name at least one security group",
+            ));
+        }
+
+        let spec = crate::state::EnvironmentSpec {
+            execution_role_arn: input.execution_role_arn.clone(),
+            source_bucket_arn: input.source_bucket_arn.clone(),
+            dag_s3_path: input.dag_s3_path.clone(),
+            network_configuration: crate::state::NetworkConfigurationRecord {
+                subnet_ids,
+                security_group_ids,
+            },
+            plugins_s3_path: input.plugins_s3_path.clone(),
+            plugins_s3_object_version: input.plugins_s3_object_version.clone(),
+            requirements_s3_path: input.requirements_s3_path.clone(),
+            requirements_s3_object_version: input.requirements_s3_object_version.clone(),
+            startup_script_s3_path: input.startup_script_s3_path.clone(),
+            startup_script_s3_object_version: input.startup_script_s3_object_version.clone(),
+            airflow_configuration_options: input
+                .airflow_configuration_options
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            environment_class: input.environment_class.clone(),
+            // "If no value is specified, it defaults to the latest version" — the
+            // `AirflowVersion` doc.
+            airflow_version: input
+                .airflow_version
+                .clone()
+                .unwrap_or_else(|| crate::state::LATEST_AIRFLOW_VERSION.to_string()),
+            kms_key: input.kms_key.clone(),
+            max_workers: input.max_workers,
+            min_workers: input.min_workers,
+            // `Schedulers`, `MinWebservers` and `MaxWebservers` all document the same
+            // default: 2 for every environment size except mw1.micro, which gets 1.
+            schedulers: input.schedulers.unwrap_or_else(|| {
+                crate::state::default_unit_count(input.environment_class.as_deref())
+            }),
+            min_webservers: input.min_webservers.unwrap_or_else(|| {
+                crate::state::default_unit_count(input.environment_class.as_deref())
+            }),
+            max_webservers: input.max_webservers.unwrap_or_else(|| {
+                crate::state::default_unit_count(input.environment_class.as_deref())
+            }),
+            webserver_access_mode: input.webserver_access_mode.clone(),
+            weekly_maintenance_window_start: input.weekly_maintenance_window_start.clone(),
+            endpoint_management: input.endpoint_management.clone(),
+            logging_configuration: {
+                let mut logging = crate::state::LoggingConfigurationRecord::default();
+                if let Some(requested) = input.logging_configuration.as_ref() {
+                    logging.merge(requested);
+                }
+                logging
+            },
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let mut store = state.lock();
+        store.settle(now);
+
+        // The operation is `@idempotent`: replaying the SAME create of a name that is
+        // already stored answers with the stored ARN and writes nothing. A create of that
+        // name with different members is a different request, and is refused rather than
+        // allowed to clobber the stored record. (Tags are deliberately outside the
+        // comparison: `TagResource` / `UntagResource` own them after the create.)
+        if let Some(existing) = store.environments.get(&input.name) {
+            if existing.spec == spec {
+                return Ok(CreateEnvironmentOutput {
+                    arn: Some(existing.arn.clone()),
+                });
+            }
+            return Err(validation(format!(
+                "An environment named {} already exists",
+                input.name
+            )));
+        }
+
+        if store.environments.len() >= crate::state::MAX_ENVIRONMENTS {
+            return Err(validation(format!(
+                "You have reached the maximum number of environments ({})",
+                crate::state::MAX_ENVIRONMENTS
+            )));
+        }
+
+        let name = input.name.clone();
+        let arn = crate::state::environment_arn(&region, &name);
+        store.insert(crate::state::EnvironmentRecord {
+            webserver_url: crate::state::webserver_url(&region, &arn),
+            service_role_arn: crate::state::service_role_arn(),
+            celery_executor_queue: crate::state::celery_executor_queue(&region, &name),
+            webserver_vpc_endpoint_service: crate::state::webserver_vpc_endpoint_service(
+                &region, &arn,
+            ),
+            database_vpc_endpoint_service: crate::state::database_vpc_endpoint_service(
+                &region, &arn,
+            ),
+            name: name.clone(),
+            arn,
+            region,
+            // A new environment is not ready yet: the clock owes it AVAILABLE.
+            status: crate::state::STATUS_CREATING.to_string(),
+            pending: Some(crate::state::PendingTransition {
+                to: crate::state::STATUS_AVAILABLE.to_string(),
+                last_update_status: None,
+                due_at: now + crate::state::TRANSITION_SPAN,
+            }),
+            created_at: now,
+            spec,
+            last_update: None,
+            tags: input.tags.clone().unwrap_or_default().into_iter().collect(),
+        });
+
+        // Answer with the ARN read back out of the stored record, so this response cannot
+        // drift from the state a later read sees.
+        let stored = store
+            .environments
+            .get(&name)
+            .ok_or_else(store_unavailable)?;
+        Ok(CreateEnvironmentOutput {
+            arn: Some(stored.arn.clone()),
+        })
     }
+}
+
+/// Refuse the request with this operation's own modelled `ValidationException` (HTTP
+/// 400): "The provided input is not valid."
+fn validation(message: impl Into<String>) -> CreateEnvironmentError {
+    CreateEnvironmentErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The store is unreachable — a server-side fault, which this operation models as
+/// `InternalServerException` (HTTP 500). Never answered by constructing a private engine.
+fn store_unavailable() -> CreateEnvironmentError {
+    CreateEnvironmentErrorModeled::InternalServerException(InternalServerException {
+        message: Some("the Amazon MWAA environment store is unavailable".to_string()),
+    })
+    .into()
 }

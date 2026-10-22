@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SearchText
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SearchText`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SearchText::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Searches the seeded place catalog in [`crate::state`] by free-form text and
+//! pages the matches — the same records GetPlace, Geocode, ReverseGeocode and
+//! SearchNearby answer from.
 //!
 //! ## Shape of an operation
 //!
@@ -194,18 +188,280 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SearchText` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchTextErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SearchText"))
+        // `ctx` carries request metadata only; this operation reads none of it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(SearchTextErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Geo Places catalog is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // Modeled input constraints, enforced here too so an in-process caller is
+        // held to the same contract as a client on the wire.
+        for invalid in [
+            crate::state::check_max_results(input.max_results),
+            crate::state::check_language(input.language.as_deref()),
+            crate::state::check_political_view(input.political_view.as_deref()),
+        ] {
+            if let Err(invalid) = invalid {
+                return Err(SearchTextErrorModeled::ValidationException(invalid).into());
+            }
+        }
+
+        // "Exactly one of the following fields must be set: QueryText or QueryId"
+        // (`SearchTextRequest$QueryText`). A `QueryId` is minted by Suggest, which
+        // this emulator does not implement, so no id it was handed can be resolved.
+        let query_text = input
+            .query_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty());
+        let query_text = match (query_text, input.query_id.as_deref()) {
+            (Some(text), None) => text,
+            (None, None) => {
+                return Err(SearchTextErrorModeled::ValidationException(
+                    crate::state::validation_exception(
+                        crate::state::REASON_MISSING,
+                        "QueryText",
+                        "exactly one of QueryText or QueryId must be set",
+                    ),
+                )
+                .into())
+            }
+            (Some(_), Some(_)) => {
+                return Err(SearchTextErrorModeled::ValidationException(
+                    crate::state::validation_exception(
+                        crate::state::REASON_OTHER,
+                        "QueryId",
+                        "QueryText and QueryId are mutually exclusive; set exactly one",
+                    ),
+                )
+                .into())
+            }
+            (None, Some(_)) => {
+                return Err(SearchTextErrorModeled::ValidationException(
+                    crate::state::validation_exception(
+                        crate::state::REASON_CANNOT_PARSE,
+                        "QueryId",
+                        "QueryId is not a query identifier issued by this service",
+                    ),
+                )
+                .into())
+            }
+        };
+
+        let filter = input.filter.as_ref();
+        let bounding_box = filter.and_then(|filter| filter.bounding_box.as_deref());
+        let circle = filter.and_then(|filter| filter.circle.as_ref());
+        // A bias that is not a two-element position is refused, not ignored.
+        let bias = match input.bias_position.as_deref() {
+            None => None,
+            Some(values) => match crate::state::position(values) {
+                Some(bias) => Some(bias),
+                None => {
+                    return Err(SearchTextErrorModeled::ValidationException(
+                        crate::state::validation_exception(
+                            crate::state::REASON_FIELD_VALIDATION_FAILED,
+                            "BiasPosition",
+                            "BiasPosition must hold exactly two values, [longitude, latitude]",
+                        ),
+                    )
+                    .into())
+                }
+            },
+        };
+
+        // "Exactly one of the following fields must be set: BiasPosition,
+        // Filter.BoundingBox, or Filter.Circle" (`SearchTextRequest$BiasPosition`):
+        // they are alternative ways to say WHERE, so two of them cannot hold at once.
+        let areas = usize::from(input.bias_position.is_some())
+            + usize::from(bounding_box.is_some())
+            + usize::from(circle.is_some());
+        if areas > 1 {
+            return Err(SearchTextErrorModeled::ValidationException(
+                crate::state::validation_exception(
+                    crate::state::REASON_OTHER,
+                    "BiasPosition",
+                    "BiasPosition, Filter.BoundingBox and Filter.Circle are mutually \
+                     exclusive; set at most one",
+                ),
+            )
+            .into());
+        }
+
+        let mut candidates = state.text_candidates(query_text);
+
+        if let Some(countries) = crate::state::non_empty(
+            filter.and_then(|filter| filter.include_countries.as_deref()),
+        ) {
+            candidates.retain(|candidate| state.places[candidate.index].in_countries(countries));
+        }
+        if let Some(values) = bounding_box {
+            let Some(area) = crate::state::bounding_box(values) else {
+                return Err(SearchTextErrorModeled::ValidationException(
+                    crate::state::validation_exception(
+                        crate::state::REASON_FIELD_VALIDATION_FAILED,
+                        "Filter.BoundingBox",
+                        "BoundingBox must hold exactly four values, \
+                         [west, south, east, north]",
+                    ),
+                )
+                .into());
+            };
+            candidates.retain(|candidate| state.places[candidate.index].within_bounding_box(area));
+        }
+        if let Some(circle) = circle {
+            let Some(center) = crate::state::position(&circle.center) else {
+                return Err(SearchTextErrorModeled::ValidationException(
+                    crate::state::validation_exception(
+                        crate::state::REASON_FIELD_VALIDATION_FAILED,
+                        "Filter.Circle.Center",
+                        "Center must hold exactly two values, [longitude, latitude]",
+                    ),
+                )
+                .into());
+            };
+            candidates.retain(|candidate| {
+                crate::state::distance_metres(center, state.places[candidate.index].position)
+                    <= circle.radius
+            });
+        }
+
+        // `Distance` is measured from the position the caller biased towards; with no
+        // bias there is no reference point, so it keeps its modeled default of 0.
+        if let Some(bias) = bias {
+            for candidate in &mut candidates {
+                candidate.distance =
+                    crate::state::distance_metres(bias, state.places[candidate.index].position);
+            }
+        }
+        state.order_by_relevance(&mut candidates);
+
+        // A `NextToken` belongs to the query that issued it, so the query travels
+        // inside the token as a fingerprint.
+        let fingerprint = crate::state::query_fingerprint(&[
+            ("QueryText", query_text.to_string()),
+            (
+                "BiasPosition",
+                bias.map(|position| format!("{},{}", position[0], position[1]))
+                    .unwrap_or_default(),
+            ),
+            (
+                "IncludeCountries",
+                filter
+                    .and_then(|filter| filter.include_countries.clone())
+                    .unwrap_or_default()
+                    .join(","),
+            ),
+            (
+                "BoundingBox",
+                bounding_box
+                    .map(|values| {
+                        values
+                            .iter()
+                            .map(f64::to_string)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .unwrap_or_default(),
+            ),
+            (
+                "Circle",
+                circle
+                    .map(|circle| {
+                        format!(
+                            "{:?}/{}",
+                            circle.center.iter().map(f64::to_string).collect::<Vec<_>>(),
+                            circle.radius
+                        )
+                    })
+                    .unwrap_or_default(),
+            ),
+        ]);
+
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                match crate::state::decode_page_token(token, Self::NAME, &fingerprint) {
+                    Some(offset) => offset,
+                    None => {
+                        return Err(SearchTextErrorModeled::ValidationException(
+                            crate::state::validation_exception(
+                                crate::state::REASON_CANNOT_PARSE,
+                                "NextToken",
+                                "NextToken is not a pagination token issued by a previous \
+                                 SearchText call with the same parameters",
+                            ),
+                        )
+                        .into())
+                    }
+                }
+            }
+        };
+
+        let page_size = input
+            .max_results
+            .unwrap_or(crate::state::DEFAULT_MAX_RESULTS)
+            .clamp(1, crate::state::MAX_RESULTS_CEILING) as usize;
+        let page = crate::state::take_page(
+            Self::NAME,
+            &fingerprint,
+            &candidates,
+            offset,
+            page_size,
+        );
+
+        let features = input.additional_features.as_deref().unwrap_or_default();
+        let wants = |feature: &str| features.iter().any(|asked| asked == feature);
+        let political_view = match state.political_view(input.political_view.as_deref()) {
+            Ok(political_view) => political_view,
+            Err(invalid) => {
+                return Err(SearchTextErrorModeled::ValidationException(invalid).into())
+            }
+        };
+
+        let result_items = page
+            .items
+            .iter()
+            .map(|candidate| {
+                let place = &state.places[candidate.index];
+                SearchTextResultItem {
+                    place_id: place.place_id.clone(),
+                    place_type: place.place_type.clone(),
+                    title: place.title.clone(),
+                    address: Some(place.address.to_modeled()),
+                    position: Some(place.position_modeled()),
+                    distance: candidate.distance,
+                    map_view: Some(place.map_view_modeled()),
+                    categories: place.categories_modeled(),
+                    food_types: place.food_types_modeled(),
+                    business_chains: place.business_chains_modeled(),
+                    opening_hours: place.opening_hours_modeled(),
+                    // An additional feature is reported only when the request asks
+                    // for it.
+                    contacts: wants(crate::state::FEATURE_CONTACT)
+                        .then(|| place.contacts_modeled())
+                        .flatten(),
+                    access_points: wants(crate::state::FEATURE_ACCESS)
+                        .then(|| place.access_points_modeled())
+                        .flatten(),
+                    time_zone: wants(crate::state::FEATURE_TIME_ZONE)
+                        .then(|| place.time_zone_modeled())
+                        .flatten(),
+                    political_view: political_view.clone(),
+                    ..SearchTextResultItem::default()
+                }
+            })
+            .collect();
+
+        Ok(SearchTextOutput {
+            pricing_bucket: state.pricing_bucket(Self::NAME, input.intended_use.as_deref()),
+            result_items: Some(result_items),
+            next_token: page.next_token,
+        })
     }
 }

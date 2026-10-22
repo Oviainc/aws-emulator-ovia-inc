@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEventTypes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEventTypes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEventTypes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the distinct event types present in this service's stored event catalog,
+//! narrowed by the request's `filter`. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -124,6 +119,12 @@ impl From<DescribeEventTypesErrorModeled> for DescribeEventTypesError {
     }
 }
 
+/// The page size used when the request names none.
+///
+/// The `maxResults` doc states it: "If you don't specify the maxResults parameter,
+/// this operation returns a maximum of 30 items by default."
+const DEFAULT_PAGE_SIZE: usize = 30;
+
 /// The `DescribeEventTypes` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -160,18 +161,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEventTypes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEventTypesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEventTypes"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+
+        if !crate::state::locale_supported(input.locale.as_deref()) {
+            return Err(DescribeEventTypesErrorModeled::UnsupportedLocale(
+                UnsupportedLocale {
+                    message: Some(format!(
+                        "The locale {} is not supported. The only supported locale is {}.",
+                        input.locale.as_deref().unwrap_or_default(),
+                        crate::state::SUPPORTED_LOCALE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::require_state::<_, DescribeEventTypesErrorModeled>(
+            &*self.engine,
+            Self::NAME,
+        )?;
+
+        let empty = EventTypeFilter::default();
+        let filter = input.filter.as_ref().unwrap_or(&empty);
+        let request_digest = crate::state::RequestDigest::new()
+            .list("eventTypeCodes", filter.event_type_codes.as_deref())
+            .list("services", filter.services.as_deref())
+            .list("eventTypeCategories", filter.event_type_categories.as_deref())
+            .list("actionabilities", filter.actionabilities.as_deref())
+            .list("personas", filter.personas.as_deref())
+            .finish();
+
+        let paged = {
+            let store = state.lock();
+            // Derived from the distinct (service, code, category) triples the stored
+            // events carry — never from a second, hardcoded list — so an event type is
+            // reported exactly when the catalog holds an event of that type.
+            let event_types = store.matching_event_types(input.filter.as_ref());
+            crate::state::paginate(
+                &event_types,
+                Self::NAME,
+                &request_digest,
+                input.next_token.as_deref(),
+                input.max_results,
+                DEFAULT_PAGE_SIZE,
+            )
+        };
+
+        let Some((event_types, next_token)) = paged else {
+            return Err(DescribeEventTypesErrorModeled::InvalidPaginationToken(
+                InvalidPaginationToken {
+                    message: Some(
+                        "The specified pagination token (nextToken) is not valid.".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeEventTypesOutput {
+            event_types: Some(event_types),
+            next_token,
+        })
     }
 }

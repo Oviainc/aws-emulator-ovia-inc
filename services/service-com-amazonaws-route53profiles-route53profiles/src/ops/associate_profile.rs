@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: validates the Profile, refuses a (ProfileId, ResourceId) pair that is
+//! already associated, and persists the association it reports.
 //!
 //! ## Shape of an operation
 //!
@@ -100,11 +93,15 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-route53profiles-route53
 // here — hence the `AssociateProfileError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.route53profiles#AssociateProfile")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.route53profiles#AssociateProfile",
+    extra_errors = ["InternalServiceErrorException"]
+)]
 #[derive(Debug)]
 pub enum AssociateProfileErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
+    InternalServiceErrorException(InternalServiceErrorException),
     InvalidParameterException(InvalidParameterException),
     LimitExceededException(LimitExceededException),
     ResourceExistsException(ResourceExistsException),
@@ -164,18 +161,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateProfile"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AssociateProfileErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some(crate::state::NO_STORE.to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // The Profile named has to exist: an association can only name a Profile this
+        // account holds.
+        if !store.profiles.contains_key(&input.profile_id) {
+            return Err(AssociateProfileErrorModeled::ResourceNotFoundException(
+                crate::state::profile_not_found(&input.profile_id),
+            )
+            .into());
+        }
+
+        // A VPC can have only one Profile associated with it, though a Profile may be
+        // associated with many VPCs (`AssociateProfile`'s own documentation). So the
+        // lookup is by `ResourceId` alone, independent of the `ProfileId` asked for,
+        // and which refusal it earns depends on what already holds that VPC: the same
+        // Profile means this exact association already exists; a different Profile
+        // means the VPC is taken and must be disassociated first.
+        if let Some(existing) = store.association_for_resource(&input.resource_id) {
+            let (existing_id, existing_profile_id) =
+                (existing.id.clone(), existing.profile_id.clone());
+            return Err(if existing_profile_id == input.profile_id {
+                AssociateProfileErrorModeled::ResourceExistsException(ResourceExistsException {
+                    message: Some(format!(
+                        "Profile {} is already associated with resource {} by association \
+                         {existing_id}.",
+                        input.profile_id, input.resource_id
+                    )),
+                    resource_type: Some(
+                        crate::state::PROFILE_ASSOCIATION_RESOURCE_TYPE.to_string(),
+                    ),
+                })
+            } else {
+                AssociateProfileErrorModeled::ConflictException(ConflictException {
+                    message: Some(format!(
+                        "Resource {} is already associated with Profile {existing_profile_id} by \
+                         association {existing_id}; a resource can have only one Profile \
+                         associated with it.",
+                        input.resource_id
+                    )),
+                })
+            }
+            .into());
+        }
+
+        // The store is bounded: once it is full a further association is refused with
+        // the operation's own `LimitExceededException` rather than growing the
+        // emulator's heap.
+        if store.profile_associations.len() >= crate::state::MAX_PROFILE_ASSOCIATIONS {
+            return Err(AssociateProfileErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The maximum number of Profile associations ({}) has already been created.",
+                        crate::state::MAX_PROFILE_ASSOCIATIONS
+                    )),
+                    resource_type: Some(
+                        crate::state::PROFILE_ASSOCIATION_RESOURCE_TYPE.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let id = store.mint_profile_association_id();
+        let now = ::std::time::SystemTime::now();
+        let arn = crate::state::profile_association_arn(&region, &id);
+        let association = crate::state::ProfileAssociation {
+            id: id.clone(),
+            arn: arn.clone(),
+            name: input.name,
+            owner_id: ::engine::emulator_account_id().to_string(),
+            profile_id: input.profile_id,
+            resource_id: input.resource_id,
+            // The association exists the moment it is recorded, so it is reported in
+            // the terminal `COMPLETE` status with no pending transition owed.
+            status: crate::state::STATUS_COMPLETE.to_string(),
+            status_message: None,
+            creation_time: now,
+            modification_time: now,
+        };
+        store.record_tags(&arn, input.tags.unwrap_or_default());
+        // Insert, then report from the record now in the store.
+        let stored = store.profile_associations.entry(id).or_insert(association);
+        Ok(AssociateProfileOutput {
+            profile_association: Some(crate::state::profile_association_shape(stored)),
+        })
     }
 }

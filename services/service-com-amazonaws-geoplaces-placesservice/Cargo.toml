@@ -21,13 +21,13 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# SHA-256, for the catalog's stable PlaceIds and its opaque pagination tokens.
+sha2 = { workspace = true }
+# Hex, for rendering those digests and tokens as opaque ASCII.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the events in this service's stored catalog that satisfy the request's
+//! `filter`, newest first. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -127,6 +121,13 @@ impl From<DescribeEventsErrorModeled> for DescribeEventsError {
     }
 }
 
+/// The page size used when the request names none.
+///
+/// The model documents no default for this operation's `maxResults`, so the modelled
+/// maximum of its `range` (1..100) is used: a call that does not ask for a page size
+/// gets the largest page the operation is allowed to return.
+const DEFAULT_PAGE_SIZE: usize = 100;
+
 /// The `DescribeEvents` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -163,18 +164,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEvents"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+
+        if !crate::state::locale_supported(input.locale.as_deref()) {
+            return Err(DescribeEventsErrorModeled::UnsupportedLocale(UnsupportedLocale {
+                message: Some(format!(
+                    "The locale {} is not supported. The only supported locale is {}.",
+                    input.locale.as_deref().unwrap_or_default(),
+                    crate::state::SUPPORTED_LOCALE
+                )),
+            })
+            .into());
+        }
+
+        let state = crate::state::require_state::<_, DescribeEventsErrorModeled>(
+            &*self.engine,
+            Self::NAME,
+        )?;
+        // A page token is bound to the request that produced it, so continuing a walk
+        // with a token issued for a different filter is refused rather than answered
+        // from the wrong result set.
+        let request_digest = crate::state::event_filter_digest(input.filter.as_ref()).finish();
+
+        let paged = {
+            let store = state.lock();
+            // Every stored event the filter admits, already in the order this
+            // operation's doc states (`lastUpdatedTime` descending), projected onto
+            // the modelled summary shape.
+            let events: Vec<Event> = store
+                .matching_events(input.filter.as_ref())
+                .into_iter()
+                .map(crate::state::HealthEvent::to_event)
+                .collect();
+            crate::state::paginate(
+                &events,
+                Self::NAME,
+                &request_digest,
+                input.next_token.as_deref(),
+                input.max_results,
+                DEFAULT_PAGE_SIZE,
+            )
+        };
+
+        let Some((events, next_token)) = paged else {
+            return Err(DescribeEventsErrorModeled::InvalidPaginationToken(
+                InvalidPaginationToken {
+                    message: Some(
+                        "The specified pagination token (nextToken) is not valid.".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeEventsOutput {
+            events: Some(events),
+            next_token,
+        })
     }
 }

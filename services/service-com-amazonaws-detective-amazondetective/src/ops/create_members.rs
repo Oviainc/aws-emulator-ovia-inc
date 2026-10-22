@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMembers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMembers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMembers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: each accepted account becomes a member record on the stored graph,
+//! which is what `ListMembers` and `GetMembers` read back.
 //!
 //! ## Shape of an operation
 //!
@@ -186,18 +180,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMembers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMembersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMembers"))
+        let _ = ctx;
+        // `GraphArn`'s pattern, `Accounts`' 1..50 length and each account's 12-digit
+        // `AccountId` and `EmailAddress` pattern are modelled constraints, so the
+        // centralized walk has already refused anything outside them with a 400
+        // before this body runs: an account that reaches here is well formed, and the
+        // reasons an account lands in `UnprocessedAccounts` below are the ones the
+        // model cannot express.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateMembersErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the behavior graph store is unavailable".to_string()),
+            })
+        })?;
+
+        let now = crate::state::now_epoch_millis();
+        let mut store = state.lock();
+        let graph = store.graph_mut(&input.graph_arn).ok_or_else(|| {
+            CreateMembersErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(format!("behavior graph {} does not exist", input.graph_arn)),
+            })
+        })?;
+
+        // The graph is finite, and the quota is the service's own: "A behavior graph
+        // cannot have more than 1,200 member accounts." A request that would take it
+        // past that stores nothing at all, so the caller can retry a smaller one.
+        if graph.members.len() + input.accounts.len() > crate::state::MAX_MEMBERS_PER_GRAPH {
+            return Err(CreateMembersErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "a behavior graph cannot have more than {} member accounts; this graph \
+                         already has {}",
+                        crate::state::MAX_MEMBERS_PER_GRAPH,
+                        graph.members.len()
+                    )),
+                    resources: Some(vec![graph.arn.clone()]),
+                },
+            )
+            .into());
+        }
+
+        let administrator_id = graph.administrator_id.clone();
+        let graph_arn = graph.arn.clone();
+        let mut members = Vec::with_capacity(input.accounts.len());
+        let mut unprocessed_accounts = Vec::new();
+        let mut seen = ::std::collections::BTreeSet::new();
+
+        for account in &input.accounts {
+            // "The accounts that CreateMembers was unable to process. This list
+            // includes accounts that were already invited to be member accounts in
+            // the behavior graph." A repeat of the same account inside one request is
+            // the same thing: the first occurrence is the membership, the rest cannot
+            // be processed on top of it.
+            if !seen.insert(account.account_id.clone()) {
+                unprocessed_accounts.push(crate::state::unprocessed(
+                    &account.account_id,
+                    "The account is listed more than once in this request.".to_string(),
+                ));
+                continue;
+            }
+            if account.account_id == administrator_id {
+                unprocessed_accounts.push(crate::state::unprocessed(
+                    &account.account_id,
+                    "The account administers this behavior graph and cannot also be a member \
+                     account of it."
+                        .to_string(),
+                ));
+                continue;
+            }
+            if graph.members.contains_key(&account.account_id) {
+                unprocessed_accounts.push(crate::state::unprocessed(
+                    &account.account_id,
+                    "The account is already a member account in the behavior graph.".to_string(),
+                ));
+                continue;
+            }
+
+            // "CreateMembers verifies the accounts and then invites the verified
+            // accounts": the membership starts in VERIFICATION_IN_PROGRESS and the
+            // move to INVITED is owed by the clock alone, so the due instant is
+            // recorded here and materialised by whichever call first reads the record
+            // after it passes. `DisableEmailNotification` only suppresses the
+            // invitation email, which this emulator sends to nobody either way, so it
+            // changes nothing about the stored membership.
+            let member = crate::state::Member {
+                account_id: account.account_id.clone(),
+                email_address: account.email_address.clone(),
+                graph_arn: graph_arn.clone(),
+                administrator_id: administrator_id.clone(),
+                status: crate::state::MEMBER_STATUS_VERIFICATION_IN_PROGRESS.to_string(),
+                invitation_type: crate::state::INVITATION_TYPE_INVITATION.to_string(),
+                invited_time_millis: now,
+                updated_time_millis: now,
+                disabled_reason: None,
+                verification_due_millis: Some(now + crate::state::MEMBER_VERIFICATION_MILLIS),
+            };
+            members.push(member.detail());
+            graph.members.insert(account.account_id.clone(), member);
+        }
+
+        Ok(CreateMembersOutput {
+            members: Some(members),
+            unprocessed_accounts: Some(unprocessed_accounts),
+        })
     }
 }

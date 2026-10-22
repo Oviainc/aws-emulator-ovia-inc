@@ -8,6 +8,12 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# Hex codec for the opaque pagination cursor `ListHsms`'s `NextToken` carries, and for
+# rendering the derived `vpc-<8 hex>` identifier.
+hex = { workspace = true }
+# Stable digest a subnet's VPC id and zone are derived from, so the subnet -> placement
+# mapping is a pure function and needs no stored table.
+sha2 = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
@@ -25,9 +31,6 @@ tracing = { workspace = true }
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

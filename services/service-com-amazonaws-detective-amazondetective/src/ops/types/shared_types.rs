@@ -75,7 +75,27 @@ pub struct ServiceQuotaExceededException {
     pub resources: Option<Vec<String>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.detective#MemberDetail")]
+// `MemberDetail` and `DatasourcePackageUsageInfo` (reached only through it) are the two
+// shapes in this module written out by hand rather than produced by
+// `#[smithy_macros::smithy(shape = ...)]`, and the reason is a single trait the macro
+// does not read: `@timestampFormat`.
+//
+// Every `Timestamp` member of these two shapes carries `@timestampFormat("date-time")`
+// (`smithy_query(query="shape",shape="MemberDetail")` reports `"timestampFormat":
+// "date-time"` on each), and their own documentation says so: "The value is an ISO8601
+// formatted string. For example, 2021-08-18T16:35:56.284Z." The vendored codegen never
+// emits `with_timestamp_format`, so a macro-built member schema reports no format and
+// the restJson1 JSON codec falls back to its protocol default, epoch seconds — a NUMBER
+// where the model (and every AWS SDK's generated deserializer for a `date-time` member)
+// requires an ISO-8601 string. The hand-written member schemas below differ from the
+// macro's output in exactly that one chain call.
+//
+// Everything else mirrors the macro's output for a structure: one `M_<MEMBER>` member
+// schema per member (index = position in the model's member list), a `SCHEMA` naming them
+// in order, the `<SHAPE>_SCHEMA` alias, and the serialize/deserialize pair. Constraint
+// traits are deliberately absent: the validating walk runs on operation INPUTS only, and
+// both shapes are output-only, so the macro's captured constraints would be inert here
+// too.
 #[derive(Debug, Clone, Default)]
 pub struct MemberDetail {
     pub account_id: Option<String>,
@@ -96,11 +116,316 @@ pub struct MemberDetail {
     pub datasource_package_ingest_states: Option<std::collections::HashMap<String, String>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.detective#DatasourcePackageUsageInfo")]
+/// One member schema of [`MemberDetail`], named and indexed as the model orders it.
+macro_rules! member_detail_member {
+    ($name:literal, $ty:ident, $index:literal) => {
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                concat!("com.amazonaws.detective#MemberDetail$", $name),
+                MemberDetail::NAMESPACE,
+                $name,
+            ),
+            ::aws_smithy_schema::ShapeType::$ty,
+            $name,
+            $index,
+        )
+    };
+}
+
+#[allow(non_upper_case_globals)]
+impl MemberDetail {
+    const SHAPE_ID: &'static str = "com.amazonaws.detective#MemberDetail";
+    const NAMESPACE: &'static str = "com.amazonaws.detective";
+
+    pub const M_ACCOUNT_ID: ::aws_smithy_schema::Schema =
+        member_detail_member!("AccountId", String, 0);
+    pub const M_EMAIL_ADDRESS: ::aws_smithy_schema::Schema =
+        member_detail_member!("EmailAddress", String, 1);
+    pub const M_GRAPH_ARN: ::aws_smithy_schema::Schema =
+        member_detail_member!("GraphArn", String, 2);
+    pub const M_MASTER_ID: ::aws_smithy_schema::Schema =
+        member_detail_member!("MasterId", String, 3);
+    pub const M_ADMINISTRATOR_ID: ::aws_smithy_schema::Schema =
+        member_detail_member!("AdministratorId", String, 4);
+    pub const M_STATUS: ::aws_smithy_schema::Schema = member_detail_member!("Status", String, 5);
+    pub const M_DISABLED_REASON: ::aws_smithy_schema::Schema =
+        member_detail_member!("DisabledReason", String, 6);
+    /// `@timestampFormat("date-time")` — the chain the macro cannot emit.
+    pub const M_INVITED_TIME: ::aws_smithy_schema::Schema =
+        member_detail_member!("InvitedTime", Timestamp, 7)
+            .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    /// `@timestampFormat("date-time")`, as for `InvitedTime`.
+    pub const M_UPDATED_TIME: ::aws_smithy_schema::Schema =
+        member_detail_member!("UpdatedTime", Timestamp, 8)
+            .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    pub const M_VOLUME_USAGE_IN_BYTES: ::aws_smithy_schema::Schema =
+        member_detail_member!("VolumeUsageInBytes", Long, 9);
+    /// `@timestampFormat("date-time")`, as for `InvitedTime`.
+    pub const M_VOLUME_USAGE_UPDATED_TIME: ::aws_smithy_schema::Schema =
+        member_detail_member!("VolumeUsageUpdatedTime", Timestamp, 10)
+            .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    pub const M_PERCENT_OF_GRAPH_UTILIZATION: ::aws_smithy_schema::Schema =
+        member_detail_member!("PercentOfGraphUtilization", Double, 11);
+    /// `@timestampFormat("date-time")`, as for `InvitedTime`.
+    pub const M_PERCENT_OF_GRAPH_UTILIZATION_UPDATED_TIME: ::aws_smithy_schema::Schema =
+        member_detail_member!("PercentOfGraphUtilizationUpdatedTime", Timestamp, 12)
+            .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    pub const M_INVITATION_TYPE: ::aws_smithy_schema::Schema =
+        member_detail_member!("InvitationType", String, 13);
+    pub const M_VOLUME_USAGE_BY_DATASOURCE_PACKAGE: ::aws_smithy_schema::Schema =
+        member_detail_member!("VolumeUsageByDatasourcePackage", Map, 14);
+    pub const M_DATASOURCE_PACKAGE_INGEST_STATES: ::aws_smithy_schema::Schema =
+        member_detail_member!("DatasourcePackageIngestStates", Map, 15);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(Self::SHAPE_ID, Self::NAMESPACE, "MemberDetail"),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ACCOUNT_ID,
+            &Self::M_EMAIL_ADDRESS,
+            &Self::M_GRAPH_ARN,
+            &Self::M_MASTER_ID,
+            &Self::M_ADMINISTRATOR_ID,
+            &Self::M_STATUS,
+            &Self::M_DISABLED_REASON,
+            &Self::M_INVITED_TIME,
+            &Self::M_UPDATED_TIME,
+            &Self::M_VOLUME_USAGE_IN_BYTES,
+            &Self::M_VOLUME_USAGE_UPDATED_TIME,
+            &Self::M_PERCENT_OF_GRAPH_UTILIZATION,
+            &Self::M_PERCENT_OF_GRAPH_UTILIZATION_UPDATED_TIME,
+            &Self::M_INVITATION_TYPE,
+            &Self::M_VOLUME_USAGE_BY_DATASOURCE_PACKAGE,
+            &Self::M_DATASOURCE_PACKAGE_INGEST_STATES,
+        ],
+    );
+}
+
+pub static MEMBER_DETAIL_SCHEMA: &::aws_smithy_schema::Schema = &MemberDetail::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for MemberDetail {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(v) = self.account_id.as_ref() {
+            s.write_string(&Self::M_ACCOUNT_ID, v.as_str())?;
+        }
+        if let Some(v) = self.email_address.as_ref() {
+            s.write_string(&Self::M_EMAIL_ADDRESS, v.as_str())?;
+        }
+        if let Some(v) = self.graph_arn.as_ref() {
+            s.write_string(&Self::M_GRAPH_ARN, v.as_str())?;
+        }
+        if let Some(v) = self.master_id.as_ref() {
+            s.write_string(&Self::M_MASTER_ID, v.as_str())?;
+        }
+        if let Some(v) = self.administrator_id.as_ref() {
+            s.write_string(&Self::M_ADMINISTRATOR_ID, v.as_str())?;
+        }
+        if let Some(v) = self.status.as_ref() {
+            s.write_string(&Self::M_STATUS, v.as_str())?;
+        }
+        if let Some(v) = self.disabled_reason.as_ref() {
+            s.write_string(&Self::M_DISABLED_REASON, v.as_str())?;
+        }
+        if let Some(v) = self.invited_time.as_ref() {
+            s.write_timestamp(&Self::M_INVITED_TIME, v)?;
+        }
+        if let Some(v) = self.updated_time.as_ref() {
+            s.write_timestamp(&Self::M_UPDATED_TIME, v)?;
+        }
+        if let Some(v) = self.volume_usage_in_bytes.as_ref() {
+            s.write_long(&Self::M_VOLUME_USAGE_IN_BYTES, *v)?;
+        }
+        if let Some(v) = self.volume_usage_updated_time.as_ref() {
+            s.write_timestamp(&Self::M_VOLUME_USAGE_UPDATED_TIME, v)?;
+        }
+        if let Some(v) = self.percent_of_graph_utilization.as_ref() {
+            s.write_double(&Self::M_PERCENT_OF_GRAPH_UTILIZATION, *v)?;
+        }
+        if let Some(v) = self.percent_of_graph_utilization_updated_time.as_ref() {
+            s.write_timestamp(&Self::M_PERCENT_OF_GRAPH_UTILIZATION_UPDATED_TIME, v)?;
+        }
+        if let Some(v) = self.invitation_type.as_ref() {
+            s.write_string(&Self::M_INVITATION_TYPE, v.as_str())?;
+        }
+        if let Some(v) = self.volume_usage_by_datasource_package.as_ref() {
+            s.write_map(&Self::M_VOLUME_USAGE_BY_DATASOURCE_PACKAGE, &|sm| {
+                for (k, entry) in v.iter() {
+                    sm.write_string(&Self::M_VOLUME_USAGE_BY_DATASOURCE_PACKAGE, k.as_str())?;
+                    sm.write_struct(&Self::M_VOLUME_USAGE_BY_DATASOURCE_PACKAGE, entry)?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(v) = self.datasource_package_ingest_states.as_ref() {
+            s.write_map(&Self::M_DATASOURCE_PACKAGE_INGEST_STATES, &|sm| {
+                for (k, entry) in v.iter() {
+                    sm.write_string(&Self::M_DATASOURCE_PACKAGE_INGEST_STATES, k.as_str())?;
+                    sm.write_string(&Self::M_DATASOURCE_PACKAGE_INGEST_STATES, entry.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for MemberDetail {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => out.account_id = Some(d.read_string(&Self::M_ACCOUNT_ID)?),
+                Some(1) => out.email_address = Some(d.read_string(&Self::M_EMAIL_ADDRESS)?),
+                Some(2) => out.graph_arn = Some(d.read_string(&Self::M_GRAPH_ARN)?),
+                Some(3) => out.master_id = Some(d.read_string(&Self::M_MASTER_ID)?),
+                Some(4) => out.administrator_id = Some(d.read_string(&Self::M_ADMINISTRATOR_ID)?),
+                Some(5) => out.status = Some(d.read_string(&Self::M_STATUS)?),
+                Some(6) => out.disabled_reason = Some(d.read_string(&Self::M_DISABLED_REASON)?),
+                Some(7) => out.invited_time = Some(d.read_timestamp(&Self::M_INVITED_TIME)?),
+                Some(8) => out.updated_time = Some(d.read_timestamp(&Self::M_UPDATED_TIME)?),
+                Some(9) => {
+                    out.volume_usage_in_bytes = Some(d.read_long(&Self::M_VOLUME_USAGE_IN_BYTES)?)
+                }
+                Some(10) => {
+                    out.volume_usage_updated_time =
+                        Some(d.read_timestamp(&Self::M_VOLUME_USAGE_UPDATED_TIME)?)
+                }
+                Some(11) => {
+                    out.percent_of_graph_utilization =
+                        Some(d.read_double(&Self::M_PERCENT_OF_GRAPH_UTILIZATION)?)
+                }
+                Some(12) => {
+                    out.percent_of_graph_utilization_updated_time =
+                        Some(d.read_timestamp(&Self::M_PERCENT_OF_GRAPH_UTILIZATION_UPDATED_TIME)?)
+                }
+                Some(13) => out.invitation_type = Some(d.read_string(&Self::M_INVITATION_TYPE)?),
+                Some(14) => {
+                    let mut entries: ::std::collections::HashMap<
+                        String,
+                        DatasourcePackageUsageInfo,
+                    > = ::std::default::Default::default();
+                    d.read_map(
+                        &Self::M_VOLUME_USAGE_BY_DATASOURCE_PACKAGE,
+                        &mut |key, dm| {
+                            let value = <DatasourcePackageUsageInfo as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(dm)
+                                .map_err(|e| ::aws_smithy_schema_server::within_map_entry(e, &key))?;
+                            entries.insert(key, value);
+                            Ok(())
+                        },
+                    )?;
+                    out.volume_usage_by_datasource_package = Some(entries);
+                }
+                Some(15) => {
+                    let mut entries: ::std::collections::HashMap<String, String> =
+                        ::std::default::Default::default();
+                    d.read_map(&Self::M_DATASOURCE_PACKAGE_INGEST_STATES, &mut |key, dm| {
+                        let value = dm.read_string(&Self::M_DATASOURCE_PACKAGE_INGEST_STATES)?;
+                        entries.insert(key, value);
+                        Ok(())
+                    })?;
+                    out.datasource_package_ingest_states = Some(entries);
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DatasourcePackageUsageInfo {
     pub volume_usage_in_bytes: Option<i64>,
     pub volume_usage_update_time: Option<::aws_smithy_types::DateTime>,
+}
+
+#[allow(non_upper_case_globals)]
+impl DatasourcePackageUsageInfo {
+    const SHAPE_ID: &'static str = "com.amazonaws.detective#DatasourcePackageUsageInfo";
+    const NAMESPACE: &'static str = "com.amazonaws.detective";
+
+    pub const M_VOLUME_USAGE_IN_BYTES: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.detective#DatasourcePackageUsageInfo$VolumeUsageInBytes",
+                Self::NAMESPACE,
+                "VolumeUsageInBytes",
+            ),
+            ::aws_smithy_schema::ShapeType::Long,
+            "VolumeUsageInBytes",
+            0,
+        );
+    /// `@timestampFormat("date-time")` — the chain the macro cannot emit.
+    pub const M_VOLUME_USAGE_UPDATE_TIME: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.detective#DatasourcePackageUsageInfo$VolumeUsageUpdateTime",
+                Self::NAMESPACE,
+                "VolumeUsageUpdateTime",
+            ),
+            ::aws_smithy_schema::ShapeType::Timestamp,
+            "VolumeUsageUpdateTime",
+            1,
+        )
+        .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            Self::SHAPE_ID,
+            Self::NAMESPACE,
+            "DatasourcePackageUsageInfo",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_VOLUME_USAGE_IN_BYTES,
+            &Self::M_VOLUME_USAGE_UPDATE_TIME,
+        ],
+    );
+}
+
+pub static DATASOURCE_PACKAGE_USAGE_INFO_SCHEMA: &::aws_smithy_schema::Schema =
+    &DatasourcePackageUsageInfo::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for DatasourcePackageUsageInfo {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(v) = self.volume_usage_in_bytes.as_ref() {
+            s.write_long(&Self::M_VOLUME_USAGE_IN_BYTES, *v)?;
+        }
+        if let Some(v) = self.volume_usage_update_time.as_ref() {
+            s.write_timestamp(&Self::M_VOLUME_USAGE_UPDATE_TIME, v)?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for DatasourcePackageUsageInfo {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => {
+                    out.volume_usage_in_bytes = Some(d.read_long(&Self::M_VOLUME_USAGE_IN_BYTES)?)
+                }
+                Some(1) => {
+                    out.volume_usage_update_time =
+                        Some(d.read_timestamp(&Self::M_VOLUME_USAGE_UPDATE_TIME)?)
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.detective#TooManyRequestsException")]

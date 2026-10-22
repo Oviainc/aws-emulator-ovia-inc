@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes a profile from the store. Refuses with `ConflictException` while a
+//! partnership still references it, and with `ResourceNotFoundException` for an
+//! unknown id.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +171,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteProfile"))
+        let _ = ctx;
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteProfileErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STATE_UNAVAILABLE.to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let mut state = store.lock();
+
+        if !state.profiles.contains_key(&input.profile_id) {
+            return Err(DeleteProfileErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Could not find profile with ID {}", input.profile_id),
+                },
+            )
+            .into());
+        }
+
+        // `ConflictException` is modelled for exactly this: "you attempt to delete a
+        // resource (such as a profile or a capability) that is being used by other
+        // resources". A partnership names the profile it was created under.
+        if state
+            .partnerships
+            .values()
+            .any(|partnership| partnership.profile_id == input.profile_id)
+        {
+            return Err(DeleteProfileErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "Profile {} is in use by one or more partnerships and cannot be deleted",
+                    input.profile_id
+                ),
+            })
+            .into());
+        }
+
+        state.profiles.remove(&input.profile_id);
+        state.profile_order.retain(|id| *id != input.profile_id);
+        // Release path for the idempotency map: a token that minted this profile is
+        // worth nothing once the profile is gone, so it is not kept.
+        state.forget_idempotency_for(&input.profile_id);
+        Ok(DeleteProfileOutput)
     }
 }

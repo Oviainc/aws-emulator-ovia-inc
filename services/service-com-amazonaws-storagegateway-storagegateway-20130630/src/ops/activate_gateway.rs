@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ActivateGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ActivateGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ActivateGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a gateway: the record is persisted in [`crate::state`] and the `GatewayARN` this
+//! operation answers with is the ARN that record is keyed by, so `ListGateways` and
+//! `DescribeGatewayInformation` report what the activation stored.
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +179,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ActivateGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ActivateGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ActivateGateway"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ActivateGatewayErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("the storage gateway store is unavailable".to_string()),
+                    error: None,
+                },
+            )
+            .into());
+        };
+
+        // `GatewayType` is modelled by length alone, so its documented value list
+        // ("Valid Values: STORED | CACHED | VTL | FILE_S3 | FILE_FSX_SMB") is
+        // enforced here, and its documented default ("CACHED") applied here.
+        let gateway_type = input
+            .gateway_type
+            .unwrap_or_else(|| crate::state::DEFAULT_GATEWAY_TYPE.to_string());
+        if !crate::state::GATEWAY_TYPE_VALUES.contains(&gateway_type.as_str()) {
+            return Err(ActivateGatewayErrorModeled::InvalidGatewayRequestException(
+                crate::state::invalid_gateway_request(
+                    crate::state::ERROR_CODE_INVALID_PARAMETERS,
+                    format!(
+                        "GatewayType must be one of {}.",
+                        crate::state::GATEWAY_TYPE_VALUES.join(" | ")
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        // `GatewayTimezone` is modelled by length alone, and documents its form:
+        // "The time zone is of the format "GMT", "GMT-hr:mm", or "GMT+hr:mm"".
+        if !crate::state::is_gateway_timezone(&input.gateway_timezone) {
+            return Err(ActivateGatewayErrorModeled::InvalidGatewayRequestException(
+                crate::state::invalid_gateway_request(
+                    crate::state::ERROR_CODE_INVALID_PARAMETERS,
+                    "GatewayTimezone must be of the format \"GMT\", \"GMT-hr:mm\" or \
+                     \"GMT+hr:mm\".",
+                ),
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // The store is bounded: past its ceiling an activation is refused rather
+        // than adding another record that lives for the life of the process.
+        if store.gateways.len() >= crate::state::MAX_GATEWAYS {
+            return Err(ActivateGatewayErrorModeled::InvalidGatewayRequestException(
+                crate::state::invalid_gateway_request(
+                    crate::state::ERROR_CODE_INVALID_PARAMETERS,
+                    format!(
+                        "This account already holds the maximum of {} gateways in this Region.",
+                        crate::state::MAX_GATEWAYS
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        let gateway_id = store.mint_gateway_id();
+        let sequence = store.gateway_id_seq;
+        let arn = crate::state::gateway_arn(&region, &gateway_id);
+        let gateway = crate::state::Gateway {
+            arn: arn.clone(),
+            gateway_id,
+            name: input.gateway_name,
+            timezone: input.gateway_timezone,
+            region: input.gateway_region,
+            gateway_type,
+            operational_state: crate::state::GATEWAY_OPERATIONAL_STATE_ACTIVE.to_string(),
+            gateway_state: crate::state::GATEWAY_STATE_RUNNING.to_string(),
+            activation_key: input.activation_key,
+            tape_drive_type: input.tape_drive_type,
+            medium_changer_type: input.medium_changer_type,
+            host_environment: crate::state::HOST_ENVIRONMENT_OTHER.to_string(),
+            endpoint_type: crate::state::ENDPOINT_TYPE_STANDARD.to_string(),
+            software_version: crate::state::SOFTWARE_VERSION.to_string(),
+            network_interfaces: crate::state::gateway_network_interfaces(sequence),
+            tags: input.tags.unwrap_or_default(),
+            activated_at: now,
+        };
+        store.gateways.insert(arn.clone(), gateway);
+
+        Ok(ActivateGatewayOutput {
+            gateway_arn: Some(arn),
+        })
     }
 }

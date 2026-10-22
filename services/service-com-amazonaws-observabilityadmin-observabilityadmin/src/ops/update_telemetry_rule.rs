@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateTelemetryRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateTelemetryRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateTelemetryRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the `Rule` body of the one stored telemetry rule `RuleIdentifier` names
+//! in [`crate::state`], bumps its `LastUpdateTimeStamp`, leaves its
+//! `CreatedTimeStamp` and its tags where they were, brings its fan-out replicas in
+//! line with the new scope, and answers the rule's existing ARN.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +157,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateTelemetryRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateTelemetryRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateTelemetryRule"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateTelemetryRuleErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the telemetry rule store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+
+        if let Some(why) = crate::state::telemetry_rule_rejection(&input.rule, &region) {
+            return Err(UpdateTelemetryRuleErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(why),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        let now = crate::state::now_epoch_millis();
+        // Bounded and counted before anything is allocated, exactly as on the create
+        // path: at most `MAX_REPLICATION_TARGETS` regions of the home region's
+        // partition, whatever the request listed.
+        let replication_targets = crate::state::replication_targets(&input.rule, &region);
+
+        let mut store = state.lock();
+        let Some(record) = store.rule(&region, &input.rule_identifier, now) else {
+            return Err(UpdateTelemetryRuleErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "no telemetry rule '{}' in {region}",
+                        input.rule_identifier
+                    )),
+                    resource_id: Some(input.rule_identifier),
+                    resource_type: Some("telemetry-rule".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `IsReplicated`'s own documentation: "Replicated rules cannot be directly
+        // updated or deleted in the spoke region. To modify a replicated rule, make
+        // changes in the home region." That is a conflict with the resource's
+        // current state, which is what this operation's `ConflictException` states.
+        if record.is_replica {
+            let home_region = record.home_region.clone();
+            let rule_name = record.rule_name.clone();
+            return Err(UpdateTelemetryRuleErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "telemetry rule '{rule_name}' in {region} is a replica of the rule in \
+                         {home_region}; update it in its home region"
+                    )),
+                    resource_id: Some(rule_name),
+                    resource_type: Some("telemetry-rule".to_string()),
+                },
+            )
+            .into());
+        }
+
+        let key = record.key();
+        // The new scope may add replicas, so the same store cap the create path
+        // applies is checked here before any of them is allocated. The regions the
+        // update drops are not subtracted: the check is deliberately conservative.
+        if store.would_exceed_store(replication_targets.len()) {
+            return Err(
+                UpdateTelemetryRuleErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "this rule's {} replicas would take the store past its {} records",
+                            replication_targets.len(),
+                            crate::state::MAX_STORED_RULE_RECORDS
+                        )),
+                        resource_type: Some("telemetry-rule".to_string()),
+                        service_code: Some(crate::state::ARN_SERVICE.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let rule_arn = store.replace_rule(&key, input.rule, now);
+
+        Ok(UpdateTelemetryRuleOutput { rule_arn })
     }
 }

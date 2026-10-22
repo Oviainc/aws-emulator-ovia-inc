@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateSlackChannelConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateSlackChannelConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateSlackChannelConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Merges the members the request carries into the stored Slack channel configuration
+//! — the ones it omits keep their persisted values — and answers with the
+//! post-update record read back out of the store, not with an echo of the request.
 //!
 //! ## Shape of an operation
 //!
@@ -195,18 +190,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateSlackChannelConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSlackChannelConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateSlackChannelConfiguration"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateSlackChannelConfigurationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Support App store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        let key = (input.team_id.clone(), input.channel_id.clone());
+        let Some(stored) = store.slack_channel_configurations.get(&key) else {
+            return Err(
+                UpdateSlackChannelConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "no Slack channel configuration exists for channel {} in \
+                             workspace {}",
+                            input.channel_id, input.team_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "If you don't specify these parameters in your request, the Amazon Web
+        // Services Support App uses the current values by default"
+        // (`notifyOnCaseSeverity`): an omitted member keeps what is stored, so the
+        // merge is computed from the record, never from the request alone.
+        let merged = crate::state::SlackChannelConfig {
+            channel_name: input.channel_name.or_else(|| stored.channel_name.clone()),
+            notify_on_create_or_reopen_case: input
+                .notify_on_create_or_reopen_case
+                .or(stored.notify_on_create_or_reopen_case),
+            notify_on_add_correspondence_to_case: input
+                .notify_on_add_correspondence_to_case
+                .or(stored.notify_on_add_correspondence_to_case),
+            notify_on_resolve_case: input
+                .notify_on_resolve_case
+                .or(stored.notify_on_resolve_case),
+            notify_on_case_severity: input
+                .notify_on_case_severity
+                .unwrap_or_else(|| stored.notify_on_case_severity.clone()),
+            channel_role_arn: input
+                .channel_role_arn
+                .unwrap_or_else(|| stored.channel_role_arn.clone()),
+            ..stored.clone()
+        };
+
+        // The severity/flag combination rule documented on `notifyOnCaseSeverity`,
+        // evaluated over the configuration the update would leave behind.
+        if let Some(message) = crate::state::notification_rule_violation(
+            &merged.notify_on_case_severity,
+            merged.notify_on_create_or_reopen_case.unwrap_or(false),
+            merged.notify_on_add_correspondence_to_case.unwrap_or(false),
+            merged.notify_on_resolve_case.unwrap_or(false),
+        ) {
+            return Err(UpdateSlackChannelConfigurationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        store
+            .slack_channel_configurations
+            .insert(key.clone(), merged);
+
+        // Read the post-update record back out of the store, so the response reports
+        // what a later `ListSlackChannelConfigurations` will report.
+        let persisted = store
+            .slack_channel_configurations
+            .get(&key)
+            .ok_or_else(|| {
+                UpdateSlackChannelConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the updated Slack channel configuration could not be read back"
+                                .to_string(),
+                        ),
+                    },
+                )
+            })?
+            .to_modeled();
+
+        Ok(UpdateSlackChannelConfigurationOutput {
+            team_id: Some(persisted.team_id),
+            channel_id: Some(persisted.channel_id),
+            channel_name: persisted.channel_name,
+            notify_on_create_or_reopen_case: persisted.notify_on_create_or_reopen_case,
+            notify_on_add_correspondence_to_case: persisted.notify_on_add_correspondence_to_case,
+            notify_on_resolve_case: persisted.notify_on_resolve_case,
+            notify_on_case_severity: persisted.notify_on_case_severity,
+            channel_role_arn: persisted.channel_role_arn,
+        })
     }
 }

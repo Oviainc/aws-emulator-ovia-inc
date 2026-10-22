@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListApplications
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListApplications`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListApplications::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the stored applications as `ApplicationSummary` entries, in one stable
+//! order, a page at a time.
+//!
+//! The cursor names the `applicationId` the next page resumes AT rather than an
+//! offset, so deleting a record between two pages cannot make the next page skip or
+//! repeat an application. The final page carries no `nextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -80,9 +78,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-securityagent-securitya
 // here — hence the `ListApplicationsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.securityagent#ListApplications")]
+//
+// `ListApplications` lists no errors of its own, so the two service-wide shapes this
+// handler needs are widened in with `extra_errors`: `ValidationException` (HTTP 400,
+// for a `nextToken` or `maxResults` this service cannot act on) and
+// `InternalServerException` (HTTP 500).
+#[smithy_macros::operation_error(
+    "com.amazonaws.securityagent#ListApplications",
+    extra_errors = ["InternalServerException", "ValidationException"]
+)]
 #[derive(Debug)]
 pub enum ListApplicationsErrorModeled {
+    InternalServerException(InternalServerException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -136,18 +144,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListApplications` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListApplicationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListApplications"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListApplicationsErrorModeled::InternalServerException(InternalServerException {
+                message: "the application store is unavailable".to_string(),
+            })
+        })?;
+
+        // Where this page starts. An absent token starts at the first application; a
+        // token this service minted names the `applicationId` to resume at. A token it
+        // did not mint is refused rather than read as a resume point past every record.
+        let resume_from = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(application_id) => Some(application_id),
+                None => {
+                    return Err(ListApplicationsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: "Member must be a nextToken returned by a previous \
+                                      ListApplications call: nextToken"
+                                .to_string(),
+                            field_list: Some(vec![ValidationExceptionField {
+                                path: "nextToken".to_string(),
+                                message: "must be a nextToken returned by a previous \
+                                          ListApplications call"
+                                    .to_string(),
+                            }]),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        // `MaxResults` carries no `@default` and no `@range` in the model, so an absent
+        // page size takes this service's own default. A non-positive one is refused
+        // rather than clamped: a zero-item page that still carried a cursor would be a
+        // client loop that never terminates. A page size above the service's ceiling is
+        // clamped rather than refused, so the caller still reaches every application —
+        // one page at a time — while the work and the response one call can demand stay
+        // bounded.
+        let requested = input.max_results.unwrap_or(crate::state::DEFAULT_MAX_RESULTS);
+        let page_size = match usize::try_from(requested) {
+            Ok(size) if size >= 1 => size.min(crate::state::MAX_PAGE_SIZE as usize),
+            _ => {
+                return Err(ListApplicationsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "Member must have value greater than or equal to 1: maxResults {requested}"
+                        ),
+                        field_list: Some(vec![ValidationExceptionField {
+                            path: "maxResults".to_string(),
+                            message: "must have value greater than or equal to 1".to_string(),
+                        }]),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // A read (`@readonly`): it walks the stored applications and writes nothing.
+        let state = state.lock();
+        // Borrowed bounds, so resuming copies no id.
+        let start = match resume_from.as_deref() {
+            Some(application_id) => ::std::ops::Bound::Included(application_id),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        let mut remaining = state
+            .applications
+            .range::<str, _>((start, ::std::ops::Bound::Unbounded));
+
+        let mut application_summaries = Vec::new();
+        for (_, application) in remaining.by_ref().take(page_size) {
+            application_summaries.push(application.summary());
+        }
+        // The cursor is the first application AFTER this page, so `nextToken` is present
+        // exactly when one remains.
+        let next_token = remaining
+            .next()
+            .map(|(application_id, _)| crate::state::encode_page_token(application_id));
+
+        Ok(ListApplicationsOutput {
+            application_summaries,
+            next_token,
+        })
     }
 }

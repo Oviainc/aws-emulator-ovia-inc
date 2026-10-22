@@ -28,7 +28,10 @@ pub struct ListNodesOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.managedblockchain#NodeSummary")]
+// `NodeSummary`'s schema is written out by hand for the same single reason as
+// `Network`'s — `@timestampFormat("date-time")` on `CreationDate`'s target shape, which
+// the vendored codegen does not emit — and mirrors the macro's output in every other
+// respect. See the note above `Network` in `get_network_types.rs`.
 #[derive(Debug, Clone, Default)]
 pub struct NodeSummary {
     pub id: Option<String>,
@@ -37,5 +40,143 @@ pub struct NodeSummary {
     pub availability_zone: Option<String>,
     pub instance_type: Option<String>,
     pub arn: Option<String>,
+}
+
+#[allow(non_upper_case_globals)]
+impl NodeSummary {
+    const SHAPE_ID: &'static str = "com.amazonaws.managedblockchain#NodeSummary";
+    const NAMESPACE: &'static str = "com.amazonaws.managedblockchain";
+
+    pub const M_ID: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.managedblockchain#NodeSummary$Id",
+            Self::NAMESPACE,
+            "Id",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "Id",
+        0,
+    );
+    pub const M_STATUS: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.managedblockchain#NodeSummary$Status",
+            Self::NAMESPACE,
+            "Status",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "Status",
+        1,
+    );
+    /// `@timestampFormat("date-time")` from `Timestamp` — the chain the macro cannot
+    /// emit.
+    pub const M_CREATION_DATE: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.managedblockchain#NodeSummary$CreationDate",
+                Self::NAMESPACE,
+                "CreationDate",
+            ),
+            ::aws_smithy_schema::ShapeType::Timestamp,
+            "CreationDate",
+            2,
+        )
+        .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    pub const M_AVAILABILITY_ZONE: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.managedblockchain#NodeSummary$AvailabilityZone",
+                Self::NAMESPACE,
+                "AvailabilityZone",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "AvailabilityZone",
+            3,
+        );
+    pub const M_INSTANCE_TYPE: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.managedblockchain#NodeSummary$InstanceType",
+                Self::NAMESPACE,
+                "InstanceType",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "InstanceType",
+            4,
+        );
+    pub const M_ARN: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.managedblockchain#NodeSummary$Arn",
+            Self::NAMESPACE,
+            "Arn",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "Arn",
+        5,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(Self::SHAPE_ID, Self::NAMESPACE, "NodeSummary"),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ID,
+            &Self::M_STATUS,
+            &Self::M_CREATION_DATE,
+            &Self::M_AVAILABILITY_ZONE,
+            &Self::M_INSTANCE_TYPE,
+            &Self::M_ARN,
+        ],
+    );
+}
+
+pub static NODE_SUMMARY_SCHEMA: &::aws_smithy_schema::Schema = &NodeSummary::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for NodeSummary {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(v) = self.id.as_ref() {
+            s.write_string(&Self::M_ID, v.as_str())?;
+        }
+        if let Some(v) = self.status.as_ref() {
+            s.write_string(&Self::M_STATUS, v.as_str())?;
+        }
+        if let Some(v) = self.creation_date.as_ref() {
+            s.write_timestamp(&Self::M_CREATION_DATE, v)?;
+        }
+        if let Some(v) = self.availability_zone.as_ref() {
+            s.write_string(&Self::M_AVAILABILITY_ZONE, v.as_str())?;
+        }
+        if let Some(v) = self.instance_type.as_ref() {
+            s.write_string(&Self::M_INSTANCE_TYPE, v.as_str())?;
+        }
+        if let Some(v) = self.arn.as_ref() {
+            s.write_string(&Self::M_ARN, v.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for NodeSummary {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => out.id = Some(d.read_string(&Self::M_ID)?),
+                Some(1) => out.status = Some(d.read_string(&Self::M_STATUS)?),
+                Some(2) => out.creation_date = Some(d.read_timestamp(&Self::M_CREATION_DATE)?),
+                Some(3) => {
+                    out.availability_zone = Some(d.read_string(&Self::M_AVAILABILITY_ZONE)?)
+                }
+                Some(4) => out.instance_type = Some(d.read_string(&Self::M_INSTANCE_TYPE)?),
+                Some(5) => out.arn = Some(d.read_string(&Self::M_ARN)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
 }
 

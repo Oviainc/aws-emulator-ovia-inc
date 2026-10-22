@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResourceShareAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetResourceShareAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the associations [`crate::state`] holds between resource shares and the
+//! resources, principals and sources associated with them, filtered as the request
+//! asks and one `@paginated` page at a time.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetResourceShareAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A read: the only thing it writes is the `ASSOCIATING` -> `ASSOCIATED` move the
+//! clock already owed an association, which is due whether or not anybody calls.
 //!
 //! ## Shape of an operation
 //!
@@ -191,18 +188,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetResourceShareAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetResourceShareAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetResourceShareAssociations"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetResourceShareAssociationsErrorModeled::ServerInternalException(
+                ServerInternalException {
+                    message: "the resource share store is unavailable".to_string(),
+                },
+            )
+        })?;
+
+        let requested_arns = input.resource_share_arns.clone().unwrap_or_default();
+        if let Some(why) = requested_arns
+            .iter()
+            .find_map(|arn| crate::state::share_arn_rejection("resourceShareArns entry", arn))
+            .or_else(|| {
+                input.resource_arn.as_deref().and_then(|arn| {
+                    (!crate::state::is_arn(arn)).then(|| "resourceArn is not an ARN".to_string())
+                })
+            })
+        {
+            return Err(
+                GetResourceShareAssociationsErrorModeled::MalformedArnException(
+                    MalformedArnException { message: why },
+                )
+                .into(),
+            );
+        }
+
+        // From the two members' own documentation: `principal` "cannot be specified
+        // if the association type is RESOURCE" and `resourceArn` "cannot be
+        // specified if the association type is PRINCIPAL".
+        let exclusivity = if input.association_type == crate::state::ASSOCIATION_TYPE_RESOURCE
+            && input.principal.is_some()
+        {
+            Some("principal cannot be specified when associationType is RESOURCE")
+        } else if input.association_type == crate::state::ASSOCIATION_TYPE_PRINCIPAL
+            && input.resource_arn.is_some()
+        {
+            Some("resourceArn cannot be specified when associationType is PRINCIPAL")
+        } else {
+            None
+        };
+        if let Some(why) = exclusivity {
+            return Err(
+                GetResourceShareAssociationsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: why.to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let page_size = crate::state::page_size(input.max_results);
+        let start = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_association_cursor(token).ok_or_else(
+                || {
+                    GetResourceShareAssociationsErrorModeled::InvalidNextTokenException(
+                        InvalidNextTokenException {
+                            message: "nextToken is not a pagination token issued by \
+                                      GetResourceShareAssociations"
+                                .to_string(),
+                        },
+                    )
+                },
+            )?),
+        };
+
+        let mut store = state.lock();
+        let now = store.tick();
+        store.settle_due_associations(now);
+
+        if let Some(unknown) = requested_arns
+            .iter()
+            .find(|arn| store.share(arn.as_str()).is_none())
+        {
+            return Err(
+                GetResourceShareAssociationsErrorModeled::UnknownResourceException(
+                    UnknownResourceException {
+                        message: format!("no resource share with the ARN '{unknown}' exists"),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut resource_share_associations =
+            Vec::with_capacity(page_size.min(store.associations.len()));
+        let mut next_token = None;
+        let mut remaining = match &start {
+            Some(key) => store.associations.range(key.clone()..),
+            None => store.associations.range::<crate::state::AssociationKey, _>(..),
+        };
+        for (key, association) in remaining.by_ref() {
+            if association.association_type != input.association_type {
+                continue;
+            }
+            if !requested_arns.is_empty()
+                && !requested_arns.contains(&association.resource_share_arn)
+            {
+                continue;
+            }
+            // Both filters name the associated entity; which of them a caller may
+            // use is decided by the association type above.
+            if let Some(entity) = input.resource_arn.as_deref().or(input.principal.as_deref()) {
+                if association.associated_entity != entity {
+                    continue;
+                }
+            }
+            if input
+                .association_status
+                .as_deref()
+                .is_some_and(|status| association.status != status)
+            {
+                continue;
+            }
+            // The first association that does not fit becomes the next page's
+            // start, and only then is a `nextToken` emitted.
+            if resource_share_associations.len() == page_size {
+                next_token = Some(crate::state::encode_association_cursor(key));
+                break;
+            }
+            resource_share_associations.push(association.view());
+        }
+
+        Ok(GetResourceShareAssociationsOutput {
+            resource_share_associations: Some(resource_share_associations),
+            next_token,
+        })
     }
 }

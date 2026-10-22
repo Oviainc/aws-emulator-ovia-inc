@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCapability
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCapability`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCapability::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a capability, persists its configuration verbatim, and answers with the
+//! STORED record so a later `GetCapability` returns exactly what was created.
 //!
 //! ## Shape of an operation
 //!
@@ -154,6 +147,42 @@ impl From<CreateCapabilityErrorModeled> for CreateCapabilityError {
     }
 }
 
+/// The modelled refusal for a store already holding
+/// [`crate::state::MAX_RECORDS_PER_STORE`] capabilities: this emulator will not grow
+/// its capability store further, so the request is refused rather than served by
+/// allocating more.
+///
+/// `quotaCode` and `serviceCode` name the limit that was actually reached — this
+/// emulator's own storage bound and this service's own code — rather than an AWS quota
+/// code, which only AWS can assign.
+fn store_full() -> CreateCapabilityError {
+    CreateCapabilityErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException {
+        message: format!(
+            "this emulator stores at most {} capabilities",
+            crate::state::MAX_RECORDS_PER_STORE
+        ),
+        resource_id: ::engine::emulator_account_id().to_string(),
+        resource_type: "capability".to_string(),
+        service_code: "b2bi".to_string(),
+        quota_code: "CapabilitiesPerAccount".to_string(),
+    })
+    .into()
+}
+
+/// The response for a stored capability — every member read back off the record, so a
+/// create and a later `GetCapability` cannot disagree.
+fn stored_capability_response(capability: &crate::state::Capability) -> CreateCapabilityOutput {
+    CreateCapabilityOutput {
+        capability_id: capability.capability_id.clone(),
+        capability_arn: capability.capability_arn.clone(),
+        name: capability.name.clone(),
+        r#type: capability.r#type.clone(),
+        configuration: capability.configuration.clone(),
+        instructions_documents: capability.instructions_documents.clone(),
+        created_at: capability.created_at,
+    }
+}
+
 /// The `CreateCapability` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -190,18 +219,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCapability` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCapabilityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCapability"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateCapabilityErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STATE_UNAVAILABLE.to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let mut state = store.lock();
+
+        // `clientToken` is this operation's `@idempotencyToken`: a repeat carrying the
+        // same token answers with the resource the first call created, not a second one.
+        let idempotency_key = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::idempotency_key("capability", token));
+        if let Some(key) = idempotency_key.as_deref() {
+            if let Some(existing) = state
+                .idempotency
+                .get(key)
+                .and_then(|id| state.capabilities.get(id))
+            {
+                return Ok(stored_capability_response(existing));
+            }
+        }
+
+        // Residency bound: this store holds at most `MAX_RECORDS_PER_STORE`
+        // capabilities, so repeated creates cannot grow the emulator's memory without
+        // limit. Checked AFTER the idempotency replay, so a replay still answers from a
+        // full store.
+        if !state.accepts_another_capability() {
+            return Err(store_full());
+        }
+
+        let mut capability_id = crate::state::new_resource_id("ca");
+        while state.capabilities.contains_key(&capability_id) {
+            capability_id = crate::state::new_resource_id("ca");
+        }
+        let region = crate::state::request_region(ctx.parts());
+        let capability = crate::state::Capability {
+            capability_arn: ::engine::emulator_arn(
+                "b2bi",
+                &region,
+                &format!("capability/{capability_id}"),
+            ),
+            capability_id,
+            name: input.name,
+            r#type: input.r#type,
+            configuration: input.configuration,
+            instructions_documents: input.instructions_documents,
+            created_at: crate::state::now(),
+            modified_at: None,
+            tags: input.tags.unwrap_or_default(),
+        };
+
+        let response = stored_capability_response(&capability);
+        let capability_id = capability.capability_id.clone();
+        state.capabilities.insert(capability_id.clone(), capability);
+        state.capability_order.push(capability_id.clone());
+        if let Some(key) = idempotency_key {
+            state.record_idempotency(key, &capability_id);
+        }
+        Ok(response)
     }
 }

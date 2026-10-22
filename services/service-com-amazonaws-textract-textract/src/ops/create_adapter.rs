@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAdapter
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAdapter`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates an adapter from the request and PERSISTS it, so `GetAdapter` reads it back.
+//! This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAdapter::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this handler decides
+//!
+//! * the adapter's identity is the `AdapterId` this service MINTS (see
+//!   [`crate::state::ComAmazonawsTextractTextractState::mint_adapter_id`]); the adapter
+//!   name is metadata, so two adapters may carry the same name;
+//! * `FeatureTypes` must name only the feature type the service supports for adapters,
+//!   and `AutoUpdate` defaults to `DISABLED` — both rules live in `crate::state` beside
+//!   the doc sentences they come from;
+//! * a `ClientRequestToken` already used for the SAME request answers with the adapter
+//!   that request created, and for a DIFFERENT request is an
+//!   `IdempotentParameterMismatchException`.
 //!
 //! ## Shape of an operation
 //!
@@ -185,20 +190,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAdapter` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAdapterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAdapter"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateAdapterErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("Textract state is unavailable".to_string()),
+                    code: None,
+                },
+            )
+            .into());
+        };
+
+        // An adapter can only be trained on a feature type the service supports for
+        // adapters. The modelled length and pattern constraints on the other members were
+        // already enforced before this handler ran.
+        if let Err(message) = crate::state::validate_adapter_features(&input.feature_types) {
+            return Err(CreateAdapterErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                    code: None,
+                },
+            )
+            .into());
+        }
+        let auto_update = match crate::state::adapter_auto_update(input.auto_update.as_deref()) {
+            Ok(auto_update) => auto_update,
+            Err(message) => {
+                return Err(CreateAdapterErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                        code: None,
+                    },
+                )
+                .into())
+            }
+        };
+
+        let now = std::time::SystemTime::now();
+        // The adapter this request asks for. Its `adapter_id` is filled in below, from
+        // the mint, for the call that actually creates it.
+        let requested = crate::state::AdapterRecord {
+            adapter_id: String::new(),
+            adapter_name: input.adapter_name,
+            description: input.description,
+            feature_types: input.feature_types,
+            auto_update,
+            tags: input.tags.unwrap_or_default(),
+            created_at: now,
+            client_request_token: input.client_request_token,
+        };
+
+        // ONE lock spans the token check and the mint, so two concurrent creates carrying
+        // the same token cannot both mint: the later one reads the earlier one's adapter.
+        let mut store = state.lock();
+
+        // Idempotency: the same token for the same request answers with the adapter the
+        // first call created; for a different request it is a mismatch.
+        if let Some(token) = requested.client_request_token.clone() {
+            if let Some(existing) = store.adapter_for_token(&token) {
+                if existing.same_request_as(&requested) {
+                    return Ok(CreateAdapterOutput {
+                        adapter_id: Some(existing.adapter_id.clone()),
+                    });
+                }
+                let adapter_id = existing.adapter_id.clone();
+                return Err(
+                    CreateAdapterErrorModeled::IdempotentParameterMismatchException(
+                        IdempotentParameterMismatchException {
+                            message: Some(format!(
+                                "the ClientRequestToken was already used to create adapter \
+                                 {adapter_id} from different parameters"
+                            )),
+                            code: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // An adapter is never evicted, so the store's ceiling is refused rather than made
+        // room for: see `crate::state::MAX_STORED_ADAPTERS`.
+        if store.adapters.len() >= crate::state::MAX_STORED_ADAPTERS {
+            return Err(CreateAdapterErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "this account already holds {} adapters, the most this emulator stores",
+                        crate::state::MAX_STORED_ADAPTERS
+                    )),
+                    code: None,
+                },
+            )
+            .into());
+        }
+
+        let adapter_id = store.mint_adapter_id(&requested.adapter_name);
+        store.insert_adapter(crate::state::AdapterRecord {
+            adapter_id: adapter_id.clone(),
+            ..requested
+        });
+
+        Ok(CreateAdapterOutput {
+            adapter_id: Some(adapter_id),
+        })
     }
 }
+

@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCampaign
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCampaign`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints a campaign id and ARN, stores the whole campaign in this service's state with
+//! an initial run state of `Initialized`, and answers `id`/`arn`/`tags` read back out
+//! of the store.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCampaign::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## Idempotency
+//!
+//! The model marks this operation `@idempotent` and its documentation says "This API is
+//! idempotent", but `CreateCampaignRequest` carries no client token and the operation
+//! answers only `id`/`arn`/`tags`, so there is no request-supplied key to recognise a
+//! retry by: every call mints its own campaign, exactly as two distinct campaigns with
+//! the same name on the same instance are distinct in AWS (name is not an identifier,
+//! and `UpdateCampaignName` can make two campaigns share one). The modelled
+//! `ConflictException` is therefore unreachable here; if a later slice adopts a key
+//! (a client token, or instance id + name), a retry must answer the ORIGINAL campaign's
+//! `id`/`arn` and a key reused with a different body must answer `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +167,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCampaign` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCampaignErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCampaign"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateCampaignError::from(CreateCampaignErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the campaign store is unavailable".to_string(),
+                    x_amz_error_type: None,
+                },
+            ))
+        })?;
+
+        // A fresh campaign id, and the ARN naming it in the region the request was
+        // signed for.
+        let id = crate::state::fresh_campaign_id();
+        let region = crate::state::request_region(ctx.parts());
+        let arn = crate::state::campaign_arn(&region, &id);
+
+        let stored = {
+            let mut store = state.lock();
+
+            // The store is bounded: a campaign is released only by DeleteCampaign, so
+            // a create past the per-instance quota, or past what this store holds in
+            // total, is refused with the quota error the model declares rather than
+            // growing the store without limit.
+            if store.campaigns_for_instance(&input.connect_instance_id)
+                >= crate::state::CAMPAIGNS_PER_INSTANCE_QUOTA
+            {
+                return Err(CreateCampaignErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "Amazon Connect instance {} already holds its quota of {} campaigns",
+                            input.connect_instance_id,
+                            crate::state::CAMPAIGNS_PER_INSTANCE_QUOTA
+                        ),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into());
+            }
+            if store.campaigns.len() >= crate::state::CAMPAIGN_STORE_CAPACITY {
+                return Err(CreateCampaignErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "this emulator's campaign store already holds its limit of {} campaigns",
+                            crate::state::CAMPAIGN_STORE_CAPACITY
+                        ),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into());
+            }
+
+            store.insert_campaign(crate::state::StoredCampaign {
+                id,
+                arn,
+                name: input.name,
+                connect_instance_id: input.connect_instance_id,
+                dialer_config: input.dialer_config,
+                outbound_call_config: input.outbound_call_config,
+                tags: input.tags.unwrap_or_default(),
+                // A campaign AWS has created but nobody has started is `Initialized`; it
+                // leaves that state only when a caller starts it.
+                state: crate::state::CampaignState::Initialized,
+                created_at: ::std::time::SystemTime::now(),
+                // Replaced by the store's own creation counter.
+                sequence: 0,
+            })
+        };
+
+        crate::state::audit_campaign_change(ctx.parts(), "CreateCampaign", &stored.id, "created");
+
+        // Answered from what was stored, so a response that differs from the stored
+        // campaign cannot happen.
+        Ok(CreateCampaignOutput {
+            id: Some(stored.id),
+            arn: Some(stored.arn),
+            tags: (!stored.tags.is_empty()).then_some(stored.tags),
+        })
     }
 }

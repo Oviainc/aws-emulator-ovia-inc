@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op Sample
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `Sample`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`Sample::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -123,6 +114,11 @@ impl From<SampleErrorModeled> for SampleError {
     }
 }
 
+/// This operation's own modelled 400 `ValidationException`.
+fn validation(message: String) -> SampleError {
+    SampleErrorModeled::ValidationException(ValidationException { message }).into()
+}
+
 /// The `Sample` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -159,18 +155,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `Sample` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SampleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("Sample"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(SampleErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the AgenticRFT runtime emulator has no state store".to_string(),
+            })
+            .into());
+        };
+
+        // `Body` is `@required` and `@httpPayload`, so a request without one is
+        // already refused at the boundary; a request WITH an empty payload gets
+        // this far and carries no inference request to capture.
+        if input.body.is_empty() {
+            return Err(validation(
+                "Body must carry the inference request payload; it was empty.".to_string(),
+            ));
+        }
+
+        let request_content_type = ctx
+            .parts()
+            .headers
+            .get(::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+
+        let now = ::std::time::SystemTime::now();
+        let job_arn = input.job_arn.clone();
+        let trajectory_id = input.trajectory_id.clone();
+        let prompt = input.body.clone();
+        let turn = state
+            .lock()
+            .append_turn(
+                &crate::state::TurnRequest {
+                    job_arn: &job_arn,
+                    trajectory_id: &trajectory_id,
+                    request_body: &prompt,
+                    request_content_type,
+                    streamed: false,
+                    at: now,
+                },
+                |index| {
+                    (
+                        crate::state::sample_response_body(
+                            &job_arn,
+                            &trajectory_id,
+                            index,
+                            &prompt,
+                            now,
+                        ),
+                        crate::state::JSON_CONTENT_TYPE.to_string(),
+                    )
+                },
+            )
+            .map_err(|refusal| {
+                let message = refusal.message(&trajectory_id);
+                if refusal.is_quota() {
+                    SampleErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException { message },
+                    )
+                    .into()
+                } else {
+                    // `Sample` models no `ConflictException`, so a request that
+                    // conflicts with the trajectory's sealed state is refused with
+                    // the client error it does model.
+                    validation(message)
+                }
+            })?;
+
+        Ok(SampleOutput {
+            content_type: turn.response_content_type.clone(),
+            body: turn.response_body,
+        })
     }
 }

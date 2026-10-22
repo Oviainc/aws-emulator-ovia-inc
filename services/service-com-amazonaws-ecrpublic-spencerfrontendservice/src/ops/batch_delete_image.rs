@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDeleteImage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDeleteImage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchDeleteImage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes images, or single tags, from a repository held in [`crate::state`], and
+//! reports exactly what it removed and what it could not.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +150,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDeleteImage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDeleteImageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDeleteImage"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(BatchDeleteImageErrorModeled::ServerException(ServerException {
+                message: Some(
+                    "The ECR Public emulator could not reach its state store.".to_string(),
+                ),
+            })
+            .into());
+        };
+
+        let mut store = state.lock();
+        if let Some(registry_id) = input.registry_id.as_deref() {
+            if !store.is_this_registry(registry_id) {
+                return Err(BatchDeleteImageErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "Invalid parameter at 'registryId' failed to satisfy constraint: \
+                             'Member must name the public registry of this account ({})'",
+                            store.registry_id
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+        let registry_id = store.registry_id.clone();
+        let Some(repository) = store.repositories.get_mut(&input.repository_name) else {
+            return Err(BatchDeleteImageErrorModeled::RepositoryNotFoundException(
+                RepositoryNotFoundException {
+                    message: Some(format!(
+                        "The repository with name '{}' does not exist in the registry with id \
+                         '{registry_id}'",
+                        input.repository_name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        let mut deleted: Vec<ImageIdentifier> = Vec::new();
+        let mut failures: Vec<ImageFailure> = Vec::new();
+
+        for id in &input.image_ids {
+            // Resolve to an owned digest first: the lookup borrows the repository, and
+            // the removal below mutates it.
+            let resolved = repository
+                .resolve_identifier(id)
+                .map(|image| image.digest.clone());
+            let digest = match resolved {
+                Ok(digest) => digest,
+                Err(problem) => {
+                    failures.push(ImageFailure {
+                        image_id: Some(id.clone()),
+                        failure_code: Some(problem.failure_code().to_string()),
+                        failure_reason: Some(problem.failure_reason().to_string()),
+                    });
+                    continue;
+                }
+            };
+
+            let tag = id.image_tag.as_deref().filter(|tag| !tag.is_empty());
+            let by_digest = id
+                .image_digest
+                .as_deref()
+                .is_some_and(|digest| !digest.is_empty());
+            if by_digest {
+                // "You can completely delete an image (and all of its tags) by
+                // specifying the digest of the image in your request."
+                if let Some(removed) = repository.images.remove(&digest) {
+                    for stale in &removed.tags {
+                        repository.tag_index.remove(stale);
+                    }
+                }
+            } else if let Some(tag) = tag {
+                // "You can remove a tag from an image by specifying the image's tag in
+                // your request. When you remove the last tag from an image, the image is
+                // deleted from your repository."
+                repository.tag_index.remove(tag);
+                let now_untagged = match repository.images.get_mut(&digest) {
+                    Some(image) => {
+                        image.tags.remove(tag);
+                        image.tags.is_empty()
+                    }
+                    None => false,
+                };
+                if now_untagged {
+                    repository.images.remove(&digest);
+                }
+            }
+            deleted.push(ImageIdentifier {
+                image_digest: Some(digest),
+                image_tag: tag.map(ToString::to_string),
+            });
+        }
+        drop(store);
+
+        Ok(BatchDeleteImageOutput {
+            image_ids: Some(deleted),
+            failures: Some(failures),
+        })
     }
 }
