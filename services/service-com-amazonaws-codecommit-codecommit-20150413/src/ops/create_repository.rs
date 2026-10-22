@@ -195,7 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `repositoryName`'s length and pattern are modeled, so the boundary
         // validator already refused anything outside them. What is left is the
         // documented rule the model cannot express: "The suffix .git is prohibited."
-        if input.repository_name.to_ascii_lowercase().ends_with(".git") {
+        if crate::state::has_prohibited_git_suffix(&input.repository_name) {
             return Err(CreateRepositoryErrorModeled::InvalidRepositoryNameException(
                 InvalidRepositoryNameException {
                     message: Some(format!(

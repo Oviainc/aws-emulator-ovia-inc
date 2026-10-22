@@ -21,7 +21,11 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The region the test's requests are signed for; every ARN and clone URL the
 /// service reports must be built for it.
-const REGION: &str = "us-west-2";
+///
+/// This module's harness (`emulator`, `call`, `ok`, `error` and the small value
+/// helpers) is shared with the sibling suites in `tests/all/`, so every suite
+/// drives the same emulator over the same wire protocol.
+pub(crate) const REGION: &str = "us-west-2";
 
 /// Build the emulator the way the router does: one shared engine, this service
 /// mounted on it, request authentication off so the test signs nothing. The
@@ -38,13 +42,13 @@ fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     (router, engine)
 }
 
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     emulator_with_engine().0
 }
 
 /// Send one awsJson1_1 request: `POST /` with `X-Amz-Target:
 /// CodeCommit_20150413.<Operation>` (the crate's OPERATIONS.md "Wire protocol").
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("https://codecommit.us-west-2.amazonaws.com/")
@@ -77,7 +81,7 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u1
 }
 
 /// A successful call's payload, with the status asserted.
-async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+pub(crate) async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
     let (status, payload) = call(router, operation, body).await;
     assert_eq!(
         status, 200,
@@ -88,7 +92,7 @@ async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value
 
 /// The modeled error code of a failed call, with the status asserted. awsJson
 /// carries it in `__type`, optionally namespace-qualified.
-async fn error(
+pub(crate) async fn error(
     router: &MultiServiceRouter,
     operation: &str,
     body: &Value,
@@ -122,7 +126,7 @@ fn is_object_id(value: &str) -> bool {
 }
 
 /// A UUID in its canonical textual form: 8-4-4-4-12 hex characters.
-fn is_uuid(value: &str) -> bool {
+pub(crate) fn is_uuid(value: &str) -> bool {
     let groups: Vec<&str> = value.split('-').collect();
     groups.len() == 5
         && [8usize, 4, 4, 4, 12]
@@ -142,7 +146,7 @@ fn from_base64(encoded: &str) -> Vec<u8> {
     aws_smithy_types::base64::decode(encoded).expect("the service returns base64 blobs")
 }
 
-fn string_at(payload: &Value, pointer: &str) -> String {
+pub(crate) fn string_at(payload: &Value, pointer: &str) -> String {
     payload
         .pointer(pointer)
         .and_then(Value::as_str)

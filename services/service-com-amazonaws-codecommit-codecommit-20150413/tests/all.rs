@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/repository_lifecycle.rs"]
 mod repository_lifecycle;
+#[path = "all/repository_rename.rs"]
+mod repository_rename;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
