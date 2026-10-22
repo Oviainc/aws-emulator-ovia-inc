@@ -17,5 +17,7 @@ mod get_group_id;
 mod group_membership_lookup;
 #[path = "all/identity_store_lifecycle.rs"]
 mod identity_store_lifecycle;
+#[path = "all/list_groups.rs"]
+mod list_groups;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
