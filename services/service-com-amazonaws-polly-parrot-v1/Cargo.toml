@@ -21,13 +21,20 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Opaque pagination tokens are hex-encoded, so a garbage token is detectable.
+hex = { workspace = true }
+# PLS lexicon documents (PutLexicon `Content`) are XML: parse them with a real
+# XML reader rather than scanning the text by hand.
+# >= 0.41 is required: RUSTSEC-2026-0195 affects 0.37.
+quick-xml = "0.41"
+# Ogg bitstream framing (pages, lacing, CRC) for the ogg_opus output format.
+ogg = "0.9"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListLexicons
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListLexicons`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Lists the stored lexicons, in name order, one page at a time.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListLexicons::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The store is a `BTreeMap` keyed by name, so the order is the name order and a page
+//! is "the next [`LEXICON_PAGE_SIZE`] names after the cursor". `NextToken` is present
+//! only when a further lexicon exists, and a token this service did not mint is
+//! `InvalidNextTokenException` (400) rather than a silent restart from the first page.
 //!
 //! ## Shape of an operation
 //!
@@ -107,6 +104,14 @@ impl From<ListLexiconsErrorModeled> for ListLexiconsError {
     }
 }
 
+/// How many lexicons one `ListLexicons` page carries.
+///
+/// CHOSEN: Amazon Polly documents `NextToken` on this operation but no page size, so
+/// this is the emulator's own, and it is the only thing that decides where a page
+/// ends. It is well under the number of lexicons a Region holds, so the paging path
+/// is the normal path rather than one only a huge store reaches.
+pub const LEXICON_PAGE_SIZE: usize = 20;
+
 /// The `ListLexicons` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -141,20 +146,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListLexicons` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListLexiconsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListLexicons"))
+        // A token must be one this service minted; anything else is refused before
+        // any state is read, so a garbage token can never read as "first page".
+        let after = match input.next_token.as_deref() {
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                ListLexiconsErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
+                    message: Some(format!("the NextToken is invalid: {token}")),
+                })
+            })?),
+            None => None,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListLexiconsErrorModeled::ServiceFailureException(ServiceFailureException {
+                message: Some("the Amazon Polly lexicon store is unavailable".to_string()),
+            })
+        })?;
+
+        let guard = state.lock();
+        let mut remaining = guard
+            .lexicons
+            .iter()
+            .filter(|(name, _)| after.as_ref().is_none_or(|cursor| *name > cursor));
+        let page: Vec<LexiconDescription> = remaining
+            .by_ref()
+            .take(LEXICON_PAGE_SIZE)
+            .map(|(name, stored)| LexiconDescription {
+                name: Some(name.clone()),
+                attributes: Some(crate::state::lexicon_attributes(stored)),
+            })
+            .collect();
+        // The token is minted only when the iterator still has an entry, so the last
+        // page omits it.
+        let next_token = remaining
+            .next()
+            .and(page.last())
+            .and_then(|last| last.name.as_deref())
+            .map(crate::state::encode_page_token);
+
+        Ok(ListLexiconsOutput {
+            lexicons: Some(page),
+            next_token,
+        })
     }
 }

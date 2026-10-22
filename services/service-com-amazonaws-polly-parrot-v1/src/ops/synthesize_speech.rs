@@ -1,15 +1,50 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SynthesizeSpeech
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SynthesizeSpeech`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Serves one synthesis request: resolves the lexicons it names, settles the output
+//! encoding and returns an audio stream in it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SynthesizeSpeech::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What is real, and what the emulator cannot do
+//!
+//! THE EMULATOR PERFORMS NO TEXT-TO-SPEECH. There is no speech synthesiser in this
+//! process and none it may reach, so it does not pretend to have produced speech: the
+//! `AudioStream` it returns is a SILENT signal, encoded in the format the request
+//! asked for and lasting as long as the emulator's timeline model
+//! ([`CHARACTERS_PER_SECOND`]) says that text takes to speak. Nothing is echoed back,
+//! no bytes are matched against the input, and no output is dressed up to look like
+//! speech.
+//!
+//! Everything AROUND the synthesis is the service's real behaviour, computed from the
+//! request and from state:
+//!
+//! * every name in `LexiconNames` is resolved in the lexicon store, and a name that
+//!   is not stored is `LexiconNotFoundException` (404);
+//! * `Engine` and `LanguageCode` are checked against the voice the request names, as
+//!   the voice catalog `DescribeVoices` serves records it, so the two operations
+//!   cannot disagree: an engine the voice does not support is
+//!   `EngineNotSupportedException` and a language it does not speak is
+//!   `LanguageNotSupportedException`. A voice the seeded catalog does not carry is not
+//!   narrowed, because that catalog is a stated subset;
+//! * `ContentType` is the `OutputFormat`'s documented media type;
+//! * `RequestCharacters` is the billed character count — every character of plain
+//!   text, and for `ssml` the text content only, because "SSML tags are not counted
+//!   as billed characters";
+//! * `SampleRate` is checked against the values the model documents for the chosen
+//!   format, and defaults per format and engine the same way;
+//! * the text limits (6000 total / 3000 billed characters) are enforced;
+//! * `json` output is a real speech-mark stream: the sentence and word marks are
+//!   computed from the text itself — their `start`/`end` offsets and `value` come
+//!   straight out of `Text`, while each `time` is an estimate off the emulator's own
+//!   chosen timeline ([`CHARACTERS_PER_SECOND`]) rather than a measured one — and a
+//!   request naming no mark type gets an empty stream rather than a refusal Amazon
+//!   Polly does not declare;
+//!
+//! What it cannot compute faithfully it refuses rather than invents: `viseme` marks
+//! need the phoneme timeline a synthesiser produces, `ssml` marks need SSML `<mark>`
+//! resolution, marks over `ssml` input would need text-content offsets that skip the
+//! markup, and `ogg_vorbis` needs a Vorbis encoder's codebooks (there is no pure-Rust
+//! Vorbis encoder and no external process available), so all four answer the
+//! scaffold's 501 rather than a response that looks like success.
 //!
 //! ## Shape of an operation
 //!
@@ -188,6 +223,503 @@ impl From<SynthesizeSpeechErrorModeled> for SynthesizeSpeechError {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The request's documented limits and derived values
+// ---------------------------------------------------------------------------
+
+/// The total characters `Text` may carry.
+///
+/// From this operation's `TextLengthExceededException` documentation: "For the
+/// SynthesizeSpeech API, the limit for input text is a maximum of 6000 characters
+/// total, of which no more than 3000 can be billed characters."
+pub const MAX_TOTAL_CHARACTERS: usize = 6000;
+
+/// The billed characters `Text` may carry — the same documented sentence.
+pub const MAX_BILLED_CHARACTERS: usize = 3000;
+
+/// How fast the emulator's timeline model reads text, in characters per second.
+///
+/// CHOSEN, not an AWS-documented rate: Amazon Polly documents no speaking rate, and
+/// this emulator does not synthesise speech at all. The constant exists so that the
+/// silent stream it returns, and the speech-mark timeline it computes, are
+/// deterministic and proportional to the text rather than a fixed-size blob.
+///
+/// It is also what bounds the response, together with [`MAX_TOTAL_CHARACTERS`]: the
+/// longest stream any request can ask for is 6000 / 15 = 400 seconds, which is at
+/// most 400 s × 16000 Hz × 2 bytes ≈ 12.8 MB for `pcm` (its highest valid rate),
+/// ≈ 3.2 MB for `mp3` at 64 kb/s, ≈ 3.2 MB for the companded formats at 8 kHz and a
+/// few tens of kilobytes for `ogg_opus`. Each is built once, per request.
+pub const CHARACTERS_PER_SECOND: u64 = 15;
+
+/// The media type the response carries for `output_format`.
+///
+/// The mapping is `SynthesizeSpeechOutput$ContentType`'s own documentation: mp3 →
+/// audio/mpeg, ogg_vorbis → audio/ogg, ogg_opus → audio/ogg, pcm → audio/pcm, mu-law
+/// → audio/mulaw, a-law → audio/alaw, json → application/x-json-stream.
+pub fn content_type_for(output_format: &str) -> Option<&'static str> {
+    Some(match output_format {
+        "mp3" => "audio/mpeg",
+        "ogg_vorbis" | "ogg_opus" => "audio/ogg",
+        "pcm" => "audio/pcm",
+        "mulaw" => "audio/mulaw",
+        "alaw" => "audio/alaw",
+        "json" => "application/x-json-stream",
+        _ => return None,
+    })
+}
+
+/// The `SampleRate` values valid for `output_format`.
+///
+/// Verbatim from `SynthesizeSpeechInput$SampleRate`'s documentation: "The valid
+/// values for mp3 and ogg_vorbis are 8000, 16000, 22050, 24000, 44100 and 48000 …
+/// Valid values for pcm are 8000 and 16000 … Valid value for ogg_opus is 48000 …
+/// Valid value for mu-law and a-law is 8000." `json` carries speech marks rather than
+/// audio, so no sample rate applies to it.
+pub fn valid_sample_rates(output_format: &str) -> &'static [u32] {
+    match output_format {
+        "mp3" | "ogg_vorbis" => &[8000, 16000, 22050, 24000, 44100, 48000],
+        "pcm" => &[8000, 16000],
+        "ogg_opus" => &[48000],
+        "mulaw" | "alaw" => &[8000],
+        _ => &[],
+    }
+}
+
+/// The sample rate used when the request names none.
+///
+/// Also from `SynthesizeSpeechInput$SampleRate`: for mp3 and ogg_vorbis "The default
+/// value for standard voices is 22050. The default value for neural voices is 24000.
+/// The default value for long-form voices is 24000. The default value for generative
+/// voices is 24000"; for pcm "The default value is 16000"; ogg_opus and the companded
+/// formats document a single valid value, which is therefore also the default.
+pub fn default_sample_rate(output_format: &str, engine: &str) -> u32 {
+    match output_format {
+        "pcm" => 16000,
+        "ogg_opus" => 48000,
+        "mulaw" | "alaw" => 8000,
+        // mp3 and ogg_vorbis: the default follows the engine.
+        _ if engine == "standard" => 22050,
+        _ => 24000,
+    }
+}
+
+/// The engine a request without an explicit `Engine` runs on.
+///
+/// `SynthesizeSpeechInput$Engine`: "If you don't provide an engine, the standard
+/// engine is selected by default."
+pub const DEFAULT_ENGINE: &str = "standard";
+
+/// The `TextType` a request without an explicit one carries.
+///
+/// `SynthesizeSpeechInput$TextType`: "The default value is plain text."
+pub const DEFAULT_TEXT_TYPE: &str = "text";
+
+/// The characters Amazon Polly bills for.
+///
+/// Every character of plain text; for `ssml`, the text content only, because "SSML
+/// tags are not counted as billed characters" (`TextLengthExceededException`). The
+/// SSML document is read with a real XML parser, so `Err` here means the SSML is not
+/// well-formed — which is `InvalidSsmlException`.
+pub fn billed_characters(text: &str, text_type: &str) -> Result<usize, String> {
+    if text_type != "ssml" {
+        return Ok(text.chars().count());
+    }
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(text);
+    let mut billed = 0usize;
+    let mut depth = 0i32;
+    let mut root_seen = false;
+    loop {
+        match reader.read_event().map_err(|e| e.to_string())? {
+            Event::Eof => break,
+            Event::Start(ref e) => {
+                check_ssml_root(e, &mut root_seen)?;
+                depth += 1;
+            }
+            Event::Empty(ref e) => check_ssml_root(e, &mut root_seen)?,
+            Event::End(_) => depth -= 1,
+            Event::Text(ref t) => {
+                // Entities count as the character they stand for, so the raw bytes
+                // are unescaped before counting.
+                let raw = String::from_utf8_lossy(t.as_ref()).to_string();
+                let decoded =
+                    quick_xml::escape::unescape(&raw).map_err(|e| e.to_string())?;
+                billed = billed.saturating_add(decoded.chars().count());
+            }
+            Event::CData(ref c) => {
+                billed = billed
+                    .saturating_add(String::from_utf8_lossy(c.as_ref()).chars().count());
+            }
+            _ => {}
+        }
+    }
+    if !root_seen {
+        return Err("the text carries no SSML element".to_string());
+    }
+    if depth != 0 {
+        return Err("an SSML element is left unclosed".to_string());
+    }
+    Ok(billed)
+}
+
+/// Check that the first element of an SSML document is `<speak>`, as SSML requires.
+fn check_ssml_root(
+    element: &quick_xml::events::BytesStart<'_>,
+    root_seen: &mut bool,
+) -> Result<(), String> {
+    if *root_seen {
+        return Ok(());
+    }
+    let name = String::from_utf8_lossy(element.local_name().as_ref()).to_string();
+    if name != "speak" {
+        return Err(format!("the document element is <{name}>, not <speak>"));
+    }
+    *root_seen = true;
+    Ok(())
+}
+
+/// How long the emulator's timeline model says `billed` characters take to speak, in
+/// milliseconds. Never zero, so even a one-character request carries a frame of audio.
+pub fn spoken_duration_ms(billed: usize) -> u64 {
+    let exact = (billed as u64).saturating_mul(1000) / CHARACTERS_PER_SECOND;
+    exact.max(audio::MIN_DURATION_MS)
+}
+
+// ---------------------------------------------------------------------------
+// The silent audio encoders
+// ---------------------------------------------------------------------------
+
+/// Deterministic SILENT streams in the encodings `OutputFormat` names.
+///
+/// None of this is speech and none of it claims to be: each function emits the
+/// encoding's real framing around a signal of zero amplitude. `pcm`, `mulaw` and
+/// `alaw` are exact — silence has an exact representation in all three. `mp3` is a
+/// run of conformant MPEG Layer III frames (the header is computed for the requested
+/// sample rate) whose main data is zero. `ogg_opus` is a conformant Ogg stream of
+/// `OpusHead`/`OpusTags` plus one-byte DTX packets, which RFC 6716 defines as
+/// "no transmission" and a decoder renders as silence; the Ogg framing (pages,
+/// lacing, checksum) comes from the `ogg` crate.
+///
+/// `ogg_vorbis` is NOT here. A conformant Vorbis stream needs a *setup* header of
+/// encoder-generated codebooks, and this emulator has no Vorbis encoder to generate
+/// them (no pure-Rust Vorbis encoder is published, and a container or external
+/// process is not available to a generated emulator). Rather than answer 200 with a
+/// stream no decoder accepts, `SynthesizeSpeech` answers that format with the
+/// scaffold's 501.
+pub mod audio {
+    /// The shortest stream any request produces: one 20 ms frame.
+    pub const MIN_DURATION_MS: u64 = 20;
+
+    /// Signed 16-bit mono little-endian silence — the representation
+    /// `SynthesizeSpeechInput$OutputFormat` documents for `pcm` ("a signed 16-bit, 1
+    /// channel (mono), little-endian format"). Zero is silence in it.
+    pub fn pcm_silence(sample_rate: u32, duration_ms: u64) -> Vec<u8> {
+        vec![0u8; samples(sample_rate, duration_ms) * 2]
+    }
+
+    /// ITU-T G.711 μ-law silence. Zero amplitude encodes to `0xFF` in μ-law.
+    pub fn mulaw_silence(sample_rate: u32, duration_ms: u64) -> Vec<u8> {
+        vec![0xFFu8; samples(sample_rate, duration_ms)]
+    }
+
+    /// ITU-T G.711 A-law silence. Zero amplitude encodes to `0xD5` in A-law.
+    pub fn alaw_silence(sample_rate: u32, duration_ms: u64) -> Vec<u8> {
+        vec![0xD5u8; samples(sample_rate, duration_ms)]
+    }
+
+    /// How many samples `duration_ms` is at `sample_rate`.
+    fn samples(sample_rate: u32, duration_ms: u64) -> usize {
+        let count = u64::from(sample_rate).saturating_mul(duration_ms) / 1000;
+        usize::try_from(count).unwrap_or(usize::MAX)
+    }
+
+    /// A run of conformant MPEG Layer III frames whose main data is zero.
+    ///
+    /// The frame header is built per ISO/IEC 11172-3 (MPEG-1) and 13818-3 (MPEG-2),
+    /// plus the MPEG-2.5 extension for 8 kHz: 11 sync bits, the version and layer,
+    /// the bitrate and sample-rate indexes, and single-channel mode. `None` for a
+    /// sample rate MPEG Layer III cannot carry, which the caller has already refused
+    /// as an invalid sample rate.
+    pub fn mp3_silence(sample_rate: u32, duration_ms: u64) -> Option<Vec<u8>> {
+        // (version bits, sample-rate index, samples per frame, frame-size
+        // coefficient, bitrate index for 64 kb/s). MPEG-1 = 0b11, MPEG-2 = 0b10,
+        // MPEG-2.5 = 0b00; Layer III carries 1152 samples per MPEG-1 frame and 576
+        // per MPEG-2/2.5 frame.
+        let (version, rate_index, samples_per_frame, coefficient, bitrate_index) = match sample_rate
+        {
+            44100 => (0b11u8, 0u8, 1152u64, 144u64, 5u8),
+            48000 => (0b11, 1, 1152, 144, 5),
+            32000 => (0b11, 2, 1152, 144, 5),
+            22050 => (0b10, 0, 576, 72, 8),
+            24000 => (0b10, 1, 576, 72, 8),
+            16000 => (0b10, 2, 576, 72, 8),
+            8000 => (0b00, 2, 576, 72, 8),
+            _ => return None,
+        };
+        const BITRATE: u64 = 64_000;
+        // Layer III frame length is `coefficient * bitrate / sample_rate`, which is
+        // rarely a whole number; the header's padding bit is what carries the
+        // remainder, so a constant-bitrate stream alternates padded and unpadded
+        // frames. Tracking the remainder frame by frame keeps the stream's real
+        // bitrate equal to the one its header declares.
+        let numerator = coefficient.saturating_mul(BITRATE);
+        let divisor = u64::from(sample_rate);
+        let base_bytes = usize::try_from(numerator / divisor).unwrap_or(usize::MAX);
+        let remainder = numerator % divisor;
+        let frames = usize::try_from(
+            (u64::from(sample_rate).saturating_mul(duration_ms) / 1000)
+                .div_ceil(samples_per_frame)
+                .max(1),
+        )
+        .unwrap_or(usize::MAX);
+
+        let mut out: Vec<u8> = Vec::with_capacity(frames.saturating_mul(base_bytes + 1));
+        let mut carry = 0u64;
+        for _ in 0..frames {
+            carry += remainder;
+            let padded = carry >= divisor;
+            if padded {
+                carry -= divisor;
+            }
+            let header = [
+                0xFF,
+                // sync (3 more bits) | version | Layer III (0b01) | no CRC (1)
+                0xE0 | (version << 3) | (0b01 << 1) | 0x01,
+                (bitrate_index << 4) | (rate_index << 2) | if padded { 0x02 } else { 0x00 },
+                // single channel, no mode extension, no copyright/original, no
+                // emphasis
+                0xC0,
+            ];
+            out.extend_from_slice(&header);
+            // The rest of the frame is main data, and zero main data is silence.
+            let main_data = base_bytes.saturating_sub(header.len()) + usize::from(padded);
+            out.resize(out.len() + main_data, 0);
+        }
+        Some(out)
+    }
+
+    /// A conformant Ogg Opus stream of silence (RFC 7845 headers, RFC 6716 packets).
+    ///
+    /// The Ogg layer — pages, lacing and the page checksum — is the `ogg` crate's;
+    /// only the two codec headers and the packet payloads are built here, because
+    /// those are Opus, not Ogg. `None` only if the in-memory writer fails, which the
+    /// caller answers with the modelled server error rather than a panic.
+    pub fn ogg_opus_silence(input_sample_rate: u32, duration_ms: u64) -> Option<Vec<u8>> {
+        use ogg::writing::{PacketWriteEndInfo, PacketWriter};
+
+        /// Every Opus frame this emits is 20 ms long.
+        const FRAME_MS: u64 = 20;
+        /// An Opus granule position counts 48 kHz samples, whatever the input rate.
+        const FRAME_GRANULES: u64 = 960;
+        /// Frames per audio page, so a long stream is paged rather than one huge page.
+        const FRAMES_PER_PAGE: u64 = 50;
+        /// A one-byte packet is a TOC byte with a zero-length frame: RFC 6716's
+        /// "no transmission" (DTX) packet, which a decoder renders as silence. The
+        /// TOC selects SILK narrowband, 20 ms, mono, one frame per packet.
+        const DTX_PACKET: [u8; 1] = [0x08];
+        /// The Ogg logical-stream serial number this service uses. Fixed, because one
+        /// response is always exactly one logical stream.
+        const OGG_SERIAL: u32 = 0x506f_6c6c;
+
+        let mut buffer: Vec<u8> = Vec::new();
+        {
+            let mut writer = PacketWriter::new(&mut buffer);
+            // RFC 7845 §3: the identification and comment headers each occupy their
+            // own page, and the audio packets follow.
+            writer
+                .write_packet(
+                    opus_head(input_sample_rate),
+                    OGG_SERIAL,
+                    PacketWriteEndInfo::EndPage,
+                    0,
+                )
+                .ok()?;
+            writer
+                .write_packet(opus_tags(), OGG_SERIAL, PacketWriteEndInfo::EndPage, 0)
+                .ok()?;
+
+            let frames = duration_ms.div_ceil(FRAME_MS).max(1);
+            for frame in 1..=frames {
+                let end = if frame == frames {
+                    PacketWriteEndInfo::EndStream
+                } else if frame % FRAMES_PER_PAGE == 0 {
+                    PacketWriteEndInfo::EndPage
+                } else {
+                    PacketWriteEndInfo::NormalPacket
+                };
+                writer
+                    .write_packet(
+                        DTX_PACKET.to_vec(),
+                        OGG_SERIAL,
+                        end,
+                        frame.saturating_mul(FRAME_GRANULES),
+                    )
+                    .ok()?;
+            }
+        }
+        Some(buffer)
+    }
+
+    /// RFC 7845 §5.1 `OpusHead`: mono, no pre-skip, no output gain, mapping family 0.
+    fn opus_head(input_sample_rate: u32) -> Vec<u8> {
+        let mut head = Vec::with_capacity(19);
+        head.extend_from_slice(b"OpusHead");
+        head.push(1); // version
+        head.push(1); // channel count
+        head.extend_from_slice(&0u16.to_le_bytes()); // pre-skip
+        head.extend_from_slice(&input_sample_rate.to_le_bytes());
+        head.extend_from_slice(&0i16.to_le_bytes()); // output gain
+        head.push(0); // channel mapping family
+        head
+    }
+
+    /// RFC 7845 §5.2 `OpusTags`: a vendor string and no user comments. The vendor
+    /// string names the producer honestly — this stream comes from an emulator, not
+    /// from Amazon Polly.
+    fn opus_tags() -> Vec<u8> {
+        const VENDOR: &[u8] = b"aws-emulator polly";
+        let mut tags = Vec::new();
+        tags.extend_from_slice(b"OpusTags");
+        tags.extend_from_slice(&u32::try_from(VENDOR.len()).unwrap_or(0).to_le_bytes());
+        tags.extend_from_slice(VENDOR);
+        tags.extend_from_slice(&0u32.to_le_bytes()); // user comment count
+        tags
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Speech marks (`OutputFormat: json`)
+// ---------------------------------------------------------------------------
+
+/// A speech mark, as Amazon Polly's `application/x-json-stream` carries it: one JSON
+/// object per line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpeechMark {
+    /// Milliseconds from the start of the stream.
+    pub time: u64,
+    /// `"sentence"` or `"word"`.
+    pub mark_type: &'static str,
+    /// Byte offset of the mark's text in `Text`.
+    pub start: usize,
+    /// Byte offset just past the mark's text in `Text`.
+    pub end: usize,
+    /// The text the mark covers.
+    pub value: String,
+}
+
+/// The sentence and word marks of `text`, in stream order.
+///
+/// Both are computed from the text: a word is a run of alphanumeric characters
+/// (apostrophes and hyphens included, so "don't" and "well-known" are one word each),
+/// a sentence runs to and includes its terminating `.`, `!` or `?`, and each mark's
+/// `time` is where its first character falls on the [`CHARACTERS_PER_SECOND`]
+/// timeline. `start`/`end` are byte offsets into `text`, which is what Amazon Polly
+/// reports.
+pub fn speech_marks(text: &str, want_sentences: bool, want_words: bool) -> Vec<SpeechMark> {
+    let mut marks: Vec<SpeechMark> = Vec::new();
+    if want_sentences {
+        marks.extend(spans(text, Grouping::Sentence).into_iter().map(
+            |(start, end, chars)| SpeechMark {
+                time: mark_time(chars),
+                mark_type: "sentence",
+                start,
+                end,
+                value: text[start..end].to_string(),
+            },
+        ));
+    }
+    if want_words {
+        marks.extend(spans(text, Grouping::Word).into_iter().map(
+            |(start, end, chars)| SpeechMark {
+                time: mark_time(chars),
+                mark_type: "word",
+                start,
+                end,
+                value: text[start..end].to_string(),
+            },
+        ));
+    }
+    // A sentence mark precedes the words it contains, which is the order Amazon Polly
+    // streams them in.
+    marks.sort_by_key(|mark| (mark.time, mark.start, mark.mark_type != "sentence"));
+    marks
+}
+
+/// Render speech marks as the `application/x-json-stream` body: one JSON object per
+/// line, newline-terminated.
+pub fn speech_marks_stream(marks: &[SpeechMark]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for mark in marks {
+        let line = ::serde_json::json!({
+            "time": mark.time,
+            "type": mark.mark_type,
+            "start": mark.start,
+            "end": mark.end,
+            "value": mark.value,
+        });
+        out.extend_from_slice(line.to_string().as_bytes());
+        out.push(b'\n');
+    }
+    out
+}
+
+/// Which kind of span [`spans`] collects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Grouping {
+    /// A run of word characters.
+    Word,
+    /// Text up to and including a sentence terminator.
+    Sentence,
+}
+
+/// The `(byte start, byte end, character index of the start)` of every span of
+/// `grouping` in `text`.
+fn spans(text: &str, grouping: Grouping) -> Vec<(usize, usize, usize)> {
+    let mut found = Vec::new();
+    let mut open: Option<(usize, usize)> = None;
+    for (char_index, (byte_index, ch)) in text.char_indices().enumerate() {
+        let end = byte_index + ch.len_utf8();
+        match grouping {
+            Grouping::Word => {
+                if is_word_character(ch) {
+                    let (start, start_char) = open.unwrap_or((byte_index, char_index));
+                    open = Some((start, start_char));
+                    if text[end..].chars().next().is_none_or(|next| !is_word_character(next)) {
+                        found.push((start, end, start_char));
+                        open = None;
+                    }
+                }
+            }
+            Grouping::Sentence => {
+                if ch.is_whitespace() && open.is_none() {
+                    continue;
+                }
+                let (start, start_char) = open.unwrap_or((byte_index, char_index));
+                open = Some((start, start_char));
+                if matches!(ch, '.' | '!' | '?') {
+                    found.push((start, end, start_char));
+                    open = None;
+                }
+            }
+        }
+    }
+    if let Some((start, start_char)) = open {
+        found.push((start, text.len(), start_char));
+    }
+    found
+}
+
+/// Whether `ch` belongs to a word. Apostrophes and hyphens are inside words, so
+/// "don't" and "well-known" each come back as one word mark.
+fn is_word_character(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '\'' || ch == '\u{2019}' || ch == '-'
+}
+
+/// Where the character at `char_index` falls on the timeline, in milliseconds.
+fn mark_time(char_index: usize) -> u64 {
+    (char_index as u64).saturating_mul(1000) / CHARACTERS_PER_SECOND
+}
+
 /// The `SynthesizeSpeech` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -222,20 +754,415 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SynthesizeSpeech` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SynthesizeSpeechErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SynthesizeSpeech"))
+        let output_format = input.output_format.as_str();
+        let content_type = content_type_for(output_format).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(format!(
+                "OutputFormat must be one of {}; got {output_format}",
+                OUTPUT_FORMAT_VALUES.join(", ")
+            ))
+        })?;
+        let engine = input.engine.as_deref().unwrap_or(DEFAULT_ENGINE);
+        let text_type = input.text_type.as_deref().unwrap_or(DEFAULT_TEXT_TYPE);
+        let marks = input.speech_mark_types.clone().unwrap_or_default();
+
+        // Speech marks ride the `json` stream, so asking for them with an audio
+        // format is the failure `MarksNotSupportedForFormatException` names.
+        if !marks.is_empty() && output_format != "json" {
+            return Err(SynthesizeSpeechErrorModeled::MarksNotSupportedForFormatException(
+                MarksNotSupportedForFormatException {
+                    message: Some(format!(
+                        "speech marks are not supported for the OutputFormat selected \
+                         ({output_format}); they are only available for content in json format"
+                    )),
+                },
+            )
+            .into());
+        }
+        if marks.iter().any(|mark| mark == "ssml") && text_type != "ssml" {
+            return Err(
+                SynthesizeSpeechErrorModeled::SsmlMarksNotSupportedForTextTypeException(
+                    SsmlMarksNotSupportedForTextTypeException {
+                        message: Some(
+                            "SSML speech marks are not supported for plain text-type input"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The two documented text limits. `Text` carries no modeled length
+        // constraint, so the boundary validator has not checked either.
+        let total_characters = input.text.chars().count();
+        if total_characters > MAX_TOTAL_CHARACTERS {
+            return Err(SynthesizeSpeechErrorModeled::TextLengthExceededException(
+                TextLengthExceededException {
+                    message: Some(format!(
+                        "the value of the Text parameter is longer than the accepted limits: \
+                         {total_characters} characters, maximum {MAX_TOTAL_CHARACTERS}"
+                    )),
+                },
+            )
+            .into());
+        }
+        let billed = billed_characters(&input.text, text_type).map_err(|detail| {
+            SynthesizeSpeechErrorModeled::InvalidSsmlException(InvalidSsmlException {
+                message: Some(format!(
+                    "the SSML you provided is invalid; verify the SSML syntax: {detail}"
+                )),
+            })
+        })?;
+        if billed > MAX_BILLED_CHARACTERS {
+            return Err(SynthesizeSpeechErrorModeled::TextLengthExceededException(
+                TextLengthExceededException {
+                    message: Some(format!(
+                        "the value of the Text parameter is longer than the accepted limits: \
+                         {billed} billed characters, maximum {MAX_BILLED_CHARACTERS}"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The sample rate, checked against the values the chosen format documents.
+        // `json` carries speech marks rather than audio, so no rate applies to it and
+        // none is resolved for it: a `SampleRate` sent with `json` is IGNORED, not
+        // validated, because `SynthesizeSpeechInput$SampleRate` documents valid values
+        // only per audio format and declares none for `json`.
+        let sample_rate: Option<u32> = if output_format == "json" {
+            None
+        } else {
+            let valid = valid_sample_rates(output_format);
+            Some(match input.sample_rate.as_deref() {
+                Some(requested) => {
+                    let parsed = requested.parse::<u32>().ok().filter(|r| valid.contains(r));
+                    parsed.ok_or_else(|| {
+                        SynthesizeSpeechErrorModeled::InvalidSampleRateException(
+                            InvalidSampleRateException {
+                                message: Some(format!(
+                                    "the specified sample rate is not valid for {output_format}: \
+                                     {requested}; valid values are {}",
+                                    valid
+                                        .iter()
+                                        .map(u32::to_string)
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                )),
+                            },
+                        )
+                    })?
+                }
+                None => default_sample_rate(output_format, engine),
+            })
+        };
+
+        // Every lexicon the request names must be in the store. This is the one place
+        // synthesis reads state, and it is why an unknown name is a 404 rather than a
+        // silently ignored input.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SynthesizeSpeechErrorModeled::ServiceFailureException(ServiceFailureException {
+                message: Some("the Amazon Polly lexicon store is unavailable".to_string()),
+            })
+        })?;
+        if let Some(names) = input.lexicon_names.as_ref() {
+            let guard = state.lock();
+            if let Some(missing) = names.iter().find(|name| !guard.lexicons.contains_key(*name)) {
+                return Err(SynthesizeSpeechErrorModeled::LexiconNotFoundException(
+                    LexiconNotFoundException {
+                        message: Some(format!(
+                            "Amazon Polly can't find the specified lexicon: {missing}"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // `VoiceId` decides which engines and languages the request may name, and the
+        // voice catalog is where that is recorded — so the check reads the same state
+        // `DescribeVoices` reports and the two cannot disagree. A voice the seeded
+        // catalog does not carry is not narrowed at all: the catalog is a stated
+        // subset of Amazon Polly's voices, and refusing a real `VoiceId` because this
+        // emulator has not seeded it yet would be worse than not checking.
+        if let Some(voice) = state
+            .lock()
+            .voices
+            .iter()
+            .find(|voice| voice.id == input.voice_id)
+            .copied()
+        {
+            // "Provide an engine that is supported by the voice you select … If a
+            // chosen voice isn't supported by the standard engine, this will result
+            // in an error" (`SynthesizeSpeechInput$Engine`).
+            if !voice.supports_engine(engine) {
+                return Err(SynthesizeSpeechErrorModeled::EngineNotSupportedException(
+                    EngineNotSupportedException {
+                        message: Some(format!(
+                            "the {engine} engine is not compatible with the voice {}; it supports \
+                             {}",
+                            voice.id,
+                            voice.supported_engines.join(", ")
+                        )),
+                    },
+                )
+                .into());
+            }
+            // "Optional language code … This is only necessary if using a bilingual
+            // voice, such as Aditi, which can be used for either Indian English
+            // (en-IN) or Hindi (hi-IN)" (`SynthesizeSpeechInput$LanguageCode`), so a
+            // language the voice does not speak is one Amazon Polly cannot serve with
+            // it. A bilingual voice's additional language counts, which is the whole
+            // point of the member.
+            if let Some(language) = input.language_code.as_deref() {
+                if !voice.speaks(language, true) {
+                    return Err(SynthesizeSpeechErrorModeled::LanguageNotSupportedException(
+                        LanguageNotSupportedException {
+                            message: Some(format!(
+                                "the language {language} is not supported by the voice {}; it \
+                                 speaks {}",
+                                voice.id,
+                                std::iter::once(voice.language_code)
+                                    .chain(voice.additional_language_codes.iter().copied())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )),
+                        },
+                    )
+                    .into());
+                }
+            }
+        }
+
+        let duration_ms = spoken_duration_ms(billed);
+        // Every arm below is matched by name: `content_type_for` has already narrowed
+        // `output_format` to the model's seven values, and the final arm refuses
+        // anything else rather than letting a future format fall into a neighbour's
+        // encoding.
+        let audio_stream = match (output_format, sample_rate) {
+            // `json`: a real speech-mark stream for the mark types this emulator can
+            // compute from the text. `viseme` needs a phoneme timeline and `ssml`
+            // needs SSML `<mark>` resolution, so neither is answered with invented
+            // marks — they are still unimplemented.
+            ("json", _) => {
+                for mark in &marks {
+                    if mark != "sentence" && mark != "word" {
+                        return Err(crate::scaffolded::Scaffolded::not_implemented(
+                            "SynthesizeSpeech speech marks of type other than sentence and word",
+                        ));
+                    }
+                }
+                // A mark's `start`/`end` are offsets into `Text` and its `value` is
+                // the text it covers, so marks over SSML would have to be computed
+                // from the document's text content with offsets that skip the markup.
+                // That is not implemented, and answering with marks whose values are
+                // tag names would be a wrong answer dressed as success, so SSML input
+                // is refused here rather than mis-answered.
+                if text_type == "ssml" {
+                    return Err(crate::scaffolded::Scaffolded::not_implemented(
+                        "SynthesizeSpeech speech marks over ssml input",
+                    ));
+                }
+                let computed = speech_marks(
+                    &input.text,
+                    marks.iter().any(|mark| mark == "sentence"),
+                    marks.iter().any(|mark| mark == "word"),
+                );
+                // A request that names no mark type asks for no marks, so the stream
+                // is empty. `json` output IS the speech-mark stream, and Amazon Polly
+                // declares no error for an empty one, so an empty stream is the
+                // honest answer rather than a refusal it never sends.
+                speech_marks_stream(&computed)
+            }
+            ("pcm", Some(rate)) => audio::pcm_silence(rate, duration_ms),
+            ("mulaw", Some(rate)) => audio::mulaw_silence(rate, duration_ms),
+            ("alaw", Some(rate)) => audio::alaw_silence(rate, duration_ms),
+            ("mp3", Some(rate)) => audio::mp3_silence(rate, duration_ms).ok_or_else(|| {
+                SynthesizeSpeechErrorModeled::InvalidSampleRateException(
+                    InvalidSampleRateException {
+                        message: Some(format!(
+                            "the specified sample rate is not valid for mp3: {rate}"
+                        )),
+                    },
+                )
+            })?,
+            ("ogg_opus", Some(rate)) => {
+                audio::ogg_opus_silence(rate, duration_ms).ok_or_else(|| {
+                    SynthesizeSpeechErrorModeled::ServiceFailureException(
+                        ServiceFailureException {
+                            message: Some("the Ogg Opus stream could not be written".to_string()),
+                        },
+                    )
+                })?
+            }
+            // `ogg_vorbis` is NOT served: a conformant Vorbis stream needs a setup
+            // header of encoder-generated codebooks, and there is no Vorbis encoder
+            // available in-process. Answering 200 with a stream no decoder accepts
+            // would be absence dressed as success, so it stays a 501.
+            ("ogg_vorbis", _) => {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "SynthesizeSpeech with OutputFormat ogg_vorbis",
+                ))
+            }
+            (other, _) => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "OutputFormat must be one of {}; got {other}",
+                    OUTPUT_FORMAT_VALUES.join(", ")
+                )))
+            }
+        };
+
+        Ok(SynthesizeSpeechOutput {
+            audio_stream,
+            content_type: Some(content_type.to_string()),
+            // "Number of characters synthesized" — the billed count, which for SSML
+            // excludes the tags.
+            request_characters: i32::try_from(billed).unwrap_or(i32::MAX),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_type_follows_the_documented_mapping() {
+        for (format, expected) in [
+            ("mp3", "audio/mpeg"),
+            ("ogg_vorbis", "audio/ogg"),
+            ("ogg_opus", "audio/ogg"),
+            ("pcm", "audio/pcm"),
+            ("mulaw", "audio/mulaw"),
+            ("alaw", "audio/alaw"),
+            ("json", "application/x-json-stream"),
+        ] {
+            assert_eq!(
+                content_type_for(format),
+                Some(expected),
+                "format {format:?}: wrong content type"
+            );
+        }
+        // Every modeled OutputFormat value is covered, so no request reaches the
+        // handler's refusal path.
+        for format in OUTPUT_FORMAT_VALUES {
+            assert!(
+                content_type_for(format).is_some(),
+                "modeled OutputFormat {format:?} has no content type"
+            );
+        }
+    }
+
+    #[test]
+    fn mp3_frames_carry_a_valid_header_for_every_documented_rate() {
+        for rate in valid_sample_rates("mp3") {
+            let bytes = audio::mp3_silence(*rate, 1_000).expect("mp3 supports this rate");
+            assert!(
+                !bytes.is_empty(),
+                "rate {rate}: expected frames, got an empty stream"
+            );
+            assert_eq!(
+                bytes[0], 0xFF,
+                "rate {rate}: the frame must start with the MPEG sync byte, got {:#04x}",
+                bytes[0]
+            );
+            assert_eq!(
+                bytes[1] & 0xE0,
+                0xE0,
+                "rate {rate}: the remaining sync bits are missing, got {:#04x}",
+                bytes[1]
+            );
+            // Layer III is 0b01 in bits 2..1 of the second header byte.
+            assert_eq!(
+                (bytes[1] >> 1) & 0b11,
+                0b01,
+                "rate {rate}: the frame does not declare Layer III"
+            );
+            // One second at the declared 64 kb/s is 8000 bytes; the stream rounds up
+            // to a whole frame, so it must land within one frame of that. A stream
+            // that ignored the padding bit would drift away from its own header.
+            assert!(
+                (7_600..=8_600).contains(&bytes.len()),
+                "rate {rate}: one second at 64 kb/s is ~8000 bytes, got {}",
+                bytes.len()
+            );
+        }
+    }
+
+    #[test]
+    fn silence_is_exact_for_the_uncompanded_and_companded_formats() {
+        assert!(
+            audio::pcm_silence(16000, 1_000).iter().all(|b| *b == 0x00),
+            "pcm silence must be zero samples"
+        );
+        assert!(
+            audio::mulaw_silence(8000, 1_000).iter().all(|b| *b == 0xFF),
+            "mu-law silence must be 0xFF"
+        );
+        assert!(
+            audio::alaw_silence(8000, 1_000).iter().all(|b| *b == 0xD5),
+            "a-law silence must be 0xD5"
+        );
+    }
+
+    #[test]
+    fn the_opus_stream_is_ogg_framed_and_names_its_codec() {
+        let opus = audio::ogg_opus_silence(48000, 200).expect("the in-memory writer cannot fail");
+        assert_eq!(&opus[..4], b"OggS", "an Ogg page starts with OggS");
+        assert!(
+            opus.windows(8).any(|w| w == b"OpusHead"),
+            "the Opus stream must carry an OpusHead header"
+        );
+        assert!(
+            opus.windows(8).any(|w| w == b"OpusTags"),
+            "the Opus stream must carry an OpusTags header"
+        );
+        let longer = audio::ogg_opus_silence(48000, 2_000).expect("writer cannot fail");
+        assert!(
+            longer.len() > opus.len(),
+            "a longer duration must carry more packets: {} vs {}",
+            longer.len(),
+            opus.len()
+        );
+    }
+
+    #[test]
+    fn ssml_tags_are_not_billed() {
+        let plain = billed_characters("hello world", "text").expect("plain text is never invalid");
+        assert_eq!(plain, 11, "plain text bills every character");
+        let ssml = billed_characters("<speak>hello world</speak>", "ssml").expect("valid ssml");
+        assert_eq!(ssml, 11, "SSML tags are not billed, got {ssml}");
+        assert!(
+            billed_characters("<speak>unclosed", "ssml").is_err(),
+            "malformed SSML must be rejected"
+        );
+    }
+
+    #[test]
+    fn speech_marks_are_computed_from_the_text() {
+        let marks = speech_marks("Hi there. Go!", true, true);
+        let rendered: Vec<(&str, usize, usize, &str)> = marks
+            .iter()
+            .map(|m| (m.mark_type, m.start, m.end, m.value.as_str()))
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                ("sentence", 0, 9, "Hi there."),
+                ("word", 0, 2, "Hi"),
+                ("word", 3, 8, "there"),
+                ("sentence", 10, 13, "Go!"),
+                ("word", 10, 12, "Go"),
+            ],
+            "marks must track the text's sentences and words"
+        );
+        let stream = speech_marks_stream(&marks);
+        assert_eq!(
+            stream.iter().filter(|b| **b == b'\n').count(),
+            marks.len(),
+            "the stream is one newline-terminated JSON object per mark"
+        );
     }
 }

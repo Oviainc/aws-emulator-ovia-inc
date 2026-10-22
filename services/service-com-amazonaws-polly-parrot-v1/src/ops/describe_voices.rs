@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeVoices
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeVoices`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the voice catalog, narrowed by the query parameters.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeVoices::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The catalog is state ([`crate::state::ComAmazonawsPollyParrotV1State::voices`]),
+//! seeded once and never written, so this is a pure read. `Engine` keeps only voices
+//! whose `SupportedEngines` carry it; `LanguageCode` keeps only voices that speak it,
+//! counting a bilingual voice's `AdditionalLanguageCodes` only when
+//! `IncludeAdditionalLanguageCodes` is set — the rule that member documents. Both
+//! filters narrow, so a request naming an engine or language no seeded voice has gets
+//! an empty list, not the whole catalog.
+//!
+//! A page carries at most [`VOICE_PAGE_SIZE`] voices and the `NextToken` encodes both
+//! the position reached and the query it was reached under, so a token minted for one
+//! filter cannot silently resume a different one.
 //!
 //! ## Shape of an operation
 //!
@@ -132,6 +136,60 @@ impl From<DescribeVoicesErrorModeled> for DescribeVoicesError {
     }
 }
 
+/// How many voices one `DescribeVoices` page carries.
+///
+/// CHOSEN: Amazon Polly documents `NextToken` on this operation but no page size.
+pub const VOICE_PAGE_SIZE: usize = 50;
+
+/// The field separator inside a page cursor. An ASCII unit separator, so it cannot
+/// occur in an `Engine` or `LanguageCode` value.
+const CURSOR_SEPARATOR: char = '\u{1f}';
+
+/// Encode the cursor a `NextToken` carries: the position reached AND the query it was
+/// reached under.
+///
+/// The filter travels in the token because a position alone is meaningless across
+/// queries — an index into the en-US voices is a different voice from the same index
+/// into the whole catalog. [`decode_voice_cursor`] refuses a token whose filter does
+/// not match the request, so resuming with different parameters is an error rather
+/// than a silently wrong page.
+fn encode_voice_cursor(
+    start: usize,
+    engine: Option<&str>,
+    language: Option<&str>,
+    include_additional: bool,
+) -> String {
+    crate::state::encode_page_token(&format!(
+        "{start}{CURSOR_SEPARATOR}{}{CURSOR_SEPARATOR}{}{CURSOR_SEPARATOR}{include_additional}",
+        engine.unwrap_or_default(),
+        language.unwrap_or_default(),
+    ))
+}
+
+/// The position a `NextToken` resumes at, or `None` if this service did not mint the
+/// token or it was minted for a different query.
+fn decode_voice_cursor(
+    token: &str,
+    engine: Option<&str>,
+    language: Option<&str>,
+    include_additional: bool,
+) -> Option<usize> {
+    let cursor = crate::state::decode_page_token(token)?;
+    let mut fields = cursor.split(CURSOR_SEPARATOR);
+    let start = fields.next()?.parse::<usize>().ok()?;
+    let minted_for = (fields.next()?, fields.next()?, fields.next()?);
+    if fields.next().is_some() {
+        return None;
+    }
+    let include = include_additional.to_string();
+    let asked_for = (
+        engine.unwrap_or_default(),
+        language.unwrap_or_default(),
+        include.as_str(),
+    );
+    (minted_for == asked_for).then_some(start)
+}
+
 /// The `DescribeVoices` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -166,20 +224,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeVoices` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeVoicesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeVoices"))
+        // The cursor carries the position AND the query it was reached under, so a
+        // token minted for one filter cannot resume a different one, and a token this
+        // service did not mint is refused before any state is read.
+        let start = match input.next_token.as_deref() {
+            Some(token) => decode_voice_cursor(
+                token,
+                input.engine.as_deref(),
+                input.language_code.as_deref(),
+                input.include_additional_language_codes,
+            )
+            .ok_or_else(|| {
+                DescribeVoicesErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
+                    message: Some(format!(
+                        "the NextToken is invalid, or was not issued for this request's \
+                         Engine, LanguageCode and IncludeAdditionalLanguageCodes: {token}"
+                    )),
+                })
+            })?,
+            None => 0,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeVoicesErrorModeled::ServiceFailureException(ServiceFailureException {
+                message: Some("the Amazon Polly voice catalog is unavailable".to_string()),
+            })
+        })?;
+
+        let guard = state.lock();
+        // One past the page is enough to know whether a further page exists, so the
+        // whole filtered catalog is never materialised — the same shape as
+        // `ListLexicons`, which peeks one entry past its page.
+        let mut window: Vec<Voice> = guard
+            .voices
+            .iter()
+            .filter(|voice| {
+                input
+                    .engine
+                    .as_deref()
+                    .is_none_or(|engine| voice.supports_engine(engine))
+            })
+            .filter(|voice| {
+                input.language_code.as_deref().is_none_or(|language| {
+                    voice.speaks(language, input.include_additional_language_codes)
+                })
+            })
+            .skip(start)
+            .take(VOICE_PAGE_SIZE.saturating_add(1))
+            .map(|voice| Voice {
+                id: Some(voice.id.to_string()),
+                name: Some(voice.name.to_string()),
+                gender: Some(voice.gender.to_string()),
+                language_code: Some(voice.language_code.to_string()),
+                language_name: Some(voice.language_name.to_string()),
+                additional_language_codes: Some(
+                    voice
+                        .additional_language_codes
+                        .iter()
+                        .map(|code| (*code).to_string())
+                        .collect(),
+                ),
+                supported_engines: Some(
+                    voice
+                        .supported_engines
+                        .iter()
+                        .map(|engine| (*engine).to_string())
+                        .collect(),
+                ),
+            })
+            .collect();
+
+        let has_further_page = window.len() > VOICE_PAGE_SIZE;
+        window.truncate(VOICE_PAGE_SIZE);
+        let next_token = has_further_page.then(|| {
+            encode_voice_cursor(
+                start.saturating_add(window.len()),
+                input.engine.as_deref(),
+                input.language_code.as_deref(),
+                input.include_additional_language_codes,
+            )
+        });
+
+        Ok(DescribeVoicesOutput {
+            voices: Some(window),
+            next_token,
+        })
     }
 }

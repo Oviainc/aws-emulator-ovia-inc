@@ -1,0 +1,1189 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! End-to-end tests for the Polly lexicon lifecycle, speech synthesis and the voice
+//! catalog, driven over HTTP through the same router the emulator serves with.
+//!
+//! Each test states the RULE it is checking and then checks it over a TABLE of inputs
+//! that span the class the rule covers — several PLS documents rather than one, every
+//! `OutputFormat` rather than mp3, every documented sample rate rather than the
+//! default. The single request an issue happens to quote is one row.
+
+use std::collections::BTreeSet;
+use std::sync::Arc;
+
+use bytes::Bytes;
+use service_com_amazonaws_polly_parrot_v1::EmulatedService;
+use smithy_server_runtime::MultiServiceRouter;
+
+/// The region the test's SigV4 credential scope names, so the ARNs the service mints
+/// are predictable.
+const REGION: &str = "us-east-1";
+
+/// The account id every generated emulator presents.
+const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
+
+/// One emulator with Polly mounted on it, driven exactly as the router drives it.
+struct Polly {
+    router: MultiServiceRouter,
+}
+
+impl Polly {
+    fn new() -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        // The tests exercise handler behaviour, not SigV4; the `Authorization`
+        // header below is still what routes the request and names the region.
+        router.set_request_authentication(false);
+        router.register_service(EmulatedService::new(engine));
+        Self { router }
+    }
+
+    async fn call(&self, method: &str, path: &str, body: &str) -> http::Response<Bytes> {
+        let request = http::Request::builder()
+            .method(method)
+            .uri(format!("https://polly.{REGION}.amazonaws.com{path}"))
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/polly/aws4_request, \
+                     SignedHeaders=host, Signature=0"
+                ),
+            )
+            .header("content-type", "application/json")
+            .body(Bytes::from(body.to_owned()))
+            .expect("a well-formed test request");
+        self.router.dispatch(request).await
+    }
+
+    async fn put_lexicon(&self, name: &str, content: &str) -> http::Response<Bytes> {
+        let body = serde_json::json!({ "Content": content }).to_string();
+        self.call("PUT", &format!("/v1/lexicons/{name}"), &body).await
+    }
+
+    async fn get_lexicon(&self, name: &str) -> http::Response<Bytes> {
+        self.call("GET", &format!("/v1/lexicons/{name}"), "").await
+    }
+
+    async fn delete_lexicon(&self, name: &str) -> http::Response<Bytes> {
+        self.call("DELETE", &format!("/v1/lexicons/{name}"), "").await
+    }
+
+    async fn list_lexicons(&self, query: &str) -> http::Response<Bytes> {
+        self.call("GET", &format!("/v1/lexicons{query}"), "").await
+    }
+
+    async fn describe_voices(&self, query: &str) -> http::Response<Bytes> {
+        self.call("GET", &format!("/v1/voices{query}"), "").await
+    }
+
+    async fn synthesize(&self, request: &serde_json::Value) -> http::Response<Bytes> {
+        self.call("POST", "/v1/speech", &request.to_string()).await
+    }
+}
+
+/// The JSON body of a response, for the operations that return one.
+fn json(response: &http::Response<Bytes>) -> serde_json::Value {
+    serde_json::from_slice(response.body()).unwrap_or_else(|e| {
+        panic!(
+            "expected a JSON body, got {:?}: {e}",
+            String::from_utf8_lossy(response.body())
+        )
+    })
+}
+
+/// The modeled error code a failure response carries (`__type` on restJson1).
+fn error_code(response: &http::Response<Bytes>) -> String {
+    json(response)
+        .get("__type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("<no __type>")
+        .rsplit(['#', ':'])
+        .next()
+        .unwrap_or("<no __type>")
+        .to_string()
+}
+
+fn header(response: &http::Response<Bytes>, name: &str) -> String {
+    response
+        .headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// A PLS lexicon with `lexemes` lexemes in `alphabet` for `language`.
+fn pls(alphabet: &str, language: &str, lexemes: usize) -> String {
+    let body: String = (0..lexemes)
+        .map(|i| {
+            format!(
+                "  <lexeme><grapheme>G{i}</grapheme><alias>Grapheme {i}</alias></lexeme>\n"
+            )
+        })
+        .collect();
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <lexicon version=\"1.0\" \
+         xmlns=\"http://www.w3.org/2005/01/pronunciation-lexicon\" \
+         alphabet=\"{alphabet}\" xml:lang=\"{language}\">\n{body}</lexicon>"
+    )
+}
+
+/// A valid PLS lexicon exactly `total` characters long (padding goes in a grapheme).
+fn pls_of_size(total: usize) -> String {
+    const PREFIX: &str =
+        "<lexicon version=\"1.0\" alphabet=\"ipa\" xml:lang=\"en-US\"><lexeme><grapheme>";
+    const SUFFIX: &str = "</grapheme></lexeme></lexicon>";
+    let padding = total.saturating_sub(PREFIX.len() + SUFFIX.len());
+    format!("{PREFIX}{}{SUFFIX}", "x".repeat(padding))
+}
+
+/// RULE: a lexicon is stored under its name, read back verbatim with the attributes
+/// derived from its own document, replaced in place by a later put of the same name,
+/// and gone from every read after a delete.
+#[tokio::test]
+async fn a_lexicon_round_trips_through_state_and_is_replaced_in_place() {
+    let polly = Polly::new();
+    let first = pls("ipa", "en-US", 2);
+
+    let put = polly.put_lexicon("RoundTrip", &first).await;
+    assert_eq!(put.status(), 200, "PutLexicon: body {:?}", json(&put));
+
+    let got = polly.get_lexicon("RoundTrip").await;
+    assert_eq!(got.status(), 200, "GetLexicon: body {:?}", json(&got));
+    let body = json(&got);
+    assert_eq!(
+        body["Lexicon"]["Content"].as_str(),
+        Some(first.as_str()),
+        "GetLexicon must return the content that was put, character for character"
+    );
+    assert_eq!(body["Lexicon"]["Name"].as_str(), Some("RoundTrip"));
+    let attributes = &body["LexiconAttributes"];
+    assert_eq!(attributes["Alphabet"].as_str(), Some("ipa"));
+    assert_eq!(attributes["LanguageCode"].as_str(), Some("en-US"));
+    assert_eq!(attributes["LexemesCount"].as_u64(), Some(2));
+    assert_eq!(
+        attributes["Size"].as_u64(),
+        Some(first.chars().count() as u64),
+        "Size is the lexicon's size in characters"
+    );
+    assert_eq!(
+        attributes["LexiconArn"].as_str(),
+        Some(format!("arn:aws:polly:{REGION}:{ACCOUNT}:lexicon/RoundTrip").as_str()),
+        "the ARN is minted for the request's region and the emulator's account"
+    );
+    let first_modified = attributes["LastModified"]
+        .as_f64()
+        .expect("LastModified is a timestamp");
+
+    let listed = polly.list_lexicons("").await;
+    assert_eq!(listed.status(), 200);
+    assert_eq!(
+        listed_names(&json(&listed)),
+        BTreeSet::from(["RoundTrip".to_string()]),
+        "ListLexicons must report the lexicon that was put"
+    );
+
+    // Replacing: same name, different document. One entry, new attributes, and a
+    // LastModified that has not gone backwards.
+    let second = pls("x-sampa", "de-DE", 5);
+    assert_eq!(polly.put_lexicon("RoundTrip", &second).await.status(), 200);
+    let replaced = json(&polly.get_lexicon("RoundTrip").await);
+    assert_eq!(
+        replaced["Lexicon"]["Content"].as_str(),
+        Some(second.as_str()),
+        "a re-put must overwrite the stored content"
+    );
+    assert_eq!(replaced["LexiconAttributes"]["Alphabet"].as_str(), Some("x-sampa"));
+    assert_eq!(replaced["LexiconAttributes"]["LanguageCode"].as_str(), Some("de-DE"));
+    assert_eq!(replaced["LexiconAttributes"]["LexemesCount"].as_u64(), Some(5));
+    let second_modified = replaced["LexiconAttributes"]["LastModified"]
+        .as_f64()
+        .expect("LastModified is a timestamp");
+    assert!(
+        second_modified >= first_modified,
+        "LastModified moved backwards: {second_modified} < {first_modified}"
+    );
+    assert_eq!(
+        listed_names(&json(&polly.list_lexicons("").await)).len(),
+        1,
+        "a re-put must not duplicate the entry"
+    );
+
+    let deleted = polly.delete_lexicon("RoundTrip").await;
+    assert_eq!(deleted.status(), 200, "DeleteLexicon: {:?}", json(&deleted));
+    let after_delete = polly.get_lexicon("RoundTrip").await;
+    assert_eq!(
+        (after_delete.status().as_u16(), error_code(&after_delete)),
+        (404, "LexiconNotFoundException".to_string()),
+        "GetLexicon after a delete must be a 404"
+    );
+    assert!(
+        listed_names(&json(&polly.list_lexicons("").await)).is_empty(),
+        "ListLexicons must not report a deleted lexicon"
+    );
+    let delete_again = polly.delete_lexicon("RoundTrip").await;
+    assert_eq!(
+        (delete_again.status().as_u16(), error_code(&delete_again)),
+        (404, "LexiconNotFoundException".to_string()),
+        "deleting an absent lexicon must be a 404"
+    );
+}
+
+/// The names `ListLexicons` reported.
+fn listed_names(body: &serde_json::Value) -> BTreeSet<String> {
+    body["Lexicons"]
+        .as_array()
+        .expect("Lexicons is a list")
+        .iter()
+        .map(|entry| {
+            entry["Name"]
+                .as_str()
+                .expect("every description names its lexicon")
+                .to_string()
+        })
+        .collect()
+}
+
+/// RULE: every `LexiconAttributes` value but the ARN and the timestamp is read out of
+/// the PLS document itself, so a document with a different alphabet, language, lexeme
+/// count or length reports exactly those differences.
+#[tokio::test]
+async fn lexicon_attributes_are_derived_from_the_document() {
+    let polly = Polly::new();
+    // Each alphabet is one the model's `UnsupportedPlsAlphabetException` documentation
+    // lists; `en` is the bare primary subtag `LexiconAttributes$LanguageCode`
+    // documents ("A lexicon with a language code such as \"en\" ...").
+    let table = [
+        ("Ipa", "ipa", "en-US", 1usize),
+        ("Sampa", "x-sampa", "en-GB", 3),
+        ("Pinyin", "x-amazon-pinyin", "cmn-CN", 7),
+        ("Jyutping", "x-amazon-jyutping", "yue-CN", 2),
+        ("Kana", "x-amazon-pron-kana", "ja-JP", 4),
+        ("Yomigana", "x-amazon-yomigana", "ja-JP", 0),
+        ("Generic", "ipa", "en", 2),
+        ("Arabic", "ipa", "arb", 1),
+    ];
+    for (name, alphabet, language, lexemes) in table {
+        let content = pls(alphabet, language, lexemes);
+        let put = polly.put_lexicon(name, &content).await;
+        assert_eq!(
+            put.status(),
+            200,
+            "case {name:?}: PutLexicon failed with {:?}",
+            json(&put)
+        );
+        let attributes = json(&polly.get_lexicon(name).await)["LexiconAttributes"].clone();
+        assert_eq!(
+            (
+                attributes["Alphabet"].as_str(),
+                attributes["LanguageCode"].as_str(),
+                attributes["LexemesCount"].as_u64(),
+                attributes["Size"].as_u64(),
+            ),
+            (
+                Some(alphabet),
+                Some(language),
+                Some(lexemes as u64),
+                Some(content.chars().count() as u64),
+            ),
+            "case {name:?}: attributes do not match the document, got {attributes:?}"
+        );
+    }
+    assert_eq!(
+        listed_names(&json(&polly.list_lexicons("").await)).len(),
+        table.len(),
+        "every lexicon put must be listed, and no others"
+    );
+}
+
+/// RULE: a `Content` that is not a PLS lexicon, or one declaring an alphabet or
+/// language Amazon Polly does not support, is refused with the modeled error for that
+/// cause — and nothing is stored.
+#[tokio::test]
+async fn an_unusable_pls_document_is_refused_with_its_modeled_error() {
+    let polly = Polly::new();
+    let table = [
+        ("not xml", "this is not xml at all <", "InvalidLexiconException"),
+        ("other root", "<speak>hello</speak>", "InvalidLexiconException"),
+        ("empty", "", "InvalidLexiconException"),
+        (
+            "unknown alphabet",
+            "<lexicon version=\"1.0\" alphabet=\"x-klingon\" xml:lang=\"en-US\"/>",
+            "UnsupportedPlsAlphabetException",
+        ),
+        (
+            "unknown language",
+            "<lexicon version=\"1.0\" alphabet=\"ipa\" xml:lang=\"xx-ZZ\"/>",
+            "UnsupportedPlsLanguageException",
+        ),
+    ];
+    for (case, content, expected) in table {
+        let response = polly.put_lexicon("Refused", content).await;
+        assert_eq!(
+            (response.status().as_u16(), error_code(&response)),
+            (400, expected.to_string()),
+            "case {case:?}: wrong refusal, body {:?}",
+            json(&response)
+        );
+    }
+    assert!(
+        listed_names(&json(&polly.list_lexicons("").await)).is_empty(),
+        "a refused PutLexicon must store nothing"
+    );
+}
+
+/// RULE: the lexicon store is bounded — a lexicon past the published size quota is
+/// `LexiconSizeExceededException`, an insert past the published count quota is
+/// `MaxLexiconsNumberExceededException`, and replacing a name already stored is
+/// neither.
+#[tokio::test]
+async fn the_lexicon_store_is_bounded() {
+    let polly = Polly::new();
+
+    // The size cap, exercised either side of the boundary.
+    for (case, total, expect_ok) in [
+        ("at the cap", 4_000usize, true),
+        ("one past the cap", 4_001, false),
+        ("far past the cap", 40_000, false),
+    ] {
+        let content = pls_of_size(total);
+        assert_eq!(
+            content.chars().count(),
+            total,
+            "case {case:?}: the test document is the wrong size"
+        );
+        let response = polly.put_lexicon("Sized", &content).await;
+        if expect_ok {
+            assert_eq!(
+                response.status(),
+                200,
+                "case {case:?}: expected success, body {:?}",
+                json(&response)
+            );
+        } else {
+            assert_eq!(
+                (response.status().as_u16(), error_code(&response)),
+                (400, "LexiconSizeExceededException".to_string()),
+                "case {case:?}: expected a refusal"
+            );
+        }
+    }
+
+    // The count cap. `Sized` above already occupies one slot.
+    let small = pls("ipa", "en-US", 1);
+    for index in 0..99 {
+        let name = format!("Count{index:02}");
+        assert_eq!(
+            polly.put_lexicon(&name, &small).await.status(),
+            200,
+            "PutLexicon {name} must succeed below the count cap"
+        );
+    }
+    let over = polly.put_lexicon("OneTooMany", &small).await;
+    assert_eq!(
+        (over.status().as_u16(), error_code(&over)),
+        (400, "MaxLexiconsNumberExceededException".to_string()),
+        "a new name past the count cap must be refused"
+    );
+    // Replacing an existing name adds no entry, so the cap does not refuse it.
+    assert_eq!(
+        polly.put_lexicon("Count00", &small).await.status(),
+        200,
+        "replacing a stored lexicon must still succeed at the count cap"
+    );
+}
+
+/// RULE: `ListLexicons` serves the store in name order one page at a time, a
+/// `NextToken` appears only while a further lexicon exists, and a token this service
+/// did not mint is `InvalidNextTokenException`.
+#[tokio::test]
+async fn list_lexicons_pages_the_store_and_refuses_a_foreign_token() {
+    let polly = Polly::new();
+    let content = pls("ipa", "en-US", 1);
+    let total = 25;
+    for index in 0..total {
+        let name = format!("Lex{index:02}");
+        assert_eq!(
+            polly.put_lexicon(&name, &content).await.status(),
+            200,
+            "PutLexicon {name} failed"
+        );
+    }
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut query = String::new();
+    let mut pages = 0;
+    loop {
+        let page = json(&polly.list_lexicons(&query).await);
+        let names: Vec<String> = page["Lexicons"]
+            .as_array()
+            .expect("Lexicons is a list")
+            .iter()
+            .map(|e| e["Name"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            !names.is_empty(),
+            "page {pages}: a page reached through a NextToken must not be empty"
+        );
+        seen.extend(names);
+        pages += 1;
+        match page["NextToken"].as_str() {
+            Some(token) => query = format!("?NextToken={token}"),
+            None => break,
+        }
+        assert!(pages < 10, "pagination did not terminate");
+    }
+    assert!(pages > 1, "25 lexicons must not fit in one page, got {pages}");
+    let expected: Vec<String> = (0..total).map(|index| format!("Lex{index:02}")).collect();
+    assert_eq!(
+        seen, expected,
+        "the pages together must be the whole store, in name order"
+    );
+
+    for bad in ["not-a-token", "zzzz", "ff"] {
+        let response = polly.list_lexicons(&format!("?NextToken={bad}")).await;
+        assert_eq!(
+            (response.status().as_u16(), error_code(&response)),
+            (400, "InvalidNextTokenException".to_string()),
+            "token {bad:?}: expected a refusal, body {:?}",
+            json(&response)
+        );
+    }
+}
+
+/// RULE: `SynthesizeSpeech` answers with the `OutputFormat`'s documented media type, a
+/// non-empty stream in that encoding, and the billed character count of `Text`.
+#[tokio::test]
+async fn synthesize_speech_answers_every_output_format() {
+    let polly = Polly::new();
+    let text = "Hello world, this is a sentence.";
+    // The mapping is `SynthesizeSpeechOutput$ContentType`'s own documentation; the
+    // signature is the format's real framing.
+    let table: [(&str, &str, Option<&[u8]>); 5] = [
+        ("mp3", "audio/mpeg", Some(&[0xFF])),
+        ("ogg_opus", "audio/ogg", Some(b"OggS")),
+        ("pcm", "audio/pcm", None),
+        ("mulaw", "audio/mulaw", None),
+        ("alaw", "audio/alaw", None),
+    ];
+    for (format, content_type, signature) in table {
+        let response = polly
+            .synthesize(&serde_json::json!({
+                "Text": text,
+                "VoiceId": "Joanna",
+                "OutputFormat": format,
+            }))
+            .await;
+        assert_eq!(
+            response.status(),
+            200,
+            "format {format:?}: body {:?}",
+            String::from_utf8_lossy(response.body())
+        );
+        assert_eq!(
+            header(&response, "content-type"),
+            content_type,
+            "format {format:?}: wrong Content-Type"
+        );
+        assert_eq!(
+            header(&response, "x-amzn-requestcharacters"),
+            text.chars().count().to_string(),
+            "format {format:?}: wrong RequestCharacters"
+        );
+        assert!(
+            !response.body().is_empty(),
+            "format {format:?}: the audio stream must not be empty"
+        );
+        if let Some(signature) = signature {
+            assert_eq!(
+                &response.body()[..signature.len()],
+                signature,
+                "format {format:?}: the stream does not start with the format's framing"
+            );
+        }
+    }
+}
+
+/// RULE: a format the emulator cannot encode conformantly is answered with the
+/// scaffold's 501, never with a 200 carrying a stream no decoder accepts. `ogg_vorbis`
+/// needs a Vorbis encoder's codebooks, which no in-process encoder can produce.
+#[tokio::test]
+async fn an_unencodable_output_format_is_not_dressed_up_as_success() {
+    let polly = Polly::new();
+    let requests = [
+        serde_json::json!({
+            "Text": "hello world",
+            "VoiceId": "Joanna",
+            "OutputFormat": "ogg_vorbis",
+        }),
+        serde_json::json!({
+            "Text": "hello world",
+            "VoiceId": "Joanna",
+            "OutputFormat": "ogg_vorbis",
+            "SampleRate": "22050",
+        }),
+    ];
+    for request in requests {
+        let response = polly.synthesize(&request).await;
+        assert_eq!(
+            (response.status().as_u16(), error_code(&response)),
+            (501, "NotImplemented".to_string()),
+            "request {request:?}: ogg_vorbis must answer 501, body {:?}",
+            String::from_utf8_lossy(response.body())
+        );
+    }
+}
+
+/// RULE: the stream's length follows the text, so more text means more audio for every
+/// encoding whose length carries the signal.
+#[tokio::test]
+async fn a_longer_text_yields_a_longer_stream() {
+    let polly = Polly::new();
+    let short = "Hi.";
+    let long = "Hi. ".repeat(100);
+    for format in ["mp3", "ogg_opus", "pcm", "mulaw", "alaw"] {
+        let mut lengths = Vec::new();
+        for text in [short, long.as_str()] {
+            let response = polly
+                .synthesize(&serde_json::json!({
+                    "Text": text,
+                    "VoiceId": "Matthew",
+                    "OutputFormat": format,
+                }))
+                .await;
+            assert_eq!(response.status(), 200, "format {format:?}: synthesis failed");
+            lengths.push(response.body().len());
+        }
+        assert!(
+            lengths[1] > lengths[0],
+            "format {format:?}: expected a longer stream for longer text, got {lengths:?}"
+        );
+    }
+}
+
+/// RULE: `SynthesizeSpeech` resolves every name in `LexiconNames` against the lexicon
+/// store, so a name that is not stored is `LexiconNotFoundException` (404) — including
+/// a name that was stored and then deleted.
+#[tokio::test]
+async fn synthesis_resolves_lexicon_names_against_the_store() {
+    let polly = Polly::new();
+    let content = pls("ipa", "en-US", 1);
+    for name in ["LexA", "LexB"] {
+        assert_eq!(polly.put_lexicon(name, &content).await.status(), 200);
+    }
+
+    let request = |names: serde_json::Value| {
+        serde_json::json!({
+            "Text": "hello world",
+            "VoiceId": "Joanna",
+            "OutputFormat": "mp3",
+            "LexiconNames": names,
+        })
+    };
+
+    for stored in [
+        serde_json::json!([]),
+        serde_json::json!(["LexA"]),
+        serde_json::json!(["LexA", "LexB"]),
+    ] {
+        let response = polly.synthesize(&request(stored.clone())).await;
+        assert_eq!(
+            response.status(),
+            200,
+            "lexicons {stored:?}: expected success, body {:?}",
+            String::from_utf8_lossy(response.body())
+        );
+        assert_eq!(
+            header(&response, "x-amzn-requestcharacters"),
+            "11",
+            "lexicons {stored:?}: wrong RequestCharacters"
+        );
+    }
+
+    for missing in [
+        serde_json::json!(["NoSuchLex"]),
+        serde_json::json!(["LexA", "NoSuchLex"]),
+        serde_json::json!(["lexa"]),
+    ] {
+        let response = polly.synthesize(&request(missing.clone())).await;
+        assert_eq!(
+            (response.status().as_u16(), error_code(&response)),
+            (404, "LexiconNotFoundException".to_string()),
+            "lexicons {missing:?}: expected a 404"
+        );
+    }
+
+    // Deleting a lexicon makes synthesis that names it fail: the store is the only
+    // source of truth here.
+    assert_eq!(polly.delete_lexicon("LexA").await.status(), 200);
+    let after_delete = polly.synthesize(&request(serde_json::json!(["LexA"]))).await;
+    assert_eq!(
+        (after_delete.status().as_u16(), error_code(&after_delete)),
+        (404, "LexiconNotFoundException".to_string()),
+        "a deleted lexicon must no longer resolve"
+    );
+}
+
+/// RULE: a `SampleRate` is accepted exactly when the chosen `OutputFormat` documents
+/// it, and refused with `InvalidSampleRateException` otherwise.
+#[tokio::test]
+async fn sample_rates_follow_the_documented_values_per_format() {
+    let polly = Polly::new();
+    // Verbatim from `SynthesizeSpeechInput$SampleRate`'s documentation.
+    let table: [(&str, &[&str], &[&str]); 5] = [
+        (
+            "mp3",
+            &["8000", "16000", "22050", "24000", "44100", "48000"],
+            &["11025", "0", "96000", "not-a-number"],
+        ),
+        // `ogg_vorbis` has no accepted-rate row: the rate is still validated (the
+        // refusals below prove it), but a valid rate reaches the 501 the format
+        // answers, which `an_unencodable_output_format_is_not_dressed_up_as_success`
+        // covers.
+        ("ogg_vorbis", &[], &["11025", "32000"]),
+        ("ogg_opus", &["48000"], &["8000", "24000"]),
+        ("pcm", &["8000", "16000"], &["22050", "24000"]),
+        ("mulaw", &["8000"], &["16000", "22050"]),
+    ];
+    for (format, valid, invalid) in table {
+        for rate in valid {
+            let response = polly
+                .synthesize(&serde_json::json!({
+                    "Text": "hello",
+                    "VoiceId": "Joanna",
+                    "OutputFormat": format,
+                    "SampleRate": rate,
+                }))
+                .await;
+            assert_eq!(
+                response.status(),
+                200,
+                "format {format:?} rate {rate:?}: expected success, body {:?}",
+                String::from_utf8_lossy(response.body())
+            );
+        }
+        for rate in invalid {
+            let response = polly
+                .synthesize(&serde_json::json!({
+                    "Text": "hello",
+                    "VoiceId": "Joanna",
+                    "OutputFormat": format,
+                    "SampleRate": rate,
+                }))
+                .await;
+            assert_eq!(
+                (response.status().as_u16(), error_code(&response)),
+                (400, "InvalidSampleRateException".to_string()),
+                "format {format:?} rate {rate:?}: expected a refusal"
+            );
+        }
+    }
+}
+
+/// RULE: `RequestCharacters` is the billed character count — every character of plain
+/// text, and for SSML the text content only — and text past the documented limits is
+/// `TextLengthExceededException`.
+#[tokio::test]
+async fn request_characters_counts_billed_characters() {
+    let polly = Polly::new();
+    let table: [(&str, &str, &str, u64); 5] = [
+        ("ascii", "hello world", "text", 11),
+        ("empty-ish", ".", "text", 1),
+        ("non-ascii", "ünïcödé", "text", 7),
+        ("ssml", "<speak>hello world</speak>", "ssml", 11),
+        (
+            "ssml with tags",
+            "<speak>one <break time=\"1s\"/>two</speak>",
+            "ssml",
+            7,
+        ),
+    ];
+    for (case, text, text_type, expected) in table {
+        let response = polly
+            .synthesize(&serde_json::json!({
+                "Text": text,
+                "TextType": text_type,
+                "VoiceId": "Joanna",
+                "OutputFormat": "mp3",
+            }))
+            .await;
+        assert_eq!(
+            response.status(),
+            200,
+            "case {case:?}: body {:?}",
+            String::from_utf8_lossy(response.body())
+        );
+        assert_eq!(
+            header(&response, "x-amzn-requestcharacters"),
+            expected.to_string(),
+            "case {case:?}: wrong RequestCharacters"
+        );
+    }
+
+    // 6000 total characters is the documented limit; 6001 is past it.
+    let too_long = "a".repeat(6001);
+    let response = polly
+        .synthesize(&serde_json::json!({
+            "Text": too_long,
+            "VoiceId": "Joanna",
+            "OutputFormat": "mp3",
+        }))
+        .await;
+    assert_eq!(
+        (response.status().as_u16(), error_code(&response)),
+        (400, "TextLengthExceededException".to_string()),
+        "text past the total limit must be refused"
+    );
+
+    // Malformed SSML is the SSML error, not a 500 and not a silent success.
+    let bad_ssml = polly
+        .synthesize(&serde_json::json!({
+            "Text": "<speak>unclosed",
+            "TextType": "ssml",
+            "VoiceId": "Joanna",
+            "OutputFormat": "mp3",
+        }))
+        .await;
+    assert_eq!(
+        (bad_ssml.status().as_u16(), error_code(&bad_ssml)),
+        (400, "InvalidSsmlException".to_string()),
+        "malformed SSML must be refused"
+    );
+}
+
+/// RULE: speech marks ride the `json` stream only — asking for them with an audio
+/// format is `MarksNotSupportedForFormatException` — and the marks a `json` request
+/// gets back are computed from the text.
+#[tokio::test]
+async fn speech_marks_are_json_only_and_computed_from_the_text() {
+    let polly = Polly::new();
+    for format in ["mp3", "pcm", "ogg_opus"] {
+        let response = polly
+            .synthesize(&serde_json::json!({
+                "Text": "hello world",
+                "VoiceId": "Joanna",
+                "OutputFormat": format,
+                "SpeechMarkTypes": ["word"],
+            }))
+            .await;
+        assert_eq!(
+            (response.status().as_u16(), error_code(&response)),
+            (400, "MarksNotSupportedForFormatException".to_string()),
+            "format {format:?}: speech marks must be refused"
+        );
+    }
+
+    let response = polly
+        .synthesize(&serde_json::json!({
+            "Text": "Hi there. Go!",
+            "VoiceId": "Joanna",
+            "OutputFormat": "json",
+            "SpeechMarkTypes": ["sentence", "word"],
+        }))
+        .await;
+    assert_eq!(response.status(), 200, "json synthesis must succeed");
+    assert_eq!(
+        header(&response, "content-type"),
+        "application/x-json-stream",
+        "json output carries the speech-mark media type"
+    );
+    let marks: Vec<serde_json::Value> = String::from_utf8_lossy(response.body())
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each line is a JSON object"))
+        .collect();
+    let rendered: Vec<(String, u64, u64, String)> = marks
+        .iter()
+        .map(|mark| {
+            (
+                mark["type"].as_str().unwrap_or_default().to_string(),
+                mark["start"].as_u64().unwrap_or_default(),
+                mark["end"].as_u64().unwrap_or_default(),
+                mark["value"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rendered,
+        vec![
+            ("sentence".to_string(), 0, 9, "Hi there.".to_string()),
+            ("word".to_string(), 0, 2, "Hi".to_string()),
+            ("word".to_string(), 3, 8, "there".to_string()),
+            ("sentence".to_string(), 10, 13, "Go!".to_string()),
+            ("word".to_string(), 10, 12, "Go".to_string()),
+        ],
+        "the marks must be the text's own sentences and words"
+    );
+
+    // Asking for no mark type asks for no marks, so the stream is empty — not a
+    // refusal Amazon Polly does not declare.
+    let no_types = polly
+        .synthesize(&serde_json::json!({
+            "Text": "Hi there. Go!",
+            "VoiceId": "Joanna",
+            "OutputFormat": "json",
+        }))
+        .await;
+    assert_eq!(no_types.status(), 200, "json without mark types must succeed");
+    assert!(
+        no_types.body().is_empty(),
+        "no mark type means no marks, got {:?}",
+        String::from_utf8_lossy(no_types.body())
+    );
+
+    // Marks over SSML input would need offsets into the document's text content that
+    // skip the markup; that is not implemented, so it is refused rather than answered
+    // with marks whose values are tag names.
+    for mark_types in [
+        serde_json::json!(["word"]),
+        serde_json::json!(["sentence"]),
+        serde_json::json!(["sentence", "word"]),
+    ] {
+        let response = polly
+            .synthesize(&serde_json::json!({
+                "Text": "<speak>one <break time=\"1s\"/>two</speak>",
+                "TextType": "ssml",
+                "VoiceId": "Joanna",
+                "OutputFormat": "json",
+                "SpeechMarkTypes": mark_types,
+            }))
+            .await;
+        assert_eq!(
+            (response.status().as_u16(), error_code(&response)),
+            (501, "NotImplemented".to_string()),
+            "mark types {mark_types:?} over ssml input: expected a 501, body {:?}",
+            String::from_utf8_lossy(response.body())
+        );
+    }
+
+    // One mark type at a time yields only that type.
+    for (requested, expected) in [("sentence", 2usize), ("word", 3)] {
+        let response = polly
+            .synthesize(&serde_json::json!({
+                "Text": "Hi there. Go!",
+                "VoiceId": "Joanna",
+                "OutputFormat": "json",
+                "SpeechMarkTypes": [requested],
+            }))
+            .await;
+        assert_eq!(response.status(), 200, "mark type {requested:?}: failed");
+        let body = String::from_utf8_lossy(response.body()).to_string();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(
+            lines.len(),
+            expected,
+            "mark type {requested:?}: expected {expected} marks, got {lines:?}"
+        );
+        for line in lines {
+            assert!(
+                line.contains(&format!("\"type\":\"{requested}\"")),
+                "mark type {requested:?}: a line reports another type: {line}"
+            );
+        }
+    }
+}
+
+/// RULE: `Engine` and `LanguageCode` are checked against the voice the request names,
+/// as the catalog `DescribeVoices` serves records it — so an engine the voice does not
+/// support is `EngineNotSupportedException` and a language it does not speak is
+/// `LanguageNotSupportedException`, while a bilingual voice's additional language is
+/// accepted.
+#[tokio::test]
+async fn synthesis_checks_the_voice_against_the_catalog() {
+    let polly = Polly::new();
+    // Each row is read off the seeded catalog, which DescribeVoices also serves.
+    let table: [(&str, &str, Option<&str>, Option<&str>); 7] = [
+        // (voice, engine, language, expected error code or None for success)
+        ("Joanna", "neural", None, None),
+        ("Joanna", "standard", None, None),
+        ("Geraint", "standard", None, None),
+        ("Geraint", "neural", None, Some("EngineNotSupportedException")),
+        ("Kevin", "standard", None, Some("EngineNotSupportedException")),
+        // Aditi is the bilingual voice the model's own documentation names: en-IN by
+        // default, hi-IN as an additional language.
+        ("Aditi", "standard", Some("hi-IN"), None),
+        ("Joanna", "neural", Some("hi-IN"), Some("LanguageNotSupportedException")),
+    ];
+    for (voice, engine, language, expected) in table {
+        let mut request = serde_json::json!({
+            "Text": "hello world",
+            "VoiceId": voice,
+            "Engine": engine,
+            "OutputFormat": "mp3",
+        });
+        if let Some(language) = language {
+            request["LanguageCode"] = serde_json::json!(language);
+        }
+        let response = polly.synthesize(&request).await;
+        match expected {
+            None => assert_eq!(
+                response.status(),
+                200,
+                "voice {voice:?} engine {engine:?} language {language:?}: expected success, \
+                 body {:?}",
+                String::from_utf8_lossy(response.body())
+            ),
+            Some(code) => assert_eq!(
+                (response.status().as_u16(), error_code(&response)),
+                (400, code.to_string()),
+                "voice {voice:?} engine {engine:?} language {language:?}: wrong refusal"
+            ),
+        }
+    }
+
+    // The engine the catalog reports for a voice is what synthesis accepts, for every
+    // voice DescribeVoices lists under that engine.
+    for engine in ["standard", "neural"] {
+        for voice in voices(&polly, &format!("?Engine={engine}")).await.iter().take(5) {
+            let id = voice["Id"].as_str().expect("every voice has an id");
+            let response = polly
+                .synthesize(&serde_json::json!({
+                    "Text": "hi",
+                    "VoiceId": id,
+                    "Engine": engine,
+                    "OutputFormat": "mp3",
+                }))
+                .await;
+            assert_eq!(
+                response.status(),
+                200,
+                "voice {id:?} is listed for engine {engine:?} but synthesis refused it: {:?}",
+                String::from_utf8_lossy(response.body())
+            );
+        }
+    }
+}
+
+/// RULE: `DescribeVoices` serves the catalog narrowed by its query parameters —
+/// `Engine` keeps voices that support it, `LanguageCode` keeps voices that speak it,
+/// and a bilingual voice appears for a secondary language only when
+/// `IncludeAdditionalLanguageCodes` is set.
+#[tokio::test]
+async fn describe_voices_filters_the_catalog() {
+    let polly = Polly::new();
+
+    let all = voices(&polly, "").await;
+    assert!(
+        all.len() > 20,
+        "the seeded catalog must carry a real set of voices, got {}",
+        all.len()
+    );
+    for voice in &all {
+        for field in ["Id", "Name", "Gender", "LanguageCode", "LanguageName"] {
+            assert!(
+                voice[field].as_str().is_some_and(|v| !v.is_empty()),
+                "voice {:?}: {field} is missing",
+                voice["Id"]
+            );
+        }
+        assert!(
+            voice["SupportedEngines"]
+                .as_array()
+                .is_some_and(|e| !e.is_empty()),
+            "voice {:?}: SupportedEngines is empty",
+            voice["Id"]
+        );
+    }
+
+    // A language filter narrows to that language, and only to it.
+    for language in ["en-US", "de-DE", "ja-JP", "arb"] {
+        let filtered = voices(&polly, &format!("?LanguageCode={language}")).await;
+        assert!(
+            !filtered.is_empty(),
+            "language {language:?}: the catalog must carry voices for it"
+        );
+        assert!(
+            filtered.len() < all.len(),
+            "language {language:?}: the filter did not narrow the list"
+        );
+        for voice in &filtered {
+            assert_eq!(
+                voice["LanguageCode"].as_str(),
+                Some(language),
+                "language {language:?}: voice {:?} does not speak it",
+                voice["Id"]
+            );
+        }
+    }
+
+    // An engine filter narrows to voices that support it.
+    for engine in ["standard", "neural", "generative", "long-form"] {
+        let filtered = voices(&polly, &format!("?Engine={engine}")).await;
+        assert!(
+            !filtered.is_empty(),
+            "engine {engine:?}: the catalog must carry voices for it"
+        );
+        assert!(
+            filtered.len() < all.len(),
+            "engine {engine:?}: the filter did not narrow the list"
+        );
+        for voice in &filtered {
+            let engines: Vec<&str> = voice["SupportedEngines"]
+                .as_array()
+                .expect("SupportedEngines is a list")
+                .iter()
+                .filter_map(|e| e.as_str())
+                .collect();
+            assert!(
+                engines.contains(&engine),
+                "engine {engine:?}: voice {:?} supports only {engines:?}",
+                voice["Id"]
+            );
+        }
+    }
+
+    // Both filters together narrow further than either alone.
+    let en_us = voices(&polly, "?LanguageCode=en-US").await;
+    let en_us_standard = voices(&polly, "?LanguageCode=en-US&Engine=standard").await;
+    assert!(
+        !en_us_standard.is_empty() && en_us_standard.len() < en_us.len(),
+        "combining the filters must narrow further: {} of {}",
+        en_us_standard.len(),
+        en_us.len()
+    );
+
+    // A language no seeded voice speaks is an empty list, not the whole catalog.
+    let none = voices(&polly, "?LanguageCode=de-CH").await;
+    assert!(
+        none.is_empty(),
+        "a language with no voices must answer an empty list, got {none:?}"
+    );
+
+    // `Aditi` speaks hi-IN as an additional language (the model documents exactly
+    // this), so it appears for hi-IN only with IncludeAdditionalLanguageCodes.
+    let primary = ids(&voices(&polly, "?LanguageCode=hi-IN").await);
+    let with_additional = ids(&voices(
+        &polly,
+        "?LanguageCode=hi-IN&IncludeAdditionalLanguageCodes=true",
+    )
+    .await);
+    assert!(
+        !primary.contains("Aditi"),
+        "a bilingual voice must not appear for its secondary language by default: {primary:?}"
+    );
+    assert!(
+        with_additional.contains("Aditi"),
+        "IncludeAdditionalLanguageCodes must add the bilingual voice: {with_additional:?}"
+    );
+    assert!(
+        primary.is_subset(&with_additional),
+        "IncludeAdditionalLanguageCodes must only widen the list"
+    );
+
+    // A token this service did not mint is refused.
+    let bad = polly.describe_voices("?NextToken=not-a-token").await;
+    assert_eq!(
+        (bad.status().as_u16(), error_code(&bad)),
+        (400, "InvalidNextTokenException".to_string()),
+        "a foreign NextToken must be refused"
+    );
+}
+
+/// RULE: a `DescribeVoices` `NextToken` resumes the query it was issued for and no
+/// other, so replaying it under different filters is `InvalidNextTokenException`
+/// rather than a page of the wrong voices.
+#[tokio::test]
+async fn a_voice_page_token_only_resumes_its_own_query() {
+    let polly = Polly::new();
+    let first = json(&polly.describe_voices("").await);
+    let token = first["NextToken"]
+        .as_str()
+        .expect("the seeded catalog spans more than one page")
+        .to_string();
+
+    // The same query resumes, and the two pages do not overlap.
+    let page_one = ids(first["Voices"].as_array().expect("Voices is a list"));
+    let resumed = polly.describe_voices(&format!("?NextToken={token}")).await;
+    assert_eq!(resumed.status(), 200, "the same query must resume");
+    let page_two = ids(json(&resumed)["Voices"].as_array().expect("Voices is a list"));
+    assert!(
+        page_one.is_disjoint(&page_two),
+        "the second page repeats voices from the first: {:?}",
+        page_one.intersection(&page_two).collect::<Vec<_>>()
+    );
+
+    // A different query is refused rather than resumed at the same offset.
+    for mismatched in [
+        format!("?LanguageCode=en-US&NextToken={token}"),
+        format!("?Engine=standard&NextToken={token}"),
+        format!("?IncludeAdditionalLanguageCodes=true&NextToken={token}"),
+    ] {
+        let response = polly.describe_voices(&mismatched).await;
+        assert_eq!(
+            (response.status().as_u16(), error_code(&response)),
+            (400, "InvalidNextTokenException".to_string()),
+            "query {mismatched:?}: a token from another query must be refused"
+        );
+    }
+}
+
+/// Every voice a `DescribeVoices` query reports, following `NextToken` to the end.
+async fn voices(polly: &Polly, query: &str) -> Vec<serde_json::Value> {
+    let mut all: Vec<serde_json::Value> = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let paged = match &token {
+            Some(token) if query.is_empty() => format!("?NextToken={token}"),
+            Some(token) => format!("{query}&NextToken={token}"),
+            None => query.to_string(),
+        };
+        let response = polly.describe_voices(&paged).await;
+        assert_eq!(
+            response.status(),
+            200,
+            "DescribeVoices{paged}: body {:?}",
+            String::from_utf8_lossy(response.body())
+        );
+        let body = json(&response);
+        all.extend(body["Voices"].as_array().expect("Voices is a list").clone());
+        match body["NextToken"].as_str() {
+            Some(next) => token = Some(next.to_string()),
+            None => break,
+        }
+        assert!(all.len() < 1_000, "DescribeVoices pagination did not terminate");
+    }
+    all
+}
+
+fn ids(voices: &[serde_json::Value]) -> BTreeSet<String> {
+    voices
+        .iter()
+        .map(|voice| voice["Id"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// RULE: every operation in this slice reads the one shared store, so a lexicon put
+/// through one request is visible to every later request — this is the whole point of
+/// the engine seam.
+#[tokio::test]
+async fn state_written_by_one_request_is_visible_to_the_next() {
+    let polly = Polly::new();
+    let content = pls("ipa", "en-US", 1);
+    assert_eq!(polly.put_lexicon("Shared", &content).await.status(), 200);
+
+    // A different operation, a different request: it must see the write.
+    assert!(
+        listed_names(&json(&polly.list_lexicons("").await)).contains("Shared"),
+        "ListLexicons must see what PutLexicon wrote"
+    );
+    assert_eq!(
+        polly
+            .synthesize(&serde_json::json!({
+                "Text": "hello",
+                "VoiceId": "Joanna",
+                "OutputFormat": "mp3",
+                "LexiconNames": ["Shared"],
+            }))
+            .await
+            .status(),
+        200,
+        "SynthesizeSpeech must see what PutLexicon wrote"
+    );
+
+    // And a second emulator shares nothing with the first.
+    let other = Polly::new();
+    assert!(
+        listed_names(&json(&other.list_lexicons("").await)).is_empty(),
+        "a separate emulator must not see another's lexicons"
+    );
+}
