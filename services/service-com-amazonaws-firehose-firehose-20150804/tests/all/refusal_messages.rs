@@ -27,7 +27,7 @@ use super::delivery_stream_lifecycle::{
 
 /// The `message` of an error body. The firehose exceptions model the member as
 /// `message`; a refusal the framework renders uses the same key.
-fn error_message(body: &Value) -> String {
+pub(crate) fn error_message(body: &Value) -> String {
     body.get("message")
         .or_else(|| body.get("Message"))
         .and_then(Value::as_str)

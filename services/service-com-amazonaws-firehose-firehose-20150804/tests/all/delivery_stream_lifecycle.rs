@@ -84,7 +84,7 @@ impl Emulator {
 
     /// `(RecordId, Data)` of every record buffered for `stream`, in arrival order. No
     /// modelled operation reports the buffer, so the test reads the state the puts wrote.
-    fn buffered(&self, stream: &str) -> Vec<(String, Vec<u8>)> {
+    pub(crate) fn buffered(&self, stream: &str) -> Vec<(String, Vec<u8>)> {
         let state = self
             .engine
             .state::<ComAmazonawsFirehoseFirehose20150804State>();

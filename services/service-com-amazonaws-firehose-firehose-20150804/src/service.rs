@@ -247,6 +247,20 @@ pub fn put_not_found_message() -> String {
     )
 }
 
+/// A put refused because the stream takes data from CloudWatch Logs only: the account the
+/// put was scoped to and the stream it named.
+///
+/// This one DOES name the stream, unlike [`put_not_found_message`]: the refusal is a
+/// property of a stream the caller already named successfully, so the sentence answers
+/// "does this stream exist?" for nobody who did not know already.
+pub fn invalid_source_message(name: &str) -> String {
+    format!(
+        "Put to Firehose failed for AccountId: {}, FirehoseName: {name} \
+         because the request is not originating from CloudWatch.",
+        ::engine::emulator_account_id()
+    )
+}
+
 /// A delete the stream's current state blocks: the name, the account and the state that
 /// blocks it, stated for whatever that state is rather than asserting a precondition of
 /// its own.
