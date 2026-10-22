@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAppMonitor
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAppMonitor`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAppMonitor::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -191,18 +182,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAppMonitor` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAppMonitorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateAppMonitorErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::NO_STORE.to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // Modelled constraints (the name's pattern and length, the domain's pattern, the
+        // domain list's 1..5 length) are refused before this handler runs. What is left
+        // are the rules the model states in prose only.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAppMonitor"))
+        // `AppMonitorDomainList`: "The CreateAppMonitor requires either the domain or the
+        // domain list." A monitor's domain authority is held in exactly ONE of the two
+        // forms, so neither and both are equally refusable.
+        if let Some(message) = crate::state::domain_choice_refusal(
+            input.domain.as_deref(),
+            input.domain_list.as_deref(),
+            true,
+        ) {
+            return Err(
+                CreateAppMonitorErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+        if let Some(message) = input
+            .app_monitor_configuration
+            .as_ref()
+            .and_then(crate::state::app_monitor_configuration_refusal)
+        {
+            return Err(
+                CreateAppMonitorErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+
+        // The ARN carries the region the request was signed for; `ctx` is the only place
+        // that is readable from.
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::current_iso_timestamp();
+
+        let mut store = state.lock();
+        // A name identifies an app monitor for every other operation, so a second
+        // monitor cannot take one that is in use.
+        if store.app_monitors.contains_key(&input.name) {
+            return Err(CreateAppMonitorErrorModeled::ConflictException(
+                crate::state::app_monitor_already_exists(&input.name),
+            )
+            .into());
+        }
+        if store.app_monitors.len() >= crate::state::MAX_APP_MONITORS {
+            return Err(CreateAppMonitorErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The maximum number of app monitors ({}) has already been created.",
+                        crate::state::MAX_APP_MONITORS
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let name = input.name.clone();
+        let id = store.mint_app_monitor_id();
+        store.insert_app_monitor(crate::state::AppMonitorRecord {
+            arn: crate::state::app_monitor_arn(&region, &name),
+            id: id.clone(),
+            name: input.name,
+            domain: input.domain,
+            domain_list: input.domain_list,
+            // `Created` and `LastModified` start equal: nothing has changed the monitor
+            // since the call that created it.
+            created: now.clone(),
+            last_modified: now,
+            state: crate::state::ACTIVE_STATE.to_string(),
+            platform: input
+                .platform
+                .unwrap_or_else(|| crate::state::DEFAULT_PLATFORM.to_string()),
+            cw_log_enabled: input.cw_log_enabled.unwrap_or(false),
+            app_monitor_configuration: input
+                .app_monitor_configuration
+                .unwrap_or_else(crate::state::default_app_monitor_configuration),
+            custom_events: input
+                .custom_events
+                .unwrap_or_else(crate::state::default_custom_events),
+            deobfuscation_configuration: input.deobfuscation_configuration,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            // No telemetry has arrived for a monitor this call just created.
+            events: ::std::collections::VecDeque::new(),
+        });
+
+        // The id was minted and stored under the SAME lock this call still holds, so the
+        // value reported here is the one `GetAppMonitor` and `PutRumEvents` resolve.
+        Ok(CreateAppMonitorOutput { id: Some(id) })
     }
 }

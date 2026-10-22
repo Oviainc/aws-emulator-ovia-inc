@@ -5,9 +5,11 @@
 //! ControlCatalog is a read-only catalog: every one of its six operations reports
 //! what Amazon Web Services publishes, and none of them creates, updates or deletes
 //! anything. The catalog therefore lives in this service's state, seeded once (the
-//! engine builds the state through `Default` on first touch, atomically) with a
-//! deterministic set of domains, objectives, common controls, controls and control
-//! mappings. Every handler projects its response out of these records, so two
+//! engine builds the state through `Default` on first touch, atomically) with the
+//! ontology the catalog publishes — every domain, every objective under it and every
+//! common control under those objectives, in [`published_ontology`] — together with a
+//! deterministic set of controls and control mappings. Every handler projects its
+//! response out of these records, so two
 //! processes talking to one emulator — and two runs of the same emulator — see the
 //! same catalog.
 //!
@@ -27,6 +29,9 @@ const MIN_MAX_RESULTS: i32 = 1;
 /// The validation path of the page-size member, as every list operation's input
 /// spells it (`MaxResults`, lowerCamel in a message path).
 const MAX_RESULTS_MEMBER: &str = "maxResults";
+
+/// The domain/objective/common-control ontology the catalog publishes, as data.
+mod published_ontology;
 
 /// A catalog domain — the top of the catalog hierarchy.
 #[derive(Debug, Clone)]
@@ -502,7 +507,11 @@ const CIS_GCP_FOUNDATION_V2_0_0: &str = "CIS Google Cloud Platform Foundation Be
 
 /// Build the catalog this emulator serves.
 ///
-/// Small but complete: every objective names a domain that is in `domains`, every
+/// The ontology (domains, objectives, common controls) is the whole published table in
+/// [`published_ontology`], not a sample of it, because a client walks domain ->
+/// objective -> common control for any domain the catalog publishes.
+///
+/// Referentially closed: every objective names a domain that is in `domains`, every
 /// common control names an objective and a domain that are in `objectives` /
 /// `domains`, and every mapping names a control (and, for a common-control or
 /// related-control mapping, a common control or control) that is in `controls` /
@@ -515,228 +524,72 @@ fn seed_catalog() -> ComAmazonawsControlcatalogControlcatalogState {
     let mut controls = BTreeMap::new();
     let mut control_mappings = BTreeMap::new();
 
-    // --- domains -----------------------------------------------------------
-    // The top of the published Control Catalog ontology. The NAMES are the ones
-    // Amazon Web Services publishes for its control domains — "Asset management",
-    // "Business continuity and recovery", "Data protection", "Identity and access
-    // management", "Logging and monitoring", "Secure development lifecycle and change
-    // management" — so a client browsing this emulator walks the same domain names it
-    // walks against the service. The 25-character opaque identifier AWS assigned to
-    // each published record is registry data that no rule derives, so the ARN of each
-    // entry here is derived deterministically from its slug (see [`catalog_id`])
-    // rather than copied from any one recorded response.
-    let domain_seed: [(&str, &str, &str); 6] = [
-        (
-            "asset-management",
-            "Asset management",
-            "Controls that inventory Amazon Web Services resources and keep that inventory current.",
-        ),
-        (
-            "business-continuity-and-recovery",
-            "Business continuity and recovery",
-            "Controls that keep workloads available, and restore them after a disruption.",
-        ),
-        (
-            "data-protection",
-            "Data protection",
-            "Controls that protect the confidentiality and integrity of data at rest and in transit.",
-        ),
-        (
-            "identity-and-access-management",
-            "Identity and access management",
-            "Controls that govern who can reach Amazon Web Services resources, and what they may do with them.",
-        ),
-        (
-            "logging-and-monitoring",
-            "Logging and monitoring",
-            "Controls that record and observe activity across Amazon Web Services accounts.",
-        ),
-        (
-            "secure-development-lifecycle-and-change-management",
-            "Secure development lifecycle and change management",
-            "Controls that govern how changes to workloads are proposed, reviewed and released.",
-        ),
-    ];
-    for (index, (slug, name, description)) in domain_seed.iter().enumerate() {
-        let arn = catalog_arn("domain", &catalog_id(slug));
-        let create_time = CATALOG_EPOCH + (index as i64) * DAY;
-        domains.insert(
-            arn.clone(),
-            Domain {
-                arn,
-                name: (*name).to_string(),
-                description: (*description).to_string(),
-                create_time,
-                // `LastUpdateTime` is documented as "the time when the domain was most
-                // recently updated": a published catalog record that has not been
-                // revised since it was created was most recently updated when it was
-                // created, so the two timestamps are equal. Nothing in this service
-                // revises a record — there is no create, update or delete API — so only
-                // a future revision of the seeded catalog moves this later.
-                last_update_time: create_time,
-            },
-        );
-    }
-    let domain_arn = |slug: &str| catalog_arn("domain", &catalog_id(slug));
-
-    // --- objectives --------------------------------------------------------
-    // The second level of the published ontology: every objective belongs to exactly
-    // one domain above. As with the domains, the names are the published ones (AWS
-    // publishes "Asset inventory management" under "Asset management" and "Change
-    // management" under "Secure development lifecycle and change management") and the
-    // identifiers are derived, not recorded.
-    let objective_seed: [(&str, &str, &str, &str); 8] = [
-        (
-            "asset-inventory-management",
-            "Asset inventory management",
-            "Discover and record the resources an account holds.",
-            "asset-management",
-        ),
-        (
-            "backup-and-recovery",
-            "Backup and recovery",
-            "Copy data so that a workload can be restored after a disruption.",
-            "business-continuity-and-recovery",
-        ),
-        (
-            "change-management",
-            "Change management",
-            "Review and approve changes before they reach a workload.",
-            "secure-development-lifecycle-and-change-management",
-        ),
-        (
-            "encryption-of-data-at-rest",
-            "Encryption of data at rest",
-            "Encrypt stored data so that it cannot be read without the corresponding key.",
-            "data-protection",
-        ),
-        (
-            "encryption-of-data-in-transit",
-            "Encryption of data in transit",
-            "Protect data while it moves between clients, services and Regions.",
-            "data-protection",
-        ),
-        (
-            "manage-access",
-            "Manage access",
-            "Grant and review the access that identities hold over resources.",
-            "identity-and-access-management",
-        ),
-        (
-            "limit-exposure",
-            "Limit exposure",
-            "Keep resources from being reachable more widely than intended.",
-            "identity-and-access-management",
-        ),
-        (
-            "manage-logs",
-            "Manage logs",
-            "Capture, retain and protect records of activity.",
-            "logging-and-monitoring",
-        ),
-    ];
-    for (index, (slug, name, description, domain_slug)) in objective_seed.iter().enumerate() {
-        let arn = catalog_arn("objective", &catalog_id(slug));
-        let create_time = CATALOG_EPOCH + (index as i64) * DAY;
-        objectives.insert(
-            arn.clone(),
-            Objective {
-                arn,
-                name: (*name).to_string(),
-                description: (*description).to_string(),
-                domain_arn: domain_arn(domain_slug),
-                create_time,
-                // Equal to `CreateTime` until a revision moves it; see the domain seed.
-                last_update_time: create_time,
-            },
-        );
-    }
-    let objective_arn = |slug: &str| catalog_arn("objective", &catalog_id(slug));
-
-    // --- common controls ---------------------------------------------------
-    let common_control_seed: [(&str, &str, &str, &str, &str); 9] = [
-        (
-            "maintain-an-asset-inventory",
-            "Maintain an asset inventory",
-            "Keep a current record of the resources an account holds.",
-            "asset-inventory-management",
-            "asset-management",
-        ),
-        (
-            "back-up-data-on-a-defined-schedule",
-            "Back up data on a defined schedule",
-            "Copy data to a separate, restorable location on a schedule.",
-            "backup-and-recovery",
-            "business-continuity-and-recovery",
-        ),
-        (
-            "change-request-and-approval",
-            "Change request and approval",
-            "Require a reviewed and approved request before a change is released.",
-            "change-management",
-            "secure-development-lifecycle-and-change-management",
-        ),
-        (
-            "encrypt-data-at-rest-in-storage-services",
-            "Encrypt data at rest in storage services",
-            "Require server-side encryption for data held by storage services.",
-            "encryption-of-data-at-rest",
-            "data-protection",
-        ),
-        (
-            "rotate-encryption-keys",
-            "Rotate encryption keys",
-            "Replace encryption key material on a defined schedule.",
-            "encryption-of-data-at-rest",
-            "data-protection",
-        ),
-        (
-            "enforce-encryption-in-transit",
-            "Enforce encryption in transit",
-            "Require TLS for connections that carry data between endpoints.",
-            "encryption-of-data-in-transit",
-            "data-protection",
-        ),
-        (
-            "require-multi-factor-authentication",
-            "Require multi-factor authentication",
-            "Require a second authentication factor for human access.",
-            "manage-access",
-            "identity-and-access-management",
-        ),
-        (
-            "restrict-public-access",
-            "Restrict public access",
-            "Keep resources from being made reachable from the public internet.",
-            "limit-exposure",
-            "identity-and-access-management",
-        ),
-        (
-            "enable-centralized-logging",
-            "Enable centralized logging",
-            "Record activity to a central, tamper-resistant log store.",
-            "manage-logs",
-            "logging-and-monitoring",
-        ),
-    ];
-    for (index, (slug, name, description, objective_slug, domain_slug)) in
-        common_control_seed.iter().enumerate()
+    // --- the published ontology: domains, objectives, common controls ------
+    //
+    // ONE pass over the published ontology, which carries the parentage with it: an
+    // objective is inserted under the domain whose entry holds it, and a common
+    // control under the objective whose entry holds it. The catalog therefore cannot
+    // be seeded with an entry whose parent is missing, and every objective and every
+    // common control the ontology publishes is reachable through the filter that
+    // narrows to its parent.
+    //
+    // Timestamps are positional and fixed (see CATALOG_EPOCH), so the catalog a client
+    // reads is identical in every process and on every run.
+    let mut objective_position: i64 = 0;
+    let mut common_control_position: i64 = 0;
+    for (domain_position, (domain_slug, domain_name, domain_description, domain_objectives)) in
+        published_ontology::PUBLISHED_ONTOLOGY.iter().enumerate()
     {
-        let arn = catalog_arn("common-control", &catalog_id(slug));
-        let create_time = CATALOG_EPOCH + (index as i64) * DAY;
-        common_controls.insert(
-            arn.clone(),
-            CommonControl {
-                arn,
-                name: (*name).to_string(),
-                description: (*description).to_string(),
-                objective_arn: objective_arn(objective_slug),
-                domain_arn: domain_arn(domain_slug),
+        let domain_arn = catalog_arn("domain", &catalog_id(domain_slug));
+        let create_time = CATALOG_EPOCH + (domain_position as i64) * DAY;
+        domains.insert(
+            domain_arn.clone(),
+            Domain {
+                arn: domain_arn.clone(),
+                name: (*domain_name).to_string(),
+                description: (*domain_description).to_string(),
                 create_time,
                 // Equal to `CreateTime` until a revision moves it; see the domain seed.
                 last_update_time: create_time,
             },
         );
+        for (objective_slug, objective_name, objective_description, objective_common_controls) in
+            *domain_objectives
+        {
+            let objective_arn = catalog_arn("objective", &catalog_id(objective_slug));
+            let create_time = CATALOG_EPOCH + objective_position * DAY;
+            objective_position += 1;
+            objectives.insert(
+                objective_arn.clone(),
+                Objective {
+                    arn: objective_arn.clone(),
+                    name: (*objective_name).to_string(),
+                    description: (*objective_description).to_string(),
+                    domain_arn: domain_arn.clone(),
+                    create_time,
+                    // Equal to `CreateTime` until a revision moves it; see the domain.
+                    last_update_time: create_time,
+                },
+            );
+            for (slug, name, description) in *objective_common_controls {
+                let arn = catalog_arn("common-control", &catalog_id(slug));
+                let create_time = CATALOG_EPOCH + common_control_position * DAY;
+                common_control_position += 1;
+                common_controls.insert(
+                    arn.clone(),
+                    CommonControl {
+                        arn,
+                        name: (*name).to_string(),
+                        description: (*description).to_string(),
+                        objective_arn: objective_arn.clone(),
+                        domain_arn: domain_arn.clone(),
+                        create_time,
+                        // Equal to `CreateTime` until a revision moves it; see the domain.
+                        last_update_time: create_time,
+                    },
+                );
+            }
+        }
     }
     let common_control_arn = |slug: &str| catalog_arn("common-control", &catalog_id(slug));
 
@@ -1170,6 +1023,49 @@ mod tests {
                 MappingDetails::Framework { .. } => {}
             }
         }
+    }
+
+    /// Every entry the published ontology declares is seeded exactly once.
+    ///
+    /// A slug duplicated anywhere in the ontology would hash to the ARN that keys the
+    /// catalog, so one of the two entries would silently replace the other and the
+    /// served population would shrink without a diagnostic. Comparing the seeded
+    /// counts with the declared ones is what makes such an editing mistake fail loudly.
+    #[test]
+    fn every_published_entry_is_seeded_exactly_once() {
+        let state = ComAmazonawsControlcatalogControlcatalogState::default();
+        let declared_domains = published_ontology::PUBLISHED_ONTOLOGY.len();
+        let declared_objectives: usize = published_ontology::PUBLISHED_ONTOLOGY
+            .iter()
+            .map(|(_, _, _, objectives)| objectives.len())
+            .sum();
+        let declared_common_controls: usize = published_ontology::PUBLISHED_ONTOLOGY
+            .iter()
+            .flat_map(|(_, _, _, objectives)| objectives.iter())
+            .map(|(_, _, _, common_controls)| common_controls.len())
+            .sum();
+
+        assert_eq!(
+            state.domains.len(),
+            declared_domains,
+            "case domains: the ontology declares {declared_domains} domains, the catalog \
+             serves {}; a duplicated domain slug would do this",
+            state.domains.len()
+        );
+        assert_eq!(
+            state.objectives.len(),
+            declared_objectives,
+            "case objectives: the ontology declares {declared_objectives} objectives, the \
+             catalog serves {}; a duplicated objective slug would do this",
+            state.objectives.len()
+        );
+        assert_eq!(
+            state.common_controls.len(),
+            declared_common_controls,
+            "case common controls: the ontology declares {declared_common_controls} common \
+             controls, the catalog serves {}; a duplicated common-control slug would do this",
+            state.common_controls.len()
+        );
     }
 
     /// A token resumes only in the collection and filter that issued it.

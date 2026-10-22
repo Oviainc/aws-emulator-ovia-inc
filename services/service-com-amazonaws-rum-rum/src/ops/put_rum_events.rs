@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutRumEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutRumEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutRumEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +146,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutRumEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutRumEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutRumEvents"))
+        // The data plane takes no request metadata beyond the signature the emulator
+        // has already verified.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutRumEventsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::NO_STORE.to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // The route names the monitor by its MINTED id, so the batch is resolved through
+        // the stored id index — an id no stored monitor holds (never created, or already
+        // deleted) is not found.
+        let Some(record) = store.app_monitor_by_id_mut(&input.id) else {
+            return Err(PutRumEventsErrorModeled::ResourceNotFoundException(
+                crate::state::app_monitor_not_found(&input.id),
+            )
+            .into());
+        };
+
+        let batch_id = input.batch_id;
+        let alias = input.alias;
+        let app_monitor_details = input.app_monitor_details;
+        let user_id = input.user_details.user_id;
+        let session_id = input.user_details.session_id;
+        record.record_events(input.rum_events.iter().map(|event| {
+            crate::state::StoredRumEvent {
+                batch_id: batch_id.clone(),
+                alias: alias.clone(),
+                app_monitor_details: app_monitor_details.clone(),
+                user_id: user_id.clone(),
+                session_id: session_id.clone(),
+                event_json: event_json(event),
+            }
+        }));
+
+        // `PutRumEventsResponse` models no members: the 200 IS the acknowledgement.
+        Ok(PutRumEventsOutput {})
     }
+}
+
+/// One `RumEvent` as the JSON document it is stored (and later reported) as.
+///
+/// `metadata` and `details` are `@mediaType("application/json")` strings, so they are
+/// re-parsed into the document rather than nested as escaped text; a value that is not
+/// valid JSON is kept verbatim as a string, since the model constrains neither.
+fn event_json(event: &RumEvent) -> String {
+    let mut document = ::serde_json::Map::new();
+    document.insert("id".to_string(), ::serde_json::Value::String(event.id.clone()));
+    document.insert(
+        "timestamp".to_string(),
+        ::serde_json::Value::String(
+            event
+                .timestamp
+                .fmt(::aws_smithy_types::date_time::Format::DateTime)
+                .unwrap_or_default(),
+        ),
+    );
+    document.insert(
+        "type".to_string(),
+        ::serde_json::Value::String(event.r#type.clone()),
+    );
+    if let Some(metadata) = event.metadata.as_deref() {
+        document.insert("metadata".to_string(), json_member(metadata));
+    }
+    document.insert("details".to_string(), json_member(&event.details));
+    ::serde_json::Value::Object(document).to_string()
+}
+
+/// A `JsonValue` member as the document it carries, or as a plain string when it does
+/// not parse as JSON.
+fn json_member(text: &str) -> ::serde_json::Value {
+    ::serde_json::from_str(text).unwrap_or_else(|_| ::serde_json::Value::String(text.to_string()))
 }
