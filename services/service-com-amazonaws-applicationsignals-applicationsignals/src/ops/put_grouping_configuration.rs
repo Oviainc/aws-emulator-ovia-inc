@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutGroupingConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutGroupingConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutGroupingConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Persists this account's grouping configuration.
 //!
 //! ## Shape of an operation
 //!
@@ -143,23 +135,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::PUT_GROUPING_CONFIGURATION_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Store the supplied definitions as this account's grouping configuration and answer
+    /// the record that was written.
+    ///
+    /// "Creates or updates the grouping configuration for this account": there is one
+    /// configuration per account, so a second call REPLACES the definitions of the first
+    /// rather than merging with them. `UpdatedAt` is "the timestamp when this grouping
+    /// configuration was last updated", so it comes from the clock at the moment of the
+    /// write, never from the request.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutGroupingConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutGroupingConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutGroupingConfiguration"))
+        let _ = ctx;
+
+        // `GroupingAttributeDefinition.GroupingName` is "the friendly name for this
+        // grouping attribute ... used to identify the grouping in the console and APIs", so
+        // it IDENTIFIES a definition: two definitions in one configuration cannot share a
+        // name, or a later read could not say which one a name denotes. The model cannot
+        // express the uniqueness (the list carries no `@uniqueItems` and the key is one
+        // member of the element), so the boundary validator let it through and it is
+        // refused here.
+        if let Some(duplicate) = first_duplicate_grouping_name(&input.grouping_attribute_definitions)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "GroupingAttributeDefinitions must not define the grouping name {duplicate} more than once"
+            )));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutGroupingConfigurationErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: crate::state::STATE_UNAVAILABLE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+        let grouping_configuration = state
+            .lock()
+            .put_grouping_configuration(input.grouping_attribute_definitions, now);
+
+        Ok(PutGroupingConfigurationOutput {
+            grouping_configuration,
+        })
     }
+}
+
+/// The first `GroupingName` that occurs twice in `definitions`, or `None` when every name is
+/// distinct.
+fn first_duplicate_grouping_name(definitions: &[GroupingAttributeDefinition]) -> Option<&str> {
+    let mut seen = ::std::collections::HashSet::new();
+    definitions
+        .iter()
+        .find(|definition| !seen.insert(definition.grouping_name.as_str()))
+        .map(|definition| definition.grouping_name.as_str())
 }

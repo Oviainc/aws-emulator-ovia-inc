@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListGroupingAttributeDefinitions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListGroupingAttributeDefinitions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListGroupingAttributeDefinitions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports this account's persisted grouping configuration.
 //!
 //! ## Shape of an operation
 //!
@@ -150,23 +142,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::LIST_GROUPING_ATTRIBUTE_DEFINITIONS_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Report the stored grouping configuration's definitions, and when it was last written.
+    ///
+    /// Modelled `@readonly`: it only projects the stored record, and writes nothing. An
+    /// account with no configuration reports an EMPTY definition list and no `UpdatedAt` —
+    /// there is no timestamp for a configuration that was never written.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListGroupingAttributeDefinitions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListGroupingAttributeDefinitionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListGroupingAttributeDefinitions"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListGroupingAttributeDefinitionsErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: crate::state::STATE_UNAVAILABLE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // One account holds at most one grouping configuration, whose definitions always
+        // fit in a single page, so this operation never issues a `NextToken`. A caller that
+        // sends one therefore did not get it from here: refuse it rather than ignore it, so
+        // a forged cursor is never read as a page boundary.
+        if input.next_token.is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "NextToken is not a token this service issued",
+            ));
+        }
+
+        // This emulator holds exactly one account's grouping configuration, so a request
+        // that asks for another account's selects nothing. For the same reason
+        // `IncludeLinkedAccounts` is not consulted: there is no source account whose
+        // definitions it could add, so the flag selects nothing extra and the answer is the
+        // same either way.
+        let other_account = input
+            .aws_account_id
+            .as_deref()
+            .is_some_and(|account| account != ::engine::emulator_account_id());
+        if other_account {
+            return Ok(ListGroupingAttributeDefinitionsOutput {
+                grouping_attribute_definitions: Vec::new(),
+                updated_at: None,
+                next_token: None,
+            });
+        }
+
+        let store = state.lock();
+        let (grouping_attribute_definitions, updated_at) = match store.grouping_configuration.as_ref()
+        {
+            Some(configuration) => (
+                configuration.grouping_attribute_definitions.clone(),
+                Some(configuration.updated_at),
+            ),
+            None => (Vec::new(), None),
+        };
+
+        Ok(ListGroupingAttributeDefinitionsOutput {
+            grouping_attribute_definitions,
+            updated_at,
+            next_token: None,
+        })
     }
 }
