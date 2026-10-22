@@ -11,7 +11,13 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-ivschat-amazoninteractivevideoservicechat.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ivschat#ListTagsForResourceRequest")]
+// `skip_validation` names `resourceArn` for the reason given on `TagResourceInput`: the
+// published `@pattern`'s single-character resource-type class matches no real ivschat
+// resource type. `crate::state::check_resource_arn` is what checks the member instead.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.ivschat#ListTagsForResourceRequest",
+    skip_validation = ["resourceArn"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListTagsForResourceInput {
     pub resource_arn: String,

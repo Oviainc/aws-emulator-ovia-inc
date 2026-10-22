@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the tag set the stored resource an ARN names carries, straight out
+//! of [`crate::state`] — so it answers exactly what `TagResource`/`UntagResource` left
+//! there, and an untagged resource answers an empty map. A reporting operation
+//! (`@readonly`): the store is read, never written. An ARN naming no stored resource
+//! answers `ResourceNotFoundException` (404); an ARN outside the member's length bound or
+//! its (corrected) pattern answers `ValidationException` (400).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A 501 from this operation would mean "nobody has written it yet"; it no longer
+//! answers one.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +141,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let _ = ctx;
+        // `resourceArn` is checked here rather than at the boundary (see
+        // `skip_validation` on `ListTagsForResourceInput`).
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service. An engine this service cannot read its state
+            // from means the operation cannot be served at all, which is what 501 says.
+            crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource")
+        })?;
+
+        crate::state::check_resource_arn(&input.resource_arn)
+            .map_err(ListTagsForResourceErrorModeled::ValidationException)?;
+
+        // A reporting operation: the store is read, never written.
+        let store = state.lock();
+        // The room is this service's one persisted taggable resource: a logging
+        // configuration is not stored yet (its create is still a stub), so an ARN naming
+        // one names nothing and is a 404 here, exactly as an ARN for a deleted room is.
+        let Some(room) = store.room(&input.resource_arn) else {
+            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(&input.resource_arn),
+            )
+            .into());
+        };
+
+        Ok(ListTagsForResourceOutput {
+            tags: room
+                .tags
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        })
     }
 }

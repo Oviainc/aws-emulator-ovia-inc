@@ -9,7 +9,13 @@
 //! answers exactly what was created.
 
 use std::collections::BTreeMap;
+use std::sync::LazyLock;
 use std::time::{Duration, SystemTime};
+
+use ::aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
+use ::aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
+use ::aws_smithy_schema_server::constraints::{validate, LengthTrait, PatternTrait, Violation};
+use ::aws_smithy_schema_server::envelope;
 
 use crate::ops::types::{
     MessageReviewHandler, ResourceNotFoundException, ValidationException, ValidationExceptionField,
@@ -35,8 +41,46 @@ pub const DEFAULT_SESSION_DURATION_IN_MINUTES: i32 = 60;
 /// ("Maximum number of rooms to return. Default: 50.").
 pub const DEFAULT_MAX_ROOM_RESULTS: i32 = 50;
 
-/// The largest page `ListRooms` answers, from the modelled `MaxRoomResults` range 1..50.
-pub const MAX_ROOM_RESULTS: i32 = 50;
+/// The `@range` the model declares for a numeric request member: the inclusive bounds a
+/// value has to sit between, as `smithy_query(query="operation", …)` reports them.
+///
+/// Held as data rather than as two loose constants so one checker
+/// ([`check_range`]) can refuse a violation of ANY of this service's range-constrained
+/// members with the same message rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelledRange {
+    /// Inclusive minimum.
+    pub min: i32,
+    /// Inclusive maximum.
+    pub max: i32,
+}
+
+impl ModelledRange {
+    const fn new(min: i32, max: i32) -> Self {
+        Self { min, max }
+    }
+}
+
+/// `CreateChatToken.sessionDurationInMinutes` targets `SessionDurationInMinutes`,
+/// `@range(min: 1, max: 180)`.
+pub const SESSION_DURATION_IN_MINUTES_RANGE: ModelledRange = ModelledRange::new(1, 180);
+
+/// `ListRooms.maxResults` targets `MaxRoomResults`, `@range(min: 1, max: 50)`.
+pub const MAX_ROOM_RESULTS_RANGE: ModelledRange = ModelledRange::new(1, 50);
+
+/// `CreateRoom`/`UpdateRoom`'s `maximumMessageRatePerSecond` targets
+/// `RoomMaxMessageRatePerSecond`, `@range(min: 1, max: 100)`.
+pub const ROOM_MAX_MESSAGE_RATE_PER_SECOND_RANGE: ModelledRange = ModelledRange::new(1, 100);
+
+/// `CreateRoom`/`UpdateRoom`'s `maximumMessageLength` targets `RoomMaxMessageLength`,
+/// `@range(min: 1, max: 500)`.
+pub const ROOM_MAX_MESSAGE_LENGTH_RANGE: ModelledRange = ModelledRange::new(1, 500);
+
+/// The most tags one resource carries: the modelled `Tags` map is `@length(0..50)`, and
+/// every operation that REPORTS a resource's tags reports them through that same shape, so
+/// a resource holding more than this could not be rendered. It is also what bounds the
+/// store: `TagResource` can be called repeatedly with fresh keys.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
 /// The number of rooms one account may hold in one Region: Amazon IVS Chat publishes a
 /// rooms-per-account-per-Region service quota (50,000), and `ServiceQuotaExceededException`
@@ -225,15 +269,19 @@ impl ComAmazonawsIvschatAmazoninteractivevideoservicechatState {
     }
 }
 
-/// The modelled `ResourceNotFoundException` for a room identifier that names no stored
-/// room.
+/// The modelled `ResourceNotFoundException` for an identifier that names no stored
+/// resource.
+///
+/// The service builds the `Message` from the request by one rule, identical across its
+/// operations: `Resource: <the identifier the caller sent> not found`. The identifier is
+/// echoed exactly as received — the full ARN, not the id extracted out of it — because
+/// that is the value the caller has to fix.
 ///
 /// `resourceType` is the modelled `ResourceType` enum's only value; `resourceId` is the
-/// `RoomID` the identifier named. The message is built from the request, so it names the
-/// identifier the caller has to fix.
-pub fn room_not_found(identifier: &str) -> ResourceNotFoundException {
+/// id the identifier named, when it names one.
+pub fn resource_not_found(identifier: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: format!("Room not found for identifier {identifier}."),
+        message: format!("Resource: {identifier} not found"),
         resource_id: ComAmazonawsIvschatAmazoninteractivevideoservicechatState::room_id_of(
             identifier,
         )
@@ -263,6 +311,153 @@ pub fn field_validation_failed(field: &str, message: impl Into<String>) -> Valid
             name: field.to_string(),
             message,
         }]),
+    }
+}
+
+/// A numeric bound or submitted value as this service's validation layer renders it: the
+/// decimal form, so an integral value carries a `.0` (`180` reads as `180.0`).
+fn as_decimal(value: i32) -> String {
+    format!("{value}.0")
+}
+
+/// Refuse `value` when it sits outside `range`, the way this service's validation layer
+/// states a range violation, or pass it through.
+///
+/// The message is built entirely from the request: the operation, the member whose bound
+/// was violated, that modelled bound and the submitted value —
+/// `<Operation>.<member> is required to have a maximum value of <max>, found <value>` (and
+/// the symmetric `minimum` form below the lower bound), with both numbers in the decimal
+/// form [`as_decimal`] renders. A value ON either bound is accepted.
+pub fn check_range(
+    operation: &str,
+    member: &str,
+    value: i32,
+    range: ModelledRange,
+) -> Result<(), ValidationException> {
+    let bound = if value < range.min {
+        Some(("minimum", range.min))
+    } else if value > range.max {
+        Some(("maximum", range.max))
+    } else {
+        None
+    };
+    match bound {
+        None => Ok(()),
+        Some((kind, bound)) => Err(field_validation_failed(
+            member,
+            format!(
+                "{operation}.{member} is required to have a {kind} value of {}, found {}",
+                as_decimal(bound),
+                as_decimal(value)
+            ),
+        )),
+    }
+}
+
+// ===========================================================================
+// `resourceArn`: the tagging operations' own check for the member whose modelled
+// `@pattern` the published model mis-states
+// ===========================================================================
+//
+// `TagResource`/`UntagResource`/`ListTagsForResource` take `resourceArn`
+// (`smithy_query(query="operation", operation="TagResource")`): `@length(1..128)` plus
+// `@pattern(^arn:aws:ivschat:[a-z0-9-]+:[0-9]+:[a-z-]/[a-zA-Z0-9-]+$)`. That pattern's
+// resource-type segment is the SINGLE-character class `[a-z-]`, which no resource type
+// this service mints can match — `room/…` and `logging-configuration/…` both need more
+// than one character — so the published pattern refuses every ARN the service itself
+// produces, and the real service accepts those ARNs. The three inputs therefore carry
+// `skip_validation = ["resourceArn"]` in `src/ops/types/`, and this module re-declares the
+// member's constraints with the only reading of that resource-type class under which a
+// real ARN matches: one-or-more of the same characters. Everything else about the member
+// — its length bound, the rest of the pattern — is enforced exactly as modelled.
+//
+// NOTHING about constraint checking is reimplemented here: the constraints are
+// re-declared in the framework's own form (a [`TraitMap`] of
+// [`LengthTrait`]/[`PatternTrait`]) hung on a member schema of the same name, and the
+// check is [`validate`] — the same walk the request boundary runs — so a refusal made
+// here reads exactly like one made there.
+
+/// This service's Smithy namespace, for the member schema below.
+const NAMESPACE: &str = "com.amazonaws.ivschat";
+
+/// The modelled `ResourceArn` pattern with its resource-type segment read as one-or-more
+/// of the characters the model's own class names, which is what makes a real `room/<id>`
+/// or `logging-configuration/<id>` ARN match.
+const RESOURCE_ARN_PATTERN: &str = r"^arn:aws:ivschat:[a-z0-9-]+:[0-9]+:[a-z-]+/[a-zA-Z0-9-]+$";
+
+/// `ResourceArn`: the modelled `@length(1..128)` plus [`RESOURCE_ARN_PATTERN`].
+static RESOURCE_ARN_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(LengthTrait::new(Some(1), Some(128))));
+    traits.insert(Box::new(PatternTrait::new(RESOURCE_ARN_PATTERN)));
+    traits
+});
+
+/// The `resourceArn` member schema the walk reads: its name gives the violation path and
+/// its trait map carries the constraints.
+static M_RESOURCE_ARN: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.ivschat#TaggedResource$resourceArn",
+        NAMESPACE,
+        "resourceArn",
+    ),
+    ShapeType::String,
+    "resourceArn",
+    0,
+)
+.with_traits(&RESOURCE_ARN_TRAITS);
+
+/// The root of the shadow input the walk is driven over. Its member list is empty on
+/// purpose: the walk visits what [`TaggedResource`] WRITES, and a root struct schema
+/// carries no member name, so it contributes no path segment.
+static TAGGED_RESOURCE_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "com.amazonaws.ivschat#TaggedResource",
+        NAMESPACE,
+        "TaggedResource",
+    ),
+    ShapeType::Structure,
+    &[],
+);
+
+/// One request's `resourceArn`, written for the validating walk the way the codec writes a
+/// string member.
+struct TaggedResource<'a> {
+    resource_arn: &'a str,
+}
+
+impl SerializableStruct for TaggedResource<'_> {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&M_RESOURCE_ARN, self.resource_arn)
+    }
+}
+
+/// Refuse a `resourceArn` that violates the member's length bound or its corrected
+/// pattern, or pass it through.
+///
+/// The `Message` is the framework's own validation envelope, so a refusal made here reads
+/// like one made at the boundary; `reason` and `fieldList` are what the boundary cannot
+/// carry and the modelled shape requires.
+pub fn check_resource_arn(resource_arn: &str) -> Result<(), ValidationException> {
+    let violations: Vec<Violation> = validate(
+        &TaggedResource { resource_arn },
+        &TAGGED_RESOURCE_SCHEMA,
+    );
+    match envelope(&violations) {
+        None => Ok(()),
+        Some(message) => Err(ValidationException {
+            message,
+            reason: "FIELD_VALIDATION_FAILED".to_string(),
+            field_list: Some(
+                violations
+                    .iter()
+                    .map(|violation| ValidationExceptionField {
+                        name: violation.path.clone(),
+                        message: violation.message(),
+                    })
+                    .collect(),
+            ),
+        }),
     }
 }
 

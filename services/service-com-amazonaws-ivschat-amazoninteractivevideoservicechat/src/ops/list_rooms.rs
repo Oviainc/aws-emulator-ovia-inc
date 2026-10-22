@@ -186,8 +186,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        // Modeled constraints are already refused BEFORE this handler runs, so reaching
-        // here means every filter and `maxResults` satisfy their modelled bounds.
+        // Modeled constraints are already refused BEFORE this handler runs, except
+        // `maxResults`, whose range refusal this operation words itself (see
+        // `skip_validation` on `ListRoomsInput`).
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             // Unreachable in this emulator: the router builds one `InMemoryEngine` and
             // hands it to every service. An engine this service cannot read its state
@@ -211,11 +212,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
 
+        // A page size ON either modelled bound is honoured as asked, never clamped; one
+        // outside them is refused.
+        if let Some(requested) = input.max_results {
+            crate::state::check_range(
+                Self::NAME,
+                "maxResults",
+                requested,
+                crate::state::MAX_ROOM_RESULTS_RANGE,
+            )
+            .map_err(ListRoomsErrorModeled::ValidationException)?;
+        }
         let page_size = usize::try_from(
             input
                 .max_results
-                .unwrap_or(crate::state::DEFAULT_MAX_ROOM_RESULTS)
-                .clamp(1, crate::state::MAX_ROOM_RESULTS),
+                .unwrap_or(crate::state::DEFAULT_MAX_ROOM_RESULTS),
         )
         .unwrap_or(1);
 

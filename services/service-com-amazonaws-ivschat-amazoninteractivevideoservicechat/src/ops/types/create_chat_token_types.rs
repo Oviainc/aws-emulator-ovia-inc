@@ -11,7 +11,16 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-ivschat-amazoninteractivevideoservicechat.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ivschat#CreateChatTokenRequest")]
+// `skip_validation` names the member whose modelled constraint the HANDLER checks
+// instead of the request boundary: a value outside `SessionDurationInMinutes`'
+// `@range(1..180)` is refused with this service's own `ValidationException` message rule,
+// which names the OPERATION — a fact the boundary refusal cannot carry. It drops only
+// this member's constraint traits; every other member of this input is still refused at
+// the boundary exactly as modelled.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.ivschat#CreateChatTokenRequest",
+    skip_validation = ["sessionDurationInMinutes"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct CreateChatTokenInput {
     pub room_identifier: String,

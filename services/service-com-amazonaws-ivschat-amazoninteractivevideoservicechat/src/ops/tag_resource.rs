@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: attaches the request's tags to the stored resource the ARN names — a key
+//! the resource already carries is updated, the rest are added — and answers an empty 200.
+//! The tags are read back by `ListTagsForResource`, `GetRoom` and `ListRooms`, because
+//! they are the one tag set held in [`crate::state`]. An ARN naming no stored resource
+//! answers `ResourceNotFoundException` (404); an ARN outside the member's length bound or
+//! its (corrected) pattern answers `ValidationException` (400).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A 501 from this operation would mean "nobody has written it yet"; it no longer
+//! answers one.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +141,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        // `tags` was refused at the boundary if it broke its modelled bound; `resourceArn`
+        // is checked here instead (see `skip_validation` on `TagResourceInput`).
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service. An engine this service cannot read its state
+            // from means the operation cannot be served at all, which is what 501 says.
+            crate::scaffolded::Scaffolded::not_implemented("TagResource")
+        })?;
+
+        crate::state::check_resource_arn(&input.resource_arn)
+            .map_err(TagResourceErrorModeled::ValidationException)?;
+
+        let mut store = state.lock();
+        // The room is this service's one persisted taggable resource: a logging
+        // configuration is not stored yet (its create is still a stub), so an ARN naming
+        // one names nothing and is a 404 here, exactly as an ARN for a deleted room is.
+        let Some(room) = store.room_mut(&input.resource_arn) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(&input.resource_arn),
+            )
+            .into());
+        };
+
+        // "Adds or updates tags": a key the request carries replaces the stored value, and
+        // a key it does not carry is left alone.
+        let mut tags = room.tags.clone();
+        for (key, value) in input.tags {
+            tags.insert(key, value);
+        }
+        if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::ValidationException(
+                crate::state::field_validation_failed(
+                    "tags",
+                    format!(
+                        "a resource carries at most {} tags; this request would leave it with {}.",
+                        crate::state::MAX_TAGS_PER_RESOURCE,
+                        tags.len()
+                    ),
+                ),
+            )
+            .into());
+        }
+        room.tags = tags;
+
+        // The modelled output carries no members: an empty 200.
+        Ok(TagResourceOutput {})
     }
 }

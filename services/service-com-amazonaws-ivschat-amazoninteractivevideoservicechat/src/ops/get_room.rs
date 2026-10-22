@@ -191,7 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let Some(room) = store.room(&input.identifier) else {
             return Err(GetRoomErrorModeled::ResourceNotFoundException(
-                crate::state::room_not_found(&input.identifier),
+                crate::state::resource_not_found(&input.identifier),
             )
             .into());
         };

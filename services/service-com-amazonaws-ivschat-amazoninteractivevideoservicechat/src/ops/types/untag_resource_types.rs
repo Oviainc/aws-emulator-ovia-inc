@@ -11,7 +11,14 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-ivschat-amazoninteractivevideoservicechat.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ivschat#UntagResourceRequest")]
+// `skip_validation` names `resourceArn` for the reason given on `TagResourceInput`: the
+// published `@pattern`'s single-character resource-type class matches no real ivschat
+// resource type. `crate::state::check_resource_arn` is what checks the member instead.
+// `tagKeys` keeps its modelled bound at the boundary.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.ivschat#UntagResourceRequest",
+    skip_validation = ["resourceArn"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct UntagResourceInput {
     pub resource_arn: String,

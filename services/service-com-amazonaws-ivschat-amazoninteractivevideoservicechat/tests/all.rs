@@ -15,3 +15,5 @@
 mod room_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/validation_rules_and_tagging.rs"]
+mod validation_rules_and_tagging;

@@ -174,14 +174,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        // Modeled constraints are already refused BEFORE this handler runs, so reaching
-        // here means every member present satisfies its modelled bounds.
+        // Modeled constraints are already refused BEFORE this handler runs, except the two
+        // range-constrained members this operation words its own refusal for (see
+        // `skip_validation` on `UpdateRoomInput`).
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             // Unreachable in this emulator: the router builds one `InMemoryEngine` and
             // hands it to every service. An engine this service cannot read its state
             // from means the operation cannot be served at all, which is what 501 says.
             crate::scaffolded::Scaffolded::not_implemented("UpdateRoom")
         })?;
+
+        // A value ON either modelled bound is accepted and stored as given, never clamped;
+        // one outside them is refused.
+        if let Some(rate) = input.maximum_message_rate_per_second {
+            crate::state::check_range(
+                Self::NAME,
+                "maximumMessageRatePerSecond",
+                rate,
+                crate::state::ROOM_MAX_MESSAGE_RATE_PER_SECOND_RANGE,
+            )
+            .map_err(UpdateRoomErrorModeled::ValidationException)?;
+        }
+        if let Some(length) = input.maximum_message_length {
+            crate::state::check_range(
+                Self::NAME,
+                "maximumMessageLength",
+                length,
+                crate::state::ROOM_MAX_MESSAGE_LENGTH_RANGE,
+            )
+            .map_err(UpdateRoomErrorModeled::ValidationException)?;
+        }
 
         if crate::state::ComAmazonawsIvschatAmazoninteractivevideoservicechatState::room_id_of(
             &input.identifier,
@@ -204,7 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let Some(room) = store.room_mut(&input.identifier) else {
             return Err(UpdateRoomErrorModeled::ResourceNotFoundException(
-                crate::state::room_not_found(&input.identifier),
+                crate::state::resource_not_found(&input.identifier),
             )
             .into());
         };

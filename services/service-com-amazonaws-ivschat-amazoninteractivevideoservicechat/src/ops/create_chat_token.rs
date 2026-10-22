@@ -4,8 +4,9 @@
 //! IMPLEMENTED: verifies the room exists in [`crate::state`], then mints an opaque token
 //! recorded there against (room, user, capabilities, attributes) with its expiry
 //! timestamps. Two calls never return the same token. An unknown room answers
-//! `ResourceNotFoundException` (404); a capability the modelled enum does not carry
-//! answers `ValidationException` (400).
+//! `ResourceNotFoundException` (404); a capability the modelled enum does not carry, or a
+//! `sessionDurationInMinutes` outside the modelled range, answers `ValidationException`
+//! (400).
 //!
 //! A 501 from this operation would mean "nobody has written it yet"; it no longer
 //! answers one.
@@ -167,9 +168,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
         // Modeled constraints are already refused BEFORE this handler runs, so reaching
-        // here means `roomIdentifier`, `userId` and `sessionDurationInMinutes` satisfy
-        // their modelled bounds. The capability VALUES are checked below: the generated
-        // input carries them as plain strings.
+        // here means `roomIdentifier` and `userId` satisfy their modelled bounds. Two
+        // things are checked below: the capability VALUES (the generated input carries
+        // them as plain strings) and `sessionDurationInMinutes`' modelled range, whose
+        // refusal this operation words itself (see `skip_validation` on
+        // `CreateChatTokenInput`).
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             // Unreachable in this emulator: the router builds one `InMemoryEngine` and
             // hands it to every service. An engine this service cannot read its state
@@ -194,6 +197,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A duration ON either modelled bound is accepted and honoured below, never
+        // clamped; one outside them is refused.
+        if let Some(requested) = input.session_duration_in_minutes {
+            crate::state::check_range(
+                Self::NAME,
+                "sessionDurationInMinutes",
+                requested,
+                crate::state::SESSION_DURATION_IN_MINUTES_RANGE,
+            )
+            .map_err(CreateChatTokenErrorModeled::ValidationException)?;
+        }
+
         let session_minutes = input
             .session_duration_in_minutes
             .unwrap_or(crate::state::DEFAULT_SESSION_DURATION_IN_MINUTES);
@@ -208,7 +223,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let Some(room_id) = store.room(&input.room_identifier).map(|room| room.id.clone()) else {
             return Err(CreateChatTokenErrorModeled::ResourceNotFoundException(
-                crate::state::room_not_found(&input.room_identifier),
+                crate::state::resource_not_found(&input.room_identifier),
             )
             .into());
         };

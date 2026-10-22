@@ -11,7 +11,16 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-ivschat-amazoninteractivevideoservicechat.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ivschat#UpdateRoomRequest")]
+// `skip_validation` names the two members whose modelled constraints the HANDLER checks
+// instead of the request boundary: a value outside `RoomMaxMessageRatePerSecond`'
+// `@range(1..100)` or `RoomMaxMessageLength`' `@range(1..500)` is refused with this
+// service's own `ValidationException` message rule, which names the OPERATION. Every other
+// member of this input — `identifier` included — is still refused at the boundary exactly
+// as modelled.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.ivschat#UpdateRoomRequest",
+    skip_validation = ["maximumMessageRatePerSecond", "maximumMessageLength"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct UpdateRoomInput {
     pub identifier: String,

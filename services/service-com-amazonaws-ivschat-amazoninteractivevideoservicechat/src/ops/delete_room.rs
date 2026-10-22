@@ -189,7 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         if store.remove_room(&input.identifier).is_none() {
             return Err(DeleteRoomErrorModeled::ResourceNotFoundException(
-                crate::state::room_not_found(&input.identifier),
+                crate::state::resource_not_found(&input.identifier),
             )
             .into());
         }
