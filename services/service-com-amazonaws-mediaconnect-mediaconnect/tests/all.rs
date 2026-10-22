@@ -23,6 +23,8 @@ mod flow_lifecycle;
 mod flow_media_streams;
 #[path = "all/flow_outputs.rs"]
 mod flow_outputs;
+#[path = "all/flow_projection.rs"]
+mod flow_projection;
 #[path = "all/gateway_lifecycle.rs"]
 mod gateway_lifecycle;
 #[path = "all/ops_name_bindings.rs"]

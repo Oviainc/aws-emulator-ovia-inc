@@ -15,9 +15,10 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AddMediaStreamRequest, AddOutputRequest, EncodingConfig, Encryption, Entitlement,
-    FailoverConfig, Flow, Fmtp, Gateway, GatewayNetwork, GrantEntitlementRequest, ListedFlow,
-    ListedGateway, Maintenance, MediaStream, MediaStreamAttributes, MonitoringConfig, NdiConfig,
-    Output, Source, Transport, VpcInterface, VpcInterfaceAttachment,
+    FailoverConfig, Flow, FlowTransitEncryption, Fmtp, Gateway, GatewayNetwork,
+    GrantEntitlementRequest, ListedFlow, ListedGateway, Maintenance, MediaStream,
+    MediaStreamAttributes, MonitoringConfig, NdiConfig, Output, Source, Transport, VpcInterface,
+    VpcInterfaceAttachment,
 };
 
 /// The `Status` enum the model declares for a flow
@@ -55,6 +56,27 @@ pub const SOURCE_TYPE_ENTITLED: &str = "ENTITLED";
 /// (`AddOutputRequest$OutputStatus`), and the same sentence on
 /// `GrantEntitlementRequest$EntitlementStatus`.
 pub const STATUS_ENABLED: &str = "ENABLED";
+
+/// The `State` enum (`smithy_query(query="shape",shape="State")`: ENABLED | DISABLED) —
+/// the two values every on/off setting of this service targets, from a flow's failover
+/// state to a source's or an output's router integration state. Named here once so the
+/// operations that read a state and the projections that report one cannot drift apart.
+pub const STATE_ENABLED: &str = "ENABLED";
+/// See [`STATE_ENABLED`].
+pub const STATE_DISABLED: &str = "DISABLED";
+
+/// The `RouterIntegrationState` a source or an output reports, given the state the
+/// request that configured it carried (`None` when it carried none).
+///
+/// `Source$RouterIntegrationState` ("indicates if router integration is enabled or
+/// disabled on the flow source") and `Output$RouterIntegrationState` both target the
+/// `State` enum and are reported on every source and every output, so a record whose
+/// request never mentioned router integration still reports a state: the disabled one,
+/// because router integration is off until a request asks for it. Every projection of a
+/// source or an output resolves it HERE, so one stored record always reports one state.
+pub fn reported_router_integration_state(configured: Option<&str>) -> Option<String> {
+    Some(configured.unwrap_or(STATE_DISABLED).to_string())
+}
 
 /// How long a flow stays in a transient status (`STARTING`, `STOPPING`) before the
 /// clock settles it into the steady one.
@@ -290,6 +312,68 @@ pub const VIDEO_CLOCK_RATE_HZ: i32 = 90_000;
 /// assigns this value to the media stream."
 pub const DYNAMIC_RTP_PAYLOAD_TYPE_BASE: i32 = 96;
 
+/// The `Protocol` enum values the smoothing max bitrate applies to:
+/// `Transport$MaxBitrate` is "the smoothing max bitrate (in bps) for RIST, RTP, and
+/// RTP-FEC streams", which are the `rist`, `rtp` and `rtp-fec` values of `Protocol`
+/// (`smithy_query(query="shape",shape="Protocol")`). A source on any other protocol
+/// carries no smoothing bitrate unless its request named one.
+pub const SMOOTHING_BITRATE_PROTOCOLS: [&str; 3] = ["rist", "rtp", "rtp-fec"];
+
+/// The smoothing max bitrate (in bits per second) MediaConnect assigns a source on one
+/// of [`SMOOTHING_BITRATE_PROTOCOLS`] whose request named none.
+///
+/// `SetSourceRequest$MaxBitrate` is optional and the service reports a populated
+/// `Transport$MaxBitrate` on such a source either way, so the value is service-assigned
+/// rather than echoed: the recorded CreateFlow and DescribeFlow bodies this emulator is
+/// replayed against report 160 Mbps for an `rtp` source, and they report it for a source
+/// whose request named NO bitrate — a request that names one already round-trips
+/// unchanged (see `tests/all/flow_projection.rs`), so an echo would have matched the
+/// recording before this assignment existed, and it did not. The model publishes no
+/// default on the member, so the number is named here once and nowhere else.
+pub const ASSIGNED_SOURCE_MAX_BITRATE_BPS: i32 = 160_000_000;
+
+/// The `Transport$MaxBitrate` a source on `protocol` reports, given the `requested`
+/// bitrate its request carried (`None` when it carried none).
+///
+/// A request that names a bitrate keeps it, whatever the protocol; one that names none
+/// gets the service's assignment where the member applies, and nothing where it does
+/// not. Every operation that materialises a source resolves it HERE, so one request
+/// shape always becomes the same stored transport.
+pub fn assigned_source_max_bitrate(protocol: &str, requested: Option<i32>) -> Option<i32> {
+    requested.or_else(|| {
+        SMOOTHING_BITRATE_PROTOCOLS
+            .contains(&protocol)
+            .then_some(ASSIGNED_SOURCE_MAX_BITRATE_BPS)
+    })
+}
+
+/// The recovery window (in milliseconds) a flow's source failover config reports when
+/// the request that set it named none.
+///
+/// `FailoverConfig$RecoveryWindow` / `UpdateFailoverConfig$RecoveryWindow` are the
+/// "search window time to look for dash-7 packets" and are optional on the way in, yet a
+/// flow that carries a failover config reports a window either way: 200 ms, the
+/// documented default search window for dash-7 merge. The model publishes no default on
+/// the member, so the number is named here once.
+pub const ASSIGNED_RECOVERY_WINDOW_MS: i32 = 200;
+
+/// `config` with the members MediaConnect assigns itself resolved.
+///
+/// Every operation that writes a flow's `SourceFailoverConfig` (CreateFlow's
+/// `SourceFailoverConfig`, UpdateFlow's merge of `UpdateFailoverConfig`) stores the
+/// config through this function, so a flow's failover settings never depend on which
+/// call wrote them.
+pub fn resolved_failover_config(config: FailoverConfig) -> FailoverConfig {
+    FailoverConfig {
+        recovery_window: Some(
+            config
+                .recovery_window
+                .unwrap_or(ASSIGNED_RECOVERY_WINDOW_MS),
+        ),
+        ..config
+    }
+}
+
 /// A status change the clock owes: at `due_at` the flow's status becomes `status`.
 #[derive(Debug, Clone)]
 pub struct PendingStatus {
@@ -315,12 +399,26 @@ pub struct StoredSource {
     pub sender_control_port: Option<i32>,
     pub decryption: Option<Encryption>,
     pub transport: Option<Transport>,
+    /// The router integration state the request that set this source asked for, or
+    /// `None` when it asked for none — see [`reported_router_integration_state`], which
+    /// is what turns this into the state the source REPORTS.
+    pub router_integration_state: Option<String>,
+    /// `Source$RouterIntegrationTransitDecryption`: "the decryption configuration for the
+    /// flow source when router integration is enabled", as the request that set the
+    /// source configured it.
+    pub router_integration_transit_decryption: Option<FlowTransitEncryption>,
 }
 
 impl StoredSource {
     /// The modelled `Source` for this record.
     pub fn to_source(&self) -> Source {
         Source {
+            router_integration_state: reported_router_integration_state(
+                self.router_integration_state.as_deref(),
+            ),
+            router_integration_transit_decryption: self
+                .router_integration_transit_decryption
+                .clone(),
             source_arn: self.source_arn.clone(),
             name: self.name.clone(),
             description: self.description.clone(),
@@ -350,6 +448,14 @@ pub struct StoredOutput {
     pub output_status: Option<String>,
     pub vpc_interface_attachment: Option<VpcInterfaceAttachment>,
     pub transport: Option<Transport>,
+    /// The router integration state the request that added this output asked for, or
+    /// `None` when it asked for none — see [`reported_router_integration_state`], which
+    /// is what turns this into the state the output REPORTS.
+    pub router_integration_state: Option<String>,
+    /// `Output$RouterIntegrationTransitEncryption`: "the encryption configuration for the
+    /// output when router integration is enabled", as the request that added the output
+    /// configured it.
+    pub router_integration_transit_encryption: Option<FlowTransitEncryption>,
 }
 
 impl StoredOutput {
@@ -384,6 +490,10 @@ impl StoredOutput {
                     .unwrap_or_else(|| STATUS_ENABLED.to_string()),
             ),
             vpc_interface_attachment: request.vpc_interface_attachment.clone(),
+            router_integration_state: request.router_integration_state.clone(),
+            router_integration_transit_encryption: request
+                .router_integration_transit_encryption
+                .clone(),
             // `Transport.Protocol` is required, so an output that names no protocol
             // carries no transport rather than an empty one.
             transport: request.protocol.clone().map(|protocol| Transport {
@@ -407,6 +517,12 @@ impl StoredOutput {
     /// The modelled `Output` for this record.
     pub fn to_output(&self) -> Output {
         Output {
+            router_integration_state: reported_router_integration_state(
+                self.router_integration_state.as_deref(),
+            ),
+            router_integration_transit_encryption: self
+                .router_integration_transit_encryption
+                .clone(),
             output_arn: self.output_arn.clone(),
             name: self.name.clone(),
             description: self.description.clone(),
@@ -670,12 +786,15 @@ impl StoredFlow {
                 .unwrap_or_default(),
             sources: (!self.sources.is_empty())
                 .then(|| self.sources.iter().map(StoredSource::to_source).collect()),
-            media_streams: (!self.media_streams.is_empty()).then(|| {
+            // `Flow.MediaStreams` is reported whether or not the flow has any: a flow
+            // with none carries the member as an EMPTY list, so a client that iterates it
+            // can tell "no media streams" from "not reported" without a default.
+            media_streams: Some(
                 self.media_streams
                     .iter()
                     .map(StoredMediaStream::to_media_stream)
-                    .collect()
-            }),
+                    .collect(),
+            ),
             vpc_interfaces: (!self.vpc_interfaces.is_empty()).then(|| self.vpc_interfaces.clone()),
         }
     }

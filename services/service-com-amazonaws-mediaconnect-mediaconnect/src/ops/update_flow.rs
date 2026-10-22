@@ -123,13 +123,14 @@ const NDI_CAPABLE_FLOW_SIZES: [&str; 2] = ["LARGE", "LARGE_4X"];
 /// `NdiState` / `State` enum value (`smithy_query(query="shape",shape="NdiState")`:
 /// ENABLED | DISABLED). `NdiConfig$NdiState` is "a setting that controls whether NDI®
 /// sources or outputs can be used in the flow… This value must be set as ENABLED for your
-/// flow to support NDI sources or outputs".
-const STATE_ENABLED: &str = "ENABLED";
+/// flow to support NDI sources or outputs". Named in [`crate::state`], where every
+/// operation of this service reads the two values of the `State` enum from.
+const STATE_ENABLED: &str = crate::state::STATE_ENABLED;
 
 /// See [`STATE_ENABLED`]. `UpdateFailoverConfig$State` is "the state of source failover on
 /// the flow. If the state is inactive, the flow can have only one source. If the state is
 /// active, the flow can have one or two sources."
-const STATE_DISABLED: &str = "DISABLED";
+const STATE_DISABLED: &str = crate::state::STATE_DISABLED;
 
 /// The maintenance start hour applied to a flow whose maintenance window names a day but
 /// no hour: "UTC time when the maintenance will happen. Use 24-hour HH:MM format. Minutes
@@ -231,7 +232,10 @@ fn merged_maintenance(stored: Option<&Maintenance>, update: &UpdateMaintenance) 
 /// The failover setting the flow holds after `update` is applied to `stored`.
 ///
 /// `UpdateFailoverConfig` mirrors `FailoverConfig` member for member and every member is
-/// optional, so this is the same member-wise merge as [`merged_maintenance`].
+/// optional, so this is the same member-wise merge as [`merged_maintenance`]. The merged
+/// result is resolved through [`crate::state::resolved_failover_config`], so the window
+/// MediaConnect assigns a failover config that names none is the same here as on the
+/// create path.
 fn merged_failover_config(
     stored: Option<&FailoverConfig>,
     update: &UpdateFailoverConfig,
@@ -249,7 +253,7 @@ fn merged_failover_config(
     if let Some(state) = update.state.clone() {
         merged.state = Some(state);
     }
-    merged
+    crate::state::resolved_failover_config(merged)
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
