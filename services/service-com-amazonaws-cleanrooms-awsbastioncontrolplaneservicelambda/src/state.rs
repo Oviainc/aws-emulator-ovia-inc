@@ -164,6 +164,11 @@ pub const MIN_SELECTED_ANALYSIS_METHODS: usize = 2;
 /// `ConflictExceptionReason`: ALREADY_EXISTS | SUBRESOURCES_EXIST | INVALID_STATE).
 pub const CONFLICT_REASON_ALREADY_EXISTS: &str = "ALREADY_EXISTS";
 
+/// `ConflictExceptionReason` for a resource whose current status does not admit the
+/// requested change — a membership whose collaboration is gone, say (model shape
+/// `ConflictExceptionReason`: ALREADY_EXISTS | SUBRESOURCES_EXIST | INVALID_STATE).
+pub const CONFLICT_REASON_INVALID_STATE: &str = "INVALID_STATE";
+
 /// The only `AccessDeniedExceptionReason` the model declares (model shape
 /// `AccessDeniedExceptionReason`: INSUFFICIENT_PERMISSIONS).
 pub const ACCESS_DENIED_REASON_INSUFFICIENT_PERMISSIONS: &str = "INSUFFICIENT_PERMISSIONS";

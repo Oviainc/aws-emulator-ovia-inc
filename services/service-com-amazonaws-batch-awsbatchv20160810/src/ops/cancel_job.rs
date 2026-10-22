@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Cancels a job: a persisted job that has not progressed past `RUNNABLE` moves to the
+//! modelled `FAILED` status with the caller's `reason` as its `statusReason` and
+//! `isCancelled` set, so the next `DescribeJobs` observes the cancellation. The model's
+//! own doc fixes the three cases this operation does NOT end: a job in `STARTING` or
+//! `RUNNING` "aren't cancelled" (it is `TerminateJob` that ends those), a `PENDING` job
+//! "is cancelled after all dependency jobs are completed" — so the cancel is recorded and
+//! the clock materialises it when the jobs it waits on finish — and a job already in a
+//! terminal status is left exactly as it is. The call itself succeeds in every one of
+//! them, "even if no job is cancelled", including for a `jobId` the service holds no job
+//! for.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +150,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelJob"))
+        use crate::state as batch;
+
+        let _ = ctx;
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(CancelJobErrorModeled::ServerException(batch::unreachable_state()).into());
+        };
+        let now = batch::now_millis();
+        let mut state = state.lock();
+        // Materialise what the clock owed BEFORE cancelling, so the job is judged on the
+        // status it has at `now` rather than on the one it had when it was last looked
+        // at: a job that already reached a terminal status is not dragged back out of it,
+        // and one that already left `RUNNABLE` is not cancelled after the fact.
+        state.materialize_due(now);
+
+        // `state::cancel_job` keeps the documented cases apart: `SUBMITTED`/`RUNNABLE`
+        // are cancelled now, `PENDING` records the cancel for the clock to materialise
+        // when the dependencies complete, `STARTING`/`RUNNING` and a job that is already
+        // terminal are left alone, and an unknown job id cancels nothing. The operation
+        // succeeds for all of them — "the API operation still succeeds, even if no job is
+        // cancelled" — so the outcome is not an error channel and no modelled error is
+        // raised here.
+        let _outcome: batch::CancelOutcome = state.cancel_job(&input.job_id, &input.reason, now);
+
+        Ok(CancelJobOutput {})
     }
 }

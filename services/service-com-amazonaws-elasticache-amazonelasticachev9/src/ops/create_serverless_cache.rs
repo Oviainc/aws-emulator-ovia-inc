@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateServerlessCache
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateServerlessCache`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateServerlessCache::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation reads and writes this service's state and no
+//! longer answers 501, so it carries no `SCAFFOLDED, NOT IMPLEMENTED:` marker line
+//! (that line is the machine-readable census of the operations that are still stubs,
+//! `grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`). This is still the ONLY
+//! file to touch for `CreateServerlessCache`.
 //!
 //! ## Shape of an operation
 //!
@@ -206,18 +202,292 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateServerlessCache` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateServerlessCacheErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // Every member of this request is either persisted and reported, or the
+        // request is refused with a modelled error: a 200 never claims a
+        // configuration the store does not hold.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateServerlessCache"))
+        // `ServerlessCacheName` "is stored as a lowercase string", so the
+        // identity a later Describe / Modify / Delete resolves is the lowercased
+        // one.
+        let name = input.serverless_cache_name.to_ascii_lowercase();
+        // The member is `required` but carries no modelled `@length`, so a name
+        // that cannot identify a resource is refused here. AWS documents no
+        // further pattern for it, so nothing more is enforced.
+        if name.trim().is_empty() {
+            return Err(invalid_value(
+                "Invalid value for ServerlessCacheName: a name must not be empty.",
+            ));
+        }
+
+        let engine = match crate::state::normalize_engine(&input.engine) {
+            Ok(engine) => engine,
+            Err(message) => return Err(invalid_value(message)),
+        };
+
+        // `MajorEngineVersion` is "the version of the cache engine that will be
+        // used to create the serverless cache"; omitted, the cache is created on
+        // the engine's current major line.
+        let major_engine_version = match input.major_engine_version {
+            Some(requested) => {
+                if !crate::state::is_version_label(&requested) {
+                    return Err(invalid_value(format!(
+                        "Invalid value {requested} for MajorEngineVersion: must be a version such \
+                         as {}.",
+                        crate::state::default_major_engine_version(&engine)
+                    )));
+                }
+                requested
+            }
+            None => crate::state::default_major_engine_version(&engine),
+        };
+
+        // "The maximum length is 255 characters": `Description` carries no
+        // modelled `@length`, so the documented bound is enforced here rather
+        // than at the boundary, and a longer one is refused rather than stored
+        // truncated.
+        if let Some(description) = input.description.as_deref() {
+            if description.chars().count() > crate::state::MAX_SERVERLESS_DESCRIPTION_LENGTH {
+                return Err(invalid_value(format!(
+                    "Invalid value for Description: the maximum length is {} characters, got {}.",
+                    crate::state::MAX_SERVERLESS_DESCRIPTION_LENGTH,
+                    description.chars().count()
+                )));
+            }
+        }
+        // "The default is NULL, i.e. if no description is provided then an empty
+        // string will be returned", which the API reports as a single space; see
+        // `crate::state::DEFAULT_SERVERLESS_DESCRIPTION`.
+        let description = match input.description {
+            Some(description) if !description.trim().is_empty() => description,
+            _ => crate::state::DEFAULT_SERVERLESS_DESCRIPTION.to_string(),
+        };
+
+        // "The number of days for which ElastiCache retains automatic snapshots
+        // before deleting them … The maximum value allowed is 35 days." A limit
+        // outside that range is refused rather than clamped.
+        if let Some(limit) = input.snapshot_retention_limit {
+            if !(0..=crate::state::MAX_SNAPSHOT_RETENTION_LIMIT).contains(&limit) {
+                return Err(invalid_value(format!(
+                    "Invalid value {limit} for SnapshotRetentionLimit: must be at least 0 and no \
+                     more than {} days.",
+                    crate::state::MAX_SNAPSHOT_RETENTION_LIMIT
+                )));
+            }
+        }
+
+        // `DailySnapshotTime` is a wall-clock `HH:MM` in UTC; a value that is
+        // not one names no time to snapshot at.
+        if let Some(time) = input.daily_snapshot_time.as_deref() {
+            if !crate::state::is_daily_snapshot_time(time) {
+                return Err(invalid_value(format!(
+                    "Invalid value {time} for DailySnapshotTime: must be a daily time in the \
+                     format HH:MM (UTC)."
+                )));
+            }
+        }
+
+        if let Some(limits) = input.cache_usage_limits.as_ref() {
+            if let Err(message) = crate::state::validate_cache_usage_limits(limits) {
+                return Err(invalid_value(message));
+            }
+        }
+
+        // "Must be either vpc | public. … Setting this to public requires Valkey
+        // 9 or above."
+        let connection_type = input
+            .connection_type
+            .unwrap_or_else(|| crate::state::CONNECTION_TYPE_VPC.to_string());
+        if connection_type == crate::state::CONNECTION_TYPE_PUBLIC {
+            let major = crate::state::major_version_number(&major_engine_version).unwrap_or(0);
+            if engine != crate::state::PUBLIC_CONNECTION_ENGINE
+                || major < crate::state::PUBLIC_CONNECTION_MIN_MAJOR
+            {
+                return Err(
+                    CreateServerlessCacheErrorModeled::InvalidParameterCombinationException(
+                        InvalidParameterCombinationException {
+                            message: Some(format!(
+                                "ConnectionType {} requires {} {} or above, not {engine} \
+                                 {major_engine_version}.",
+                                crate::state::CONNECTION_TYPE_PUBLIC,
+                                crate::state::PUBLIC_CONNECTION_ENGINE,
+                                crate::state::PUBLIC_CONNECTION_MIN_MAJOR,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // "If not specified, defaults to ipv4, unless all provided subnets are
+        // IPv6-only": the emulator models no EC2 subnet to read an address
+        // family from, so the documented default applies.
+        let network_type = input
+            .network_type
+            .unwrap_or_else(|| crate::state::DEFAULT_NETWORK_TYPE.to_string());
+
+        // The subnets "where the VPC endpoint for the serverless cache will be
+        // deployed" have to be subnet ids; `SubnetIdentifier` carries no
+        // modelled pattern, so the form is checked here.
+        let requested_subnets = input.subnet_ids.unwrap_or_default();
+        for subnet in &requested_subnets {
+            if !crate::state::is_subnet_id(subnet) {
+                return Err(invalid_value(format!(
+                    "Invalid value {subnet} for SubnetIds: must be an EC2 subnet identifier."
+                )));
+            }
+        }
+
+        // A user group can only be associated if it exists, and none can: every
+        // user-group operation in this service is still a scaffolded 501, so
+        // there is nothing to associate. It is "available for Valkey and Redis
+        // OSS only", so a Memcached request naming one is the incompatible
+        // combination rather than a missing group.
+        if let Some(group) = input.user_group_id.as_deref() {
+            if engine == "memcached" {
+                return Err(
+                    CreateServerlessCacheErrorModeled::InvalidParameterCombinationException(
+                        InvalidParameterCombinationException {
+                            message: Some(
+                                "UserGroupId is only valid for a serverless cache running valkey \
+                                 or redis, not for memcached."
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            return Err(CreateServerlessCacheErrorModeled::UserGroupNotFoundFault(
+                UserGroupNotFoundFault {
+                    message: Some(format!("User group {group} not found.")),
+                },
+            )
+            .into());
+        }
+
+        // A cache can only be restored from a snapshot that exists, and none
+        // can: `CreateServerlessCacheSnapshot` / `CopyServerlessCacheSnapshot`
+        // are scaffolded 501s, and an S3 snapshot ARN would have to be read out
+        // of Amazon S3, which this emulator does not reach.
+        if let Some(arn) = input
+            .snapshot_arns_to_restore
+            .as_deref()
+            .unwrap_or_default()
+            .first()
+        {
+            return Err(invalid_value(format!(
+                "Invalid value {arn} for SnapshotArnsToRestore: no such snapshot exists."
+            )));
+        }
+
+        let tags = match crate::state::tag_pairs(input.tags) {
+            Ok(tags) => tags,
+            Err(crate::state::TagRefusal::TooMany(count)) => {
+                return Err(
+                    CreateServerlessCacheErrorModeled::TagQuotaPerResourceExceeded(
+                        TagQuotaPerResourceExceeded {
+                            message: Some(format!(
+                                "{count} tags were supplied; the maximum number of tags permitted \
+                                 on a resource is {}.",
+                                crate::state::MAX_TAGS_PER_RESOURCE
+                            )),
+                        },
+                    )
+                    .into(),
+                )
+            }
+            Err(crate::state::TagRefusal::MissingKey) => {
+                return Err(invalid_value(
+                    "Invalid value for Tags: a tag's Key may not be null.",
+                ))
+            }
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        if store.serverless_caches.contains_key(&name) {
+            return Err(
+                CreateServerlessCacheErrorModeled::ServerlessCacheAlreadyExistsFault(
+                    ServerlessCacheAlreadyExistsFault {
+                        message: Some(format!("Serverless cache {name} already exists.")),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The store is bounded: past its quota a create is refused rather than
+        // adding another record.
+        if store.serverless_caches.len() >= crate::state::SERVERLESS_CACHE_QUOTA {
+            return Err(
+                CreateServerlessCacheErrorModeled::ServerlessCacheQuotaForCustomerExceededFault(
+                    ServerlessCacheQuotaForCustomerExceededFault {
+                        message: Some(format!(
+                            "This account already holds the maximum of {} serverless caches.",
+                            crate::state::SERVERLESS_CACHE_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "If no subnet IDs are given … ElastiCache will select [2 or 3] default
+        // subnets across AZs": the selected ids are minted once and stored, so
+        // every later read reports the same subnets.
+        let subnet_ids = if requested_subnets.is_empty() {
+            (0..crate::state::default_subnet_count(&region))
+                .map(|_| store.mint_subnet_id())
+                .collect()
+        } else {
+            requested_subnets
+        };
+
+        let new = crate::state::NewServerlessCache {
+            name,
+            region,
+            description,
+            port: crate::state::default_port(&engine),
+            engine,
+            major_engine_version,
+            cache_usage_limits: input.cache_usage_limits,
+            kms_key_id: input.kms_key_id,
+            security_group_ids: input.security_group_ids.unwrap_or_default(),
+            subnet_ids,
+            user_group_id: None,
+            snapshot_retention_limit: input.snapshot_retention_limit,
+            daily_snapshot_time: input.daily_snapshot_time,
+            network_type,
+            connection_type,
+            tags,
+            now,
+        };
+
+        // A created cache is NOT ready: it answers `CREATING`, and the clock
+        // owes it `AVAILABLE` once the transition span has passed.
+        Ok(CreateServerlessCacheOutput {
+            serverless_cache: Some(store.insert_serverless_cache(new).to_modeled()),
+        })
     }
+}
+
+/// The modelled refusal for a parameter value this operation cannot accept:
+/// `InvalidParameterValueException` ("The value for a parameter is invalid"),
+/// HTTP 400.
+fn invalid_value(message: impl Into<String>) -> CreateServerlessCacheError {
+    CreateServerlessCacheErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message.into()),
+        },
+    )
+    .into()
 }

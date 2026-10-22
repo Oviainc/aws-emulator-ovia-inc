@@ -13,11 +13,18 @@
 //! from the request that created the multiplex or derived from the stored state
 //! ([`ComAmazonawsMedialiveMedialiveState::multiplex_description`]) — no
 //! operation builds a multiplex out of its own request.
+//!
+//! The PROGRAMS a multiplex holds live in the same slice, on the
+//! [`MultiplexRecord`] that owns them: one [`MultiplexProgramRecord`] per
+//! created program, keyed by the `ProgramName` that identifies it within its
+//! multiplex, which is what the multiplex's own derived `ProgramCount` counts. A
+//! program has no id and no ARN of its own — it is reached by naming its
+//! multiplex and its name — and it goes away with the multiplex that holds it.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 
-use crate::ops::types::{Multiplex, MultiplexSettings};
+use crate::ops::types::{Multiplex, MultiplexProgram, MultiplexProgramSettings, MultiplexSettings};
 
 use super::{ComAmazonawsMedialiveMedialiveState, TRANSIENT_STATE_SPAN};
 
@@ -64,6 +71,25 @@ pub const MAX_MULTIPLEXES: usize = 100;
 /// same bound, for the same reason, as [`super::MAX_IDEMPOTENCY_TOKENS`] on
 /// channels: a token is only useful while the multiplex it created still exists.
 pub const MAX_MULTIPLEX_TOKENS: usize = MAX_MULTIPLEXES;
+
+/// The most programs this emulator stores in ONE multiplex.
+///
+/// A ceiling, not a guess at AWS's published quota: it exists so a create loop
+/// cannot grow the emulator's heap without bound. `CreateMultiplexProgram`
+/// models `TooManyRequestsException`, which is the refusal once a multiplex is
+/// full.
+pub const MAX_MULTIPLEX_PROGRAMS: usize = 100;
+
+/// The most `RequestId` entries kept for `CreateMultiplexProgram` idempotency —
+/// the same bound, for the same reason, as [`MAX_MULTIPLEX_TOKENS`].
+pub const MAX_MULTIPLEX_PROGRAM_TOKENS: usize = MAX_MULTIPLEX_PROGRAMS;
+
+/// The longest `ProviderName` or `ServiceName` a program's
+/// `MultiplexProgramServiceDescriptor` may carry: both members target
+/// `__stringMax256` (`smithy_query(query="shape",
+/// shape="MultiplexProgramServiceDescriptor")`), a `@length` max the request
+/// boundary does not apply to the members of a nested structure.
+pub const MAX_SERVICE_DESCRIPTOR_NAME_LEN: usize = 256;
 
 /// Why [`ComAmazonawsMedialiveMedialiveState::insert_multiplex`] stored nothing.
 /// Each variant is one refusal `CreateMultiplex` models.
@@ -141,6 +167,170 @@ fn setting_out_of_range(settings: &MultiplexSettings) -> Option<MultiplexRefusal
         })
 }
 
+/// Why [`ComAmazonawsMedialiveMedialiveState::insert_multiplex_program`] stored
+/// nothing. Each variant is one refusal `CreateMultiplexProgram` models.
+#[derive(Debug)]
+pub enum MultiplexProgramRefusal {
+    /// No multiplex in the store has the id the request named, so there is
+    /// nothing to create the program in.
+    MultiplexNotFound,
+    /// The multiplex the request named is going away (`DELETING`) or gone
+    /// (`DELETED`), so no program can be created in it. Carries its current
+    /// `MultiplexState`, so the refusal can name it.
+    MultiplexGone(String),
+    /// The multiplex already holds a program with that `ProgramName`, which is
+    /// what identifies a program within one multiplex.
+    ProgramNameInUse,
+    /// The multiplex already holds a program with that `ProgramNumber`
+    /// ("Unique program number"). Carries the number and the name of the
+    /// program already holding it.
+    ProgramNumberInUse { program_number: i32, held_by: String },
+    /// A `MultiplexProgramSettings` member fell outside the range the model
+    /// publishes for it. Carries the member's wire path inside the structure,
+    /// the value the request carried and that published range.
+    SettingOutOfRange {
+        member: &'static str,
+        value: i32,
+        min: i32,
+        max: i32,
+    },
+    /// A `MultiplexProgramSettings` string member was longer than the `@length`
+    /// max the model publishes for it. Carries the member's wire path, the
+    /// length the request carried and that max.
+    SettingTooLong {
+        member: &'static str,
+        length: usize,
+        max: usize,
+    },
+    /// `VideoSettings` defined both `ConstantBitrate` and `StatmuxSettings`,
+    /// which each member's own documentation forbids ("When this field is
+    /// defined, StatmuxSettings must be undefined" and conversely).
+    VideoSettingsOverSpecified,
+    /// The multiplex already holds [`MAX_MULTIPLEX_PROGRAMS`] programs.
+    MultiplexFull,
+}
+
+/// The first `MultiplexProgramSettings` member whose value falls outside the
+/// range the model publishes for it, if any.
+///
+/// Every range here is the `@range` trait of the integer shape the member
+/// targets (`smithy_query(query="shape",
+/// shape="MultiplexProgramSettings,MultiplexVideoSettings,MultiplexStatmuxVideoSettings")`:
+/// `ProgramNumber` -> `__integerMin0Max65535`,
+/// `VideoSettings$ConstantBitrate` -> `__integerMin100000Max100000000`,
+/// `StatmuxSettings$MaximumBitrate` and `$MinimumBitrate` ->
+/// `__integerMin100000Max100000000`, `StatmuxSettings$Priority` ->
+/// `__integerMinNegative5Max5`). They are re-stated here for the same reason as
+/// [`setting_out_of_range`] above: the request boundary validates range traits
+/// only on the operation's own input members, not on the members of a nested
+/// structure, so a value the real service refuses would otherwise be stored.
+fn program_setting_out_of_range(
+    settings: &MultiplexProgramSettings,
+) -> Option<MultiplexProgramRefusal> {
+    let video = settings.video_settings.as_ref();
+    let statmux = video.and_then(|video| video.statmux_settings.as_ref());
+    // (wire path within `multiplexProgramSettings`, the value the request
+    // carried, minimum, maximum)
+    let members: [(&'static str, Option<i32>, i32, i32); 5] = [
+        ("programNumber", Some(settings.program_number), 0, 65_535),
+        (
+            "videoSettings.constantBitrate",
+            video.and_then(|video| video.constant_bitrate),
+            100_000,
+            100_000_000,
+        ),
+        (
+            "videoSettings.statmuxSettings.maximumBitrate",
+            statmux.and_then(|statmux| statmux.maximum_bitrate),
+            100_000,
+            100_000_000,
+        ),
+        (
+            "videoSettings.statmuxSettings.minimumBitrate",
+            statmux.and_then(|statmux| statmux.minimum_bitrate),
+            100_000,
+            100_000_000,
+        ),
+        (
+            "videoSettings.statmuxSettings.priority",
+            statmux.and_then(|statmux| statmux.priority),
+            -5,
+            5,
+        ),
+    ];
+    members
+        .into_iter()
+        .find_map(|(member, value, min, max)| match value {
+            Some(value) if !(min..=max).contains(&value) => {
+                Some(MultiplexProgramRefusal::SettingOutOfRange {
+                    member,
+                    value,
+                    min,
+                    max,
+                })
+            }
+            _ => None,
+        })
+}
+
+/// The first `MultiplexProgramServiceDescriptor` name longer than the `@length`
+/// max the model publishes for it ([`MAX_SERVICE_DESCRIPTOR_NAME_LEN`]), if any.
+fn service_descriptor_too_long(
+    settings: &MultiplexProgramSettings,
+) -> Option<MultiplexProgramRefusal> {
+    let descriptor = settings.service_descriptor.as_ref()?;
+    [
+        (
+            "serviceDescriptor.providerName",
+            descriptor.provider_name.as_str(),
+        ),
+        (
+            "serviceDescriptor.serviceName",
+            descriptor.service_name.as_str(),
+        ),
+    ]
+    .into_iter()
+    .find_map(|(member, value)| {
+        let length = value.chars().count();
+        (length > MAX_SERVICE_DESCRIPTOR_NAME_LEN).then_some(
+            MultiplexProgramRefusal::SettingTooLong {
+                member,
+                length,
+                max: MAX_SERVICE_DESCRIPTOR_NAME_LEN,
+            },
+        )
+    })
+}
+
+/// Whether `VideoSettings` defines both of the two alternatives its own
+/// documentation makes mutually exclusive: `ConstantBitrate` ("When this field
+/// is defined, StatmuxSettings must be undefined") and `StatmuxSettings` ("When
+/// this field is defined, ConstantBitrate must be undefined"). The model makes
+/// them plain optional members rather than a union, so this is the rule's only
+/// home.
+fn video_settings_over_specified(settings: &MultiplexProgramSettings) -> bool {
+    settings.video_settings.as_ref().is_some_and(|video| {
+        video.constant_bitrate.is_some() && video.statmux_settings.is_some()
+    })
+}
+
+/// One created multiplex program, as `CreateMultiplexProgram` stored it.
+///
+/// The members mirror the model's `MultiplexProgram` shape minus the three it
+/// derives or does not report: `ChannelId` is "The MediaLive channel associated
+/// with the program", which comes from the channels this store holds
+/// ([`ComAmazonawsMedialiveMedialiveState::channel_in_multiplex_program`]);
+/// `PacketIdentifiersMap` and `PipelineDetails` report what the transport-stream
+/// multiplexer the real service runs allocates and ingests, which this emulator
+/// does not run and therefore does not claim.
+#[derive(Debug, Clone)]
+pub struct MultiplexProgramRecord {
+    /// The `ProgramName` the request created the program under, which is also
+    /// the key it is stored at: it identifies the program within its multiplex.
+    pub program_name: String,
+    pub multiplex_program_settings: MultiplexProgramSettings,
+}
+
 /// One created multiplex, as `CreateMultiplex` stored it plus its lifecycle
 /// state.
 ///
@@ -169,22 +359,28 @@ pub struct MultiplexRecord {
     /// multiplex is `DELETING`. Stored, never slept on, and `None` on a
     /// multiplex nobody has deleted.
     deleted_due: Option<SystemTime>,
-    /// The names of the programs this multiplex holds, which is what
-    /// `ProgramCount` counts. A set, because `CreateMultiplexProgram`'s
-    /// `ProgramName` identifies a program within one multiplex.
-    ///
-    /// `CreateMultiplexProgram` is still a scaffold stub with an issue of its
-    /// own, so nothing writes into this set yet and a multiplex therefore
-    /// reports zero programs — which is what a multiplex that has had no program
-    /// created in it really holds.
-    program_names: BTreeSet<String>,
+    /// The programs this multiplex holds, keyed by the `ProgramName` that
+    /// identifies a program within one multiplex, which is what `ProgramCount`
+    /// counts. A `BTreeMap`, so a walk over them is in name order on every
+    /// call.
+    programs: BTreeMap<String, MultiplexProgramRecord>,
 }
 
 impl MultiplexRecord {
     /// "The number of programs in the multiplex" — the programs the store holds
     /// for it, never a recorded number.
     fn program_count(&self) -> i32 {
-        i32::try_from(self.program_names.len()).unwrap_or(i32::MAX)
+        i32::try_from(self.programs.len()).unwrap_or(i32::MAX)
+    }
+
+    /// Whether a program can be created in this multiplex right now: in every
+    /// state but the two that take the multiplex away, since a multiplex that
+    /// is `DELETING` or has reached the terminal `DELETED` holds nothing new.
+    /// Creating is NOT one of them — the real service accepts a program in a
+    /// multiplex that has not finished coming up, which is why a caller can
+    /// create one straight after `CreateMultiplex`.
+    fn accepts_programs(&self) -> bool {
+        self.state != multiplex_state::DELETING && self.state != multiplex_state::DELETED
     }
 
     /// "The number of currently healthy pipelines". A multiplex runs one
@@ -304,7 +500,7 @@ impl ComAmazonawsMedialiveMedialiveState {
                 state: multiplex_state::CREATING.to_string(),
                 idle_due: Some(now + TRANSIENT_STATE_SPAN),
                 deleted_due: None,
-                program_names: BTreeSet::new(),
+                programs: BTreeMap::new(),
             },
         );
         Ok(id)
@@ -348,6 +544,169 @@ impl ComAmazonawsMedialiveMedialiveState {
             tags: Some(multiplex.tags.clone()),
         })
     }
+
+    /// Store a program in the multiplex `multiplex_id`, or refuse.
+    ///
+    /// The published ranges and lengths of the nested settings, the documented
+    /// mutual exclusion inside `VideoSettings`, the state the multiplex must be
+    /// in, the uniqueness of `ProgramName` and of `ProgramNumber` within that
+    /// multiplex, the per-multiplex cap and the insert live together here, so a
+    /// handler cannot check one of them and write past another; the handler's
+    /// job is only to turn a [`MultiplexProgramRefusal`] into the operation's
+    /// own modelled error.
+    ///
+    /// The request is validated before it is resolved: a settings value the
+    /// real service refuses is refused whatever multiplex the request names.
+    pub fn insert_multiplex_program(
+        &mut self,
+        multiplex_id: &str,
+        program_name: String,
+        multiplex_program_settings: MultiplexProgramSettings,
+    ) -> Result<(), MultiplexProgramRefusal> {
+        if let Some(refusal) = program_setting_out_of_range(&multiplex_program_settings)
+            .or_else(|| service_descriptor_too_long(&multiplex_program_settings))
+        {
+            return Err(refusal);
+        }
+        if video_settings_over_specified(&multiplex_program_settings) {
+            return Err(MultiplexProgramRefusal::VideoSettingsOverSpecified);
+        }
+
+        let multiplex = self
+            .multiplexes
+            .get_mut(multiplex_id)
+            .ok_or(MultiplexProgramRefusal::MultiplexNotFound)?;
+        if !multiplex.accepts_programs() {
+            return Err(MultiplexProgramRefusal::MultiplexGone(
+                multiplex.state.clone(),
+            ));
+        }
+        if multiplex.programs.contains_key(&program_name) {
+            return Err(MultiplexProgramRefusal::ProgramNameInUse);
+        }
+        // `ProgramNumber` is documented as "Unique program number", and it is
+        // the program's number in this multiplex's transport stream, so two
+        // programs of one multiplex cannot share it.
+        let program_number = multiplex_program_settings.program_number;
+        if let Some(held_by) = multiplex
+            .programs
+            .values()
+            .find(|program| program.multiplex_program_settings.program_number == program_number)
+        {
+            return Err(MultiplexProgramRefusal::ProgramNumberInUse {
+                program_number,
+                held_by: held_by.program_name.clone(),
+            });
+        }
+        if multiplex.programs.len() >= MAX_MULTIPLEX_PROGRAMS {
+            return Err(MultiplexProgramRefusal::MultiplexFull);
+        }
+
+        multiplex.programs.insert(
+            program_name.clone(),
+            MultiplexProgramRecord {
+                program_name,
+                multiplex_program_settings,
+            },
+        );
+        Ok(())
+    }
+
+    /// Record `token` as having created the program `program_name` of the
+    /// multiplex `multiplex_id`, evicting the oldest token first if that would
+    /// push the map past [`MAX_MULTIPLEX_PROGRAM_TOKENS`].
+    pub fn record_multiplex_program_token(
+        &mut self,
+        token: String,
+        multiplex_id: &str,
+        program_name: &str,
+    ) {
+        self.multiplex_program_tokens.record(
+            token,
+            &multiplex_program_key(multiplex_id, program_name),
+            MAX_MULTIPLEX_PROGRAM_TOKENS,
+        );
+    }
+
+    /// The program a stored `RequestId` created \u2014 the multiplex's id and the
+    /// program's name \u2014 if that program still exists.
+    pub fn multiplex_program_for_token(&self, request_id: &str) -> Option<(String, String)> {
+        let key = self.multiplex_program_tokens.created(request_id)?;
+        let (multiplex_id, program_name) = key.split_once(MULTIPLEX_PROGRAM_KEY_SEPARATOR)?;
+        let program = self.multiplexes.get(multiplex_id)?.programs.get(program_name)?;
+        Some((multiplex_id.to_string(), program.program_name.clone()))
+    }
+
+    /// The full `MultiplexProgram` description of one stored program, or `None`
+    /// when that multiplex holds no program of that name.
+    pub fn multiplex_program_description(
+        &self,
+        multiplex_id: &str,
+        program_name: &str,
+    ) -> Option<MultiplexProgram> {
+        let program = self.multiplexes.get(multiplex_id)?.programs.get(program_name)?;
+        Some(MultiplexProgram {
+            channel_id: self.channel_in_multiplex_program(multiplex_id, &program.program_name),
+            multiplex_program_settings: Some(program.multiplex_program_settings.clone()),
+            // ABSENT, not empty: `PacketIdentifiersMap` reports the
+            // transport-stream packet identifiers the real service's
+            // multiplexer allocates for the program, and `PipelineDetails`
+            // reports which channel pipeline each multiplex pipeline is
+            // currently ingesting from. This emulator runs neither, so it
+            // reports neither rather than inventing PIDs and an active
+            // pipeline for a transport stream nothing is producing.
+            packet_identifiers_map: None,
+            pipeline_details: None,
+            program_name: Some(program.program_name.clone()),
+        })
+    }
+
+    /// "The MediaLive channel associated with the program": the channel whose
+    /// `Destinations` name this multiplex and this program
+    /// (`OutputDestination$MultiplexSettings` is a
+    /// `MultiplexProgramChannelDestinationSettings` carrying exactly that
+    /// pair), or `None` while no channel sends its output to the program.
+    ///
+    /// Derived on every read, so the association tracks the channels created
+    /// and deleted after the program: a channel that has reached the terminal
+    /// `DELETED` state is no longer associated with anything.
+    fn channel_in_multiplex_program(
+        &self,
+        multiplex_id: &str,
+        program_name: &str,
+    ) -> Option<String> {
+        self.channels
+            .values()
+            .filter(|channel| !channel.is_deleted())
+            .find(|channel| {
+                channel.destinations.iter().any(|destination| {
+                    destination
+                        .multiplex_settings
+                        .as_ref()
+                        .is_some_and(|settings| {
+                            settings.multiplex_id.as_deref() == Some(multiplex_id)
+                                && settings.program_name.as_deref() == Some(program_name)
+                        })
+                })
+            })
+            .map(|channel| channel.id.clone())
+    }
+}
+
+/// What separates the two halves of a multiplex program's idempotency-token key.
+///
+/// A program is identified by the multiplex it lives in and its name rather than
+/// by an id, so the token map records both. `ProgramName` is a URI path label
+/// (`smithy_query(query="operation", operation="DescribeMultiplexProgram")`:
+/// `/prod/multiplexes/{MultiplexId}/programs/{ProgramName}`) and a multiplex id
+/// is a numeric string, so a `/` cannot appear in the first half and the split
+/// is unambiguous.
+const MULTIPLEX_PROGRAM_KEY_SEPARATOR: char = '/';
+
+/// The key [`ComAmazonawsMedialiveMedialiveState::record_multiplex_program_token`]
+/// records a token against, read back by `multiplex_program_for_token`.
+fn multiplex_program_key(multiplex_id: &str, program_name: &str) -> String {
+    format!("{multiplex_id}{MULTIPLEX_PROGRAM_KEY_SEPARATOR}{program_name}")
 }
 
 /// Project a `Multiplex` onto one of the structurally identical per-operation
@@ -375,3 +734,25 @@ macro_rules! multiplex_description_output {
 }
 
 pub(crate) use multiplex_description_output;
+
+/// Project a `MultiplexProgram` onto one of the structurally identical
+/// per-operation program-description output shapes
+/// (`DescribeMultiplexProgramOutput`, `DeleteMultiplexProgramOutput`), whose
+/// members are the `MultiplexProgram`'s own rather than a wrapper.
+///
+/// One macro rather than a hand-written copy per operation, so a create and the
+/// read that follows it cannot report the same stored program differently.
+macro_rules! multiplex_program_description_output {
+    ($out:ident, $program:expr) => {{
+        let program: $crate::ops::types::MultiplexProgram = $program;
+        $out {
+            channel_id: program.channel_id,
+            multiplex_program_settings: program.multiplex_program_settings,
+            packet_identifiers_map: program.packet_identifiers_map,
+            pipeline_details: program.pipeline_details,
+            program_name: program.program_name,
+        }
+    }};
+}
+
+pub(crate) use multiplex_program_description_output;

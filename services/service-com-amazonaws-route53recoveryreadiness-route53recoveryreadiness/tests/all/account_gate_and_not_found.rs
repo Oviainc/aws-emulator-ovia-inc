@@ -160,11 +160,11 @@ impl Kind {
     }
 
     /// The items member of this kind's list operation, where this emulator implements
-    /// one (`ListCells` and `ListRecoveryGroups` are still scaffold stubs with their
-    /// own filed issues).
+    /// one (`ListCells` is still a scaffold stub with its own filed issue).
     fn list_items_field(self) -> Option<&'static str> {
         match self {
-            Kind::Cell | Kind::RecoveryGroup => None,
+            Kind::Cell => None,
+            Kind::RecoveryGroup => Some("recoveryGroups"),
             Kind::ReadinessCheck => Some("readinessChecks"),
             Kind::ResourceSet => Some("resourceSets"),
         }

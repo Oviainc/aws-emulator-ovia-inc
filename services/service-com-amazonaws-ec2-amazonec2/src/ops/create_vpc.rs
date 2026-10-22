@@ -299,57 +299,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The tags to assign to the VPC" — "you must specify the resource type to tag,
         // otherwise the request will fail" (TagSpecification), and the only type this
-        // action tags is the VPC it creates.
-        let mut tags: Vec<Tag> = Vec::new();
-        for specification in input.tag_specifications.iter().flatten() {
-            match specification.resource_type.as_deref() {
-                Some(state::RESOURCE_TYPE_VPC) => {
-                    tags.extend(specification.tags.clone().unwrap_or_default());
-                }
-                Some(other) => {
-                    return Err(state::invalid_parameter_value(format!(
-                        "'{other}' is not a valid resource type for tagging on CreateVpc"
-                    )))
-                }
-                None => {
-                    return Err(state::missing_parameter(
-                        "Tag specification resource type must have a value",
-                    ))
-                }
-            }
-        }
-        // A count of VPCs is not a bound on the caller-chosen bytes each one holds, so the
-        // tag payload is bounded here the way `CreateTags` bounds its own: at most the
-        // documented number of tags per resource, each key and value within its documented
-        // length, and no key given twice ("Tag keys must be unique per resource", so two
-        // entries for one key have no defined winner).
-        if tags.len() > state::MAX_TAGS_PER_RESOURCE {
-            return Err(crate::scaffolded::Scaffolded::tag_limit_exceeded(format!(
-                "The request carries {} tags, above the maximum of {max} per resource",
-                tags.len(),
-                max = state::MAX_TAGS_PER_RESOURCE,
-            )));
-        }
-        let mut keys_seen: ::std::collections::BTreeSet<&str> =
-            ::std::collections::BTreeSet::new();
-        for tag in &tags {
-            let key = tag.key.as_deref().unwrap_or_default();
-            if key.is_empty() {
-                return Err(state::invalid_parameter_value("A tag key cannot be empty"));
-            }
-            if key.starts_with(state::RESERVED_TAG_PREFIX) {
-                return Err(state::invalid_parameter_value(format!(
-                    "Tag key '{key}' is invalid: the '{prefix}' prefix is reserved",
-                    prefix = state::RESERVED_TAG_PREFIX,
-                )));
-            }
-            if !keys_seen.insert(key) {
-                return Err(state::invalid_parameter_value(format!(
-                    "Tag key '{key}' is given more than once; tag keys must be unique"
-                )));
-            }
-            state::validate_tag_size(key, tag.value.as_deref().unwrap_or_default())?;
-        }
+        // action tags is the VPC it creates. The tag payload's own bounds (the count per
+        // resource, each key and value's length, no key twice, nothing in the reserved
+        // namespace) are the ones every create holds its tags to, so they are applied by
+        // the one shared reader rather than re-stated here.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_VPC,
+            Self::NAME,
+        )?;
         // The bytes this VPC would add to the store, charged against the crate's one
         // byte budget below so the store is bounded in bytes and not only in records.
         let tag_payload_bytes = state::tag_list_bytes(&tags);

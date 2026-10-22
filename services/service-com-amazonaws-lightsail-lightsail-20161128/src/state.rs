@@ -344,6 +344,9 @@ pub const OPERATION_TYPE_DELETE_ALARM: &str = "DeleteAlarm";
 /// `Operation$operationType` targets that enum — so adding an entry to a zone is
 /// logged as the modelled recordset update, not as an unmodelled value.
 pub const OPERATION_TYPE_UPDATE_DOMAIN_ENTRY: &str = "UpdateDomainEntry";
+/// The `operationType` the log entry of an entry's removal from a zone carries,
+/// the modelled `OperationType` enum's own `DeleteDomainEntry` member.
+pub const OPERATION_TYPE_DELETE_DOMAIN_ENTRY: &str = "DeleteDomainEntry";
 
 // ---------------------------------------------------------------------------
 // Store bounds
