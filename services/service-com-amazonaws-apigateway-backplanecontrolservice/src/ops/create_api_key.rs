@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateApiKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateApiKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: persists an `ApiKey` record in [`crate::state`] under a freshly minted
+//! id and answers with that STORED record. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateApiKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The key's `value` is the caller's `value` when the request carries one, and
+//! otherwise a secret minted by the emulator's credential store
+//! ([`crate::state::mint_api_key_value`]) — never a value this handler constructs.
 //!
 //! ## Shape of an operation
 //!
@@ -104,6 +102,89 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::ApiKeyEntry;
+
+/// The longest caller-supplied `value` this emulator will store. AWS publishes an API
+/// key value length of 20 to 128 characters for an imported key; the model declares no
+/// constraint, so the bound is enforced here and the refusal names it.
+const MAX_VALUE_CHARS: usize = 128;
+
+/// The shortest caller-supplied `value` AWS accepts; see [`MAX_VALUE_CHARS`].
+const MIN_VALUE_CHARS: usize = 20;
+
+impl From<&ApiKeyEntry> for CreateApiKeyOutput {
+    /// The `ApiKey` body for a stored key — the one place this crate renders that
+    /// shape, so `CreateApiKey` and `GetApiKey` cannot report a record differently.
+    ///
+    /// The `value` is included: `CreateApiKey` is the call AWS returns a new key's
+    /// value from. A reader that must withhold it clears the member instead (see
+    /// `GetApiKey`'s `includeValue`).
+    fn from(entry: &ApiKeyEntry) -> Self {
+        Self {
+            id: Some(entry.id.clone()),
+            value: Some(entry.value.clone()),
+            name: entry.name.clone(),
+            customer_id: entry.customer_id.clone(),
+            description: entry.description.clone(),
+            enabled: entry.enabled,
+            created_date: entry.created_date,
+            last_updated_date: entry.last_updated_date,
+            stage_keys: (!entry.stage_keys.is_empty()).then(|| entry.stage_keys.clone()),
+            tags: (!entry.tags.is_empty()).then(|| {
+                entry
+                    .tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            }),
+        }
+    }
+}
+
+/// Refuse a request whose caller-sized members would grow the store past a bound.
+///
+/// Called BEFORE the store lock is taken, so an over-sized request never reaches the
+/// records at all. Each bound is a published API Gateway/AWS quota or, where the
+/// service publishes none, this emulator's own resource guard — see `crate::state`.
+fn bound_input(input: &CreateApiKeyInput) -> Result<(), String> {
+    use crate::state::{
+        bound_chars, bound_entries, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS, MAX_TAGS,
+        MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS,
+    };
+
+    for (member, value) in [
+        ("name", &input.name),
+        ("description", &input.description),
+        ("customerId", &input.customer_id),
+    ] {
+        if let Some(value) = value {
+            bound_chars(member, value, MAX_STRING_CHARS)?;
+        }
+    }
+    if let Some(value) = &input.value {
+        bound_chars("value", value, MAX_VALUE_CHARS)?;
+    }
+    if let Some(stage_keys) = &input.stage_keys {
+        bound_entries("stageKeys", stage_keys.len(), MAX_COLLECTION_ENTRIES)?;
+        for stage_key in stage_keys {
+            if let Some(value) = &stage_key.rest_api_id {
+                bound_chars("stageKeys.restApiId", value, MAX_STRING_CHARS)?;
+            }
+            if let Some(value) = &stage_key.stage_name {
+                bound_chars("stageKeys.stageName", value, MAX_STRING_CHARS)?;
+            }
+        }
+    }
+    if let Some(tags) = &input.tags {
+        bound_entries("tags", tags.len(), MAX_TAGS)?;
+        for (key, value) in tags {
+            bound_chars("a tag key", key, MAX_TAG_KEY_CHARS)?;
+            bound_chars("a tag value", value, MAX_TAG_VALUE_CHARS)?;
+        }
+    }
+    Ok(())
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -177,18 +258,151 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateApiKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateApiKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateApiKey"))
+        let bad_request = |message: String| -> Self::Error {
+            CreateApiKeyErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // Nothing caller-sized reaches the store unchecked: the request's members are
+        // bounded first, before the store lock is taken at all.
+        bound_input(&input).map_err(bad_request)?;
+
+        // A caller-supplied key value is what a client will present in `x-api-key`, so
+        // it must be long enough to be a key at all. The model declares no length, so
+        // the published bound is enforced here and the refusal names it.
+        if let Some(value) = input.value.as_deref() {
+            let length = value.chars().count();
+            if !(MIN_VALUE_CHARS..=MAX_VALUE_CHARS).contains(&length) {
+                return Err(bad_request(format!(
+                    "value must be between {MIN_VALUE_CHARS} and {MAX_VALUE_CHARS} characters, got {length}"
+                )));
+            }
+        }
+
+        // Each `stageKeys` entry names one stage of one API, so both members are needed
+        // for it to name anything.
+        let requested_stages: Vec<(String, String)> = input
+            .stage_keys
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|stage_key| {
+                match (
+                    stage_key.rest_api_id.as_deref(),
+                    stage_key.stage_name.as_deref(),
+                ) {
+                    (Some(rest_api_id), Some(stage_name)) => {
+                        Ok((rest_api_id.to_string(), stage_name.to_string()))
+                    }
+                    _ => Err(bad_request(
+                        "a stageKeys entry must carry both restApiId and stageName"
+                            .to_string(),
+                    )),
+                }
+            })
+            .collect::<Result<_, _>>()?;
+
+        // Minted BEFORE the store lock is taken, and only when the request supplies no
+        // value of its own: the secret comes from the emulator's credential store, never
+        // from this handler. See `crate::state::mint_api_key_value`.
+        let value = match input.value {
+            Some(value) => value,
+            None => crate::state::mint_api_key_value(ctx.credential_store())
+                .ok_or_else(crate::state::state_unavailable)?,
+        };
+
+        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+        let mut store = state.lock();
+
+        // Bound the growth a caller drives, at API Gateway's published quota.
+        if store.api_keys.len() >= crate::state::MAX_API_KEYS {
+            return Err(CreateApiKeyErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    retry_after_seconds: None,
+                    message: Some(format!(
+                        "Maximum number of API keys exceeded: {}",
+                        crate::state::MAX_API_KEYS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A key value is what identifies the caller presenting it, so two keys cannot
+        // share one. That is the conflict `ConflictException` states for this operation.
+        if store.api_keys.values().any(|key| key.value == value) {
+            return Err(CreateApiKeyErrorModeled::ConflictException(ConflictException {
+                message: Some("An API Key already exists for the given value".to_string()),
+            })
+            .into());
+        }
+
+        // Every stage key must name a stored API; an unknown id is the modelled
+        // `NotFoundException` rather than a silently dropped association. A stage's own
+        // existence cannot be checked here: this service stores no stage records yet,
+        // because the stage operations are still scaffolded.
+        let mut stage_keys = Vec::with_capacity(requested_stages.len());
+        for (rest_api_id, stage_name) in requested_stages {
+            if !store.rest_apis.contains_key(&rest_api_id) {
+                return Err(CreateApiKeyErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::NO_SUCH_REST_API.to_string()),
+                })
+                .into());
+            }
+            stage_keys.push(format!("{rest_api_id}/{stage_name}"));
+        }
+
+        // `generateDistinctId` is documented "deprecated and should not be used", so the
+        // id is always minted distinct from the value, whichever way the member is set.
+        let id = store.mint_id();
+        let sequence = store.next_sequence();
+        let entry = ApiKeyEntry {
+            id: id.clone(),
+            value,
+            name: input.name,
+            description: input.description,
+            customer_id: input.customer_id,
+            enabled: input.enabled,
+            created_date: Some(now),
+            // A key is created and last updated at the same instant; `UpdateApiKey`
+            // moves this one, and is still scaffolded.
+            last_updated_date: Some(now),
+            stage_keys,
+            tags: input
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<::std::collections::BTreeMap<String, String>>(),
+            sequence,
+        };
+
+        // `id` comes from the store's own id bijection, so it names no existing key and
+        // this inserts. Reading the entry back means what the caller is told is what a
+        // later `GetApiKey` will report.
+        store.api_keys.insert(id.clone(), entry);
+        let stored = store
+            .api_keys
+            .get(&id)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let output = CreateApiKeyOutput::from(stored);
+        // Everything below is owned, so the store lock is released before the record is
+        // formatted: the critical section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome.
+        // Metadata only — the key's `value` is a secret and is never a field here.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            api_key = ?id,
+            outcome = "created",
+            "api key created",
+        );
+        Ok(output)
     }
 }

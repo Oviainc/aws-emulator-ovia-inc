@@ -307,7 +307,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // bounded by its own step budget, but it is the expensive part of this call,
         // so it does not hold the shared store. The outcome it computes is owed to
         // the clock, so the execution reports RUNNING until then.
-        let (history, pending) = crate::state::plan_run(&definition, &execution_input, started);
+        let (history, pending) = crate::state::plan_run(
+            &definition,
+            &execution_input,
+            started,
+            crate::state::EVENT_EXECUTION_STARTED,
+            0,
+        );
         let candidate = crate::state::Execution {
             arn: arn.clone(),
             state_machine_arn: machine_arn.clone(),
@@ -321,6 +327,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             cause: None,
             trace_header: input.trace_header,
             redrive_count: 0,
+            redrive_date: None,
+            redrive_tokens: Vec::new(),
             history,
             pending: Some(pending),
             // Measured and counted by `insert_execution`.

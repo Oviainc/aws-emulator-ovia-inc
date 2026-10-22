@@ -17,5 +17,7 @@ mod backend_job_listing;
 mod backend_lifecycle;
 #[path = "all/challenge_tokens.rs"]
 mod challenge_tokens;
+#[path = "all/s3_buckets.rs"]
+mod s3_buckets;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

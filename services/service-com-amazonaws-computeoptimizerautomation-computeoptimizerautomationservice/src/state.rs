@@ -18,9 +18,11 @@ use sha2::{Digest, Sha256};
 use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
-    AutomationEvent, AutomationEventFilter, AutomationRule, Criteria, EstimatedMonthlySavings,
-    Filter, OptInRequiredException, OrganizationConfiguration, RecommendedAction,
-    RecommendedActionFilter, ResourceDetails, Schedule, Tag, AUTOMATION_EVENT_FILTER_NAME_VALUES,
+    AutomationEvent, AutomationEventFilter, AutomationRule, Criteria, DoubleCriteriaCondition,
+    EbsVolumeConfiguration, EstimatedMonthlySavings, Filter, IntegerCriteriaCondition,
+    OptInRequiredException, OrganizationConfiguration, OrganizationScope, PreviewResult,
+    RecommendedAction, RecommendedActionFilter, ResourceDetails, ResourceTagsCriteriaCondition,
+    Schedule, StringCriteriaCondition, Tag, AUTOMATION_EVENT_FILTER_NAME_VALUES,
     RECOMMENDED_ACTION_FILTER_NAME_VALUES,
 };
 
@@ -77,9 +79,10 @@ pub const DEFAULT_RULE_DESCRIPTION: &str = "";
 /// whose create named a priority always wins the tie against one that did not.
 pub const DEFAULT_RULE_PRIORITY: &str = "1";
 
-/// The page size `ListAutomationRules` uses when the caller sends no
-/// `maxResults`. The model bounds `maxResults` at `range(min: 1, max: 100)`, so
-/// the largest page a caller may ask for is also the default.
+/// The page size a paginated list uses when the caller sends no `maxResults`.
+/// The model bounds every `maxResults` member at `range(min: 1, max: 100)`
+/// (`ListAutomationRules`, `ListAutomationRulePreview`, …), so the largest page
+/// a caller may ask for is also the default.
 pub const DEFAULT_MAX_RESULTS: i32 = 100;
 
 /// The number of characters in a minted id. `RuleId`, `EventId` and
@@ -586,13 +589,57 @@ impl RecommendedActionStore {
     }
 }
 
+/// This action as the `PreviewResult` `ListAutomationRulePreview` reports. The
+/// model's `PreviewResult` repeats every member of `RecommendedAction`, so the
+/// preview is the stored action itself, projected member for member.
+pub fn preview_result_for(action: &RecommendedAction) -> PreviewResult {
+    PreviewResult {
+        recommended_action_id: action.recommended_action_id.clone(),
+        resource_arn: action.resource_arn.clone(),
+        resource_id: action.resource_id.clone(),
+        account_id: action.account_id.clone(),
+        region: action.region.clone(),
+        resource_type: action.resource_type.clone(),
+        look_back_period_in_days: action.look_back_period_in_days,
+        recommended_action_type: action.recommended_action_type.clone(),
+        current_resource_summary: action.current_resource_summary.clone(),
+        current_resource_details: action.current_resource_details.clone(),
+        recommended_resource_summary: action.recommended_resource_summary.clone(),
+        recommended_resource_details: action.recommended_resource_details.clone(),
+        restart_needed: action.restart_needed,
+        estimated_monthly_savings: action.estimated_monthly_savings.clone(),
+        resource_tags: action.resource_tags.clone(),
+    }
+}
+
+/// The EBS volume configuration carried by `details`, which is what the
+/// `ebsVolumeType` and `ebsVolumeSizeInGib` criteria read off the CURRENT
+/// resource: the criteria choose which resources a rule acts on, so they read
+/// the resource as it is now, never the recommended one.
+fn ebs_configuration(details: Option<&ResourceDetails>) -> Option<&EbsVolumeConfiguration> {
+    match details? {
+        ResourceDetails::ebsVolume(volume) => volume.configuration.as_ref(),
+    }
+}
+
+/// The value an `estimatedMonthlySavings` criterion compares against: the figure
+/// for the estimate's OWN `savingsEstimationMode`, so a `BeforeDiscount`
+/// estimate is compared before discounts and an `AfterDiscount` one after them.
+fn savings_for_criteria(savings: &EstimatedMonthlySavings) -> f64 {
+    match savings.savings_estimation_mode.as_str() {
+        "AfterDiscount" => savings.after_discount_savings,
+        // `BeforeDiscount` is the enum's only other member, and the
+        // before-discount figure is the conservative reading of a mode this
+        // model does not yet declare.
+        _ => savings.before_discount_savings,
+    }
+}
+
 /// The EBS volume type of `details`, for the
 /// `CurrentResourceDetailsEbsVolumeType` filter. `None` when the action carries
 /// no such configuration.
 fn ebs_volume_type(details: Option<&ResourceDetails>) -> Option<String> {
-    match details? {
-        ResourceDetails::ebsVolume(volume) => volume.configuration.as_ref()?.r#type.clone(),
-    }
+    ebs_configuration(details)?.r#type.clone()
 }
 
 /// An automation event as stored: the run of ONE recommended action, which is
@@ -756,6 +803,410 @@ pub fn event_for_action(
     }
 }
 
+/// Which accounts a preview covers.
+///
+/// `None` means every account the store holds actions for: an `OrganizationRule`
+/// preview that names no `organizationScope` spans the organization. An
+/// `AccountRule` covers only the calling account, because a rule of that type is
+/// scoped to the account it lives in.
+///
+/// An EMPTY account list cannot reach here: the model constrains
+/// `OrganizationConfigurationAccountIds` at `length(min: 1, max: 50)`, so the
+/// protocol boundary refuses `accountIds: []` before the handler runs. A scope
+/// present with no `accountIds` member is the same as no scope at all.
+pub fn preview_account_scope(
+    rule_type: &str,
+    organization_scope: Option<&OrganizationScope>,
+) -> Option<Vec<String>> {
+    if rule_type == "OrganizationRule" {
+        return organization_scope
+            .and_then(|scope| scope.account_ids.clone())
+            .filter(|accounts| !accounts.is_empty());
+    }
+    Some(vec![caller_account_id()])
+}
+
+/// Is `account_id` one of the accounts `scope` covers? An absent scope covers
+/// every account.
+pub fn account_in_scope(account_id: &str, scope: Option<&[String]>) -> bool {
+    scope.is_none_or(|accounts| accounts.iter().any(|candidate| candidate == account_id))
+}
+
+/// Does `action` satisfy every condition of `criteria`?
+///
+/// A criterion holds a LIST of conditions and `criteria` holds several
+/// criterions: all of them must hold (AND), while the values inside one
+/// condition are alternatives (OR). A criterion the caller left out constrains
+/// nothing, so empty criteria match every action.
+pub fn action_matches_criteria(action: &RecommendedAction, criteria: &Criteria) -> bool {
+    let configuration = ebs_configuration(action.current_resource_details.as_ref());
+    // `restartNeeded` is modelled as a STRING criterion over a boolean member,
+    // so it is compared against the member's wire rendering.
+    let restart_needed = action
+        .restart_needed
+        .map(|needed| if needed { "true" } else { "false" });
+
+    criteria
+        .region
+        .iter()
+        .flatten()
+        .all(|condition| string_condition_holds(condition, action.region.as_deref()))
+        && criteria
+            .resource_arn
+            .iter()
+            .flatten()
+            .all(|condition| string_condition_holds(condition, action.resource_arn.as_deref()))
+        && criteria.ebs_volume_type.iter().flatten().all(|condition| {
+            string_condition_holds(
+                condition,
+                configuration.and_then(|configuration| configuration.r#type.as_deref()),
+            )
+        })
+        && criteria
+            .restart_needed
+            .iter()
+            .flatten()
+            .all(|condition| string_condition_holds(condition, restart_needed))
+        && criteria
+            .ebs_volume_size_in_gib
+            .iter()
+            .flatten()
+            .all(|condition| {
+                integer_condition_holds(
+                    condition,
+                    configuration
+                        .and_then(|configuration| configuration.size_in_gib)
+                        .map(f64::from),
+                )
+            })
+        && criteria
+            .look_back_period_in_days
+            .iter()
+            .flatten()
+            .all(|condition| {
+                integer_condition_holds(condition, action.look_back_period_in_days.map(f64::from))
+            })
+        && criteria
+            .estimated_monthly_savings
+            .iter()
+            .flatten()
+            .all(|condition| {
+                double_condition_holds(
+                    condition,
+                    action
+                        .estimated_monthly_savings
+                        .as_ref()
+                        .map(savings_for_criteria),
+                )
+            })
+        && criteria
+            .resource_tag
+            .iter()
+            .flatten()
+            .all(|condition| tag_condition_holds(condition, action))
+}
+
+/// The `String*` comparison operators, i.e. the members of the model's
+/// `ComparisonOperator` enum that compare strings, with the `IfExists` suffix
+/// stripped (`smithy_query(query="shape",shape="ComparisonOperator")`).
+const STRING_COMPARISONS: &[&str] = &[
+    "StringEquals",
+    "StringNotEquals",
+    "StringEqualsIgnoreCase",
+    "StringNotEqualsIgnoreCase",
+    "StringLike",
+    "StringNotLike",
+];
+
+/// The `Numeric*` comparison operators of the same enum, `IfExists` stripped.
+const NUMERIC_COMPARISONS: &[&str] = &[
+    "NumericEquals",
+    "NumericNotEquals",
+    "NumericLessThan",
+    "NumericLessThanEquals",
+    "NumericGreaterThan",
+    "NumericGreaterThanEquals",
+];
+
+/// A comparison operator split into the base operator and whether it carried the
+/// `IfExists` suffix. `IfExists` is what decides a condition over an attribute
+/// the resource does not have: it holds, while every other operator does not.
+fn split_comparison(comparison: &str) -> (&str, bool) {
+    match comparison.strip_suffix("IfExists") {
+        Some(base) => (base, true),
+        None => (comparison, false),
+    }
+}
+
+/// Does a string condition hold for `attribute`?
+fn string_comparison_holds(comparison: &str, attribute: Option<&str>, values: &[String]) -> bool {
+    let (base, if_exists) = split_comparison(comparison);
+    let Some(attribute) = attribute else {
+        return if_exists;
+    };
+    match base {
+        "StringEquals" => values.iter().any(|value| value == attribute),
+        "StringNotEquals" => !values.iter().any(|value| value == attribute),
+        "StringEqualsIgnoreCase" => values
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(attribute)),
+        "StringNotEqualsIgnoreCase" => !values
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(attribute)),
+        "StringLike" => values
+            .iter()
+            .any(|value| wildcard_matches(value, attribute)),
+        "StringNotLike" => !values
+            .iter()
+            .any(|value| wildcard_matches(value, attribute)),
+        // Unreachable: a comparison outside the operator's family is refused
+        // before any action is matched.
+        _ => false,
+    }
+}
+
+/// Does `candidate` match the `StringLike` wildcard `pattern`?
+///
+/// The wildcard language of a `String*Like` condition value is the two
+/// metacharacters an AWS condition uses: `*` stands for any run of characters
+/// (including none) and `?` for exactly one; every other character is literal,
+/// compared by Unicode scalar. Two metacharacters are not a pattern language, so
+/// this is the textbook greedy walk rather than a dependency: `star` remembers
+/// the last `*` seen and `resume` the input position it matched from, so a later
+/// mismatch backtracks by giving that `*` one more character. It visits each
+/// input position at most once per `*`, so it always terminates.
+fn wildcard_matches(pattern: &str, candidate: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let candidate: Vec<char> = candidate.chars().collect();
+    let mut pattern_at = 0usize;
+    let mut candidate_at = 0usize;
+    let mut star: Option<usize> = None;
+    let mut resume = 0usize;
+
+    while candidate_at < candidate.len() {
+        match pattern.get(pattern_at) {
+            Some('*') => {
+                star = Some(pattern_at);
+                resume = candidate_at;
+                pattern_at += 1;
+            }
+            Some('?') => {
+                pattern_at += 1;
+                candidate_at += 1;
+            }
+            Some(literal) if *literal == candidate[candidate_at] => {
+                pattern_at += 1;
+                candidate_at += 1;
+            }
+            // No literal match here: hand one more character to the last `*`, or
+            // report the mismatch when there was none.
+            _ => {
+                let Some(star_at) = star else {
+                    return false;
+                };
+                pattern_at = star_at + 1;
+                resume += 1;
+                candidate_at = resume;
+            }
+        }
+    }
+
+    // The input is consumed: what is left of the pattern may only be `*`s, each
+    // of which can match the empty rest.
+    pattern[pattern_at..].iter().all(|left| *left == '*')
+}
+
+/// Does a numeric condition hold for `attribute`? Several values are
+/// alternatives, as they are for a string condition.
+fn numeric_comparison_holds(comparison: &str, attribute: Option<f64>, values: &[f64]) -> bool {
+    let (base, if_exists) = split_comparison(comparison);
+    let Some(attribute) = attribute else {
+        return if_exists;
+    };
+    match base {
+        "NumericEquals" => values.contains(&attribute),
+        "NumericNotEquals" => !values.contains(&attribute),
+        "NumericLessThan" => values.iter().any(|value| attribute < *value),
+        "NumericLessThanEquals" => values.iter().any(|value| attribute <= *value),
+        "NumericGreaterThan" => values.iter().any(|value| attribute > *value),
+        "NumericGreaterThanEquals" => values.iter().any(|value| attribute >= *value),
+        _ => false,
+    }
+}
+
+fn string_condition_holds(condition: &StringCriteriaCondition, attribute: Option<&str>) -> bool {
+    string_comparison_holds(
+        condition.comparison.as_deref().unwrap_or_default(),
+        attribute,
+        condition.values.as_deref().unwrap_or_default(),
+    )
+}
+
+fn integer_condition_holds(condition: &IntegerCriteriaCondition, attribute: Option<f64>) -> bool {
+    let values: Vec<f64> = condition
+        .values
+        .iter()
+        .flatten()
+        .copied()
+        .map(f64::from)
+        .collect();
+    numeric_comparison_holds(
+        condition.comparison.as_deref().unwrap_or_default(),
+        attribute,
+        &values,
+    )
+}
+
+fn double_condition_holds(condition: &DoubleCriteriaCondition, attribute: Option<f64>) -> bool {
+    numeric_comparison_holds(
+        condition.comparison.as_deref().unwrap_or_default(),
+        attribute,
+        condition.values.as_deref().unwrap_or_default(),
+    )
+}
+
+/// Does a `resourceTag` condition hold? It names the tag KEY it is about, and
+/// compares its values against the value of that one tag; a resource without the
+/// tag has no attribute, so only an `IfExists` comparison holds for it.
+fn tag_condition_holds(
+    condition: &ResourceTagsCriteriaCondition,
+    action: &RecommendedAction,
+) -> bool {
+    let key = condition.key.as_deref().unwrap_or_default();
+    let attribute = action
+        .resource_tags
+        .iter()
+        .flatten()
+        .find(|tag| tag.key == key)
+        .map(|tag| tag.value.as_str());
+    string_comparison_holds(
+        condition.comparison.as_deref().unwrap_or_default(),
+        attribute,
+        condition.values.as_deref().unwrap_or_default(),
+    )
+}
+
+/// Whether a criterion compares strings or numbers, which is what decides the
+/// family of comparison operators it accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CriterionKind {
+    Text,
+    Numeric,
+}
+
+/// Why this `criteria` cannot be evaluated, if it cannot, as the service's own
+/// validation report ([`constraint_report`], which echoes no request value).
+///
+/// The model types `comparison` and `values` as OPTIONAL members of every
+/// condition and types `comparison` as the whole `ComparisonOperator` enum, so
+/// the protocol boundary admits a condition with no operator, with no values, or
+/// with an operator from the wrong family (a `Numeric*` operator on a string
+/// criterion). None of those can select resources, so each is refused rather
+/// than quietly matching nothing.
+pub fn criteria_violation(criteria: &Criteria) -> Option<String> {
+    let mut conditions: Vec<(&str, CriterionKind, Option<&str>, usize)> = Vec::new();
+    let text_criteria: [(&str, &Option<Vec<StringCriteriaCondition>>); 4] = [
+        ("criteria.region", &criteria.region),
+        ("criteria.resourceArn", &criteria.resource_arn),
+        ("criteria.ebsVolumeType", &criteria.ebs_volume_type),
+        ("criteria.restartNeeded", &criteria.restart_needed),
+    ];
+    for (path, criterion) in text_criteria {
+        for condition in criterion.iter().flatten() {
+            conditions.push((
+                path,
+                CriterionKind::Text,
+                condition.comparison.as_deref(),
+                condition.values.as_ref().map_or(0, Vec::len),
+            ));
+        }
+    }
+    for condition in criteria.resource_tag.iter().flatten() {
+        conditions.push((
+            "criteria.resourceTag",
+            CriterionKind::Text,
+            condition.comparison.as_deref(),
+            condition.values.as_ref().map_or(0, Vec::len),
+        ));
+    }
+    for condition in criteria.ebs_volume_size_in_gib.iter().flatten() {
+        conditions.push((
+            "criteria.ebsVolumeSizeInGib",
+            CriterionKind::Numeric,
+            condition.comparison.as_deref(),
+            condition.values.as_ref().map_or(0, Vec::len),
+        ));
+    }
+    for condition in criteria.look_back_period_in_days.iter().flatten() {
+        conditions.push((
+            "criteria.lookBackPeriodInDays",
+            CriterionKind::Numeric,
+            condition.comparison.as_deref(),
+            condition.values.as_ref().map_or(0, Vec::len),
+        ));
+    }
+    for condition in criteria.estimated_monthly_savings.iter().flatten() {
+        conditions.push((
+            "criteria.estimatedMonthlySavings",
+            CriterionKind::Numeric,
+            condition.comparison.as_deref(),
+            condition.values.as_ref().map_or(0, Vec::len),
+        ));
+    }
+    // A `resourceTag` condition is also about one tag KEY, so a condition
+    // without one names no attribute to compare.
+    let missing_tag_key = criteria
+        .resource_tag
+        .iter()
+        .flatten()
+        .any(|condition| condition.key.as_deref().unwrap_or_default().is_empty());
+    if missing_tag_key {
+        return Some(constraint_report(
+            "criteria.resourceTag.member.key",
+            "Member is required",
+        ));
+    }
+
+    conditions
+        .into_iter()
+        .find_map(|(path, kind, comparison, value_count)| {
+            condition_violation(path, kind, comparison, value_count)
+        })
+}
+
+/// Why one criteria condition cannot be evaluated, if it cannot.
+fn condition_violation(
+    path: &str,
+    kind: CriterionKind,
+    comparison: Option<&str>,
+    value_count: usize,
+) -> Option<String> {
+    let Some(comparison) = comparison else {
+        return Some(constraint_report(
+            &format!("{path}.member.comparison"),
+            "Member is required",
+        ));
+    };
+    let (base, _) = split_comparison(comparison);
+    let (accepted, family) = match kind {
+        CriterionKind::Text => (STRING_COMPARISONS, "String"),
+        CriterionKind::Numeric => (NUMERIC_COMPARISONS, "Numeric"),
+    };
+    if !accepted.contains(&base) {
+        return Some(constraint_report(
+            &format!("{path}.member.comparison"),
+            &format!("Member must be a {family} comparison operator for this criterion"),
+        ));
+    }
+    if value_count == 0 {
+        return Some(constraint_report(
+            &format!("{path}.member.values"),
+            "Member must have length greater than or equal to 1",
+        ));
+    }
+    None
+}
+
 /// A total order key for a wire timestamp: `DateTime` carries seconds and
 /// sub-second nanos, so comparing the pair orders two instants exactly.
 pub fn instant_key(at: ::aws_smithy_types::DateTime) -> (i64, u32) {
@@ -913,8 +1364,9 @@ pub struct ComAmazonawsComputeoptimizerautomationComputeoptimizerautomationservi
     /// A recommended action is produced by Compute Optimizer's analysis of the
     /// account's resources, which this emulator does not perform, so nothing in
     /// this API populates it: `StartAutomationEvent` resolves every id against
-    /// this ONE store and `ListRecommendedActions` pages over it, so the two
-    /// never read two copies of one resource.
+    /// this ONE store, `ListRecommendedActions` pages over it and
+    /// `ListAutomationRulePreview` previews it, so no two of them read two
+    /// copies of one resource.
     pub recommended_actions: RecommendedActionStore,
     /// Every automation event, in creation order. Written by the operations
     /// that start and roll back an event; read by the event readers.

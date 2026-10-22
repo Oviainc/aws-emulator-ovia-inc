@@ -7,11 +7,13 @@
 //!
 //! The table is reported `CREATING`, as the doc below states: the status becomes
 //! `ACTIVE` once [`crate::state::STATUS_TRANSITION`] has elapsed, so a caller that
-//! writes an item immediately still sees the transient status. `GlobalSecondaryIndexes`
-//! are stored with the table and reported back in its `TableDescription`; local and
-//! vector indexes, streams, SSE, resource policies and the other members this slice
-//! does not store are refused with the scaffold's 501 and filed as their own gap
-//! issues.
+//! writes an item immediately still sees the transient status.
+//! `GlobalSecondaryIndexes` and `LocalSecondaryIndexes` are stored with the table and
+//! reported back in its `TableDescription` — a local index with the table's own
+//! partition key and its own sort key, and no status or throughput of its own, as the
+//! model's `LocalSecondaryIndexDescription` declares it; vector indexes, streams, SSE,
+//! resource policies and the other members this slice does not store are refused with
+//! the scaffold's 501 and filed as their own gap issues.
 //!
 //! The table is stored under the REGION the request was signed for, because that is
 //! the scope a table name is unique in ("table names must be unique within each
@@ -293,6 +295,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let global_secondary_indexes =
             validated_indexes(&input, &billing_mode, &region, &name, now).map_err(lift)?;
+        let local_secondary_indexes =
+            validated_local_indexes(&input, &key_schema, &global_secondary_indexes, &region, &name)
+                .map_err(lift)?;
 
         let mut store = state.lock();
         store.apply_due_transitions(now);
@@ -346,6 +351,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             provisioned_throughput,
             throughput_history: crate::state::ThroughputHistory::default(),
             global_secondary_indexes,
+            local_secondary_indexes,
             table_class: input.table_class.clone(),
             deletion_protection_enabled: input.deletion_protection_enabled.unwrap_or(false),
             tags,
@@ -372,6 +378,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or_default(),
             global_secondary_indexes = description
                 .global_secondary_indexes
+                .as_ref()
+                .map_or(0, Vec::len),
+            local_secondary_indexes = description
+                .local_secondary_indexes
                 .as_ref()
                 .map_or(0, Vec::len),
             outcome = "created",
@@ -412,13 +422,6 @@ fn too_many_tags(requested: usize) -> CreateTableError {
 
 /// The first input member present that this slice does not store, if any.
 fn unsupported_member(input: &CreateTableInput) -> Option<&'static str> {
-    if input
-        .local_secondary_indexes
-        .as_ref()
-        .is_some_and(|indexes| !indexes.is_empty())
-    {
-        return Some("LocalSecondaryIndexes");
-    }
     if input
         .vector_indexes
         .as_ref()
@@ -508,6 +511,25 @@ fn clamped_lists(input: &CreateTableInput) -> Result<(), crate::state::RequestEr
             )));
         }
     }
+    let local_indexes = input.local_secondary_indexes.as_ref().map_or(0, Vec::len);
+    if local_indexes > crate::state::MAX_LOCAL_SECONDARY_INDEXES {
+        return Err(crate::state::RequestError::Validation(format!(
+            "Invalid LocalSecondaryIndexes: a table may carry at most {} local secondary \
+             indexes, got {local_indexes}",
+            crate::state::MAX_LOCAL_SECONDARY_INDEXES
+        )));
+    }
+    for index in input.local_secondary_indexes.iter().flatten() {
+        if index.key_schema.len() > crate::state::MAX_INDEX_KEY_ELEMENTS {
+            return Err(crate::state::RequestError::Validation(format!(
+                "Invalid KeySchema for index {}: an index key may carry at most {} elements, \
+                 got {}",
+                index.index_name,
+                crate::state::MAX_INDEX_KEY_ELEMENTS,
+                index.key_schema.len()
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -566,12 +588,20 @@ fn validated_key_schema(
     }
     // The key attributes of every requested index, collected ONCE: the loop below asks
     // whether each definition is used, and a per-definition scan of every index's key
-    // schema would be the product of two request-chosen counts.
+    // schema would be the product of two request-chosen counts. Both index kinds declare
+    // their key attributes in the same array, so both are collected here.
     let index_key_attributes: ::std::collections::HashSet<&str> = input
         .global_secondary_indexes
         .iter()
         .flatten()
         .flat_map(|index| index.key_schema.iter())
+        .chain(
+            input
+                .local_secondary_indexes
+                .iter()
+                .flatten()
+                .flat_map(|index| index.key_schema.iter()),
+        )
         .map(|element| element.attribute_name.as_str())
         .collect();
     for definition in &definitions {
@@ -634,6 +664,67 @@ fn validated_indexes(
             transient_status: crate::state::IndexStatus::Creating,
             active_at: now + crate::state::STATUS_TRANSITION,
             throughput_history: crate::state::ThroughputHistory::default(),
+        });
+    }
+    Ok(indexes)
+}
+
+/// The local secondary indexes to store with the table.
+///
+/// A local secondary index is "an index that has the same partition key as the table,
+/// but a different sort key" (the `LocalSecondaryIndex` doc and the Developer Guide), so
+/// each one is refused unless its `HASH` key is the table's own partition key. Beyond
+/// that it is held to the same rules as a global index: a name unique "among all other
+/// indexes on this table" (`LocalSecondaryIndex$IndexName`), key attributes declared in
+/// `AttributeDefinitions` with a scalar type, and a `Projection` the model's
+/// `ProjectionType` enum names. A local index carries no throughput of its own and no
+/// status: it exists from the moment the table does.
+///
+/// [`clamped_lists`] has already bounded every list this walks.
+fn validated_local_indexes(
+    input: &CreateTableInput,
+    table_key_schema: &[KeySchemaElement],
+    global_secondary_indexes: &[crate::state::GlobalSecondaryIndex],
+    region: &str,
+    table: &str,
+) -> Result<Vec<crate::state::LocalSecondaryIndex>, crate::state::RequestError> {
+    let requested = input.local_secondary_indexes.clone().unwrap_or_default();
+    let definitions = input.attribute_definitions.clone().unwrap_or_default();
+    let partition_key = table_key_schema
+        .iter()
+        .find(|element| element.key_type == "HASH")
+        .map_or("", |element| element.attribute_name.as_str());
+    let mut indexes: Vec<crate::state::LocalSecondaryIndex> = Vec::new();
+    for index in &requested {
+        if indexes.iter().any(|stored| stored.name == index.index_name)
+            || global_secondary_indexes
+                .iter()
+                .any(|stored| stored.name == index.index_name)
+        {
+            return Err(crate::state::RequestError::Validation(format!(
+                "Invalid LocalSecondaryIndex: duplicate index name {}",
+                index.index_name
+            )));
+        }
+        validated_index_key_schema(&index.index_name, &index.key_schema, &definitions)?;
+        validated_projection(&index.index_name, &index.projection)?;
+        let hash_key = index
+            .key_schema
+            .iter()
+            .find(|element| element.key_type == "HASH")
+            .map_or("", |element| element.attribute_name.as_str());
+        if hash_key != partition_key {
+            return Err(crate::state::RequestError::Validation(format!(
+                "Invalid KeySchema for index {}: a local secondary index must have the table's \
+                 partition key {partition_key} as its HASH key, got {hash_key}",
+                index.index_name
+            )));
+        }
+        indexes.push(crate::state::LocalSecondaryIndex {
+            arn: crate::state::index_arn(region, table, &index.index_name),
+            name: index.index_name.clone(),
+            key_schema: index.key_schema.clone(),
+            projection: index.projection.clone(),
         });
     }
     Ok(indexes)

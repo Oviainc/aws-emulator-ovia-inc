@@ -246,7 +246,10 @@ async fn a_started_event_is_built_from_the_action_and_settles_on_the_clock() {
             ("eventStatus", "InProgress".to_string()),
             ("resourceArn", action.resource_arn.clone().unwrap_or_default()),
             ("resourceId", action.resource_id.clone().unwrap_or_default()),
-            ("resourceType", action.resource_type.clone().unwrap_or_default()),
+            (
+                "resourceType",
+                action.resource_type.clone().unwrap_or_default(),
+            ),
             ("region", action.region.clone().unwrap_or_default()),
             ("accountId", action.account_id.clone().unwrap_or_default()),
         ] {
