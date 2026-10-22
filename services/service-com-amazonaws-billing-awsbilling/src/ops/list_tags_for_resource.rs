@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the tags stored on the billing view the `resourceArn` names, in key
+//! order.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Taggability is a property of the resource, not of the direction of the call, so
+//! this read draws the same two lines `TagResource` does: a managed billing view is
+//! refused with the modeled `ValidationException` (400) and an ARN naming no stored
+//! resource with `ResourceNotFoundException` (404). A taggable resource with no tags
+//! answers an empty list.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +147,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        // The modeled `resourceArn` pattern is refused by the boundary validator
+        // before this runs.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTagsForResourceErrorModeled::InternalServerException(InternalServerException {
+                message: "the billing view store is unavailable".to_string(),
+            })
+        })?;
+        let state = state.lock();
+
+        // The same two refusals `TagResource` answers, for the same reason: a
+        // managed view's tags are not the customer's to read through this API.
+        if state
+            .billing_views
+            .get(&input.resource_arn)
+            .is_some_and(crate::state::BillingView::is_managed)
+        {
+            return Err(ListTagsForResourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: "Managed billing views cannot be tagged".to_string(),
+                    reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "resourceArn".to_string(),
+                        message: "Managed billing views cannot be tagged".to_string(),
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        let view = state.billing_views.get(&input.resource_arn).ok_or_else(|| {
+            ListTagsForResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("Resource {} not found", input.resource_arn),
+                resource_id: input.resource_arn.clone(),
+                resource_type: crate::state::BILLING_VIEW_RESOURCE_TYPE.to_string(),
+            })
+        })?;
+
+        // `tags` is a BTreeMap, so the list is in key order on every read and a
+        // caller comparing two responses sees a difference only where one is.
+        Ok(ListTagsForResourceOutput {
+            resource_tags: Some(
+                view.tags
+                    .iter()
+                    .map(|(key, value)| ResourceTag {
+                        key: key.clone(),
+                        value: Some(value.clone()),
+                    })
+                    .collect(),
+            ),
+        })
     }
 }

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateSourceViews
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateSourceViews`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Adds source billing views to a stored billing view's source list, then reports
+//! that view's ARN. The association is a set: a source already associated is kept
+//! once, so a replayed request is idempotent (the operation is `@idempotent`).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateSourceViews::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! No view may be its own source — directly or through the chain of views it draws
+//! from — so a request that would close such a loop is refused with the modeled
+//! `ValidationException` (400) and nothing is stored.
 //!
 //! ## Shape of an operation
 //!
@@ -138,6 +136,31 @@ pub struct AssociateSourceViews<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// Refuse a request member as invalid, in the modeled `ValidationException`
+/// shape (HTTP 400) this operation declares.
+fn invalid_field(member: &str, why: &str) -> AssociateSourceViewsError {
+    AssociateSourceViewsErrorModeled::ValidationException(ValidationException {
+        message: why.to_string(),
+        reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: why.to_string(),
+        }]),
+    })
+    .into()
+}
+
+/// The modeled `ResourceNotFoundException` (HTTP 404) for a billing-view ARN no
+/// view is stored under, named by the member that carried it.
+fn not_found(arn: &str, member: &str) -> AssociateSourceViewsError {
+    AssociateSourceViewsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: format!("{member}: billing view {arn} does not exist"),
+        resource_id: arn.to_string(),
+        resource_type: crate::state::BILLING_VIEW_RESOURCE_TYPE.to_string(),
+    })
+    .into()
+}
+
 impl<Eng> AssociateSourceViews<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -164,18 +187,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateSourceViews` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateSourceViewsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateSourceViews"))
+        // The modeled constraints (`arn` pattern, `sourceViews` 1..10 and each
+        // member's pattern) are refused by the boundary validator before this
+        // runs; what is left is the state this request is legal against.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AssociateSourceViewsErrorModeled::InternalServerException(InternalServerException {
+                message: "the billing view store is unavailable".to_string(),
+            })
+        })?;
+        let mut state = state.lock();
+
+        let Some(target) = state.billing_views.get(&input.arn) else {
+            return Err(not_found(&input.arn, "arn"));
+        };
+        let target_is_managed = target.is_managed();
+        let target_health = target.health_status_code.clone();
+        let mut source_views = target.source_views.clone();
+
+        // A view may not draw from itself, directly or through the chain of views
+        // its sources already draw from: such a loop has no well-defined cost
+        // aggregation. The direct case is the degenerate one.
+        for source in &input.source_views {
+            // The direct case is only split out to say so plainly: `draws_from`
+            // already answers true when its start IS the needle.
+            if *source == input.arn {
+                return Err(invalid_field(
+                    "sourceViews",
+                    "A billing view cannot be associated to itself",
+                ));
+            }
+            if state.draws_from(source, &input.arn) {
+                return Err(invalid_field(
+                    "sourceViews",
+                    &format!(
+                        "{source} already draws from {}, so associating it would make \
+                         the billing view its own source",
+                        input.arn
+                    ),
+                ));
+            }
+        }
+
+        // A managed view's definition — which views it aggregates — is the
+        // service's to maintain, not the customer's: see `BillingView::is_managed`.
+        if target_is_managed {
+            return Err(invalid_field(
+                "arn",
+                "Managed billing views cannot be modified",
+            ));
+        }
+
+        // Every source must name a view this account holds, or the association
+        // would point at nothing.
+        for source in &input.source_views {
+            if !state.billing_views.contains_key(source) {
+                return Err(not_found(source, "sourceViews"));
+            }
+        }
+
+        // `BillingViewHealthStatusException`: "a billing view's health status
+        // prevents an operation from being performed … if the billing view is in
+        // a state other than HEALTHY".
+        if target_health != crate::state::BILLING_VIEW_STATUS_HEALTHY {
+            return Err(AssociateSourceViewsErrorModeled::BillingViewHealthStatusException(
+                BillingViewHealthStatusException {
+                    message: format!(
+                        "Billing view {} is {target_health}; it must be {} to associate source views",
+                        input.arn,
+                        crate::state::BILLING_VIEW_STATUS_HEALTHY
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The association is a set, so a source already present adds nothing and
+        // the request stays idempotent.
+        for source in input.source_views {
+            if !source_views.contains(&source) {
+                source_views.push(source);
+            }
+        }
+        if source_views.len() > crate::state::MAX_SOURCE_VIEWS_PER_VIEW {
+            return Err(AssociateSourceViewsErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "A billing view can draw from at most {} source views",
+                        crate::state::MAX_SOURCE_VIEWS_PER_VIEW
+                    ),
+                    resource_id: input.arn.clone(),
+                    resource_type: crate::state::BILLING_VIEW_RESOURCE_TYPE.to_string(),
+                    service_code: crate::state::BILLING_SERVICE_CODE.to_string(),
+                    quota_code: crate::state::SOURCE_VIEWS_QUOTA_CODE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // Nothing above this line writes, so every refusal leaves the view — and
+        // the `sourceViewCount` a later read derives from it — untouched.
+        let now = std::time::SystemTime::now();
+        let view = state.billing_views.get_mut(&input.arn).ok_or_else(|| {
+            AssociateSourceViewsErrorModeled::InternalServerException(InternalServerException {
+                message: format!("Billing view {} disappeared while being updated", input.arn),
+            })
+        })?;
+        let changed = view.source_views != source_views;
+        view.source_views = source_views;
+        if changed {
+            view.updated_at = Some(now);
+            // The set of source views is part of the view definition, so a change
+            // to it moves `viewDefinitionLastUpdatedAt` — the same member
+            // `UpdateBillingView` moves when the data filter expression changes.
+            view.view_definition_last_updated_at = Some(now);
+        }
+
+        Ok(AssociateSourceViewsOutput {
+            arn: view.arn.clone(),
+        })
     }
 }
