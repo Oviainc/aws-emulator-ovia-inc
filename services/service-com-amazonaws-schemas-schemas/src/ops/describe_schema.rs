@@ -187,7 +187,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(DescribeSchemaOutput {
             // Verbatim: the bytes the create/update call stored for this version.
             content: Some(version.content.clone()),
-            description: version.description.clone(),
+            // `Description` is the SCHEMA's metadata, not a property of one
+            // definition, so a read of ANY version reports the schema's current
+            // description — the one the last `UpdateSchema` that sent one stored.
+            description: schema.description.clone(),
             last_modified: Some(schema.last_modified.into()),
             schema_arn: Some(registry.schema_arn_in(&region, schema)),
             schema_name: Some(schema.name.clone()),

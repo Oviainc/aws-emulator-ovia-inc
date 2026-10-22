@@ -264,7 +264,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     version: FIRST_VERSION,
                     content: input.content.clone(),
                     r#type: input.r#type.clone(),
-                    description: input.description.clone(),
                     created_date: now,
                 },
             ))

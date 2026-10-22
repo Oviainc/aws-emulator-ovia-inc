@@ -171,18 +171,19 @@ pub struct Schema {
 /// One version of a schema: the content a caller sent for it.
 ///
 /// The `content`, the `type` and the `created_date` are written once and never
-/// rewritten — a reader of version N gets the bytes version N was minted with. The
-/// `description` is the schema's own metadata as it stood for this version, so an
-/// `UpdateSchema` that changes only the description writes it onto the version that
-/// IS the schema's current definition (the latest) and leaves earlier ones with the
-/// description they were written under.
+/// rewritten — a reader of version N gets the bytes version N was minted with.
+///
+/// A version holds NO description: `Description` is metadata of the SCHEMA, not of a
+/// definition ([`Schema::description`]), so an `UpdateSchema` that changes it changes
+/// what every read of the schema reports, whichever version the read selects. Keeping
+/// a second copy per version is what let a read of one version report a description a
+/// later update had already replaced.
 #[derive(Debug, Clone)]
 pub struct SchemaVersion {
     pub version: u64,
     /// Returned verbatim by `DescribeSchema`.
     pub content: String,
     pub r#type: String,
-    pub description: Option<String>,
     pub created_date: SystemTime,
 }
 
@@ -301,25 +302,25 @@ impl Schema {
     /// earlier number, and two writers cannot be handed the same one, because the
     /// whole mint-and-insert happens under the one state lock the caller already
     /// holds. An existing version is never rewritten.
+    /// The schema's `description` is NOT touched here: it is metadata of the schema
+    /// rather than of a definition, so only a request that sends `Description`
+    /// changes it.
     pub fn add_version(
         &mut self,
         content: String,
         r#type: String,
-        description: Option<String>,
         now: SystemTime,
     ) -> &SchemaVersion {
         let version = self.latest_version.saturating_add(1);
         self.latest_version = version;
         self.last_modified = now;
         self.r#type = r#type.clone();
-        self.description = description.clone();
         self.versions.insert(
             version,
             SchemaVersion {
                 version,
                 content,
                 r#type,
-                description,
                 created_date: now,
             },
         );
@@ -1026,7 +1027,6 @@ fn aws_managed_registries() -> BTreeMap<String, Registry> {
                         version: 1,
                         content: entry.content.clone(),
                         r#type: AWS_MANAGED_SCHEMA_TYPE.to_string(),
-                        description: entry.description.clone(),
                         created_date: now,
                     },
                 ))
@@ -1934,7 +1934,6 @@ mod tests {
                                 version: 1,
                                 content: (*content).to_string(),
                                 r#type: "OpenApi3".to_string(),
-                                description: None,
                                 created_date: now,
                             },
                         ))
@@ -2193,7 +2192,6 @@ mod tests {
                     version: 1,
                     content: "one".to_string(),
                     r#type: "OpenApi3".to_string(),
-                    description: None,
                     created_date: now,
                 },
             ))
@@ -2205,12 +2203,7 @@ mod tests {
         let mut minted = vec![1];
         for round in 0..4 {
             let version = schema
-                .add_version(
-                    format!("content-{round}"),
-                    "OpenApi3".to_string(),
-                    None,
-                    now,
-                )
+                .add_version(format!("content-{round}"), "OpenApi3".to_string(), now)
                 .version;
             assert!(
                 !minted.contains(&version),

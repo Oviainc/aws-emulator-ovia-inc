@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRegistry
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRegistry`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRegistry::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes a registry's new description into the stored registry, so every later read
+//! of it reports what this call stored.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +143,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRegistry` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRegistryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRegistry"))
+        // A registry a caller created reports the ARN its create minted; a
+        // service-owned one was created by no request, so its ARN names the region
+        // THIS request is signed for. Nothing here derives an ARN itself.
+        let region = crate::state::request_region(ctx.parts());
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateRegistryError::from(UpdateRegistryErrorModeled::InternalServerErrorException(
+                crate::state::internal_error(),
+            ))
+        })?;
+        // ONE lock for the read-decide-write, so the registry this call answers from is
+        // the one it just wrote.
+        let mut state = store.lock();
+
+        let registry = state
+            .registries
+            .get_mut(&input.registry_name)
+            .ok_or_else(|| {
+                UpdateRegistryError::from(UpdateRegistryErrorModeled::NotFoundException(
+                    crate::state::registry_not_found(&input.registry_name),
+                ))
+            })?;
+
+        // A service-owned registry is AWS's, not the caller's, so its description is
+        // not a caller's to rewrite — the same refusal every other write to one gets.
+        if registry.scope.is_managed() {
+            return Err(UpdateRegistryErrorModeled::ForbiddenException(
+                crate::state::managed_registry_is_read_only(&input.registry_name),
+            )
+            .into());
+        }
+
+        // The whole point of the call: the description the request sends REPLACES the
+        // stored one, so a later `DescribeRegistry`/`ListRegistries` reports it. An
+        // absent `Description` asks for no change rather than clearing it, exactly as
+        // `UpdateSchema` treats a member its request does not send.
+        if let Some(description) = input.description {
+            registry.description = Some(description);
+        }
+
+        // Answer from the STORED registry rather than from `input`, so this response
+        // can only ever describe what a later read will report.
+        Ok(UpdateRegistryOutput {
+            description: registry.description.clone(),
+            registry_arn: Some(registry.arn_in(&region)),
+            registry_name: Some(registry.name.clone()),
+            tags: crate::state::tags_to_output(&registry.tags),
+        })
     }
 }

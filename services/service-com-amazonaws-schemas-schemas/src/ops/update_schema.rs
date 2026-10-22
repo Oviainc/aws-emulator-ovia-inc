@@ -237,7 +237,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // Unless this is a RETRY of a call that already wrote one: the token
                 // the first attempt carried names the version it minted, and a retry
                 // must answer that rather than write the same definition twice. A
-                // token whose version has since been deleted names nothing.
+                // token whose version has since been deleted names nothing. A retry
+                // that resolves to an already-minted version writes NOTHING at all —
+                // not even a `Description` it carries: the first attempt's call is
+                // the one that happened.
                 let already_minted = input
                     .client_token_id
                     .as_deref()
@@ -267,14 +270,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             )
                             .into());
                         }
-                        // An absent `Description` leaves the schema's description as
-                        // it is, rather than clearing it: a member a request does not
-                        // send asks for no change.
-                        let description = input
-                            .description
-                            .clone()
-                            .or_else(|| schema.description.clone());
-                        let minted = schema.add_version(content, r#type, description, now).version;
+                        // `Description` is metadata of the SCHEMA, so a request
+                        // that sends it replaces the stored one and a request that
+                        // omits it asks for no change — whether or not the same call
+                        // also writes a new definition.
+                        if let Some(description) = input.description {
+                            schema.description = Some(description);
+                        }
+                        let minted = schema.add_version(content, r#type, now).version;
                         if let Some(token) = input.client_token_id.clone() {
                             schema.minted_by_token.insert(token, minted);
                         }
@@ -285,16 +288,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // No `Content`: the definition is unchanged, so no version is minted and
             // the only thing a request can still change is the description.
             None => {
-                if let Some(description) = input.description.clone() {
-                    schema.description = Some(description.clone());
-                    // `DescribeSchema` reports the description recorded WITH a
-                    // version, and the latest version is the schema's current
-                    // definition, so the new description has to reach it or no read
-                    // would ever show it. Earlier versions keep theirs.
-                    let latest = schema.latest_version;
-                    if let Some(version) = schema.versions.get_mut(&latest) {
-                        version.description = Some(description);
-                    }
+                if let Some(description) = input.description {
+                    // The same write as above: the description belongs to the schema,
+                    // so this is what every later read of it reports, whichever
+                    // version that read selects.
+                    schema.description = Some(description);
                     schema.last_modified = now;
                 }
                 schema.latest_version
@@ -313,7 +311,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clone();
         let schema_arn = schema.arn.clone();
         Ok(UpdateSchemaOutput {
-            description: version.description.clone(),
+            // The schema's own metadata, not the version's: the description a read
+            // reports is the schema's current one.
+            description: schema.description.clone(),
             last_modified: Some(schema.last_modified.into()),
             schema_arn: Some(schema_arn),
             schema_name: Some(schema.name.clone()),
