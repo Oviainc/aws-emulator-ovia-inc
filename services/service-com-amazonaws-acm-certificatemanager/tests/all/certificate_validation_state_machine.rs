@@ -191,11 +191,22 @@ fn assert_terminal(case: &str, detail: &Value, expected: &str, method: &str) {
                     );
                 }
             }
-            // Nothing was issued, so no issuance member exists.
-            for absent in ["IssuedAt", "NotBefore", "NotAfter", "KeyUsages", "ExtendedKeyUsages"] {
+            // Nothing was issued, so no issuance member exists. The X.509 key-usage
+            // lists are not among them: a certificate ACM has not issued reports them
+            // as EMPTY LISTS (the recorded DescribeCertificate response of a
+            // not-yet-issued certificate carries `KeyUsages: []` and
+            // `ExtendedKeyUsages: []`), not as missing members.
+            for absent in ["IssuedAt", "NotBefore", "NotAfter"] {
                 assert!(
                     detail[absent].is_null(),
                     "case {case}: {absent} cannot exist without issuance, got {detail}"
+                );
+            }
+            for empty in ["KeyUsages", "ExtendedKeyUsages"] {
+                assert_eq!(
+                    detail[empty],
+                    json!([]),
+                    "case {case}: expected {empty} to be the empty list without issuance, got {detail}"
                 );
             }
         }

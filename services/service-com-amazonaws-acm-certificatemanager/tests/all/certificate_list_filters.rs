@@ -95,11 +95,15 @@ async fn list_certificates_selects_on_the_stored_key_algorithm() {
             }),
         )
         .await;
-        // The algorithm reached the record, which is what the filters select on.
+        // The algorithm reached the record, which is what the filters select on; the
+        // detail reports it as the hyphenated X.509 descriptor, whose spelling comes
+        // from the literal catalog in [`crate::certificate_detail_projection`].
         let detail = describe(&router, &arn).await;
+        let (described, _) =
+            crate::certificate_detail_projection::algorithm_forms(Some(algorithm));
         assert_eq!(
             detail["KeyAlgorithm"].as_str(),
-            Some(*algorithm),
+            Some(described),
             "case {algorithm}: expected the requested KeyAlgorithm on the record, got {detail}"
         );
         created.push((algorithm, arn));
@@ -193,7 +197,7 @@ async fn summaries_are_projected_from_the_record_the_filters_select_on() {
         created.len(),
         "expected one summary per created certificate, got {summaries:?}"
     );
-    for ((domain, export, managed_by, expected_export), arn) in &created {
+    for ((domain, _export, managed_by, expected_export), arn) in &created {
         let summary = summaries
             .iter()
             .find(|summary| summary["CertificateArn"].as_str() == Some(arn.as_str()))
@@ -213,12 +217,13 @@ async fn summaries_are_projected_from_the_record_the_filters_select_on() {
         }
 
         // The options the request named are on the record too, so a describe reports
-        // the same opt-in the summary projects.
+        // the same opt-in the summary projects — defaulted, as the summary's own
+        // `ExportOption` is, when the request named none.
         let detail = describe(&router, arn).await;
         assert_eq!(
             detail["Options"]["Export"],
-            export.map_or(Value::Null, |e| json!(e)),
-            "case {domain}: expected the stored Options.Export to be {export:?}, got {detail}"
+            json!(expected_export),
+            "case {domain}: expected the described Options.Export to be {expected_export}, got {detail}"
         );
     }
 
@@ -344,7 +349,8 @@ async fn the_stored_validation_method_comes_from_the_request_then_its_options() 
             "case {case}: expected one validation per domain name, got {detail}"
         );
         // The evidence each method publishes: a CNAME to add for DNS, the URLs the CA
-        // fetches for HTTP, the mailboxes ACM wrote to for EMAIL.
+        // fetches for HTTP, and for EMAIL the mailbox list itself — reported as a list
+        // for an email-validated name, empty because no message has been sent.
         let evidence = match *expected {
             "DNS" => "ResourceRecord",
             "HTTP" => "HttpRedirect",
@@ -356,10 +362,18 @@ async fn the_stored_validation_method_comes_from_the_request_then_its_options() 
                 Some(*expected),
                 "case {case}: expected ValidationMethod {expected}, got {validation}"
             );
-            assert!(
-                !validation[evidence].is_null(),
-                "case {case}: expected {evidence} beside ValidationMethod {expected}, got {validation}"
-            );
+            if evidence == "ValidationEmails" {
+                assert_eq!(
+                    validation["ValidationEmails"],
+                    json!([]),
+                    "case {case}: expected an empty mailbox list beside ValidationMethod {expected}, got {validation}"
+                );
+            } else {
+                assert!(
+                    !validation[evidence].is_null(),
+                    "case {case}: expected {evidence} beside ValidationMethod {expected}, got {validation}"
+                );
+            }
         }
     }
 }

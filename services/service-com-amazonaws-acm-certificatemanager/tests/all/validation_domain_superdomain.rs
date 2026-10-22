@@ -185,22 +185,14 @@ async fn validation_domain_must_be_the_domain_or_a_superdomain() {
                 "case {case:?}: expected the stored ValidationDomain to be \
                  {expected_suffix}, got {validation}"
             );
-            let mailboxes: Vec<&str> = validation["ValidationEmails"]
-                .as_array()
-                .unwrap_or_else(|| {
-                    panic!("case {case:?}: no ValidationEmails in {validation}")
-                })
-                .iter()
-                .map(|value| value.as_str().unwrap_or_default())
-                .collect();
-            assert!(
-                !mailboxes.is_empty()
-                    && mailboxes.iter().all(|mailbox| mailbox
-                        .rsplit('@')
-                        .next()
-                        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(expected_suffix))),
-                "case {case:?}: every validation mailbox must sit at {expected_suffix}, \
-                 got {mailboxes:?}"
+            // The mailbox list of an email-validated name holds the messages ACM has
+            // SENT; nothing here sends mail, so it is the empty list rather than a set
+            // of invented addresses. (The recorded DescribeCertificate response of an
+            // email-validated certificate carries no mailbox entries either.)
+            assert_eq!(
+                validation["ValidationEmails"],
+                json!([]),
+                "case {case:?}: no validation email has been sent, got {validation}"
             );
         } else {
             assert_eq!(

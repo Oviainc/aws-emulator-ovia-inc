@@ -155,6 +155,17 @@ pub const KEY_PAIR_ORIGIN_AWS_MANAGED: &str = "AWS_MANAGED";
 /// (`CertificateOptions$Export` doc).
 pub const EXPORT_DISABLED: &str = "DISABLED";
 
+/// `CertificateTransparencyLoggingPreference` when `Options` names none: "All public
+/// certificates are recorded in a certificate transparency log" and "certificate
+/// transparency logging opt-out is no longer available" (`CertificateOptions` doc), so
+/// a certificate that asked for nothing is logged.
+pub const TRANSPARENCY_LOGGING_ENABLED: &str = "ENABLED";
+
+/// `CertificateDetail$Issuer` ("the name of the certificate authority that issued and
+/// signed the certificate") for a public certificate ACM issues: Amazon's own CA
+/// signs it.
+pub const ISSUER_AMAZON: &str = "Amazon";
+
 /// `CertificateExport` of a certificate whose owner opted in to export: "You can opt
 /// in to allow the export of your certificates by specifying ENABLED. You cannot
 /// update the value of Export after the the certificate is created"
@@ -169,16 +180,6 @@ pub const RECORD_TYPE_CNAME: &str = "CNAME";
 
 /// The zone ACM publishes DNS-validation CNAME targets under.
 pub const ACM_VALIDATIONS_ZONE: &str = "acm-validations.aws";
-
-/// The mailbox local-parts ACM sends domain-validation email to, beside the domain's
-/// registered contacts, for `ValidationMethod=EMAIL`.
-pub const VALIDATION_EMAIL_LOCAL_PARTS: &[&str] = &[
-    "administrator",
-    "hostmaster",
-    "postmaster",
-    "webmaster",
-    "admin",
-];
 
 /// The path a CA fetches an HTTP domain-validation token from — the
 /// `/.well-known/pki-validation/` location the CA/Browser Forum baseline
@@ -323,18 +324,20 @@ pub struct DomainValidationRecord {
     pub validation_status: String,
     /// A `ValidationMethod` value.
     pub validation_method: String,
-    /// The domain ACM mails, for email validation.
+    /// The domain ACM proves control of for this name — "the domain name that ACM
+    /// used to send domain validation emails" — which is the name itself unless the
+    /// request named another in `DomainValidationOptions`.
     pub validation_domain: Option<String>,
     /// The validation domain the certificate was REQUESTED with for this name
-    /// (`DomainValidationOption$ValidationDomain`), kept whatever method is in force.
-    ///
-    /// [`Self::validation_domain`] is reported only for email validation, because it
-    /// is "the domain name that ACM used to send domain validation emails"; this is
-    /// the configuration that choice came from, so a certificate migrated away from
-    /// `EMAIL` and back mails the domain the request named rather than the covered
-    /// name itself.
+    /// (`DomainValidationOption$ValidationDomain`), kept whatever method is in force,
+    /// so a certificate migrated away from `EMAIL` and back mails the domain the
+    /// request named rather than the covered name itself.
     pub requested_validation_domain: Option<String>,
-    /// The mailboxes ACM mailed, for email validation.
+    /// The mailboxes ACM has sent a domain-validation email to: one entry per message
+    /// sent, for a name ACM validates BY EMAIL. Nothing sends mail at request time, so
+    /// the list stays empty until `ResendValidationEmail` writes to it; a name
+    /// validated by DNS or HTTP has no mailbox list at all, which is what
+    /// [`domain_validation`] reports from the record's own method.
     pub validation_emails: Vec<String>,
     /// The CNAME to publish, for DNS validation.
     pub resource_record: Option<ResourceRecord>,
@@ -394,8 +397,19 @@ pub struct Certificate {
     pub status: String,
     /// A `CertificateType` value.
     pub cert_type: String,
-    /// A `KeyAlgorithm` value.
+    /// A `KeyAlgorithm` value, in the model enum's spelling (`RSA_2048`) — the
+    /// spelling the request and the `Includes.keyTypes` filter use. The detail
+    /// projection reports it through [`detail_key_algorithm`].
     pub key_algorithm: String,
+    /// "The name of the entity that is associated with the public key contained in the
+    /// certificate" (`CertificateDetail$Subject`): the subject distinguished name,
+    /// which ACM fixes when it accepts the request — see
+    /// [`subject_distinguished_name`].
+    pub subject: Option<String>,
+    /// The name of the CA that signs the certificate ([`issuer_name`]).
+    pub issuer: Option<String>,
+    /// The algorithm that CA signs with ([`signature_algorithm`]).
+    pub signature_algorithm: Option<String>,
     /// A `CertificateKeyPairOrigin` value.
     pub key_pair_origin: String,
     /// A `ValidationMethod` value, for a certificate ACM has to validate.
@@ -917,6 +931,22 @@ pub fn validation_target(domain_name: &str) -> &str {
     domain_name.strip_prefix("*.").unwrap_or(domain_name)
 }
 
+/// The mailbox local-parts ACM sends a domain-validation email to: "ACM sends email
+/// to the the following five addresses: admin@<suffix> administrator@<suffix>
+/// hostmaster@<suffix> postmaster@<suffix> webmaster@<suffix>"
+/// (`ResendValidationEmailRequest$ValidationDomain` doc).
+///
+/// A certificate's `ValidationEmails` lists the addresses ACM HAS written to, so these
+/// are rendered onto a record by the call that sends the mail
+/// (`ResendValidationEmail`), never by the describe that reports it.
+pub const VALIDATION_EMAIL_LOCAL_PARTS: &[&str] = &[
+    "admin",
+    "administrator",
+    "hostmaster",
+    "postmaster",
+    "webmaster",
+];
+
 /// The mailboxes ACM sends a domain's validation email to, at `mail_suffix`.
 ///
 /// "ACM sends email to the the following five addresses:
@@ -984,8 +1014,20 @@ pub fn domain_validation_record(
         domain_name: domain_name.to_string(),
         validation_status: DOMAIN_STATUS_PENDING_VALIDATION.to_string(),
         validation_method: validation_method.to_string(),
-        validation_domain: None,
+        // The domain whose control is being proven, whatever the method proves it
+        // with: the one the request named for this name, else the name itself. It is
+        // also the SUFFIX of the mailboxes ACM writes to, and a mail suffix carries no
+        // wildcard label — a certificate that validates `*.example.com` through itself
+        // is mailed at `example.com`, the domain ACM proves control of.
+        validation_domain: Some(
+            validation_domain
+                .map(validation_target)
+                .unwrap_or(target)
+                .to_string(),
+        ),
         requested_validation_domain: validation_domain.map(str::to_string),
+        // Minting a validation sends no mail: the mailbox list names the messages ACM
+        // HAS sent, which is what `ResendValidationEmail` records.
         validation_emails: Vec::new(),
         resource_record: None,
         http_redirect: None,
@@ -1010,16 +1052,10 @@ pub fn domain_validation_record(
                 )),
             });
         }
-        // EMAIL, and the default when no method was named.
-        _ => {
-            // The validation domain is the SUFFIX of the mailboxes ACM writes to, and
-            // a mail suffix carries no wildcard label: a request that validates
-            // `*.example.com` through itself is mailed at `example.com`, the domain
-            // ACM proves control of.
-            let mailed = validation_domain.map(validation_target).unwrap_or(target);
-            record.validation_domain = Some(mailed.to_string());
-            record.validation_emails = validation_mailboxes(mailed);
-        }
+        // EMAIL, and the default when no method was named: the validation domain ACM
+        // mails is already on the record, and the mailboxes it wrote to are recorded
+        // by the call that writes them.
+        _ => {}
     }
     record
 }
@@ -1098,6 +1134,84 @@ pub fn export_option(cert: &Certificate) -> String {
         .unwrap_or_else(|| EXPORT_DISABLED.to_string())
 }
 
+/// A certificate's `CertificateOptions` as a response reports them: every preference
+/// the certificate carries, defaulted where the request named none, so a client that
+/// set one can read it back and one that set nothing sees what ACM applied.
+///
+/// `ValidationMethod` is reported from the certificate's own options: it is the
+/// preference a request or an `UpdateCertificateOptions` named there, and a
+/// certificate whose options never named one reports none — the method each name is
+/// being validated by is reported per domain, in `DomainValidation$ValidationMethod`.
+pub fn certificate_options(cert: &Certificate) -> CertificateOptions {
+    CertificateOptions {
+        certificate_transparency_logging_preference: Some(
+            cert.options
+                .as_ref()
+                .and_then(|options| options.certificate_transparency_logging_preference.clone())
+                .unwrap_or_else(|| TRANSPARENCY_LOGGING_ENABLED.to_string()),
+        ),
+        export: Some(export_option(cert)),
+        validation_method: cert
+            .options
+            .as_ref()
+            .and_then(|options| options.validation_method.clone()),
+    }
+}
+
+/// `CertificateDetail$Subject`: the subject distinguished name of a certificate whose
+/// common name is `common_name`, in the `CN=<name>` form an X.509 subject is written
+/// in.
+pub fn subject_distinguished_name(common_name: &str) -> String {
+    format!("CN={common_name}")
+}
+
+/// `CertificateDetail$Issuer`: the name of the CA that signs the certificate.
+///
+/// A public certificate ACM issues is signed by Amazon's own CA ([`ISSUER_AMAZON`]).
+/// One ACM issues from a private CA is signed by that CA, whose subject name lives in
+/// Private CA's own store and not in this service's, so no issuer is reported for it.
+pub fn issuer_name(certificate_authority_arn: Option<&str>) -> Option<String> {
+    certificate_authority_arn
+        .is_none()
+        .then(|| ISSUER_AMAZON.to_string())
+}
+
+/// `CertificateDetail$SignatureAlgorithm`: "the algorithm that was used to sign the
+/// certificate", as the `<hash>WITH<key family>` spelling AWS reports it in, or `None`
+/// for a key algorithm of no family this service knows how to sign with — an absent
+/// member rather than a wrong one.
+///
+/// ACM signs with SHA-256, so the stored `KeyAlgorithm`'s family picks the rest:
+/// `SHA256WITHRSA` for an RSA key pair and `SHA256WITHECDSA` for an elliptic-curve
+/// one. Both spellings are the sibling Private CA model's `SigningAlgorithm` values
+/// (`smithy_query(query="shape", shape="com.amazonaws.acmpca#SigningAlgorithm")`).
+///
+/// The family is the part of the `KeyAlgorithm` BEFORE its separator (`EC` of
+/// `EC_prime256v1`), matched in full, so neither a name that merely begins with those
+/// letters nor a family the model adds later is reported as one of these two.
+pub fn signature_algorithm(key_algorithm: &str) -> Option<String> {
+    // The family is the part before the first separator (`EC` of `EC_prime256v1`),
+    // and a name with no separator is its own family.
+    let family = match key_algorithm
+        .split_once('_')
+        .map(|(family, _)| family)
+        .unwrap_or(key_algorithm)
+    {
+        "RSA" => "RSA",
+        "EC" => "ECDSA",
+        _ => return None,
+    };
+    Some(format!("SHA256WITH{family}"))
+}
+
+/// `KeyAlgorithm` as a certificate's detail reports it: the X.509 algorithm
+/// descriptor, whose family and parameter are joined by a HYPHEN (`RSA-2048`,
+/// `EC-prime256v1`), rather than the model enum's underscored name (`RSA_2048`) that
+/// a request and the `Includes.keyTypes` filter are written in.
+pub fn detail_key_algorithm(key_algorithm: &str) -> String {
+    key_algorithm.replacen('_', "-", 1)
+}
+
 /// The account's expiry-events configuration as the modelled
 /// `ExpiryEventsConfiguration`: what `PutAccountConfiguration` stored, or the
 /// documented default for an account that has written none.
@@ -1139,8 +1253,11 @@ fn domain_validation(record: &DomainValidationRecord) -> DomainValidation {
 
 /// A stored certificate as `DescribeCertificate`'s `CertificateDetail`.
 ///
-/// Members that exist only once a certificate has been issued (`Serial`, `Subject`,
-/// `Issuer`, `SignatureAlgorithm`, the key usages, `IssuedAt`, `NotBefore` /
+/// Every member the certificate's own state decides is reported: the X.509 identity
+/// ACM fixed when it accepted the request (`Subject`, `Issuer`,
+/// `SignatureAlgorithm`), the key-usage extension lists (empty, as lists, while the
+/// certificate is still pending) and the full `Options`. Members that come into
+/// existence only with the certificate itself (`Serial`, `IssuedAt`, `NotBefore` /
 /// `NotAfter`) stay absent until the record carries them.
 pub fn certificate_detail(cert: &Certificate) -> CertificateDetail {
     CertificateDetail {
@@ -1155,19 +1272,22 @@ pub fn certificate_detail(cert: &Certificate) -> CertificateDetail {
         status: Some(cert.status.clone()),
         not_before: cert.not_before.map(to_date_time),
         not_after: cert.not_after.map(to_date_time),
-        key_algorithm: Some(cert.key_algorithm.clone()),
+        key_algorithm: Some(detail_key_algorithm(&cert.key_algorithm)),
+        subject: cert.subject.clone(),
+        issuer: cert.issuer.clone(),
+        signature_algorithm: cert.signature_algorithm.clone(),
         in_use_by: Some(cert.in_use_by.clone()),
-        // The X.509 key-usage extensions of an issued certificate; absent while the
-        // record carries none.
-        key_usages: (!cert.key_usages.is_empty()).then(|| {
+        // The X.509 key-usage extensions the certificate carries. A pending
+        // certificate has none yet, which is the EMPTY list, not a missing member.
+        key_usages: Some(
             cert.key_usages
                 .iter()
                 .map(|name| KeyUsage {
                     name: Some(name.clone()),
                 })
-                .collect()
-        }),
-        extended_key_usages: (!cert.extended_key_usages.is_empty()).then(|| {
+                .collect(),
+        ),
+        extended_key_usages: Some(
             cert.extended_key_usages
                 .iter()
                 .map(|name| ExtendedKeyUsage {
@@ -1176,8 +1296,8 @@ pub fn certificate_detail(cert: &Certificate) -> CertificateDetail {
                     // certificate carries.
                     oid: None,
                 })
-                .collect()
-        }),
+                .collect(),
+        ),
         r#type: Some(cert.cert_type.clone()),
         certificate_authority_arn: cert.certificate_authority_arn.clone(),
         renewal_eligibility: Some(cert.renewal_eligibility.clone()),
@@ -1189,7 +1309,7 @@ pub fn certificate_detail(cert: &Certificate) -> CertificateDetail {
         // only ever carries them together with that status.
         revoked_at: cert.revoked_at.map(to_date_time),
         revocation_reason: cert.revocation_reason.clone(),
-        options: cert.options.clone(),
+        options: Some(certificate_options(cert)),
         certificate_key_pair_origin: Some(cert.key_pair_origin.clone()),
         ..CertificateDetail::default()
     }
@@ -1212,6 +1332,10 @@ pub fn certificate_summary(cert: &Certificate) -> CertificateSummary {
         has_additional_subject_alternative_names: Some(total_sans > shown),
         status: Some(cert.status.clone()),
         r#type: Some(cert.cert_type.clone()),
+        // The summary reports the algorithm in the model enum's spelling — the one a
+        // request's `Includes.keyTypes` is written in and this very list is filtered
+        // on. Only the certificate's DETAIL carries the X.509 descriptor spelling
+        // (see [`detail_key_algorithm`]).
         key_algorithm: Some(cert.key_algorithm.clone()),
         // The X.509 key-usage extension names of an issued certificate; absent while
         // the record carries none.
@@ -1265,9 +1389,10 @@ pub fn acme_endpoint_detail(endpoint: &AcmeEndpointRecord) -> AcmeEndpoint {
 /// Members that belong to something this service never does stay absent, and are the
 /// members the search filters correspondingly keep nothing on:
 ///
-/// * `X509Attributes.Issuer` and `X509Attributes.SerialNumber` are minted by the
-///   certificate authority that signs an X.509 certificate, and this emulator signs
-///   none — the same reason [`certificate_detail`] reports no `Issuer` or `Serial`.
+/// * `X509Attributes.Issuer` is the issuing CA's distinguished NAME, and
+///   `X509Attributes.SerialNumber` the serial that CA assigns when it signs; this
+///   emulator signs no X.509 certificate, so it holds neither. (The detail's own
+///   `Issuer` member is a plain CA name, which [`issuer_name`] does report.)
 /// * `AcmCertificateMetadata.ImportedAt` dates an import, `RenewalStatus` belongs to
 ///   a renewal ACM has started, and the ACME members to a certificate obtained
 ///   through an ACME endpoint; no stored record carries any of them. `RevokedAt` is
@@ -1291,7 +1416,11 @@ pub fn certificate_search_result(cert: &Certificate) -> CertificateSearchResult 
                     .map(|name| GeneralName::DnsName(name.clone()))
                     .collect(),
             ),
-            key_algorithm: Some(cert.key_algorithm.clone()),
+            // These attributes are "extracted from the certificate" (`X509Attributes`
+            // doc), so the key algorithm is reported in the same X.509 descriptor
+            // spelling the certificate's detail uses, not in the model enum's
+            // underscored spelling the search FILTERS are written in.
+            key_algorithm: Some(detail_key_algorithm(&cert.key_algorithm)),
             // The X.509 key-usage extensions of an issued certificate; absent while
             // the record carries none.
             key_usages: (!cert.key_usages.is_empty()).then(|| cert.key_usages.clone()),

@@ -367,6 +367,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             subject_alternative_names: names,
             status: crate::state::STATUS_PENDING_VALIDATION.to_string(),
             cert_type: crate::state::TYPE_AMAZON_ISSUED.to_string(),
+            // The X.509 identity ACM fixes when it accepts the request: the subject
+            // distinguished name of the certificate's common name, the CA that will
+            // sign it and the algorithm that CA signs with.
+            subject: Some(crate::state::subject_distinguished_name(
+                &input.domain_name,
+            )),
+            issuer: crate::state::issuer_name(input.certificate_authority_arn.as_deref()),
+            signature_algorithm: crate::state::signature_algorithm(&key_algorithm),
             key_algorithm,
             key_pair_origin: crate::state::KEY_PAIR_ORIGIN_AWS_MANAGED.to_string(),
             validation_method: Some(validation_method.clone()),
