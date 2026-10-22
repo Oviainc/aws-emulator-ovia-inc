@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeContainerInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeContainerInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeContainerInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Describes the container instances a request names, rendered from what
+//! `RegisterContainerInstance` STORED; an id that names nothing is reported as a
+//! `MISSING` failure rather than refusing the whole request. A reporting operation.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +156,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeContainerInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeContainerInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeContainerInstances"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeContainerInstancesErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx);
+        let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
+        let fields = crate::state::ContainerInstanceFields::from_include(input.include.as_ref());
+
+        // One request names at most `MAX_DESCRIBE_BATCH` instances, so the work it does
+        // and the bytes it answers with are bounded however long its list is.
+        if input.container_instances.len() > crate::state::MAX_DESCRIBE_BATCH {
+            return Err(
+                DescribeContainerInstancesErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "containerInstances must name at most {} container instances; got {}",
+                            crate::state::MAX_DESCRIBE_BATCH,
+                            input.container_instances.len()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut guard = state.lock();
+        guard.advance_clock(::std::time::SystemTime::now());
+
+        if !guard.clusters.contains_key(&cluster_name) {
+            return Err(
+                DescribeContainerInstancesErrorModeled::ClusterNotFoundException(
+                    ClusterNotFoundException {
+                        message: Some(format!("cluster {cluster_name:?} was not found")),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut container_instances = Vec::new();
+        let mut failures = Vec::new();
+        // An instance is reported once however many times the request names it: the same
+        // id repeated names the same instance, so it is one answer, not one per entry.
+        let mut seen = ::std::collections::HashSet::new();
+        for reference in &input.container_instances {
+            let arn = crate::state::container_instance_arn_from_reference(
+                &region,
+                &cluster_name,
+                reference,
+            );
+            if !seen.insert(arn.clone()) {
+                continue;
+            }
+            match guard
+                .container_instances
+                .get(&arn)
+                .filter(|instance| instance.cluster_name == cluster_name)
+            {
+                Some(instance) => container_instances.push(instance.view(fields)),
+                None => failures.push(crate::state::missing_failure(&arn)),
+            }
+        }
+
+        Ok(DescribeContainerInstancesOutput {
+            container_instances: Some(container_instances),
+            failures: Some(failures),
+        })
     }
 }

@@ -29,12 +29,16 @@ const USERS: &[(&str, &str)] = &[
 ];
 
 /// The account id every emulated ARN carries (`engine::emulator_account_id`).
-fn account_id() -> &'static str {
+///
+/// This module's awsQuery harness is shared with the other suites in this crate
+/// (`tests/all/service_linked_roles.rs`), so a request a test drives is built and
+/// read exactly one way.
+pub(crate) fn account_id() -> &'static str {
     engine::emulator_account_id()
 }
 
 /// A router serving only this service, over a single shared engine.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The suite drives unsigned requests, so no authenticator is registered.
@@ -47,7 +51,11 @@ fn router() -> MultiServiceRouter {
 
 /// One awsQuery call: `Action` plus form parameters, answered with the HTTP status
 /// and the XML body.
-async fn call(router: &MultiServiceRouter, action: &str, params: &[(&str, &str)]) -> (u16, String) {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    action: &str,
+    params: &[(&str, &str)],
+) -> (u16, String) {
     let mut body = format!("Action={action}&Version=2010-05-08");
     for (name, value) in params {
         body.push('&');
@@ -93,7 +101,7 @@ fn form_encode(value: &str) -> String {
 /// (`services/service-com-amazonaws-sts-awssecuritytokenservicev20110615/tests/all/sts_sessions.rs`):
 /// every tag this suite asks for is a LEAF whose content is text, so there is no
 /// nesting to track.
-fn elements(body: &str, tag: &str) -> Vec<String> {
+pub(crate) fn elements(body: &str, tag: &str) -> Vec<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let mut found = Vec::new();
@@ -114,7 +122,7 @@ fn elements(body: &str, tag: &str) -> Vec<String> {
 }
 
 /// The text of the single `<tag>` element the body must carry.
-fn element(body: &str, tag: &str) -> String {
+pub(crate) fn element(body: &str, tag: &str) -> String {
     let found = elements(body, tag);
     assert_eq!(
         found.len(),
@@ -167,7 +175,7 @@ fn unescape(text: &str) -> String {
 }
 
 /// The awsQuery error code (`<Code>`) of a failure envelope.
-fn error_code(body: &str) -> String {
+pub(crate) fn error_code(body: &str) -> String {
     element(body, "Code")
 }
 

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutSnapshotBlock
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutSnapshotBlock`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutSnapshotBlock::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: stores the request's bytes under (snapshot id, block index) in the
+//! pending snapshot's block map and answers with the checksum computed over what was
+//! persisted.
 //!
 //! ## Shape of an operation
 //!
@@ -111,6 +106,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use crate::state::{
+    blocks_in_volume, checksum_base64_sha256, BlockEntry, SnapshotStatus,
+    CHECKSUM_ALGORITHM_SHA256, MAX_STORED_BLOCKS_PER_SNAPSHOT, MAX_STORED_BLOCKS_TOTAL,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -184,18 +186,192 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutSnapshotBlock` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutSnapshotBlockErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutSnapshotBlock"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(no_state)?;
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        store.expire_due_snapshots(now);
+
+        let Some(snapshot) = store.snapshots.get(&input.snapshot_id) else {
+            return Err(not_found(format!(
+                "snapshot {} does not exist",
+                input.snapshot_id
+            )));
+        };
+        let (status, block_size, volume_size, stored_blocks, index_already_written) = (
+            snapshot.status,
+            snapshot.block_size,
+            snapshot.volume_size,
+            snapshot.blocks.len(),
+            snapshot.blocks.contains_key(&input.block_index),
+        );
+
+        // "The target snapshot must be in the pending state."
+        if status != SnapshotStatus::Pending {
+            return Err(validation(
+                "INVALID_SNAPSHOT_ID",
+                format!(
+                    "snapshot {} is {}; blocks can only be written to a pending snapshot",
+                    input.snapshot_id,
+                    status.as_wire()
+                ),
+            ));
+        }
+
+        // `BlockIndex` is "a logical index in units of 512 KiB blocks … (logical offset
+        // of data/524288)", so an index at or past the snapshot's own volume extent
+        // names an offset outside the volume.
+        let index_limit = blocks_in_volume(volume_size);
+        if i64::from(input.block_index) >= index_limit {
+            return Err(validation(
+                "INVALID_BLOCK",
+                format!(
+                    "BlockIndex {} is outside a {volume_size} GiB volume, which addresses block indexes 0..{index_limit}",
+                    input.block_index
+                ),
+            ));
+        }
+
+        // `DataLength`: "Currently, the only supported size is 524288 bytes. Valid
+        // values: 524288."
+        if input.data_length != block_size {
+            return Err(validation(
+                "INVALID_PARAMETER_VALUE",
+                format!(
+                    "DataLength {} is not supported; the only supported block size is {block_size} bytes",
+                    input.data_length
+                ),
+            ));
+        }
+
+        // The declared length must describe the payload actually sent.
+        let actual_length = i64::try_from(input.block_data.len()).unwrap_or(i64::MAX);
+        if actual_length != i64::from(input.data_length) {
+            return Err(validation(
+                "INVALID_BLOCK",
+                format!(
+                    "DataLength {} does not match the {actual_length} bytes of BlockData sent",
+                    input.data_length
+                ),
+            ));
+        }
+
+        // `BlockData`: the caller's checksum "is validated against a checksum generated
+        // by Amazon EBS to ensure the validity and authenticity of the data. If the
+        // checksums do not correspond, the request fails."
+        let checksum = checksum_base64_sha256(&input.block_data);
+        if checksum != input.checksum {
+            return Err(validation(
+                "INVALID_BLOCK",
+                format!(
+                    "Checksum {} does not match the {CHECKSUM_ALGORITHM_SHA256} checksum of the block data",
+                    input.checksum
+                ),
+            ));
+        }
+
+        // This emulator keeps block bytes in memory, so the number of blocks it retains
+        // is capped — a storage quota, answered with the modeled
+        // `ServiceQuotaExceededException` (HTTP 402). Checked AFTER every validation
+        // above, so a malformed write earns the modeled `ValidationException` it deserves
+        // rather than being masked by a full store. Overwriting an index already written
+        // grows nothing and is never refused here.
+        if !index_already_written {
+            if stored_blocks >= MAX_STORED_BLOCKS_PER_SNAPSHOT {
+                return Err(quota_exceeded(format!(
+                    "snapshot {} already holds this emulator's maximum of {MAX_STORED_BLOCKS_PER_SNAPSHOT} blocks",
+                    input.snapshot_id
+                )));
+            }
+            if store.stored_block_count() >= MAX_STORED_BLOCKS_TOTAL {
+                return Err(quota_exceeded(format!(
+                    "this emulator already holds its maximum of {MAX_STORED_BLOCKS_TOTAL} snapshot blocks"
+                )));
+            }
+        }
+
+        // A block index keeps one token for its lifetime: "If the specified block
+        // contains data, the existing data is overwritten", so a token handed out
+        // earlier still names this block and reads whatever is stored now.
+        let existing_token = store
+            .snapshots
+            .get(&input.snapshot_id)
+            .and_then(|snapshot| snapshot.blocks.get(&input.block_index))
+            .map(|entry| entry.block_token.clone());
+        let block_token = match existing_token {
+            Some(token) => token,
+            None => store.mint_block_token(&input.snapshot_id, input.block_index),
+        };
+
+        let entry = BlockEntry {
+            data: input.block_data,
+            data_length: input.data_length,
+            checksum,
+            checksum_algorithm: CHECKSUM_ALGORITHM_SHA256.to_string(),
+            block_token,
+            progress: input.progress,
+        };
+        let Some(snapshot) = store.snapshots.get_mut(&input.snapshot_id) else {
+            return Err(not_found(format!(
+                "snapshot {} does not exist",
+                input.snapshot_id
+            )));
+        };
+        snapshot.blocks.insert(input.block_index, entry);
+
+        // Answer from the stored block, so the checksum on the wire is the one computed
+        // over the persisted bytes rather than the one the request carried.
+        let stored = snapshot
+            .blocks
+            .get(&input.block_index)
+            .ok_or_else(|| no_state_message("the block was not persisted".to_string()))?;
+        Ok(PutSnapshotBlockOutput {
+            checksum: Some(stored.checksum.clone()),
+            checksum_algorithm: Some(stored.checksum_algorithm.clone()),
+        })
     }
+}
+
+/// The modelled server error for an engine that holds no state for this service.
+fn no_state() -> PutSnapshotBlockError {
+    no_state_message(
+        "the com-amazonaws-ebs-ebs service is mounted on an engine that holds no state"
+            .to_string(),
+    )
+}
+
+/// The modelled server error carrying `message`.
+fn no_state_message(message: String) -> PutSnapshotBlockError {
+    PutSnapshotBlockErrorModeled::InternalServerException(InternalServerException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled `ValidationException` (HTTP 400) with one of `ValidationExceptionReason`'s
+/// values.
+fn validation(reason: &str, message: String) -> PutSnapshotBlockError {
+    PutSnapshotBlockErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+        reason: Some(reason.to_string()),
+    })
+    .into()
+}
+
+/// The modelled `ResourceNotFoundException` (HTTP 404) for an absent snapshot.
+fn not_found(message: String) -> PutSnapshotBlockError {
+    PutSnapshotBlockErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+        reason: Some("SNAPSHOT_NOT_FOUND".to_string()),
+    })
+    .into()
+}
+
+/// The modelled `ServiceQuotaExceededException` (HTTP 402) for an emulator storage limit.
+fn quota_exceeded(message: String) -> PutSnapshotBlockError {
+    PutSnapshotBlockErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException {
+        message: Some(message),
+        reason: None,
+    })
+    .into()
 }
