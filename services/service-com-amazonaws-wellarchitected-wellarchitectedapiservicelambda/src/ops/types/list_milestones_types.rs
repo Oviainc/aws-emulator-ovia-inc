@@ -11,7 +11,17 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-wellarchitected-wellarchitectedapiservicelambda.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.wellarchitected#ListMilestonesInput")]
+// `WorkloadId` is a path label this operation RESOLVES: the lookup in
+// `ops::list_milestones` owns a value that names no workload, and answers the modelled
+// 404 `ResourceNotFoundException` for it (with `ResourceId` as sent), so the boundary
+// validator must not refuse the id's `@length`/`@pattern` with a 400 first — the same
+// treatment `get_workload_types.rs` explains and every operation resolving a
+// `WorkloadId` takes. `NextToken` and `MaxResults` are request BODY members the service
+// validates, so their `@pattern`/`@range` are still enforced at the boundary.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.wellarchitected#ListMilestonesInput",
+    skip_validation = ["WorkloadId"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListMilestonesInput {
     pub workload_id: String,

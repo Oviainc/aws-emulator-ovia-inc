@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeIndexFields
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeIndexFields`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the index fields stored for one domain. A REPORTER: the only state it
+//! changes is the transitions the clock already made due (initialisation, a rebuild
+//! started by `IndexDocuments`, post-delete cleanup).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeIndexFields::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `Deployed` selects which of the two configurations CloudSearch keeps is reported:
+//! absent or false reports the PENDING copy of each field, true reports the copy the
+//! live index serves — so a field defined but not yet rebuilt is absent from the
+//! deployed view, and one awaiting deletion is absent from the pending view.
+//! `FieldNames`, when present, narrows the answer to the named fields; a name no
+//! field carries simply contributes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +151,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeIndexFields` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeIndexFieldsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeIndexFields"))
+        // Request metadata only; the store is reached through `self.engine`.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeIndexFieldsErrorModeled::InternalException(InternalException {
+                code: None,
+                message: Some(
+                    "CloudSearch domain state is unavailable on this engine.".to_string(),
+                ),
+            })
+        })?;
+        let mut state = state.lock();
+
+        let clock = ::std::time::Instant::now();
+        state.advance(clock);
+
+        let Some(domain) = state
+            .domain(&input.domain_name)
+            .filter(|domain| domain.is_live())
+        else {
+            return Err(DescribeIndexFieldsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    code: None,
+                    message: Some(format!("Domain not found: {}", input.domain_name)),
+                },
+            )
+            .into());
+        };
+
+        let deployed = input.deployed.unwrap_or(false);
+        let wanted = input.field_names.unwrap_or_default();
+
+        let index_fields = domain
+            .index_fields
+            .iter()
+            .filter(|(name, _)| wanted.is_empty() || wanted.contains(*name))
+            .filter_map(|(_, entry)| entry.index_field_status(deployed))
+            .collect();
+
+        Ok(DescribeIndexFieldsOutput { index_fields })
     }
 }

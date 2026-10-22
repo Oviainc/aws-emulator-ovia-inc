@@ -38,6 +38,11 @@
 //! telemetry back — `PutTelemetryRecordsResult` carries no members and X-Ray
 //! publishes no telemetry reader — so the store is what the ingest asserts, and
 //! it is bounded like the trace store is.
+//!
+//! Every instant a segment document carries is checked where the document is
+//! read ([`MAX_SEGMENT_EPOCH_SECONDS`]), so no stored `start_time` / `end_time`
+//! can be a value a reader cannot convert to the modelled `Timestamp`; the
+//! conversion itself goes through [`timestamp_of`].
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -436,6 +441,19 @@ pub const MAX_WINDOW_FUTURE_SKEW_SECONDS: f64 = 24.0 * 60.0 * 60.0;
 /// publishes no bound, so this caps the response a caller can amplify out of
 /// widely-spread segment durations.
 pub const MAX_HISTOGRAM_ENTRIES: usize = 50;
+
+/// How far from the epoch an instant a segment document carries may be, in
+/// seconds.
+///
+/// A `start_time` or `end_time` beyond this — and any value that is not finite
+/// — is not a time a trace could have been recorded at (a millisecond-scale
+/// epoch value read as seconds already lands past it, the same mistake
+/// [`validate_window`] refuses for a request window) and is not a value every
+/// reader's modelled `Timestamp` can carry, so the document is refused at
+/// ingest rather than stored and converted later. 1e12 seconds is about 31,000
+/// years, which covers every instant in seconds of epoch time and no
+/// millisecond-scale one.
+pub const MAX_SEGMENT_EPOCH_SECONDS: f64 = 1e12;
 
 /// Per-service state for com-amazonaws-xray-awsxray. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
@@ -1125,6 +1143,19 @@ impl SegmentRejection {
         }
     }
 
+    /// A document whose instant is not a time a trace could have been recorded
+    /// at. Its `ErrorCode` is the "present but unusable" one, and the message is
+    /// built from the request: it names the member and the value at fault.
+    fn not_an_instant(id: Option<&str>, member: &str, seconds: f64) -> Self {
+        Self {
+            id: id.map(str::to_string),
+            error_code: SEGMENT_ERROR_INVALID_FIELD,
+            message: format!(
+                "segment document field `{member}` ({seconds}) must be a finite time within {MAX_SEGMENT_EPOCH_SECONDS} seconds of the epoch, in seconds of epoch time"
+            ),
+        }
+    }
+
     /// A document refused because its trace is full.
     fn trace_full(id: &str, trace_id: &str) -> Self {
         Self {
@@ -1165,7 +1196,8 @@ fn required_string(
     }
 }
 
-/// A required epoch-seconds field, distinguishing "absent" from "wrong type".
+/// A required epoch-seconds field, distinguishing "absent" from "wrong type"
+/// and from an instant no trace could carry.
 fn required_seconds(
     object: &JsonObject,
     member: &str,
@@ -1173,16 +1205,33 @@ fn required_seconds(
 ) -> Result<f64, SegmentRejection> {
     match object.get(member) {
         None | Some(serde_json::Value::Null) => Err(SegmentRejection::missing(id, member)),
-        Some(serde_json::Value::Number(number)) => number.as_f64().ok_or_else(|| {
-            SegmentRejection::invalid(
-                id,
-                member,
-                "a number",
-                &serde_json::Value::Number(number.clone()),
-            )
-        }),
+        Some(serde_json::Value::Number(number)) => {
+            let seconds = number.as_f64().ok_or_else(|| {
+                SegmentRejection::invalid(
+                    id,
+                    member,
+                    "a number",
+                    &serde_json::Value::Number(number.clone()),
+                )
+            })?;
+            epoch_instant(id, member, seconds)
+        }
         Some(other) => Err(SegmentRejection::invalid(id, member, "a number", other)),
     }
+}
+
+/// One instant a segment document carries, refused when it is not a time a
+/// trace could have been recorded at.
+///
+/// Checked HERE, where the document is read, so no unusable instant is ever
+/// stored: every reader converts a stored instant to the modelled `Timestamp`,
+/// and a value that is not finite, or is further from the epoch than
+/// [`MAX_SEGMENT_EPOCH_SECONDS`], has no `Timestamp` to convert to.
+fn epoch_instant(id: Option<&str>, member: &str, seconds: f64) -> Result<f64, SegmentRejection> {
+    if !seconds.is_finite() || seconds.abs() > MAX_SEGMENT_EPOCH_SECONDS {
+        return Err(SegmentRejection::not_an_instant(id, member, seconds));
+    }
+    Ok(seconds)
 }
 
 /// An optional string field; a wrong-typed value is ignored rather than fatal,
@@ -1234,7 +1283,10 @@ pub fn parse_segment_document(document: &str) -> Result<(String, SegmentRecord),
     // readable.
     let end_time = match object.get("end_time") {
         None | Some(serde_json::Value::Null) => None,
-        Some(serde_json::Value::Number(number)) => number.as_f64(),
+        Some(serde_json::Value::Number(number)) => match number.as_f64() {
+            Some(seconds) => Some(epoch_instant(id_ref, "end_time", seconds)?),
+            None => None,
+        },
         Some(other) => {
             return Err(SegmentRejection::invalid(
                 id_ref,
@@ -2780,13 +2832,28 @@ impl Span {
 
     /// The span's start as a modelled timestamp.
     fn start_time(&self) -> Option<::aws_smithy_types::DateTime> {
-        self.start.map(::aws_smithy_types::DateTime::from_secs_f64)
+        self.start.map(timestamp_of)
     }
 
     /// The span's end as a modelled timestamp.
     fn end_time(&self) -> Option<::aws_smithy_types::DateTime> {
-        self.end.map(::aws_smithy_types::DateTime::from_secs_f64)
+        self.end.map(timestamp_of)
     }
+}
+
+/// One stored instant as the modelled `Timestamp`.
+///
+/// Ingest refuses an instant that is not finite or further from the epoch than
+/// [`MAX_SEGMENT_EPOCH_SECONDS`], so this conversion is always in range; the
+/// bounding here is the second belt, so no stored value can make a READ end the
+/// request instead of answering it.
+pub fn timestamp_of(seconds: f64) -> ::aws_smithy_types::DateTime {
+    let bounded = if seconds.is_nan() {
+        0.0
+    } else {
+        seconds.clamp(-MAX_SEGMENT_EPOCH_SECONDS, MAX_SEGMENT_EPOCH_SECONDS)
+    };
+    ::aws_smithy_types::DateTime::from_secs_f64(bounded)
 }
 
 /// The counts `ServiceStatistics` and `EdgeStatistics` both carry, accumulated

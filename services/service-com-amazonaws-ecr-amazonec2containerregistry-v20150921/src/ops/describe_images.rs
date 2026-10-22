@@ -154,9 +154,14 @@ fn fault_error(fault: crate::state::Fault) -> DescribeImagesErrorModeled {
                 message,
             })
         }
-        // The tag faults belong to the tagging operations; this read validates no tag,
-        // and its model declares no tag error to report one with.
-        crate::state::Fault::InvalidTagParameter(_) | crate::state::Fault::TooManyTags(_) => {
+        // Neither of these can arise here, and this read's model declares no error for
+        // them: the tag faults belong to the tagging operations (this read validates no
+        // tag) and the lifecycle-policy fault to the policy operations (this read
+        // resolves no policy). Reported as a server fault, which is what an unreachable
+        // mapping is, rather than as a bad parameter the caller could fix.
+        crate::state::Fault::LifecyclePolicyNotFound(_)
+        | crate::state::Fault::InvalidTagParameter(_)
+        | crate::state::Fault::TooManyTags(_) => {
             DescribeImagesErrorModeled::ServerException(ServerException { message })
         }
     }

@@ -238,13 +238,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service configuration includes HealthCheckCustomConfig, you can optionally
         // use AWS_INIT_HEALTH_STATUS to specify the initial status of the custom health
         // check, HEALTHY or UNHEALTHY. If you don't specify a value for
-        // AWS_INIT_HEALTH_STATUS, the initial status is HEALTHY." Without a custom
-        // config nothing has reported on the instance — no Route 53 checker runs in
-        // this emulator — so its status is UNKNOWN.
-        let custom_health_check = state
+        // AWS_INIT_HEALTH_STATUS, the initial status is HEALTHY." Any other health
+        // checking is performed by the service itself, which has not reported yet when
+        // the instance is registered, so the instance starts UNKNOWN.
+        // Which kind of health checking the service configures, read in one lookup:
+        // the two are mutually exclusive ("you can specify either
+        // HealthCheckCustomConfig or HealthCheckConfig but not both").
+        let (custom_health_check, route53_health_check) = state
             .services
             .get(&service_id)
-            .is_some_and(|service| service.health_check_custom_config.is_some());
+            .map_or((false, false), |service| {
+                (
+                    service.custom_health_checked(),
+                    service.health_check_config.is_some(),
+                )
+            });
         let initial = input.attributes.get(INIT_HEALTH_STATUS_ATTRIBUTE);
         let health_status = if custom_health_check {
             match initial.map(String::as_str) {
@@ -270,11 +278,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::HEALTH_STATUS_UNKNOWN
         };
 
+        // A `HealthCheckConfig` health check is the SERVICE's to perform: Cloud Map
+        // reports its verdict once the checker has run, which
+        // `GetInstancesHealthStatus` documents as "a brief delay between when you
+        // register an instance and when the health status for the instance is
+        // available". The verdict this emulator can report is
+        // `ROUTE53_HEALTH_CHECK_VERDICT` (see its documentation: no probe of the
+        // instance's endpoint can be observed here, so `HEALTHY` is never claimed), and
+        // the clock owes it `ROUTE53_HEALTH_CHECK_SPAN` after this call.
+        let pending_health_status = route53_health_check.then(|| crate::state::PendingHealthStatus {
+            status: crate::state::ROUTE53_HEALTH_CHECK_VERDICT.to_string(),
+            due_at: now + crate::state::ROUTE53_HEALTH_CHECK_SPAN,
+        });
+
         let namespace_id = {
-            let service = state
-                .services
-                .get_mut(&service_id)
-                .expect("the resolved service id is present");
+            // The id was resolved from the record map under this same lock; the record
+            // is still reached with a graceful branch so no request-derived reference
+            // can panic a handler, answering the same `ServiceNotFound` the resolution
+            // step does.
+            let Some(service) = state.services.get_mut(&service_id) else {
+                return Err(RegisterInstanceErrorModeled::ServiceNotFound(ServiceNotFound {
+                    message: Some(format!(
+                        "No service exists with the specified ID {}.",
+                        input.service_id
+                    )),
+                })
+                .into());
+            };
             // A new instance is refused once the service holds its quota; replacing
             // one that is already there adds nothing, so it is always allowed.
             if !service.instances.contains_key(&input.instance_id)
@@ -304,6 +334,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     attributes,
                     creator_request_id: input.creator_request_id.clone(),
                     health_status: health_status.to_string(),
+                    // Re-registering an instance replaces it, so a status a previous
+                    // `UpdateInstanceCustomHealthStatus` call still owed is dropped
+                    // with the record it was owed to; a Route 53 health check starts
+                    // over, exactly as `RegisterInstanceRequest$InstanceId` documents
+                    // ("Cloud Map deletes the old health check and creates a new one").
+                    pending_health_status,
                 },
             );
             service.instances_revision += 1;

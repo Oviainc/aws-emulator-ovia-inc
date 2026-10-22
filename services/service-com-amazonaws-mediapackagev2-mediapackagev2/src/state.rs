@@ -1313,14 +1313,18 @@ pub fn origin_endpoint_etag(endpoint: &OriginEndpoint) -> String {
     ])
 }
 
+// =============================================================================
+// Resource policies: the shared document check and the wording around it
+// =============================================================================
+
 /// Whether `policy` is a policy document this service accepts.
 ///
 /// A resource policy is an IAM policy document: a JSON OBJECT carrying a `Statement`.
 /// Anything else — text that is not JSON, a JSON array or scalar, an object with no
 /// `Statement` — is the model's `INVALID_POLICY` validation case, which is why the
 /// service's `ValidationExceptionType` enum names it. Shared by the policy writers
-/// (`PutChannelPolicy`, and `PutOriginEndpointPolicy` when it is implemented) so both
-/// decide validity the same way.
+/// (`PutChannelPolicy` and `PutOriginEndpointPolicy`) so both decide validity the same
+/// way.
 pub fn is_policy_document(policy: &str) -> bool {
     let Ok(::serde_json::Value::Object(document)) = ::serde_json::from_str(policy) else {
         return false;

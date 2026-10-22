@@ -379,6 +379,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// Refuse the request with this operation's modelled `ValidationException` (HTTP 400):
 /// the message says what to fix and `fieldList` names the member, the way this service's
 /// other handlers report a field refusal.
+///
+/// The shape itself comes from [`crate::state::field_validation_exception`], so this
+/// refusal carries the same reason \u2014 in the same spelling \u2014 and the same single-entry
+/// `fieldList` as every other member refusal in the crate.
 fn refuse_field(member: &str, message: String) -> CheckAccessNotGrantedError {
     ::tracing::debug!(
         operation = OPERATION,
@@ -386,14 +390,9 @@ fn refuse_field(member: &str, message: String) -> CheckAccessNotGrantedError {
         %message,
         "refusing the request"
     );
-    CheckAccessNotGrantedErrorModeled::ValidationException(ValidationException {
-        message: message.clone(),
-        reason: crate::state::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
-        field_list: Some(vec![ValidationExceptionField {
-            name: member.to_string(),
-            message,
-        }]),
-    })
+    CheckAccessNotGrantedErrorModeled::ValidationException(
+        crate::state::field_validation_exception(member, message),
+    )
     .into()
 }
 

@@ -129,12 +129,24 @@ impl From<StartSigningJobErrorModeled> for StartSigningJobError {
 
 /// The modelled 404 for a profile that cannot start a signing job: either this
 /// account holds no profile of that name, or the one it holds is not `Active`.
-fn profile_cannot_sign(detail: String) -> StartSigningJobError {
+///
+/// `code` names WHICH of the two it was — the discriminator a client branches on:
+/// an absent profile is `ProfileNotFound`, and one refused for its status carries
+/// that status's code (`ProfileCanceled`, `ProfileRevoked`).
+fn profile_cannot_sign(code: String, detail: String) -> StartSigningJobError {
     StartSigningJobErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: Some(detail),
-        code: None,
+        code: Some(code),
     })
     .into()
+}
+
+/// The 404 for a profile name this account holds no profile for.
+fn profile_not_found(detail: String) -> StartSigningJobError {
+    profile_cannot_sign(
+        crate::state::ERROR_CODE_PROFILE_NOT_FOUND.to_string(),
+        detail,
+    )
 }
 
 /// The `StartSigningJob` operation.
@@ -177,7 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(StartSigningJobErrorModeled::InternalServiceErrorException(
                 InternalServiceErrorException {
                     message: Some("the signer job store is unavailable".to_string()),
-                    code: None,
+                    code: Some(crate::state::ERROR_CODE_INTERNAL_SERVICE_ERROR.to_string()),
                 },
             )
             .into());
@@ -194,7 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message: Some(
                         "source must name the S3 object to sign in its s3 member".to_string(),
                     ),
-                    code: None,
+                    code: Some(crate::state::ERROR_CODE_VALIDATION.to_string()),
                 },
             )
             .into());
@@ -212,7 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                          s3.bucketName member"
                             .to_string(),
                     ),
-                    code: None,
+                    code: Some(crate::state::ERROR_CODE_VALIDATION.to_string()),
                 },
             )
             .into());
@@ -239,7 +251,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // no profile at all.
         if let Some(owner) = input.profile_owner.as_deref() {
             if owner != ::engine::emulator_account_id() {
-                return Err(profile_cannot_sign(format!(
+                return Err(profile_not_found(format!(
                     "Signing profile {} owned by account {owner} not found",
                     input.profile_name
                 )));
@@ -247,16 +259,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let Some(profile) = store.profiles.get(&input.profile_name).cloned() else {
-            return Err(profile_cannot_sign(format!(
+            return Err(profile_not_found(format!(
                 "Signing profile {} not found",
                 input.profile_name
             )));
         };
         if !profile.can_sign() {
-            return Err(profile_cannot_sign(format!(
-                "Signing profile {} is {} and cannot perform new signing jobs",
-                profile.profile_name, profile.status
-            )));
+            return Err(profile_cannot_sign(
+                crate::state::profile_status_error_code(&profile.status),
+                format!(
+                    "Signing profile {} is {} and cannot perform new signing jobs",
+                    profile.profile_name, profile.status
+                ),
+            ));
         }
 
         // What the job runs with is fixed now: a later `PutSigningProfile` on the

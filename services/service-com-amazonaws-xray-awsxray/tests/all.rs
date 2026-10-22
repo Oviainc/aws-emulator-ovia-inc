@@ -32,6 +32,9 @@ mod resource_tags;
 #[path = "all/sampling_rules.rs"]
 mod sampling_rules;
 
+#[path = "all/service_graph.rs"]
+mod service_graph;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 

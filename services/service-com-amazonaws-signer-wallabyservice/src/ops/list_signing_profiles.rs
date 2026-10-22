@@ -94,12 +94,22 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-signer-wallabyservice.j
 // here — hence the `ListSigningProfilesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.signer#ListSigningProfiles")]
+//
+// `extra_errors` widens the set with `ValidationException`, a shape the SERVICE
+// models (`message` + `code`, `@httpError 400`) and other operations list, which
+// this one does not. It is what lets a refused `nextToken` answer with the
+// modelled 400 — carrying the `code` member a client branches on — instead of the
+// framework's synthetic `ValidationException`, which models `message` alone.
+#[smithy_macros::operation_error(
+    "com.amazonaws.signer#ListSigningProfiles",
+    extra_errors = ["ValidationException"]
+)]
 #[derive(Debug)]
 pub enum ListSigningProfilesErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InternalServiceErrorException(InternalServiceErrorException),
     TooManyRequestsException(TooManyRequestsException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -158,20 +168,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(ListSigningProfilesErrorModeled::InternalServiceErrorException(
                 InternalServiceErrorException {
                     message: Some("the signer profile store is unavailable".to_string()),
-                    code: None,
+                    code: Some(crate::state::ERROR_CODE_INTERNAL_SERVICE_ERROR.to_string()),
                 },
             )
             .into());
         };
 
-        // The token is the profile name the next page starts at. This operation
-        // models no `ValidationException`, so a token that is not a profile name
-        // is refused through the service's own 400 channel.
+        // The token is the profile name the next page starts at. A token this
+        // service never handed out is refused with the modelled 400, whose `code`
+        // names the condition a paginating client resets on.
         if let Some(token) = input.next_token.as_deref() {
             if !crate::state::is_profile_name(token) {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "nextToken {token:?} is not a token returned by ListSigningProfiles"
-                )));
+                return Err(ListSigningProfilesErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some("Invalid next token provided".to_string()),
+                        code: Some(crate::state::ERROR_CODE_INVALID_NEXT_TOKEN.to_string()),
+                    },
+                )
+                .into());
             }
         }
 

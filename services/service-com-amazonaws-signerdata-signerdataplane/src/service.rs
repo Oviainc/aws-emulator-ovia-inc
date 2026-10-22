@@ -41,9 +41,11 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
 
 /// The first `/`-separated segment of `path`, or `None` for a path with no non-empty
 /// first segment (`"/"`, `""`).
@@ -143,15 +145,23 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // What is reworded here is ONE class, and only for a LIST member: a
+        // required list the request supplied nothing for. The framework states
+        // that as "Value null at '<member>' failed to satisfy constraint: Member
+        // must not be null", which asserts the value was NULL — and for a list
+        // that is a claim the wire cannot support: a query-bound list that is
+        // absent and a query-bound EMPTY list are the same request, so "null"
+        // names a constraint the request may not have violated. This service
+        // therefore states the constraint such a member actually violated, naming
+        // it ([`missing_list_member_constraint`]), and leaves every other refusal
+        // — a single-value member that is absent, a value present but outside a
+        // bound — to the framework's own wording, which is accurate for those.
+        match refusal {
+            Refusal::Invalid(violations) => missing_member_refusal(violations),
+            _ => None,
+        }
     }
 
     fn override_routing_error(
@@ -172,23 +182,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // naming each absent member. Anything else (another path, another method)
         // keeps the framework's protocol-correct default.
         let missing = missing_required_query_parameters(req)?;
-        let violations = missing
+        let violations: Vec<Violation> = missing
             .into_iter()
-            .map(|member| aws_smithy_schema_server::Violation {
+            .map(|member| Violation {
                 path: member.to_string(),
-                kind: aws_smithy_schema_server::ViolationKind::MissingRequiredMember,
+                kind: ViolationKind::MissingRequiredMember,
                 value: None,
             })
             .collect();
         // Rendered through the generated entry, so this refusal lands in the same
-        // envelope (and with the same wording) as one the boundary validator raises
-        // for a value that was present but out of bounds.
-        Some(
-            self.entry
-                .framework_error_response(aws_smithy_schema_server::ProtocolError::Invalid(
-                    violations,
-                )),
-        )
+        // envelope as one the boundary validator raises for a value that was
+        // present but out of bounds — and through `refusal_response` with this
+        // service's own wording (`override_refusal`), so a required member the
+        // ROUTER found absent and one the VALIDATOR found absent are stated
+        // identically.
+        let chosen = self.override_refusal(&Refusal::Invalid(violations.clone()));
+        Some(self.entry.refusal_response(
+            aws_smithy_schema_server::ProtocolError::Invalid(violations),
+            chosen,
+        ))
     }
 
     fn override_framework_error(
@@ -210,6 +222,63 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 /// from its SigV4 signing name (`signer`), which the generated identity carries.
 /// `can_handle` claims a request that names either.
 pub const ENDPOINT_PREFIX: &str = "data-signer";
+
+/// The error code every refusal of a request's own values carries: the modelled
+/// shape that is this service's 400
+/// (`smithy_query(query="operation",operation="GetRevocationStatus")` lists
+/// `ValidationException` @httpError 400).
+const VALIDATION_EXCEPTION_CODE: &str = "ValidationException";
+
+/// Whether the input member `member_name` names is a LIST, read off the generated
+/// input schema so the model stays the one source of which members are lists.
+fn is_list_member(member_name: &str) -> bool {
+    crate::ops::types::GET_REVOCATION_STATUS_INPUT_SCHEMA
+        .members()
+        .iter()
+        .any(|member| {
+            member.http_query().map(|query| query.value()) == Some(member_name)
+                && matches!(member.shape_type(), aws_smithy_schema::ShapeType::List)
+        })
+}
+
+/// The constraint a required LIST member violated when the request supplied
+/// nothing for it, as a sentence naming the member.
+///
+/// A list is the case the framework's generic wording gets wrong. On the wire a
+/// query-bound list that is ABSENT and one that is EMPTY are the same request —
+/// an SDK serializing an empty list emits no parameter at all — so the refusal
+/// cannot claim the value was null; what it can state, and what the service
+/// states, is that the member must carry at least one element.
+pub fn missing_list_member_constraint(member_name: &str) -> String {
+    format!("{member_name} must not be null or empty")
+}
+
+/// How this service states a refusal whose every violation is a required LIST
+/// member the request supplied nothing for: one clause per member, in the order
+/// the violations arrive (the model's member order), each naming the member and
+/// the constraint it actually violated.
+///
+/// `None` for every other refusal, which keeps the framework's own wording: a
+/// single-value member that is absent really was null, and a value present but
+/// outside a declared bound is already described accurately, with the offending
+/// value echoed.
+fn missing_member_refusal(violations: &[Violation]) -> Option<Refused> {
+    if violations.is_empty() {
+        return None;
+    }
+    let mut clauses = Vec::with_capacity(violations.len());
+    for violation in violations {
+        if violation.kind != ViolationKind::MissingRequiredMember || !is_list_member(&violation.path)
+        {
+            return None;
+        }
+        clauses.push(missing_list_member_constraint(&violation.path));
+    }
+    Some(Refused {
+        code: VALIDATION_EXCEPTION_CODE.to_string(),
+        message: clauses.join("; "),
+    })
+}
 
 /// The method of the one route this service's model binds (`GET /revocations`).
 const REVOCATIONS_METHOD: &str = "GET";

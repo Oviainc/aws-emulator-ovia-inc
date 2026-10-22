@@ -17,6 +17,10 @@
 //! * [`CallerAccess`] — whether `GetBuyerDashboard` is available to a caller at
 //!   all, which the operation's docs restrict to Organizations management
 //!   accounts and delegated administrators registered for procurement insights.
+//!   That grant is created in AWS Organizations, so no operation of THIS service
+//!   can write one: a record in [`ComAmazonawsMarketplacereportingAwsmarketplacereportingState::access`]
+//!   is the only seam onto the success path, and a caller with no record is
+//!   refused (see [`CallerAccess::standalone_account`]).
 
 use std::collections::hash_map::{Entry, RandomState};
 use std::collections::HashMap;
@@ -266,17 +270,47 @@ pub struct CallerAccess {
 }
 
 impl CallerAccess {
-    /// The registration a caller the store holds no record for is served under.
+    /// The registration a caller the store holds no record for is served under: a
+    /// plain standalone account, which the operation's availability rule does not
+    /// name — so the gate REFUSES it.
     ///
-    /// The emulator presents a single account ([`::engine::emulator_account_id`]),
-    /// which is this organization's management account, registered for
-    /// procurement insights — the caller the API is available to. A record in
+    /// Organization membership and procurement-insights enrolment are held by AWS
+    /// Organizations (`EnableAWSServiceAccess` /
+    /// `RegisterDelegatedAdministrator` for
+    /// `procurement-insights.marketplace.amazonaws.com`), never by this service:
+    /// no operation here creates an organization, joins one, or registers a
+    /// delegated administrator, so this emulator can hold a grant only as a
+    /// record somebody put in
+    /// [`ComAmazonawsMarketplacereportingAwsmarketplacereportingState::access`].
+    /// An account with no such record is what a fresh AWS account is — in no
+    /// organization at all — and an authorization gate with no grant on record
+    /// refuses rather than serves.
+    pub const fn standalone_account() -> Self {
+        Self {
+            is_org_management_account: false,
+            delegated_admin: false,
+            procurement_insights_registered: false,
+        }
+    }
+
+    /// The organization's management account — the first caller the operation's
+    /// availability rule names. Recorded in
     /// [`ComAmazonawsMarketplacereportingAwsmarketplacereportingState::access`]
-    /// is therefore what makes a caller a restricted one.
+    /// to serve a caller the API is available to.
     pub const fn management_account() -> Self {
         Self {
             is_org_management_account: true,
             delegated_admin: false,
+            procurement_insights_registered: true,
+        }
+    }
+
+    /// A delegated administrator registered for the procurement insights feature
+    /// — the other caller that rule names.
+    pub const fn registered_delegated_admin() -> Self {
+        Self {
+            is_org_management_account: false,
+            delegated_admin: true,
             procurement_insights_registered: true,
         }
     }
@@ -329,7 +363,9 @@ pub struct ComAmazonawsMarketplacereportingAwsmarketplacereportingState {
     pub embed_sessions: HashMap<String, EmbedSession>,
     /// What this service knows about a caller, keyed by the principal the
     /// request presented ([`caller_principal`]). A caller with no record is
-    /// served under [`CallerAccess::management_account`].
+    /// served under [`CallerAccess::standalone_account`], which the API is not
+    /// available to: a record here is what GRANTS access, never what restricts
+    /// it.
     pub access: HashMap<String, CallerAccess>,
     /// The counter embed tokens are minted from, so two calls never mint the
     /// same token.
@@ -338,12 +374,21 @@ pub struct ComAmazonawsMarketplacereportingAwsmarketplacereportingState {
 
 impl ComAmazonawsMarketplacereportingAwsmarketplacereportingState {
     /// The registration recorded for `principal`, or
-    /// [`CallerAccess::management_account`] when the store holds none.
+    /// [`CallerAccess::standalone_account`] when the store holds none.
     pub fn caller_access(&self, principal: &str) -> CallerAccess {
         self.access
             .get(principal)
             .copied()
-            .unwrap_or_else(CallerAccess::management_account)
+            .unwrap_or_else(CallerAccess::standalone_account)
+    }
+
+    /// Whether `GetBuyerDashboard` is available to `principal`, from the
+    /// registration this store holds for it.
+    ///
+    /// A pure read of recorded state: the same principal gets the same answer
+    /// however often, and from however many threads at once, it is asked.
+    pub fn access_decision(&self, principal: &str) -> AccessDecision {
+        self.caller_access(principal).decision()
     }
 
     /// Mint the one-shot bearer token an embed URL carries.

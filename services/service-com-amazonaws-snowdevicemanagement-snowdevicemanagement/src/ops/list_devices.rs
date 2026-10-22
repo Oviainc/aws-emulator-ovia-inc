@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDevices
-//! Enumerates the managed-device inventory held in state as `DeviceSummary`, in
-//! `managedDeviceId` order, narrowed to one `jobId` when the request names one:
-//! `@paginated(items: devices)`, so a page is cut at `maxResults` and `nextToken`
-//! carries the device id the next page resumes at.
+//! Enumerates the managed-device inventory held in state for the signed Region as
+//! `DeviceSummary`, in `managedDeviceId` order, narrowed to one `jobId` when the
+//! request names one: `@paginated(items: devices)`, so a page is cut at
+//! `maxResults` and `nextToken` carries the device id the next page resumes at.
+//! A Region this account has activated no device in is refused by the
+//! account-level device gate (`AccessDeniedException`) instead.
 //!
 //! ## Shape of an operation
 //!
@@ -156,6 +158,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // The account-level device gate comes FIRST: a Region this account has
+        // activated no Snow device in has nothing to list, and the service refuses
+        // the call rather than answering an empty inventory — or than judging the
+        // request's `nextToken`, which is request-carried state like any id.
+        if !store.has_activated_device(&region) {
+            return Err(ListDevicesErrorModeled::AccessDeniedException(
+                crate::state::no_devices_in_region(),
+            )
+            .into());
+        }
+        store.settle(now);
+
         // The token carries the device id the next page resumes at; a value this
         // service never issued is refused rather than silently serving page one.
         let resume_at = match input.next_token.as_deref() {
@@ -176,15 +193,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let page_size = crate::state::page_size(input.max_results);
 
-        let now = ::std::time::SystemTime::now();
-        let region = crate::state::request_region(ctx.parts());
-        let mut store = state.lock();
-        store.ensure_seeded(&region, now);
-        store.settle(now);
-
         let mut devices = Vec::with_capacity(page_size);
         let mut next_token = None;
         for (managed_device_id, device) in &store.devices {
+            // "all devices … in the Amazon Web Services Region where the command is
+            // run": the inventory is regional.
+            if device.region != region {
+                continue;
+            }
             // Resume at the first id at or after the token, so a page is still
             // served when the device the token named is gone.
             if resume_at

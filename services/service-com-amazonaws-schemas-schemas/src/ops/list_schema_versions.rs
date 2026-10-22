@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSchemaVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSchemaVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSchemaVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the stored versions of one schema, one page at a time. A pure read.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +145,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSchemaVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSchemaVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSchemaVersions"))
+        // A schema in a service-owned registry was created by no request, so its ARN
+        // names the region THIS request is signed for; a caller's reports the ARN its
+        // create minted.
+        let region = crate::state::request_region(ctx.parts());
+        // The model gives `Limit` no range: fewer than one item is not a page, and
+        // more than `MAX_PAGE_SIZE` would materialise every stored version into one
+        // response, so the handler owns both bounds.
+        let page_size = crate::state::requested_page_size(input.limit).map_err(|refusal| {
+            ListSchemaVersionsError::from(ListSchemaVersionsErrorModeled::BadRequestException(
+                refusal,
+            ))
+        })?;
+
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListSchemaVersionsError::from(
+                ListSchemaVersionsErrorModeled::InternalServerErrorException(
+                    crate::state::internal_error(),
+                ),
+            )
+        })?;
+        let state = store.lock();
+
+        let registry = state.registries.get(&input.registry_name).ok_or_else(|| {
+            ListSchemaVersionsError::from(ListSchemaVersionsErrorModeled::NotFoundException(
+                crate::state::registry_not_found(&input.registry_name),
+            ))
+        })?;
+        let schema = registry.schemas.get(&input.schema_name).ok_or_else(|| {
+            ListSchemaVersionsError::from(ListSchemaVersionsErrorModeled::NotFoundException(
+                crate::state::schema_not_found(&input.registry_name, &input.schema_name),
+            ))
+        })?;
+
+        // The members that decide WHICH versions this listing contains. Bound into the
+        // `NextToken`, so a token cannot resume a differently-selected listing.
+        let selection = format!(
+            "registryName={};schemaName={}",
+            input.registry_name, input.schema_name
+        );
+
+        // The paging key is the version number, zero-padded: the pager resumes after
+        // the last key it handed out by STRING comparison, and unpadded decimals would
+        // order "10" before "2" and drop versions from a resumed page. The width holds
+        // every `u64`.
+        let entries = schema
+            .versions
+            .values()
+            .map(|version| (format!("{:020}", version.version), version));
+        let page = crate::state::page_by_key(
+            entries,
+            &selection,
+            input.next_token.as_deref(),
+            page_size,
+        )
+        .map_err(|_| {
+            ListSchemaVersionsError::from(ListSchemaVersionsErrorModeled::BadRequestException(
+                crate::state::invalid_next_token(),
+            ))
+        })?;
+
+        let schema_arn = registry.schema_arn_in(&region, schema);
+        Ok(ListSchemaVersionsOutput {
+            next_token: page.next_token,
+            schema_versions: Some(
+                page.items
+                    .into_iter()
+                    .map(|version| SchemaVersionSummary {
+                        schema_arn: Some(schema_arn.clone()),
+                        schema_name: Some(schema.name.clone()),
+                        schema_version: Some(version.version.to_string()),
+                        // The type of THIS version's content: a later version can be
+                        // written with another type, so it is read per version.
+                        r#type: Some(version.r#type.clone()),
+                    })
+                    .collect(),
+            ),
+        })
     }
 }

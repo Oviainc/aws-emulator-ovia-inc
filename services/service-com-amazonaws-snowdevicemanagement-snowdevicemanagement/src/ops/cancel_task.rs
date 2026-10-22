@@ -157,12 +157,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        store.ensure_seeded(&region, now);
+        // The account-level device gate, consulted BEFORE the id is resolved.
+        if !store.has_activated_device(&region) {
+            return Err(CancelTaskErrorModeled::AccessDeniedException(
+                crate::state::no_devices_in_region(),
+            )
+            .into());
+        }
         // Settle first, so this call cancels only what the clock had not already
         // carried to a terminal state.
         store.settle(now);
 
-        let Some(task) = store.tasks.get(&input.task_id) else {
+        let Some(task) = store.task_in(&region, &input.task_id) else {
             return Err(CancelTaskErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(crate::state::TASK_RESOURCE_TYPE, &input.task_id),
             )

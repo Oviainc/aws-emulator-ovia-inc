@@ -31,7 +31,7 @@ fn authorization(region: &str) -> String {
 const REGION: &str = "us-west-2";
 
 /// An IAM role ARN of the shape the `Role` member documents.
-const ROLE: &str = "arn:aws:iam::123456789012:role/MediaConvertRole";
+pub(crate) const ROLE: &str = "arn:aws:iam::123456789012:role/MediaConvertRole";
 
 /// Longer than any case takes to run, so a job stays `SUBMITTED` for the whole of a
 /// case that is not about the clock. Pinned rather than raced: the span is state, so no
@@ -39,10 +39,10 @@ const ROLE: &str = "arn:aws:iam::123456789012:role/MediaConvertRole";
 const HELD_IN_SUBMITTED: Duration = Duration::from_secs(3_600);
 
 /// A settle span short enough for the one case that waits past it.
-const SHORT_SETTLE: Duration = Duration::from_millis(50);
+pub(crate) const SHORT_SETTLE: Duration = Duration::from_millis(50);
 
 /// Comfortably past [`SHORT_SETTLE`], so that case always observes the transition.
-const PAST_THE_SETTLE: Duration = Duration::from_millis(400);
+pub(crate) const PAST_THE_SETTLE: Duration = Duration::from_millis(400);
 
 /// One emulator: a single shared engine behind the multi-service router, exactly as the
 /// production router assembles it.
@@ -66,7 +66,7 @@ impl Reply {
     }
 
     /// A string member of the body.
-    fn string(&self, pointer: &str) -> String {
+    pub(crate) fn string(&self, pointer: &str) -> String {
         self.at(pointer)
             .as_str()
             .unwrap_or_default()
@@ -82,7 +82,7 @@ impl Emulator {
     }
 
     /// An emulator whose jobs are due to leave `SUBMITTED` after `span`.
-    fn with_settle_span(span: Duration) -> Self {
+    pub(crate) fn with_settle_span(span: Duration) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         // The settle span lives in the service's state, so a case pins it instead of
         // racing the real clock. Nothing on a request path writes it.
@@ -139,25 +139,25 @@ impl Emulator {
         }
     }
 
-    async fn create_queue(&self, body: Value) -> Reply {
+    pub(crate) async fn create_queue(&self, body: Value) -> Reply {
         self.send("POST", "/2017-08-29/queues", Some(body)).await
     }
 
-    async fn get_queue(&self, name: &str) -> Reply {
+    pub(crate) async fn get_queue(&self, name: &str) -> Reply {
         self.send("GET", &format!("/2017-08-29/queues/{name}"), None)
             .await
     }
 
-    async fn create_job(&self, body: Value) -> Reply {
+    pub(crate) async fn create_job(&self, body: Value) -> Reply {
         self.send("POST", "/2017-08-29/jobs", Some(body)).await
     }
 
-    async fn get_job(&self, id: &str) -> Reply {
+    pub(crate) async fn get_job(&self, id: &str) -> Reply {
         self.send("GET", &format!("/2017-08-29/jobs/{id}"), None)
             .await
     }
 
-    async fn cancel_job(&self, id: &str) -> Reply {
+    pub(crate) async fn cancel_job(&self, id: &str) -> Reply {
         self.send("DELETE", &format!("/2017-08-29/jobs/{id}"), None)
             .await
     }
@@ -173,7 +173,7 @@ impl Emulator {
 }
 
 /// A minimal but structurally real `JobSettings`: one input file and one output group.
-fn settings(input_uri: &str, name_modifier: &str) -> Value {
+pub(crate) fn settings(input_uri: &str, name_modifier: &str) -> Value {
     json!({
         "inputs": [{ "fileInput": input_uri }],
         "outputGroups": [{

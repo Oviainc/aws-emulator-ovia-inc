@@ -14,7 +14,11 @@
 //! * `embeddingDomains` are fully qualified domains (optionally with `*` standing for
 //!   every subdomain), which is narrower than the member's `@pattern`;
 //! * the API is available only to an Organizations management account, or to a delegated
-//!   administrator registered for procurement insights.
+//!   administrator registered for procurement insights — so every case that expects a URL
+//!   records that grant first ([`Emulator::available_to_default_caller`]).
+//!
+//! The harness here is shared with `buyer_dashboard_authorization.rs`, which carries the
+//! availability gate's own table.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -31,7 +35,11 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The region the requests below are signed for, and so the region every generated embed
 /// URL names.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
+
+/// The SigV4 access key id every case signs with unless it names another — the principal
+/// a [`CallerAccess`] record is keyed by.
+pub(crate) const DEFAULT_PRINCIPAL: &str = "AKIDEXAMPLE";
 
 /// The lifetimes `GetBuyerDashboard`'s docs state ("valid for 5 minutes after it is
 /// generated", "a session lifetime of one hour"), spelled out here rather than imported
@@ -42,7 +50,7 @@ const SESSION_LIFETIME: Duration = Duration::from_secs(3600);
 /// The ARN of the `AgreementSummary_V1` dashboard for `account`. Both tails below are the
 /// ones `DashboardIdentifier`'s `@pattern` admits
 /// (`smithy_query(query="shape",shape="DashboardIdentifier")`).
-fn agreement_summary(account: &str) -> String {
+pub(crate) fn agreement_summary(account: &str) -> String {
     format!(
         "arn:aws:aws-marketplace::{account}:AWSMarketplace/ReportingData/\
          Agreement_V1/Dashboard/AgreementSummary_V1"
@@ -51,7 +59,7 @@ fn agreement_summary(account: &str) -> String {
 
 /// The ARN of the `CostAnalysis_V1` dashboard for `account` — the dashboard the issue's
 /// own reproduction never names.
-fn cost_analysis(account: &str) -> String {
+pub(crate) fn cost_analysis(account: &str) -> String {
     format!(
         "arn:aws:aws-marketplace::{account}:AWSMarketplace/ReportingData/\
          BillingEvent_V1/Dashboard/CostAnalysis_V1"
@@ -60,13 +68,13 @@ fn cost_analysis(account: &str) -> String {
 
 /// One emulator: a router carrying only this service over one shared engine, plus the
 /// engine itself so a case can read the session the handler persisted.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -74,9 +82,25 @@ impl Emulator {
         Self { router, engine }
     }
 
+    /// The same emulator, with the default caller recorded as the organization's
+    /// management account.
+    ///
+    /// The API is available only to the callers the operation's docs name, and this
+    /// service holds that grant only as a record (nothing here enrols an account — see
+    /// `CallerAccess::standalone_account`), so a case that expects a URL has to put one
+    /// in the store first.
+    pub(crate) fn available_to_default_caller() -> Self {
+        let emulator = Self::new();
+        emulator.store().lock().access.insert(
+            DEFAULT_PRINCIPAL.to_string(),
+            CallerAccess::management_account(),
+        );
+        emulator
+    }
+
     /// `POST /getBuyerDashboard` signed by `principal` (the SigV4 access key id, which is
     /// the caller identity a `CallerAccess` record is keyed by).
-    async fn get_buyer_dashboard(&self, principal: &str, body: &Value) -> Answer {
+    pub(crate) async fn get_buyer_dashboard(&self, principal: &str, body: &Value) -> Answer {
         let credential =
             format!("AWS4-HMAC-SHA256 Credential={principal}/20260101/{REGION}/aws-marketplace/aws4_request, SignedHeaders=host, Signature=abc");
         let request = ::http::Request::builder()
@@ -104,32 +128,32 @@ impl Emulator {
         Answer { status, body }
     }
 
-    /// The same call as the default caller, which the store holds no record for.
-    async fn call(&self, body: &Value) -> Answer {
-        self.get_buyer_dashboard("AKIDEXAMPLE", body).await
+    /// The same call as the default caller.
+    pub(crate) async fn call(&self, body: &Value) -> Answer {
+        self.get_buyer_dashboard(DEFAULT_PRINCIPAL, body).await
     }
 
-    fn store(&self) -> ::engine::ServiceState<Store> {
+    pub(crate) fn store(&self) -> ::engine::ServiceState<Store> {
         self.engine.state::<Store>()
     }
 }
 
 /// What the emulator answered.
-struct Answer {
-    status: u16,
-    body: Value,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
 }
 
 impl Answer {
-    fn embed_url(&self) -> &str {
+    pub(crate) fn embed_url(&self) -> &str {
         self.body["embedUrl"].as_str().unwrap_or_default()
     }
 
-    fn dashboard_identifier(&self) -> &str {
+    pub(crate) fn dashboard_identifier(&self) -> &str {
         self.body["dashboardIdentifier"].as_str().unwrap_or_default()
     }
 
-    fn embedding_domains(&self) -> Vec<String> {
+    pub(crate) fn embedding_domains(&self) -> Vec<String> {
         self.body["embeddingDomains"]
             .as_array()
             .map(|values| {
@@ -142,19 +166,24 @@ impl Answer {
     }
 
     /// The wire error code (`__type`), or the empty string on a success.
-    fn error_code(&self) -> &str {
+    pub(crate) fn error_code(&self) -> &str {
         self.body["__type"].as_str().unwrap_or_default()
+    }
+
+    /// The error message the body carries, or the empty string when it carries none.
+    pub(crate) fn error_message(&self) -> &str {
+        self.body["message"].as_str().unwrap_or_default()
     }
 }
 
 /// A request body naming `dashboard` and `domains`.
-fn request(dashboard: &str, domains: &[&str]) -> Value {
+pub(crate) fn request(dashboard: &str, domains: &[&str]) -> Value {
     json!({ "dashboardIdentifier": dashboard, "embeddingDomains": domains })
 }
 
 /// The bearer token out of an embed URL, parsed here rather than through the crate's own
 /// helper so a wrong helper cannot make this suite pass.
-fn token_of(url: &str) -> &str {
+pub(crate) fn token_of(url: &str) -> &str {
     url.split("/embed/")
         .nth(1)
         .unwrap_or_default()
@@ -192,7 +221,7 @@ async fn every_call_generates_a_fresh_session_the_response_is_built_from() {
         ),
     ];
 
-    let emulator = Emulator::new();
+    let emulator = Emulator::available_to_default_caller();
     // Every token this suite sees, so no two calls — in one case or across them — ever
     // mint the same one.
     let mut tokens: HashSet<String> = HashSet::new();
@@ -337,7 +366,7 @@ async fn an_embedding_domain_that_is_not_fully_qualified_is_refused() {
         ("https://example..com", "an empty label"),
     ];
 
-    let emulator = Emulator::new();
+    let emulator = Emulator::available_to_default_caller();
     let dashboard = agreement_summary("123456789012");
 
     for (domain, why) in cases {
@@ -408,7 +437,7 @@ async fn the_models_own_constraints_are_refused_at_the_boundary() {
         ),
     ];
 
-    let emulator = Emulator::new();
+    let emulator = Emulator::available_to_default_caller();
     for (case, body) in cases {
         let answer = emulator.call(&body).await;
         assert_eq!(
@@ -425,65 +454,68 @@ async fn the_models_own_constraints_are_refused_at_the_boundary() {
 async fn the_api_is_available_only_to_the_callers_its_docs_name() {
     // The documented rule: "available only to Amazon Web Services Organization
     // management accounts or delegated administrators registered for the procurement
-    // insights … feature". One row per combination of the three flags that decides it.
-    let cases: [(&str, CallerAccess, u16, &str); 6] = [
+    // insights … feature". One row per combination of the three flags that decides it,
+    // plus the caller the store holds NO record for — which is every caller until
+    // something records a grant, since no operation of this service enrols an account.
+    let cases: [(&str, Option<CallerAccess>, u16, &str); 7] = [
+        ("no record at all", None, 401, "UnauthorizedException"),
         (
             "management account",
-            CallerAccess {
+            Some(CallerAccess {
                 is_org_management_account: true,
                 delegated_admin: false,
                 procurement_insights_registered: true,
-            },
+            }),
             200,
             "",
         ),
         (
             "management account, feature not registered",
-            CallerAccess {
+            Some(CallerAccess {
                 is_org_management_account: true,
                 delegated_admin: false,
                 procurement_insights_registered: false,
-            },
+            }),
             200,
             "",
         ),
         (
             "registered delegated administrator",
-            CallerAccess {
+            Some(CallerAccess {
                 is_org_management_account: false,
                 delegated_admin: true,
                 procurement_insights_registered: true,
-            },
+            }),
             200,
             "",
         ),
         (
             "delegated administrator not registered for procurement insights",
-            CallerAccess {
+            Some(CallerAccess {
                 is_org_management_account: false,
                 delegated_admin: true,
                 procurement_insights_registered: false,
-            },
+            }),
             403,
             "AccessDeniedException",
         ),
         (
             "neither, registered for procurement insights",
-            CallerAccess {
+            Some(CallerAccess {
                 is_org_management_account: false,
                 delegated_admin: false,
                 procurement_insights_registered: true,
-            },
+            }),
             401,
             "UnauthorizedException",
         ),
         (
             "a member account",
-            CallerAccess {
+            Some(CallerAccess {
                 is_org_management_account: false,
                 delegated_admin: false,
                 procurement_insights_registered: false,
-            },
+            }),
             401,
             "UnauthorizedException",
         ),
@@ -491,14 +523,19 @@ async fn the_api_is_available_only_to_the_callers_its_docs_name() {
 
     let emulator = Emulator::new();
     let body = request(&agreement_summary("123456789012"), &["https://*.amazon.com"]);
+    // Only an available caller may generate a session, so this is what the store must
+    // hold after each row.
+    let mut generated = 0usize;
 
     for (index, (case, access, status, code)) in cases.into_iter().enumerate() {
         let principal = format!("AKIDCALLER{index}");
-        emulator
-            .store()
-            .lock()
-            .access
-            .insert(principal.clone(), access);
+        if let Some(access) = access {
+            emulator
+                .store()
+                .lock()
+                .access
+                .insert(principal.clone(), access);
+        }
         let answer = emulator.get_buyer_dashboard(&principal, &body).await;
         assert_eq!(
             (answer.status, answer.error_code()),
@@ -507,8 +544,8 @@ async fn the_api_is_available_only_to_the_callers_its_docs_name() {
             answer.status,
             answer.body
         );
-        let sessions = emulator.store().lock().embed_sessions.len();
         if status == 200 {
+            generated += 1;
             assert!(
                 answer.embed_url().contains("/embed/"),
                 "case {case:?}: an allowed caller must get an embed URL, got {:?}",
@@ -521,24 +558,17 @@ async fn the_api_is_available_only_to_the_callers_its_docs_name() {
                 answer.embed_url()
             );
         }
+        let sessions = emulator.store().lock().embed_sessions.len();
         assert_eq!(
-            sessions,
-            cases_allowed_so_far(index),
+            sessions, generated,
             "case {case:?}: only an allowed call may generate a session, store holds {sessions}"
         );
     }
 }
 
-/// How many of the access cases up to and including `index` are allowed ones — the
-/// sessions the store must hold at that point.
-fn cases_allowed_so_far(index: usize) -> usize {
-    // Rows 0, 1 and 2 above are the allowed ones.
-    (0..=index).filter(|row| *row <= 2).count()
-}
-
 #[tokio::test]
 async fn a_bearer_token_is_redeemable_once_inside_its_five_minute_window() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::available_to_default_caller();
     let body = request(&cost_analysis("123456789012"), &["https://*.amazon.com"]);
 
     // The instants a redemption is attempted at, and what each must come to. The token's
@@ -615,7 +645,7 @@ async fn a_bearer_token_is_redeemable_once_inside_its_five_minute_window() {
 
 #[tokio::test]
 async fn a_session_whose_hour_has_run_out_is_released() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::available_to_default_caller();
     let body = request(&agreement_summary("123456789012"), &["https://*.amazon.com"]);
     let answer = emulator.call(&body).await;
     assert_eq!(answer.status, 200, "{:?}", answer.body);

@@ -133,13 +133,18 @@ impl From<GetSigningProfileErrorModeled> for GetSigningProfileError {
 }
 
 /// The modelled 404 for a profile name this account holds no profile for.
+///
+/// `code` carries the condition a client branches on — the profile named by the
+/// request does not exist — which is the only machine-readable discriminator a
+/// 404 body has. The message is prose built from the request, worded the way the
+/// recorded service words it.
 fn profile_not_found(profile_name: &str, owner: Option<&str>) -> GetSigningProfileError {
     let owned_by = owner.map_or_else(String::new, |owner| format!(" owned by account {owner}"));
     GetSigningProfileErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: Some(format!(
-            "Signing profile {profile_name}{owned_by} not found"
+            "profile with name {profile_name}{owned_by} does not exists"
         )),
-        code: None,
+        code: Some(crate::state::ERROR_CODE_PROFILE_NOT_FOUND.to_string()),
     })
     .into()
 }
@@ -185,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(GetSigningProfileErrorModeled::InternalServiceErrorException(
                 InternalServiceErrorException {
                     message: Some("the signer profile store is unavailable".to_string()),
-                    code: None,
+                    code: Some(crate::state::ERROR_CODE_INTERNAL_SERVICE_ERROR.to_string()),
                 },
             )
             .into());

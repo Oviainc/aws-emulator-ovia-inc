@@ -18,4 +18,9 @@ union can be declared as `{Op}Output`. A `@required` union member and a
 `@required`-member reference cycle are NOT decline reasons — a scaffolded
 handler returns an error, so it never has to construct a value.
 
-// SKIPPED: InvokeEndpointWithBidirectionalStream — unsupported shape construct: operation 'InvokeEndpointWithBidirectionalStream' has a @streaming event-stream input member, which needs wire framing the generator does not emit
+// IMPLEMENTED SINCE: InvokeEndpointWithBidirectionalStream was declined by the
+// generator ("a @streaming event-stream input member, which needs wire framing
+// the generator does not emit") and has since been HAND-AUTHORED in
+// `src/ops/invoke_endpoint_with_bidirectional_stream.rs`, with the
+// `vnd.amazon.event-stream` framing written there. Nothing is skipped for this
+// service any more.

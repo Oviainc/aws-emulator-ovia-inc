@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ExportSchema
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ExportSchema`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ExportSchema::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Renders a stored schema in another schema language: the JSON Schema draft-4 form
+//! of an AWS-managed OpenAPI 3 event schema.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +146,278 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ExportSchema` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ExportSchemaErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ExportSchema"))
+        // A schema in a service-owned registry was created by no request, so its ARN
+        // names the region THIS request is signed for.
+        let region = crate::state::request_region(ctx.parts());
+
+        // `Type` is modelled `__string` on this operation, not the `Type` enum, so the
+        // boundary validator admits anything: the handler is what refuses a value that
+        // is not a schema language this service knows. Named members and admitted
+        // values, as a validation refusal does.
+        if !TYPE_VALUES.contains(&input.r#type.as_str()) {
+            return Err(ExportSchemaErrorModeled::BadRequestException(
+                crate::state::bad_request(format!(
+                    "Type must be one of {}.",
+                    TYPE_VALUES.join(", ")
+                )),
+            )
+            .into());
+        }
+
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ExportSchemaError::from(ExportSchemaErrorModeled::InternalServerErrorException(
+                crate::state::internal_error(),
+            ))
+        })?;
+        let state = store.lock();
+
+        let registry = state.registries.get(&input.registry_name).ok_or_else(|| {
+            ExportSchemaError::from(ExportSchemaErrorModeled::NotFoundException(
+                crate::state::registry_not_found(&input.registry_name),
+            ))
+        })?;
+        let schema = registry.schemas.get(&input.schema_name).ok_or_else(|| {
+            ExportSchemaError::from(ExportSchemaErrorModeled::NotFoundException(
+                crate::state::schema_not_found(&input.registry_name, &input.schema_name),
+            ))
+        })?;
+        // "Specifying this limits the results to only this schema version"; absent,
+        // the latest stored version answers. A version this schema does not hold is as
+        // absent as a schema that was never created.
+        let version = schema
+            .version_for(input.schema_version.as_deref())
+            .ok_or_else(|| {
+                ExportSchemaError::from(ExportSchemaErrorModeled::NotFoundException(
+                    crate::state::schema_version_not_found(
+                        &input.registry_name,
+                        &input.schema_name,
+                        input.schema_version.as_deref(),
+                    ),
+                ))
+            })?;
+
+        // Exporting is offered for the schemas AWS publishes, not for a caller's own:
+        // a schema in a registry the caller created is refused.
+        if !registry.scope.is_managed() {
+            return Err(ExportSchemaErrorModeled::ForbiddenException(
+                crate::state::forbidden(
+                    "ExportSchema is supported only for AWS-managed schemas; a schema in a \
+                     registry you created cannot be exported.",
+                ),
+            )
+            .into());
+        }
+
+        let content = if input.r#type == version.r#type {
+            // Already in the requested language: the export is the stored document.
+            version.content.clone()
+        } else if input.r#type == JSON_SCHEMA_DRAFT4_TYPE && version.r#type == OPEN_API_3_TYPE {
+            to_json_schema_draft4(&version.content).ok_or_else(|| {
+                ExportSchemaError::from(ExportSchemaErrorModeled::BadRequestException(
+                    crate::state::bad_request(format!(
+                        "Version {} of schema {} is not an OpenAPI 3 document with component \
+                         schemas, so it cannot be exported as {}.",
+                        version.version, input.schema_name, JSON_SCHEMA_DRAFT4_TYPE
+                    )),
+                ))
+            })?
+        } else {
+            // The other direction is not a conversion this service performs: a draft-4
+            // document carries nothing an OpenAPI document needs around it, so it
+            // cannot be rendered as one.
+            return Err(ExportSchemaErrorModeled::BadRequestException(
+                crate::state::bad_request(format!(
+                    "A schema stored as {} cannot be exported as {}.",
+                    version.r#type, input.r#type
+                )),
+            )
+            .into());
+        };
+
+        Ok(ExportSchemaOutput {
+            content: Some(content),
+            schema_arn: Some(registry.schema_arn_in(&region, schema)),
+            schema_name: Some(schema.name.clone()),
+            schema_version: Some(version.version.to_string()),
+            r#type: Some(input.r#type.clone()),
+        })
+    }
+}
+
+/// The two schema languages this service stores, as [`TYPE_VALUES`] spells them.
+const JSON_SCHEMA_DRAFT4_TYPE: &str = "JSONSchemaDraft4";
+
+/// See [`JSON_SCHEMA_DRAFT4_TYPE`].
+const OPEN_API_3_TYPE: &str = "OpenApi3";
+
+/// The `$schema` of a JSON Schema draft-4 document — what makes the export draft 4
+/// rather than some other draft. Shared with `GetDiscoveredSchema`, which stamps the
+/// same marker on the document it infers.
+use crate::state::JSON_SCHEMA_DRAFT4_URI;
+
+/// Where an OpenAPI 3 document keeps its reusable schemas, as a `$ref` names one.
+const OPENAPI_COMPONENT_REF: &str = "#/components/schemas/";
+
+/// Where a JSON Schema draft-4 document keeps the same, as a `$ref` names one.
+const DRAFT4_DEFINITION_REF: &str = "#/definitions/";
+
+/// The component an AWS event schema's OpenAPI document roots at: the event envelope,
+/// whose `detail` references the event-specific component.
+const EVENT_ENVELOPE_COMPONENT: &str = "AWSEvent";
+
+/// Render the OpenAPI 3 document `openapi` as one JSON Schema draft-4 document.
+///
+/// The conversion is structural and computed entirely from the stored document: the
+/// document's `components.schemas` become the draft-4 `definitions`, the root
+/// component is promoted to the document root (the event envelope when the document
+/// has one, else the only component when there is exactly one, else no component —
+/// co-equal components have no single root), and every `$ref` into
+/// `#/components/schemas/` is rewritten to the `#/definitions/` the root now holds.
+///
+/// `None` when `openapi` is not a JSON document carrying an object at
+/// `components.schemas`, or when the component chosen as the root is not an object:
+/// there is nothing to convert.
+fn to_json_schema_draft4(openapi: &str) -> Option<String> {
+    let document: ::serde_json::Value = ::serde_json::from_str(openapi).ok()?;
+    let components = document.get("components")?.get("schemas")?.as_object()?;
+
+    let mut definitions: ::serde_json::Map<String, ::serde_json::Value> = components
+        .iter()
+        .map(|(name, schema)| (name.clone(), rewrite_refs(schema)))
+        .collect();
+
+    let root_name = if definitions.contains_key(EVENT_ENVELOPE_COMPONENT) {
+        Some(EVENT_ENVELOPE_COMPONENT.to_string())
+    } else if definitions.len() == 1 {
+        definitions.keys().next().cloned()
+    } else {
+        None
+    };
+    let mut root = match root_name {
+        Some(name) => match definitions.remove(&name)? {
+            ::serde_json::Value::Object(root) => root,
+            _ => return None,
+        },
+        None => ::serde_json::Map::new(),
+    };
+
+    root.insert(
+        "$schema".to_string(),
+        ::serde_json::Value::String(JSON_SCHEMA_DRAFT4_URI.to_string()),
+    );
+    if !definitions.is_empty() {
+        root.insert(
+            "definitions".to_string(),
+            ::serde_json::Value::Object(definitions),
+        );
+    }
+    ::serde_json::to_string(&::serde_json::Value::Object(root)).ok()
+}
+
+/// Rewrite every `$ref` in `value` from the OpenAPI component it names to the
+/// draft-4 definition of the same name, recursively, leaving everything else as it
+/// stands. A `$ref` to anything else (an external document, say) is left alone: it
+/// names nothing this conversion moved.
+fn rewrite_refs(value: &::serde_json::Value) -> ::serde_json::Value {
+    match value {
+        ::serde_json::Value::Object(members) => ::serde_json::Value::Object(
+            members
+                .iter()
+                .map(|(key, member)| {
+                    let rewritten = match (key.as_str(), member.as_str()) {
+                        ("$ref", Some(target)) => target
+                            .strip_prefix(OPENAPI_COMPONENT_REF)
+                            .map(|name| {
+                                ::serde_json::Value::String(format!("{DRAFT4_DEFINITION_REF}{name}"))
+                            })
+                            .unwrap_or_else(|| member.clone()),
+                        _ => rewrite_refs(member),
+                    };
+                    (key.clone(), rewritten)
+                })
+                .collect(),
+        ),
+        ::serde_json::Value::Array(items) => {
+            ::serde_json::Value::Array(items.iter().map(rewrite_refs).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The conversion is computed from the document it is given: the envelope becomes
+    /// the root, the rest becomes `definitions`, and references follow.
+    #[test]
+    fn the_conversion_promotes_the_envelope_and_rewrites_refs() {
+        let openapi = r##"{"openapi":"3.0.0","components":{"schemas":{
+            "AWSEvent":{"type":"object","properties":{
+                "detail":{"$ref":"#/components/schemas/Detail"},
+                "resources":{"type":"array","items":{"$ref":"#/components/schemas/Resource"}}}},
+            "Detail":{"type":"object","properties":{"id":{"type":"string"}}},
+            "Resource":{"type":"string"}}}}"##;
+        let converted = to_json_schema_draft4(openapi).expect("an OpenAPI 3 document converts");
+        let converted: ::serde_json::Value =
+            ::serde_json::from_str(&converted).expect("the conversion is JSON");
+
+        assert_eq!(
+            converted["$schema"], JSON_SCHEMA_DRAFT4_URI,
+            "the document must name draft 4, got {converted:?}"
+        );
+        assert_eq!(
+            converted["properties"]["detail"]["$ref"], "#/definitions/Detail",
+            "a component ref must point into definitions, got {converted:?}"
+        );
+        assert_eq!(
+            converted["properties"]["resources"]["items"]["$ref"], "#/definitions/Resource",
+            "a nested component ref must be rewritten too, got {converted:?}"
+        );
+        assert!(
+            converted["definitions"]["Detail"].is_object()
+                && converted["definitions"]["Resource"]["type"] == "string",
+            "every other component must be a definition, got {converted:?}"
+        );
+        assert!(
+            converted["definitions"]["AWSEvent"].is_null(),
+            "the promoted component is the root, not also a definition, got {converted:?}"
+        );
+    }
+
+    /// Rows: documents with no single root component, and documents that are not
+    /// OpenAPI 3 documents at all.
+    #[test]
+    fn the_conversion_reports_what_it_cannot_render() {
+        let only_one = r#"{"components":{"schemas":{"Solo":{"type":"object"}}}}"#;
+        let converted = to_json_schema_draft4(only_one).expect("one component converts");
+        let converted: ::serde_json::Value =
+            ::serde_json::from_str(&converted).expect("the conversion is JSON");
+        assert_eq!(
+            converted["type"], "object",
+            "the only component is the root, got {converted:?}"
+        );
+
+        let co_equal = r#"{"components":{"schemas":{"A":{"type":"object"},"B":{"type":"string"}}}}"#;
+        let converted = to_json_schema_draft4(co_equal).expect("co-equal components convert");
+        let converted: ::serde_json::Value =
+            ::serde_json::from_str(&converted).expect("the conversion is JSON");
+        assert!(
+            converted["definitions"]["A"].is_object() && converted["definitions"]["B"].is_object(),
+            "co-equal components are all definitions under a bare root, got {converted:?}"
+        );
+
+        for case in [
+            "not json at all",
+            "{}",
+            r#"{"components":{}}"#,
+            r#"{"components":{"schemas":[]}}"#,
+            r#"{"components":{"schemas":{"AWSEvent":"not an object"}}}"#,
+        ] {
+            assert!(
+                to_json_schema_draft4(case).is_none(),
+                "case {case:?}: a document with nothing to convert must report so"
+            );
+        }
     }
 }

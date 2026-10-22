@@ -25,7 +25,11 @@ pub enum SchemaDefinition {
     cedarJson(String),
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.verifiedpermissions#PutSchemaOutput")]
+/// `createdDate`/`lastUpdatedDate` target `TimestampFormat`
+/// (`@timestampFormat("date-time")`), so this shape's schema comes from
+/// `vp_schema_and_codec!` rather than `#[smithy_macros::smithy(shape = ...)]` — see
+/// `types/date_time_wire.rs`. Member set, order and requiredness from
+/// `smithy_query(query="shape", shape="PutSchemaOutput")`.
 #[derive(Debug, Clone)]
 pub struct PutSchemaOutput {
     pub policy_store_id: String,
@@ -33,4 +37,16 @@ pub struct PutSchemaOutput {
     pub created_date: ::aws_smithy_types::DateTime,
     pub last_updated_date: ::aws_smithy_types::DateTime,
 }
+
+vp_schema_and_codec!(
+    PutSchemaOutput,
+    PUT_SCHEMA_OUTPUT_SCHEMA,
+    "com.amazonaws.verifiedpermissions#PutSchemaOutput",
+    "com.amazonaws.verifiedpermissions",
+    "PutSchemaOutput",
+    (M_POLICY_STORE_ID, policy_store_id, "policyStoreId", 0, req, string),
+    (M_NAMESPACES, namespaces, "namespaces", 1, req, list_of_string),
+    (M_CREATED_DATE, created_date, "createdDate", 2, req, date_time),
+    (M_LAST_UPDATED_DATE, last_updated_date, "lastUpdatedDate", 3, req, date_time),
+);
 

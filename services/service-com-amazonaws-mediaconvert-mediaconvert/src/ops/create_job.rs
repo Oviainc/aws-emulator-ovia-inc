@@ -252,7 +252,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or_else(|| crate::state::DEFAULT_QUEUE_NAME.to_string());
         if !state.queues.contains_key(&queue) {
             return Err(CreateJobErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("Queue {queue} not found.")),
+                // The refusal names the request member the reference came from, `Queue`.
+                message: Some(crate::state::not_found_message("queue")),
             })
             .into());
         }

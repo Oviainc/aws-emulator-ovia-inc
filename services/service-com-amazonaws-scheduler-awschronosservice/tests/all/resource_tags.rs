@@ -21,35 +21,13 @@ use std::collections::BTreeMap;
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::wire_harness::{account_id, call, error_code, scheduler_router, REGION};
+use crate::wire_harness::{
+    account_id, call, encode_label, error_code, group_arn, list_tags, scheduler_router, tags_of,
+    REGION,
+};
 
 /// One tag as a case writes it.
 type Pair = (String, String);
-
-/// Percent-encode one URI path segment or query value, the way an SDK does: an
-/// ARN carries `:` and `/`, and `/tags/{ResourceArn}` is a single (non-greedy)
-/// label, so everything but the unreserved characters has to be encoded for the
-/// value to survive the server's percent-decode unchanged.
-fn encode_label(value: &str) -> String {
-    let mut encoded = String::new();
-    for byte in value.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                encoded.push(char::from(*byte));
-            }
-            other => encoded.push_str(&format!("%{other:02X}")),
-        }
-    }
-    encoded
-}
-
-/// The ARN `CreateScheduleGroup` mints for `name` in `region`.
-fn group_arn(region: &str, name: &str) -> String {
-    format!(
-        "arn:aws:scheduler:{region}:{}:schedule-group/{name}",
-        account_id()
-    )
-}
 
 /// Create a schedule group and answer its ARN.
 async fn create_group(router: &MultiServiceRouter, name: &str) -> String {
@@ -93,32 +71,6 @@ async fn untag(router: &MultiServiceRouter, arn: &str, keys: &[&str]) -> (u16, s
         .collect();
     let uri = format!("/tags/{}?{}", encode_label(arn), query.join("&"));
     call(router, "DELETE", &uri, None).await
-}
-
-async fn list_tags(router: &MultiServiceRouter, arn: &str) -> (u16, serde_json::Value) {
-    call(router, "GET", &format!("/tags/{}", encode_label(arn)), None).await
-}
-
-/// `ListTagsForResource`'s answer as the map it represents, so a comparison does
-/// not depend on an order AWS never promises.
-fn tags_of(body: &serde_json::Value) -> BTreeMap<String, String> {
-    body.get("Tags")
-        .and_then(serde_json::Value::as_array)
-        .unwrap_or_else(|| panic!("no Tags list in {body}"))
-        .iter()
-        .map(|tag| {
-            (
-                tag.get("Key")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                tag.get("Value")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            )
-        })
-        .collect()
 }
 
 /// The tag set `tags` stands for — the last value wins for a repeated key, the

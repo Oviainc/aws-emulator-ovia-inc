@@ -28,14 +28,23 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_snowdevicemanagement_snowdevicemanagement::state::{
-    seeded_device_id, seeded_instance_id, seeded_instance_ids,
+    device_instance_ids, instance_id, managed_device_id, service_state,
 };
 use service_com_amazonaws_snowdevicemanagement_snowdevicemanagement::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
+
+/// The Region every request in this suite signs for, which is also the Region its
+/// devices are activated in.
+const SIGNED_REGION: &str = "eu-west-1";
+
+/// How many devices this suite activates Snow Device Management on. The fixture puts
+/// a different number of instances on each, including none on the third.
+const ACTIVATED_DEVICES: u64 = 3;
 
 /// A SigV4 credential scope naming this service, which is what routes the request.
 const SIGNED_SCOPE: &str = "AWS4-HMAC-SHA256 \
@@ -61,7 +70,7 @@ const INSTANCE_STATES: &[(&str, i64)] = &[
 const ATTACHMENT_STATUSES: &[&str] = &["ATTACHING", "ATTACHED", "DETACHING", "DETACHED"];
 
 /// Managed-device ids no account inventory holds, spanning the shapes a client can send:
-/// the modelled `@length(1..64)` floor and ceiling, an id shaped like a seeded one but
+/// the modelled `@length(1..64)` floor and ceiling, an id shaped like an activated one but
 /// absent, and ids in another service's shape.
 fn unmanaged_device_ids() -> Vec<String> {
     vec![
@@ -69,16 +78,27 @@ fn unmanaged_device_ids() -> Vec<String> {
         "f".repeat(64),
         "smd-ffffffffffffffff".to_string(),
         "mdev-sim2real-ghost-70d421d7da1a".to_string(),
-        seeded_device_id(u64::MAX),
+        managed_device_id(u64::MAX),
     ]
 }
 
-/// One emulator: a router carrying only this service, over one shared engine.
+/// One emulator: a router carrying only this service, over one shared engine, with
+/// Snow Device Management activated on [`ACTIVATED_DEVICES`] ordered devices in
+/// [`SIGNED_REGION`].
+///
+/// The API models no device-creation operation, so the activation goes through the one
+/// state seam that puts a device in the inventory; without it the account's inventory
+/// is empty and every gated operation answers the account-level device gate (see
+/// `account_device_gate.rs`).
 fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    service_state(&*engine)
+        .expect("the in-memory engine carries this service's state")
+        .lock()
+        .activate_devices(SIGNED_REGION, ACTIVATED_DEVICES, SystemTime::now());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
     router
 }
 
@@ -172,7 +192,8 @@ async fn inventory(router: &MultiServiceRouter) -> Vec<String> {
                 .as_str()
                 .unwrap_or_else(|| panic!("case \"inventory\": expected a managedDeviceId, got {device}"))
                 .to_string();
-            let expected = seeded_device_id(u64::try_from(index).expect("a small index fits in u64"));
+            let expected =
+                managed_device_id(u64::try_from(index).expect("a small index fits in u64"));
             assert_eq!(
                 id, expected,
                 "case \"inventory\": ListDevices must serve the inventory in index order \
@@ -306,8 +327,8 @@ async fn the_answer_is_the_requested_ids_intersected_with_the_devices_cache() {
     let mut empty_devices = 0usize;
 
     for (index, device) in devices.iter().enumerate() {
-        let held = seeded_instance_ids(u64::try_from(index).expect("a small index fits in u64"));
-        let ghost = seeded_instance_id(u64::MAX);
+        let held = device_instance_ids(u64::try_from(index).expect("a small index fits in u64"));
+        let ghost = instance_id(u64::MAX);
 
         // The table rows: how the requested id set is formed. The expected answer is
         // always the held ids the row asks for, in cache order.
@@ -382,7 +403,7 @@ async fn an_instance_of_one_device_is_not_visible_through_another() {
         .map(|(index, device)| {
             (
                 device,
-                seeded_instance_ids(u64::try_from(index).expect("a small index fits in u64")),
+                device_instance_ids(u64::try_from(index).expect("a small index fits in u64")),
             )
         })
         .collect();
@@ -409,7 +430,7 @@ async fn an_instance_of_one_device_is_not_visible_through_another() {
 async fn a_device_the_account_does_not_manage_is_refused_without_disclosing_it() {
     let router = emulator();
     let managed = inventory(&router).await;
-    let held = seeded_instance_ids(0);
+    let held = device_instance_ids(0);
     let mut messages: BTreeSet<String> = BTreeSet::new();
 
     // The table rows: the shape of the unmanaged id × what was asked of it. The gate is
@@ -419,7 +440,7 @@ async fn a_device_the_account_does_not_manage_is_refused_without_disclosing_it()
             !managed.contains(&device),
             "case \"fixture\": {device:?} must not be in the managed inventory"
         );
-        for requested in [vec![], held.clone(), vec![seeded_instance_id(u64::MAX)]] {
+        for requested in [vec![], held.clone(), vec![instance_id(u64::MAX)]] {
             let case = format!("device {device:?} with {} requested id(s)", requested.len());
             let answer = describe_instances(&router, &device, &requested).await;
             assert_eq!(
@@ -467,7 +488,7 @@ async fn two_identical_calls_answer_identically() {
 
     // The table rows: every device, asked for its whole cache.
     for (index, device) in devices.iter().enumerate() {
-        let held = seeded_instance_ids(u64::try_from(index).expect("a small index fits in u64"));
+        let held = device_instance_ids(u64::try_from(index).expect("a small index fits in u64"));
         let case = format!("device {device} ({index})");
         let first = describe_instances(&router, device, &held).await;
         let second = describe_instances(&router, device, &held).await;

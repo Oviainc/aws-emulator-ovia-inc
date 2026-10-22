@@ -257,6 +257,9 @@ pub enum Fault {
     InvalidParameter(String),
     /// An `imageIds` entry matches no stored image — `ImageNotFoundException`.
     ImageNotFound(String),
+    /// The repository exists but carries no lifecycle policy —
+    /// `LifecyclePolicyNotFoundException`.
+    LifecyclePolicyNotFound(String),
     /// A tag key or value is longer than a tag may be — `InvalidTagParameterException`.
     InvalidTagParameter(String),
     /// The resource would end up carrying more tags than one may hold —
@@ -271,6 +274,7 @@ impl Fault {
             Self::RepositoryNotFound(m)
             | Self::InvalidParameter(m)
             | Self::ImageNotFound(m)
+            | Self::LifecyclePolicyNotFound(m)
             | Self::InvalidTagParameter(m)
             | Self::TooManyTags(m) => m,
         }
@@ -745,6 +749,24 @@ pub fn parse_lifecycle_policy(text: &str) -> Result<Vec<LifecycleRule>, Fault> {
     // Rules are applied in ascending rule priority, whatever order the document lists
     // them in.
     parsed.sort_by_key(|rule| rule.priority);
+
+    // "A lifecycle policy rule with a tagStatus value of any must have the highest value
+    // for rulePriority and be evaluated last", so a catch-all rule is refused exactly
+    // when another rule sorts after it. Checked once the rules are in applied order: the
+    // last one is the one with the highest priority.
+    if let Some(last) = parsed.last() {
+        if let Some(catch_all) = parsed
+            .iter()
+            .find(|rule| rule.tag_status == ANY_TAG_STATUS && rule.priority < last.priority)
+        {
+            return Err(bad(format!(
+                "rule {} selects every image but is evaluated before rule {}; a rule \
+                 selecting every image carries the highest rulePriority in the policy",
+                catch_all.priority, last.priority
+            )));
+        }
+    }
+
     Ok(parsed)
 }
 
@@ -833,7 +855,10 @@ pub struct Repo {
     pub images: BTreeMap<String, ImageRecord>,
     pub tag_index: BTreeMap<String, String>,
     /// The repository's lifecycle policy, which `PutLifecyclePolicy` sets: the policy
-    /// `StartLifecyclePolicyPreview` evaluates when the start call names none.
+    /// `StartLifecyclePolicyPreview` evaluates when the start call names none, and the
+    /// document `GetLifecyclePolicy` reports. `None` until a policy is put and again
+    /// once `DeleteLifecyclePolicy` removes it, which is what the two of them report
+    /// `LifecyclePolicyNotFoundException` for.
     pub lifecycle_policy: Option<String>,
     /// The one lifecycle policy preview this repository carries; a later start replaces
     /// it.
@@ -1412,6 +1437,15 @@ pub const POLICY_EFFECTS: [&str; 2] = ["Allow", "Deny"];
 pub fn registry_policy_not_found_message() -> String {
     format!(
         "Registry policy does not exist in the registry with id '{}'",
+        registry_id()
+    )
+}
+
+/// The wording ECR uses when a repository carries no lifecycle policy.
+pub fn lifecycle_policy_not_found_message(name: &str) -> String {
+    format!(
+        "Lifecycle policy does not exist for the repository with name '{name}' in the \
+         registry with id '{}'",
         registry_id()
     )
 }

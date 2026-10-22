@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: moves each `stopped` instance to `pending` and records the `running`
+//! transition the clock then owes it, reporting the state it actually held before the
+//! call beside the one it now holds.
+//!
+//! An instance already `pending` or `running` is reported unchanged; one that is
+//! `stopping` or on its way to `terminated` is refused with `IncorrectInstanceState`.
+//! The whole batch is checked before any instance is moved.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +147,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartInstances"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            deduplicate_ids, require_known_instance, require_service_state, InstanceStateName,
+            PendingTransition, MAX_RESOURCE_IDS,
+        };
+
+        let _ = ctx;
+
+        if input.instance_ids.is_empty() {
+            return Err(Scaffolded::missing_parameter(
+                "The request must contain the parameter InstanceIds",
+            ));
+        }
+        // The model declares no `@length` on `InstanceIds`, so this is the only
+        // place the batch size can be bounded.
+        if input.instance_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "InstanceIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                input.instance_ids.len()
+            )));
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        store.materialize_due_transitions();
+
+        // One instance gets one answer however many times the batch names it.
+        let instance_ids = deduplicate_ids(&input.instance_ids);
+
+        // The whole batch is checked first: EC2 refuses the call rather than starting
+        // some of the instances it names.
+        for instance_id in &instance_ids {
+            require_known_instance(&store, instance_id)?;
+            let Some(instance) = store.instances.get(instance_id) else {
+                continue;
+            };
+            if !matches!(
+                instance.state,
+                InstanceStateName::Stopped
+                    | InstanceStateName::Pending
+                    | InstanceStateName::Running
+            ) {
+                return Err(Scaffolded::incorrect_instance_state(
+                    instance_id,
+                    instance.state.as_str(),
+                    "started",
+                ));
+            }
+        }
+
+        // DryRun sits AFTER the whole batch has been resolved and checked and
+        // BEFORE the first write: the flag asks whether the request would have
+        // succeeded, so a request that names an unknown instance, or one in a state
+        // it cannot be started from, must be refused with that reason instead. The
+        // checks above only read state.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let mut changes: Vec<InstanceStateChange> = Vec::new();
+        for instance_id in &instance_ids {
+            let Some(instance) = store.instances.get_mut(instance_id) else {
+                continue;
+            };
+            let previous = instance.state;
+            // `pending` and `running` are already at or on their way to the state
+            // this call asks for, so the call reports what it found.
+            if previous == InstanceStateName::Stopped {
+                instance.state = InstanceStateName::Pending;
+                instance.pending_transition = Some(PendingTransition::starting_now(
+                    InstanceStateName::Running,
+                ));
+                // The instance is on its way up again, so the reason recorded for
+                // the stop no longer describes its state.
+                instance.state_transition_reason = None;
+                instance.state_reason = None;
+            }
+            changes.push(InstanceStateChange {
+                instance_id: Some(instance_id.clone()),
+                previous_state: Some(previous.view()),
+                current_state: Some(instance.state.view()),
+            });
+        }
+
+        Ok(StartInstancesOutput {
+            starting_instances: Some(changes),
+        })
     }
 }

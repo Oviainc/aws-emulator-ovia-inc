@@ -140,6 +140,22 @@ const RESULT_PASS: &str = "PASS";
 /// from the same modelled value list.
 const RESULT_FAIL: &str = "FAIL";
 
+/// The `message` the check reports for a `PASS`.
+///
+/// `CheckNoNewAccessResponse$message` is "The message indicating whether the updated
+/// policy allows new access" (`smithy_query(query="shape",
+/// shape="CheckNoNewAccessResponse")`): a sentence determined by the `result` ALONE, so
+/// every request that reaches a verdict reports that verdict's sentence and none of the
+/// request's own content appears in it. The text is the service's, not a paraphrase —
+/// the recorded AWS response for a `PASS` carries this one.
+const MESSAGE_PASS: &str = "The modified permissions do not grant new access.";
+
+/// The `message` the check reports for a `FAIL`, the service's own sentence for that
+/// verdict as the recorded AWS response carries it: it names the baseline the comparison
+/// was made against (the caller's existing policy), which is what the verdict means.
+const MESSAGE_FAIL: &str =
+    "The modified permissions grant new access compared to your existing policy.";
+
 /// The `existingPolicyDocument` member name, as a validation refusal reports it.
 const EXISTING_MEMBER: &str = "existingPolicyDocument";
 
@@ -244,7 +260,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if new_access.is_empty() {
             return Ok(CheckNoNewAccessOutput {
                 result: Some(RESULT_PASS.to_string()),
-                message: Some("The modified permissions do not grant new access.".to_string()),
+                message: Some(MESSAGE_PASS.to_string()),
                 // Nothing in the updated policy grants new access, so there is no
                 // statement to report a reason about.
                 reasons: None,
@@ -253,7 +269,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(CheckNoNewAccessOutput {
             result: Some(RESULT_FAIL.to_string()),
-            message: Some("The modified permissions grant new access.".to_string()),
+            message: Some(MESSAGE_FAIL.to_string()),
             reasons: Some(
                 new_access
                     .into_iter()
@@ -275,22 +291,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// `ValidationException` (HTTP 400) rather than the scaffold's synthetic one: the
 /// modelled shape carries the `reason` and the `fieldList` a client reads.
 fn field_validation(member: &str, message: String) -> CheckNoNewAccessError {
-    CheckNoNewAccessErrorModeled::ValidationException(ValidationException {
-        message: message.clone(),
-        reason: crate::state::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
-        field_list: Some(vec![ValidationExceptionField {
-            name: member.to_string(),
-            message,
-        }]),
-    })
+    CheckNoNewAccessErrorModeled::ValidationException(crate::state::field_validation_exception(
+        member, message,
+    ))
     .into()
 }
 
 /// Render a comparison failure as the modelled error that says what happened.
 ///
 /// A document that is not JSON, or not a policy, is a bad request member: HTTP 400
-/// `ValidationException`, with the model's own `cannotParse` / `fieldValidationFailed`
-/// reason and the member named in `fieldList`. A policy the engine cannot decide
+/// `ValidationException`, carrying the `cannotParse` / `fieldValidationFailed`
+/// discriminators in the spelling [`crate::state::VALIDATION_REASONS`] pairs them with,
+/// and the member named in `fieldList`. A policy the engine cannot decide
 /// FAITHFULLY (a condition operator it does not model, or a comparison past its
 /// evaluation budget) is answered with the modelled HTTP 422
 /// `UnprocessableEntityException` — "the specified entity could not be processed" — and
@@ -309,7 +321,7 @@ fn render_engine_error(error: policy::EngineError) -> CheckNoNewAccessError {
         policy::EngineError::Unparseable { member, detail } => {
             CheckNoNewAccessErrorModeled::ValidationException(ValidationException {
                 message: format!("{member} is not a JSON document: {detail}"),
-                reason: VALIDATION_REASON_CANNOT_PARSE.to_string(),
+                reason: crate::state::VALIDATION_REASON_CANNOT_PARSE.to_string(),
                 field_list: Some(vec![ValidationExceptionField {
                     name: member.to_string(),
                     message: format!("not a JSON document: {detail}"),
@@ -328,10 +340,6 @@ fn render_engine_error(error: policy::EngineError) -> CheckNoNewAccessError {
         }
     }
 }
-
-/// The `ValidationExceptionReason` for a document that could not be parsed at all: the
-/// service's shared constant, so this check and `CheckNoPublicAccess` report the same one.
-use crate::state::VALIDATION_REASON_CANNOT_PARSE;
 
 /// A self-contained IAM policy comparison engine: does an updated policy allow any
 /// access the existing policy does not?

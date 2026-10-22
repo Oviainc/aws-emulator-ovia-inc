@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchCreateBillingAdjustmentRequest
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchCreateBillingAdjustmentRequest`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchCreateBillingAdjustmentRequest::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores one billing adjustment request per entry the batch could accept, and
+//! reports the entries it could not on the per-entry `errors` channel.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +149,177 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchCreateBillingAdjustmentRequest` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchCreateBillingAdjustmentRequestErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                BatchCreateBillingAdjustmentRequestErrorModeled::InternalServerException(
+                    crate::state::store_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        let entries = input.billing_adjustment_request_entries;
+
+        // The rules about the batch AS A WHOLE, each refused before any entry is
+        // stored, so a malformed batch creates nothing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchCreateBillingAdjustmentRequest"))
+        // "A list of billing adjustment request entries": a batch that submits
+        // no adjustment has nothing to do.
+        if entries.is_empty() {
+            return Err(
+                BatchCreateBillingAdjustmentRequestErrorModeled::ValidationException(
+                    crate::state::validation_exception(
+                        "MISSING_BILLING_ADJUSTMENTS",
+                        "billingAdjustmentRequestEntries",
+                    ),
+                )
+                .into(),
+            );
+        }
+        if entries.len() > crate::state::BILLING_ADJUSTMENT_BATCH_LIMIT {
+            return Err(
+                BatchCreateBillingAdjustmentRequestErrorModeled::ValidationException(
+                    crate::state::validation_exception(
+                        "BILLING_ADJUSTMENTS_LIMIT_EXCEEDED",
+                        "billingAdjustmentRequestEntries",
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // "submit billing adjustment requests for one or more invoices WITHIN AN
+        // AGREEMENT": one batch adjusts invoices of a single agreement.
+        let agreements: ::std::collections::BTreeSet<&str> = entries
+            .iter()
+            .map(|entry| entry.agreement_id.as_str())
+            .collect();
+        if agreements.len() > 1 {
+            return Err(
+                BatchCreateBillingAdjustmentRequestErrorModeled::ValidationException(
+                    crate::state::validation_exception(
+                        "MULTIPLE_AGREEMENT_IDS",
+                        "billingAdjustmentRequestEntries",
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // "Each entry requires a unique `clientToken` for idempotency": two
+        // entries of one batch sharing a token name no distinct adjustment.
+        let tokens: ::std::collections::BTreeSet<&str> = entries
+            .iter()
+            .map(|entry| entry.client_token.as_str())
+            .collect();
+        if tokens.len() != entries.len() {
+            return Err(
+                BatchCreateBillingAdjustmentRequestErrorModeled::ValidationException(
+                    crate::state::validation_exception(
+                        "INVALID_CLIENT_TOKEN",
+                        "billingAdjustmentRequestEntries",
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let mut items: Vec<BatchCreateBillingAdjustmentItem> = Vec::new();
+        let mut errors: Vec<BatchCreateBillingAdjustmentError> = Vec::new();
+
+        for entry in &entries {
+            // Idempotency: the token names the adjustment, so a replayed submit
+            // reports the request it already created rather than a second one,
+            // and a token reused for different details is a conflict.
+            let replayed = store
+                .billing_adjustment_by_client_token(&entry.client_token)
+                .map(|stored| (stored.id.clone(), stored.matches_entry(entry)));
+            match replayed {
+                Some((id, true)) => {
+                    items.push(BatchCreateBillingAdjustmentItem {
+                        billing_adjustment_request_id: id,
+                        client_token: entry.client_token.clone(),
+                    });
+                    continue;
+                }
+                Some((id, false)) => {
+                    errors.push(BatchCreateBillingAdjustmentError {
+                        code: crate::state::BILLING_ADJUSTMENT_ERROR_CONFLICT.to_string(),
+                        message: format!(
+                            "clientToken {:?} already submitted billing adjustment request {id} \
+                             with different details",
+                            entry.client_token
+                        ),
+                        client_token: entry.client_token.clone(),
+                    });
+                    continue;
+                }
+                None => {}
+            }
+
+            // An adjustment is made to an invoice OF an agreement, so the
+            // agreement has to exist: it is also where a summary's
+            // `agreementType` and `catalog` come from.
+            let Some((agreement_type, catalog)) = store
+                .agreements
+                .get(&entry.agreement_id)
+                .map(|agreement| (agreement.agreement_type.clone(), agreement.catalog.clone()))
+            else {
+                errors.push(BatchCreateBillingAdjustmentError {
+                    code: crate::state::BILLING_ADJUSTMENT_ERROR_NOT_FOUND.to_string(),
+                    message: format!("agreement {} not found", entry.agreement_id),
+                    client_token: entry.client_token.clone(),
+                });
+                continue;
+            };
+
+            if !crate::state::is_positive_amount(&entry.adjustment_amount) {
+                errors.push(BatchCreateBillingAdjustmentError {
+                    code: crate::state::BILLING_ADJUSTMENT_ERROR_VALIDATION.to_string(),
+                    message: format!(
+                        "adjustmentAmount {:?} is not a positive amount",
+                        entry.adjustment_amount
+                    ),
+                    client_token: entry.client_token.clone(),
+                });
+                continue;
+            }
+
+            let id = store.mint_billing_adjustment_request_id();
+            let request = crate::state::BillingAdjustmentRequest {
+                id: id.clone(),
+                agreement_id: entry.agreement_id.clone(),
+                agreement_type,
+                catalog,
+                original_invoice_id: entry.original_invoice_id.clone(),
+                adjustment_amount: entry.adjustment_amount.clone(),
+                currency_code: entry.currency_code.clone(),
+                adjustment_reason_code: entry.adjustment_reason_code.clone(),
+                description: entry.description.clone(),
+                client_token: entry.client_token.clone(),
+                // Submitted for processing, which the clock owes at
+                // `completes_at`.
+                status: crate::state::BILLING_ADJUSTMENT_PENDING.to_string(),
+                status_message: None,
+                created_at: now,
+                updated_at: now,
+                completes_at: now + crate::state::BILLING_ADJUSTMENT_SETTLEMENT,
+            };
+            store.billing_adjustment_requests.insert(id.clone(), request);
+            crate::state::audit(
+                "BatchCreateBillingAdjustmentRequest",
+                "created",
+                &id,
+                ctx.parts(),
+            );
+            items.push(BatchCreateBillingAdjustmentItem {
+                billing_adjustment_request_id: id,
+                client_token: entry.client_token.clone(),
+            });
+        }
+
+        Ok(BatchCreateBillingAdjustmentRequestOutput { items, errors })
     }
 }

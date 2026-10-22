@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TerminateInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TerminateInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TerminateInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: moves each named instance to `shutting-down` and records the
+//! `terminated` transition the clock then owes it, reporting the state it actually
+//! held before the call beside the one it now holds.
+//!
+//! A terminated instance is kept, not removed, so a later `DescribeInstances` still
+//! reports it as `terminated` and `Start`/`StopInstances` on it are refused. An
+//! instance whose `DisableApiTermination` attribute is set is refused with
+//! `OperationNotPermitted`, and the whole batch is checked before any instance is
+//! moved.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +177,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TerminateInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TerminateInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TerminateInstances"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            deduplicate_ids, require_known_instance, require_service_state, user_initiated_reason,
+            InstanceStateName, PendingTransition, MAX_RESOURCE_IDS,
+        };
+
+        let _ = ctx;
+
+        if input.instance_ids.is_empty() {
+            return Err(Scaffolded::missing_parameter(
+                "The request must contain the parameter InstanceIds",
+            ));
+        }
+        // Documented on `InstanceIds`: "Up to 1000 instance IDs." The model declares
+        // no `@length`, so this is the only place the batch size can be bounded.
+        if input.instance_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "InstanceIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                input.instance_ids.len()
+            )));
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        store.materialize_due_transitions();
+
+        // One instance gets one answer however many times the batch names it.
+        let instance_ids = deduplicate_ids(&input.instance_ids);
+
+        // The whole batch is checked first: EC2 refuses the call rather than
+        // terminating some of the instances it names.
+        for instance_id in &instance_ids {
+            require_known_instance(&store, instance_id)?;
+            let Some(instance) = store.instances.get(instance_id) else {
+                continue;
+            };
+            if instance.disable_api_termination && !instance.state.is_terminating() {
+                return Err(Scaffolded::operation_not_permitted(format!(
+                    "The instance '{instance_id}' may not be terminated. Modify its \
+                     'disableApiTermination' instance attribute and try again"
+                )));
+            }
+        }
+
+        // DryRun sits AFTER the whole batch has been resolved and checked and
+        // BEFORE the first write: the flag asks whether the request would have
+        // succeeded, so a request that names an unknown instance, or one that
+        // termination protection forbids, must be refused with that reason instead.
+        // The checks above only read state.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut changes: Vec<InstanceStateChange> = Vec::new();
+        for instance_id in &instance_ids {
+            let Some(instance) = store.instances.get_mut(instance_id) else {
+                continue;
+            };
+            let previous = instance.state;
+            // An instance already on its way to (or at) `terminated` is reported
+            // unchanged; termination is idempotent.
+            if !previous.is_terminating() {
+                instance.state = InstanceStateName::ShuttingDown;
+                instance.pending_transition = Some(PendingTransition::starting_now(
+                    InstanceStateName::Terminated,
+                ));
+                instance.state_transition_reason = Some(user_initiated_reason(now));
+                instance.state_reason = Some((
+                    "Client.UserInitiatedShutdown".to_string(),
+                    "Client.UserInitiatedShutdown: User initiated shutdown".to_string(),
+                ));
+            }
+            changes.push(InstanceStateChange {
+                instance_id: Some(instance_id.clone()),
+                previous_state: Some(previous.view()),
+                current_state: Some(instance.state.view()),
+            });
+        }
+
+        Ok(TerminateInstancesOutput {
+            terminating_instances: Some(changes),
+        })
     }
 }

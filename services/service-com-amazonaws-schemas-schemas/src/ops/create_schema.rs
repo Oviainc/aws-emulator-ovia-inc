@@ -182,15 +182,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             })?;
 
+        // AWS owns what is in a service-owned registry, so a caller cannot add to it.
+        if registry.scope.is_managed() {
+            return Err(CreateSchemaErrorModeled::ForbiddenException(
+                crate::state::managed_registry_is_read_only(&input.registry_name),
+            )
+            .into());
+        }
+
         // A schema name identifies the schema within its registry; a second create
         // under the same name is a conflict, not a new version. Versions come from
         // UpdateSchema.
         if registry.schemas.contains_key(&input.schema_name) {
             return Err(CreateSchemaErrorModeled::ConflictException(
-                crate::state::conflict(format!(
-                    "Schema {} already exists in registry {}.",
-                    input.schema_name, input.registry_name
-                )),
+                crate::state::schema_already_exists(&input.schema_name),
             )
             .into());
         }
@@ -249,6 +254,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             ))
             .collect(),
+            minted_by_token: ::std::collections::BTreeMap::new(),
         };
         registry.schemas.insert(input.schema_name.clone(), schema);
 
@@ -264,7 +270,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(CreateSchemaOutput {
             description: stored.description.clone(),
             last_modified: Some(stored.last_modified.into()),
-            schema_arn: Some(stored.arn.clone()),
+            schema_arn: Some(registry.schema_arn_in(&region, stored)),
             schema_name: Some(stored.name.clone()),
             schema_version: Some(version.version.to_string()),
             tags: crate::state::tags_to_output(&stored.tags),

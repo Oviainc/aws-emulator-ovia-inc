@@ -744,18 +744,56 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
-/// The `ValidationExceptionReason` for a request member that failed validation, from
-/// the model's own `VALIDATION_EXCEPTION_REASON_VALUES`.
-pub const VALIDATION_REASON_FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
+/// Every entry of the model's `ValidationExceptionReason` enum, as the MODEL declares it:
+/// the lowerCamel discriminator (`value`) paired with the SCREAMING_SNAKE `name` a
+/// response spells that discriminator with.
+///
+/// This service's model declares the enum in Smithy-1.0 `@enum` form, as pairs:
+///
+/// ```text
+/// {"value":"unknownOperation","name":"UNKNOWN_OPERATION"},
+/// {"value":"cannotParse","name":"CANNOT_PARSE"},
+/// {"value":"fieldValidationFailed","name":"FIELD_VALIDATION_FAILED"},
+/// {"value":"other","name":"OTHER"},
+/// {"value":"notSupported","name":"NOT_SUPPORTED"}
+/// ```
+///
+/// and it is the `name` that AWS puts on the wire: the recorded 400s of this service
+/// carry `"reason":"FIELD_VALIDATION_FAILED"`, never the lowerCamel `value` that a
+/// `smithy_query(query="shape",shape="ValidationExceptionReason")` value list shows (that
+/// list, and the generated `VALIDATION_EXCEPTION_REASON_VALUES`, are the `value` half of
+/// these pairs). This table is the ONE place the pairing is written down; the consts below
+/// are the `name` half, so a refusal names its wire value directly and nothing transforms
+/// a discriminator at runtime.
+pub const VALIDATION_REASONS: &[(&str, &str)] = &[
+    ("unknownOperation", "UNKNOWN_OPERATION"),
+    ("cannotParse", "CANNOT_PARSE"),
+    ("fieldValidationFailed", "FIELD_VALIDATION_FAILED"),
+    ("other", "OTHER"),
+    ("notSupported", "NOT_SUPPORTED"),
+];
 
-/// The `ValidationExceptionReason` for a well-formed request asking for something this
-/// resource does not support, from the same `VALIDATION_EXCEPTION_REASON_VALUES` list.
-pub const VALIDATION_REASON_NOT_SUPPORTED: &str = "notSupported";
+/// The wire value of the `fieldValidationFailed` discriminator — the `name`
+/// [`VALIDATION_REASONS`] pairs with it. This is what a refusal of a request member
+/// carries, in every operation of this service.
+pub const VALIDATION_REASON_FIELD_VALIDATION_FAILED: &str = "FIELD_VALIDATION_FAILED";
 
-/// The `ValidationExceptionReason` for a document that could not be parsed at all, from
-/// the same `VALIDATION_EXCEPTION_REASON_VALUES` list. Shared, so the policy checks that
-/// refuse an unparseable `policyDocument` all report the same reason.
-pub const VALIDATION_REASON_CANNOT_PARSE: &str = "cannotParse";
+/// The wire value of the `cannotParse` discriminator, from the same table: what a refusal
+/// of a document that could not be parsed at all carries. Shared, so every policy check
+/// that refuses an unparseable document reports the same one.
+pub const VALIDATION_REASON_CANNOT_PARSE: &str = "CANNOT_PARSE";
+
+/// The wire value [`VALIDATION_REASONS`] pairs with `discriminator`, or `None` when the
+/// model declares no such discriminator.
+///
+/// A handler names a const instead; this is the lookup the pairing exists for, and what
+/// this crate's tests read the table through.
+pub fn validation_reason_wire(discriminator: &str) -> Option<&'static str> {
+    VALIDATION_REASONS
+        .iter()
+        .find(|(modelled, _)| *modelled == discriminator)
+        .map(|(_, wire)| *wire)
+}
 
 /// A `ValidationException` about ONE request member: the reason the model lists for a
 /// member that failed validation, and a `fieldList` naming it.
@@ -776,12 +814,21 @@ pub fn field_validation_exception(member: &str, message: impl Into<String>) -> V
     }
 }
 
-/// A `ValidationException` for a well-formed request the named resource does not support
-/// at all, so no single member is at fault and there is no `fieldList`.
-pub fn not_supported_exception(message: impl Into<String>) -> ValidationException {
+/// A `ValidationException` for a well-formed request the action does not support against
+/// the resource it names — every member parses and satisfies its constraints, but the
+/// resource is not one this action acts on.
+///
+/// Two things make it different from [`field_validation_exception`] and both come from
+/// what AWS answers: there is no `fieldList`, because no single member is at fault and so
+/// there is nothing for a client to correct; and the reason is still the
+/// FIELD-VALIDATION discriminator, because that is what the recorded refusal carries
+/// (HTTP 400, `reason = FIELD_VALIDATION_FAILED`) — the modelled `notSupported`
+/// discriminator is NOT what this service puts on a refusal that is about the resource a
+/// request names.
+pub fn unsupported_action_exception(message: impl Into<String>) -> ValidationException {
     ValidationException {
         message: message.into(),
-        reason: VALIDATION_REASON_NOT_SUPPORTED.to_string(),
+        reason: VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
         field_list: None,
     }
 }

@@ -152,6 +152,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| server_error(crate::state::NO_STORE))?;
 
+        // `certificateHashes` is `@required`, and what it requires is a certificate
+        // to check — so a request that supplies the parameter but no element in it
+        // is refused for the constraint it actually violated (the list is empty),
+        // not for the absence of a member it did supply. The absent-parameter form
+        // of the same refusal is worded identically by
+        // `crate::service::missing_member_constraint`, since on the query string
+        // the two are the same request.
+        if input.certificate_hashes.is_empty() {
+            return Err(GetRevocationStatusErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::service::missing_list_member_constraint(
+                        CERTIFICATE_HASHES_QUERY,
+                    )),
+                    code: Some(VALIDATION_EXCEPTION_CODE.to_string()),
+                },
+            )
+            .into());
+        }
+
         // `@readonly`: the guard is taken, the answer is computed from what the
         // registry holds, and nothing is written — so repeating the call answers the
         // same list, and a later caller sees exactly what this one saw.
@@ -185,3 +204,11 @@ fn server_error(message: impl Into<String>) -> GetRevocationStatusError {
     })
     .into()
 }
+
+/// The wire name of the `certificateHashes` input member, as `@httpQuery` binds
+/// it — the name a refusal of that member states.
+const CERTIFICATE_HASHES_QUERY: &str = "certificateHashes";
+
+/// The `code` member of this operation's 400: the modelled error shape's own
+/// name, which is what a refusal of the request's values reports.
+const VALIDATION_EXCEPTION_CODE: &str = "ValidationException";

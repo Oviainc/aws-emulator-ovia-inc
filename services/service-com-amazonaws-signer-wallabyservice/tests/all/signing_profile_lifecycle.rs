@@ -56,6 +56,17 @@ fn matches_profile_version_pattern(value: &str) -> bool {
     value.len() == 10 && value.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
+/// An ACM certificate ARN for `signingMaterial`: the certificate a profile's
+/// signatures are issued under. A put below carries it whenever its platform is
+/// one whose profile holds that certificate — see
+/// `crate::state::platform_requires_signing_material`.
+const CERTIFICATE_ARN: &str = "arn:aws:acm:us-west-2:000000000000:certificate/abc";
+
+/// `signingMaterial` naming [`CERTIFICATE_ARN`].
+fn signing_material() -> Value {
+    json!({ "certificateArn": CERTIFICATE_ARN })
+}
+
 /// One emulator: a router carrying only this service, over one shared engine.
 fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -207,12 +218,22 @@ struct ProfileCase {
 
 fn profile_cases() -> Vec<ProfileCase> {
     vec![
-        // The smallest request the model admits: `platformId` alone, and a name at
-        // `ProfileName`'s `@length` minimum of 2.
+        // The smallest request a code-signing profile admits: `platformId` alone,
+        // and a name at `ProfileName`'s `@length` minimum of 2.
         ProfileCase {
             name: "Ab",
             request: json!({ "platformId": "AWSLambda-SHA384-ECDSA" }),
             platform_display_name: Some("AWS Lambda"),
+        },
+        // A CONTAINER-IMAGE profile, which carries the certificate its signatures
+        // are issued under.
+        ProfileCase {
+            name: "Container_Profile",
+            request: json!({
+                "platformId": "Notation-OCI-SHA384-ECDSA",
+                "signingMaterial": { "certificateArn": CERTIFICATE_ARN },
+            }),
+            platform_display_name: None,
         },
         // Signing material, a DAYS validity period, parameters and tags.
         ProfileCase {
@@ -235,6 +256,7 @@ fn profile_cases() -> Vec<ProfileCase> {
             name: "A_profile_name_that_is_exactly_sixty_four_characters_long_______",
             request: json!({
                 "platformId": "AmazonFreeRTOS-TI-CC3220SF",
+                "signingMaterial": { "certificateArn": CERTIFICATE_ARN },
                 "signatureValidityPeriod": { "value": 135, "type": "MONTHS" },
                 "overrides": {
                     "signingConfiguration": {
@@ -252,6 +274,7 @@ fn profile_cases() -> Vec<ProfileCase> {
             name: "Private_Platform_Profile_9",
             request: json!({
                 "platformId": "PrivatePlatform-SHA256-ECDSA",
+                "signingMaterial": { "certificateArn": CERTIFICATE_ARN },
                 "signatureValidityPeriod": { "value": 2, "type": "YEARS" },
                 "tags": { "only": "one" },
             }),
@@ -417,6 +440,7 @@ async fn every_validity_type_round_trips() {
             &name,
             json!({
                 "platformId": "AWSLambda-SHA384-ECDSA",
+                "signingMaterial": signing_material(),
                 "signatureValidityPeriod": period,
             }),
         )
@@ -451,6 +475,7 @@ async fn each_put_mints_a_new_version_of_the_same_profile() {
             "Reversioned_Profile",
             json!({
                 "platformId": "AWSLambda-SHA384-ECDSA",
+                "signingMaterial": signing_material(),
                 "signingParameters": { "generation": ordinal.to_string() },
             }),
         )
@@ -521,7 +546,12 @@ async fn list_pages_through_profiles_and_honours_the_filters() {
         })
         .collect();
     for (name, platform) in &seeded {
-        let put = put_profile(&router, name, json!({ "platformId": platform })).await;
+        let put = put_profile(
+            &router,
+            name,
+            json!({ "platformId": platform, "signingMaterial": signing_material() }),
+        )
+        .await;
         assert_eq!(
             put.status, 200,
             "seeding {name}: expected 200, got {} {:?}",
@@ -693,7 +723,10 @@ async fn start_signing_job_is_idempotent_and_describe_reports_the_stored_job() {
     let reput = put_profile(
         &router,
         "Job_Profile",
-        json!({ "platformId": "AWSLambda-SHA384-ECDSA" }),
+        json!({
+            "platformId": "AWSLambda-SHA384-ECDSA",
+            "signingMaterial": signing_material(),
+        }),
     )
     .await;
     assert_ne!(
@@ -769,7 +802,10 @@ async fn a_signing_job_completes_once_the_clock_makes_it_due() {
         put_profile(
             &router,
             "Completing_Profile",
-            json!({ "platformId": "AWSLambda-SHA384-ECDSA" })
+            json!({
+                "platformId": "AWSLambda-SHA384-ECDSA",
+                "signingMaterial": signing_material(),
+            })
         )
         .await
         .status,
@@ -850,7 +886,11 @@ async fn cancel_is_a_soft_cancel_that_stops_new_jobs() {
     let put = put_profile(
         &router,
         "Canceled_Profile",
-        json!({ "platformId": "AWSLambda-SHA384-ECDSA", "tags": { "keep": "me" } }),
+        json!({
+            "platformId": "AWSLambda-SHA384-ECDSA",
+            "signingMaterial": signing_material(),
+            "tags": { "keep": "me" },
+        }),
     )
     .await;
     assert_eq!(put.status, 200, "seeding the profile: {:?}", put.body);
@@ -925,7 +965,10 @@ async fn unknown_resources_and_bad_input_are_refused() {
         put_profile(
             &router,
             "Known_Profile",
-            json!({ "platformId": "AWSLambda-SHA384-ECDSA" })
+            json!({
+                "platformId": "AWSLambda-SHA384-ECDSA",
+                "signingMaterial": signing_material(),
+            })
         )
         .await
         .status,

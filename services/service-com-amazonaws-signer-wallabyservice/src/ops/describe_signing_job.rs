@@ -177,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(DescribeSigningJobErrorModeled::InternalServiceErrorException(
                 InternalServiceErrorException {
                     message: Some("the signer job store is unavailable".to_string()),
-                    code: None,
+                    code: Some(crate::state::ERROR_CODE_INTERNAL_SERVICE_ERROR.to_string()),
                 },
             )
             .into());
@@ -187,10 +187,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let Some(job) = store.settled_job_mut(&input.job_id, now) else {
             return Err(
+                // A job-specific `code`: the discriminator a client branches on
+                // must tell a missing JOB apart from any other 404 this service
+                // answers, so it is not the profile one.
                 DescribeSigningJobErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!("Signing job {} not found", input.job_id)),
-                        code: None,
+                        message: Some(format!("Signing job not found for id {}", input.job_id)),
+                        code: Some(crate::state::ERROR_CODE_JOB_NOT_FOUND.to_string()),
                     },
                 )
                 .into(),

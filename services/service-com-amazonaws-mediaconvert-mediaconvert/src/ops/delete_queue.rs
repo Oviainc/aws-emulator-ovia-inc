@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteQueue
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteQueue`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteQueue::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -146,20 +137,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteQueue` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteQueueErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteQueue"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteQueueErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("this service's state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        // Settle first, so the conflict guard below reads the job statuses the clock had
+        // already made due at `now` rather than stale ones: a queue whose last job has
+        // finished is deletable even if nobody polled that job in between.
+        state.settle(now);
+
+        // `{Name}` is the queue name, as `GetQueue`'s is; this operation's input is not
+        // documented to accept an ARN.
+        let name = input.name;
+        // The store owns the removal and the two refusals that go with it, so the
+        // decision and the state it is read from cannot disagree.
+        match state.delete_queue(&name) {
+            crate::state::DeleteQueueOutcome::Deleted => Ok(DeleteQueueOutput {}),
+            crate::state::DeleteQueueOutcome::NotFound => {
+                Err(DeleteQueueErrorModeled::NotFoundException(NotFoundException {
+                    // The refusal names the request member the lookup read, `Name`.
+                    message: Some(crate::state::not_found_message("name")),
+                })
+                .into())
+            }
+            // "Permanently delete a queue you have created", and `Queue`'s `Type`:
+            // "System queues are built in. You can't modify or delete system queues."
+            // A built-in queue is not one the caller created, so the delete is refused —
+            // `ForbiddenException`, the code AWS is recorded answering for a system
+            // resource, naming the request member that pointed at it.
+            crate::state::DeleteQueueOutcome::SystemQueue => {
+                Err(DeleteQueueErrorModeled::ForbiddenException(ForbiddenException {
+                    message: Some(crate::state::system_resource_delete_message("name")),
+                })
+                .into())
+            }
+            // A queue that still owes work conflicts with the current state of the
+            // resource: deleting it would leave jobs whose `Queue` names a queue that is
+            // no longer there.
+            crate::state::DeleteQueueOutcome::HasActiveJobs {
+                submitted,
+                progressing,
+            } => Err(DeleteQueueErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Queue {name} still has {submitted} submitted and {progressing} \
+                     progressing job(s) and can't be deleted."
+                )),
+            })
+            .into()),
+        }
     }
 }

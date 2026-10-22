@@ -2,7 +2,7 @@
 
 //! @op DeleteRegistry
 //!
-//! Removes a stored registry and everything it holds.
+//! Removes a stored registry, refusing while anything still lives in it.
 //!
 //! ## Shape of an operation
 //!
@@ -56,6 +56,9 @@
 //! * `NotFoundException` (HTTP 404)
 //! * `ServiceUnavailableException` (HTTP 503)
 //! * `UnauthorizedException` (HTTP 401)
+//!
+//! Beyond the model: `ConflictException` (HTTP 409), for a registry that still holds
+//! a schema. See the `extra_errors` note below.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -95,10 +98,21 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteRegistryOutput {
 // here — hence the `DeleteRegistryError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.schemas#DeleteRegistry")]
+//
+// `extra_errors` widens the set with one shape the SERVICE models that this
+// operation's `errors` list omits: deleting a registry that still holds a schema is
+// refused, and the error class for "the request is well-formed but the store's
+// contents refuse it" is 409 `ConflictException` — the shape `CreateRegistry` already
+// declares for its own referential refusal. It is not a 400: nothing about the
+// request is wrong, and the identical call succeeds once the last schema is gone.
+#[smithy_macros::operation_error(
+    "com.amazonaws.schemas#DeleteRegistry",
+    extra_errors = ["ConflictException"]
+)]
 #[derive(Debug)]
 pub enum DeleteRegistryErrorModeled {
     BadRequestException(BadRequestException),
+    ConflictException(ConflictException),
     ForbiddenException(ForbiddenException),
     InternalServerErrorException(InternalServerErrorException),
     NotFoundException(NotFoundException),
@@ -166,14 +180,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = store.lock();
 
-        // Removing the registry removes the schemas it owns with it: they are nested
-        // inside it, and their names are only unique within it.
-        if state.registries.remove(&input.registry_name).is_none() {
-            return Err(DeleteRegistryErrorModeled::NotFoundException(
+        // Deleting a registry is refused while anything still depends on it, so the
+        // precondition is checked BEFORE the store is touched: a refused delete leaves
+        // the registry and every schema in it exactly as they were.
+        let registry = state.registries.get(&input.registry_name).ok_or_else(|| {
+            DeleteRegistryError::from(DeleteRegistryErrorModeled::NotFoundException(
                 crate::state::registry_not_found(&input.registry_name),
+            ))
+        })?;
+
+        // A service-owned registry is AWS's, not the caller's, so it cannot be deleted
+        // at all.
+        if registry.scope.is_managed() {
+            return Err(DeleteRegistryErrorModeled::ForbiddenException(
+                crate::state::managed_registry_is_read_only(&input.registry_name),
             )
             .into());
         }
+
+        // A schema lives INSIDE its registry, so removing the registry would take
+        // every schema and every version in it with it. That is refused: the caller
+        // deletes the schemas first, and the identical call then succeeds.
+        if !registry.schemas.is_empty() {
+            return Err(DeleteRegistryErrorModeled::ConflictException(
+                crate::state::registry_not_empty(),
+            )
+            .into());
+        }
+
+        state
+            .registries
+            .remove(&input.registry_name)
+            .expect("the registry resolved above is present");
         Ok(DeleteRegistryOutput)
     }
 }

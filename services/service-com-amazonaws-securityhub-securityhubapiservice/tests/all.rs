@@ -17,6 +17,8 @@ mod action_targets;
 mod describe_standards;
 #[path = "all/enabled_standards.rs"]
 mod enabled_standards;
+#[path = "all/finding_history.rs"]
+mod finding_history;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/security_hub_core_loop.rs"]

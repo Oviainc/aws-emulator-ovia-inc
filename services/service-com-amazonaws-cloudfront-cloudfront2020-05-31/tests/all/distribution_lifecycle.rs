@@ -23,8 +23,9 @@
 //!   request whose `Quantity` disagrees with its `Items` is refused;
 //! * a distribution or an invalidation CloudFront has just accepted is `InProgress`, and
 //!   the clock — not a later call — owes it the terminal status;
-//! * deleting a distribution requires its stored configuration to have it disabled, and
-//!   after the delete the distribution is gone from every read.
+//! * deleting a distribution requires its stored configuration to have it disabled AND
+//!   that configuration to have finished propagating, and after the delete the
+//!   distribution is gone from every read.
 //!
 //! The restXml bodies are read through the small element scanner below, so each
 //! assertion is about the document a client would read rather than about a substring of
@@ -60,6 +61,9 @@ pub(crate) const ACCOUNT_ID: &str = "000000000000";
 pub(crate) const API_VERSION: &str = "2020-05-31";
 
 /// One emulator: a router carrying only this service, over one shared engine.
+///
+/// `pub(crate)` so the sibling suites in `tests/all/` stand one up the same way rather
+/// than each writing its own harness.
 pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -1244,7 +1248,8 @@ async fn a_page_is_bounded_by_the_servers_own_ceiling() {
 }
 
 /// A delete needs the current version AND a stored configuration that has the
-/// distribution disabled; after it, the distribution is gone from every read.
+/// distribution disabled and deployed; after it, the distribution is gone from every
+/// read.
 #[tokio::test]
 async fn delete_requires_a_disabled_distribution_at_its_current_version() {
     let router = emulator();
@@ -1309,6 +1314,24 @@ async fn delete_requires_a_disabled_distribution_at_its_current_version() {
         updated.status, updated.raw
     );
     let disabled_etag = updated.header("etag").to_string();
+
+    // The disable has not reached the edge locations yet, so the delete is still
+    // refused: CloudFront's teardown waits for the disabled configuration to deploy.
+    let propagating = delete_distribution(&router, &id, Some(&disabled_etag)).await;
+    assert_eq!(
+        propagating.status, 409,
+        "case disable-propagating: expected HTTP 409, got {} with {}",
+        propagating.status, propagating.raw
+    );
+    assert_eq!(
+        propagating.error_code(),
+        "DistributionNotDisabled",
+        "case disable-propagating: expected DistributionNotDisabled, got {:?}",
+        propagating.error_code()
+    );
+
+    // Once the clock owes the disabled configuration its deployment, the delete lands.
+    tokio::time::sleep(PROPAGATION_DELAY + Duration::from_millis(250)).await;
 
     let deleted = delete_distribution(&router, &id, Some(&disabled_etag)).await;
     assert_eq!(
