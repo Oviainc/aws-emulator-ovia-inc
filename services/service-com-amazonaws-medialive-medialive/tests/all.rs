@@ -14,6 +14,9 @@
 #[path = "all/channel_lifecycle.rs"]
 mod channel_lifecycle;
 
+#[path = "all/event_bridge_rule_template_groups.rs"]
+mod event_bridge_rule_template_groups;
+
 #[path = "all/input_lifecycle.rs"]
 mod input_lifecycle;
 

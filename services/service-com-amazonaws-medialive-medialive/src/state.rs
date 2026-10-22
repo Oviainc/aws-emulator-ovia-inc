@@ -15,13 +15,20 @@
 //! `Id`. A group's `State`, `Inputs` and `Channels` are derived from the rest of
 //! the state on every read, never recorded at create time.
 //!
-//! Every value a channel-, input-, input-security-group- or SdiSource-shaped
-//! response carries is either stored verbatim from the request that created the
-//! resource or derived from the stored state
-//! ([`ComAmazonawsMedialiveMedialiveState::channel_description`],
+//! The eventbridge rule template GROUP slice lives here as well: one
+//! [`EventBridgeRuleTemplateGroupRecord`] per created group, keyed by its minted
+//! `Id`, with the region it was created in so a group's name is unique "within
+//! the scope of a resource type in a specific region" (the `Name` member's own
+//! documentation).
+//!
+//! Every value a channel-, input-, input-security-group-, SdiSource- or
+//! eventbridge-rule-template-group-shaped response carries is either stored
+//! verbatim from the request that created the resource or derived from the stored
+//! state ([`ComAmazonawsMedialiveMedialiveState::channel_description`],
 //! [`ComAmazonawsMedialiveMedialiveState::input_description`],
-//! [`ComAmazonawsMedialiveMedialiveState::sdi_source_description`]) - no
-//! operation builds a response out of its own request.
+//! [`ComAmazonawsMedialiveMedialiveState::sdi_source_description`],
+//! [`event_bridge_rule_template_group_output`]) - no operation builds a response
+//! out of its own request.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
@@ -205,6 +212,37 @@ pub const MAX_INPUTS: usize = 100;
 /// bound, for the same reason, as [`MAX_IDEMPOTENCY_TOKENS`] on channels.
 pub const MAX_INPUT_IDEMPOTENCY_TOKENS: usize = MAX_INPUTS;
 
+/// The most eventbridge rule template groups this emulator stores for one
+/// account.
+///
+/// A ceiling, not a guess at AWS's published quota: it exists so a create loop
+/// cannot grow the emulator's heap without bound.
+/// `CreateEventBridgeRuleTemplateGroup` models `TooManyRequestsException`, which
+/// is the refusal once the store is full.
+pub const MAX_EVENT_BRIDGE_RULE_TEMPLATE_GROUPS: usize = 100;
+
+/// The id the first eventbridge rule template group of a process gets.
+///
+/// The `Id` member targets `__stringMin7Max11PatternAws097` and documents "AWS
+/// provided template groups have ids that start with `aws-`", so a
+/// caller-created group's id is seven digits; minting from a counter keeps every
+/// minted id seven digits wide and the `BTreeMap` key order equal to the mint
+/// order. A range of its own keeps the id spaces of the service's resource types
+/// apart, as [`FIRST_SDI_SOURCE_ID`] and [`FIRST_INPUT_SECURITY_GROUP_ID`] do.
+const FIRST_EVENT_BRIDGE_RULE_TEMPLATE_GROUP_ID: u64 = 5_000_000;
+
+/// The longest `Name` `CreateEventBridgeRuleTemplateGroup` accepts, from its
+/// target shape `__stringMin1Max255PatternS`.
+pub const MAX_RESOURCE_NAME_LEN: usize = 255;
+
+/// The longest `Description` a monitor resource accepts, from its target shape
+/// `__stringMin0Max1024`.
+pub const MAX_RESOURCE_DESCRIPTION_LEN: usize = 1024;
+
+/// The longest `RequestId` (`@idempotencyToken`) a create accepts, from its
+/// target shape `__stringMin1Max256PatternS`.
+pub const MAX_REQUEST_ID_LEN: usize = 256;
+
 /// The page size a list operation (`ListChannels`, `ListSdiSources`) uses when
 /// the request names no `MaxResults`, and the ceiling it clamps a larger
 /// `MaxResults` to. Finite, so one request cannot ask the service to project an
@@ -344,6 +382,28 @@ impl ChannelRecord {
             _ => true,
         }
     }
+}
+
+/// One created eventbridge rule template group, as
+/// `CreateEventBridgeRuleTemplateGroup` stored it.
+///
+/// `Description` is `Option` because the member is documented "A resource's
+/// optional description": a group created without one has none, rather than an
+/// empty one. `created_at` / `modified_at` are the only computed members, and
+/// `region` is what scopes the group's name uniqueness and the identifier
+/// lookups.
+#[derive(Debug, Clone)]
+pub struct EventBridgeRuleTemplateGroupRecord {
+    pub id: String,
+    pub arn: String,
+    /// The region the creating request was signed for, which is also the region
+    /// [`Self::arn`] names.
+    pub region: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub tags: HashMap<String, String>,
+    pub created_at: SystemTime,
+    pub modified_at: SystemTime,
 }
 
 /// One created input security group, as `CreateInputSecurityGroup` stored it.
@@ -519,6 +579,16 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     /// `CreateSdiSource`'s `RequestId` (`@idempotencyToken`) -> the SdiSource it
     /// created. PRIVATE for the same reason as [`Self::channel_tokens`].
     sdi_source_tokens: IdempotencyTokens,
+    /// Every eventbridge rule template group that exists, keyed by its minted
+    /// `Id`. A `BTreeMap` so a walk over the groups is in id order on every
+    /// call.
+    pub event_bridge_rule_template_groups: BTreeMap<String, EventBridgeRuleTemplateGroupRecord>,
+    /// Mint counter behind [`Self::mint_event_bridge_rule_template_group_id`].
+    pub next_event_bridge_rule_template_group_id: u64,
+    /// `CreateEventBridgeRuleTemplateGroup`'s `RequestId` (`@idempotencyToken`)
+    /// -> the group it created, so a retry returns that group instead of a
+    /// second one. PRIVATE for the same reason as [`Self::channel_tokens`].
+    event_bridge_rule_template_group_tokens: IdempotencyTokens,
 }
 
 impl ComAmazonawsMedialiveMedialiveState {
@@ -740,6 +810,70 @@ impl ComAmazonawsMedialiveMedialiveState {
             name: source.name.clone(),
             r#type: source.r#type.clone(),
         }
+    }
+
+    /// Whether the group store is full, so
+    /// `CreateEventBridgeRuleTemplateGroup` must refuse rather than mint
+    /// another group.
+    pub fn event_bridge_rule_template_groups_full(&self) -> bool {
+        self.event_bridge_rule_template_groups.len() >= MAX_EVENT_BRIDGE_RULE_TEMPLATE_GROUPS
+    }
+
+    /// The next eventbridge rule template group id: seven digits, so it matches
+    /// the `Id` member's `__stringMin7Max11PatternAws097` target without the
+    /// `aws-` prefix AWS reserves for the groups it provides itself.
+    pub fn mint_event_bridge_rule_template_group_id(&mut self) -> String {
+        let id = FIRST_EVENT_BRIDGE_RULE_TEMPLATE_GROUP_ID
+            + self.next_event_bridge_rule_template_group_id;
+        self.next_event_bridge_rule_template_group_id += 1;
+        id.to_string()
+    }
+
+    /// Record `token` as having created the group `group_id`.
+    pub fn record_event_bridge_rule_template_group_token(&mut self, token: String, group_id: &str) {
+        self.event_bridge_rule_template_group_tokens.record(
+            token,
+            group_id,
+            MAX_EVENT_BRIDGE_RULE_TEMPLATE_GROUPS,
+        );
+    }
+
+    /// The eventbridge rule template group a stored `RequestId` created, if that
+    /// group still exists.
+    pub fn event_bridge_rule_template_group_for_token(&self, request_id: &str) -> Option<&str> {
+        let id = self
+            .event_bridge_rule_template_group_tokens
+            .created(request_id)?;
+        self.event_bridge_rule_template_groups
+            .get(id)
+            .map(|group| group.id.as_str())
+    }
+
+    /// The group called `name` in `region`, if one exists. The `Name` member is
+    /// documented "Names must be unique within the scope of a resource type in a
+    /// specific region", so the scope of the search is one region.
+    pub fn event_bridge_rule_template_group_named(
+        &self,
+        region: &str,
+        name: &str,
+    ) -> Option<&EventBridgeRuleTemplateGroupRecord> {
+        self.event_bridge_rule_template_groups
+            .values()
+            .find(|group| group.region == region && group.name == name)
+    }
+
+    /// The group an `Identifier` names in `region`: "Can be either be its id or
+    /// current name" (the `Identifier` member's documentation), so the id is
+    /// tried first and the name second.
+    pub fn event_bridge_rule_template_group(
+        &self,
+        region: &str,
+        identifier: &str,
+    ) -> Option<&EventBridgeRuleTemplateGroupRecord> {
+        self.event_bridge_rule_template_groups
+            .get(identifier)
+            .filter(|group| group.region == region)
+            .or_else(|| self.event_bridge_rule_template_group_named(region, identifier))
     }
 
     /// The full `Channel` description of one stored channel, or `None` when no
@@ -1360,6 +1494,32 @@ pub fn delete_sdi_source(source: &mut SdiSourceRecord) {
     source.deleted = true;
 }
 
+/// Build a new eventbridge rule template group record.
+///
+/// `name` is the value the request supplied; `created_at` and `modified_at` are
+/// the create instant, because a group has not been modified since the call
+/// that created it. The caller then stores the request's optional `Description`
+/// and `Tags` on the record. There is no lifecycle transition to owe: AWS
+/// returns a created group ready.
+pub fn new_event_bridge_rule_template_group(
+    id: String,
+    arn: String,
+    region: String,
+    name: String,
+    now: SystemTime,
+) -> EventBridgeRuleTemplateGroupRecord {
+    EventBridgeRuleTemplateGroupRecord {
+        id,
+        arn,
+        region,
+        name,
+        description: None,
+        tags: HashMap::new(),
+        created_at: now,
+        modified_at: now,
+    }
+}
+
 /// The region this request was signed for, which is the region every ARN this
 /// request mints names. Falls back to the emulator's default region when the
 /// request carries no SigV4 credential scope, or an empty region in it.
@@ -1455,6 +1615,37 @@ macro_rules! input_description_output {
 }
 
 pub(crate) use input_description_output;
+
+/// Project a stored [`EventBridgeRuleTemplateGroupRecord`] onto one of the
+/// structurally identical per-operation group output shapes
+/// (`CreateEventBridgeRuleTemplateGroupOutput` and
+/// `GetEventBridgeRuleTemplateGroupOutput` today;
+/// `UpdateEventBridgeRuleTemplateGroupOutput` when its own issue lands).
+///
+/// One macro rather than a hand-written copy per operation, so the operations
+/// that report a group cannot drift from each other. `Tags` is reported only
+/// when the group carries tags: an empty map would claim a tag set the caller
+/// never supplied.
+macro_rules! event_bridge_rule_template_group_output {
+    ($out:ident, $group:expr) => {{
+        let group: &$crate::state::EventBridgeRuleTemplateGroupRecord = $group;
+        $out {
+            arn: Some(group.arn.clone()),
+            created_at: Some(::aws_smithy_types::DateTime::from(group.created_at)),
+            description: group.description.clone(),
+            id: Some(group.id.clone()),
+            modified_at: Some(::aws_smithy_types::DateTime::from(group.modified_at)),
+            name: Some(group.name.clone()),
+            tags: if group.tags.is_empty() {
+                None
+            } else {
+                Some(group.tags.clone())
+            },
+        }
+    }};
+}
+
+pub(crate) use event_bridge_rule_template_group_output;
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
