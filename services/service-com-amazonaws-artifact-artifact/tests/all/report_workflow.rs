@@ -787,10 +787,13 @@ async fn a_report_downloads_only_under_a_term_grant_issued_for_it() {
 }
 
 #[tokio::test]
-async fn a_report_id_naming_nothing_is_a_not_found_on_every_report_operation() {
+async fn a_report_id_naming_nothing_is_unauthorized_on_every_report_operation() {
     let router = emulator();
     // `^report-[a-zA-Z0-9]{16}$` is satisfied, so these reach the handler: the only
-    // reason they fail is that the catalog holds no such report.
+    // reason they fail is that the catalog holds no such report — and the catalog IS
+    // the account's entitlement, so the answer is the front door's authorization
+    // refusal, not the modelled not-found. The whole rule, over both kinds of
+    // identifier and both front-door refusals, is pinned in `front_door_errors.rs`.
     let unseeded = ["report-0000000000000000", "report-zzzzzzzzzzzzzzzz"];
     for id in unseeded {
         for (operation, answer) in [
@@ -812,14 +815,14 @@ async fn a_report_id_naming_nothing_is_a_not_found_on_every_report_operation() {
             ),
         ] {
             assert_eq!(
-                answer.status, 404,
-                "case {operation} {id:?}: an unseeded report must answer 404, got {} with {:?}",
+                answer.status, 401,
+                "case {operation} {id:?}: an unseeded report must answer 401, got {} with {:?}",
                 answer.status, answer.body
             );
             assert_eq!(
                 answer.error_code(),
-                "ResourceNotFoundException",
-                "case {operation} {id:?}: expected ResourceNotFoundException, got {:?}",
+                "UnauthorizedException",
+                "case {operation} {id:?}: expected UnauthorizedException, got {:?}",
                 answer.body
             );
         }
@@ -843,34 +846,65 @@ async fn a_report_id_naming_nothing_is_a_not_found_on_every_report_operation() {
 async fn a_malformed_report_id_or_version_is_refused_before_the_catalog_is_consulted() {
     let router = emulator();
     // Each row breaks ONE modelled constraint: the id pattern (prefix, length, alphabet)
-    // or `reportVersion`'s `@range(min: 1)`.
+    // or `reportVersion`'s `@range(min: 1)`. The two are refused by different layers,
+    // which is the row's expectation: a `reportId` that is not a well-formed id names no
+    // report to authorize, so the front door refuses it (401 `UnauthorizedException`)
+    // before the modelled constraint is reached, while a `reportVersion` is not a
+    // resource identifier at all and is refused by the service's own validation (400
+    // `ValidationException`).
     let cases = [
-        ("missing prefix", "?reportId=0123456789abcdef".to_string()),
-        ("short suffix", "?reportId=report-abc".to_string()),
-        ("long suffix", "?reportId=report-0123456789abcdef0".to_string()),
+        (
+            "missing prefix",
+            "?reportId=0123456789abcdef".to_string(),
+            401,
+            "UnauthorizedException",
+        ),
+        (
+            "short suffix",
+            "?reportId=report-abc".to_string(),
+            401,
+            "UnauthorizedException",
+        ),
+        (
+            "long suffix",
+            "?reportId=report-0123456789abcdef0".to_string(),
+            401,
+            "UnauthorizedException",
+        ),
         (
             "suffix outside the alphabet",
             "?reportId=report-0123456789abcde_".to_string(),
+            401,
+            "UnauthorizedException",
         ),
         (
             "version below the range",
             format!("?reportId={}&reportVersion=0", CATALOG[0].id),
+            400,
+            "ValidationException",
         ),
         (
             "negative version",
             format!("?reportId={}&reportVersion=-1", CATALOG[0].id),
+            400,
+            "ValidationException",
         ),
     ];
-    for (case, query) in cases {
+    for (case, query, status, code) in cases {
         for (operation, answer) in [
             ("GetReportMetadata", get_report_metadata(&router, &query).await),
             ("GetTermForReport", get_term_for_report(&router, &query).await),
         ] {
             assert_eq!(
-                answer.status, 400,
-                "case {operation} {case:?}: a value outside its modelled constraint must be \
-                 refused, got {} with {:?}",
+                answer.status, status,
+                "case {operation} {case:?}: expected HTTP {status}, got {} with {:?}",
                 answer.status, answer.body
+            );
+            assert_eq!(
+                answer.error_code(),
+                code,
+                "case {operation} {case:?}: expected {code}, got {:?}",
+                answer.body
             );
         }
     }
