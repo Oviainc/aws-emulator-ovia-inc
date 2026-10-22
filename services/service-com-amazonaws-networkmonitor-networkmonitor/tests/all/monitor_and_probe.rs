@@ -922,8 +922,11 @@ async fn an_unstored_resource_is_reported_as_not_found() {
     }
 }
 
-/// The six operations this slice implements answer from state; the other six
-/// are still scaffolded, so they must answer 501 rather than an empty 200.
+/// The operations this slice implements answer from state; the ones still
+/// scaffolded must answer 501 rather than an empty 200.
+///
+/// `UntagResource` is no longer among them: it is implemented, and
+/// `tests/all/resource_tags.rs` asserts what it does.
 ///
 /// A fixer implementing one of the rows below deletes that row in the same
 /// change: the point of the case is that a not-yet-written operation never
@@ -955,12 +958,6 @@ async fn the_unimplemented_operations_still_answer_501() {
             "POST",
             format!("/tags/{encoded_arn}"),
             Some(r#"{"tags":{"a":"1"}}"#.to_string()),
-        ),
-        (
-            "UntagResource",
-            "DELETE",
-            format!("/tags/{encoded_arn}?tagKeys=a"),
-            None,
         ),
     ];
 

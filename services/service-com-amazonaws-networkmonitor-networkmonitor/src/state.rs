@@ -313,6 +313,23 @@ impl Monitor {
     }
 }
 
+/// Which stored resource the `resourceArn` of a tagging request names.
+///
+/// The tagging operations address their target by ARN rather than by name
+/// (`TagResource`, `UntagResource` and `ListTagsForResource` all bind
+/// `resourceArn` to `/tags/{resourceArn}`), and the model documents that target
+/// as "a monitor or probe", so an ARN resolves to one of these two.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggedResource {
+    /// A monitor, by `monitorName`.
+    Monitor { monitor_name: String },
+    /// A probe, by the monitor that holds it and its own `probeId`.
+    Probe {
+        monitor_name: String,
+        probe_id: String,
+    },
+}
+
 /// What a recorded `clientToken` replays, and when it was recorded so it can be
 /// forgotten after [`CLIENT_TOKEN_TTL`].
 #[derive(Debug, Clone)]
@@ -394,6 +411,81 @@ impl ComAmazonawsNetworkmonitorNetworkmonitorState {
         let names: Vec<String> = self.monitors.keys().cloned().collect();
         for name in names {
             self.settle_monitor(&name, now);
+        }
+    }
+
+    /// Which stored resource carries `resource_arn`, or `None` when nothing this
+    /// service holds does.
+    ///
+    /// The ARN is compared against the one STORED on each record — the ARN the
+    /// service minted and reports — so a tagging call reaches exactly the
+    /// resource a read of that ARN reports, and an ARN for a region or an
+    /// account this store never minted resolves to nothing.
+    pub fn resolve_tagged_resource(&self, resource_arn: &str) -> Option<TaggedResource> {
+        for monitor in self.monitors.values() {
+            if monitor.monitor_arn == resource_arn {
+                return Some(TaggedResource::Monitor {
+                    monitor_name: monitor.monitor_name.clone(),
+                });
+            }
+            for probe in monitor.probes.values() {
+                if probe.probe_arn == resource_arn {
+                    return Some(TaggedResource::Probe {
+                        monitor_name: monitor.monitor_name.clone(),
+                        probe_id: probe.probe_id.clone(),
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// The tag map stored on one resolved resource, for writing.
+    ///
+    /// There is ONE tag map per resource — the same one `GetMonitor` reports —
+    /// so a tagging write and a read can never disagree.
+    pub fn tags_mut(&mut self, resource: &TaggedResource) -> Option<&mut BTreeMap<String, String>> {
+        match resource {
+            TaggedResource::Monitor { monitor_name } => self
+                .monitors
+                .get_mut(monitor_name)
+                .map(|monitor| &mut monitor.tags),
+            TaggedResource::Probe {
+                monitor_name,
+                probe_id,
+            } => self
+                .monitors
+                .get_mut(monitor_name)
+                .and_then(|monitor| monitor.probes.get_mut(probe_id))
+                .map(|probe| &mut probe.tags),
+        }
+    }
+
+    /// Record that a call CHANGED one resolved resource, moving its
+    /// `modifiedAt` to `now`.
+    ///
+    /// Tags are part of the resource every read reports, so a call that removes
+    /// or adds one modified the resource. Called only when the stored tag map
+    /// actually changed: a tagging call that is a no-op modified nothing.
+    pub fn mark_modified(&mut self, resource: &TaggedResource, now: SystemTime) {
+        match resource {
+            TaggedResource::Monitor { monitor_name } => {
+                if let Some(monitor) = self.monitors.get_mut(monitor_name) {
+                    monitor.modified_at = now;
+                }
+            }
+            TaggedResource::Probe {
+                monitor_name,
+                probe_id,
+            } => {
+                if let Some(probe) = self
+                    .monitors
+                    .get_mut(monitor_name)
+                    .and_then(|monitor| monitor.probes.get_mut(probe_id))
+                {
+                    probe.modified_at = now;
+                }
+            }
         }
     }
 
