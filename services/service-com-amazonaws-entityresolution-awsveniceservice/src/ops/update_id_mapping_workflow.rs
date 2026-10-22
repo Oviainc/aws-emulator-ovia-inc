@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateIdMappingWorkflow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateIdMappingWorkflow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateIdMappingWorkflow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! REPLACES the configuration of the ID mapping workflow already persisted under the
+//! requested `workflowName` in
+//! [`crate::state::ComAmazonawsEntityresolutionAwsveniceserviceState::id_mapping_workflows`]
+//! and re-stamps its `updatedAt`, leaving the resource's IDENTITY (the name it is keyed
+//! by, the `workflowArn` minted at create time, the `createdAt` stamp) and its tags,
+//! none of which this request carries, exactly as `CreateIdMappingWorkflow` and
+//! `TagResource` left them. "The IdMappingWorkflow must already exist for the method to
+//! succeed", so a name nothing was created under is refused with the modelled
+//! `ResourceNotFoundException` (HTTP 404) and persists nothing. Every member of the
+//! response is read back out of the stored record, so `GetIdMappingWorkflow` cannot
+//! disagree with it.
 //!
 //! ## Shape of an operation
 //!
@@ -178,20 +180,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateIdMappingWorkflow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateIdMappingWorkflowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateIdMappingWorkflow"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateIdMappingWorkflowErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the Entity Resolution emulator has no state store attached".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        let updated = crate::state::now();
+
+        let mut store = state.lock();
+        let stored = store
+            .id_mapping_workflows
+            .get_mut(&input.workflow_name)
+            .ok_or_else(|| {
+                UpdateIdMappingWorkflowErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            crate::state::messages::UPDATE_ID_MAPPING_WORKFLOW_NOT_FOUND
+                                .to_string(),
+                        ),
+                    },
+                )
+            })?;
+
+        // The request carries the WHOLE configuration — this operation "is identical to
+        // CreateIdMappingWorkflow, except it uses an HTTP PUT request" — so every
+        // configuration member is replaced wholesale and an optional member the request
+        // omits is CLEARED rather than kept. `roleArn` is modelled with `default: ""`,
+        // so a request carrying none stores the empty string, exactly as the create
+        // does. The identity members (`workflowName`, `workflowArn`, `createdAt`) and
+        // the tags are not members of this request, so they stay as
+        // `CreateIdMappingWorkflow` and `TagResource` left them.
+        stored.description = input.description;
+        stored.input_source_config = input.input_source_config;
+        stored.output_source_config = input.output_source_config;
+        stored.id_mapping_techniques = input.id_mapping_techniques;
+        stored.incremental_run_config = input.incremental_run_config;
+        stored.role_arn = input.role_arn.unwrap_or_default();
+        stored.updated_at = updated;
+
+        // Answered from the STORED record, not from the request object: this response
+        // and a later `GetIdMappingWorkflow` therefore cannot disagree.
+        Ok(UpdateIdMappingWorkflowOutput {
+            workflow_name: stored.workflow_name.clone(),
+            workflow_arn: stored.workflow_arn.clone(),
+            description: stored.description.clone(),
+            input_source_config: stored.input_source_config.clone(),
+            output_source_config: stored.output_source_config.clone(),
+            id_mapping_techniques: stored.id_mapping_techniques.clone(),
+            incremental_run_config: stored.incremental_run_config.clone(),
+            role_arn: Some(stored.role_arn.clone()),
+        })
     }
 }
+
