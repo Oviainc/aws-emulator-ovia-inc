@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateContactFlow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateContactFlow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateContactFlow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a flow inside an existing instance: unknown `InstanceId` is a 404, a flow
+//! `Name` already taken within that instance is a 409, the stored flow's ARN is the
+//! instance's own ARN plus `/contact-flow/<ContactFlowId>`, and `FlowContentSha256` is
+//! the SHA-256 of the content that was stored. A `PUBLISHED` flow (the status a request
+//! that names none gets) has its content validated, as the model's `Status` member
+//! documents; a `SAVED` one does not.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +169,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateContactFlow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateContactFlowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateContactFlow"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateContactFlowErrorModeled::InternalServiceException(InternalServiceException {
+                message: Some("the Amazon Connect store is unavailable".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // A request that names no `Status` gets a published flow: the modelled member
+        // is optional, and the flow a create answers with is one a contact can already
+        // be routed to, which only a PUBLISHED flow is.
+        let status = input
+            .status
+            .clone()
+            .unwrap_or_else(|| crate::state::CONTACT_FLOW_STATUS_PUBLISHED.to_string());
+
+        // "The PUBLISHED status will initiate validation on the content. the SAVED
+        // status does not initiate validation of the content." (the model's
+        // `CreateContactFlowRequest$Status` doc). `Content` is documented as "The JSON
+        // string that represents the content of the flow", so the validation this
+        // emulator performs is that the content parses as a JSON object; what it cannot
+        // parse is refused through the modelled `InvalidContactFlowException`.
+        if status == crate::state::CONTACT_FLOW_STATUS_PUBLISHED {
+            if let Err(problem) = flow_content_problem(&input.content) {
+                return Err(CreateContactFlowErrorModeled::InvalidContactFlowException(
+                    InvalidContactFlowException {
+                        problems: Some(vec![ProblemDetail {
+                            message: Some(problem),
+                        }]),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut store = state.lock();
+
+        // Minted before the instance is borrowed, so the borrow below is the only one.
+        // Identifiers need not be contiguous: a refused create simply leaves its id
+        // unused.
+        let id = store.mint_resource_id();
+        let instance = store
+            .instances
+            .get_mut(&input.instance_id)
+            .ok_or_else(|| {
+                CreateContactFlowErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("Instance not found: {}", input.instance_id)),
+                    },
+                )
+            })?;
+
+        // A flow name is unique within its instance.
+        if instance.contact_flow_id_named(&input.name).is_some() {
+            return Err(CreateContactFlowErrorModeled::DuplicateResourceException(
+                DuplicateResourceException {
+                    message: Some(format!("A flow with the name {} already exists", input.name)),
+                },
+            )
+            .into());
+        }
+
+        // The store is bounded: a flow is kept for the life of the process, so a create
+        // that would grow this instance's flow map past the quota is refused.
+        if instance.contact_flows.len() >= crate::state::CONTACT_FLOWS_PER_INSTANCE_QUOTA {
+            return Err(CreateContactFlowErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The maximum number of flows ({}) for this instance has been \
+                         reached; delete a flow before creating another",
+                        crate::state::CONTACT_FLOWS_PER_INSTANCE_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let arn = format!("{}/contact-flow/{id}", instance.arn);
+        let content_sha256 = crate::state::flow_content_sha256(&input.content);
+        let record = crate::state::ContactFlowRecord {
+            id: id.clone(),
+            arn: arn.clone(),
+            name: input.name,
+            description: input.description,
+            flow_type: input.r#type,
+            state: crate::state::CONTACT_FLOW_STATE_ACTIVE.to_string(),
+            status,
+            content: input.content,
+            tags: crate::state::tags_in(input.tags),
+            last_modified_time: now,
+            last_modified_region: region,
+        };
+        instance.contact_flows.insert(id.clone(), record);
+
+        Ok(CreateContactFlowOutput {
+            contact_flow_id: Some(id),
+            contact_flow_arn: Some(arn),
+            flow_content_sha256: Some(content_sha256),
+        })
+    }
+}
+
+/// What is wrong with a flow content, for the validation a `PUBLISHED` create runs.
+///
+/// `Ok(())` for a content that is a JSON object, which is the form the Connect flow
+/// language takes; otherwise the problem to report, derived from the content itself.
+fn flow_content_problem(content: &str) -> Result<(), String> {
+    match ::serde_json::from_str::<::serde_json::Value>(content) {
+        Ok(::serde_json::Value::Object(_)) => Ok(()),
+        Ok(other) => Err(format!(
+            "The flow content must be a JSON object, got {}",
+            json_kind(&other)
+        )),
+        Err(error) => Err(format!("The flow content is not valid JSON: {error}")),
+    }
+}
+
+/// The JSON kind of a parsed content, for the problem message above.
+fn json_kind(value: &::serde_json::Value) -> &'static str {
+    match value {
+        ::serde_json::Value::Null => "null",
+        ::serde_json::Value::Bool(_) => "a boolean",
+        ::serde_json::Value::Number(_) => "a number",
+        ::serde_json::Value::String(_) => "a string",
+        ::serde_json::Value::Array(_) => "an array",
+        ::serde_json::Value::Object(_) => "an object",
     }
 }

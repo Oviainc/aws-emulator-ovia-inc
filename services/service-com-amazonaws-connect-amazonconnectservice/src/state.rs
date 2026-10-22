@@ -15,7 +15,8 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    Instance, InstanceSummary, OutboundCallerConfig, OutboundEmailConfig, Queue, QueueSummary,
+    ContactFlow, Instance, InstanceSummary, OutboundCallerConfig, OutboundEmailConfig, Queue,
+    QueueSummary,
 };
 
 /// The region an unsigned request is served in. The emulator's own shared AWS config
@@ -68,6 +69,25 @@ pub const INSTANCE_QUOTA: usize = 1_000;
 /// `LimitExceededException`. The emulator's own bound on the store, for the reason
 /// [`INSTANCE_QUOTA`] gives; released by `DeleteQueue` (and by deleting the instance).
 pub const QUEUES_PER_INSTANCE_QUOTA: usize = 1_000;
+
+/// `ContactFlowStatus` values, from the `com.amazonaws.connect#ContactFlowStatus` enum.
+pub const CONTACT_FLOW_STATUS_PUBLISHED: &str = "PUBLISHED";
+/// See [`CONTACT_FLOW_STATUS_PUBLISHED`].
+pub const CONTACT_FLOW_STATUS_SAVED: &str = "SAVED";
+
+/// `ContactFlowState` value a created flow carries, from
+/// `com.amazonaws.connect#ContactFlowState` (the other member, `ARCHIVED`, is what
+/// `UpdateContactFlowMetadata` moves a flow to, not a state a create produces).
+pub const CONTACT_FLOW_STATE_ACTIVE: &str = "ACTIVE";
+
+/// The alias `DescribeContactFlow` documents for "the saved, not-yet-published
+/// content of this flow": `arn:aws:.../contact-flow/{id}:$SAVED`.
+pub const CONTACT_FLOW_SAVED_ALIAS: &str = "$SAVED";
+
+/// How many flows one instance holds before `CreateContactFlow` refuses with the
+/// modelled `LimitExceededException`. The emulator's own bound on the store, for the
+/// reason [`INSTANCE_QUOTA`] gives; released by deleting the instance.
+pub const CONTACT_FLOWS_PER_INSTANCE_QUOTA: usize = 1_000;
 
 /// Per-service state for com-amazonaws-connect-amazonconnectservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
@@ -130,6 +150,8 @@ pub struct InstanceRecord {
     pub tags: BTreeMap<String, String>,
     /// This instance's queues, keyed by queue id.
     pub queues: BTreeMap<String, QueueRecord>,
+    /// This instance's flows, keyed by flow id.
+    pub contact_flows: BTreeMap<String, ContactFlowRecord>,
 }
 
 impl InstanceRecord {
@@ -185,6 +207,36 @@ impl InstanceRecord {
             .find(|queue| queue.name == name)
             .map(|queue| queue.id.as_str())
     }
+
+    /// The id of this instance's flow called `name`, if it has one. Flow names are
+    /// unique within an instance, which is what makes a same-name create a duplicate.
+    pub fn contact_flow_id_named(&self, name: &str) -> Option<&str> {
+        self.contact_flows
+            .values()
+            .find(|flow| flow.name == name)
+            .map(|flow| flow.id.as_str())
+    }
+
+    /// This instance's flow named by a `ContactFlowId` path label.
+    ///
+    /// `DescribeContactFlow` documents three forms for that label: the bare flow id,
+    /// the flow's ARN, and either of those with a `:$SAVED` (or `:<version>`) suffix.
+    /// The emulator stores one content per flow — the saved content, which publishing
+    /// does not change — so the `$SAVED` alias resolves to the same record, while a
+    /// numbered version resolves to nothing until flow versions are stored.
+    pub fn contact_flow_for_label(&self, label: &str) -> Option<&ContactFlowRecord> {
+        // An ARN's own colons all precede its resource segment, so taking the last
+        // `/`-separated segment first leaves at most the `:<qualifier>` suffix.
+        let resource = label.rsplit_once('/').map_or(label, |(_, last)| last);
+        let (id, qualifier) = match resource.split_once(':') {
+            Some((id, qualifier)) => (id, Some(qualifier)),
+            None => (resource, None),
+        };
+        if qualifier.is_some_and(|qualifier| qualifier != CONTACT_FLOW_SAVED_ALIAS) {
+            return None;
+        }
+        self.contact_flows.get(id)
+    }
 }
 
 /// One stored queue, inside its instance.
@@ -239,6 +291,57 @@ impl QueueRecord {
             last_modified_region: Some(self.last_modified_region.clone()),
         }
     }
+}
+
+/// One stored flow, inside its instance.
+#[derive(Debug, Clone)]
+pub struct ContactFlowRecord {
+    pub id: String,
+    pub arn: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub flow_type: String,
+    pub state: String,
+    pub status: String,
+    pub content: String,
+    pub tags: BTreeMap<String, String>,
+    pub last_modified_time: SystemTime,
+    pub last_modified_region: String,
+}
+
+impl ContactFlowRecord {
+    /// The modelled `ContactFlow` shape `DescribeContactFlow` returns.
+    ///
+    /// `Version`/`VersionDescription` stay absent: a flow version is only minted by
+    /// `CreateContactFlowVersion`, which this emulator does not implement yet, so there
+    /// is no stored version to report.
+    pub fn to_contact_flow(&self) -> ContactFlow {
+        ContactFlow {
+            arn: Some(self.arn.clone()),
+            id: Some(self.id.clone()),
+            name: Some(self.name.clone()),
+            r#type: Some(self.flow_type.clone()),
+            state: Some(self.state.clone()),
+            status: Some(self.status.clone()),
+            description: self.description.clone(),
+            content: Some(self.content.clone()),
+            tags: tags_out(&self.tags),
+            flow_content_sha256: Some(flow_content_sha256(&self.content)),
+            version: None,
+            version_description: None,
+            last_modified_time: Some(to_date_time(self.last_modified_time)),
+            last_modified_region: Some(self.last_modified_region.clone()),
+        }
+    }
+}
+
+/// The checksum Connect reports for a flow's content: the SHA-256 of the content
+/// bytes, lowercase hex — 64 characters, which is the only form the modelled
+/// `FlowContentSha256` (`^[a-zA-Z0-9]{64}$`) can take. Derived from the stored
+/// content, so the same content always checksums the same and a changed content
+/// always changes the checksum.
+pub fn flow_content_sha256(content: &str) -> String {
+    hex::encode(Sha256::digest(content.as_bytes()))
 }
 
 /// The region this request was signed for, or [`DEFAULT_REGION`] when it carries no

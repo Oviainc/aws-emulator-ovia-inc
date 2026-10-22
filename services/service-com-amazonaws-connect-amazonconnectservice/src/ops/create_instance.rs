@@ -235,6 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             active_at: now + crate::state::INSTANCE_ACTIVATION_DELAY,
             tags: crate::state::tags_in(input.tags),
             queues: ::std::collections::BTreeMap::new(),
+            contact_flows: ::std::collections::BTreeMap::new(),
         };
 
         store.instances.insert(id.clone(), record);

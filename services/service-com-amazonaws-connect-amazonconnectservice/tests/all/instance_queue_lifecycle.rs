@@ -21,16 +21,27 @@ use service_com_amazonaws_connect_amazonconnectservice::state::{
 use service_com_amazonaws_connect_amazonconnectservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
+/// One answered request: the HTTP status, the `x-amzn-errortype` error code restJson1
+/// names a modelled error shape with (empty on a success), and the parsed JSON body.
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) error_code: String,
+    pub(crate) body: Value,
+}
+
 /// One emulator, one region, with the Connect service mounted — the fixture every suite
 /// builds. The region travels in the SigV4 credential scope, which is also how the
 /// handlers learn which region to mint ARNs in.
-struct Connect {
+///
+/// `pub(crate)` so a sibling suite in this test crate drives the same fixture rather
+/// than standing up a second copy of it.
+pub(crate) struct Connect {
     router: MultiServiceRouter,
     region: String,
 }
 
 impl Connect {
-    fn in_region(region: &str) -> Self {
+    pub(crate) fn in_region(region: &str) -> Self {
         let engine: Arc<InMemoryEngine> = Arc::new(InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -41,11 +52,23 @@ impl Connect {
         }
     }
 
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::in_region("us-east-1")
     }
 
-    async fn send(&self, method: &str, uri: &str, body: Option<Value>) -> (u16, Value) {
+    pub(crate) async fn send(&self, method: &str, uri: &str, body: Option<Value>) -> (u16, Value) {
+        let answer = self.send_answer(method, uri, body).await;
+        (answer.status, answer.body)
+    }
+
+    /// The same call as [`Connect::send`], keeping the `x-amzn-errortype` header a
+    /// suite needs to tell two modelled errors of the same status apart.
+    pub(crate) async fn send_answer(
+        &self,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> Answer {
         let payload = body.map_or_else(Bytes::new, |value| {
             Bytes::from(serde_json::to_vec(&value).expect("serialize the request body"))
         });
@@ -67,17 +90,27 @@ impl Connect {
 
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
+        let error_code = response
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
         let bytes = response.into_body();
         let parsed = if bytes.is_empty() {
             Value::Null
         } else {
             serde_json::from_slice(&bytes).unwrap_or(Value::Null)
         };
-        (status, parsed)
+        Answer {
+            status,
+            error_code,
+            body: parsed,
+        }
     }
 
     /// `CreateInstance`, asserting success and handing back `(Id, Arn)`.
-    async fn create_instance(&self, body: Value) -> (String, String) {
+    pub(crate) async fn create_instance(&self, body: Value) -> (String, String) {
         let (status, out) = self.send("PUT", "/instance", Some(body.clone())).await;
         assert_eq!(status, 200, "CreateInstance {body}: got {out}");
         (
@@ -90,7 +123,7 @@ impl Connect {
         self.send("GET", &format!("/instance/{id}"), None).await
     }
 
-    async fn delete_instance(&self, id: &str) -> u16 {
+    pub(crate) async fn delete_instance(&self, id: &str) -> u16 {
         self.send("DELETE", &format!("/instance/{id}"), None).await.0
     }
 
@@ -151,7 +184,7 @@ fn query(max_results: Option<i32>, token: Option<&str>, queue_types: &[&str]) ->
 }
 
 /// A minimal valid `CreateInstance` body.
-fn connect_managed(alias: &str) -> Value {
+pub(crate) fn connect_managed(alias: &str) -> Value {
     json!({
         "IdentityManagementType": "CONNECT_MANAGED",
         "InstanceAlias": alias,
@@ -166,7 +199,7 @@ fn queue_named(name: &str) -> Value {
 }
 
 /// `8-4-4-4-12` lowercase hex: the shape of the v4 UUIDs Connect mints.
-fn looks_like_a_uuid(value: &str) -> bool {
+pub(crate) fn looks_like_a_uuid(value: &str) -> bool {
     let groups: Vec<&str> = value.split('-').collect();
     groups.len() == 5
         && [8usize, 4, 4, 4, 12]
