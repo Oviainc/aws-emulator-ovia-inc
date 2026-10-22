@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateQApp
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateQApp`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateQApp::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a Q App and persists the whole record under the request's
+//! `instance-id`. Reading it back is `GetQApp`; revising it is `UpdateQApp`.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +178,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateQApp` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateQAppErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateQApp"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateQAppErrorModeled::InternalServerException(InternalServerException {
+                message: "the qapps store is unavailable".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+
+        // Two cards of one definition cannot share an id: those ids are what a
+        // card's `dependencies` and a session's `cardStatus` map name.
+        let mut seen: Vec<&str> = Vec::with_capacity(input.app_definition.cards.len());
+        for card in &input.app_definition.cards {
+            let id = crate::state::card_input_id(card);
+            if seen.contains(&id) {
+                return Err(CreateQAppErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "appDefinition.cards contains more than one card with id {id}"
+                    ),
+                })
+                .into());
+            }
+            seen.push(id);
+        }
+
+        let principal = crate::state::caller_principal(ctx);
+        let region = crate::state::caller_region(ctx);
+        let created_at = crate::state::now();
+        // Stored as submitted; `canEdit` holds for the creator, who is the
+        // caller of this request. Shared (not copied) between the app's current
+        // definition and the entry for version 1.
+        let definition = ::std::sync::Arc::new(crate::state::definition_from_input(
+            &input.app_definition,
+            true,
+        ));
+        let required_capabilities = crate::state::required_capabilities(&definition);
+
+        let mut store = state.lock();
+        // Guardrails on this emulator's memory, reported as the quota refusal
+        // the operation models rather than as unbounded growth. BOTH are
+        // checked under the same lock as the insert below: the per-instance
+        // bound keeps one tenant from filling the store, and the total bound is
+        // what actually caps `apps`/`app_order`, since `instanceId` is an
+        // unconstrained string and a caller can name unboundedly many.
+        if store.app_count(&input.instance_id) >= crate::state::MAX_APPS_PER_INSTANCE {
+            return Err(CreateQAppErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "instance {} already holds the maximum of {} Q Apps",
+                        input.instance_id,
+                        crate::state::MAX_APPS_PER_INSTANCE
+                    ),
+                    resource_id: input.instance_id.clone(),
+                    resource_type: "qapp".to_string(),
+                    service_code: "qapps".to_string(),
+                    quota_code: "QAppsPerInstance".to_string(),
+                },
+            )
+            .into());
+        }
+        if store.total_app_count() >= crate::state::MAX_APPS_TOTAL {
+            return Err(CreateQAppErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this endpoint already holds the maximum of {} Q Apps",
+                        crate::state::MAX_APPS_TOTAL
+                    ),
+                    resource_id: input.instance_id.clone(),
+                    resource_type: "qapp".to_string(),
+                    service_code: "qapps".to_string(),
+                    quota_code: "QApps".to_string(),
+                },
+            )
+            .into());
+        }
+        let app_id = crate::state::mint_uuid();
+        let app = crate::state::QApp {
+            app_id: app_id.clone(),
+            app_arn: crate::state::app_arn(&region, &input.instance_id, &app_id),
+            title: input.title.clone(),
+            description: input.description.clone(),
+            initial_prompt: input.app_definition.initial_prompt.clone(),
+            app_version: 1,
+            status: crate::state::AppStatus::Draft,
+            created_at,
+            created_by: principal.clone(),
+            updated_at: created_at,
+            updated_by: principal,
+            required_capabilities,
+            app_definition: definition.clone(),
+            versions: std::collections::BTreeMap::from([(1, definition)]),
+            tags: input.tags.clone().unwrap_or_default(),
+        };
+
+        let output = CreateQAppOutput {
+            app_id: app.app_id.clone(),
+            app_arn: app.app_arn.clone(),
+            title: app.title.clone(),
+            description: app.description.clone(),
+            initial_prompt: app.initial_prompt.clone(),
+            app_version: app.app_version,
+            status: app.status.as_wire().to_string(),
+            created_at: app.created_at,
+            created_by: app.created_by.clone(),
+            updated_at: app.updated_at,
+            updated_by: app.updated_by.clone(),
+            required_capabilities: Some(app.required_capabilities.clone()),
+        };
+
+        let key = (input.instance_id.clone(), app.app_id.clone());
+        store.apps.insert(key.clone(), app);
+        store.app_order.push(key);
+        drop(store);
+
+        Ok(output)
     }
 }

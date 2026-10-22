@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateQApp
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateQApp`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateQApp::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: applies the supplied members to the stored Q App, bumps its
+//! `appVersion` and reports the revised record. This is the ONLY file to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +174,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateQApp` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateQAppErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateQApp"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateQAppErrorModeled::InternalServerException(InternalServerException {
+                message: "the qapps store is unavailable".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+        let principal = crate::state::caller_principal(ctx);
+        let updated_at = crate::state::now();
+
+        // Everything that can refuse the request is decided BEFORE the stored
+        // record is touched, so a refused update leaves the app as it was.
+        let revised_definition = match &input.app_definition {
+            Some(definition_input) => {
+                // Same rule as CreateQApp: card ids within one definition are unique.
+                let mut seen: Vec<&str> = Vec::with_capacity(definition_input.cards.len());
+                for card in &definition_input.cards {
+                    let id = crate::state::card_input_id(card);
+                    if seen.contains(&id) {
+                        return Err(UpdateQAppErrorModeled::ValidationException(
+                            ValidationException {
+                                message: format!(
+                                    "appDefinition.cards contains more than one card with id {id}"
+                                ),
+                            },
+                        )
+                        .into());
+                    }
+                    seen.push(id);
+                }
+                Some(::std::sync::Arc::new(crate::state::definition_from_input(
+                    definition_input,
+                    true,
+                )))
+            }
+            None => None,
+        };
+
+        let mut store = state.lock();
+        let key = (input.instance_id.clone(), input.app_id.clone());
+        // A delete removes the record, so the entry's presence IS its
+        // existence: one lookup decides it.
+        let app = match store.apps.get_mut(&key) {
+            Some(app) => app,
+            None => {
+                return Err(UpdateQAppErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("Q App {} was not found", input.app_id),
+                        resource_id: input.app_id.clone(),
+                        resource_type: "qapp".to_string(),
+                    },
+                )
+                .into());
+            }
+        };
+
+        // Only the supplied members move; an absent member leaves the stored
+        // value alone.
+        if let Some(title) = &input.title {
+            app.title = title.clone();
+        }
+        if let Some(description) = &input.description {
+            app.description = Some(description.clone());
+        }
+        if let Some(definition) = revised_definition {
+            app.required_capabilities = crate::state::required_capabilities(&definition);
+            // A supplied definition replaces the stored one wholesale, so the
+            // app's initial prompt is the one that definition carries.
+            app.initial_prompt = input
+                .app_definition
+                .as_ref()
+                .and_then(|supplied| supplied.initial_prompt.clone());
+            app.app_definition = definition;
+        }
+        app.app_version = app.app_version.saturating_add(1);
+        // The new version carries the definition in force after this update,
+        // whether or not this call replaced it.
+        app.versions
+            .insert(app.app_version, app.app_definition.clone());
+        // Updating an app mints a version without creating a resource, so the
+        // retained window is bounded: the oldest definition is dropped past it,
+        // and GetQApp answers 404 for a version no longer retained.
+        while app.versions.len() > crate::state::MAX_RETAINED_VERSIONS {
+            app.versions.pop_first();
+        }
+        app.updated_at = updated_at;
+        app.updated_by = principal;
+
+        Ok(UpdateQAppOutput {
+            app_id: app.app_id.clone(),
+            app_arn: app.app_arn.clone(),
+            title: app.title.clone(),
+            description: app.description.clone(),
+            initial_prompt: app.initial_prompt.clone(),
+            app_version: app.app_version,
+            status: app.status.as_wire().to_string(),
+            created_at: app.created_at,
+            created_by: app.created_by.clone(),
+            updated_at: app.updated_at,
+            updated_by: app.updated_by.clone(),
+            required_capabilities: Some(app.required_capabilities.clone()),
+        })
     }
 }

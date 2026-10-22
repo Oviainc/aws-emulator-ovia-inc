@@ -1,11 +1,555 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Engine state for the com-amazonaws-qapps-qappsservice service.
+//! Engine state for the com-amazonaws-qapps-qappsservice service, plus the small
+//! helpers every Q Apps handler needs (id minting, ARNs, the caller principal,
+//! pagination tokens and the card/definition conversions).
+//!
+//! The helpers live here rather than in one operation's file because several
+//! operations read and write the SAME records: `src/ops/<op>.rs` owns an
+//! operation's behaviour, and this module owns the store those operations share.
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use ::aws_smithy_types::DateTime;
+
+use crate::ops::types::{
+    AppDefinition, AppDefinitionInput, Card, CardInput, CardStatus, CardValue, FileUploadCard,
+    FormInputCard, QPluginCard, QQueryCard, SessionSharingConfiguration, TextInputCard,
+};
+
+/// The version of the app-definition schema this emulator renders
+/// `AppDefinition.appDefinitionVersion` with. The member is documented as "the
+/// version of the app definition schema or specification" — a property of the
+/// shape of the definition, not of the app's own `appVersion`, so it does not
+/// move when an app is updated.
+pub const APP_DEFINITION_VERSION: &str = "1.0";
+
+/// The `AppStatus` of a stored Q App. The wire spellings are the model's
+/// `AppStatus` enum values (`DELETED | DRAFT | PUBLISHED`); see
+/// `crate::ops::types::APP_STATUS_VALUES`, which this crate's tests pin these
+/// against. `Deleted` is the model's value for an app that is gone: this
+/// emulator removes the record on `DeleteQApp` rather than keeping it in that
+/// status, so no stored app carries it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppStatus {
+    Draft,
+    Published,
+    Deleted,
+}
+
+impl AppStatus {
+    /// The value this status serializes as.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Draft => "DRAFT",
+            Self::Published => "PUBLISHED",
+            Self::Deleted => "DELETED",
+        }
+    }
+}
+
+/// The `ExecutionStatus` of a session or of one card in it. The wire spellings
+/// are the model's `ExecutionStatus` enum values (`COMPLETED | ERROR |
+/// IN_PROGRESS | WAITING`); see `crate::ops::types::EXECUTION_STATUS_VALUES`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionStatus {
+    Completed,
+    Error,
+    InProgress,
+    Waiting,
+}
+
+impl ExecutionStatus {
+    /// The value this status serializes as.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Completed => "COMPLETED",
+            Self::Error => "ERROR",
+            Self::InProgress => "IN_PROGRESS",
+            Self::Waiting => "WAITING",
+        }
+    }
+}
+
+/// One persisted Q App, as `CreateQApp` minted it and `UpdateQApp` revises it.
+#[derive(Debug, Clone)]
+pub struct QApp {
+    pub app_id: String,
+    pub app_arn: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub initial_prompt: Option<String>,
+    pub app_version: i32,
+    pub status: AppStatus,
+    pub created_at: DateTime,
+    pub created_by: String,
+    pub updated_at: DateTime,
+    pub updated_by: String,
+    pub required_capabilities: Vec<String>,
+    /// The definition at `app_version`, with the cards exactly as submitted
+    /// (plus the dependencies `CreateQApp`/`UpdateQApp` computed). Shared with
+    /// the entry for `app_version` in `versions` rather than copied.
+    pub app_definition: Arc<AppDefinition>,
+    /// Every retained version of the definition, keyed by the `appVersion` it
+    /// belongs to, so `GetQApp(appVersion=N)` can answer the definition of
+    /// version N. Versions that share a definition share ONE copy of it, so an
+    /// `UpdateQApp` that does not supply a definition costs a pointer.
+    pub versions: BTreeMap<i32, Arc<AppDefinition>>,
+    pub tags: HashMap<String, String>,
+}
+
+/// One persisted Q App session, as `StartQAppSession` seeded it.
+#[derive(Debug, Clone)]
+pub struct QAppSession {
+    pub session_id: String,
+    pub session_arn: String,
+    pub session_name: Option<String>,
+    pub app_id: String,
+    pub app_version: i32,
+    pub status: ExecutionStatus,
+    /// Keyed by the card ids of the app definition this session runs.
+    pub card_status: HashMap<String, CardStatus>,
+    pub card_values: Vec<CardValue>,
+    pub sharing_configuration: SessionSharingConfiguration,
+    pub owner: String,
+    pub tags: HashMap<String, String>,
+    pub created_at: DateTime,
+}
 
 /// Per-service state for com-amazonaws-qapps-qappsservice. A handler reaches it through [`service_state`].
+///
+/// Every map is keyed by the `instance-id` request header first: an Amazon Q
+/// Business application environment instance is the tenant boundary of this
+/// API, and every operation takes that header as required input.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsQappsQappsserviceState {
-    // TODO: add service-specific state fields
+    /// `(instanceId, appId) -> app`.
+    pub apps: HashMap<(String, String), QApp>,
+    /// Creation order of `(instanceId, appId)`, so `ListQApps` pages
+    /// deterministically.
+    pub app_order: Vec<(String, String)>,
+    /// `(instanceId, sessionId) -> session`.
+    pub sessions: HashMap<(String, String), QAppSession>,
+    /// `(instanceId, appId) -> sessionIds`, so deleting an app can drop the
+    /// sessions that ran it.
+    pub sessions_by_app: HashMap<(String, String), Vec<String>>,
+}
+
+/// How many Q Apps one instance may hold at once. A guardrail on this
+/// emulator's memory, answered with the `ServiceQuotaExceededException`
+/// CreateQApp models (HTTP 402) so a client sees a quota refusal rather than an
+/// emulator that grows without limit. Charged against every entry the store
+/// holds for that instance (a delete removes the entry, so it frees room).
+pub const MAX_APPS_PER_INSTANCE: usize = 250;
+
+/// How many Q Apps this emulator holds at once across EVERY instance. The
+/// model's `InstanceId` is an unconstrained string, so the number of distinct
+/// instances a caller can name is unbounded and the per-instance guardrail
+/// alone would not bound `apps`/`app_order`: this total is the bound that does,
+/// answered with the same quota refusal.
+pub const MAX_APPS_TOTAL: usize = 1_000;
+
+/// How many sessions one Q App may hold at once. Same guardrail, answered with
+/// the `ServiceQuotaExceededException` StartQAppSession models (HTTP 402).
+pub const MAX_SESSIONS_PER_APP: usize = 250;
+
+/// How many sessions this emulator holds at once across every instance and
+/// app — the bound on `sessions`/`sessions_by_app`, for the same reason
+/// [`MAX_APPS_TOTAL`] bounds the apps: both key components are caller-chosen.
+pub const MAX_SESSIONS_TOTAL: usize = 1_000;
+
+/// The page size `ListQApps` uses when the request names no `limit`. The
+/// model's `limit` is `range(min: 1, max: 100)`, so this is the largest page a
+/// caller could ask for: one call never returns more apps than the API lets one
+/// ask for, and the rest are reached with the `nextToken`.
+pub const DEFAULT_PAGE_SIZE: usize = 100;
+
+/// How many definition versions one Q App retains. `UpdateQApp` mints a new
+/// version on every call without creating a new resource, so the oldest
+/// retained definition is dropped past this many; `GetQApp` answers
+/// `ResourceNotFoundException` for a version no longer retained, exactly as it
+/// does for one that never existed.
+///
+/// With [`MAX_APPS_TOTAL`] this is what bounds the BYTES the store holds for
+/// definitions: at most `MAX_APPS_TOTAL * MAX_RETAINED_VERSIONS` definitions,
+/// each itself bounded by the model (`CardList` length max 20, `Prompt` length
+/// max 50000), and versions that share a definition hold one copy of it.
+pub const MAX_RETAINED_VERSIONS: usize = 10;
+
+impl ComAmazonawsQappsQappsserviceState {
+    /// The app `app_id` of `instance_id`, if the store holds one.
+    ///
+    /// `DeleteQApp` REMOVES the record outright — this emulator keeps no
+    /// tombstone — so an entry in `apps` is a live app, and every count below
+    /// charges exactly what the store holds.
+    pub fn app(&self, instance_id: &str, app_id: &str) -> Option<&QApp> {
+        self.apps
+            .get(&(instance_id.to_string(), app_id.to_string()))
+    }
+
+    /// How many apps `instance_id` holds, for the quota check: every entry the
+    /// store holds for that instance, so nothing escapes the quota.
+    pub fn app_count(&self, instance_id: &str) -> usize {
+        self.apps
+            .keys()
+            .filter(|(instance, _)| instance == instance_id)
+            .count()
+    }
+
+    /// How many apps this emulator holds across every instance, for the total
+    /// quota check: the whole map, which is also what `app_order` indexes.
+    pub fn total_app_count(&self) -> usize {
+        self.apps.len()
+    }
+
+    /// How many sessions this emulator holds across every instance, for the
+    /// total quota check.
+    pub fn total_session_count(&self) -> usize {
+        self.sessions.len()
+    }
+}
+
+/// Mint a fresh id of the service's `UUID` shape.
+///
+/// A version-4 UUID: the model constrains every `UUID` member to
+/// `^[\da-f]{8}-[\da-f]{4}-[45][\da-f]{3}-[89ABab][\da-f]{3}-[\da-f]{12}$`,
+/// which is the hyphenated lowercase rendering of exactly that — 32 hex digits
+/// with the version nibble `4` and the variant nibble in `8..=b`.
+///
+/// The 122 free bits come from the OS-seeded, per-process
+/// [`std::collections::hash_map::RandomState`] hasher over a process-wide
+/// sequence number and the clock, so two ids minted in one tick differ and an id
+/// is not guessable from another one. This is the same way the b2bi service in
+/// this workspace mints its resource ids, and it keeps this crate's dependency
+/// set exactly the one the scaffold generated.
+pub fn mint_uuid() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Distinguishes two ids minted inside one clock tick.
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    /// Odd 64-bit constant (the golden-ratio mix) so the two halves of the
+    /// digest see different inputs.
+    const MIX: u64 = 0x9e37_79b9_7f4a_7c15;
+
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos() as u64);
+
+    let seed = std::collections::hash_map::RandomState::new();
+    let mut high = seed.build_hasher();
+    high.write_u64(sequence);
+    high.write_u64(nanos);
+    let mut low = seed.build_hasher();
+    low.write_u64(nanos);
+    low.write_u64(sequence.wrapping_mul(MIX));
+    let digits = format!("{:016x}{:016x}", high.finish(), low.finish());
+
+    // The variant nibble is one of `8 9 a b`, chosen by the two low bits of the
+    // digit this layout drops, so it carries entropy rather than a constant.
+    let variant = match digits.as_bytes()[16] {
+        b'0' | b'4' | b'8' | b'c' => '8',
+        b'1' | b'5' | b'9' | b'd' => '9',
+        b'2' | b'6' | b'a' | b'e' => 'a',
+        _ => 'b',
+    };
+    format!(
+        "{}-{}-4{}-{}{}-{}",
+        &digits[0..8],
+        &digits[8..12],
+        &digits[13..16],
+        variant,
+        &digits[17..20],
+        &digits[20..32]
+    )
+}
+
+/// Whether `value` matches the model's `UUID` pattern
+/// (`^[\da-f]{8}-[\da-f]{4}-[45][\da-f]{3}-[89ABab][\da-f]{3}-[\da-f]{12}$`).
+///
+/// `StartQAppSession` accepts a caller-supplied `sessionId` as a plain string,
+/// but every operation that reads a session back takes `UUID`, so an id outside
+/// that pattern could never be read again.
+pub fn is_uuid_shaped(value: &str) -> bool {
+    let groups: Vec<&str> = value.split('-').collect();
+    let [g0, g1, g2, g3, g4] = groups[..] else {
+        return false;
+    };
+    let hex_lower = |s: &str, len: usize| {
+        s.len() == len && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    hex_lower(g0, 8)
+        && hex_lower(g1, 4)
+        && g2.len() == 4
+        && matches!(g2.as_bytes()[0], b'4' | b'5')
+        && hex_lower(&g2[1..], 3)
+        && g3.len() == 4
+        && matches!(g3.as_bytes()[0], b'8' | b'9' | b'A' | b'B' | b'a' | b'b')
+        && hex_lower(&g3[1..], 3)
+        && hex_lower(g4, 12)
+}
+
+/// Now, as the model's `QAppsTimestamp`.
+pub fn now() -> DateTime {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis());
+    DateTime::from_millis(i64::try_from(millis).unwrap_or(i64::MAX))
+}
+
+/// The principal this request is signed by, for `createdBy`/`updatedBy` and for
+/// a session's owner. Derived from the SigV4 access key id, so the same caller
+/// is the same principal on every call.
+pub fn caller_principal(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    ::engine::extract_akid(&ctx.parts().headers)
+}
+
+/// The region this request was signed for; `us-east-1` when it carries no
+/// credential scope.
+pub fn caller_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
+        .map_or_else(|| "us-east-1".to_string(), |scope| scope.region)
+}
+
+/// The ARN of a Q App: `application/<instanceId>/qapp/<appId>` in the `qapps`
+/// namespace the model declares.
+pub fn app_arn(region: &str, instance_id: &str, app_id: &str) -> String {
+    ::engine::emulator_arn(
+        "qapps",
+        region,
+        &format!("application/{instance_id}/qapp/{app_id}"),
+    )
+}
+
+/// The ARN of a Q App session, which hangs off the app it runs.
+pub fn session_arn(region: &str, instance_id: &str, app_id: &str, session_id: &str) -> String {
+    ::engine::emulator_arn(
+        "qapps",
+        region,
+        &format!("application/{instance_id}/qapp/{app_id}/session/{session_id}"),
+    )
+}
+
+/// The opaque `nextToken` marking "resume after this app". Hex-encoded so the
+/// token is opaque to the caller and every byte of it is validated on the way
+/// back in.
+pub fn encode_page_token(instance_id: &str, last_app_id: &str) -> String {
+    hex::encode(format!("v1:{instance_id}:{last_app_id}"))
+}
+
+/// The app id a `nextToken` resumes after, or `None` when the token is not one
+/// this service issued for `instance_id`.
+pub fn decode_page_token(instance_id: &str, token: &str) -> Option<String> {
+    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    let rest = decoded.strip_prefix("v1:")?;
+    let (token_instance, last_app_id) = rest.split_once(':')?;
+    (token_instance == instance_id && !last_app_id.is_empty()).then(|| last_app_id.to_string())
+}
+
+/// The id of a submitted card, whichever variant it is.
+pub fn card_input_id(card: &CardInput) -> &str {
+    match card {
+        CardInput::textInput(c) => &c.id,
+        CardInput::qQuery(c) => &c.id,
+        CardInput::qPlugin(c) => &c.id,
+        CardInput::fileUpload(c) => &c.id,
+        CardInput::formInput(c) => &c.id,
+    }
+}
+
+/// The prompt a submitted card carries, for the cards that have one.
+fn card_input_prompt(card: &CardInput) -> Option<&str> {
+    match card {
+        CardInput::qQuery(c) => Some(&c.prompt),
+        CardInput::qPlugin(c) => Some(&c.prompt),
+        CardInput::textInput(_) | CardInput::fileUpload(_) | CardInput::formInput(_) => None,
+    }
+}
+
+/// The id of a stored card, whichever variant it is.
+pub fn card_id(card: &Card) -> &str {
+    match card {
+        Card::textInput(c) => &c.id,
+        Card::qQuery(c) => &c.id,
+        Card::qPlugin(c) => &c.id,
+        Card::fileUpload(c) => &c.id,
+        Card::formInput(c) => &c.id,
+    }
+}
+
+/// Build the stored `AppDefinition` from a submitted `AppDefinitionInput`.
+///
+/// `CreateQApp` is documented to "calculate the dependencies between the cards
+/// by inspecting the references in the prompts", so each card's `dependencies`
+/// are the ids of the OTHER cards of the same definition that its prompt
+/// references, in definition order. A card with no prompt references nothing.
+pub fn definition_from_input(input: &AppDefinitionInput, can_edit: bool) -> AppDefinition {
+    let ids: Vec<String> = input
+        .cards
+        .iter()
+        .map(|card| card_input_id(card).to_string())
+        .collect();
+
+    let cards = input
+        .cards
+        .iter()
+        .map(|card| {
+            let own_id = card_input_id(card).to_string();
+            let prompt = card_input_prompt(card).unwrap_or_default();
+            let dependencies: Vec<String> = ids
+                .iter()
+                .filter(|id| **id != own_id && prompt.contains(id.as_str()))
+                .cloned()
+                .collect();
+            card_from_input(card, dependencies)
+        })
+        .collect();
+
+    AppDefinition {
+        app_definition_version: APP_DEFINITION_VERSION.to_string(),
+        cards,
+        can_edit: Some(can_edit),
+    }
+}
+
+/// One submitted card, as the stored card of the same kind.
+fn card_from_input(card: &CardInput, dependencies: Vec<String>) -> Card {
+    match card {
+        CardInput::textInput(c) => Card::textInput(TextInputCard {
+            id: c.id.clone(),
+            title: c.title.clone(),
+            dependencies,
+            r#type: c.r#type.clone(),
+            placeholder: c.placeholder.clone(),
+            default_value: c.default_value.clone(),
+        }),
+        CardInput::qQuery(c) => Card::qQuery(QQueryCard {
+            id: c.id.clone(),
+            title: c.title.clone(),
+            dependencies,
+            r#type: c.r#type.clone(),
+            prompt: c.prompt.clone(),
+            output_source: c.output_source.clone(),
+            attribute_filter: c.attribute_filter.clone(),
+            memory_references: None,
+        }),
+        CardInput::qPlugin(c) => Card::qPlugin(QPluginCard {
+            id: c.id.clone(),
+            title: c.title.clone(),
+            dependencies,
+            r#type: c.r#type.clone(),
+            prompt: c.prompt.clone(),
+            // The submitted card carries only the plugin's id; `pluginType` is
+            // a property of that plugin, which this service does not host, so
+            // the stored card reports the model's `CUSTOM` plugin type.
+            plugin_type: "CUSTOM".to_string(),
+            plugin_id: c.plugin_id.clone(),
+            action_identifier: c.action_identifier.clone(),
+        }),
+        CardInput::fileUpload(c) => Card::fileUpload(FileUploadCard {
+            id: c.id.clone(),
+            title: c.title.clone(),
+            dependencies,
+            r#type: c.r#type.clone(),
+            filename: c.filename.clone(),
+            file_id: c.file_id.clone(),
+            allow_override: c.allow_override,
+        }),
+        CardInput::formInput(c) => Card::formInput(FormInputCard {
+            id: c.id.clone(),
+            title: c.title.clone(),
+            dependencies,
+            r#type: c.r#type.clone(),
+            metadata: c.metadata.clone(),
+            compute_mode: c.compute_mode.clone(),
+        }),
+    }
+}
+
+/// The capabilities a definition's cards require, from the model's
+/// `AppRequiredCapability` enum (`CreatorMode | FileUpload | PluginMode |
+/// RetrievalMode`): a file-upload card needs `FileUpload`, a plugin card needs
+/// `PluginMode`, and a query card needs `RetrievalMode` or `CreatorMode`
+/// according to its `CardOutputSource` (`approved-sources` or `llm`).
+pub fn required_capabilities(definition: &AppDefinition) -> Vec<String> {
+    let mut capabilities: Vec<String> = Vec::new();
+    let mut require = |capability: &str| {
+        if !capabilities.iter().any(|held| held == capability) {
+            capabilities.push(capability.to_string());
+        }
+    };
+    for card in &definition.cards {
+        match card {
+            Card::fileUpload(_) => require("FileUpload"),
+            Card::qPlugin(_) => require("PluginMode"),
+            Card::qQuery(c) => {
+                if c.output_source == "approved-sources" {
+                    require("RetrievalMode");
+                } else {
+                    require("CreatorMode");
+                }
+            }
+            Card::textInput(_) | Card::formInput(_) => {}
+        }
+    }
+    capabilities.sort();
+    capabilities
+}
+
+/// The `cardStatus` map a session starts with: one entry per card of the app's
+/// definition, carrying the value `initialValues` supplied for that card.
+///
+/// A card nobody supplied a value for is `WAITING`: its value is whatever the
+/// session later produces for it, and this emulator runs no model, so it
+/// reports no value rather than inventing one.
+pub fn seed_card_status(
+    definition: &AppDefinition,
+    initial_values: &[CardValue],
+) -> HashMap<String, CardStatus> {
+    definition
+        .cards
+        .iter()
+        .map(|card| {
+            let id = card_id(card).to_string();
+            let supplied = initial_values.iter().find(|value| value.card_id == id);
+            let status = match supplied {
+                Some(value) => CardStatus {
+                    current_state: ExecutionStatus::Completed.as_wire().to_string(),
+                    current_value: value.value.clone(),
+                    submissions: None,
+                },
+                None => CardStatus {
+                    current_state: ExecutionStatus::Waiting.as_wire().to_string(),
+                    current_value: String::new(),
+                    submissions: None,
+                },
+            };
+            (id, status)
+        })
+        .collect()
+}
+
+/// A session's own status: `COMPLETED` once every card of its definition holds
+/// a value, `WAITING` while any card is still waiting for one.
+///
+/// A session of a definition with NO cards has nothing that could produce a
+/// value, so it is reported `WAITING` rather than complete: the empty map is
+/// stated explicitly here instead of riding on `all()`'s vacuous truth.
+pub fn session_status(card_status: &HashMap<String, CardStatus>) -> ExecutionStatus {
+    if card_status.is_empty() {
+        return ExecutionStatus::Waiting;
+    }
+    if card_status
+        .values()
+        .all(|status| status.current_state == ExecutionStatus::Completed.as_wire())
+    {
+        ExecutionStatus::Completed
+    } else {
+        ExecutionStatus::Waiting
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
