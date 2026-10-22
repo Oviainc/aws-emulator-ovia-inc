@@ -286,7 +286,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             scalable_dimension: input.scalable_dimension.clone(),
         };
 
-        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+        let state = &mut *guard;
 
         // Register is an upsert on the (namespace, resource id, dimension) identity: "To
         // update a scalable target, specify the parameters that you want to change. […]
@@ -311,8 +313,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // target when it is created. To tag an existing scalable target, use the
                 // TagResource operation."
                 check_capacity_range(updated.min_capacity, updated.max_capacity)?;
+                // "Any parameters that you don't specify are not changed" — but the
+                // capacity window is enforced regardless: "Application Auto Scaling
+                // retrieves the current capacity of the resource. If it's below the
+                // minimum capacity or above the maximum capacity, Application Auto
+                // Scaling adjusts the capacity of the scalable target to place it within
+                // these bounds, even if you don't include the MinCapacity or MaxCapacity
+                // request parameters." A movement this service makes is a scaling
+                // activity, which `DescribeScalingActivities` reports.
+                let moved = updated
+                    .current_capacity
+                    .clamp(updated.min_capacity, updated.max_capacity);
+                // What caused the movement, from the bound the capacity was placed at.
+                // Every writer leaves `current_capacity` inside the stored window, so a
+                // capacity outside it means THIS request moved that bound past it: a
+                // capacity pushed up was pushed by the new floor, one pushed down by the
+                // new ceiling.
+                let adjustment = (moved != updated.current_capacity).then(|| {
+                    if moved > updated.current_capacity {
+                        format!("minimum capacity was set to {}", updated.min_capacity)
+                    } else {
+                        format!("maximum capacity was set to {}", updated.max_capacity)
+                    }
+                });
+                updated.current_capacity = moved;
                 let arn = updated.arn.clone();
                 state.targets.insert(key.clone(), updated);
+                if let Some(cause) = adjustment {
+                    state.record_capacity_change(&key, moved, cause, now);
+                }
                 arn
             }
             None => {
@@ -346,11 +375,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     arn: arn.clone(),
                     min_capacity,
                     max_capacity,
+                    // A first registration adopts the floor of the window it declares
+                    // rather than moving anything, so it records no scaling activity;
+                    // see `ScalableTargetRecord::current_capacity`.
+                    current_capacity: min_capacity,
                     role_arn: input
                         .role_arn
                         .clone()
                         .unwrap_or_else(|| service_linked_role_arn(&input.service_namespace)),
-                    creation_time: ::std::time::SystemTime::now(),
+                    creation_time: now,
                     suspended_state: input.suspended_state.clone(),
                     tags: input
                         .tags

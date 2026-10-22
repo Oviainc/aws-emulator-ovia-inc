@@ -15,6 +15,8 @@
 mod resource_tags;
 #[path = "all/scalable_target_lifecycle.rs"]
 mod scalable_target_lifecycle;
+#[path = "all/scaling_activities.rs"]
+mod scaling_activities;
 #[path = "all/scheduled_action_lifecycle.rs"]
 mod scheduled_action_lifecycle;
 #[path = "all/state_roundtrip.rs"]

@@ -17,11 +17,12 @@
 //! cannot drift from each other.
 
 use std::collections::BTreeMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Alarm, PredictiveScalingPolicyConfiguration, ScalableTarget, ScalingPolicy, ScheduledAction,
-    StepScalingPolicyConfiguration, SuspendedState, TargetTrackingScalingPolicyConfiguration,
+    Alarm, NotScaledReason, PredictiveScalingPolicyConfiguration, ScalableTarget, ScalingActivity,
+    ScalingPolicy, ScheduledAction, StepScalingPolicyConfiguration, SuspendedState,
+    TargetTrackingScalingPolicyConfiguration,
 };
 
 /// The natural AWS identity of a scalable target, and the prefix of a scaling policy's
@@ -60,6 +61,16 @@ pub struct ScalableTargetRecord {
     pub arn: String,
     pub min_capacity: i32,
     pub max_capacity: i32,
+    /// The capacity this service believes the scalable target currently sits at.
+    ///
+    /// Application Auto Scaling learns a resource's capacity from the target service
+    /// (ECS, DynamoDB, …) and moves it on the target's behalf; this emulator does not
+    /// drive those data planes yet, so it tracks the capacity of the scalable target
+    /// itself. A first registration adopts the window's floor — the registered minimum
+    /// is the smallest capacity "inside of this range", and adopting it records no
+    /// activity because nothing was moved — and every later movement is an action this
+    /// service performed, so it is recorded as a scaling activity.
+    pub current_capacity: i32,
     pub role_arn: String,
     pub creation_time: SystemTime,
     pub suspended_state: Option<SuspendedState>,
@@ -79,6 +90,50 @@ pub struct ScalingPolicyRecord {
     pub creation_time: SystemTime,
 }
 
+/// One entry of the scaling-activity log: a capacity movement this service performed,
+/// or declined to perform, on a scalable target.
+///
+/// The status is NOT stored as a single current value. A movement is non-terminal when
+/// it starts and terminal once the clock reaches [`ScalingActivityRecord::fulfilled_at`],
+/// so the record keeps the terminal status it is owed and a reader derives the status it
+/// reports from the instant it reads at. Nothing has to tick for an activity to complete.
+#[derive(Debug, Clone)]
+pub struct ScalingActivityRecord {
+    /// The activity's unique identifier, as `ScalingActivity$ActivityId`.
+    pub activity_id: String,
+    /// Where this activity sits in the order the log recorded them, so activities that
+    /// share a `StartTime` still have one newest-first order.
+    pub sequence: u64,
+    /// The scalable target the activity belongs to; its three members are what
+    /// `DescribeScalingActivities` filters on.
+    pub target: TargetKey,
+    /// "A simple description of what action the scaling activity intends to accomplish."
+    pub description: String,
+    /// "A simple description of what caused the scaling activity to happen."
+    pub cause: String,
+    pub start_time: SystemTime,
+    /// When the activity reaches [`ScalingActivityRecord::terminal_status_code`], or
+    /// `None` for one that was already terminal when it was recorded (an activity that
+    /// was not scaled never started).
+    pub fulfilled_at: Option<SystemTime>,
+    /// The status the activity ends in, one of `SCALING_ACTIVITY_STATUS_CODE_VALUES`.
+    pub terminal_status_code: String,
+    /// The message that goes with that terminal status.
+    pub terminal_status_message: Option<String>,
+    pub details: Option<String>,
+    /// Why the activity was not scaled; empty for one that was. A non-empty list is
+    /// what makes this a "not scaled activity", which a `Describe` hides unless the
+    /// caller asks for it.
+    ///
+    /// Only [`ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState::record_capacity_change`]
+    /// writes records today and a movement it records WAS scaled, so no stored activity
+    /// carries reasons yet: the writer that will is the one that evaluates a scaling
+    /// policy or fires a scheduled action and declines to move capacity
+    /// (`AlreadyAtMaxCapacity` and the other codes the model's `NotScaledReason$Code`
+    /// lists). Same for `details`.
+    pub not_scaled_reasons: Vec<NotScaledReason>,
+}
+
 /// Per-service state for com-amazonaws-applicationautoscaling-anyscalefrontendservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState {
@@ -96,6 +151,70 @@ pub struct ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState {
     /// own: every member of it is either part of the key or a value `PutScheduledAction`
     /// persisted verbatim, so `DescribeScheduledActions` has nothing to rebuild.
     pub scheduled_actions: BTreeMap<ScheduledActionKey, ScheduledAction>,
+    /// The scaling-activity log, oldest first — every capacity movement this service
+    /// performed, within the window it reports over. `DescribeScalingActivities` reads
+    /// it newest first.
+    pub activities: Vec<ScalingActivityRecord>,
+    /// How many activities have ever been recorded. It only grows, so it both orders the
+    /// log and makes each minted `ActivityId` unique.
+    pub activities_recorded: u64,
+}
+
+impl ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState {
+    /// Record the scaling activity for a capacity movement this service has just made on
+    /// `target`, and answer its `ActivityId`.
+    ///
+    /// The activity is non-terminal for [`ACTIVITY_FULFILMENT`] and `Successful`
+    /// afterwards: this service moved the capacity, so the movement is fulfilled.
+    pub fn record_capacity_change(
+        &mut self,
+        target: &TargetKey,
+        capacity: i32,
+        cause: impl Into<String>,
+        at: SystemTime,
+    ) -> String {
+        let noun = capacity_noun(&target.scalable_dimension);
+        let sequence = self.activities_recorded;
+        self.activities_recorded += 1;
+        let activity_id = scaling_activity_id(sequence, target);
+        self.activities.push(ScalingActivityRecord {
+            activity_id: activity_id.clone(),
+            sequence,
+            target: target.clone(),
+            description: format!("Setting {noun} to {capacity}."),
+            cause: cause.into(),
+            start_time: at,
+            fulfilled_at: Some(at + ACTIVITY_FULFILMENT),
+            terminal_status_code: ACTIVITY_SUCCESSFUL.to_string(),
+            terminal_status_message: Some(format!(
+                "Successfully set {noun} to {capacity}. Change successfully fulfilled by {}.",
+                target.service_namespace
+            )),
+            details: None,
+            not_scaled_reasons: Vec::new(),
+        });
+        // The emulator's own ceiling on the log: the oldest entries go first, exactly as
+        // ageing out of the reported window would have dropped them.
+        let overflow = self.activities.len().saturating_sub(MAX_SCALING_ACTIVITIES);
+        if overflow > 0 {
+            self.activities.drain(..overflow);
+        }
+        activity_id
+    }
+
+    /// Drop the activities that have aged out of the window this service reports over.
+    ///
+    /// This is owed by the CLOCK, not by the read that calls it: an activity older than
+    /// [`ACTIVITY_RETENTION`] was already outside the window at that same instant,
+    /// whether or not anybody asked.
+    pub fn expire_old_activities(&mut self, now: SystemTime) {
+        // Before the window is wider than the clock there is nothing to expire.
+        let Some(cutoff) = now.checked_sub(ACTIVITY_RETENTION) else {
+            return;
+        };
+        self.activities
+            .retain(|activity| activity.start_time >= cutoff);
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -131,6 +250,34 @@ pub const MAX_SCALING_POLICIES: usize = 20_000;
 /// The same bound for scheduled actions, which hang off a target the same way a policy
 /// does and are keyed by a free-form name. See [`MAX_SCALABLE_TARGETS`].
 pub const MAX_SCHEDULED_ACTIONS: usize = 20_000;
+
+/// How many scaling activities the log keeps before the oldest are dropped.
+///
+/// The same emulator-own bound as [`MAX_SCALABLE_TARGETS`], for the same reason: the log
+/// grows with every capacity movement and is otherwise only trimmed by
+/// [`ACTIVITY_RETENTION`], which a long-lived emulator may never reach.
+pub const MAX_SCALING_ACTIVITIES: usize = 10_000;
+
+/// The window `DescribeScalingActivities` reports over: the operation's own
+/// documentation, "provides descriptive information about the scaling activities in the
+/// specified namespace from the previous six weeks".
+pub const ACTIVITY_RETENTION: Duration = Duration::from_secs(6 * 7 * 24 * 60 * 60);
+
+/// How long after the call that starts it a scaling activity reaches its terminal
+/// status.
+///
+/// CHOSEN, not documented: on AWS the fulfilment time is the target service's own. The
+/// span is inside this project's 250-750 ms band for a transition the clock owes, so a
+/// caller that reads the activity log straight after the call that moved capacity still
+/// observes the non-terminal activity, and one that reads a moment later sees it
+/// fulfilled.
+pub const ACTIVITY_FULFILMENT: Duration = Duration::from_millis(600);
+
+/// The non-terminal status a capacity movement carries until it is fulfilled, from the
+/// model's `ScalingActivityStatusCode` enum (`SCALING_ACTIVITY_STATUS_CODE_VALUES`).
+pub const ACTIVITY_IN_PROGRESS: &str = "InProgress";
+/// The status a fulfilled capacity movement ends in. See [`ACTIVITY_IN_PROGRESS`].
+pub const ACTIVITY_SUCCESSFUL: &str = "Successful";
 
 // ---------------------------------------------------------------------------
 // Request-derived values
@@ -223,6 +370,24 @@ pub fn scheduled_action_arn(region: &str, key: &ScheduledActionKey) -> String {
     )
 }
 
+/// A scaling activity's `ActivityId`.
+///
+/// Derived from the log sequence the activity was recorded at and the target it moved,
+/// so it is unique (the sequence only grows), stable across reads, and reproducible
+/// rather than per-run.
+pub fn scaling_activity_id(sequence: u64, key: &TargetKey) -> String {
+    uuid_shaped_id(
+        &[
+            "scalingActivity",
+            &sequence.to_string(),
+            &key.service_namespace,
+            &key.resource_id,
+            &key.scalable_dimension,
+        ]
+        .join("\u{1f}"),
+    )
+}
+
 /// The 8-4-4-4-12 identifier that sits inside an `autoscaling` sub-resource ARN,
 /// derived from `seed` so it is reproducible rather than per-run.
 fn uuid_shaped_id(seed: &str) -> String {
@@ -309,6 +474,64 @@ pub fn scaling_policy_of(key: &PolicyKey, record: &ScalingPolicyRecord) -> Scali
         predictive_scaling_policy_configuration: record.predictive_config.clone(),
         alarms: Some(record.alarms.clone()),
         creation_time: timestamp_of(record.creation_time),
+    }
+}
+
+/// The capacity a scalable dimension names, in the words a scaling activity's text uses.
+///
+/// A dimension "consists of the service namespace, resource type, and scaling property"
+/// (the model's own documentation for the member), so the property is its last segment,
+/// and splitting that at its word boundaries gives the noun the model's own
+/// `DescribeScalingActivities` example carries: `ecs:service:DesiredCount` yields
+/// "desired count", as in "Setting desired count to 1.".
+pub fn capacity_noun(scalable_dimension: &str) -> String {
+    let property = scalable_dimension
+        .rsplit(':')
+        .next()
+        .unwrap_or(scalable_dimension);
+    let mut words: Vec<String> = Vec::new();
+    for character in property.chars() {
+        match words.last_mut() {
+            Some(word) if !character.is_uppercase() => word.push(character),
+            _ => words.push(character.to_lowercase().to_string()),
+        }
+    }
+    words.join(" ")
+}
+
+/// The `ScalingActivity` a `Describe` returns for a stored record, as of `now`.
+///
+/// An activity whose fulfilment instant has not arrived yet is reported in its
+/// non-terminal status with no `EndTime`; from that instant on it reports the terminal
+/// status it was recorded with, and the `EndTime` is that instant — so the same record
+/// answers the same thing to every reader at the same clock reading.
+pub fn scaling_activity_of(record: &ScalingActivityRecord, now: SystemTime) -> ScalingActivity {
+    let pending = record.fulfilled_at.filter(|due| *due > now);
+    ScalingActivity {
+        activity_id: record.activity_id.clone(),
+        service_namespace: record.target.service_namespace.clone(),
+        resource_id: record.target.resource_id.clone(),
+        scalable_dimension: record.target.scalable_dimension.clone(),
+        description: record.description.clone(),
+        cause: record.cause.clone(),
+        start_time: timestamp_of(record.start_time),
+        end_time: match pending {
+            Some(_) => None,
+            None => record.fulfilled_at.map(timestamp_of),
+        },
+        status_code: match pending {
+            Some(_) => ACTIVITY_IN_PROGRESS.to_string(),
+            None => record.terminal_status_code.clone(),
+        },
+        status_message: match pending {
+            Some(_) => None,
+            None => record.terminal_status_message.clone(),
+        },
+        details: record.details.clone(),
+        // The member is "only available when IncludeNotScaledActivities is true" AND
+        // the activity is one that was not scaled; an activity that scaled carries none.
+        not_scaled_reasons: (!record.not_scaled_reasons.is_empty())
+            .then(|| record.not_scaled_reasons.clone()),
     }
 }
 

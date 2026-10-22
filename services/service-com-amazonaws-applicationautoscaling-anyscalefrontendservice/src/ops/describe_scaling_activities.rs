@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeScalingActivities
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeScalingActivities`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation reports the service's scaling-activity log. Every
+//! activity it returns was recorded by a capacity movement this service performed
+//! (`crate::state::ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState::record_capacity_change`),
+//! so the response is computed from persisted state and nothing here is synthesised.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeScalingActivities::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reporting-only, with one exception the CLOCK owes: an activity outside the six-week
+//! window this operation reports over is dropped, and an activity whose fulfilment
+//! instant has passed reports its terminal status. Both were already due at the instant
+//! of the read, whether or not anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -189,20 +189,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeScalingActivities` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeScalingActivitiesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeScalingActivities"))
+        use crate::state::{
+            check_dimension_namespace, check_dimension_requires_resource_id, check_enum,
+            decode_next_token, encode_next_token, page_size, scaling_activity_of, take_page,
+            ScalingActivityRecord,
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeScalingActivitiesErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some(
+                        "this service is mounted on an engine that holds no state".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        check_enum(
+            "serviceNamespace",
+            &input.service_namespace,
+            SERVICE_NAMESPACE_VALUES,
+        )
+        .map_err(validation)?;
+        // The member's own documentation: "If you specify a scalable dimension, you must
+        // also specify a resource ID" — the same rule, and the same wording, the sibling
+        // `Describe` handlers refuse it with.
+        check_dimension_requires_resource_id(
+            input.resource_id.as_deref(),
+            input.scalable_dimension.as_deref(),
+        )
+        .map_err(validation)?;
+        if let Some(dimension) = input.scalable_dimension.as_deref() {
+            check_enum("scalableDimension", dimension, SCALABLE_DIMENSION_VALUES)
+                .map_err(validation)?;
+            check_dimension_namespace(&input.service_namespace, dimension).map_err(validation)?;
+        }
+        let page_size = page_size(input.max_results).map_err(validation)?;
+
+        // The token carries the id of the last activity the previous page emitted, so
+        // this page resumes at the one recorded just before it. A token this service did
+        // not issue, or one naming an activity this filtered log no longer holds, is
+        // refused rather than silently read as "from the newest".
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match decode_next_token(token, 1) {
+                Some(fields) => Some(fields[0].clone()),
+                None => return Err(invalid_next_token()),
+            },
+        };
+
+        // "Specifies whether to include activities that aren't scaled (not scaled
+        // activities) in the response" — so by default they are left out.
+        let include_not_scaled = input.include_not_scaled_activities.unwrap_or(false);
+
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+        let state = &mut *guard;
+        // The window this operation reports over is "the previous six weeks": whatever
+        // fell out of it was already out at this instant, called or not.
+        state.expire_old_activities(now);
+
+        let mut matching: Vec<&ScalingActivityRecord> = state
+            .activities
+            .iter()
+            .filter(|activity| activity.target.service_namespace == input.service_namespace)
+            .filter(|activity| {
+                input
+                    .resource_id
+                    .as_ref()
+                    .is_none_or(|resource_id| &activity.target.resource_id == resource_id)
+            })
+            .filter(|activity| {
+                input
+                    .scalable_dimension
+                    .as_ref()
+                    .is_none_or(|dimension| &activity.target.scalable_dimension == dimension)
+            })
+            .filter(|activity| include_not_scaled || activity.not_scaled_reasons.is_empty())
+            .collect();
+
+        // Activity history reads newest first. `StartTime` orders it, and the log's own
+        // sequence settles activities that share one instant, so the order is total.
+        matching.sort_by(|left, right| {
+            right
+                .start_time
+                .cmp(&left.start_time)
+                .then(right.sequence.cmp(&left.sequence))
+        });
+
+        if let Some(after) = resume_after {
+            let Some(position) = matching
+                .iter()
+                .position(|activity| activity.activity_id == after)
+            else {
+                return Err(invalid_next_token());
+            };
+            matching.drain(..=position);
+        }
+
+        let rendered: Vec<ScalingActivity> = matching
+            .into_iter()
+            .map(|activity| scaling_activity_of(activity, now))
+            .collect();
+        let (scaling_activities, next_token) = take_page(rendered, page_size, |activity| {
+            encode_next_token(&[&activity.activity_id])
+        });
+
+        Ok(DescribeScalingActivitiesOutput {
+            scaling_activities: Some(scaling_activities),
+            next_token,
+        })
     }
+}
+
+/// This operation's modelled `ValidationException`, carrying `message`.
+fn validation(message: impl Into<String>) -> DescribeScalingActivitiesError {
+    DescribeScalingActivitiesErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// This operation's modelled `InvalidNextTokenException`.
+fn invalid_next_token() -> DescribeScalingActivitiesError {
+    DescribeScalingActivitiesErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
+        message: Some("The next token supplied was invalid.".to_string()),
+    })
+    .into()
 }
