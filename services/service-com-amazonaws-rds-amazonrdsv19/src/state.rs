@@ -45,6 +45,12 @@ use crate::ops::types::{
 /// stored on the record and materialised by the next call — nothing sleeps.
 pub const STATUS_TRANSITION_DELAY: Duration = Duration::from_millis(300);
 
+/// The status a DB instance reports once a delete has been accepted for it: "If you
+/// request a final DB snapshot, the status of the Amazon RDS DB instance is deleting
+/// until the DB snapshot is created" (`DeleteDBInstance`). It is a transient status —
+/// the instance is removed [`STATUS_TRANSITION_DELAY`] later, and then it is not found.
+pub const DB_INSTANCE_STATUS_DELETING: &str = "deleting";
+
 /// The ARN namespace and sigv4 signing name of this service, as its Smithy model's
 /// `aws.api#service` trait declares them (`arnNamespace: rds`).
 const ARN_NAMESPACE: &str = "rds";
@@ -166,6 +172,9 @@ impl ComAmazonawsRdsAmazonrdsv19State {
     /// request does under the state lock does not grow with what other callers stored.
     pub fn settle_due_transitions(&mut self, region: &str) {
         let now = Instant::now();
+        // A record whose pending change is its REMOVAL leaves the store here: the
+        // keys are collected first because the range borrows the map mutably.
+        let mut gone: Vec<RegionalKey> = Vec::new();
         for (key, instance) in self
             .db_instances
             .range_mut((region.to_string(), String::new())..)
@@ -173,7 +182,12 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             if key.0 != region {
                 break;
             }
-            instance.settle(now);
+            if instance.settle(now) {
+                gone.push(key.clone());
+            }
+        }
+        for key in gone.drain(..) {
+            self.db_instances.remove(&key);
         }
         for (key, snapshot) in self
             .db_snapshots
@@ -182,7 +196,12 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             if key.0 != region {
                 break;
             }
-            snapshot.settle(now);
+            if snapshot.settle(now) {
+                gone.push(key.clone());
+            }
+        }
+        for key in gone {
+            self.db_snapshots.remove(&key);
         }
     }
 
@@ -230,10 +249,20 @@ fn range_in<'a, T>(map: &'a BTreeMap<RegionalKey, T>, region: &str) -> Vec<&'a T
         .collect()
 }
 
-/// A status this service owes: what the resource becomes, and when that is due.
+/// What the clock owes a record once its due instant passes.
+#[derive(Debug, Clone)]
+pub enum PendingChange {
+    /// The resource reaches this status (`creating` -> `available`, say).
+    Status(String),
+    /// The resource is gone from the service: the end of a delete that was already
+    /// accepted, which "can't be canceled or reverted after it begins".
+    Removal,
+}
+
+/// A change this service owes: what becomes of the resource, and when that is due.
 #[derive(Debug, Clone)]
 pub struct PendingStatus {
-    pub status: String,
+    pub change: PendingChange,
     pub due_at: Instant,
 }
 
@@ -241,7 +270,15 @@ impl PendingStatus {
     /// A transition to `status`, due [`STATUS_TRANSITION_DELAY`] from now.
     pub fn in_a_moment(status: &str) -> Self {
         Self {
-            status: status.to_string(),
+            change: PendingChange::Status(status.to_string()),
+            due_at: Instant::now() + STATUS_TRANSITION_DELAY,
+        }
+    }
+
+    /// The record's removal from the store, due [`STATUS_TRANSITION_DELAY`] from now.
+    pub fn removal_in_a_moment() -> Self {
+        Self {
+            change: PendingChange::Removal,
             due_at: Instant::now() + STATUS_TRANSITION_DELAY,
         }
     }
@@ -296,12 +333,34 @@ pub struct DbInstanceRecord {
 }
 
 impl DbInstanceRecord {
-    /// Apply a transition whose due instant has passed.
-    fn settle(&mut self, now: Instant) {
+    /// Apply a change whose due instant has passed. Returns whether the record is now
+    /// gone — an accepted delete that has run its course — so the caller drops it from
+    /// the store.
+    fn settle(&mut self, now: Instant) -> bool {
         if self.pending_status.as_ref().is_some_and(|p| now >= p.due_at) {
             let pending = self.pending_status.take().expect("checked just above");
-            self.status = pending.status;
+            match pending.change {
+                PendingChange::Status(status) => self.status = status,
+                PendingChange::Removal => return true,
+            }
         }
+        false
+    }
+
+    /// Whether a delete has already been accepted for this instance, so it is on its
+    /// way out and nothing further can be done to it.
+    pub fn is_deleting(&self) -> bool {
+        self.status == DB_INSTANCE_STATUS_DELETING
+    }
+
+    /// Accept a delete: the instance reports `deleting` from now on, and the clock
+    /// owes its removal from the store [`STATUS_TRANSITION_DELAY`] from now, after
+    /// which every read of the identifier is a `DBInstanceNotFoundFault`. Nothing
+    /// sleeps: the due instant is stored and materialised by
+    /// [`ComAmazonawsRdsAmazonrdsv19State::settle_due_transitions`].
+    pub fn begin_deletion(&mut self) {
+        self.status = DB_INSTANCE_STATUS_DELETING.to_string();
+        self.pending_status = Some(PendingStatus::removal_in_a_moment());
     }
 
     /// `arn:aws:rds:<region>:<account>:db:<identifier>`, from the stored region and
@@ -416,12 +475,17 @@ pub struct DbSnapshotRecord {
 }
 
 impl DbSnapshotRecord {
-    /// Apply a transition whose due instant has passed.
-    fn settle(&mut self, now: Instant) {
+    /// Apply a change whose due instant has passed. Returns whether the record is now
+    /// gone, exactly as [`DbInstanceRecord::settle`] does.
+    fn settle(&mut self, now: Instant) -> bool {
         if self.pending_status.as_ref().is_some_and(|p| now >= p.due_at) {
             let pending = self.pending_status.take().expect("checked just above");
-            self.status = pending.status;
+            match pending.change {
+                PendingChange::Status(status) => self.status = status,
+                PendingChange::Removal => return true,
+            }
         }
+        false
     }
 
     /// Snapshot the source instance's settings. `snapshot_type` is `manual` for a

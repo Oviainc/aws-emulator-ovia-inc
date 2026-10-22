@@ -15,6 +15,8 @@
 mod ad_configuration;
 #[path = "all/batch_get_channel.rs"]
 mod batch_get_channel;
+#[path = "all/batch_get_stream_key.rs"]
+mod batch_get_stream_key;
 #[path = "all/channel_lifecycle.rs"]
 mod channel_lifecycle;
 #[path = "all/recording_configuration_lifecycle.rs"]

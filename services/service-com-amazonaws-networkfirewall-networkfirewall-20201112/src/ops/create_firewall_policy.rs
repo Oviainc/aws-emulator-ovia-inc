@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFirewallPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFirewallPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFirewallPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a `FirewallPolicyRecord` in `crate::state` and answers from
+//! it. `DryRun=true` computes the same response without storing anything.
 //!
 //! ## Shape of an operation
 //!
@@ -186,18 +179,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFirewallPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFirewallPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFirewallPolicy"))
+        let region = crate::state::request_region(ctx);
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateFirewallPolicyErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("the firewall policy store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        if state
+            .firewall_policies
+            .contains_key(&input.firewall_policy_name)
+        {
+            return Err(CreateFirewallPolicyErrorModeled::InvalidOperationException(
+                InvalidOperationException {
+                    message: Some(format!(
+                        "A firewall policy named {} already exists.",
+                        input.firewall_policy_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Bound what one caller can make this emulator retain: the model puts no
+        // length constraint on the policy document's lists, and nothing caps the
+        // number of stored policies, so both are refused here with the modelled
+        // `LimitExceededException` before anything is built or inserted. The
+        // checks run for a dry run too, which is what "check whether the request
+        // can run successfully" means.
+        if let Some(breach) = crate::state::policy_document_breach(&input.firewall_policy) {
+            return Err(
+                CreateFirewallPolicyErrorModeled::LimitExceededException(LimitExceededException {
+                    message: Some(breach),
+                })
+                .into(),
+            );
+        }
+        if state.firewall_policies.len() >= crate::state::MAX_STORED_FIREWALL_POLICIES {
+            return Err(
+                CreateFirewallPolicyErrorModeled::LimitExceededException(LimitExceededException {
+                    message: Some(format!(
+                        "This emulator holds the maximum of {} firewall policies; delete one \
+                         before creating another.",
+                        crate::state::MAX_STORED_FIREWALL_POLICIES
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let record = crate::state::FirewallPolicyRecord {
+            policy_arn: crate::state::firewall_policy_arn(&region, &input.firewall_policy_name),
+            policy_name: input.firewall_policy_name,
+            policy_id: crate::state::new_uuid(),
+            policy: input.firewall_policy,
+            description: input.description,
+            tags: input.tags,
+            encryption_configuration: input.encryption_configuration,
+            status: crate::state::RESOURCE_ACTIVE.to_string(),
+            number_of_associations: 0,
+            update_token: crate::state::new_uuid(),
+            last_modified_time: now,
+        };
+
+        let output = CreateFirewallPolicyOutput {
+            update_token: record.update_token.clone(),
+            firewall_policy_response: record.to_response(),
+        };
+
+        // `DryRun` asks the service to check the request rather than run it, so
+        // nothing is stored. The response still reports the ARN and id the policy
+        // WOULD have had, which is why the model's
+        // `FirewallPolicyResponse$FirewallPolicyArn` doc calls a dry run's ARN "a
+        // placeholder that isn't attached to a valid resource".
+        if !input.dry_run {
+            state
+                .firewall_policy_arn_index
+                .insert(record.policy_arn.clone(), record.policy_name.clone());
+            state
+                .firewall_policies
+                .insert(record.policy_name.clone(), record);
+        }
+
+        Ok(output)
     }
 }

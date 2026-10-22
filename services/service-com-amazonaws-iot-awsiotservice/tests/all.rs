@@ -15,5 +15,7 @@
 mod describe_endpoint;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/thing_group_hierarchy.rs"]
+mod thing_group_hierarchy;
 #[path = "all/thing_registry_lifecycle.rs"]
 mod thing_registry_lifecycle;

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociatePrincipalWithPortfolio
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociatePrincipalWithPortfolio`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociatePrincipalWithPortfolio::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +156,169 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociatePrincipalWithPortfolio` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociatePrincipalWithPortfolioErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociatePrincipalWithPortfolio"))
+        let _ = ctx;
+        // The ARN must be one this principal type admits. `Principal$PrincipalARN`
+        // states the rule: "This field allows for an ARN with no accountID, with or
+        // without wildcard characters if the PrincipalType is an IAM_PATTERN" — so an
+        // `IAM` principal is a FULLY defined IAM ARN (an account id, no wildcards),
+        // while an `IAM_PATTERN` may omit the account id and may carry wildcards.
+        // Either way it is an IAM ARN of a user, role or group. Checked before the
+        // portfolio is touched, so a refused association records nothing.
+        match principal_arn_violation(&input.principal_arn, &input.principal_type) {
+            Some(PrincipalArnViolation::Invalid(message)) => {
+                return Err(
+                    AssociatePrincipalWithPortfolioErrorModeled::InvalidParametersException(
+                        InvalidParametersException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                )
+            }
+            Some(PrincipalArnViolation::NoSuchPrincipal(message)) => {
+                return Err(
+                    AssociatePrincipalWithPortfolioErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                )
+            }
+            None => {}
+        }
+
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut state = state.lock();
+
+        // The association lives ON the portfolio, so a portfolio this account does
+        // not hold cannot take one.
+        let Some(portfolio) = state.portfolios.get_mut(&input.portfolio_id) else {
+            return Err(
+                AssociatePrincipalWithPortfolioErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Portfolio not found: {}",
+                            input.portfolio_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A principal is addressed by its ARN, so associating one already associated
+        // records its (possibly new) type rather than listing the ARN twice — which
+        // is also why the quota is only consulted for an ARN not yet present.
+        if !portfolio.principals.contains_key(&input.principal_arn)
+            && portfolio.principals.len() >= crate::state::MAX_PRINCIPALS_PER_PORTFOLIO
+        {
+            return Err(
+                AssociatePrincipalWithPortfolioErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "A portfolio cannot hold more than {} associated principals.",
+                            crate::state::MAX_PRINCIPALS_PER_PORTFOLIO
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // An ARN already associated keeps the position it was first associated at:
+        // this call changed its type, not when it joined the portfolio. A new one
+        // joins at the end, after every association already made.
+        let sequence = match portfolio.principals.get(&input.principal_arn) {
+            Some(existing) => existing.sequence,
+            None => portfolio
+                .principals
+                .values()
+                .map(|association| association.sequence + 1)
+                .max()
+                .unwrap_or(0),
+        };
+        portfolio.principals.insert(
+            input.principal_arn,
+            crate::state::PrincipalAssociation {
+                principal_type: input.principal_type,
+                sequence,
+            },
+        );
+
+        Ok(AssociatePrincipalWithPortfolioOutput {})
     }
+}
+
+/// The `PrincipalType` whose ARN may omit the account id and may carry wildcards
+/// (`smithy_query query="shape" shape="PrincipalType"`: `IAM` | `IAM_PATTERN`).
+const IAM_PATTERN: &str = "IAM_PATTERN";
+
+/// What is wrong with a `PrincipalARN`, which decides WHICH modelled error answers
+/// it: a value that is no principal ARN at all is a bad parameter, while a
+/// well-formed ARN this account holds no principal under is a missing resource.
+enum PrincipalArnViolation {
+    Invalid(String),
+    NoSuchPrincipal(String),
+}
+
+/// Why `arn` is not a principal ARN of type `principal_type`, or `None` when it is.
+///
+/// From `Principal$PrincipalARN`, a principal is "the principal (user, role, or
+/// group)", and an ARN with no account id, "with or without wildcard characters", is
+/// allowed "if the PrincipalType is an IAM_PATTERN" — so a plain `IAM` principal
+/// must be fully defined. Both forms are IAM ARNs,
+/// `arn:<partition>:iam::<account>:<type>/<name>`: IAM is global, so the region
+/// field is always empty, and the resource names one of the three principal types.
+fn principal_arn_violation(arn: &str, principal_type: &str) -> Option<PrincipalArnViolation> {
+    let is_pattern = principal_type == IAM_PATTERN;
+    let fields: Vec<&str> = arn.splitn(6, ':').collect();
+    let [prefix, partition, service, region, account, resource] = fields.as_slice() else {
+        return Some(PrincipalArnViolation::Invalid(format!(
+            "Invalid principal ARN {arn}: not an ARN"
+        )));
+    };
+    if *prefix != "arn"
+        || partition.is_empty()
+        || *service != "iam"
+        || !region.is_empty()
+        || resource.is_empty()
+    {
+        return Some(PrincipalArnViolation::Invalid(format!(
+            "Invalid principal ARN {arn}: not an IAM ARN"
+        )));
+    }
+    // The three principal types an IAM ARN can name, from the member's own doc.
+    let resource_type = resource.split('/').next().unwrap_or_default();
+    if !matches!(resource_type, "user" | "role" | "group") {
+        return Some(PrincipalArnViolation::Invalid(format!(
+            "Invalid principal ARN {arn}: a principal is a user, role or group"
+        )));
+    }
+    let account_well_formed =
+        account.len() == 12 && account.chars().all(|c| c.is_ascii_digit());
+    let account_allowed = account_well_formed || (is_pattern && account.is_empty());
+    if !account_allowed {
+        return Some(PrincipalArnViolation::Invalid(format!(
+            "Invalid principal ARN {arn}: an ARN with no accountID is allowed only for \
+             PrincipalType {IAM_PATTERN}"
+        )));
+    }
+    if !is_pattern && resource.contains(['*', '?']) {
+        return Some(PrincipalArnViolation::Invalid(format!(
+            "Invalid principal ARN {arn}: wildcard characters are allowed only for PrincipalType \
+             {IAM_PATTERN}"
+        )));
+    }
+    // A portfolio's principals are principals of the account that owns it: Service
+    // Catalog shares a portfolio with another ACCOUNT through
+    // `CreatePortfolioShare`, not by associating that account's principal here. So a
+    // well-formed ARN naming any other account names no principal this account can
+    // associate — a missing resource, not a malformed parameter.
+    if account_well_formed && *account != ::emulator_server::emulator_account_id() {
+        return Some(PrincipalArnViolation::NoSuchPrincipal(format!(
+            "Principal {arn} not found"
+        )));
+    }
+    None
 }

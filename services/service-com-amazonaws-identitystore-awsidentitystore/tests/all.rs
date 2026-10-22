@@ -21,3 +21,5 @@ mod identity_store_lifecycle;
 mod list_groups;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_user_attributes.rs"]
+mod update_user_attributes;

@@ -2065,25 +2065,16 @@ async fn delete_removes_the_instance_and_can_take_a_final_snapshot() {
         400,
         "InvalidDBInstanceState",
     );
-    // So does a status that is not yet settled.
+    // A status the clock has yet to settle does NOT refuse a delete: nothing has to
+    // be up for RDS to tear an instance down. `db_instance_deletion` spans the
+    // statuses a delete is accepted from; this row keeps this refusal suite honest
+    // about which refusals are real.
     expect_ok(
         "an instance that is still creating",
         create_instance(&router, "emu-del-creating", "postgres", "db.t3.micro", &[]).await,
     );
-    expect_error(
-        "delete while creating",
-        call(
-            &router,
-            "DeleteDBInstance",
-            &params!["DBInstanceIdentifier" => "emu-del-creating", "SkipFinalSnapshot" => true],
-        )
-        .await,
-        400,
-        "InvalidDBInstanceState",
-    );
-    wait_for_settle();
     expect_ok(
-        "delete once it is available",
+        "delete while creating",
         call(
             &router,
             "DeleteDBInstance",
@@ -2113,7 +2104,18 @@ async fn delete_removes_the_instance_and_can_take_a_final_snapshot() {
         "deleting",
         "a delete reports the instance as `deleting`"
     );
-    for attempt in ["the first read after the delete", "and the second"] {
+    // The instance reports `deleting` while the clock owes its removal, and is not
+    // found at all once that removal is due.
+    assert_eq!(
+        text(
+            &describe_one(&router, "a read inside the deleting window", "emu-del-skip").await,
+            "DBInstanceStatus"
+        ),
+        "deleting",
+        "a read inside the deleting window must report `deleting`"
+    );
+    wait_for_settle();
+    for attempt in ["the first read after the removal", "and the second"] {
         expect_error(
             attempt,
             call(

@@ -17,13 +17,29 @@ use crate::ops::types::{
     WorkspaceDescription, WorkspaceSummary,
 };
 
+/// The Grafana versions this emulator supports, OLDEST FIRST.
+///
+/// This is the emulator's single statement of the supported set: the catalogue
+/// `ListVersions` publishes ("Lists available versions of Grafana. These are
+/// available when calling CreateWorkspace") and the one
+/// [`DEFAULT_GRAFANA_VERSION`] reads "latest" off. The entries are the major
+/// versions Amazon Managed Grafana names in this service's own model docs —
+/// `CreateWorkspaceRequest$grafanaVersion` ("defaults to the latest version (for
+/// example, 10.4)") and `UpdateWorkspaceConfigurationRequest$grafanaVersion`
+/// ("Can only be used to upgrade (for example, from 8.4 to 9.4)").
+///
+/// Oldest first is what makes the slice its own total order, so a `ListVersions`
+/// page can be cut at any index and resumed from the version its `nextToken`
+/// names.
+pub const SUPPORTED_GRAFANA_VERSIONS: &[&str] = &["8.4", "9.4", "10.4"];
+
 /// The Grafana version a workspace runs when `CreateWorkspace` names none.
 ///
 /// `CreateWorkspaceRequest$grafanaVersion` documents the default as "the latest
-/// version (for example, 10.4)". `ListVersions`, which publishes the supported
-/// set, is still a stub, so this constant is the emulator's single statement of
-/// what "latest" is.
-pub const DEFAULT_GRAFANA_VERSION: &str = "10.4";
+/// version (for example, 10.4)", so it is the newest entry of
+/// [`SUPPORTED_GRAFANA_VERSIONS`] rather than a second, independent constant.
+pub const DEFAULT_GRAFANA_VERSION: &str =
+    SUPPORTED_GRAFANA_VERSIONS[SUPPORTED_GRAFANA_VERSIONS.len() - 1];
 
 /// The workspace configuration stored when `CreateWorkspace` names none.
 ///
@@ -43,6 +59,11 @@ pub const WORKSPACE_RESOURCE_TYPE: &str = "Workspace";
 /// request names no `maxResults`: `ListWorkspacesRequest$maxResults` is modelled
 /// `@range(min: 1, max: 100)`.
 pub const WORKSPACE_PAGE_LIMIT: i32 = 100;
+
+/// The largest page `ListVersions` serves, and the page size it uses when the
+/// request names no `maxResults`: `ListVersionsRequest$maxResults` is modelled
+/// `@range(min: 1, max: 100)`.
+pub const VERSION_PAGE_LIMIT: i32 = 100;
 
 /// How many workspaces the store holds before `CreateWorkspace` refuses with the
 /// modelled `ServiceQuotaExceededException`.
@@ -273,6 +294,38 @@ pub fn is_workspace_id(value: &str) -> bool {
         return false;
     };
     hex.len() == 10 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The sort key of a Grafana version: its dot-separated components as numbers.
+///
+/// A Grafana version is written `major.minor` (`GrafanaVersion` is otherwise an
+/// unconstrained 1..255 string), so the components must be compared as NUMBERS:
+/// byte order puts "10.4" before "9.4", which would report a newer version as
+/// older. A component that is not a number contributes 0, which keeps the key
+/// total over any string a workspace may carry.
+pub fn version_order(version: &str) -> Vec<u64> {
+    version
+        .split('.')
+        .map(|component| {
+            let digits: String = component.chars().take_while(|c| c.is_ascii_digit()).collect();
+            digits.parse().unwrap_or(0)
+        })
+        .collect()
+}
+
+/// The versions a workspace running `current` can be upgraded to: the supported
+/// versions strictly newer than it, oldest first.
+///
+/// `UpdateWorkspaceConfigurationRequest$grafanaVersion` is what consumes this
+/// set — it "[c]an only be used to upgrade ..., not downgrade" — so the current
+/// version and every older one is not an upgrade target.
+pub fn upgrade_targets(current: &str) -> Vec<String> {
+    let current = version_order(current);
+    SUPPORTED_GRAFANA_VERSIONS
+        .iter()
+        .filter(|candidate| version_order(candidate) > current)
+        .map(|candidate| (*candidate).to_string())
+        .collect()
 }
 
 /// The region this request was signed for — what a workspace endpoint names.
