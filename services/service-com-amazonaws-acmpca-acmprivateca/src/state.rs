@@ -49,6 +49,14 @@ pub const STATUS_PENDING_CERTIFICATE: &str = "PENDING_CERTIFICATE";
 /// Private CA holds its certificate and may issue end-entity certificates.
 pub const STATUS_ACTIVE: &str = "ACTIVE";
 
+// `ResourceOwner` members a listing filters on (see `RESOURCE_OWNER_VALUES` in
+// `ops::types` for the whole enum).
+/// The CAs the calling account owns — "The default is SELF."
+/// (`ListCertificateAuthoritiesRequest$ResourceOwner` docs).
+pub const RESOURCE_OWNER_SELF: &str = "SELF";
+/// The CAs another account owns and shared with the calling account.
+pub const RESOURCE_OWNER_OTHER_ACCOUNTS: &str = "OTHER_ACCOUNTS";
+
 /// What Amazon Web Services Private CA answers while a CA's creation is still in
 /// progress — one sentence, the same for every operation that refuses on `CREATING`
 /// rather than one built from the request.
@@ -170,6 +178,56 @@ pub const MAX_PERMISSIONS_PER_CA: usize = 100;
 /// record, and the oldest live entry is evicted at the ceiling, so a caller sending a
 /// fresh token per request cannot grow the map without limit.
 pub const MAX_IDEMPOTENCY_TOKENS: usize = 128;
+
+/// Most items one page of a listing carries, whatever `MaxResults` asks for: "Although
+/// the maximum value is 1000, the action only returns a maximum of 100 items."
+/// (`ListCertificateAuthoritiesRequest$MaxResults` docs). It is also what a request that
+/// names no `MaxResults` gets.
+pub const MAX_LIST_PAGE_SIZE: i32 = 100;
+
+/// How many items the page of a listing asked for by `max_results` holds: what the
+/// caller asked for, never more than the ceiling the operation publishes, and the
+/// ceiling when the caller asked for nothing.
+///
+/// The modelled `@range(1..1000)` is refused before any handler runs, so a value that
+/// reaches here is at least 1.
+pub fn page_size(max_results: Option<i32>) -> usize {
+    let requested = max_results.unwrap_or(MAX_LIST_PAGE_SIZE);
+    requested.clamp(1, MAX_LIST_PAGE_SIZE) as usize
+}
+
+/// The listing `ListCertificateAuthorities` pages over, as its cursors name it.
+pub const LISTING_CERTIFICATE_AUTHORITIES: &str = "certificate-authorities";
+
+/// What Amazon Web Services Private CA answers for a `NextToken` it did not issue for
+/// the listing being paged — the modelled exception's own sentence, naming no value out
+/// of the request: a token is opaque, so a caller cannot act on its text.
+pub const INVALID_NEXT_TOKEN_MESSAGE: &str =
+    "The token specified in the NextToken argument is not valid. Use the token returned \
+     from your previous call to ListCertificateAuthorities.";
+
+/// The separator between a cursor's listing and the key it resumes at: an ASCII unit
+/// separator, which no ARN and no listing name contains.
+const PAGE_TOKEN_SEPARATOR: char = '\u{1f}';
+
+/// Encode a pagination cursor: the `listing` it belongs to and the key of the first item
+/// of the NEXT page.
+///
+/// Hex-encoded so the token is opaque to the caller and carries an ARN's `:` and `/`
+/// safely, and stamped with the listing so a token one listing issued cannot resume
+/// another.
+pub fn encode_page_token(listing: &str, key: &str) -> String {
+    ::hex::encode(format!("{listing}{PAGE_TOKEN_SEPARATOR}{key}"))
+}
+
+/// The key a cursor of `listing` resumes at, or `None` when `token` is not one this
+/// service issued for that listing — which the caller answers with
+/// `InvalidNextTokenException` rather than by restarting the listing.
+pub fn decode_page_token(listing: &str, token: &str) -> Option<String> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    let (stamped, key) = decoded.split_once(PAGE_TOKEN_SEPARATOR)?;
+    (stamped == listing && !key.is_empty()).then(|| key.to_string())
+}
 
 /// One issued end-entity certificate, held under the CA that issued it.
 #[derive(Debug, Clone)]
@@ -489,6 +547,18 @@ impl ComAmazonawsAcmpcaAcmprivatecaState {
         record.settle(now);
         Some(record)
     }
+
+    /// Materialise every status change the clock owed at `now`, across every CA.
+    ///
+    /// What [`certificate_authority_mut`](Self::certificate_authority_mut) does for one
+    /// CA, for the whole store: an operation that reports on more than one CA at a time
+    /// applies the transitions that were due at the same instant whether or not anybody
+    /// called, so no two readers disagree about a CA's current status.
+    pub fn settle(&mut self, now: SystemTime) {
+        for record in self.certificate_authorities.values_mut() {
+            record.settle(now);
+        }
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -560,6 +630,28 @@ pub fn parse_certificate_arn(arn: &str) -> Option<(String, String)> {
     }
     parse_certificate_authority_arn(ca_arn)?;
     Some((ca_arn.to_string(), serial.to_string()))
+}
+
+/// Every private CA whose owner account `owned_by` accepts, in the order a listing
+/// reports them.
+///
+/// The order is by ARN: a stable TOTAL order over the set, since a CA's ARN is unique.
+/// That is what makes a cursor cut into the listing exact — a page resumes at the first
+/// CA at or after the cursor's ARN, so no CA is reported twice or skipped even when CAs
+/// are created between two pages. Amazon Web Services Private CA documents no order for
+/// this listing, so any stable total order is faithful; an unstable one (a hash map's
+/// iteration order) is not.
+pub fn certificate_authorities_where(
+    state: &ComAmazonawsAcmpcaAcmprivatecaState,
+    owned_by: impl Fn(&str) -> bool,
+) -> Vec<CertificateAuthority> {
+    let mut records: Vec<&CertificateAuthorityRecord> = state
+        .certificate_authorities
+        .values()
+        .filter(|record| owned_by(&record.owner_account))
+        .collect();
+    records.sort_by(|left, right| left.arn.cmp(&right.arn));
+    records.into_iter().map(|record| record.to_wire()).collect()
 }
 
 /// The region this request was signed for, which is the region of every ARN it mints.

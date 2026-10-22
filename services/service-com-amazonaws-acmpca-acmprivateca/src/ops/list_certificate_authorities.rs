@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCertificateAuthorities
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCertificateAuthorities`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCertificateAuthorities::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this handler does
+//!
+//! Reports the private CAs this service holds, as one page of a stable total order (by
+//! ARN) cut by an opaque cursor. Reporting only: the one write is
+//! [`crate::state::ComAmazonawsAcmpcaAcmprivatecaState::settle`], which materialises the
+//! `CREATING` -> `PENDING_CERTIFICATE` changes the clock already made due — owed at the
+//! same instant whether or not anybody listed.
 //!
 //! ## Shape of an operation
 //!
@@ -95,10 +94,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-acmpca-acmprivateca.jso
 // here — hence the `ListCertificateAuthoritiesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.acmpca#ListCertificateAuthorities")]
+// `RequestFailedException` is widened in: the service models it, this operation does
+// not list it, and it is the only modelled answer for "this emulator could not reach
+// its own state store".
+#[smithy_macros::operation_error(
+    "com.amazonaws.acmpca#ListCertificateAuthorities",
+    extra_errors = ["RequestFailedException"]
+)]
 #[derive(Debug)]
 pub enum ListCertificateAuthoritiesErrorModeled {
     InvalidNextTokenException(InvalidNextTokenException),
+    RequestFailedException(RequestFailedException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -152,18 +158,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCertificateAuthorities` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCertificateAuthoritiesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCertificateAuthorities"))
+        let _ = ctx;
+
+        // A cursor is one of THIS listing's own tokens or it is not a cursor at all: a
+        // token this service did not issue is refused, never read as "start again from
+        // the beginning", which would silently serve the first page to a caller that
+        // asked to resume.
+        let resume_from = match input.next_token.as_deref() {
+            Some(token) => Some(
+                crate::state::decode_page_token(
+                    crate::state::LISTING_CERTIFICATE_AUTHORITIES,
+                    token,
+                )
+                .ok_or_else(invalid_next_token)?,
+            ),
+            None => None,
+        };
+
+        // "The default is SELF." (`ListCertificateAuthoritiesRequest$ResourceOwner`
+        // docs.) SELF is the CAs this account owns; OTHER_ACCOUNTS is the ones another
+        // account owns and shared with it, of which this emulator holds none, since
+        // every CA it mints is owned by the account it presents. A value outside the
+        // modelled enum is REFUSED rather than read as "not SELF", so a request the real
+        // service rejects cannot get a plausible empty page here.
+        let owner = input
+            .resource_owner
+            .unwrap_or_else(|| crate::state::RESOURCE_OWNER_SELF.to_string());
+        let owned_by_this_account = match owner.as_str() {
+            crate::state::RESOURCE_OWNER_SELF => true,
+            crate::state::RESOURCE_OWNER_OTHER_ACCOUNTS => false,
+            other => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "ResourceOwner must be one of {}, not {other}",
+                    RESOURCE_OWNER_VALUES.join(" | ")
+                )))
+            }
+        };
+        let account = ::emulator_server::emulator_account_id().to_string();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListCertificateAuthoritiesErrorModeled::RequestFailedException(
+                RequestFailedException {
+                    message: Some("the private CA store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // Reporting only: the transitions settled here were due on the clock whether or
+        // not anybody listed, and every handler settles, so no two readers disagree.
+        store.settle(::std::time::SystemTime::now());
+
+        let listed = crate::state::certificate_authorities_where(&store, |owner_account| {
+            if owned_by_this_account {
+                owner_account == account
+            } else {
+                owner_account != account
+            }
+        });
+
+        // `MaxResults` is a maximum, not a demand. The page is the stretch of the order
+        // that starts where the cursor resumes (the first CA at or after its ARN, so a
+        // CA created between two pages cannot shift a later page back over one already
+        // reported), and the cursor for the next page names the CA just past its end.
+        let page_size = crate::state::page_size(input.max_results);
+        let start = match resume_from.as_deref() {
+            Some(from) => listed.partition_point(|authority| arn_of(authority) < from),
+            None => 0,
+        };
+        let end = (start + page_size).min(listed.len());
+        let next_token = listed.get(end).map(|first_of_next_page| {
+            crate::state::encode_page_token(
+                crate::state::LISTING_CERTIFICATE_AUTHORITIES,
+                arn_of(first_of_next_page),
+            )
+        });
+
+        Ok(ListCertificateAuthoritiesOutput {
+            certificate_authorities: Some(listed[start..end].to_vec()),
+            next_token,
+        })
     }
+}
+
+/// A reported CA's ARN, which [`crate::state::CertificateAuthorityRecord::to_wire`]
+/// always carries: the key the listing is ordered by and the cursor is cut on.
+fn arn_of(authority: &CertificateAuthority) -> &str {
+    authority.arn.as_deref().unwrap_or_default()
+}
+
+/// "The token specified in the NextToken argument is not valid." — the refusal for a
+/// cursor this listing did not issue.
+fn invalid_next_token() -> ListCertificateAuthoritiesError {
+    ListCertificateAuthoritiesErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
+        message: Some(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string()),
+    })
+    .into()
 }
