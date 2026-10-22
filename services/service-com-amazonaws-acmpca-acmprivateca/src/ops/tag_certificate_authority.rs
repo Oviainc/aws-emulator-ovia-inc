@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagCertificateAuthority
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagCertificateAuthority`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagCertificateAuthority::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +73,19 @@
 //!   certificate, audit report, or policy cannot be found.
 //! * `TooManyTagsException` (HTTP 400) — You can associate up to 50 tags with a private CA.
 //!   Exception information is contained in the exception message field.
+//!
+//! ## What this handler does
+//!
+//! A tag key identifies one tag of a resource: a key the CA already carries takes the
+//! value in the request, and a key it does not carry is added, so the CA's tag set ends
+//! up the union of what was stored and what the request names. `ListTags` reads that set
+//! back and `UntagCertificateAuthority` removes from it.
+//!
+//! `InvalidStateException` answers a CA that has been deleted and not restored: its tag
+//! set is not writable while it waits to be restored or permanently deleted. Every other
+//! status a CA reports accepts the call — a CA may be tagged while it is still `CREATING`
+//! (`CreateCertificateAuthority` takes a `Tags` list of its own, applied in that status),
+//! while it is `PENDING_CERTIFICATE` and once it is `ACTIVE`.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -177,18 +181,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagCertificateAuthority` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagCertificateAuthorityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagCertificateAuthority"))
+        let _ = ctx;
+        let arn = input.certificate_authority_arn;
+        if crate::state::parse_certificate_authority_arn(&arn).is_none() {
+            return Err(TagCertificateAuthorityErrorModeled::InvalidArnException(
+                InvalidArnException {
+                    message: Some(crate::state::INVALID_ARN_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The rules every tag set this service reads is held to, refused before the CA
+        // is touched so a bad request writes nothing.
+        if let Some(reason) = crate::state::invalid_tag_reason(&input.tags) {
+            return Err(TagCertificateAuthorityErrorModeled::InvalidTagException(
+                InvalidTagException {
+                    message: Some(reason),
+                },
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(not_found(
+                "the private CA store is unavailable, so no certificate authority can be read",
+            ));
+        };
+        let mut state = state.lock();
+
+        // `certificate_authority_mut` also materialises the CREATING ->
+        // PENDING_CERTIFICATE change the clock already owed: this call writes to the CA
+        // anyway, and that transition came due at the same instant either way.
+        let Some(record) = state.certificate_authority_mut(&arn, ::std::time::SystemTime::now())
+        else {
+            return Err(not_found(format!(
+                "the certificate authority {arn} was not found"
+            )));
+        };
+
+        // A deleted CA is waiting to be restored or permanently deleted: its tag set is
+        // not writable in that status, which is what the modelled `InvalidStateException`
+        // answers.
+        if record.is_deleted() {
+            return Err(TagCertificateAuthorityErrorModeled::InvalidStateException(
+                InvalidStateException {
+                    message: Some(crate::state::DELETED_INVALID_STATE_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Counted before anything is written, so a refused request leaves the CA's tag
+        // set exactly as it was.
+        let total = crate::state::tag_count_after(&record.tags, &input.tags);
+        if total > crate::state::MAX_TAGS_PER_CERTIFICATE_AUTHORITY {
+            return Err(TagCertificateAuthorityErrorModeled::TooManyTagsException(
+                TooManyTagsException {
+                    message: Some(format!(
+                        "You can associate up to {} tags with a private CA, and this request \
+                         would leave it with {total}.",
+                        crate::state::MAX_TAGS_PER_CERTIFICATE_AUTHORITY
+                    )),
+                },
+            )
+            .into());
+        }
+
+        crate::state::apply_tags(&mut record.tags, input.tags);
+        Ok(TagCertificateAuthorityOutput)
     }
 }
+
+/// "A resource such as a private CA, S3 bucket, certificate, audit report, or policy
+/// cannot be found."
+///
+/// This operation models no server-fault error, so a store that cannot be reached is
+/// reported the way a CA that was never created is: the named CA cannot be read.
+fn not_found(message: impl Into<String>) -> TagCertificateAuthorityError {
+    TagCertificateAuthorityErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
