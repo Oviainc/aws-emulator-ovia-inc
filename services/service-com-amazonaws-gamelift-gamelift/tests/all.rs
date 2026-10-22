@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/hosting_loop.rs"]
 mod hosting_loop;
+#[path = "all/server_process_capacity.rs"]
+mod server_process_capacity;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/unknown_resource_lookups.rs"]

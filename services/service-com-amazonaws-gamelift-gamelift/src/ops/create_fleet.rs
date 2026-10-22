@@ -444,15 +444,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // 50 processes running concurrently. To calculate the total number of processes
         // defined in a runtime configuration, add the values of the ConcurrentExecutions
         // parameter for each server process."
-        let configured_processes = input
-            .runtime_configuration
-            .as_ref()
-            .and_then(|configuration| configuration.server_processes.as_ref())
-            .map_or(0, |processes| {
-                processes.iter().fold(0_i32, |total, process| {
-                    total.saturating_add(process.concurrent_executions)
-                })
-            });
+        let configured_processes =
+            crate::state::configured_server_processes(input.runtime_configuration.as_ref());
         if configured_processes > crate::state::MAX_SERVER_PROCESSES_PER_INSTANCE {
             return Err(invalid(&format!(
                 "RuntimeConfiguration asks for {configured_processes} concurrent server \
@@ -493,12 +486,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (FLEET_STATUS_NEW, Some(now + WORKFLOW_DELAY))
         };
 
+        // How many server processes each of this fleet's locations runs, and so how many
+        // game sessions each can host: a managed fleet runs the processes its runtime
+        // configuration asks for, an Anywhere fleet runs none of its own.
+        let server_processes =
+            crate::state::server_processes_per_location(&compute_type, configured_processes);
+
         // `CreateFleetOutput$LocationStates` doc: "This list includes an entry for the
         // fleet's home Region. For fleets with no remote locations, only one entry,
         // representing the home Region, is returned."
         let mut locations = vec![crate::state::FleetLocation {
             location: region.clone(),
             status: status.to_string(),
+            server_processes,
         }];
         for configured in input.locations.iter().flatten() {
             if !locations
@@ -508,6 +508,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 locations.push(crate::state::FleetLocation {
                     location: configured.location.clone(),
                     status: status.to_string(),
+                    server_processes,
                 });
             }
         }
