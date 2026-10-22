@@ -71,7 +71,8 @@ pub const MAX_MONITORS: usize = 100;
 /// `ScopeStatus`, the lifecycle status of a scope. The wire values are the model's
 /// (SUCCEEDED | IN_PROGRESS | FAILED | DEACTIVATING | DEACTIVATED); only the ones
 /// this slice can produce are modelled here, and the others arrive with the
-/// operations that move a scope into them (`DeleteScope`, still a 501).
+/// operations that move a scope into them. `DeleteScope` is not one of them: it
+/// removes the scope outright, so no reader sees a deactivation status for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScopeStatus {
     /// The scope is being set up: the status a create answers with.

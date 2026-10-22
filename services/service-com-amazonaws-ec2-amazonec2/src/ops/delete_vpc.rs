@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteVpc
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteVpc`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes a stored VPC once nothing is associated with it any more, taking
+//! the default security group the VPC came with along with it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteVpc::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +149,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteVpc` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteVpcErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteVpc"))
+        // `ctx` carries request metadata only; this operation reads none of it — a VPC is
+        // named by id. The store is reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // What is still associated with the VPC is a question about the CURRENT states, so
+        // a termination the clock already owed is applied before it is asked: the move was
+        // due at that instant whether or not anybody called.
+        store.materialize_due_transitions();
+
+        // "Deletes the specified VPC": a VPC id this account holds no VPC for is a refusal,
+        // not a no-op — a caller that deletes twice has to be able to tell the deletion it
+        // performed from one it did not.
+        if !store.vpcs.contains_key(&input.vpc_id) {
+            return Err(state::invalid_vpc_id_not_found(&input.vpc_id));
+        }
+        // "You must detach or delete all gateways and resources that are associated with the
+        // VPC before you can delete it. For example, you must terminate all instances
+        // running in the VPC, delete all security groups associated with the VPC (except the
+        // default one) …" (`DeleteVpc`). The default group is not a dependency, because the
+        // delete removes it.
+        let dependencies = store.vpc_dependencies(&input.vpc_id);
+        if !dependencies.is_empty() {
+            return Err(state::dependency_violation(format!(
+                "The vpc '{vpc_id}' has dependencies and cannot be deleted: {held}",
+                vpc_id = input.vpc_id,
+                held = dependencies.join(", "),
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (DryRun).
+        // Nothing has been removed yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // "When you delete the VPC, it deletes the default security group, network ACL, and
+        // route table for the VPC" — `remove_vpc` is what takes those with it, and what
+        // gives every removed record's caller-supplied bytes back to the store's budget.
+        if store.remove_vpc(&input.vpc_id).is_none() {
+            return Err(state::internal_error(
+                "the VPC checked a moment ago could not be removed",
+            ));
+        }
+        Ok(DeleteVpcOutput)
     }
 }
