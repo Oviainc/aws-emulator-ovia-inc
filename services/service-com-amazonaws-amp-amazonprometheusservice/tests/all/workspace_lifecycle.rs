@@ -29,26 +29,30 @@ fn kms_key_arn(region: &str) -> String {
 }
 
 /// One response, as a test reads it: the HTTP status and the parsed body.
+///
+/// `pub(crate)`, with [`Amp`], [`text`] and [`wait_for_due_transition`], because every
+/// suite in this crate drives the service over the same request path — a second copy of
+/// this harness is a second set of rules about how a test reaches the emulator.
 #[derive(Debug)]
-struct Reply {
-    status: u16,
-    body: serde_json::Value,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) body: serde_json::Value,
 }
 
 impl Reply {
     /// The error code a modelled failure renders as the JSON envelope's `__type`.
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         text(&self.body["__type"])
     }
 }
 
 /// The emulator under test: this service on its own shared engine.
-struct Amp {
+pub(crate) struct Amp {
     router: MultiServiceRouter,
 }
 
 impl Amp {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -59,7 +63,7 @@ impl Amp {
     /// Dispatch one request, signed (unverified — authentication is off here) for
     /// `region`, which is also the region the handlers read out of the credential
     /// scope when they build an ARN or a Prometheus endpoint.
-    async fn call(&self, method: &str, uri: &str, region: &str, body: &str) -> Reply {
+    pub(crate) async fn call(&self, method: &str, uri: &str, region: &str, body: &str) -> Reply {
         let request = http::Request::builder()
             .method(method)
             .uri(uri)
@@ -120,7 +124,12 @@ impl Amp {
         .await
     }
 
-    async fn delete(&self, region: &str, workspace_id: &str, client_token: Option<&str>) -> Reply {
+    pub(crate) async fn delete(
+        &self,
+        region: &str,
+        workspace_id: &str,
+        client_token: Option<&str>,
+    ) -> Reply {
         let uri = match client_token {
             Some(token) => format!("/workspaces/{workspace_id}?clientToken={token}"),
             None => format!("/workspaces/{workspace_id}"),
@@ -159,7 +168,7 @@ impl Amp {
 
     /// Create a workspace and let the clock make it `ACTIVE` — the starting point for
     /// every operation the model allows only on an active workspace.
-    async fn active_workspace(&self, region: &str, alias: &str) -> String {
+    pub(crate) async fn active_workspace(&self, region: &str, alias: &str) -> String {
         let created = self.create(region, &serde_json::json!({ "alias": alias })).await;
         assert_eq!(created.status, 202, "create {alias}: {created:?}");
         let workspace_id = text(&created.body["workspaceId"]);
@@ -186,7 +195,7 @@ fn encode_label(value: &str) -> String {
         .collect()
 }
 
-fn text(value: &serde_json::Value) -> String {
+pub(crate) fn text(value: &serde_json::Value) -> String {
     value.as_str().unwrap_or_default().to_string()
 }
 
@@ -215,7 +224,7 @@ fn expected_tags(tags: &[(String, String)]) -> BTreeMap<String, String> {
 
 /// Sleep past the span the emulator gives a pending lifecycle transition. Blocking is
 /// fine: each suite drives one request at a time.
-fn wait_for_due_transition() {
+pub(crate) fn wait_for_due_transition() {
     std::thread::sleep(TRANSITION_DELAY + std::time::Duration::from_millis(250));
 }
 

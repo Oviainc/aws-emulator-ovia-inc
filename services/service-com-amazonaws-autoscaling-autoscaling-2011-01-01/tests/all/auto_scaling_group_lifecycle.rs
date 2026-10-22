@@ -18,11 +18,13 @@ use service_com_amazonaws_autoscaling_autoscaling_2011_01_01 as autoscaling;
 /// against the region the request names rather than a default.
 const REGION: &str = "us-west-2";
 
-fn new_engine() -> Arc<engine::InMemoryEngine> {
+/// `pub(crate)`: `tests/all.rs` is one test target, so the suites beside this one
+/// drive the service through these helpers rather than copying them.
+pub(crate) fn new_engine() -> Arc<engine::InMemoryEngine> {
     Arc::new(engine::InMemoryEngine::new())
 }
 
-fn router_with(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
+pub(crate) fn router_with(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.register_service(autoscaling::EmulatedService::new(engine));
     router
@@ -47,7 +49,7 @@ fn form_encode(value: &str) -> String {
 }
 
 /// POST one awsQuery action and return its status and body.
-async fn query(
+pub(crate) async fn query(
     router: &MultiServiceRouter,
     action: &str,
     params: &[(&str, &str)],
@@ -79,7 +81,7 @@ async fn query(
 }
 
 /// The text of every `<tag>…</tag>` in document order.
-fn tag_values(xml: &str, tag: &str) -> Vec<String> {
+pub(crate) fn tag_values(xml: &str, tag: &str) -> Vec<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let mut out = Vec::new();
@@ -94,7 +96,7 @@ fn tag_values(xml: &str, tag: &str) -> Vec<String> {
 }
 
 /// The text of the first `<tag>…</tag>`, or `""` when the member is absent.
-fn tag_value(xml: &str, tag: &str) -> String {
+pub(crate) fn tag_value(xml: &str, tag: &str) -> String {
     tag_values(xml, tag).first().cloned().unwrap_or_default()
 }
 
@@ -104,7 +106,7 @@ fn wait_for_the_lifecycle_transition() {
     std::thread::sleep(autoscaling::state::LIFECYCLE_TRANSITION + Duration::from_millis(150));
 }
 
-async fn create_launch_configuration(router: &MultiServiceRouter, name: &str) {
+pub(crate) async fn create_launch_configuration(router: &MultiServiceRouter, name: &str) {
     let (status, body) = query(
         router,
         "CreateLaunchConfiguration",

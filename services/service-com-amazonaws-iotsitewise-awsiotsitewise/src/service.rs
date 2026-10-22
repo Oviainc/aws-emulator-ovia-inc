@@ -45,6 +45,18 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The error code IoT SiteWise answers a request that breaks one of the model's
+/// own rules with.
+///
+/// `InvalidRequestException` is the client-input error this service declares ("The
+/// request isn't valid. This can occur if your request contains malformed JSON or
+/// unsupported characters.") and it is on every operation that takes input. The
+/// framework's default code, `ValidationException`, names a shape
+/// `com.amazonaws.iotsitewise` does not contain at all, so no generated SDK
+/// exception class exists for it and a client's `except InvalidRequestException`
+/// never fires.
+const INVALID_REQUEST: &str = "InvalidRequestException";
+
 /// The `com-amazonaws-iotsitewise-awsiotsitewise` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -96,17 +108,33 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        match refusal {
+            // A value outside a declared `@length`/`@range`/`@pattern`, or an
+            // absent required member: IoT SiteWise states all of these as
+            // [`INVALID_REQUEST`], which is both a modelled shape of this service
+            // and a 400, the same status the framework renders a refusal with.
+            //
+            // EVERY `Invalid` refusal is restated, with no fall-through: a refusal
+            // this service declines to word would be rendered with the framework's
+            // default code, `ValidationException`, which names no shape of this
+            // model — exactly the answer this seam exists to remove.
+            //
+            // Only the CODE is restated. The message keeps the framework's
+            // wording, which is the AWS request-validation envelope naming the
+            // member and the constraint it failed (`1 validation error detected:
+            // Value ... at 'tags' failed to satisfy constraint: Member must have
+            // length less than or equal to 50`) — the rule the caller has to fix.
+            // `envelope` answers `None` only for an empty violation list, which
+            // carries no member to name, so that one case states the class alone.
+            Refusal::Invalid(violations) => Some(Refused {
+                code: INVALID_REQUEST.to_string(),
+                message: ::aws_smithy_schema_server::envelope(violations)
+                    .unwrap_or_else(|| "The request isn't valid.".to_string()),
+            }),
+            // An authentication refusal is the emulator's, not this service's:
+            // keep the framework's 403 wording.
+            _ => None,
+        }
     }
 
     fn override_routing_error(

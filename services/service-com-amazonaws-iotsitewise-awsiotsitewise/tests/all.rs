@@ -35,6 +35,8 @@ mod batch_get_latest_values;
 mod batch_put_timestamp_and_quality;
 #[path = "all/gateway_lifecycle.rs"]
 mod gateway_lifecycle;
+#[path = "all/hierarchies_etags_and_refusals.rs"]
+mod hierarchies_etags_and_refusals;
 #[path = "all/property_value_history.rs"]
 mod property_value_history;
 #[path = "all/resource_tags.rs"]

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateModelPackageGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateModelPackageGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateModelPackageGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: registers a model package group in `crate::state` under its
+//! `ModelPackageGroupName`, minting the `ModelPackageGroupArn` from the request's region,
+//! and refuses a name already in use. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +139,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateModelPackageGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateModelPackageGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateModelPackageGroup"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let region = crate::state::request_region(ctx);
+        let arn = crate::state::resource_arn(
+            &region,
+            "model-package-group",
+            &input.model_package_group_name,
+        );
+        let created_by = crate::state::caller_user_context(ctx);
+
+        let mut store = state.lock();
+        // The store is bounded, so a caller varying `ModelPackageGroupName` cannot grow it
+        // without end. `ResourceLimitExceeded` is the limit failure this operation models.
+        if !store.model_package_groups_below_quota() {
+            return Err(CreateModelPackageGroupErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The account-level service limit for model package groups is {}, with \
+                         current utilization of {} and a request delta of 1.",
+                        crate::state::MODEL_PACKAGE_GROUP_QUOTA,
+                        store.model_package_groups.len()
+                    )),
+                },
+            )
+            .into());
+        }
+        // A name already in use is refused, never overwritten: otherwise the caller reads a
+        // 200 for a group it did not create, and the model packages already registered
+        // under that name would be re-parented to a group with different metadata.
+        if store
+            .model_package_groups
+            .contains_key(&input.model_package_group_name)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Model Package Group already exists: \"{arn}\"."
+            )));
+        }
+
+        store.model_package_groups.insert(
+            input.model_package_group_name.clone(),
+            crate::state::ModelPackageGroup {
+                name: input.model_package_group_name.clone(),
+                arn: arn.clone(),
+                description: input.model_package_group_description,
+                managed_configuration: input.managed_configuration,
+                // Creating a model group is synchronous; see `state::STATUS_COMPLETED`.
+                status: crate::state::STATUS_COMPLETED.to_string(),
+                created_by,
+                tags: input.tags.unwrap_or_default(),
+                creation_time: ::std::time::SystemTime::now(),
+            },
+        );
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateModelPackageGroupOutput {
+            model_package_group_arn: arn,
+        })
     }
 }

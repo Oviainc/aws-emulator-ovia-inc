@@ -499,15 +499,17 @@ async fn the_asset_model_asset_and_property_value_slice_round_trips() {
     );
 
     // --- DeleteAssetModel is refused while the asset references it --------
+    // A dependant the caller must remove first is a TERMINAL request error, not
+    // the retryable operation conflict: 400 InvalidRequestException.
     let (status, conflict) =
         call(&router, "DELETE", &format!("/asset-models/{model_id}"), None).await;
     assert_eq!(
-        status, 409,
-        "DeleteAssetModel with a live asset: expected 409, got {status} {conflict}"
+        status, 400,
+        "DeleteAssetModel with a live asset: expected 400, got {status} {conflict}"
     );
     assert_eq!(
         error_code(&conflict),
-        "ConflictingOperationException",
+        "InvalidRequestException",
         "DeleteAssetModel with a live asset: unexpected error code in {conflict}"
     );
 
@@ -1378,15 +1380,16 @@ async fn a_hierarchy_definition_must_name_a_stored_child_model() {
         }
     }
 
-    // And the child model cannot be deleted while a hierarchy still names it.
+    // And the child model cannot be deleted while a hierarchy still names it —
+    // a dependant the caller must remove first, so a terminal request error.
     let (status, body) = call(&router, "DELETE", &format!("/asset-models/{child_id}"), None).await;
     assert_eq!(
-        status, 409,
-        "deleting a referenced child model: expected 409, got {status} {body}"
+        status, 400,
+        "deleting a referenced child model: expected 400, got {status} {body}"
     );
     assert_eq!(
         error_code(&body),
-        "ConflictingOperationException",
+        "InvalidRequestException",
         "deleting a referenced child model: unexpected error code in {body}"
     );
 }

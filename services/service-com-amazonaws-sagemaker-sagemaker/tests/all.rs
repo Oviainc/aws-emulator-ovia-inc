@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/inference_deployment_lifecycle.rs"]
 mod inference_deployment_lifecycle;
+#[path = "all/model_package_group_lifecycle.rs"]
+mod model_package_group_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

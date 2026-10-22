@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAssetModel
-//! IMPLEMENTED: this operation removes the asset model from the shared engine store
-//! (`crate::state`); this is the ONLY file to touch for it.
+//! IMPLEMENTED: this operation evaluates the conditional request headers and then
+//! removes the asset model from the shared engine store (`crate::state`); this is
+//! the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -183,6 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
 
         let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
         // The label is either the raw UUID or the `externalId:<externalId>` alias form.
         let id = store
             .resolve_asset_model_id(&input.asset_model_id)
@@ -190,22 +192,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 DeleteAssetModelError::Modeled(
                     DeleteAssetModelErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
-                            message: format!(
-                                "The asset model {} could not be found.",
-                                input.asset_model_id
+                            message: crate::state::not_found_message(
+                                crate::state::RESOURCE_ASSET_MODEL,
+                                &input.asset_model_id,
                             ),
                         },
                     ),
                 )
             })?;
 
+        // The conditional request headers are evaluated BEFORE anything is
+        // removed, the way HTTP preconditions are: a precondition that fails
+        // leaves the resource exactly as it was.
+        //
+        // `Match-For-Version-Type` names which version the headers talk about.
+        // This store keeps one version of a model, which is its LATEST and — once
+        // the owed CREATING -> ACTIVE transition has fallen due — also its ACTIVE
+        // one; a model still CREATING has a LATEST version and no ACTIVE version.
+        // So the ETag the headers target is the stored model's, except that
+        // `ACTIVE` targets nothing while no active version exists.
+        let record = store.asset_models.get(&id).ok_or_else(|| {
+            DeleteAssetModelError::Modeled(DeleteAssetModelErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::not_found_message(
+                        crate::state::RESOURCE_ASSET_MODEL,
+                        &input.asset_model_id,
+                    ),
+                },
+            ))
+        })?;
+        let arn = record.arn.clone();
+        let version_type = input.match_for_version_type.as_deref().unwrap_or(LATEST_VERSION);
+        let target_e_tag = match version_type {
+            ACTIVE_VERSION => (record.state(now) == crate::state::STATE_ACTIVE)
+                .then(|| crate::state::asset_model_etag(record)),
+            // LATEST, and anything the enum admits but this store does not
+            // distinguish: the stored version is the latest one.
+            _ => Some(crate::state::asset_model_etag(record)),
+        };
+
+        // `If-Match`: delete only if the targeted version's ETag is the one the
+        // caller last read. A caller that read a different version — or that
+        // targets a version which does not exist — is refused 412.
+        if let Some(expected) = input.if_match.as_deref() {
+            if target_e_tag.as_deref() != Some(expected) {
+                return Err(precondition_failed(
+                    "Precondition failed for provided If-Match value.",
+                    &id,
+                    &arn,
+                ));
+            }
+        }
+        // `If-None-Match: *`: delete only if the targeted version does NOT exist.
+        // It is the guard a caller uses to avoid deleting a model that is already
+        // live, so an existing targeted version is a 412 and the model stays.
+        // `*` is the ONLY value the member's modelled pattern `^\*$` admits and
+        // the boundary validator refuses anything else before this handler runs,
+        // so the match is exact rather than a stand-in for "any value".
+        if input.if_none_match.as_deref() == Some(SELECT_ALL) && target_e_tag.is_some() {
+            return Err(precondition_failed(
+                "Precondition failed for provided If-None-Match value.",
+                &id,
+                &arn,
+            ));
+        }
+
         // A model still in use cannot go away: neither while assets instantiate it,
-        // nor while another model's hierarchy names it as the child model.
+        // nor while another model's hierarchy names it as the child model. Either
+        // way this is a TERMINAL request error — the caller has to delete the
+        // dependent resource first, and no retry of this call can succeed — so it
+        // is `InvalidRequestException` (400) and not the retryable
+        // `ConflictingOperationException` (409), which states a transient
+        // conflict between two operations on one resource.
         let referencing_asset = store
             .assets
             .values()
-            .find(|asset| asset.asset_model_id == id)
-            .map(|asset| asset.id.clone());
+            .any(|asset| asset.asset_model_id == id);
         let referencing_model = store
             .asset_models
             .values()
@@ -217,23 +279,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .any(|hierarchy| hierarchy.child_asset_model_id == id)
             })
             .map(|model| model.id.clone());
-        if let Some(referrer) = referencing_asset.or(referencing_model) {
-            let arn = store
-                .asset_models
-                .get(&id)
-                .map(|model| model.arn.clone())
-                .unwrap_or_default();
+        if referencing_asset {
             return Err(DeleteAssetModelError::Modeled(
-                DeleteAssetModelErrorModeled::ConflictingOperationException(
-                    ConflictingOperationException {
-                        message: format!(
-                            "The asset model {id} cannot be deleted while {referrer} still \
-                             references it."
-                        ),
-                        resource_id: id.clone(),
-                        resource_arn: arn,
-                    },
-                ),
+                DeleteAssetModelErrorModeled::InvalidRequestException(InvalidRequestException {
+                    message: "Asset model had assets when delete was called".to_string(),
+                }),
+            ));
+        }
+        if let Some(referrer) = referencing_model {
+            return Err(DeleteAssetModelError::Modeled(
+                DeleteAssetModelErrorModeled::InvalidRequestException(InvalidRequestException {
+                    message: format!(
+                        "Asset model {id} is referenced by a hierarchy of asset model \
+                         {referrer} when delete was called"
+                    ),
+                }),
             ));
         }
 
@@ -247,4 +307,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         })
     }
+}
+
+/// The `AssetModelVersionType` value naming a model's latest version.
+const LATEST_VERSION: &str = "LATEST";
+
+/// The `AssetModelVersionType` value naming a model's active version.
+const ACTIVE_VERSION: &str = "ACTIVE";
+
+/// The one value the `SelectAll` member `ifNoneMatch` admits (pattern `^\*$`).
+const SELECT_ALL: &str = "*";
+
+/// HTTP 412 `PreconditionFailedException` for a conditional header that evaluated
+/// to FALSE, naming the resource the precondition was evaluated on.
+fn precondition_failed(message: &str, id: &str, arn: &str) -> DeleteAssetModelError {
+    DeleteAssetModelError::Modeled(DeleteAssetModelErrorModeled::PreconditionFailedException(
+        PreconditionFailedException {
+            message: message.to_string(),
+            resource_id: id.to_string(),
+            resource_arn: arn.to_string(),
+        },
+    ))
 }

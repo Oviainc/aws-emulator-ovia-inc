@@ -23,6 +23,8 @@ mod group_membership_lookup;
 mod identity_store_lifecycle;
 #[path = "all/is_member_in_groups.rs"]
 mod is_member_in_groups;
+#[path = "all/list_group_memberships_for_member.rs"]
+mod list_group_memberships_for_member;
 #[path = "all/list_groups.rs"]
 mod list_groups;
 #[path = "all/list_users.rs"]
