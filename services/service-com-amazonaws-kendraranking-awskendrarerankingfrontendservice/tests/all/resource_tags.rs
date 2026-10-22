@@ -326,9 +326,12 @@ async fn an_arn_that_names_no_plan_is_refused_with_resource_unavailable() {
             ("ListTagsForResource", json!({ "ResourceARN": arn })),
         ] {
             let (status, answer) = call(&router, operation, body).await;
+            // Every client-side failure of this RPC service travels with the
+            // protocol's client-error status; the error TYPE in the body is what
+            // says which failure it was (see `wire_error_status.rs`).
             assert_eq!(
-                status, 404,
-                "case {case:?} on {operation}: expected 404, got {status} {answer}"
+                status, 400,
+                "case {case:?} on {operation}: expected 400, got {status} {answer}"
             );
             assert_eq!(
                 error_code(&answer),

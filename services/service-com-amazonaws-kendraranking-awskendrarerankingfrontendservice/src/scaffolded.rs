@@ -177,13 +177,48 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The HTTP status this service puts on the wire for ANY client-side failure.
+///
+/// This service speaks only the RPC protocols (`awsJson1_0` and `rpcv2Cbor`, see
+/// `OPERATIONS.md`), whose envelope discriminates a failure by the error TYPE in the
+/// body (`__type` on awsJson, the `__type` key on CBOR) rather than by the transport
+/// status; the status a client-side failure travels with is the protocol's own 400.
+/// That is what AWS's recorded responses for this service carry — a plan id naming no
+/// plan answers HTTP 400 with `ResourceNotFoundException` in the body — and it is what
+/// the framework's own pre-dispatch refusal already answers with on these protocols
+/// (`vendor/smithy-server-runtime/src/pre_dispatch.rs`), so a handler-returned client
+/// error and a boundary refusal agree.
+pub const CLIENT_ERROR_STATUS: u16 = 400;
+
+/// The status a modeled error travels with on this service's wire, given the
+/// `@httpError` status its shape is annotated with.
+///
+/// Every CLIENT error (any 4xx: `ResourceNotFoundException`'s 404,
+/// `ConflictException`'s 409, `ServiceQuotaExceededException`'s 402,
+/// `ThrottlingException`'s 429, `AccessDeniedException`'s 403, …) collapses onto
+/// [`CLIENT_ERROR_STATUS`], because the per-shape annotation is not what this RPC
+/// service's wire carries and a client that classifies by HTTP status would otherwise
+/// read a transport/routing failure where the service reported a modeled one. Every
+/// other status — a server fault's 5xx, the scaffold channel's 501 — is unchanged: only
+/// the client-error class collapses, so a retry classifier still tells a server fault
+/// from a client one.
+pub fn wire_status(modeled_status: u16) -> u16 {
+    if (400..500).contains(&modeled_status) {
+        CLIENT_ERROR_STATUS
+    } else {
+        modeled_status
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
 pub enum Scaffolded<E> {
     /// The operation is generated but has no implementation. Renders as HTTP 501.
     NotImplemented(NotImplemented),
-    /// A modeled error the operation declares. Renders with the model's own status.
+    /// A modeled error the operation declares. Renders with the status
+    /// [`wire_status`] gives it — this RPC service's client-error status for a 4xx
+    /// shape, the shape's own status otherwise.
     Modeled(E),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
@@ -278,15 +313,18 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         }
     }
 
-    /// 501 for the scaffold signal.
+    /// 501 for the scaffold signal, and [`wire_status`] for a modeled error.
     ///
-    /// Keep it 501 and not a 5xx server fault: SDK retry classifiers treat those as
-    /// retryable, so a client would retry an operation that can never succeed.
+    /// Keep the 501 and not a 5xx server fault: SDK retry classifiers treat those as
+    /// retryable, so a client would retry an operation that can never succeed. A
+    /// modeled error goes through [`wire_status`], which puts every client-side
+    /// failure on this RPC service's own [`CLIENT_ERROR_STATUS`] instead of the
+    /// per-shape `@httpError` the model annotates; a server fault keeps its status.
     fn http_status(&self) -> u16 {
         match self {
             Self::NotImplemented(_) => 501,
-            Self::Modeled(e) => e.http_status(),
-            Self::ValidationException(_) => 400,
+            Self::Modeled(e) => wire_status(e.http_status()),
+            Self::ValidationException(_) => CLIENT_ERROR_STATUS,
         }
     }
 

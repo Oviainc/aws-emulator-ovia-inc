@@ -37,17 +37,27 @@ pub const PLAN_NOT_FOUND_MESSAGE: &str = "The specified Resource Execution Plan 
 pub const PLAN_NOT_ACTIVE_MESSAGE: &str =
     "Rescore Execution Plan status is invalid, must be in ACTIVE state";
 
-/// The modelled `ResourceNotFoundException` (HTTP 404) for a plan id the store does not
-/// hold — the ONE place that message is built, so every plan-lookup path states it
-/// identically.
+/// How this service states that a `Rescore` document carries neither form of its body
+/// text.
+///
+/// A CONSTANT, request-independent sentence naming the members the document must
+/// choose between, like [`PLAN_NOT_FOUND_MESSAGE`]: the rule is about the document's
+/// shape, so nothing of the caller's values belongs in it.
+pub const DOCUMENT_BODY_REQUIRED_MESSAGE: &str = "Document must have a Body or TokenizedBody.";
+
+/// The modelled `ResourceNotFoundException` for a plan id the store does not hold —
+/// the ONE place that message is built, so every plan-lookup path states it
+/// identically. It reaches the wire with this service's client-error status (see
+/// [`crate::scaffolded::wire_status`]), not with the `@httpError 404` its shape is
+/// annotated with.
 pub fn plan_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(PLAN_NOT_FOUND_MESSAGE.to_string()),
     }
 }
 
-/// The modelled `ValidationException` (HTTP 400) a data-plane call against a plan that
-/// is not [`STATUS_ACTIVE`] is refused with.
+/// The modelled `ValidationException` a data-plane call against a plan that is not
+/// [`STATUS_ACTIVE`] is refused with.
 pub fn plan_not_active() -> ValidationException {
     ValidationException {
         message: Some(PLAN_NOT_ACTIVE_MESSAGE.to_string()),
