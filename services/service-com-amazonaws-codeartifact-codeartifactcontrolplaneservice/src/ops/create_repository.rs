@@ -291,6 +291,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_time: ::std::time::SystemTime::now(),
             tags: input.tags.clone().unwrap_or_default(),
             policy: None,
+            // A new repository holds no packages; a package record appears only when a
+            // caller publishes a version into it or sets origin restrictions on it.
+            packages: ::std::collections::BTreeMap::new(),
         };
 
         // The response is the projection of the record that was just STORED, and storing
