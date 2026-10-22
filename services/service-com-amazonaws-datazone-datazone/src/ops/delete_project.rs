@@ -162,12 +162,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|d| d.status != crate::state::DOMAIN_STATUS_DELETING)
             .ok_or_else(|| {
                 DeleteProjectErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: format!("Domain {} was not found", input.domain_identifier),
+                    message: crate::state::ResourceKind::Domain.not_found_message(),
                 })
             })?;
         domain.projects.remove(&input.identifier).ok_or_else(|| {
             DeleteProjectErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!("Project {} was not found", input.identifier),
+                message: crate::state::ResourceKind::Project.not_found_message(),
             })
         })?;
 
