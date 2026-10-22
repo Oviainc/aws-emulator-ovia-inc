@@ -16,8 +16,12 @@
 //!   409 `ConflictException` and leaves the stored action alone, while the SAME
 //!   `ClientToken` the action was minted under makes the retry answer the original
 //!   create's ARN instead (the model's `@idempotencyToken`);
-//! * the ARN is regional, so the same `ActionName` can be created once per region and an
-//!   ARN no region holds is a 404 `ResourceNotFoundException`.
+//! * the ARN is regional, so the same `ActionName` can be created once per region, and an
+//!   ARN this account holds no action under is refused with the modelled 403
+//!   `UnauthorizedException`: AWS Chatbot decides a custom-action request against the ARN
+//!   before any existence lookup, so the answer discloses nothing about whether the
+//!   action exists (see `tests/all/custom_action_fail_closed.rs`, which asserts that rule
+//!   across every operation addressed by a custom-action ARN).
 
 use std::sync::Arc;
 
@@ -40,6 +44,9 @@ const CLIENT_TOKEN: &str = "0123456789abcdef0123456789abcdef0";
 
 /// A second, different token of the same shape.
 const OTHER_CLIENT_TOKEN: &str = "fedcba9876543210fedcba9876543210f";
+
+/// The modelled error an ARN this account holds no custom action under is refused with.
+const UNAUTHORIZED_EXCEPTION: &str = "UnauthorizedException";
 
 /// A SigV4 credential scope naming this service and `region`; `MultiServiceRouter`
 /// routes on the scope's service name and the handlers read the region from it.
@@ -492,18 +499,26 @@ async fn a_create_past_the_store_bound_is_refused_and_persists_nothing() {
             "create in {region} past the bound of {bound}: expected LimitExceededException, got {body}"
         );
 
-        // Nothing was persisted for the refused name.
+        // Nothing was persisted for the refused name: the read of it is refused the way
+        // any ARN this account holds no action under is — fail closed, 403, disclosing
+        // nothing about whether the action exists.
         let refused = json!({"CustomActionArn": arn_in_region(region, "one-too-many")});
         let (status, body) = call_in_region(&router, region, "/get-custom-action", &refused).await;
         assert_eq!(
-            status, 404,
+            status, 403,
             "the refused name must not be stored in {region}, got {status} with {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            UNAUTHORIZED_EXCEPTION,
+            "the refused name must answer the modelled {UNAUTHORIZED_EXCEPTION} in {region}, \
+             got {body}"
         );
     }
 }
 
 #[tokio::test]
-async fn getting_an_arn_the_store_does_not_hold_is_resource_not_found() {
+async fn getting_an_arn_the_store_does_not_hold_is_refused_as_unauthorized() {
     let router = router();
     let created = create_ok(
         &router,
@@ -514,6 +529,10 @@ async fn getting_an_arn_the_store_does_not_hold_is_resource_not_found() {
     )
     .await;
 
+    // Each row is a well-formed `CustomActionArn` this account holds no action under. AWS
+    // Chatbot decides a custom-action request against the ARN BEFORE any existence
+    // lookup, so every one of them is the modelled 403 and none of them says whether an
+    // action exists — not even the one that names another account.
     let cases = [
         ("a name nothing was created under", expected_arn("absent")),
         (
@@ -530,13 +549,13 @@ async fn getting_an_arn_the_store_does_not_hold_is_resource_not_found() {
         let request = json!({"CustomActionArn": arn});
         let (status, body) = call(&router, "/get-custom-action", &request).await;
         assert_eq!(
-            status, 404,
-            "case {label:?} ({arn}): expected 404, got {status} with {body}"
+            status, 403,
+            "case {label:?} ({arn}): expected 403, got {status} with {body}"
         );
         assert_eq!(
             error_code(&body),
-            "ResourceNotFoundException",
-            "case {label:?} ({arn}): expected ResourceNotFoundException, got {body}"
+            UNAUTHORIZED_EXCEPTION,
+            "case {label:?} ({arn}): expected {UNAUTHORIZED_EXCEPTION}, got {body}"
         );
     }
 

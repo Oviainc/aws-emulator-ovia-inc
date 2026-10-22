@@ -46,6 +46,16 @@ impl Answer {
             .unwrap_or("<no message member>")
             .to_string()
     }
+
+    /// The error code an error body names (`__type`, which is how restJson1 conveys the
+    /// error shape in the body) — the counterpart of [`Answer::message`].
+    pub fn code(&self) -> String {
+        self.body
+            .get("__type")
+            .and_then(Value::as_str)
+            .unwrap_or("<no __type>")
+            .to_string()
+    }
 }
 
 /// POST `body` to `path` on `router`, signed for `region`.

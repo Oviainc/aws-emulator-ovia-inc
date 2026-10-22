@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! Implemented: merges `Tags` onto the stored chat configuration named by
-//! `ResourceARN`, keyed by `TagKey`, so a repeated key replaces its value. An ARN the
-//! store does not hold is a 404 `ResourceNotFoundException`, and a merge that would
-//! carry more than the modelled 200 tags is a 400 `TooManyTagsException`.
+//! Implemented: merges `Tags` onto the stored chatbot resource named by `ResourceARN`,
+//! keyed by `TagKey`, so a repeated key replaces its value. A merge that would carry more
+//! than the modelled 200 tags is a 400 `TooManyTagsException`.
+//!
+//! `ResourceARN` is any chatbot ARN, so the resource type in the ARN decides where the tags
+//! live and how an ARN the store does not hold is refused: a chat configuration (Slack
+//! channel or Chime webhook) answers the modelled 404 `ResourceNotFoundException`, a custom
+//! action the modelled 403 `UnauthorizedException` — see [`crate::state::ChatbotResourceKind`].
 //!
 //! `ListTagsForResource` then reports the merged set.
 //!
@@ -65,6 +69,9 @@
 //! * `ServiceUnavailableException` (HTTP 429) — We can’t process your request right now
 //!   because of a server issue. Try again later.
 //! * `TooManyTagsException` (HTTP 400) — The supplied list of tags contains too many tags.
+//! * `UnauthorizedException` (HTTP 403) — The request was rejected because it doesn't have
+//!   valid credentials for the target resource. NOT listed on this operation by the model;
+//!   widened in below, because a custom-action ARN is authorized before it is looked up.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -80,13 +87,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-chatbot-wheatleyorchest
 // here — hence the `TagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.chatbot#TagResource")]
+// `UnauthorizedException` is widened in through `extra_errors`: this SERVICE models it
+// (`@error("client") @httpError(403)`, and the custom-action operations list it) while the
+// model's `errors` list for TagResource does not, and it is what a custom-action ARN this
+// account holds no action for is refused with — see `crate::state::ChatbotResourceKind`.
+#[smithy_macros::operation_error(
+    "com.amazonaws.chatbot#TagResource",
+    extra_errors = ["UnauthorizedException"]
+)]
 #[derive(Debug)]
 pub enum TagResourceErrorModeled {
     InternalServiceError(InternalServiceError),
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceUnavailableException(ServiceUnavailableException),
     TooManyTagsException(TooManyTagsException),
+    UnauthorizedException(UnauthorizedException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -148,18 +163,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut store = state.lock();
-        let record = store
-            .slack_channel_configurations
-            .get_mut(&input.resource_arn)
-            .ok_or_else(|| {
-                TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: Some(format!("no resource with ARN {}", input.resource_arn)),
-                })
-            })?;
+        // The ARN names the resource and its type, so the type decides which store holds the
+        // tags and — when nothing is held under that ARN — how the request is refused. A
+        // custom action is authorized against the ARN before it is looked up, so an unknown
+        // one is 403 and never discloses non-existence; a chat configuration (of either
+        // chat client) answers the 404 the model documents for this operation.
+        let stored_tags = match crate::state::chatbot_resource_kind(&input.resource_arn) {
+            crate::state::ChatbotResourceKind::CustomAction => {
+                &mut store
+                    .custom_actions
+                    .get_mut(&input.resource_arn)
+                    .ok_or_else(|| {
+                        TagResourceErrorModeled::UnauthorizedException(UnauthorizedException {
+                            message: Some(crate::state::UNAUTHORIZED_MESSAGE.to_string()),
+                        })
+                    })?
+                    .tags
+            }
+            crate::state::ChatbotResourceKind::ChatConfiguration
+            | crate::state::ChatbotResourceKind::Other => store
+                .chat_configuration_tags_mut(&input.resource_arn)
+                .ok_or_else(|| {
+                    TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                        message: Some(format!("no resource with ARN {}", input.resource_arn)),
+                    })
+                })?,
+        };
 
         // Merge into a copy first: a request that overruns the tag limit must leave the
         // stored tags exactly as they were.
-        let mut merged = record.tags.clone();
+        let mut merged = stored_tags.clone();
         for tag in input.tags {
             merged.insert(tag.tag_key, tag.tag_value);
         }
@@ -173,7 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
-        record.tags = merged;
+        *stored_tags = merged;
 
         Ok(TagResourceOutput {})
     }

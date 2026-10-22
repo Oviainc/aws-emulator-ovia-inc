@@ -4,8 +4,9 @@
 //!
 //! This module owns the persisted shape of every chat configuration and every custom
 //! action the service stores, plus the few helpers their handlers share (the ARN forms,
-//! the request's region, and the record -> modelled-shape projections). Handlers reach
-//! it through [`service_state`]; nothing here is per-request.
+//! which chatbot resource an ARN names, the request's region, and the record ->
+//! modelled-shape projections). Handlers reach it through [`service_state`]; nothing here
+//! is per-request.
 //!
 //! It also owns the registries of chat workspaces AUTHORIZED with the account — Slack
 //! workspaces, which a channel configuration has to name one of, and Microsoft Teams
@@ -83,6 +84,60 @@ const _: () = assert!(MAX_SLACK_CHANNEL_CONFIGURATIONS <= MAX_PAGE_SIZE);
 const _: () = assert!(MAX_CHIME_WEBHOOK_CONFIGURATIONS <= MAX_PAGE_SIZE);
 const _: () = assert!(MAX_CUSTOM_ACTIONS <= MAX_PAGE_SIZE);
 
+/// The message a fail-closed authorization refusal carries (see
+/// [`ChatbotResourceKind::CustomAction`]).
+///
+/// The decision is made against the ARN before any lookup, so the answer can say nothing
+/// about the resource — not even whether it exists. The status (403) and the
+/// `UnauthorizedException` code are the contract; this sentence is the text AWS Chatbot was
+/// recorded answering, and not a value a client may rely on.
+pub const UNAUTHORIZED_MESSAGE: &str = "Unauthorized";
+
+/// The `custom-action` resource-type segment of a chatbot ARN
+/// (`CustomActionArn`'s modelled pattern: `…:custom-action/[a-zA-Z0-9_-]{1,64}`).
+const CUSTOM_ACTION_RESOURCE_TYPE: &str = "custom-action";
+
+/// The `chat-configuration` resource-type segment of a chatbot ARN (the ARN
+/// [`slack_channel_configuration_arn`] mints).
+const CHAT_CONFIGURATION_RESOURCE_TYPE: &str = "chat-configuration";
+
+/// Which chatbot resource an `AmazonResourceName` names, read from the resource-type
+/// segment of the ARN itself.
+///
+/// The tagging operations take any chatbot ARN (`AmazonResourceName`), so they have to tell
+/// the kinds apart before they can look anything up: the resources live in different maps
+/// and, per the recorded behaviour, AWS Chatbot answers an unknown ARN differently for each
+/// kind — see [`ChatbotResourceKind::CustomAction`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatbotResourceKind {
+    /// A chat configuration (`chat-configuration/…`). AWS Chatbot answers an ARN of this
+    /// kind that names no configuration with the modelled 404 `ResourceNotFoundException`,
+    /// which `Update`, `Delete` and the tagging operations all do.
+    ChatConfiguration,
+    /// A custom action (`custom-action/…`). AWS Chatbot decides a custom-action request
+    /// against the ARN BEFORE any existence lookup, so an ARN of this kind that names no
+    /// custom action is refused with the modelled 403 `UnauthorizedException` and the
+    /// answer discloses nothing about whether the action exists.
+    CustomAction,
+    /// Any other chatbot resource. Nothing in this store holds one, so it is treated as the
+    /// resource it is: not found.
+    Other,
+}
+
+/// The [`ChatbotResourceKind`] `arn` names.
+///
+/// An ARN is `arn:partition:service:region:account:resource`, and the resource segment
+/// starts with the resource type; the model's `AmazonResourceName` pattern already
+/// guarantees the five leading segments, so an ARN that reaches a handler has one.
+pub fn chatbot_resource_kind(arn: &str) -> ChatbotResourceKind {
+    let resource = arn.splitn(6, ':').nth(5).unwrap_or_default();
+    match resource.split('/').next().unwrap_or_default() {
+        CUSTOM_ACTION_RESOURCE_TYPE => ChatbotResourceKind::CustomAction,
+        CHAT_CONFIGURATION_RESOURCE_TYPE => ChatbotResourceKind::ChatConfiguration,
+        _ => ChatbotResourceKind::Other,
+    }
+}
+
 /// Per-service state for com-amazonaws-chatbot-wheatleyorchestration-20171011. A handler reaches it through [`service_state`].
 ///
 /// `BTreeMap` keyed by `ChatConfigurationArn`, so `DescribeSlackChannelConfigurations`
@@ -151,6 +206,40 @@ impl Default for ComAmazonawsChatbotWheatleyorchestration20171011State {
 }
 
 impl ComAmazonawsChatbotWheatleyorchestration20171011State {
+    /// The tags of the chat configuration `chat_configuration_arn` names, whichever chat
+    /// client it configures, or `None` when no configuration is stored under that ARN.
+    ///
+    /// A chat configuration ARN carries the client kind (`slack-channel`,
+    /// `chime-webhook`) and each kind keeps its own store, so the ARN-addressed tagging
+    /// operations resolve one through here rather than knowing the kinds themselves.
+    pub fn chat_configuration_tags(
+        &self,
+        chat_configuration_arn: &str,
+    ) -> Option<&BTreeMap<String, String>> {
+        if let Some(record) = self.slack_channel_configurations.get(chat_configuration_arn) {
+            return Some(&record.tags);
+        }
+        self.chime_webhook_configurations
+            .get(chat_configuration_arn)
+            .map(|record| &record.tags)
+    }
+
+    /// [`Self::chat_configuration_tags`], for a caller that merges onto them.
+    pub fn chat_configuration_tags_mut(
+        &mut self,
+        chat_configuration_arn: &str,
+    ) -> Option<&mut BTreeMap<String, String>> {
+        if let Some(record) = self
+            .slack_channel_configurations
+            .get_mut(chat_configuration_arn)
+        {
+            return Some(&mut record.tags);
+        }
+        self.chime_webhook_configurations
+            .get_mut(chat_configuration_arn)
+            .map(|record| &mut record.tags)
+    }
+
     /// The authorized workspace `slack_team_id` names, or `None` when no workspace with
     /// that id is authorized with this account.
     ///
@@ -625,7 +714,14 @@ impl ChimeWebhookConfigRecord {
 /// regional, so the ARN carries the request's region and the same action name can be
 /// created once per region.
 pub fn custom_action_arn(region: &str, action_name: &str) -> String {
-    ::emulator_server::emulator_arn(ARN_SERVICE, region, &format!("custom-action/{action_name}"))
+    // The resource-type segment comes from the same constant
+    // [`chatbot_resource_kind`] reads an ARN's kind from, so minting and classifying an
+    // ARN cannot disagree about it.
+    ::emulator_server::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{CUSTOM_ACTION_RESOURCE_TYPE}/{action_name}"),
+    )
 }
 
 /// The `ChatConfigurationArn` of a chat configuration of kind `kind` (the ARN
