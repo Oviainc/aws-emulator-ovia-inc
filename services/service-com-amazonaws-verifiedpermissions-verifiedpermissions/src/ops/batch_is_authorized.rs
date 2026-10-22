@@ -11,6 +11,13 @@
 //! request. Every decision, determining policy and evaluation error is whatever
 //! Cedar computed; nothing here is canned, and it writes nothing.
 //!
+//! A failure raised while EVALUATING one request is reported in that request's
+//! own `errors` on the 200 — the erroring policy determines nothing, so that
+//! result fails closed — rather than refusing the whole batch;
+//! `ValidationException` is for a batch or a request that breaks this
+//! operation's input contract (the two rules below, an absent member of a
+//! triple, an unparseable payload).
+//!
 //! Two rules the model cannot express are enforced here, both from this
 //! operation's own documentation (quoted on the constants / helpers below): a
 //! batch carries at most [`crate::state::cedar::MAX_BATCH_REQUESTS`] requests, and
@@ -237,7 +244,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every policy of the store, parsed ONCE for the whole batch: a static
         // policy's own Cedar text and a template-linked one's link of its
         // template, plus the store's schema when it holds one, which is what
-        // types the requests' entities and context.
+        // types the requests' entities and context where it types them. A value
+        // it does not type is still evaluated — untyped — and reported on
+        // through each result's `errors`, never refused.
         let prepared = crate::state::cedar::load_policies(store).map_err(refused)?;
 
         let entities =

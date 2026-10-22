@@ -404,9 +404,10 @@ async fn per_request_context_and_batch_entities_reach_the_evaluator() {
     }
 }
 
-/// The store's schema types every request of a batch: a request whose `context`
-/// does not have the type the schema declares is refused instead of evaluated,
-/// and the requests that do type-check are evaluated against it.
+/// The store's schema types every request of a batch where it types it, and a
+/// request whose `context` it does not type is still EVALUATED: its result
+/// carries the decision it failed closed to and the error the evaluation raised,
+/// and the other results are decided as usual. The batch is not refused.
 #[tokio::test]
 async fn a_batch_is_typed_against_the_stores_schema() {
     let router = router();
@@ -472,12 +473,16 @@ async fn a_batch_is_typed_against_the_stores_schema() {
         "case \"typed batch\": unexpected decisions, got {answer}"
     );
 
-    // Rows differ along WHICH request of the batch carries the untypeable
-    // context, and in what way it fails to type-check.
-    let bad_cases: &[(&str, Value)] = &[
+    // Rows differ along WHICH request of the batch carries the context the
+    // schema does not type, and in what way it fails to type-check. The second
+    // column is the decision that request must fail closed to, and the third
+    // whether the evaluation raises an error the result reports.
+    let bad_cases: &[(&str, Value, &str, bool)] = &[
         (
             "a string where the schema declares a boolean",
             json!({ "contextMap": { "authenticated": { "string": "true" } } }),
+            "DENY",
+            true,
         ),
         (
             "an attribute the schema does not declare",
@@ -485,10 +490,17 @@ async fn a_batch_is_typed_against_the_stores_schema() {
                 "authenticated": { "boolean": true },
                 "mfa": { "boolean": true },
             } }),
+            "ALLOW",
+            false,
         ),
-        ("the declared attribute absent", json!({ "contextMap": {} })),
+        (
+            "the declared attribute absent",
+            json!({ "contextMap": {} }),
+            "DENY",
+            true,
+        ),
     ];
-    for (case, context) in bad_cases {
+    for (case, context, decision, errors) in bad_cases {
         let (status, body) = call(
             &router,
             "BatchIsAuthorized",
@@ -502,13 +514,34 @@ async fn a_batch_is_typed_against_the_stores_schema() {
         )
         .await;
         assert_eq!(
-            status, 400,
-            "case {case:?}: a request the schema cannot type must be refused, got {status} {body}"
+            status, 200,
+            "case {case:?}: an evaluation failure is reported in-band, so the batch must \
+             answer 200, got {status} {body}"
+        );
+        let results = body["results"].as_array().cloned().unwrap_or_default();
+        assert_eq!(
+            results.len(),
+            2,
+            "case {case:?}: one result per request, got {body}"
         );
         assert_eq!(
-            error_code(&body),
-            "ValidationException",
-            "case {case:?}: expected a ValidationException, got {body}"
+            results[0]["decision"].as_str(),
+            Some("ALLOW"),
+            "case {case:?}: the well-typed request is still decided, got {body}"
+        );
+        assert_eq!(
+            results[1]["decision"].as_str(),
+            Some(*decision),
+            "case {case:?}: expected decision {decision}, got {body}"
+        );
+        let reported = results[1]["errors"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            !reported.is_empty(),
+            *errors,
+            "case {case:?}: expected errors non-empty = {errors}, got {body}"
         );
     }
 }
