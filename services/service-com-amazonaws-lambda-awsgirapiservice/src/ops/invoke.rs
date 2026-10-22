@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op Invoke
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `Invoke`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`Invoke::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Resolves the function and version to invoke out of [`crate::state`], refuses a
+//! request the service itself would refuse, and answers `DryRun` — the one invocation
+//! type that, as the model documents, runs no function code at all ("Validate
+//! parameter values and verify that the user or role has permission to invoke the
+//! function").
+//!
+//! Running the deployment package is NOT implemented: this emulator has no in-process
+//! runtime for a Lambda zip archive or container image, so `RequestResponse` and
+//! `Event` answer HTTP 501 rather than a payload no function produced. Everything
+//! around the run — resolving the name in each of its documented forms, the version or
+//! alias, the function's lifecycle state, the payload limits and the JSON check — is
+//! real, and happens before that 501.
 //!
 //! ## Shape of an operation
 //!
@@ -354,18 +358,160 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `Invoke` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(InvokeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("Invoke"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(InvokeErrorModeled::ServiceException(ServiceException {
+                r#type: None,
+                message: Some("Lambda state is not reachable on this engine".to_string()),
+            })
+            .into());
+        };
+
+        // "By default, Lambda invokes your function synchronously (i.e. the
+        // InvocationType is RequestResponse)." The model's `InvocationType` enum is
+        // what the boundary validator checked, so only its three values reach here.
+        let invocation_type = input
+            .invocation_type
+            .as_deref()
+            .unwrap_or(INVOCATION_TYPE_REQUEST_RESPONSE)
+            .to_string();
+
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+        let (record, version) = crate::state::resolve_function(
+            &mut store,
+            &input.function_name,
+            input.qualifier.as_deref(),
+            &region,
+            ::std::time::SystemTime::now(),
+        )
+        .map_err(|failure| match failure {
+            crate::state::ResolveFailure::Malformed(message) => {
+                InvokeErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+            crate::state::ResolveFailure::NotFound(message) => {
+                InvokeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    r#type: None,
+                    message: Some(message),
+                })
+            }
+        })?;
+
+        // The model documents the provisioning window on `CreateFunction` ("During this
+        // time, you can't invoke or modify the function") and on `StateReasonCode`
+        // ("When the code is Creating, you can't invoke or modify the function"), so an
+        // invocation that arrives inside it is refused rather than served.
+        if record.state != crate::state::STATE_ACTIVE {
+            return Err(InvokeErrorModeled::ResourceConflictException(
+                ResourceConflictException {
+                    r#type: None,
+                    message: Some(format!(
+                        "The operation cannot be performed at this time. The function is \
+                         currently in the following state: {}",
+                        record.state
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let payload = input.payload.clone().unwrap_or_default();
+
+        // "For synchronous invocations, the maximum payload size is 6 MB. For
+        // asynchronous invocations, the maximum payload size is 1 MB."
+        let payload_limit = if invocation_type == INVOCATION_TYPE_EVENT {
+            MAX_ASYNCHRONOUS_PAYLOAD_BYTES
+        } else {
+            MAX_SYNCHRONOUS_PAYLOAD_BYTES
+        };
+        if payload.len() > payload_limit {
+            return Err(InvokeErrorModeled::RequestTooLargeException(
+                RequestTooLargeException {
+                    r#type: None,
+                    message: Some(format!(
+                        "Request must be smaller than {payload_limit} bytes for the \
+                         {invocation_type} invocation type"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "The JSON that you want to provide to your Lambda function as input": a body
+        // that is not JSON is refused with the modelled 400, and an absent or empty one
+        // is the documented no-event invocation.
+        if !payload.is_empty() && ::serde_json::from_slice::<::serde_json::Value>(&payload).is_err()
+        {
+            return Err(InvokeErrorModeled::InvalidRequestContentException(
+                InvalidRequestContentException {
+                    r#type: None,
+                    message: Some("Could not parse request body into json".to_string()),
+                },
+            )
+            .into());
+        }
+
+        let executed_version = version.clone();
+        let function_arn = record.versioned_arn(&version);
+        let runtime = record
+            .config_of(&version)
+            .and_then(|config| config.runtime.clone())
+            .unwrap_or_else(|| record.config.package_type.clone());
+
+        if invocation_type == INVOCATION_TYPE_DRY_RUN {
+            // "DryRun – Validate parameter values and verify that the user or role has
+            // permission to invoke the function." Nothing runs for a dry run even on
+            // the real service, so this is the whole operation: the validation above
+            // passed, and the documented status for it is 204 with no payload. `LogType`
+            // "applies to synchronously invoked functions only", so there is no log
+            // tail to report either.
+            return Ok(InvokeOutput {
+                status_code: DRY_RUN_STATUS,
+                executed_version: Some(executed_version),
+                ..InvokeOutput::default()
+            });
+        }
+
+        // RequestResponse and Event both mean "run the deployment package". This
+        // emulator has no in-process runtime that can, and a response body, a
+        // FunctionError or a log tail invented for a run that never happened would be
+        // indistinguishable from a real one — so the run is refused, naming the
+        // function and version it resolved so the control-plane half is still useful.
+        Err(crate::scaffolded::Scaffolded::NotImplemented(
+            crate::scaffolded::NotImplemented {
+                message: format!(
+                    "Invoke resolved {function_arn} at version {executed_version}, but running \
+                     its {runtime} deployment package is not implemented in this emulator: \
+                     there is no in-process runtime for it, and no response payload is \
+                     returned that the function did not produce. InvocationType=DryRun \
+                     validates an invocation without running the function."
+                ),
+            },
+        ))
     }
 }
+
+/// `InvocationType` values, from the model's `InvocationType` enum
+/// (`Event | RequestResponse | DryRun`).
+const INVOCATION_TYPE_REQUEST_RESPONSE: &str = "RequestResponse";
+/// See [`INVOCATION_TYPE_REQUEST_RESPONSE`].
+const INVOCATION_TYPE_EVENT: &str = "Event";
+/// See [`INVOCATION_TYPE_REQUEST_RESPONSE`].
+const INVOCATION_TYPE_DRY_RUN: &str = "DryRun";
+
+/// The `StatusCode` a `DryRun` invocation answers with, which the model's own
+/// `StatusCode` documentation states: "For the DryRun invocation type, the status code
+/// is 204."
+const DRY_RUN_STATUS: i32 = 204;
+
+/// "For synchronous invocations, the maximum payload size is 6 MB" (the model's own
+/// `Invoke` documentation).
+const MAX_SYNCHRONOUS_PAYLOAD_BYTES: usize = 6 * 1024 * 1024;
+
+/// "For asynchronous invocations, the maximum payload size is 1 MB" (the model's own
+/// `Invoke` documentation).
+const MAX_ASYNCHRONOUS_PAYLOAD_BYTES: usize = 1024 * 1024;
