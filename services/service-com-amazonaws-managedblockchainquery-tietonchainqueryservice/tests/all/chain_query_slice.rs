@@ -273,7 +273,7 @@ pub(crate) fn token_json(network: &str, key: &HoldingKey) -> Value {
 /// 3-character abbreviation `TokenIdentifier$tokenId` documents), an ERC-20 event moves
 /// one fungible balance per contract (a contract and no `tokenId`), and an
 /// ERC-721/ERC-1155 event moves one token of a contract (both).
-fn event_holding(event: &Value) -> Option<(Option<String>, Option<String>)> {
+pub(crate) fn event_holding(event: &Value) -> Option<(Option<String>, Option<String>)> {
     let kind = event["eventType"].as_str()?;
     let contract = event["contractAddress"].as_str().map(str::to_string);
     let token_id = event["tokenId"].as_str().map(str::to_string);
@@ -291,7 +291,7 @@ fn event_holding(event: &Value) -> Option<(Option<String>, Option<String>)> {
 
 /// `GetTokenBalance` for one holding, as of `at` (or now when absent), as an integer —
 /// or `None` when the ledger knows no balance for it at that instant (a 404).
-async fn balance_or_none(
+pub(crate) async fn balance_or_none(
     emulator: &Emulator,
     network: &str,
     key: &HoldingKey,
@@ -343,7 +343,7 @@ async fn balance_of(
 /// per-call clock reading: two walks of the same listing legitimately differ in it, and
 /// a comparison of the two listings has to look past it. Everything else, including the
 /// stored `lastUpdatedTime`, is kept.
-fn item_identity(item: &Value) -> Value {
+pub(crate) fn item_identity(item: &Value) -> Value {
     let mut item = item.clone();
     if let Some(object) = item.as_object_mut() {
         object.remove("atBlockchainInstant");
@@ -357,7 +357,7 @@ fn item_identity(item: &Value) -> Value {
 /// Checks the pagination contract as it goes: no page exceeds the `maxResults` asked
 /// for, no item comes back twice, a `nextToken` never accompanies an empty page, and
 /// the walk terminates.
-async fn drain(
+pub(crate) async fn drain(
     emulator: &Emulator,
     path: &str,
     items_key: &str,

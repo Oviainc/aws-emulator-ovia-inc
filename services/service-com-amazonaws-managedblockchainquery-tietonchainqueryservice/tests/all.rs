@@ -19,6 +19,8 @@ mod batch_token_balance;
 mod chain_query_slice;
 #[path = "all/derived_chain_history.rs"]
 mod derived_chain_history;
+#[path = "all/derived_chain_reads.rs"]
+mod derived_chain_reads;
 #[path = "all/error_contract.rs"]
 mod error_contract;
 #[path = "all/state_roundtrip.rs"]

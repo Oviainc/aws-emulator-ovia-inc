@@ -37,6 +37,16 @@
 //! wire half (`Transaction`, `TransactionOutputItem`, `TransactionEvent`,
 //! `TokenBalance`) is PROJECTED from it by the methods below, so no handler assembles a
 //! response member by hand.
+//!
+//! On the MAINNET networks the fixture also holds the published accounts and token
+//! contracts a client of a chain index actually reads — [`derived`] writes out their
+//! holdings and transfers, and [`well_known_mainnet_erc20`] their contracts — so a
+//! balance or a transaction read of a known mainnet account answers out of stored
+//! records. An identifier no catalog and no fixture names is still the modelled
+//! `ResourceNotFoundException` or the modelled empty page: this emulator indexes no
+//! chain, so it reports only what it holds.
+
+pub mod derived;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -365,6 +375,22 @@ impl HoldingKey {
         }
     }
 
+    /// This key as the ledger spells it.
+    ///
+    /// Only the ADDRESSES are touched, and only where their spelling carries no
+    /// information — see [`derived::normalize_address`]. A lookup goes through this so
+    /// the two spellings of one Ethereum account read the same balance.
+    pub fn normalized(&self) -> HoldingKey {
+        HoldingKey {
+            contract_address: self
+                .contract_address
+                .as_deref()
+                .map(derived::normalize_address),
+            token_id: self.token_id.clone(),
+            owner_address: derived::normalize_address(&self.owner_address),
+        }
+    }
+
     /// Project the owner half of this key onto the modelled `OwnerIdentifier`.
     pub fn owner_identifier(&self) -> OwnerIdentifier {
         OwnerIdentifier {
@@ -523,7 +549,13 @@ impl NetworkLedger {
             self.by_id.insert(normalize_hash(id), key.clone());
         }
         for address in transaction.addresses() {
-            let keys = self.by_address.entry(address.to_string()).or_default();
+            // Keyed by the spelling an address is looked up under
+            // ([`derived::normalize_address`]), so one account has one entry however the
+            // transaction spelled it.
+            let keys = self
+                .by_address
+                .entry(derived::normalize_address(address))
+                .or_default();
             keys.push(key.clone());
             // Chain order, which is the order `ListTransactions` reports them in.
             keys.sort();
@@ -549,10 +581,11 @@ impl NetworkLedger {
         self.contracts.get(&normalize_contract_address(address))
     }
 
-    /// Every transaction `address` took part in, in chain order.
+    /// Every transaction `address` took part in, in chain order — however the caller
+    /// spelled the address ([`derived::normalize_address`]).
     pub fn for_address(&self, address: &str) -> Vec<&StoredTransaction> {
         self.by_address
-            .get(address)
+            .get(&derived::normalize_address(address))
             .into_iter()
             .flatten()
             .filter_map(|key| self.transactions.get(key))
@@ -636,11 +669,14 @@ impl ComAmazonawsManagedblockchainqueryTietonchainqueryserviceState {
             )));
         }
 
+        // The key as the LEDGER spells it, so the two spellings of one Ethereum account
+        // or token contract read one balance (see [`derived::normalize_address`]).
         let key = HoldingKey {
             contract_address: token.contract_address.clone(),
             token_id: token.token_id.clone(),
             owner_address: owner.address.clone(),
-        };
+        }
+        .normalized();
         let at = instant_to_secs(at_instant);
 
         let holding = self
@@ -1341,8 +1377,11 @@ fn derive_holdings(
 ) -> BTreeMap<HoldingKey, StoredHolding> {
     let mut holdings: BTreeMap<HoldingKey, StoredHolding> = BTreeMap::new();
     for (key, opened) in opening {
+        // Keyed by the spelling a holding is looked up under, so an opening balance and
+        // the events that move it land on ONE holding whichever way each spelled the
+        // address.
         holdings
-            .entry(key.clone())
+            .entry(key.normalized())
             .or_default()
             .record(opened.time, opened.balance);
     }
@@ -1362,7 +1401,8 @@ fn derive_holdings(
                     contract_address: contract_address.clone(),
                     token_id: token_id.clone(),
                     owner_address: owner.clone(),
-                };
+                }
+                .normalized();
                 let holding = holdings.entry(key).or_default();
                 let current = holding.history.last().map_or(0, |record| record.balance);
                 holding.record(transaction.transaction_timestamp, current + delta);

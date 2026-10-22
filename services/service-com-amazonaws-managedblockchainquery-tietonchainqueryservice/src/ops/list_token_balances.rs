@@ -6,6 +6,10 @@
 //! `crate::state::StoredHolding::token_balance` — the same projection `GetTokenBalance`
 //! uses, so the two always report the same balance for the same key.
 //!
+//! The filters are matched against the spelling the ledger keys a holding under
+//! (`crate::state::derived::normalize_address`), so the two spellings of one Ethereum
+//! account or token contract select one holding.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -193,13 +197,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // time — the default `TokenBalance$atBlockchainInstant` documents.
         let asked_at = crate::state::now_secs();
 
+        // The addresses as the LEDGER spells them, so the two spellings of one Ethereum
+        // account or token contract select one holding.
+        let owner = owner.map(|address| crate::state::derived::normalize_address(&address));
+        let contract = filter
+            .contract_address
+            .as_deref()
+            .map(crate::state::derived::normalize_address);
+
         let all: Vec<(String, TokenBalance)> = state
             .ledger(&filter.network)
             .into_iter()
             .flat_map(|ledger| ledger.holdings.iter())
-            .filter(|(key, _)| {
-                key.matches_token(filter.contract_address.as_deref(), filter.token_id.as_deref())
-            })
+            .filter(|(key, _)| key.matches_token(contract.as_deref(), filter.token_id.as_deref()))
             .filter(|(key, _)| {
                 owner
                     .as_deref()

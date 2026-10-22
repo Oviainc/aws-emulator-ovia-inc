@@ -214,7 +214,16 @@ pub(super) fn seed_ledger(network: &str, tip: i64) -> NetworkLedger {
 
 /// The address of the fixture wallet in slot `slot`, in the shape `network` spells
 /// addresses in.
+///
+/// On a network whose published accounts this emulator catalogs
+/// ([`super::derived::mainnet_account`]) the slots ARE those accounts, so a read of an
+/// address a client of that chain actually looks up is answered out of this fixture
+/// rather than with the modelled not-found; every other network derives a synthetic
+/// address from the slot's label.
 fn wallet(network: &str, slot: usize) -> String {
+    if let Some(published) = super::derived::mainnet_account(network, slot % WALLETS.len()) {
+        return published.to_string();
+    }
     let label = WALLETS[slot % WALLETS.len()];
     if is_bitcoin(network) {
         bitcoin_address(network, label)

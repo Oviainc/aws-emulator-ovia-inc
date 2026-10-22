@@ -7,6 +7,10 @@
 //! disagree with what `ListTransactionEvents` reports; a (token, owner) the ledger
 //! knows no balance for at the requested instant is a `ResourceNotFoundException`.
 //!
+//! The key is the one the ledger stores
+//! (`crate::state::derived::normalize_address`), so the two spellings of one Ethereum
+//! account read one balance.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -185,6 +189,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         Ok(GetTokenBalanceOutput {
+            // The owner and the token the balance was read for, as the LEDGER spells them
+            // — the identifiers of the holding, not the characters the request happened
+            // to use, so one Ethereum account comes back in one spelling whichever letter
+            // case it was asked with.
             owner_identifier: balance.owner_identifier,
             token_identifier: balance.token_identifier,
             balance: balance.balance,
