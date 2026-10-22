@@ -15,6 +15,8 @@
 mod cloud_map_core;
 #[path = "all/delete_namespace.rs"]
 mod delete_namespace;
+#[path = "all/delete_service.rs"]
+mod delete_service;
 #[path = "all/instance_health_status.rs"]
 mod instance_health_status;
 #[path = "all/state_roundtrip.rs"]
