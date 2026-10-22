@@ -9,10 +9,12 @@
 //! reads and writes, plus the two projections the model asks for (`Component`
 //! and `ComponentSummary`).
 //!
-//! The form is the control plane's other app-environment resource, held the same
-//! way: `CreateForm` mints one and `GetForm` reports it from the single
-//! [`StoredForm`] record, keyed by the same (appId, environmentName) a component
-//! is keyed by.
+//! The form and the theme are the control plane's other app-environment
+//! resources, held the same way: `CreateForm` mints a form and `GetForm` reports
+//! it from the single [`StoredForm`] record, `CreateTheme` mints a theme and
+//! `GetTheme` reports it from the single [`StoredTheme`] record, both keyed by
+//! the same (appId, environmentName) a component is keyed by and both with the
+//! projection the model asks for.
 
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -20,7 +22,8 @@ use std::time::SystemTime;
 use crate::ops::types::{
     Component, ComponentBindingPropertiesValue, ComponentChild, ComponentDataConfiguration,
     ComponentEvent, ComponentProperty, ComponentSummary, ComponentVariant, FieldConfig, Form,
-    FormCTA, FormDataTypeConfig, FormStyle, ResourceNotFoundException, SectionalElement,
+    FormCTA, FormDataTypeConfig, FormStyle, ResourceNotFoundException, SectionalElement, Theme,
+    ThemeValues,
 };
 
 /// The largest page `ListComponents` serves, and the page size it uses when the
@@ -56,6 +59,16 @@ pub const COMPONENT_QUOTA: usize = 1_000;
 /// than a claim about any account's limit, set far above any workflow an
 /// emulator serves.
 pub const FORM_QUOTA: usize = 1_000;
+
+/// How many themes the store holds before `CreateTheme` refuses with the
+/// modelled `ServiceQuotaExceededException`.
+///
+/// Amplify UI Builder publishes no theme quota this emulator can quote, so this
+/// is the emulator's OWN bound on the store rather than a claim about any
+/// account's limit. It is set far above any workflow an emulator serves, and it
+/// is what stops the theme state — the records and the client tokens that name
+/// them — growing without end.
+pub const THEME_QUOTA: usize = 1_000;
 
 /// The map key a component's property maps may not carry.
 ///
@@ -200,6 +213,48 @@ impl StoredForm {
     }
 }
 
+/// One Amplify UI Builder theme, as this emulator persists it.
+#[derive(Debug, Clone)]
+pub struct StoredTheme {
+    pub app_id: String,
+    pub environment_name: String,
+    /// `Theme$id` targets `Uuid`; minted by
+    /// [`ComAmazonawsAmplifyuibuilderAmplifyuibuilderState::mint_theme_id`].
+    pub id: String,
+    pub name: String,
+    /// `Theme$values` is `@required`: the list the create supplied, in the order
+    /// it supplied it, nested `ThemeValue$children` and all.
+    pub values: Vec<ThemeValues>,
+    /// `Theme$overrides` is optional, so an absent one stays absent rather than
+    /// being reported as an empty list.
+    pub overrides: Option<Vec<ThemeValues>>,
+    /// `Theme$tags` is reported for every theme, so the tags a create supplied
+    /// are held as a map rather than as an absence: a theme created with no tags
+    /// carries an empty one and reports `{}`, exactly as a component does.
+    pub tags: HashMap<String, String>,
+    pub created_at: SystemTime,
+    /// When the theme last changed. Creating it is the change that first set it,
+    /// so it starts at [`StoredTheme::created_at`].
+    pub modified_at: SystemTime,
+}
+
+impl StoredTheme {
+    /// The `Theme` the create and get operations return.
+    pub fn to_theme(&self) -> Theme {
+        Theme {
+            app_id: self.app_id.clone(),
+            environment_name: self.environment_name.clone(),
+            id: self.id.clone(),
+            name: self.name.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(self.created_at),
+            modified_at: Some(::aws_smithy_types::DateTime::from(self.modified_at)),
+            values: self.values.clone(),
+            overrides: self.overrides.clone(),
+            tags: Some(self.tags.clone()),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-amplifyuibuilder-amplifyuibuilder. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
@@ -225,7 +280,15 @@ pub struct ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
     pub form_tokens: HashMap<(EnvironmentKey, String), String>,
     /// The counter [`StoredComponent::cursor`] values are drawn from.
     pub cursor_seq: u64,
-    /// The seed this store's component ids are minted from, drawn from the
+    /// Every theme, keyed by the (appId, environmentName) it belongs to and held
+    /// in creation order within that environment.
+    pub themes: HashMap<EnvironmentKey, Vec<StoredTheme>>,
+    /// A `CreateTheme` `clientToken` to the theme that token created, so a
+    /// retried create reports the first theme instead of minting a second. As
+    /// for a component, the key carries the (appId, environmentName) the create
+    /// addressed: a token is scoped to the environment it was used in.
+    pub theme_tokens: HashMap<(EnvironmentKey, String), String>,
+    /// The seed this store's resource ids are minted from, drawn from the
     /// operating system the first time one is minted.
     id_seed: Option<u64>,
     /// The counter that keeps two ids of one run apart.
@@ -400,6 +463,61 @@ impl ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
         }
     }
 
+    /// The themes stored for one app environment, in creation order.
+    pub fn themes_in(&self, app_id: &str, environment_name: &str) -> &[StoredTheme] {
+        self.themes
+            .get(&(app_id.to_string(), environment_name.to_string()))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// The theme `id` names in one app environment.
+    pub fn theme(&self, app_id: &str, environment_name: &str, id: &str) -> Option<&StoredTheme> {
+        self.themes_in(app_id, environment_name)
+            .iter()
+            .find(|theme| theme.id == id)
+    }
+
+    /// Store a theme at the end of its environment's creation order.
+    pub fn insert_theme(&mut self, theme: StoredTheme) {
+        self.themes
+            .entry((theme.app_id.clone(), theme.environment_name.clone()))
+            .or_default()
+            .push(theme);
+    }
+
+    /// The theme one `clientToken` already created in the app environment the
+    /// create addressed, if that token has been seen there.
+    pub fn replayed_theme(&self, key: &EnvironmentKey, token: &str) -> Option<&StoredTheme> {
+        let id = self.theme_tokens.get(&(key.clone(), token.to_string()))?;
+        self.theme(&key.0, &key.1, id)
+    }
+
+    /// Remember that `token` created the theme `id` in that app environment.
+    pub fn remember_theme_token(&mut self, key: EnvironmentKey, token: String, id: String) {
+        self.theme_tokens.insert((key, token), id);
+    }
+
+    /// How many themes the whole store holds — what [`THEME_QUOTA`] bounds.
+    pub fn total_themes(&self) -> usize {
+        self.themes.values().map(Vec::len).sum()
+    }
+
+    /// Mint an unused theme id. `Theme$id` targets `Uuid`, like a component's,
+    /// so the id is laid out the same way; the loop skips an id already taken in
+    /// that environment.
+    pub fn mint_theme_id(&mut self, key: &EnvironmentKey) -> String {
+        loop {
+            let id = self.next_uuid();
+            if self
+                .themes
+                .get(key)
+                .is_none_or(|themes| themes.iter().all(|theme| theme.id != id))
+            {
+                return id;
+            }
+        }
+    }
+
     /// One candidate id: a version 4 UUID whose 122 free bits are the leading
     /// bits of a SHA-256 digest over this store's seed, a counter and the clock.
     ///
@@ -407,7 +525,9 @@ impl ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
     /// not predictable from one run to the next; the counter and the clock make
     /// two ids of one run differ even on a seed collision. `sha2` does the
     /// hashing and `hex` the rendering — this only composes the input and sets
-    /// the two nibbles RFC 4122 reserves.
+    /// the two nibbles RFC 4122 reserves. Every resource this service mints an
+    /// id for draws from this one counter, so two resources cannot be handed the
+    /// same id either.
     fn next_uuid(&mut self) -> String {
         use sha2::{Digest, Sha256};
 
@@ -536,6 +656,16 @@ pub fn form_not_found(app_id: &str, environment_name: &str, id: &str) -> Resourc
     ResourceNotFoundException {
         message: Some(format!(
             "no form {id} in app {app_id} environment {environment_name}"
+        )),
+    }
+}
+
+/// The `ResourceNotFoundException` payload for an id that names no theme in the
+/// app environment the request addressed.
+pub fn theme_not_found(app_id: &str, environment_name: &str, id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "no theme {id} in app {app_id} environment {environment_name}"
         )),
     }
 }
