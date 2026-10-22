@@ -4,8 +4,10 @@
 //!
 //! IMPLEMENTED. Reports the stored automation event an `eventId` names, after
 //! materialising the status the clock has already made due for it; an id no
-//! event has is `ResourceNotFoundException` (404). Implemented alongside
-//! `StartAutomationEvent`, which mints the events this reads back.
+//! event has is `ResourceNotFoundException` (404), and a caller whose account is
+//! not opted in to the service is refused with `OptInRequiredException` (403)
+//! ahead of that lookup (see `crate::state::…::opt_in_required`). Implemented
+//! alongside `StartAutomationEvent`, which mints the events this reads back.
 //!
 //! ## Shape of an operation
 //!
@@ -186,6 +188,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut guard = state.lock();
+        // The service-wide enrollment gate, AHEAD of the event lookup: an
+        // account that is not opted in is refused the whole call, so it is never
+        // told "no such event" when what it has to do is enroll. See
+        // `crate::state::…::opt_in_required`.
+        if let Some(refusal) = guard.opt_in_required() {
+            return Err(
+                GetAutomationEventErrorModeled::OptInRequiredException(refusal).into(),
+            );
+        }
         let Some(event) = guard.events.get_mut(&input.event_id) else {
             return Err(GetAutomationEventErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {

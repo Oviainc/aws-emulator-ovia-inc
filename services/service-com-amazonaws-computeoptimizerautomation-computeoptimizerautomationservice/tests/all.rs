@@ -17,6 +17,8 @@ mod automation_event_and_tagging;
 mod automation_events;
 #[path = "all/automation_rule_lifecycle.rs"]
 mod automation_rule_lifecycle;
+#[path = "all/enrollment_gate.rs"]
+mod enrollment_gate;
 #[path = "all/error_payloads.rs"]
 mod error_payloads;
 #[path = "all/recommended_actions.rs"]

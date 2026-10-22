@@ -241,6 +241,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         let mut guard = state.lock();
+        // The service-wide enrollment gate, AHEAD of filter evaluation: an
+        // account that is not opted in is refused the whole call rather than
+        // handed an (empty) listing that reads as a healthy, idle account. See
+        // `crate::state::…::opt_in_required`.
+        if let Some(refusal) = guard.opt_in_required() {
+            return Err(ListAutomationEventsErrorModeled::OptInRequiredException(refusal).into());
+        }
         // Before reporting, materialise the status transitions the clock has
         // already made due, so this reader and `GetAutomationEvent` agree on
         // every event's status and a status filter selects on the current one.

@@ -11,10 +11,19 @@
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_computeoptimizerautomation_computeoptimizerautomationservice::state;
 use service_com_amazonaws_computeoptimizerautomation_computeoptimizerautomationservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-/// A router with one freshly-engined copy of this service mounted.
+/// A router with one freshly-engined copy of this service mounted, for an
+/// account that is OPTED IN to Compute Optimizer Automation.
+///
+/// Every operation but the two enrollment-configuration ones refuses an account
+/// that is not opted in with `OptInRequiredException` (see
+/// `state::…::opt_in_required`), so a suite about anything else starts from an
+/// enrolled account. The gate itself, and the enrollment round trip that opens
+/// it over the wire, are asserted in [`crate::enrollment_gate`] and in
+/// [`enrollment_reports_the_default_until_an_update_persists_one`].
 ///
 /// `pub(crate)` so the other suites in this test binary drive the service through
 /// the same harness instead of each growing a copy of it.
@@ -25,6 +34,16 @@ pub(crate) fn emulator() -> MultiServiceRouter {
 /// The same harness, handing the engine back as well, for a suite that must
 /// record into the store what no operation of this API creates.
 pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    let (router, engine) = unenrolled_emulator_with_engine();
+    enroll_caller(&engine);
+    (router, engine)
+}
+
+/// The harness BEFORE enrollment: the account has never called
+/// `UpdateEnrollmentConfiguration`, which is the state a brand-new account is
+/// in.
+pub(crate) fn unenrolled_emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
+{
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Deterministic regardless of the process-wide default: these cases are
@@ -32,6 +51,23 @@ pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemor
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
     (router, engine)
+}
+
+/// Put the calling account's enrollment in the store at `Active`, the one
+/// status under which the service performs an action.
+///
+/// A test PRECONDITION, written where `UpdateEnrollmentConfiguration` writes it,
+/// because a harness is not `async`; that operation's own wire path is covered
+/// by the enrollment cases in this suite and in [`crate::enrollment_gate`].
+pub(crate) fn enroll_caller(engine: &Arc<engine::InMemoryEngine>) {
+    let state = state::service_state(&**engine).expect("the engine bears this service's state");
+    state.lock().enrollments.insert(
+        state::caller_account_id(),
+        state::EnrollmentConfig {
+            status: state::ENROLLED_STATUS.to_string(),
+            ..state::EnrollmentConfig::default()
+        },
+    );
 }
 
 /// Call one operation and return `(http status, parsed body)`.
@@ -163,7 +199,9 @@ pub(crate) fn is_next_token(value: &str) -> bool {
 /// status of an account") are refused and change nothing.
 #[tokio::test]
 async fn enrollment_reports_the_default_until_an_update_persists_one() {
-    let router = emulator();
+    // The unenrolled harness: this case is about the status an account that
+    // never enrolled reports, so nothing may have been stored for it first.
+    let router = unenrolled_emulator_with_engine().0;
 
     let initial = call_ok(&router, "GetEnrollmentConfiguration", &json!({}), "initial").await;
     assert_eq!(
@@ -240,6 +278,8 @@ async fn enrollment_reports_the_default_until_an_update_persists_one() {
 /// "Inactive - Disables the Automation feature for your account and stops all of
 /// your automation rules. If you opt in again later, all rules will be inactive"
 /// — so opting out deactivates every rule, and opting back in leaves them so.
+/// While the account is opted out the service performs none of its actions, so
+/// the rules are readable again only once it is opted back in.
 #[tokio::test]
 async fn opting_out_stops_every_rule() {
     let router = emulator();
@@ -266,13 +306,19 @@ async fn opting_out_stops_every_rule() {
         )
         .await;
         for arn in &arns {
-            let rule = call_ok(
-                &router,
-                "GetAutomationRule",
-                &json!({"ruleArn": arn}),
-                opting,
-            )
-            .await;
+            let response = call(&router, "GetAutomationRule", &json!({"ruleArn": arn})).await;
+            // While the account is opted OUT the service performs none of its
+            // actions, so the rules are only readable again once it is opted
+            // back in — and then they stand as the opt-out left them.
+            if opting == "Inactive" {
+                assert_refused(response, 403, "OptInRequiredException", opting);
+                continue;
+            }
+            let (status, rule) = response;
+            assert_eq!(
+                status, 200,
+                "case {opting:?}: an opted-in account reads its rules, got {status} and {rule}"
+            );
             assert_eq!(
                 string_member(&rule, "status"),
                 "Inactive",

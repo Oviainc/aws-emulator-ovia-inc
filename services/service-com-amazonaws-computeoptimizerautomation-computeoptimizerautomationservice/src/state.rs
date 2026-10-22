@@ -4,7 +4,8 @@
 //!
 //! This module owns everything the handlers share: the stored form of an
 //! automation rule, of an automation event and of a recommended action, the
-//! enrollment configuration, the client-token (idempotency) ledger, and the pure
+//! enrollment configuration and the service-wide enrollment pre-check every
+//! action goes through, the client-token (idempotency) ledger, and the pure
 //! helpers that mint a rule id, build an opaque page token, bound a queried time
 //! range and decide whether a rule, an event or a recommended action matches a
 //! list filter. Handlers live in `src/ops/`, one file per operation, and build
@@ -18,8 +19,9 @@ use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
     AutomationEvent, AutomationEventFilter, AutomationRule, Criteria, EstimatedMonthlySavings,
-    Filter, OrganizationConfiguration, RecommendedAction, RecommendedActionFilter, ResourceDetails,
-    Schedule, Tag, AUTOMATION_EVENT_FILTER_NAME_VALUES, RECOMMENDED_ACTION_FILTER_NAME_VALUES,
+    Filter, OptInRequiredException, OrganizationConfiguration, RecommendedAction,
+    RecommendedActionFilter, ResourceDetails, Schedule, Tag, AUTOMATION_EVENT_FILTER_NAME_VALUES,
+    RECOMMENDED_ACTION_FILTER_NAME_VALUES,
 };
 
 /// The ARN namespace this service stamps on a rule ARN, from the model's
@@ -37,6 +39,21 @@ pub const INITIAL_RULE_REVISION: i64 = 1;
 /// The enrollment status an account that has never called
 /// `UpdateEnrollmentConfiguration` reports: it is not enrolled.
 pub const DEFAULT_ENROLLMENT_STATUS: &str = "Inactive";
+
+/// The one `EnrollmentStatus` that means the account is OPTED IN to Compute
+/// Optimizer Automation.
+///
+/// `EnrollmentStatus` is `Active | Inactive | Pending | Failed`
+/// (`smithy_query(query="shape",shape="EnrollmentStatus")`) and the `status`
+/// member of `UpdateEnrollmentConfigurationRequest` documents what the two
+/// settable ones mean: "Active - Enables the Automation feature for your
+/// account" and "Inactive - Disables the Automation feature for your account
+/// and stops all of your automation rules". `Pending` (an opt-in the service is
+/// still processing) and `Failed` (one that did not complete) are the
+/// server-only statuses, and neither has the feature enabled either — so
+/// `Active` is the only status under which the account may perform this
+/// service's actions.
+pub const ENROLLED_STATUS: &str = "Active";
 
 /// The `description` a rule created without one carries.
 ///
@@ -240,6 +257,14 @@ pub fn fingerprint<T: std::fmt::Debug>(value: &T) -> String {
 /// request named is not there, and names neither the ARN nor the id, so a
 /// not-found body never echoes a resource identifier back to its caller.
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The specified resource could not be found";
+
+/// The message every `OptInRequiredException` of this service carries.
+///
+/// FIXED and request-independent: the refusal states that the ACCOUNT is not
+/// registered, and names neither the operation, the account nor anything else
+/// the request carried. The requirement this error has to meet is its modelled
+/// code and its HTTP 403; this is the service's own wording for it.
+pub const OPT_IN_REQUIRED_MESSAGE: &str = "Aws account is not registered for recommendation.";
 
 /// The message every `IdempotentParameterMismatchException` of this service
 /// carries — the service's own wire wording for "this client token was first
@@ -909,6 +934,40 @@ impl ComAmazonawsComputeoptimizerautomationComputeoptimizerautomationserviceStat
     /// when that account has never configured one. A READ: it stores nothing.
     pub fn enrollment(&self, account_id: &str) -> EnrollmentConfig {
         self.enrollments.get(account_id).cloned().unwrap_or_default()
+    }
+
+    /// Is `account_id` opted in to Compute Optimizer Automation, i.e. does its
+    /// stored enrollment report [`ENROLLED_STATUS`]? An account that never
+    /// enrolled is not: [`EnrollmentConfig::default`] is the unenrolled one.
+    pub fn is_enrolled(&self, account_id: &str) -> bool {
+        self.enrollment(account_id).status == ENROLLED_STATUS
+    }
+
+    /// The service-wide enrollment pre-check, as the refusal it produces.
+    ///
+    /// `OptInRequiredException` is one of this service's COMMON errors
+    /// (`smithy_query(query="service_info")`), so it is bound to every operation,
+    /// and its shape documents "The account must be opted in to Compute Optimizer
+    /// Automation before performing this action" with `httpError` 403. Every
+    /// operation that performs one of this service's ACTIONS therefore refuses a
+    /// caller whose account is not opted in, BEFORE it resolves a resource or
+    /// evaluates a filter — so an unenrolled caller is never told "no such
+    /// resource" or handed an empty listing.
+    ///
+    /// The two enrollment-configuration operations are the exception, and are the
+    /// only ones that do not call this: `UpdateEnrollmentConfiguration` is the
+    /// documented remedy for this very error (gating it would make the refusal
+    /// unrecoverable) and `GetEnrollmentConfiguration` is how a caller reads the
+    /// status it has to change, including [`DEFAULT_ENROLLMENT_STATUS`].
+    ///
+    /// `Some(..)` is the refusal to return; `None` means the gate is open. It
+    /// reads the CALLER's own account, which is what the gate is about; an
+    /// operation that has to judge some other, NAMED account (one listed in an
+    /// organization request, say) asks [`Self::is_enrolled`] about that account.
+    pub fn opt_in_required(&self) -> Option<OptInRequiredException> {
+        (!self.is_enrolled(&caller_account_id())).then(|| OptInRequiredException {
+            message: Some(OPT_IN_REQUIRED_MESSAGE.to_string()),
+        })
     }
 
     /// A fresh `ruleId` matching the model's `^[0-9A-Za-z]{16}$`, retried in the

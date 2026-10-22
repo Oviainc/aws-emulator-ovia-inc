@@ -230,6 +230,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .max(1);
 
         let guard = state.lock();
+        // The service-wide enrollment gate, AHEAD of filter evaluation: an
+        // account that is not opted in is refused the whole call rather than
+        // told there are no recommended actions to take. See
+        // `crate::state::…::opt_in_required`.
+        if let Some(refusal) = guard.opt_in_required() {
+            return Err(ListRecommendedActionsErrorModeled::OptInRequiredException(refusal).into());
+        }
         let matching: Vec<RecommendedAction> = guard
             .recommended_actions
             .iter_in_order()

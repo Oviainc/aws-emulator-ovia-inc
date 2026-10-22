@@ -247,6 +247,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut guard = state.lock();
 
+        // The service-wide enrollment gate, AHEAD of the token ledger and of
+        // the rule lookup: an account that is not opted in may not update a
+        // rule, and a refused call must not consume its client token either. See
+        // `crate::state::…::opt_in_required`.
+        if let Some(refusal) = guard.opt_in_required() {
+            return Err(UpdateAutomationRuleErrorModeled::OptInRequiredException(refusal).into());
+        }
+
         match guard.classify_token(client_token, Self::NAME, &request_fingerprint) {
             crate::state::TokenOutcome::Fresh => {}
             // A retry of the same update: the revision has already moved on, so

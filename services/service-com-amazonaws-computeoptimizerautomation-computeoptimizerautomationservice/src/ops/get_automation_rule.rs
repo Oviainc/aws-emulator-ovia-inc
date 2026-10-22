@@ -192,6 +192,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let guard = state.lock();
+        // The service-wide enrollment gate, AHEAD of the rule lookup: an account
+        // that is not opted in is refused the whole call rather than told the
+        // rule does not exist. See `crate::state::…::opt_in_required`.
+        if let Some(refusal) = guard.opt_in_required() {
+            return Err(GetAutomationRuleErrorModeled::OptInRequiredException(refusal).into());
+        }
         let Some(rule) = guard.rules.get(&input.rule_arn) else {
             return Err(GetAutomationRuleErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {

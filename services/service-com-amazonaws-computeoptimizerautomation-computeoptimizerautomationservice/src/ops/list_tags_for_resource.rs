@@ -168,6 +168,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // automation rule, so the tags of the rule that ARN identifies are the
         // whole answer.
         let guard = state.lock();
+        // The service-wide enrollment gate, AHEAD of resolving the ARN: an
+        // account that is not opted in is refused the whole call rather than
+        // told the rule the ARN names does not exist. See
+        // `crate::state::…::opt_in_required`.
+        if let Some(refusal) = guard.opt_in_required() {
+            return Err(ListTagsForResourceErrorModeled::OptInRequiredException(refusal).into());
+        }
         let Some(rule) = guard.rules.get(&input.resource_arn) else {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {

@@ -26,7 +26,10 @@ use service_com_amazonaws_computeoptimizerautomation_computeoptimizerautomations
 use smithy_server_runtime::MultiServiceRouter;
 
 /// A router with one freshly-engined copy of this service mounted, plus the
-/// engine itself so a case can seed the store the handlers read.
+/// engine itself so a case can seed the store the handlers read. The account is
+/// OPTED IN, because every operation these cases drive refuses one that is not
+/// (see `state::…::opt_in_required`); the gate itself is asserted in
+/// [`crate::enrollment_gate`].
 pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -34,6 +37,7 @@ pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     // about the service's behaviour, not about SigV4.
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    crate::automation_rule_lifecycle::enroll_caller(&engine);
     (router, engine)
 }
 
