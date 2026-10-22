@@ -180,7 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.config_rules.remove(&name).is_none() {
             return Err(DeleteConfigRuleErrorModeled::NoSuchConfigRuleException(
                 NoSuchConfigRuleException {
-                    message: Some(format!("there is no Config rule named '{name}'")),
+                    message: Some(crate::state::no_such_config_rule_message(&name)),
                 },
             )
             .into());

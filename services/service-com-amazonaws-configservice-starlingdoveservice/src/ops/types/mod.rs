@@ -68,6 +68,7 @@ pub mod get_aggregate_discovered_resource_counts_types;
 pub mod get_aggregate_resource_config_types;
 pub mod get_compliance_details_by_config_rule_types;
 pub mod get_compliance_details_by_resource_types;
+pub mod get_compliance_summary_by_config_rule_types;
 pub mod get_compliance_summary_by_resource_type_types;
 pub mod get_conformance_pack_compliance_details_types;
 pub mod get_conformance_pack_compliance_summary_types;
@@ -225,6 +226,8 @@ pub use get_aggregate_resource_config_types::*;
 pub use get_compliance_details_by_config_rule_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_compliance_details_by_resource_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use get_compliance_summary_by_config_rule_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_compliance_summary_by_resource_type_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

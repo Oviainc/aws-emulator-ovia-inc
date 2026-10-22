@@ -159,7 +159,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !store.config_rules.contains_key(name) {
                 return Err(DescribeConfigRulesErrorModeled::NoSuchConfigRuleException(
                     NoSuchConfigRuleException {
-                        message: Some(format!("there is no Config rule named '{name}'")),
+                        message: Some(crate::state::no_such_config_rule_message(name)),
                     },
                 )
                 .into());
@@ -225,7 +225,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 next_token = Some(crate::state::encode_page_token(name));
                 break;
             }
-            page.push(entry.to_shape());
+            page.push(entry.to_describe_shape());
         }
 
         Ok(DescribeConfigRulesOutput {
