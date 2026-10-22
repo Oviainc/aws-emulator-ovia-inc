@@ -6,6 +6,11 @@
 //! an account and region, so a second create under a name already taken is a
 //! `ConflictException`.
 //!
+//! The `Tags` the request carries go through the same admission check a later
+//! `TagResource` on the cluster uses ([`crate::state::tag_write_violation`]): a key
+//! or value outside the documented rules, or more tags than a resource may carry,
+//! is a `BadRequestException` and the cluster is not created.
+//!
 //! Authentication and authorization are NOT this handler's business: the emulator
 //! verifies every request signature centrally (see `AGENTS.md`), so the modelled
 //! `UnauthorizedException`/`ForbiddenException` are raised by that path and never
@@ -203,6 +208,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         "NumberOfBrokerNodes must be between 1 and {}, not {}.",
                         crate::state::MAX_BROKER_NODES_PER_CLUSTER, input.number_of_broker_nodes
                     )),
+                })
+                .into(),
+            );
+        }
+
+        // The tag rules apply wherever a caller supplies tags, so the set a
+        // create carries goes through the same admission check `TagResource`
+        // uses — against an empty stored set, because the cluster this request
+        // would mint carries no tags yet. A refused create registers nothing.
+        if let Some(reason) = crate::state::tag_write_violation(
+            &std::collections::BTreeMap::new(),
+            input
+                .tags
+                .iter()
+                .flatten()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        ) {
+            return Err(
+                CreateClusterErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("Tags".to_string()),
+                    message: Some(reason),
                 })
                 .into(),
             );

@@ -29,6 +29,8 @@ mod list_clusters_v2;
 mod replicator_lifecycle;
 #[path = "all/replicator_listing.rs"]
 mod replicator_listing;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/storage_updates.rs"]

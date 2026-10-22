@@ -237,10 +237,11 @@ pub const MAX_CLUSTERS_PER_REPLICATOR: usize = 16;
 /// ordered cluster pairs than this anyway.
 pub const MAX_FLOWS_PER_REPLICATOR: usize = 32;
 
-/// The most tags one replicator may carry, from AWS's general limit of 50 tags
-/// per resource. The model declares `__mapOf__string` with no `length` trait, so
-/// the ceiling is enforced here.
-pub const MAX_TAGS_PER_REPLICATOR: usize = 50;
+/// The most tags one replicator may carry: the general per-resource limit, which
+/// [`MAX_TAGS_PER_RESOURCE`] states and every tag write is admitted against. Kept
+/// as its own name because `Replicator::created` clamps with it, so the clamp and
+/// the admission check cannot drift apart.
+pub const MAX_TAGS_PER_REPLICATOR: usize = MAX_TAGS_PER_RESOURCE;
 
 /// Amazon MSK provisions a three-node Apache ZooKeeper ensemble alongside a
 /// provisioned cluster, which is what `ZookeeperConnectString` enumerates.
@@ -1325,6 +1326,111 @@ impl ComAmazonawsKafkaKafkaState {
         Some(cluster)
     }
 
+    /// The cluster `arn` names in `region`, mutably — the write counterpart of
+    /// [`Self::cluster_in`], with the same regional scoping, so a mutating
+    /// operation can only ever reach a cluster a reader of this endpoint also
+    /// sees.
+    pub fn cluster_mut_in(&mut self, region: &str, arn: &str) -> Option<&mut Cluster> {
+        self.clusters
+            .get_mut(arn)
+            .filter(|cluster| cluster.region == region)
+    }
+
+    /// The stored tag set of the resource `arn` names in `region`.
+    ///
+    /// This is the ONE resolution the tagging operations share, so
+    /// `TagResource`, `UntagResource` and `ListTagsForResource` cannot disagree
+    /// about which ARNs name a taggable resource or about which failure a given
+    /// ARN earns. Tags live on the resource record itself, which is why a tag
+    /// written here is visible to every other reader of that resource (a
+    /// cluster's tags are reported by `DescribeCluster` and `ListClusters`, a
+    /// channel's by `DescribeChannel` and `ListChannels`).
+    pub fn resource_tags_in(
+        &self,
+        region: &str,
+        arn: &str,
+    ) -> Result<&BTreeMap<String, String>, TagTargetRejected> {
+        match resource_type_of_arn(arn)? {
+            CLUSTER_RESOURCE_TYPE => self
+                .cluster_in(region, arn)
+                .map(|cluster| &cluster.tags)
+                .ok_or(TagTargetRejected::NoSuchResource),
+            CHANNEL_RESOURCE_TYPE => self
+                .channel_by_arn_in(region, arn)
+                .map(|channel| &channel.tags)
+                .ok_or(TagTargetRejected::NoSuchResource),
+            REPLICATOR_RESOURCE_TYPE => self
+                .replicator_in(region, arn)
+                .map(|replicator| &replicator.tags)
+                .ok_or(TagTargetRejected::NoSuchResource),
+            // Another MSK resource type: a well-formed ARN of a kind no
+            // registry here carries a tag set for yet — the creates that accept
+            // `Tags` for them (`CreateConfiguration`, `CreateVpcConnection`, …)
+            // are still scaffolds — so this region holds no such taggable
+            // resource. That is a miss, not a malformed request, and this arm is
+            // the one place to extend when one of those registries starts
+            // storing tags.
+            _ => Err(TagTargetRejected::NoSuchResource),
+        }
+    }
+
+    /// The same resolution, mutably — what `TagResource` and `UntagResource`
+    /// write through.
+    pub fn resource_tags_mut_in(
+        &mut self,
+        region: &str,
+        arn: &str,
+    ) -> Result<&mut BTreeMap<String, String>, TagTargetRejected> {
+        match resource_type_of_arn(arn)? {
+            CLUSTER_RESOURCE_TYPE => self
+                .cluster_mut_in(region, arn)
+                .map(|cluster| &mut cluster.tags)
+                .ok_or(TagTargetRejected::NoSuchResource),
+            CHANNEL_RESOURCE_TYPE => self
+                .channel_by_arn_mut_in(region, arn)
+                .map(|channel| &mut channel.tags)
+                .ok_or(TagTargetRejected::NoSuchResource),
+            REPLICATOR_RESOURCE_TYPE => self
+                .replicator_mut_in(region, arn)
+                .map(|replicator| &mut replicator.tags)
+                .ok_or(TagTargetRejected::NoSuchResource),
+            _ => Err(TagTargetRejected::NoSuchResource),
+        }
+    }
+
+    /// The channel `arn` names, as an endpoint for `region` sees it, resolved by
+    /// its OWN ARN alone.
+    ///
+    /// That is the form an operation that takes any resource ARN addresses a
+    /// channel in: the cluster is not a separate request member there, it is a
+    /// segment of the channel ARN itself (`channel/<cluster>/<cluster-id>/...`),
+    /// so a channel ARN already names the cluster that holds it.
+    /// [`Self::channel_in`] stays the resolution for the paths that carry the
+    /// cluster separately and must agree with it.
+    pub fn channel_by_arn_in(&self, region: &str, arn: &str) -> Option<&Channel> {
+        self.channels
+            .get(arn)
+            .filter(|channel| channel.region == region)
+    }
+
+    /// The same lookup, mutably — the write counterpart of
+    /// [`Self::channel_by_arn_in`], with the same regional scoping.
+    pub fn channel_by_arn_mut_in(&mut self, region: &str, arn: &str) -> Option<&mut Channel> {
+        self.channels
+            .get_mut(arn)
+            .filter(|channel| channel.region == region)
+    }
+
+    /// The replicator `arn` names in `region`, mutably — the write counterpart of
+    /// [`Self::replicator_in`], with the same regional scoping, so a mutating
+    /// operation can only ever reach a replicator a reader of this endpoint also
+    /// sees.
+    pub fn replicator_mut_in(&mut self, region: &str, arn: &str) -> Option<&mut Replicator> {
+        self.replicators
+            .get_mut(arn)
+            .filter(|replicator| replicator.region == region)
+    }
+
     /// The cluster operation `arn` names, as an endpoint for `region` sees it —
     /// `None` for an operation of another region, exactly as for an absent one.
     pub fn cluster_operation_in(&self, region: &str, arn: &str) -> Option<&ClusterOperation> {
@@ -1718,6 +1824,145 @@ impl ComAmazonawsKafkaKafkaState {
         };
         ClusterPage { keys, next_token }
     }
+}
+
+/// Why a tagging operation could not resolve its `ResourceArn` to a resource.
+///
+/// The two variants are the two failures the real service distinguishes: a value
+/// it cannot parse as one of its own resource ARNs, and a well-formed one that
+/// names nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagTargetRejected {
+    /// Not an ARN of an MSK resource at all — a client `BadRequestException`.
+    NotAnArn,
+    /// A well-formed MSK resource ARN this endpoint's region holds no resource
+    /// for: absent, deleted, or belonging to another region. A `NotFoundException`.
+    NoSuchResource,
+}
+
+/// The resource-type segment of an MSK cluster ARN.
+pub const CLUSTER_RESOURCE_TYPE: &str = "cluster";
+
+/// The resource-type segment of an MSK channel ARN.
+pub const CHANNEL_RESOURCE_TYPE: &str = "channel";
+
+/// The resource-type segment of an MSK replicator ARN.
+pub const REPLICATOR_RESOURCE_TYPE: &str = "replicator";
+
+/// The message AWS's resource-tagging plumbing answers a missing resource with.
+///
+/// RECORDED behaviour, not modelled: the Smithy model gives `NotFoundException`
+/// only a free-form `message`, and the recorded responses for the MSK tagging
+/// operations carry this fixed text (the same text the tagging APIs of other
+/// services answer with) rather than one built from the request. The requirement
+/// here is the 404 and the `NotFoundException` code; this constant keeps the
+/// three tagging operations answering with one text instead of three.
+///
+/// It is NOT the text the resource readers use for a resource they cannot find:
+/// those build a message from the request (which region looked, for which ARN).
+/// Reach for this one only from the tagging operations.
+pub const TAGGING_NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
+/// The longest a tag key may be, from the model's own documentation of
+/// `UntagResourceRequest$TagKeys`: "Tag keys must be between 1 and 128 Unicode
+/// characters in length."
+pub const MAX_TAG_KEY_LENGTH: usize = 128;
+
+/// The tag-key prefix the model reserves for AWS itself: "You can't start a tag
+/// key with aws: because this prefix is reserved for use by AWS. AWS creates tags
+/// that begin with this prefix on your behalf, but you can't edit or delete them."
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Why `key` is not a tag key a caller may set or remove, phrased as the message
+/// a `BadRequestException` carries — or `None` when the key is acceptable.
+///
+/// Every rule here is stated by the model's own `UntagResourceRequest$TagKeys`
+/// documentation: 1..128 Unicode characters, no `aws:` prefix, and a character
+/// set of "Unicode letters, digits, white space, and the following special
+/// characters: _ . / = + - @". The message names the member's constraint and the
+/// offending key, so a caller can fix the request from the text alone.
+pub fn tag_key_violation(key: &str) -> Option<String> {
+    let length = key.chars().count();
+    if !(1..=MAX_TAG_KEY_LENGTH).contains(&length) {
+        return Some(format!(
+            "Tag key '{key}' is {length} Unicode characters long; a tag key must be between 1 and {MAX_TAG_KEY_LENGTH} Unicode characters in length."
+        ));
+    }
+    if key.starts_with(RESERVED_TAG_KEY_PREFIX) {
+        return Some(format!(
+            "Tag key '{key}' starts with '{RESERVED_TAG_KEY_PREFIX}', a prefix reserved for use by AWS."
+        ));
+    }
+    if let Some(offending) = key.chars().find(|c| !is_tag_key_character(*c)) {
+        return Some(format!(
+            "Tag key '{key}' contains the unsupported character '{offending}'; a tag key must consist of Unicode letters, digits, white space and the special characters _ . / = + - @."
+        ));
+    }
+    None
+}
+
+/// Whether `c` is one of the characters the model's tag-key documentation allows.
+fn is_tag_key_character(c: char) -> bool {
+    c.is_alphabetic()
+        || c.is_numeric()
+        || c.is_whitespace()
+        || matches!(c, '_' | '.' | '/' | '=' | '+' | '-' | '@')
+}
+
+/// The most tags one resource may carry, from the Amazon MSK tag restrictions
+/// ("Maximum number of tags per resource: 50") — the same limit, from the same
+/// source, that [`MAX_TAGS_PER_REPLICATOR`] enforces on the tags a replicator is
+/// created with.
+///
+/// It is also what bounds this store: a tag key comes from the request, so
+/// without a ceiling on the resulting count a caller could grow one resource's
+/// tag map with every call it makes. The ceiling is checked BEFORE the first
+/// insert, so a refused request writes nothing.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The longest a tag value may be, from the same restrictions ("Maximum value
+/// length: 256 Unicode characters"). An empty value is allowed.
+pub const MAX_TAG_VALUE_LENGTH: usize = 256;
+
+/// Why `submitted` may not be written onto a resource that already carries
+/// `stored`, phrased as the message a `BadRequestException` takes — or `None`
+/// when the write is acceptable.
+///
+/// The ONE admission check for a tag write, shared by `TagResource` and by the
+/// `Tags` a create carries, so the two cannot disagree about which tag sets a
+/// resource may hold. It checks every key and value against the documented
+/// limits and then the resulting entry count: only keys the resource does not
+/// already carry add to it, so re-tagging an existing key at the ceiling is
+/// still allowed. The submitted pairs are walked in key order, so one request
+/// always earns the same message.
+pub fn tag_write_violation<'a, I>(stored: &BTreeMap<String, String>, submitted: I) -> Option<String>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let submitted: BTreeMap<&str, &str> = submitted.into_iter().collect();
+    for (key, value) in &submitted {
+        if let Some(reason) = tag_key_violation(key) {
+            return Some(reason);
+        }
+        let length = value.chars().count();
+        if length > MAX_TAG_VALUE_LENGTH {
+            return Some(format!(
+                "The value of tag key '{key}' is {length} Unicode characters long; a tag value must be at most {MAX_TAG_VALUE_LENGTH} Unicode characters in length."
+            ));
+        }
+    }
+    let added = submitted
+        .keys()
+        .filter(|key| !stored.contains_key(**key))
+        .count();
+    let resulting = stored.len() + added;
+    if resulting > MAX_TAGS_PER_RESOURCE {
+        return Some(format!(
+            "The resource carries {} tag(s) and the request adds {added} more, which would give it {resulting}; a resource may carry at most {MAX_TAGS_PER_RESOURCE} tags.",
+            stored.len()
+        ));
+    }
+    None
 }
 
 /// Encode the ARN a page stopped at as a token. Base64 of a marked plaintext:
@@ -2616,6 +2861,43 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
         .unwrap_or_else(|| "us-east-1".to_string())
+}
+
+/// The resource type and id path of an MSK resource ARN —
+/// `arn:<partition>:kafka:<region>:<account>:<type>/<id-path>` — or `None` when
+/// `value` is not one.
+///
+/// Built on [`kafka_arn_resource`], the one ARN parse this module has, so an
+/// operation that takes ANY resource ARN (the tagging operations) draws the
+/// "this is not an ARN of mine" line exactly where the `is_*_arn` predicates
+/// draw it.
+pub fn kafka_resource_arn_parts(value: &str) -> Option<(&str, &str)> {
+    let resource = kafka_arn_resource(value)?;
+    let (resource_type, id_path) = resource.split_once('/')?;
+    (!resource_type.is_empty() && !id_path.is_empty()).then_some((resource_type, id_path))
+}
+
+/// The resource type `value` names, for an operation that takes any MSK resource
+/// ARN.
+///
+/// A value that is not an ARN of this service, or one whose type this service
+/// mints in a shape `value` does not have, is [`TagTargetRejected::NotAnArn`] —
+/// the request the service cannot parse, as distinct from the resource it cannot
+/// find. The shape check goes through the same `is_*_arn` predicate the readers
+/// of that resource type use, so one value is never a bad request to one
+/// operation and a miss to another.
+fn resource_type_of_arn(value: &str) -> Result<&str, TagTargetRejected> {
+    let Some((resource_type, _)) = kafka_resource_arn_parts(value) else {
+        return Err(TagTargetRejected::NotAnArn);
+    };
+    match resource_type {
+        CLUSTER_RESOURCE_TYPE if !is_cluster_arn(value) => Err(TagTargetRejected::NotAnArn),
+        CHANNEL_RESOURCE_TYPE if !is_channel_arn(value) => Err(TagTargetRejected::NotAnArn),
+        REPLICATOR_RESOURCE_TYPE if !is_replicator_arn(value) => {
+            Err(TagTargetRejected::NotAnArn)
+        }
+        other => Ok(other),
+    }
 }
 
 /// Whether `value` is shaped like an MSK cluster ARN —
