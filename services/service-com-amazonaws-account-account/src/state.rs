@@ -2,11 +2,11 @@
 
 //! Engine state for the com-amazonaws-account-account service.
 //!
-//! The account record is this service's primary resource: `PutAccountName` and
-//! `PutAlternateContact` write it, `GetAccountInformation` and
-//! `GetAlternateContact` report it, and `DeleteAlternateContact` removes one of
-//! its contacts. The record below is the one copy every one of those handlers
-//! reads and writes.
+//! The account record is this service's primary resource: `PutAccountName`,
+//! `PutAlternateContact` and `PutContactInformation` write it,
+//! `GetAccountInformation`, `GetAlternateContact` and `GetContactInformation`
+//! report it, and `DeleteAlternateContact` removes one of its contacts. The
+//! record below is the one copy every one of those handlers reads and writes.
 //!
 //! Account Management operations all take an OPTIONAL `AccountId`: absent, the
 //! call lands on "the Amazon Web Services account of the identity used to call
@@ -18,8 +18,8 @@ use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    AccessDeniedException, AlternateContact, ResourceNotFoundException, ValidationException,
-    ValidationExceptionField, ALTERNATE_CONTACT_TYPE_VALUES,
+    AccessDeniedException, AlternateContact, ContactInformation, ResourceNotFoundException,
+    ValidationException, ValidationExceptionField, ALTERNATE_CONTACT_TYPE_VALUES,
 };
 
 /// The `AccountState` an account this emulator knows carries.
@@ -33,6 +33,17 @@ pub const ACTIVE_ACCOUNT_STATE: &str = "ACTIVE";
 /// The `ValidationExceptionReason` a refused input member reports: one of that
 /// enum's two values (`fieldValidationFailed | invalidRegionOptTarget`).
 pub const FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
+
+/// The `PhoneNumberVerificationStatus` the phone number of a stored primary
+/// contact carries: "UNVERIFIED – The phone number has not been verified"
+/// (`PHONE_NUMBER_VERIFICATION_STATUS_VALUES` is
+/// `NOT_SUPPORTED | PENDING | UNVERIFIED | VERIFIED`).
+///
+/// A phone number only becomes `PENDING` and then `VERIFIED` through the
+/// one-time-passcode flow (`SendPhoneNumberVerification` / `VerifyPhoneNumber`),
+/// which this emulator still answers 501 for — so a number it stores has never
+/// been through that flow, and `UNVERIFIED` is what the store knows about it.
+pub const UNVERIFIED_PHONE_NUMBER: &str = "UNVERIFIED";
 
 /// What a handler reports when the engine it was built on carries no store for
 /// this service — a server fault, never a bad request.
@@ -223,6 +234,12 @@ pub struct Account {
     /// At most one contact per `AlternateContactType`, which is what makes
     /// `PutAlternateContact` an upsert rather than an append.
     pub alternate_contacts: BTreeMap<AlternateContactType, AlternateContactRecord>,
+    /// The account's PRIMARY contact information, exactly as the last
+    /// `PutContactInformation` stored it, and `None` until one has: this
+    /// emulator learns an account's postal address only by being told it, and
+    /// never invents one. There is at most one primary contact per account, so
+    /// a second put replaces the whole structure rather than merging into it.
+    pub contact_information: Option<ContactInformation>,
     /// The `RegionOptStatus` this account carries for a Region it has been opted
     /// into or out of, keyed by Region code. A Region ABSENT from this map still
     /// reports its [`REGION_CATALOG`] status, so the map holds only what an
@@ -241,6 +258,7 @@ impl Account {
             created_date: now,
             state: ACTIVE_ACCOUNT_STATE.to_string(),
             alternate_contacts: BTreeMap::new(),
+            contact_information: None,
             region_opt_status: BTreeMap::new(),
         }
     }
@@ -379,6 +397,16 @@ pub fn alternate_contact_not_found(
         message: format!(
             "No {contact_type} alternate contact is set for account {account_id}"
         ),
+        error_type: None,
+    }
+}
+
+/// The `ResourceNotFoundException` payload for an account whose primary contact
+/// information this emulator holds no record of — "the operation failed because
+/// it specified a resource that can't be found".
+pub fn contact_information_not_set(account_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!("No primary contact information is set for account {account_id}"),
         error_type: None,
     }
 }
