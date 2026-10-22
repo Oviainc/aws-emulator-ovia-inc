@@ -3,10 +3,12 @@
 #![forbid(unsafe_code)]
 //! Code more than one emulated service needs, as a path dependency.
 //!
-//! Today that is two things: [`claims_request`], the request-claim rule a
+//! Today that is three things: [`claims_request`], the request-claim rule a
 //! service whose SigV4 signing name is SHARED with other services uses for its
-//! `Service::can_handle`, and [`stable_hex_id`], the one deterministic mixing
-//! function a service derives a wire-visible id with.
+//! `Service::can_handle`; [`stable_hex_id`], the one deterministic mixing
+//! function a service derives a wire-visible id with; and [`network`], the
+//! contract the account's EC2 network — which subnets a Region has — is modelled
+//! against, so no two services answer "does this subnet exist" differently.
 //!
 //! # Why a shared rule
 //!
@@ -51,6 +53,8 @@
 //! left in place here only because this change does not own those services' issues and
 //! each is covered by its own routing suite under `core/router/tests/all/`. Nothing new
 //! should inline the rule again — call this crate.
+
+pub mod network;
 
 use emulator_server::{resolve_route_key, service_from_target, ROOT_PATH_SEGMENT};
 
