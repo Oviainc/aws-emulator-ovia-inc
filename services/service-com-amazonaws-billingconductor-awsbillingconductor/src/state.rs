@@ -2,11 +2,12 @@
 
 //! Engine state for the com-amazonaws-billingconductor-awsbillingconductor service.
 //!
-//! The pricing-plan / billing-group core loop is persisted here. Every record is
-//! keyed by its FULL ARN, because that is the identity the wire uses: the modeled
-//! `BillingGroupArn` / `PricingPlanArn` patterns accept either the full ARN or the
-//! bare resource id, so a handler normalises its input through
-//! [`normalize_billing_group_arn`] / [`normalize_pricing_plan_arn`] before touching
+//! The pricing-rule / pricing-plan / billing-group core loop is persisted here.
+//! Every record is keyed by its FULL ARN, because that is the identity the wire
+//! uses: the modeled `BillingGroupArn` / `PricingPlanArn` / `PricingRuleArn`
+//! patterns accept either the full ARN or the bare resource id, so a handler
+//! normalises its input through [`normalize_billing_group_arn`] /
+//! [`normalize_pricing_plan_arn`] / [`normalize_pricing_rule_arn`] before touching
 //! the maps and two spellings of one resource cannot become two records.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -46,6 +47,23 @@ pub fn pricing_plan_arn(id: &str) -> String {
 /// The full ARN of a billing group resource id.
 pub fn billing_group_arn(id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, ARN_REGION, &format!("billinggroup/{id}"))
+}
+
+/// The full ARN of a pricing rule resource id.
+pub fn pricing_rule_arn(id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, ARN_REGION, &format!("pricingrule/{id}"))
+}
+
+/// A `PricingRuleArn` as this service stores it: the pattern accepts the full ARN
+/// or the bare `[a-zA-Z0-9]{10}` id, and both name the same resource. There are no
+/// AWS-managed pricing rules — the `PricingRuleArn` pattern allows only a 12-digit
+/// account segment — so a bare id always resolves into this account.
+pub fn normalize_pricing_rule_arn(value: &str) -> String {
+    if value.starts_with("arn:") {
+        value.to_string()
+    } else {
+        pricing_rule_arn(value)
+    }
 }
 
 /// A `BillingGroupArn` as this service stores it: the pattern accepts the full ARN
@@ -100,6 +118,46 @@ pub struct PricingPlanRecord {
     pub tags: BTreeMap<String, String>,
     pub creation_time_millis: i64,
     pub last_modified_time_millis: i64,
+}
+
+/// A pricing rule as `CreatePricingRule` persisted it.
+///
+/// `AssociatedPricingPlanCount` is DERIVED from the pricing plans that reference
+/// the rule (see
+/// [`associated_pricing_plan_count`](ComAmazonawsBillingconductorAwsbillingconductorState::associated_pricing_plan_count)),
+/// never stored, so it cannot drift from the associations it counts.
+#[derive(Debug, Clone, Default)]
+pub struct PricingRuleRecord {
+    pub arn: String,
+    pub name: String,
+    pub description: Option<String>,
+    /// `PricingRuleScope`, one of `PRICING_RULE_SCOPE_VALUES`.
+    pub scope: String,
+    /// `PricingRuleType`, one of `PRICING_RULE_TYPE_VALUES`.
+    pub rule_type: String,
+    pub modifier_percentage: Option<f64>,
+    pub service: Option<String>,
+    pub billing_entity: Option<String>,
+    pub tiering: Option<TieringRecord>,
+    pub usage_type: Option<String>,
+    pub operation: Option<String>,
+    pub tags: BTreeMap<String, String>,
+    pub creation_time_millis: i64,
+    pub last_modified_time_millis: i64,
+}
+
+/// A pricing rule's tiering configuration.
+///
+/// `CreateTieringInput` and the `Tiering` a read reports differ only in their
+/// free-tier structure (`CreateFreeTierConfig` / `FreeTierConfig`, both a single
+/// `Activated` boolean), and both carry the SAME `CustomTier` shape — so the
+/// boolean is what is stored and `CustomTier` is reused as modelled.
+#[derive(Debug, Clone, Default)]
+pub struct TieringRecord {
+    /// `Tiering.FreeTier.Activated`, absent when the request named no free tier.
+    pub free_tier_activated: Option<bool>,
+    /// `Tiering.CustomTiers`, in the order the request listed them.
+    pub custom_tiers: Option<Vec<crate::ops::types::CustomTier>>,
 }
 
 /// A billing group as `CreateBillingGroup` persisted it. `Size`, `Status` and
@@ -170,7 +228,9 @@ impl BillingGroupRecord {
 /// EVERY store here is bounded by an explicit maximum, because a caller decides
 /// how many requests to make:
 ///
-/// * `pricing_plans` / `pricing_plan_names` hold one entry per plan, at most
+/// * `pricing_rules` / `pricing_rule_names` hold one entry per rule, at most
+///   [`MAX_PRICING_RULES`], and `DeletePricingRule` reclaims both entries;
+///   `pricing_plans` / `pricing_plan_names` hold one entry per plan, at most
 ///   [`MAX_PRICING_PLANS`]; `billing_groups` / `billing_group_names` one per group,
 ///   at most [`MAX_BILLING_GROUPS`]; a group's membership and its share of
 ///   `account_associations` at most [`MAX_ACCOUNTS_PER_BILLING_GROUP`]. A create or
@@ -193,6 +253,11 @@ impl BillingGroupRecord {
 /// the request's `MaxResults`, or [`DEFAULT_PAGE_SIZE`] when it names none.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsBillingconductorAwsbillingconductorState {
+    /// Pricing rules by full ARN.
+    pub pricing_rules: BTreeMap<String, PricingRuleRecord>,
+    /// Pricing rule name -> ARN; the uniqueness index behind the name conflict
+    /// ("The names must be unique to each pricing rule").
+    pub pricing_rule_names: BTreeMap<String, String>,
     /// Pricing plans by full ARN.
     pub pricing_plans: BTreeMap<String, PricingPlanRecord>,
     /// Pricing plan name -> ARN; the uniqueness index behind the name conflict
@@ -322,6 +387,43 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
         Some(removed)
     }
 
+    /// Delete a pricing rule and the index entries that only existed because of
+    /// it: its name-index entry and the idempotency entries that named it, so a
+    /// `ClientToken` cannot replay into the ARN of a rule that no longer exists.
+    /// `None` when no such rule is stored.
+    pub fn remove_pricing_rule(&mut self, rule_arn: &str) -> Option<PricingRuleRecord> {
+        let removed = self.pricing_rules.remove(rule_arn)?;
+        self.pricing_rule_names.remove(&removed.name);
+
+        self.idempotency_tokens.retain(|_, arn| arn != rule_arn);
+        let remaining = &self.idempotency_tokens;
+        self.idempotency_order
+            .retain(|key| remaining.contains_key(key));
+
+        Some(removed)
+    }
+
+    /// The ARNs of every stored pricing plan whose `PricingRuleArns` names this
+    /// pricing rule. A plan may name a rule in either spelling the
+    /// `PricingRuleArn` pattern allows, so both sides are normalised.
+    pub fn pricing_plans_referencing_rule(&self, rule_arn: &str) -> Vec<String> {
+        self.pricing_plans
+            .iter()
+            .filter(|(_, plan)| {
+                plan.pricing_rule_arns
+                    .iter()
+                    .any(|arn| normalize_pricing_rule_arn(arn) == rule_arn)
+            })
+            .map(|(arn, _)| arn.clone())
+            .collect()
+    }
+
+    /// `AssociatedPricingPlanCount`: "The pricing plans count that this pricing rule
+    /// is associated with."
+    pub fn associated_pricing_plan_count(&self, rule_arn: &str) -> i64 {
+        i64::try_from(self.pricing_plans_referencing_rule(rule_arn).len()).unwrap_or(i64::MAX)
+    }
+
     /// True when the pricing plan ARN can be used by a billing group: either the
     /// caller created it, or it is one of the AWS-managed plans the
     /// `PricingPlanFullArn` pattern names.
@@ -373,6 +475,12 @@ pub const MAX_PRICING_PLANS: usize = 1000;
 /// How many billing groups this emulator stores for the account. A CHOSEN bound;
 /// see [`MAX_PRICING_PLANS`] for why it exists and how it is enforced.
 pub const MAX_BILLING_GROUPS: usize = 1000;
+
+/// How many pricing rules this emulator stores for the account. A CHOSEN bound;
+/// see [`MAX_PRICING_PLANS`] for why it exists and how it is enforced. A rule IS
+/// deletable (`DeletePricingRule`), so a caller that reaches the cap can make room
+/// by deleting one rather than being stuck.
+pub const MAX_PRICING_RULES: usize = 1000;
 
 /// How many linked accounts one billing group may hold. A CHOSEN bound; see
 /// [`MAX_PRICING_PLANS`]. The model caps one `AssociateAccounts` call at 30 account

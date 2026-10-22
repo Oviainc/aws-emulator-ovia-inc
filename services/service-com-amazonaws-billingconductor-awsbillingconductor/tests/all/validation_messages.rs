@@ -526,10 +526,10 @@ async fn a_request_within_every_modelled_constraint_reaches_the_operation() {
             json!({ "Arn": VALID_PLAN_ARN, "Name": "StillScaffolded" }),
         ),
         (
-            "DeletePricingRule with a conforming bare rule id",
-            "POST",
-            "/delete-pricing-rule",
-            json!({ "Arn": VALID_RULE_ARN }),
+            "UpdatePricingRule with a conforming bare rule id",
+            "PUT",
+            "/update-pricing-rule",
+            json!({ "Arn": VALID_RULE_ARN, "Name": "StillScaffolded" }),
         ),
         (
             "AssociatePricingRules with an AWS-managed plan id and a rule list",

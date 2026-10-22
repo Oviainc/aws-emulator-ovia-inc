@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePricingRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePricingRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePricingRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Persists a new pricing rule and answers with the ARN it minted, so a later
+//! `ListPricingRules` reports it and `DeletePricingRule` can remove it.
 //!
 //! ## Shape of an operation
 //!
@@ -149,6 +142,18 @@ impl From<CreatePricingRuleErrorModeled> for CreatePricingRuleError {
     }
 }
 
+/// Refuse the request with this operation's modelled 400 `ValidationException`.
+fn validation(
+    reason: &str,
+    field: &str,
+    message: impl Into<String>,
+) -> CreatePricingRuleError {
+    CreatePricingRuleErrorModeled::ValidationException(crate::state::validation_exception(
+        reason, field, message,
+    ))
+    .into()
+}
+
 /// The `CreatePricingRule` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -185,18 +190,153 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePricingRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePricingRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreatePricingRuleErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the billingconductor store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // "if the original request completes successfully, any subsequent retries
+        // complete successfully without performing any further actions" — the same
+        // ClientToken answers with the ARN the first call minted.
+        if let Some(arn) = state.replayed_idempotent_arn(Self::NAME, input.client_token.as_deref())
+        {
+            return Ok(CreatePricingRuleOutput { arn: Some(arn) });
+        }
+
+        // "The pricing rule name. The names must be unique to each pricing rule."
+        if let Some(existing) = state.pricing_rule_names.get(&input.name).cloned() {
+            return Err(CreatePricingRuleErrorModeled::ConflictException(ConflictException {
+                message: "a pricing rule with this name already exists".to_string(),
+                resource_id: existing,
+                resource_type: "pricingrule".to_string(),
+                reason: Some("RESOURCE_NAME_CONFLICT".to_string()),
+            })
+            .into());
+        }
+
+        // The members a `Scope` / `Type` makes meaningful are the ones the model's own
+        // documentation conditions on them, so a request that omits one describes no
+        // rule the service could apply. Each refusal is the modelled
+        // `ValidationException` with the reason `ValidationExceptionReason` enumerates
+        // for that member.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePricingRule"))
+        // `Service`: "If the Scope attribute is set to SERVICE or SKU, the attribute
+        // indicates which service the PricingRule is applicable for."
+        if matches!(input.scope.as_str(), "SERVICE" | "SKU") && input.service.is_none() {
+            return Err(validation(
+                "ILLEGAL_SERVICE",
+                "Service",
+                format!("a pricing rule scoped to {} must name a Service", input.scope),
+            ));
+        }
+        // `UsageType` / `Operation`: "If the Scope attribute is set to SKU, this
+        // attribute indicates which usage type / operation the PricingRule is
+        // modifying."
+        if input.scope == "SKU" {
+            if input.usage_type.is_none() {
+                return Err(validation(
+                    "ILLEGAL_USAGE_TYPE",
+                    "UsageType",
+                    "a pricing rule scoped to SKU must name a UsageType",
+                ));
+            }
+            if input.operation.is_none() {
+                return Err(validation(
+                    "ILLEGAL_OPERATION",
+                    "Operation",
+                    "a pricing rule scoped to SKU must name an Operation",
+                ));
+            }
+        }
+        // `BillingEntity` is what a `BILLING_ENTITY`-scoped rule applies to: "The
+        // seller of services provided by Amazon Web Services, their affiliates, or
+        // third-party providers selling services via Amazon Web Services Marketplace."
+        if input.scope == "BILLING_ENTITY" && input.billing_entity.is_none() {
+            return Err(validation(
+                "ILLEGAL_BILLING_ENTITY",
+                "BillingEntity",
+                "a pricing rule scoped to BILLING_ENTITY must name a BillingEntity",
+            ));
+        }
+        // A `TIERING` rule IS its tiering configuration ("The set of tiering
+        // configurations for the pricing rule"); a `MARKUP` or `DISCOUNT` rule is the
+        // percentage it moves the public rates by ("A percentage modifier that's
+        // applied on the public pricing rates").
+        match input.r#type.as_str() {
+            "TIERING" if input.tiering.is_none() => {
+                return Err(validation(
+                    "ILLEGAL_TIERING_INPUT",
+                    "Tiering",
+                    "a TIERING pricing rule must carry a Tiering configuration",
+                ));
+            }
+            "MARKUP" | "DISCOUNT" if input.modifier_percentage.is_none() => {
+                return Err(validation(
+                    "ILLEGAL_MODIFIER_PERCENTAGE",
+                    "ModifierPercentage",
+                    format!(
+                        "a {} pricing rule must carry a ModifierPercentage",
+                        input.r#type
+                    ),
+                ));
+            }
+            _ => {}
+        }
+
+        // The store is bounded by an explicit maximum and a create past it is refused
+        // rather than served by evicting a rule a later caller must still be able to
+        // read; a caller at the cap makes room with `DeletePricingRule`.
+        if state.pricing_rules.len() >= crate::state::MAX_PRICING_RULES {
+            return Err(CreatePricingRuleErrorModeled::ServiceLimitExceededException(
+                ServiceLimitExceededException {
+                    message: format!(
+                        "the maximum number of pricing rules ({}) already exists",
+                        crate::state::MAX_PRICING_RULES
+                    ),
+                    resource_id: None,
+                    resource_type: Some("pricingrule".to_string()),
+                    limit_code: "PricingRulesPerAccount".to_string(),
+                    service_code: crate::state::SERVICE_CODE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // Exactly 10 characters: the `PricingRuleArn` pattern's resource id is
+        // `[a-zA-Z0-9]{10}`.
+        let id = state.mint_resource_id(10);
+        let arn = crate::state::pricing_rule_arn(&id);
+        let now = crate::state::now_millis();
+        let record = crate::state::PricingRuleRecord {
+            arn: arn.clone(),
+            name: input.name.clone(),
+            description: input.description,
+            scope: input.scope,
+            rule_type: input.r#type,
+            modifier_percentage: input.modifier_percentage,
+            service: input.service,
+            billing_entity: input.billing_entity,
+            tiering: input.tiering.map(|tiering| crate::state::TieringRecord {
+                free_tier_activated: tiering.free_tier.map(|free_tier| free_tier.activated),
+                custom_tiers: tiering.custom_tiers,
+            }),
+            usage_type: input.usage_type,
+            operation: input.operation,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            creation_time_millis: now,
+            last_modified_time_millis: now,
+        };
+        state.pricing_rules.insert(arn.clone(), record);
+        state.pricing_rule_names.insert(input.name, arn.clone());
+        state.record_idempotent_arn(Self::NAME, input.client_token.as_deref(), &arn);
+
+        Ok(CreatePricingRuleOutput { arn: Some(arn) })
     }
 }
