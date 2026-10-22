@@ -191,7 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(WriteRecordsErrorModeled::InternalServerException(
@@ -202,6 +202,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let resource = crate::state::audit_resource(&input.database_name, &input.table_name);
+
         // Merge and validate every record BEFORE touching the store, so a refused
         // request stores nothing at all.
         let mut merged = Vec::with_capacity(input.records.len());
@@ -210,6 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "`Version` must be `1` or greater, or you will receive a
             // `ValidationException` error." (model doc for `Record$Version`.)
             if stored.version < crate::state::MIN_RECORD_VERSION {
+                crate::state::audit(ctx.parts(), Self::NAME, &resource, "refused_invalid_version");
                 return Err(WriteRecordsErrorModeled::ValidationException(ValidationException {
                     message: format!(
                         "Records[{index}].Version must be 1 or greater, got {}",
@@ -227,6 +230,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get_mut(&input.database_name)
             .and_then(|database| database.tables.get_mut(&input.table_name));
         let Some(table) = table else {
+            crate::state::audit(ctx.parts(), Self::NAME, &resource, "refused_no_such_table");
             return Err(WriteRecordsErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(format!(
@@ -242,6 +246,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         table.ingest(merged);
         let accepted = table.records_ingested - before;
         let stored_count = i32::try_from(accepted).unwrap_or(i32::MAX);
+        crate::state::audit(ctx.parts(), Self::NAME, &resource, "ingested");
 
         // Counted from the table's own lifetime ingest counter, after the append: it
         // is the number of records this table actually accepted, and it stays exact

@@ -264,6 +264,44 @@ pub fn as_date_time(time: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from_secs_f64(secs)
 }
 
+/// The tracing target every audit record of this service is emitted under, so an
+/// operator can route or filter the audit stream on its own.
+pub const AUDIT_TARGET: &str = "audit";
+
+/// Emit one structured audit record for a state-changing operation.
+///
+/// Every mutating operation in this crate (`CreateDatabase`, `CreateTable`,
+/// `WriteRecords`, `DeleteTable`, `DeleteDatabase`) calls this on each of its terminal
+/// paths, so a destructive call leaves a local record whether it succeeded or was
+/// refused. The record carries the time, the caller's region and presented access key
+/// id (the request's source), the operation, the resource it names and the outcome.
+///
+/// It carries NO secret: the access key id is an identifier the caller already sent in
+/// the clear, read through the vendored [`::emulator_server::extract_akid`], and no
+/// signature, secret or request body is included.
+pub fn audit(parts: &::http::request::Parts, operation: &str, resource: &str, outcome: &str) {
+    let at_epoch_millis = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    ::tracing::info!(
+        target: AUDIT_TARGET,
+        service = "timestream-write",
+        operation,
+        resource,
+        outcome,
+        region = %request_region(parts),
+        access_key_id = %::emulator_server::extract_akid(&parts.headers),
+        at_epoch_millis = %at_epoch_millis,
+        "state-changing operation"
+    );
+}
+
+/// The resource an audit record names for a table: `<database>/<table>`.
+pub fn audit_resource(database_name: &str, table_name: &str) -> String {
+    format!("{database_name}/{table_name}")
+}
+
 /// Encode a pagination cursor — the key of the first item of the NEXT page — as an
 /// opaque `NextToken`.
 ///

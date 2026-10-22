@@ -101,6 +101,78 @@ fn error_code(body: &Value) -> String {
         .to_string()
 }
 
+// ---------------------------------------------------------------------------
+// Capturing this service's audit records
+// ---------------------------------------------------------------------------
+
+/// Where captured audit records land, one record per line. Process-wide, because a
+/// `tracing` global subscriber can only be installed once per process.
+static AUDIT_LOG: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Renders one event's fields as `name=value`, with no quoting, so the assertions
+/// below check the RECORD rather than some formatter's rendering of it.
+#[derive(Default)]
+struct AuditFields(String);
+
+impl tracing::field::Visit for AuditFields {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.push_str(&format!(" {}={value}", field.name()));
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        // `{:?}` quotes a string; strip the quotes so every field reads the same way
+        // whether it was recorded as a `&str`, a `Display` or a `Debug` value.
+        let rendered = format!("{value:?}");
+        let unquoted = rendered.trim_matches('"');
+        self.0.push_str(&format!(" {}={unquoted}", field.name()));
+    }
+}
+
+/// A minimal `tracing` subscriber that appends every event to [`AUDIT_LOG`].
+///
+/// Hand-written rather than pulled from a formatting crate for two reasons: the
+/// assertions get the event's own fields instead of a third-party text format that can
+/// change under them, and this test needs no dependency the crate does not already have.
+struct AuditCapture;
+
+impl tracing::Subscriber for AuditCapture {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut fields = AuditFields::default();
+        event.record(&mut fields);
+        let mut log = AUDIT_LOG.lock().expect("the audit log lock");
+        log.push_str(&format!("target={}{}\n", event.metadata().target(), fields.0));
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// Install the capture (once per process) and return a reader for everything captured
+/// so far.
+fn install_audit_capture() -> impl Fn() -> String {
+    static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        // `try_set_global_default` rather than `set_global_default`: another suite in
+        // this test binary installing one first is not a failure of this test, and the
+        // assertion on an empty capture below names that case.
+        let _ = tracing::subscriber::set_global_default(AuditCapture);
+    });
+    || AUDIT_LOG.lock().expect("the audit log lock").clone()
+}
+
 async fn create_database(emulator: &Emulator, name: &str) -> Value {
     emulator
         .ok("CreateDatabase", &json!({ "DatabaseName": name }))
@@ -1024,6 +1096,225 @@ async fn the_kms_key_id_is_stored_or_defaulted() {
              {created_key:?}, got {described:?}"
         );
     }
+}
+
+/// Every state-changing operation leaves a structured audit record naming the time,
+/// the caller's region and presented access key id, the operation, the resource and
+/// the outcome — including the refusals, and including the destructive operations.
+///
+/// The record carries no secret: the access key id is an identifier the caller sent in
+/// the clear, and no signature or request body is logged.
+#[tokio::test]
+async fn state_changing_operations_emit_an_audit_record() {
+    let captured = install_audit_capture();
+    let emulator = Emulator::in_region("eu-west-1");
+
+    // A name no other test uses, so the assertions read only this test's records even
+    // though the capture is process-wide and tests run in parallel.
+    let database = "audit_db";
+    let table = "audit_table";
+
+    create_database(&emulator, database).await;
+    // A refused create must be audited too.
+    let (status, _) = emulator
+        .call("CreateDatabase", &json!({ "DatabaseName": database }))
+        .await;
+    assert_eq!(status, 409, "case CreateDatabase(duplicate): expected 409");
+    create_table(&emulator, database, table).await;
+    emulator
+        .ok(
+            "WriteRecords",
+            &json!({
+                "DatabaseName": database,
+                "TableName": table,
+                "Records": [sample_record(0)],
+            }),
+        )
+        .await;
+    emulator
+        .ok(
+            "DeleteTable",
+            &json!({ "DatabaseName": database, "TableName": table }),
+        )
+        .await;
+    emulator
+        .ok("DeleteDatabase", &json!({ "DatabaseName": database }))
+        .await;
+
+    // Every OTHER refusal path the audit layer covers, each exercised against the
+    // now-deleted names so each one is a distinct outcome on the same resources.
+    let missing_table = json!({ "DatabaseName": database, "TableName": table });
+    for (operation, request, status) in [
+        ("CreateTable", missing_table.clone(), 404),
+        ("DeleteTable", missing_table.clone(), 404),
+        (
+            "WriteRecords",
+            json!({
+                "DatabaseName": database,
+                "TableName": table,
+                "Records": [sample_record(0)],
+            }),
+            404,
+        ),
+        (
+            "DeleteDatabase",
+            json!({ "DatabaseName": database }),
+            404,
+        ),
+    ] {
+        let (got, body) = emulator.call(operation, &request).await;
+        assert_eq!(
+            got, status,
+            "case {operation}(absent): expected {status}, got {got} with {body:?}"
+        );
+    }
+    // And the one refusal that is not a lookup failure: a record version below 1.
+    create_database(&emulator, database).await;
+    create_table(&emulator, database, table).await;
+    let mut bad_version = sample_record(0);
+    bad_version["Version"] = json!(0);
+    let (got, body) = emulator
+        .call(
+            "WriteRecords",
+            &json!({
+                "DatabaseName": database,
+                "TableName": table,
+                "Records": [bad_version],
+            }),
+        )
+        .await;
+    assert_eq!(
+        got, 400,
+        "case WriteRecords(Version 0): expected 400, got {got} with {body:?}"
+    );
+    // A duplicate table create, and a delete of a database that still holds one.
+    let (got, body) = emulator
+        .call(
+            "CreateTable",
+            &json!({ "DatabaseName": database, "TableName": table }),
+        )
+        .await;
+    assert_eq!(
+        got, 409,
+        "case CreateTable(duplicate): expected 409, got {got} with {body:?}"
+    );
+    let (got, body) = emulator
+        .call("DeleteDatabase", &json!({ "DatabaseName": database }))
+        .await;
+    assert_eq!(
+        got, 400,
+        "case DeleteDatabase(non-empty): expected 400, got {got} with {body:?}"
+    );
+
+    let log = captured();
+    assert!(
+        !log.is_empty(),
+        "the tracing capture received nothing: another subscriber may own this test \
+         binary's global default, so no audit record could be observed"
+    );
+    // (operation, resource, outcome) — one row per terminal path exercised above.
+    let expected = [
+        ("CreateDatabase", database.to_string(), "created"),
+        (
+            "CreateDatabase",
+            database.to_string(),
+            "refused_already_exists",
+        ),
+        ("CreateTable", format!("{database}/{table}"), "created"),
+        ("WriteRecords", format!("{database}/{table}"), "ingested"),
+        ("DeleteTable", format!("{database}/{table}"), "deleted"),
+        ("DeleteDatabase", database.to_string(), "deleted"),
+        (
+            "CreateTable",
+            format!("{database}/{table}"),
+            "refused_no_such_database",
+        ),
+        (
+            "DeleteTable",
+            format!("{database}/{table}"),
+            "refused_no_such_table",
+        ),
+        (
+            "WriteRecords",
+            format!("{database}/{table}"),
+            "refused_no_such_table",
+        ),
+        (
+            "DeleteDatabase",
+            database.to_string(),
+            "refused_no_such_database",
+        ),
+        (
+            "WriteRecords",
+            format!("{database}/{table}"),
+            "refused_invalid_version",
+        ),
+        (
+            "CreateTable",
+            format!("{database}/{table}"),
+            "refused_already_exists",
+        ),
+        (
+            "DeleteDatabase",
+            database.to_string(),
+            "refused_not_empty",
+        ),
+    ];
+
+    for (operation, resource, outcome) in expected {
+        let matching = log
+            .lines()
+            .find(|line| {
+                line.contains(&format!(" operation={operation} "))
+                    && line.contains(&format!(" resource={resource} "))
+                    && line.contains(&format!(" outcome={outcome} "))
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {operation}/{resource}/{outcome}: no audit record found in \
+                     the captured log: {log}"
+                )
+            });
+        // Each record is emitted on the `audit` target, so an operator can route the
+        // audit stream, and carries the caller's region, its presented access key id
+        // and a timestamp of its own.
+        for field in [
+            "target=audit",
+            "service=timestream-write",
+            "region=eu-west-1",
+            "access_key_id=AKIDEXAMPLE",
+            "at_epoch_millis=",
+        ] {
+            assert!(
+                matching.contains(field),
+                "case {operation}/{resource}/{outcome}: the audit record must carry \
+                 {field}, got {matching}"
+            );
+        }
+        // And no signing material.
+        for secret in ["Signature=", "SignedHeaders="] {
+            assert!(
+                !matching.contains(secret),
+                "case {operation}/{resource}/{outcome}: the audit record must not \
+                 carry {secret}, got {matching}"
+            );
+        }
+    }
+
+    // The region and the access key id are READ FROM THE REQUEST, not fixed: the same
+    // operation signed for another region records that other region.
+    let elsewhere = Emulator::in_region("us-west-2");
+    create_database(&elsewhere, "audit_db_west").await;
+    let log = captured();
+    let matching = log
+        .lines()
+        .find(|line| line.contains(" resource=audit_db_west "))
+        .unwrap_or_else(|| panic!("case us-west-2: no audit record found in: {log}"));
+    assert!(
+        matching.contains(" region=us-west-2 "),
+        "case us-west-2: the audit record must carry the region the request was \
+         signed for, got {matching}"
+    );
 }
 
 /// An operation this slice does not implement still answers 501, never an empty 200:

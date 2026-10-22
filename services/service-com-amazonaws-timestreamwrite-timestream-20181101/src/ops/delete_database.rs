@@ -165,7 +165,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteDatabaseErrorModeled::InternalServerException(
@@ -178,6 +178,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         let Some(database) = store.databases.get(&input.database_name) else {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &input.database_name,
+                "refused_no_such_database",
+            );
             return Err(DeleteDatabaseErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(format!(
@@ -193,6 +199,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // will be thrown." (Timestream Write API Reference, DeleteDatabase.)
         if !database.tables.is_empty() {
             let remaining = database.tables.len();
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &input.database_name,
+                "refused_not_empty",
+            );
             return Err(DeleteDatabaseErrorModeled::ValidationException(ValidationException {
                 message: format!(
                     "The database '{}' still contains {remaining} table(s); \
@@ -204,6 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         store.databases.remove(&input.database_name);
+        crate::state::audit(ctx.parts(), Self::NAME, &input.database_name, "deleted");
 
         Ok(DeleteDatabaseOutput)
     }
