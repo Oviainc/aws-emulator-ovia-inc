@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the modifiable settings the request carries to the stored cluster and
+//! reports the cluster back. `NewClusterIdentifier` re-keys the stored record and
+//! moves its endpoint hostname; the namespace ARN is the cluster's identity and
+//! survives the rename unchanged.
 //!
 //! ## Shape of an operation
 //!
@@ -266,7 +262,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `ModifyClusterError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#ModifyCluster")]
+// `DependentServiceUnavailableFault` is widened in: the model does not list it for
+// this operation, but the service declares the shape, and it is the only modelled
+// way to say "the control-plane store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#ModifyCluster",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum ModifyClusterErrorModeled {
     ClusterAlreadyExistsFault(ClusterAlreadyExistsFault),
@@ -291,6 +293,7 @@ pub enum ModifyClusterErrorModeled {
     UnauthorizedOperation(UnauthorizedOperation),
     UnsupportedOperationFault(UnsupportedOperationFault),
     UnsupportedOptionFault(UnsupportedOptionFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -344,18 +347,243 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyCluster"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(ModifyClusterErrorModeled::DependentServiceUnavailableFault(
+                DependentServiceUnavailableFault {
+                    message: Some(st::STORE_UNAVAILABLE.to_string()),
+                },
+            )
+            .into());
+        };
+        let region = st::request_region(ctx);
+
+        if let Some(new_identifier) = input.new_cluster_identifier.as_deref() {
+            if let Err(message) = st::check_identifier(
+                st::CLUSTER_IDENTIFIER_RULE,
+                "NewClusterIdentifier",
+                new_identifier,
+            ) {
+                return Err(crate::scaffolded::Scaffolded::validation(message));
+            }
+        }
+
+        let mut store = state.lock();
+        store.settle(::std::time::Instant::now());
+
+        let Some(position) = store.cluster_position(&input.cluster_identifier) else {
+            return Err(ModifyClusterErrorModeled::ClusterNotFoundFault(
+                ClusterNotFoundFault {
+                    message: Some(format!(
+                        "Cluster {} not found.",
+                        input.cluster_identifier
+                    )),
+                },
+            )
+            .into());
+        };
+
+        if let Some(new_identifier) = input.new_cluster_identifier.as_deref() {
+            if new_identifier != input.cluster_identifier
+                && store.cluster(new_identifier).is_some()
+            {
+                return Err(ModifyClusterErrorModeled::ClusterAlreadyExistsFault(
+                    ClusterAlreadyExistsFault {
+                        message: Some(format!("Cluster already exists: {new_identifier}")),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The node count and the cluster type describe one another, so both are
+        // resolved against the stored values by the one shared rule in `state.rs`
+        // before either is applied.
+        let stored_type = store.clusters[position].cluster_type.clone();
+        let stored_nodes = store.clusters[position]
+            .cluster
+            .number_of_nodes
+            .unwrap_or(1);
+        let (cluster_type, number_of_nodes) = match st::resolve_cluster_shape(
+            input.cluster_type.as_deref(),
+            input.number_of_nodes,
+            Some((stored_type.as_str(), stored_nodes)),
+        ) {
+            Ok(shape) => shape,
+            Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+        };
+
+        if let Some(automated_retention) = input.automated_snapshot_retention_period {
+            if !(st::AUTOMATED_RETENTION_BOUNDS.0..=st::AUTOMATED_RETENTION_BOUNDS.1)
+                .contains(&automated_retention)
+            {
+                return Err(ModifyClusterErrorModeled::InvalidRetentionPeriodFault(
+                    InvalidRetentionPeriodFault {
+                        message: Some(format!(
+                            "Invalid value for AutomatedSnapshotRetentionPeriod: {automated_retention}. It must be a value from {} to {}.",
+                            st::AUTOMATED_RETENTION_BOUNDS.0, st::AUTOMATED_RETENTION_BOUNDS.1
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+        if let Some(manual_retention) = input.manual_snapshot_retention_period {
+            if manual_retention != st::MANUAL_RETENTION_INDEFINITE
+                && !(st::MANUAL_RETENTION_BOUNDS.0..=st::MANUAL_RETENTION_BOUNDS.1)
+                    .contains(&manual_retention)
+            {
+                return Err(ModifyClusterErrorModeled::InvalidRetentionPeriodFault(
+                    InvalidRetentionPeriodFault {
+                        message: Some(format!(
+                            "Invalid value for ManualSnapshotRetentionPeriod: {manual_retention}. It must be either {} or an integer between {} and {}.",
+                            st::MANUAL_RETENTION_INDEFINITE,
+                            st::MANUAL_RETENTION_BOUNDS.0,
+                            st::MANUAL_RETENTION_BOUNDS.1
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "You can't use MasterUserPassword if ManageMasterPassword is true."
+        if input.manage_master_password == Some(true) && input.master_user_password.is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "MasterUserPassword cannot be supplied when ManageMasterPassword is true.",
+            ));
+        }
+
+        let stored = &mut store.clusters[position];
+        stored.cluster_type = cluster_type;
+        stored.cluster.number_of_nodes = Some(number_of_nodes);
+        if let Some(node_type) = input.node_type.clone() {
+            stored.cluster.node_type = Some(node_type);
+        }
+        if let Some(value) = input.automated_snapshot_retention_period {
+            stored.cluster.automated_snapshot_retention_period = Some(value);
+        }
+        if let Some(value) = input.manual_snapshot_retention_period {
+            stored.cluster.manual_snapshot_retention_period = Some(value);
+        }
+        if let Some(window) = input.preferred_maintenance_window.clone() {
+            stored.cluster.preferred_maintenance_window = Some(window);
+        }
+        if let Some(value) = input.allow_version_upgrade {
+            stored.cluster.allow_version_upgrade = Some(value);
+        }
+        if let Some(value) = input.publicly_accessible {
+            stored.cluster.publicly_accessible = Some(value);
+        }
+        if let Some(value) = input.enhanced_vpc_routing {
+            stored.cluster.enhanced_vpc_routing = Some(value);
+        }
+        if let Some(value) = input.encrypted {
+            stored.cluster.encrypted = Some(value);
+        }
+        if let Some(value) = input.kms_key_id.clone() {
+            stored.cluster.kms_key_id = Some(value);
+        }
+        if let Some(value) = input.cluster_version.clone() {
+            stored.cluster.cluster_version = Some(value);
+        }
+        if let Some(value) = input.maintenance_track_name.clone() {
+            stored.cluster.maintenance_track_name = Some(value);
+        }
+        if let Some(value) = input.availability_zone.clone() {
+            stored.cluster.availability_zone = Some(value);
+        }
+        if let Some(value) = input.ip_address_type.clone() {
+            stored.cluster.ip_address_type = Some(value);
+        }
+        if let Some(value) = input.multi_az {
+            stored.cluster.multi_az =
+                Some(if value { "Enabled" } else { "Disabled" }.to_string());
+        }
+        if let Some(value) = input.extra_compute_for_automatic_optimization {
+            stored.cluster.extra_compute_for_automatic_optimization = Some(value.to_string());
+        }
+        if let Some(value) = input.availability_zone_relocation {
+            stored.cluster.availability_zone_relocation_status =
+                Some(if value { "enabled" } else { "disabled" }.to_string());
+        }
+        if let Some(groups) = input.cluster_security_groups.clone() {
+            stored.cluster.cluster_security_groups = Some(
+                groups
+                    .into_iter()
+                    .map(|name| ClusterSecurityGroupMembership {
+                        cluster_security_group_name: Some(name),
+                        status: Some("active".to_string()),
+                    })
+                    .collect(),
+            );
+        }
+        if let Some(ids) = input.vpc_security_group_ids.clone() {
+            stored.cluster.vpc_security_groups = Some(
+                ids.into_iter()
+                    .map(|id| VpcSecurityGroupMembership {
+                        vpc_security_group_id: Some(id),
+                        status: Some("active".to_string()),
+                    })
+                    .collect(),
+            );
+        }
+        if let Some(name) = input.cluster_parameter_group_name.clone() {
+            stored.cluster.cluster_parameter_groups = Some(vec![ClusterParameterGroupStatus {
+                parameter_group_name: Some(name),
+                parameter_apply_status: Some("in-sync".to_string()),
+                cluster_parameter_status_list: None,
+            }]);
+        }
+        if input.hsm_client_certificate_identifier.is_some()
+            || input.hsm_configuration_identifier.is_some()
+        {
+            stored.cluster.hsm_status = Some(HsmStatus {
+                hsm_client_certificate_identifier: input
+                    .hsm_client_certificate_identifier
+                    .clone(),
+                hsm_configuration_identifier: input.hsm_configuration_identifier.clone(),
+                status: Some("active".to_string()),
+            });
+        }
+        if let Some(ip) = input.elastic_ip.clone() {
+            stored.cluster.elastic_ip_status = Some(ElasticIpStatus {
+                elastic_ip: Some(ip),
+                status: Some("active".to_string()),
+            });
+        }
+        if input.manage_master_password == Some(true) {
+            let identifier = stored
+                .cluster
+                .cluster_identifier
+                .clone()
+                .unwrap_or_default();
+            stored.cluster.master_password_secret_arn =
+                Some(st::master_password_secret_arn(&identifier, &region));
+            stored.cluster.master_password_secret_kms_key_id =
+                input.master_password_secret_kms_key_id.clone();
+            stored.master_user_password = None;
+        } else if let Some(password) = input.master_user_password.clone() {
+            // Stored only; the `Cluster` shape models no password member.
+            stored.master_user_password = Some(password);
+        }
+        // A port change moves the endpoint the caller connects to.
+        if let Some(port) = input.port {
+            let endpoint = stored.cluster.endpoint.get_or_insert_with(Endpoint::default);
+            endpoint.port = Some(port);
+        }
+        // Renaming re-keys the record and moves the endpoint hostname, which
+        // carries the cluster name. The namespace ARN is the cluster's identity
+        // and is left exactly as it was minted.
+        if let Some(new_identifier) = input.new_cluster_identifier.clone() {
+            stored.cluster.cluster_identifier = Some(new_identifier.clone());
+            let endpoint = stored.cluster.endpoint.get_or_insert_with(Endpoint::default);
+            endpoint.address = Some(st::endpoint_address(&new_identifier, &region));
+        }
+
+        Ok(ModifyClusterOutput {
+            cluster: Some(stored.cluster.clone()),
+        })
     }
 }

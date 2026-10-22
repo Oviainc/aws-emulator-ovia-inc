@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateClusterSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateClusterSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateClusterSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Copies the identifying attributes off the stored cluster into a new manual
+//! snapshot record and reports it back in the `creating` status, which the clock
+//! moves to `available`.
 //!
 //! ## Shape of an operation
 //!
@@ -102,7 +97,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `CreateClusterSnapshotError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#CreateClusterSnapshot")]
+// `DependentServiceUnavailableFault` is widened in: the model does not list it for
+// this operation, but the service declares the shape, and it is the only modelled
+// way to say "the control-plane store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#CreateClusterSnapshot",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum CreateClusterSnapshotErrorModeled {
     ClusterNotFoundFault(ClusterNotFoundFault),
@@ -112,6 +113,7 @@ pub enum CreateClusterSnapshotErrorModeled {
     InvalidRetentionPeriodFault(InvalidRetentionPeriodFault),
     InvalidTagFault(InvalidTagFault),
     TagLimitExceededFault(TagLimitExceededFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -165,18 +167,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateClusterSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateClusterSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateClusterSnapshot"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                CreateClusterSnapshotErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = st::request_region(ctx);
+        let started = ::std::time::Instant::now();
+        let created_at = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+
+        if let Err(message) = st::check_identifier(
+            st::SNAPSHOT_IDENTIFIER_RULE,
+            "SnapshotIdentifier",
+            &input.snapshot_identifier,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        let mut store = state.lock();
+        store.settle(started);
+
+        let Some(stored_cluster) = store.cluster(&input.cluster_identifier).cloned() else {
+            return Err(CreateClusterSnapshotErrorModeled::ClusterNotFoundFault(
+                ClusterNotFoundFault {
+                    message: Some(format!(
+                        "Cluster {} not found.",
+                        input.cluster_identifier
+                    )),
+                },
+            )
+            .into());
+        };
+        if store.snapshot(&input.snapshot_identifier).is_some() {
+            return Err(
+                CreateClusterSnapshotErrorModeled::ClusterSnapshotAlreadyExistsFault(
+                    ClusterSnapshotAlreadyExistsFault {
+                        message: Some(format!(
+                            "Cluster snapshot already exists: {}",
+                            input.snapshot_identifier
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // Identity before capacity: a request that would create nothing keeps the
+        // more specific fault even when the store is full.
+        if store.snapshots.len() >= st::SNAPSHOT_QUOTA {
+            return Err(
+                CreateClusterSnapshotErrorModeled::ClusterSnapshotQuotaExceededFault(
+                    ClusterSnapshotQuotaExceededFault {
+                        message: Some(format!(
+                            "The request would exceed the allowed number of cluster snapshots ({}).",
+                            st::SNAPSHOT_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Absent on the request, the snapshot inherits the cluster's default
+        // manual retention period.
+        let manual_retention = input.manual_snapshot_retention_period.unwrap_or_else(|| {
+            stored_cluster
+                .cluster
+                .manual_snapshot_retention_period
+                .unwrap_or(st::MANUAL_RETENTION_INDEFINITE)
+        });
+        if manual_retention != st::MANUAL_RETENTION_INDEFINITE
+            && !(st::MANUAL_RETENTION_BOUNDS.0..=st::MANUAL_RETENTION_BOUNDS.1)
+                .contains(&manual_retention)
+        {
+            return Err(CreateClusterSnapshotErrorModeled::InvalidRetentionPeriodFault(
+                InvalidRetentionPeriodFault {
+                    message: Some(format!(
+                        "Invalid value for ManualSnapshotRetentionPeriod: {manual_retention}. It must be either {} or an integer between {} and {}.",
+                        st::MANUAL_RETENTION_INDEFINITE,
+                        st::MANUAL_RETENTION_BOUNDS.0,
+                        st::MANUAL_RETENTION_BOUNDS.1
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let snapshot = st::snapshot_of(
+            &stored_cluster.cluster,
+            &input.snapshot_identifier,
+            created_at,
+            manual_retention,
+            input.tags.clone().unwrap_or_default(),
+            &region,
+        );
+        store.snapshots.push(st::StoredSnapshot {
+            snapshot: snapshot.clone(),
+            available_at: started + st::PROVISIONING_SPAN,
+        });
+
+        Ok(CreateClusterSnapshotOutput {
+            snapshot: Some(snapshot),
+        })
     }
 }

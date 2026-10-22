@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the cluster from this service's store and reports it back with
+//! `ClusterStatus="deleting"`. Unless `SkipFinalClusterSnapshot` is true a final
+//! manual snapshot is taken first, under the `FinalClusterSnapshotIdentifier` the
+//! request must then supply, and stays visible through
+//! `DescribeClusterSnapshots` after the cluster is gone.
 //!
 //! ## Shape of an operation
 //!
@@ -115,7 +112,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `DeleteClusterError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DeleteCluster")]
+// `DependentServiceUnavailableFault` is widened in: the model does not list it for
+// this operation, but the service declares the shape, and it is the only modelled
+// way to say "the control-plane store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DeleteCluster",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DeleteClusterErrorModeled {
     ClusterNotFoundFault(ClusterNotFoundFault),
@@ -123,6 +126,7 @@ pub enum DeleteClusterErrorModeled {
     ClusterSnapshotQuotaExceededFault(ClusterSnapshotQuotaExceededFault),
     InvalidClusterStateFault(InvalidClusterStateFault),
     InvalidRetentionPeriodFault(InvalidRetentionPeriodFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -176,18 +180,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCluster"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(DeleteClusterErrorModeled::DependentServiceUnavailableFault(
+                DependentServiceUnavailableFault {
+                    message: Some(st::STORE_UNAVAILABLE.to_string()),
+                },
+            )
+            .into());
+        };
+        let region = st::request_region(ctx);
+        let started = ::std::time::Instant::now();
+        let created_at = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+
+        // "The FinalClusterSnapshotIdentifier parameter must be specified if
+        // SkipFinalClusterSnapshot is false. Default: false"
+        let skip_final = input.skip_final_cluster_snapshot.unwrap_or(false);
+        let final_identifier = match (skip_final, input.final_cluster_snapshot_identifier.as_deref())
+        {
+            (false, None) => {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "FinalClusterSnapshotIdentifier must be specified unless SkipFinalClusterSnapshot is true.",
+                ))
+            }
+            (true, Some(_)) => {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "FinalClusterSnapshotIdentifier cannot be specified when SkipFinalClusterSnapshot is true.",
+                ))
+            }
+            (true, None) => None,
+            (false, Some(identifier)) => {
+                if let Err(message) = st::check_identifier(
+                    st::SNAPSHOT_IDENTIFIER_RULE,
+                    "FinalClusterSnapshotIdentifier",
+                    identifier,
+                ) {
+                    return Err(crate::scaffolded::Scaffolded::validation(message));
+                }
+                Some(identifier.to_string())
+            }
+        };
+
+        let final_retention = input
+            .final_cluster_snapshot_retention_period
+            .unwrap_or(st::MANUAL_RETENTION_INDEFINITE);
+        if final_identifier.is_some()
+            && final_retention != st::MANUAL_RETENTION_INDEFINITE
+            && !(st::MANUAL_RETENTION_BOUNDS.0..=st::MANUAL_RETENTION_BOUNDS.1)
+                .contains(&final_retention)
+        {
+            return Err(DeleteClusterErrorModeled::InvalidRetentionPeriodFault(
+                InvalidRetentionPeriodFault {
+                    message: Some(format!(
+                        "Invalid value for FinalClusterSnapshotRetentionPeriod: {final_retention}. It must be either {} or an integer between {} and {}.",
+                        st::MANUAL_RETENTION_INDEFINITE,
+                        st::MANUAL_RETENTION_BOUNDS.0,
+                        st::MANUAL_RETENTION_BOUNDS.1
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        store.settle(started);
+
+        let Some(position) = store.cluster_position(&input.cluster_identifier) else {
+            return Err(DeleteClusterErrorModeled::ClusterNotFoundFault(
+                ClusterNotFoundFault {
+                    message: Some(format!(
+                        "Cluster {} not found.",
+                        input.cluster_identifier
+                    )),
+                },
+            )
+            .into());
+        };
+        if let Some(identifier) = final_identifier.as_deref() {
+            if store.snapshot(identifier).is_some() {
+                return Err(DeleteClusterErrorModeled::ClusterSnapshotAlreadyExistsFault(
+                    ClusterSnapshotAlreadyExistsFault {
+                        message: Some(format!(
+                            "Cluster snapshot already exists: {identifier}"
+                        )),
+                    },
+                )
+                .into());
+            }
+            // Identity before capacity, as in CreateClusterSnapshot.
+            if store.snapshots.len() >= st::SNAPSHOT_QUOTA {
+                return Err(
+                    DeleteClusterErrorModeled::ClusterSnapshotQuotaExceededFault(
+                        ClusterSnapshotQuotaExceededFault {
+                            message: Some(format!(
+                                "The request would exceed the allowed number of cluster snapshots ({}).",
+                                st::SNAPSHOT_QUOTA
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let mut removed = store.clusters.remove(position);
+        removed.cluster.cluster_status = Some(st::STATUS_DELETING.to_string());
+        removed.cluster.cluster_availability_status =
+            Some(st::availability_status(st::STATUS_DELETING).to_string());
+        // The stored password dies with the record.
+        removed.master_user_password = None;
+
+        if let Some(identifier) = final_identifier {
+            let snapshot = st::snapshot_of(
+                &removed.cluster,
+                &identifier,
+                created_at,
+                final_retention,
+                removed.cluster.tags.clone().unwrap_or_default(),
+                &region,
+            );
+            store.snapshots.push(st::StoredSnapshot {
+                snapshot,
+                available_at: started + st::PROVISIONING_SPAN,
+            });
+        }
+
+        Ok(DeleteClusterOutput {
+            cluster: Some(removed.cluster),
+        })
     }
 }
