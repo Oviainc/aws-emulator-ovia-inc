@@ -3,7 +3,9 @@
 //! @op StartWorkspaces
 //!
 //! Implemented: each stored WorkSpace that is `STOPPED` enters `STARTING` and settles to
-//! `AVAILABLE`; every other request is reported per item in `FailedRequests`.
+//! `AVAILABLE`; every other request is reported per item in `FailedRequests`, under a 200,
+//! with one of the per-item `ErrorType` codes `crate::state` declares (`ERROR_CODE_*`) —
+//! this operation models no errors, so nothing here answers an exception shape name.
 //!
 //! ## Shape of an operation
 //!

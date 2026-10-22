@@ -17,6 +17,9 @@ mod account_byol_configuration;
 #[path = "all/account_links.rs"]
 mod account_links;
 
+#[path = "all/batch_per_item_error_codes.rs"]
+mod batch_per_item_error_codes;
+
 #[path = "all/connection_alias_lifecycle.rs"]
 mod connection_alias_lifecycle;
 

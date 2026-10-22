@@ -4,7 +4,9 @@
 //!
 //! Implemented: each stored WorkSpace enters `TERMINATING` and is dropped from the store
 //! once the clock owes the completed termination; an id that names no stored WorkSpace is
-//! reported per item in `FailedRequests`.
+//! reported per item in `FailedRequests`, under a 200, with the per-item `ErrorType` code
+//! `crate::state::ERROR_CODE_WORKSPACE_NOT_FOUND` — this operation models no errors, so nothing here
+//! answers an exception shape name.
 //!
 //! ## Shape of an operation
 //!
