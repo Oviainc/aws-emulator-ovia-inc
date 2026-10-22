@@ -180,6 +180,15 @@ pub mod messages {
         format!("MatchingWorkflow {workflow_name} does not exist")
     }
 
+    /// `UpdateMatchingWorkflow`'s `ResourceNotFoundException$message` (HTTP 404) when
+    /// no workflow carries the `workflowName` @httpLabel. Not itself recorded; it is
+    /// this operation's own constant. `UpdateMatchingWorkflow` addresses the SAME
+    /// resource by the SAME key as `GetMatchingWorkflow` ("The workflow must already
+    /// exist for this operation to succeed"), and AWS's text for that lookup names no
+    /// resource name, so this follows the recorded
+    /// [`GET_MATCHING_WORKFLOW_NOT_FOUND`] form rather than the templated delete one.
+    pub const UPDATE_MATCHING_WORKFLOW_NOT_FOUND: &str = "MatchingWorkflow Not Found";
+
     /// `DeleteSchemaMapping`'s `ResourceNotFoundException$message` (HTTP 404) — the
     /// refusal its doc describes ("This operation returns a ResourceNotFoundException
     /// if a schema with the given name does not exist"). Not itself recorded; this
@@ -238,6 +247,38 @@ pub const ID_MAPPING_WORKFLOWS_QUOTA_NAME: &str = "ID mapping workflows";
 /// without a panic so a handler stays total.
 pub fn quota_value(maximum: usize) -> Option<i32> {
     i32::try_from(maximum).ok()
+}
+
+/// The `ResolutionType` for which matching workflows have no incremental processing.
+///
+/// One of the values `ResolutionType` admits
+/// (`RESOLUTION_TYPE_VALUES` = `ML_MATCHING | PROVIDER | RULE_MATCHING`); named here
+/// because [`incremental_run_conflict`] is the one place the service branches on it.
+pub const PROVIDER_RESOLUTION_TYPE: &str = "PROVIDER";
+
+/// Why a matching-workflow request pairing an `incrementalRunConfig` with
+/// `resolutionTechniques.resolutionType` `PROVIDER` is refused — `None` when the
+/// combination is allowed.
+///
+/// Both `CreateMatchingWorkflow` and `UpdateMatchingWorkflow` document the same rule,
+/// on the operation itself and on the member: "For workflows where `resolutionType`
+/// is `PROVIDER`, incremental processing is not supported"
+/// (`smithy_query(query="doc",shape="UpdateMatchingWorkflowInput",member="incrementalRunConfig")`).
+/// The model cannot express a condition ACROSS two members, so the boundary validator
+/// passes such a request and the handlers refuse it with the modelled
+/// `ValidationException` (HTTP 400). The message is built from the request: it names
+/// the member that cannot be carried and the `resolutionType` value the request
+/// carried, which is what a caller needs to fix it.
+pub fn incremental_run_conflict(
+    resolution_type: &str,
+    incremental_run_config: Option<&IncrementalRunConfig>,
+) -> Option<String> {
+    (incremental_run_config.is_some() && resolution_type == PROVIDER_RESOLUTION_TYPE).then(|| {
+        format!(
+            "incrementalRunConfig is not supported for a MatchingWorkflow whose \
+             resolutionTechniques.resolutionType is {resolution_type}"
+        )
+    })
 }
 
 impl ComAmazonawsEntityresolutionAwsveniceserviceState {

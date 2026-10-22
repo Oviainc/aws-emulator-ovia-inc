@@ -139,6 +139,21 @@ impl Emulator {
             .await
     }
 
+    /// `UpdateMatchingWorkflow` — `PUT /matchingworkflows/{workflowName}`, with the
+    /// name as the `@httpLabel` and the new configuration as the body.
+    pub(crate) async fn update_matching_workflow(
+        &self,
+        workflow_name: &str,
+        request: &Value,
+    ) -> Reply {
+        self.call(
+            "PUT",
+            &format!("/matchingworkflows/{workflow_name}"),
+            Some(request),
+        )
+        .await
+    }
+
     pub(crate) async fn delete_matching_workflow(&self, workflow_name: &str) -> Reply {
         self.call(
             "DELETE",
