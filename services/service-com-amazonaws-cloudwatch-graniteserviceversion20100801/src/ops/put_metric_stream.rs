@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutMetricStream
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutMetricStream`'s real behaviour. Implement it here — this is
+//! Creates or updates a metric stream in this service's store. Implemented here, and
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutMetricStream::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -206,18 +199,372 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutMetricStream` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutMetricStreamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutMetricStream"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutMetricStreamErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the CloudWatch metric stream store is unavailable".into()),
+            })
+        })?;
+
+        // Each rule below is one the MODEL cannot express, so the request reaches this
+        // handler having satisfied every modelled constraint already: `Name`'s 1..255
+        // length, both ARNs' 1..1024 length, and `OutputFormat` being one of
+        // `METRIC_STREAM_OUTPUT_FORMAT_VALUES`. None of those is re-checked here.
+        validate_name(&input.name)?;
+        let (include_filters, exclude_filters) = validate_filters(&input)?;
+        validate_statistics_configurations(&input)?;
+        validate_tags(input.tags.as_deref())?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_secs();
+        let mut store = state.lock();
+
+        // "When you use PutMetricStream to create a new metric stream, the stream is
+        // created in the running state. If you use it to update an existing stream, the
+        // state of the stream is not changed." The tags of an existing stream are kept too:
+        // "You can use this parameter only when you are creating a new metric stream. If
+        // you are updating an existing metric stream, any tags you specify in this
+        // parameter are ignored." (`PutMetricStreamInput$Tags`)
+        let existing = store.metric_streams.get(&input.name).map(|stored| {
+            (
+                stored.stream.state.clone(),
+                stored.stream.creation_date,
+                stored.tags.clone(),
+            )
+        });
+        // A capacity bound on this in-memory store, not an AWS quota, and this operation
+        // models no limit error: a store that cannot hold the stream has failed to serve
+        // the request, which is what its server fault reports.
+        if existing.is_none() && store.metric_streams.len() >= crate::state::MAX_METRIC_STREAMS {
+            return Err(
+                PutMetricStreamErrorModeled::InternalServiceFault(InternalServiceFault {
+                    message: Some(format!(
+                        "this emulator holds at most {} metric streams",
+                        crate::state::MAX_METRIC_STREAMS
+                    )),
+                })
+                .into(),
+            );
+        }
+        let (stream_state, creation_date, tags) = existing.unwrap_or_else(|| {
+            (
+                Some(crate::state::METRIC_STREAM_RUNNING.to_string()),
+                Some(crate::state::to_timestamp(now)),
+                input.tags.clone().unwrap_or_default(),
+            )
+        });
+
+        let arn = crate::state::metric_stream_arn(&region, &input.name);
+        store.metric_streams.insert(
+            input.name.clone(),
+            crate::state::StoredMetricStream {
+                // Stored as the shape its reader returns, so every member this operation
+                // accepts round-trips through `GetMetricStream` unchanged.
+                stream: GetMetricStreamOutput {
+                    arn: Some(arn.clone()),
+                    name: Some(input.name.clone()),
+                    include_filters,
+                    exclude_filters,
+                    firehose_arn: Some(input.firehose_arn.clone()),
+                    role_arn: Some(input.role_arn.clone()),
+                    state: stream_state,
+                    creation_date,
+                    last_update_date: Some(crate::state::to_timestamp(now)),
+                    output_format: Some(input.output_format.clone()),
+                    statistics_configurations: input.statistics_configurations.clone(),
+                    include_linked_accounts_metrics: input.include_linked_accounts_metrics,
+                },
+                tags,
+            },
+        );
+
+        Ok(PutMetricStreamOutput { arn: Some(arn) })
+    }
+}
+
+/// Refuse the request with this operation's modelled `InvalidParameterValueException`
+/// (HTTP 400): "The value of an input parameter is bad or out-of-range."
+fn invalid_parameter_value(message: String) -> PutMetricStreamError {
+    PutMetricStreamErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The characters a stream name may use: "Valid characters are A-Z, a-z, 0-9, \"-\" and
+/// \"_\"." (`PutMetricStreamInput$Name`) — prose the model carries no `pattern` for, so the
+/// boundary validator cannot refuse it.
+fn validate_name(name: &str) -> Result<(), PutMetricStreamError> {
+    if name
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_')
+    {
+        return Ok(());
+    }
+    Err(invalid_parameter_value(format!(
+        "The value {name} for parameter Name is not valid: valid characters are A-Z, a-z, 0-9, \
+         \"-\" and \"_\""
+    )))
+}
+
+/// Either of the two namespace filter lists a stream can carry.
+type Filters = Option<Vec<MetricStreamFilter>>;
+
+/// The namespace filters to store, refusing the one combination the operation forbids:
+/// "You cannot include ExcludeFilters and IncludeFilters in the same operation."
+///
+/// A filter list that arrived empty is stored as no filter at all: with neither filter the
+/// stream "sends metrics from all metric namespaces in the account", which is exactly what
+/// an empty list selects, and that is also why an empty list is not "included" for the
+/// purpose of the combination rule.
+fn validate_filters(
+    input: &PutMetricStreamInput,
+) -> Result<(Filters, Filters), PutMetricStreamError> {
+    let include = filters_given(input.include_filters.as_deref());
+    let exclude = filters_given(input.exclude_filters.as_deref());
+    if include.is_some() && exclude.is_some() {
+        return Err(
+            PutMetricStreamErrorModeled::InvalidParameterCombinationException(
+                InvalidParameterCombinationException {
+                    message: Some(
+                        "IncludeFilters and ExcludeFilters cannot be used in the same operation"
+                            .into(),
+                    ),
+                },
+            )
+            .into(),
+        );
+    }
+    Ok((include, exclude))
+}
+
+/// A filter list the request actually constrains the stream with, or `None`.
+fn filters_given(filters: Option<&[MetricStreamFilter]>) -> Filters {
+    filters
+        .filter(|list| !list.is_empty())
+        .map(<[MetricStreamFilter]>::to_vec)
+}
+
+/// "This array can have up to 100 members." (`PutMetricStreamInput$StatisticsConfigurations`)
+const MAX_STATISTICS_CONFIGURATIONS: usize = 100;
+
+/// "This list can include as many as 20 statistics."
+/// (`MetricStreamStatisticsConfiguration$AdditionalStatistics`)
+const MAX_ADDITIONAL_STATISTICS: usize = 20;
+
+/// "You can associate as many as 50 tags with a metric stream." (`PutMetricStreamInput$Tags`)
+const MAX_TAGS: usize = 50;
+
+/// Refuse a statistics configuration the stream's output format cannot carry.
+///
+/// "If the `OutputFormat` for the stream is `opentelemetry1.0` or `opentelemetry0.7`, the
+/// only valid values are `p??` percentile statistics such as `p90`, `p99` and so on. If the
+/// `OutputFormat` for the stream is `json`, the valid values include the abbreviations for
+/// all of the statistics listed in CloudWatch statistics definitions."
+/// (`MetricStreamStatisticsConfiguration$AdditionalStatistics`)
+fn validate_statistics_configurations(
+    input: &PutMetricStreamInput,
+) -> Result<(), PutMetricStreamError> {
+    let configurations = input.statistics_configurations.as_deref().unwrap_or(&[]);
+    if configurations.len() > MAX_STATISTICS_CONFIGURATIONS {
+        return Err(invalid_parameter_value(format!(
+            "StatisticsConfigurations can have at most {MAX_STATISTICS_CONFIGURATIONS} members; \
+             got {}",
+            configurations.len()
+        )));
+    }
+    let percentiles_only = is_opentelemetry_format(&input.output_format);
+    for configuration in configurations {
+        if configuration.additional_statistics.len() > MAX_ADDITIONAL_STATISTICS {
+            return Err(invalid_parameter_value(format!(
+                "AdditionalStatistics can include at most {MAX_ADDITIONAL_STATISTICS} \
+                 statistics; got {}",
+                configuration.additional_statistics.len()
+            )));
+        }
+        for statistic in &configuration.additional_statistics {
+            let supported = if percentiles_only {
+                percentile_statistic(statistic).is_some()
+            } else {
+                is_cloudwatch_statistic(statistic)
+            };
+            if !supported {
+                return Err(invalid_parameter_value(format!(
+                    "The additional statistic {statistic} is not supported for metric streams \
+                     with the output format {}",
+                    input.output_format
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// At most [`MAX_TAGS`] tags may be associated with a metric stream.
+fn validate_tags(tags: Option<&[Tag]>) -> Result<(), PutMetricStreamError> {
+    let count = tags.map_or(0, <[Tag]>::len);
+    if count > MAX_TAGS {
+        return Err(invalid_parameter_value(format!(
+            "a metric stream can be associated with at most {MAX_TAGS} tags; got {count}"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `format` is one of the OpenTelemetry output formats, which carry percentile
+/// statistics only. `MetricStreamOutputFormat` accepts `json`, `opentelemetry0.7` and
+/// `opentelemetry1.0` (`METRIC_STREAM_OUTPUT_FORMAT_VALUES`), and the boundary validator has
+/// already refused anything else.
+fn is_opentelemetry_format(format: &str) -> bool {
+    format.starts_with("opentelemetry")
+}
+
+/// The percentile a `p??` statistic names, in percent: `p90` is 90 and `p99.9` is 99.9.
+/// `None` for anything that is not a percentile statistic.
+fn percentile_statistic(statistic: &str) -> Option<f64> {
+    percentage(strip_prefix_ignore_ascii_case(statistic, "p")?)
+}
+
+/// The statistics CloudWatch names outright on the "CloudWatch statistics definitions" page
+/// `MetricStreamStatisticsConfiguration$AdditionalStatistics` points at for the `json`
+/// output format: the five basic statistics and the interquartile mean.
+const BASIC_STATISTICS: &[&str] = &["SampleCount", "Average", "Sum", "Minimum", "Maximum", "IQM"];
+
+/// The statistic families from the same page that take a trimming span, either as a bare
+/// percentile ("this includes tm98, wm90") or as a span: trimmed mean, trimmed count,
+/// trimmed sum and Winsorized mean.
+const TRIMMED_FAMILIES: &[&str] = &["tm", "tc", "ts", "wm"];
+
+/// The percentile-rank family from the same page, which takes a span of metric VALUES
+/// rather than a percentile ("and `PR(:300)`").
+const RANK_FAMILIES: &[&str] = &["pr"];
+
+/// Whether `statistic` is one CloudWatch supports, which is what a `json` metric stream may
+/// carry: a basic statistic, a percentile, or a member of a bounded family.
+fn is_cloudwatch_statistic(statistic: &str) -> bool {
+    BASIC_STATISTICS
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(statistic))
+        || percentile_statistic(statistic).is_some()
+        || bounded_statistic(statistic)
+}
+
+/// A statistic of one of the bounded families, in either documented form:
+/// `<family><percentile>` (`tm98`) or `<family>(<low>:<high>)` (`TM(10%:90%)`, `PR(:300)`),
+/// where one side of a span may be omitted but not both.
+fn bounded_statistic(statistic: &str) -> bool {
+    if let Some(open) = statistic.find('(') {
+        let (family, span) = statistic.split_at(open);
+        return TRIMMED_FAMILIES
+            .iter()
+            .chain(RANK_FAMILIES)
+            .any(|known| known.eq_ignore_ascii_case(family))
+            && is_span(span);
+    }
+    TRIMMED_FAMILIES.iter().any(|family| {
+        strip_prefix_ignore_ascii_case(statistic, family)
+            .and_then(percentage)
+            .is_some()
+    })
+}
+
+/// Whether `span` is a `(<low>:<high>)` bound pair with at least one bound given.
+fn is_span(span: &str) -> bool {
+    let Some(inner) = span
+        .strip_prefix('(')
+        .and_then(|rest| rest.strip_suffix(')'))
+    else {
+        return false;
+    };
+    let Some((low, high)) = inner.split_once(':') else {
+        return false;
+    };
+    !(low.is_empty() && high.is_empty())
+        && [low, high]
+            .iter()
+            .all(|bound| bound.is_empty() || bound_value(bound).is_some())
+}
+
+/// One bound of a span: a percentage when it carries a `%`, otherwise a plain metric value.
+fn bound_value(bound: &str) -> Option<f64> {
+    match bound.strip_suffix('%') {
+        Some(percent) => percentage(percent),
+        None => decimal(bound),
+    }
+}
+
+/// A percentage: a decimal in 0..=100.
+fn percentage(text: &str) -> Option<f64> {
+    decimal(text).filter(|value| (0.0..=100.0).contains(value))
+}
+
+/// A plain non-negative decimal number, so `f64`'s sign and exponent forms (`+5`, `1e3`,
+/// `inf`) cannot slip through where a statistic's bound is expected.
+fn decimal(text: &str) -> Option<f64> {
+    if text.is_empty()
+        || !text
+            .chars()
+            .all(|character| character.is_ascii_digit() || character == '.')
+    {
+        return None;
+    }
+    text.parse().ok()
+}
+
+/// `text` without `prefix`, comparing the prefix without regard to ASCII case.
+fn strip_prefix_ignore_ascii_case<'text>(text: &'text str, prefix: &str) -> Option<&'text str> {
+    let head = text.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &text[prefix.len()..])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percentile_statistics_are_recognised_by_form() {
+        for statistic in ["p0", "p90", "p99.9", "p100", "P95"] {
+            assert!(
+                percentile_statistic(statistic).is_some(),
+                "case {statistic:?}: expected a percentile, got None"
+            );
+        }
+        for statistic in ["p101", "p", "pp9", "Average", "tm98", "p1e2", "p+9"] {
+            assert!(
+                percentile_statistic(statistic).is_none(),
+                "case {statistic:?}: expected no percentile, got {:?}",
+                percentile_statistic(statistic)
+            );
+        }
+    }
+
+    #[test]
+    fn cloudwatch_statistics_cover_the_documented_forms() {
+        for statistic in [
+            "Average",
+            "SampleCount",
+            "Sum",
+            "Minimum",
+            "Maximum",
+            "IQM",
+            "p99",
+            "tm98",
+            "wm90",
+            "TM(10%:90%)",
+            "PR(:300)",
+            "ts(100:)",
+            "TC(0.5:2.5)",
+        ] {
+            assert!(
+                is_cloudwatch_statistic(statistic),
+                "case {statistic:?}: expected a supported statistic, got unsupported"
+            );
+        }
+        for statistic in ["Median", "tm", "tm110", "TM(:)", "PR(300)", "PR(a:b)", ""] {
+            assert!(
+                !is_cloudwatch_statistic(statistic),
+                "case {statistic:?}: expected an unsupported statistic, got supported"
+            );
+        }
     }
 }

@@ -4,15 +4,27 @@
 //! IMPLEMENTED: allocates a stack id, persists the stack (template body verbatim,
 //! parameters, tags, capabilities, notification ARNs, stack policy and the rest of the
 //! request's configuration) in this service's store, records its `CREATE_IN_PROGRESS`
-//! event and answers the stack id. A request naming a live stack's name is refused with
-//! the modelled `AlreadyExistsException`.
+//! event and answers the stack id. The template is then DEPLOYED: each resource it
+//! declares becomes a stack-resource record carrying the physical resource id
+//! CloudFormation's documented naming rules give it, and each declared output is
+//! evaluated against those resources and the stack's parameters, which is what
+//! `DescribeStacks` reports once the create completes. A request naming a live stack's
+//! name is refused with the modelled `AlreadyExistsException`.
 //!
-//! Two members are stored but have nothing to act on in this slice, which creates no
-//! stack RESOURCES: `StackPolicyBody` (a stack policy governs which resources an update
-//! may change; `GetStackPolicy` reports it back) and `ResourceTypes` (which resource
-//! types the stack's operations may work with). `DisableValidation` turns off
-//! pre-deployment template validation, which this emulator does not perform either way.
-//! `StackPolicyURL` names a policy in Amazon S3 and is answered 501, like `TemplateURL`.
+//! Members this handler stores but does not act on: `StackPolicyBody` (a stack policy
+//! governs which resources an update may change; `GetStackPolicy` reports it back) and
+//! `ResourceTypes` (which resource types the stack's operations may work with).
+//! `DisableValidation` turns off pre-deployment template validation, which this emulator
+//! does not perform either way. `StackPolicyURL` names a policy in Amazon S3 and is
+//! answered 501, like `TemplateURL`.
+//!
+//! Three gaps are deliberate and predate the output evaluation, so a test author can see
+//! them: `ClientRequestToken` is stored as the operation's token but not checked for
+//! reuse, so the modelled `TokenAlreadyExistsException` is never answered; `Capabilities`
+//! is stored but not weighed against the template's resource types, so
+//! `InsufficientCapabilitiesException` is never answered; and a `TemplateBody` that is
+//! neither JSON nor YAML is stored (and declares no resources and no outputs) rather than
+//! refused with a template-format `ValidationError`.
 //!
 //! ## Shape of an operation
 //!
@@ -366,40 +378,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
-        let mut store = state.lock();
-        store.settle(now);
 
-        // "The name must be unique in the Region in which you are creating the stack" —
-        // unique among the LIVE stacks: a name is free again once its stack's deletion
-        // has completed.
-        if store
-            .live_stacks()
-            .any(|stack| stack.stack_name == input.stack_name)
-        {
-            return Err(CreateStackErrorModeled::AlreadyExistsException(
-                AlreadyExistsException {
-                    message: Some(format!("Stack [{}] already exists", input.stack_name)),
-                },
-            )
-            .into());
-        }
-
-        // "The quota for the resource has already been reached": the store holds at most
-        // `MAX_STACKS` live stacks, which is what bounds its growth.
-        if store.live_stacks().count() >= crate::state::MAX_STACKS {
-            return Err(CreateStackErrorModeled::LimitExceededException(
-                LimitExceededException {
-                    message: Some(format!(
-                        "Limit for stacks exceeded: no more than {} stacks can exist in this \
-                         account and Region",
-                        crate::state::MAX_STACKS
-                    )),
-                },
-            )
-            .into());
-        }
-
-        // Validated and within quota: from here the call allocates.
+        // The stack record, built and its template DEPLOYED before the store is locked:
+        // reading a caller-sized template body and evaluating its expressions is work the
+        // request paid for, and doing it outside the critical section keeps one caller's
+        // template from holding the lock every other CloudFormation request needs. The
+        // stack id is minted here too (it is drawn, not read from the store), so nothing
+        // below the lock has to compute anything from the body.
         let operation_id = crate::state::new_operation_id();
         let mut stack = StoredStack::new(
             crate::state::new_stack_id(&region, &input.stack_name),
@@ -407,6 +392,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             template_body,
             now,
         );
+        stack.region = region;
         stack.parameters = parameters;
         stack.capabilities = input.capabilities.clone().unwrap_or_default();
         stack.tags = crate::state::stored_tags(input.tags.as_deref().unwrap_or_default());
@@ -426,6 +412,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         stack.client_request_token = input.client_request_token.clone();
         stack.stack_policy_body = input.stack_policy_body.clone();
         stack.resource_types = input.resource_types.clone().unwrap_or_default();
+        // Everything the template's resources and outputs are computed from is now in
+        // place: materialise the resources it declares and evaluate its outputs, which
+        // `DescribeStacks` reports once the create completes.
+        stack.deploy_template();
+
+        let mut store = state.lock();
+        store.settle(now);
+
+        // "The name must be unique in the Region in which you are creating the stack" —
+        // unique among the LIVE stacks: a name is free again once its stack's deletion
+        // has completed.
+        if store
+            .live_stacks()
+            .any(|live| live.stack_name == input.stack_name)
+        {
+            return Err(CreateStackErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    message: Some(format!("Stack [{}] already exists", input.stack_name)),
+                },
+            )
+            .into());
+        }
+
+        // "The quota for the resource has already been reached": the store holds at most
+        // `MAX_STACKS` live stacks, which is what bounds its growth. Nothing above this
+        // point touched the store, so a refused request leaves it exactly as it was.
+        if store.live_stacks().count() >= crate::state::MAX_STACKS {
+            return Err(CreateStackErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Limit for stacks exceeded: no more than {} stacks can exist in this \
+                         account and Region",
+                        crate::state::MAX_STACKS
+                    )),
+                },
+            )
+            .into());
+        }
+
         // "After the call completes successfully, the stack creation starts": the stack
         // is answered in CREATE_IN_PROGRESS and settles to CREATE_COMPLETE once the
         // clock makes that due.

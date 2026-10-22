@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ImportSshPublicKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ImportSshPublicKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ImportSshPublicKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds an SSH public key to a STORED user, minting the key's `SshPublicKeyId` and
+//! dating it with this call, so `DescribeUser` reports it and `ListUsers` counts it.
+//! An unknown server or user is a `ResourceNotFoundException`; a key body the user
+//! already holds is a `ResourceExistsException`.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +160,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ImportSshPublicKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ImportSshPublicKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ImportSshPublicKey"))
+        use crate::state as st;
+
+        // This operation reads no request metadata; the engine comes from `self`.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            ImportSshPublicKeyErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let mut guard = state.lock();
+
+        if !guard.servers.contains_key(&input.server_id) {
+            return Err(st::not_found(
+                ImportSshPublicKeyErrorModeled::ResourceNotFoundException(st::unknown_server(
+                    &input.server_id,
+                )),
+            ));
+        }
+
+        let key = (input.server_id.clone(), input.user_name.clone());
+        // ONE borrow of the stored user answers both refusals, so what they are taken
+        // against is exactly the record the key is added to below.
+        let Some(stored) = guard.users.get(&key) else {
+            return Err(st::not_found(
+                ImportSshPublicKeyErrorModeled::ResourceNotFoundException(st::unknown_user(
+                    &input.user_name,
+                )),
+            ));
+        };
+        // A key the user already holds is not imported twice: the same material
+        // already identifies the same credential, so the import is refused with the
+        // modelled `ResourceExistsException` rather than storing a second copy under a
+        // second id.
+        let already_held = stored
+            .ssh_public_keys
+            .iter()
+            .any(|held| held.ssh_public_key_body == input.ssh_public_key_body);
+        // A user's key set is BOUNDED by the service's published per-user quota: past
+        // it an import is refused rather than adding another key. The refusal is the
+        // modelled `InvalidRequestException` — the service is available and the
+        // request is well formed for the wire, but it asks for a key the user cannot
+        // hold — and the capacity is released by `DeleteSshPublicKey`, all of it by
+        // `DeleteUser`.
+        let at_capacity = stored.ssh_public_keys.len() >= st::MAX_SSH_KEYS_PER_USER;
+
+        if already_held {
+            return Err(ImportSshPublicKeyErrorModeled::ResourceExistsException(
+                ResourceExistsException {
+                    message: format!(
+                        "User {} on server {} already holds this SSH public key",
+                        input.user_name, input.server_id
+                    ),
+                    resource: input.user_name.clone(),
+                    resource_type: st::RESOURCE_TYPE_USER.to_string(),
+                },
+            )
+            .into());
+        }
+        if at_capacity {
+            return Err(ImportSshPublicKeyErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: format!(
+                        "user {} already holds the maximum of {} SSH public keys; \
+                         delete one before importing another",
+                        input.user_name,
+                        st::MAX_SSH_KEYS_PER_USER
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // Minted and dated here, so `DescribeUser` reports the id and the import
+        // instant from stored state rather than from a replayed request. The user was
+        // resolved above under this same lock, so the key really is stored before the
+        // minted id is reported — the answer never names a key nothing holds.
+        let ssh_public_key_id = guard.mint_id("key");
+        let user = guard.users.get_mut(&key).ok_or_else(|| {
+            st::not_found(ImportSshPublicKeyErrorModeled::ResourceNotFoundException(
+                st::unknown_user(&input.user_name),
+            ))
+        })?;
+        user.ssh_public_keys.push(st::SshKey {
+            ssh_public_key_id: ssh_public_key_id.clone(),
+            ssh_public_key_body: input.ssh_public_key_body,
+            date_imported: ::std::time::SystemTime::now(),
+        });
+
+        Ok(ImportSshPublicKeyOutput {
+            server_id: input.server_id,
+            ssh_public_key_id,
+            user_name: input.user_name,
+        })
     }
 }

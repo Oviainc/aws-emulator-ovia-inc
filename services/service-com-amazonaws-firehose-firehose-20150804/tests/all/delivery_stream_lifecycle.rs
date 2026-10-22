@@ -19,7 +19,7 @@ use service_com_amazonaws_firehose_firehose_20150804::{
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region the test's requests are signed for, so the ARNs they mint name it.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// Long enough to cover the emulator's chosen `CREATING` -> `ACTIVE` /
 /// `DELETING` -> removed span (`crate::state::TRANSITION_DELAY`).
@@ -123,9 +123,9 @@ impl Emulator {
 }
 
 /// An IAM role ARN satisfying `RoleARN`'s modelled pattern.
-const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/firehose-delivery";
+pub(crate) const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/firehose-delivery";
 /// An S3 bucket ARN satisfying `BucketARN`'s modelled pattern.
-const BUCKET_ARN: &str = "arn:aws:s3:::demo-bucket";
+pub(crate) const BUCKET_ARN: &str = "arn:aws:s3:::demo-bucket";
 
 pub(crate) fn s3_configuration() -> Value {
     json!({ "RoleARN": ROLE_ARN, "BucketARN": BUCKET_ARN, "Prefix": "raw/" })

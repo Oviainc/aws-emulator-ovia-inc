@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateUser::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Assigns new properties to a STORED user: every member the request names replaces
+//! the stored one and every member it omits is left as it was, so the user-scoped
+//! reads (`DescribeUser`, `ListUsers`) report the updated record. An unknown server or
+//! user is a `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -212,18 +208,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state as st;
+
+        // This operation reads no request metadata; the engine comes from `self`.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            UpdateUserErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let mut guard = state.lock();
+
+        if !guard.servers.contains_key(&input.server_id) {
+            return Err(st::not_found(
+                UpdateUserErrorModeled::ResourceNotFoundException(st::unknown_server(
+                    &input.server_id,
+                )),
+            ));
+        }
+
+        let key = (input.server_id.clone(), input.user_name.clone());
+        let stored = guard.users.get_mut(&key).ok_or_else(|| {
+            st::not_found(UpdateUserErrorModeled::ResourceNotFoundException(
+                st::unknown_user(&input.user_name),
+            ))
+        })?;
+
+        // "Parameters you pass modify any or all of the following": a member the
+        // request names replaces the stored one, and a member it omits leaves that
+        // property as the user already had it. The user's identity (`ServerId`,
+        // `UserName`, and so its `Arn`) and its SSH keys are not update parameters,
+        // so they are untouched here.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateUser"))
+        // The configuration the update would LEAVE has to satisfy the same documented
+        // cross-member requirement a create does, so it is checked against the
+        // effective values — the request's where it names one, the stored user's
+        // otherwise — before anything is written.
+        let effective_type = input
+            .home_directory_type
+            .clone()
+            .or_else(|| stored.home_directory_type.clone());
+        let effective_mappings = input
+            .home_directory_mappings
+            .clone()
+            .unwrap_or_else(|| stored.home_directory_mappings.clone());
+        if let Some(message) = st::home_directory_violation(
+            effective_type.as_deref(),
+            Some(effective_mappings.as_slice()),
+        ) {
+            return Err(UpdateUserErrorModeled::InvalidRequestException(
+                InvalidRequestException { message },
+            )
+            .into());
+        }
+
+        if let Some(home_directory) = input.home_directory {
+            stored.home_directory = Some(home_directory);
+        }
+        if let Some(mappings) = input.home_directory_mappings {
+            stored.home_directory_mappings = mappings;
+        }
+        if let Some(policy) = input.policy {
+            stored.policy = Some(policy);
+        }
+        if let Some(posix_profile) = input.posix_profile {
+            stored.posix_profile = Some(posix_profile);
+        }
+        if let Some(role) = input.role {
+            stored.role = role;
+        }
+        // The type the request named replaces the stored one, like every other
+        // property above; a request that names none leaves the stored type alone.
+        // `CreateUser` is where the absent-type default is resolved, because that is
+        // the write that has no stored value to keep.
+        if let Some(home_directory_type) = input.home_directory_type {
+            stored.home_directory_type = Some(home_directory_type);
+        }
+
+        Ok(UpdateUserOutput {
+            server_id: input.server_id,
+            user_name: input.user_name,
+        })
     }
 }

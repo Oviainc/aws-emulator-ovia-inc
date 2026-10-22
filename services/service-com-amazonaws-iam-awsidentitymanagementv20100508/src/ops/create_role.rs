@@ -3,7 +3,8 @@
 //! @op CreateRole
 //!
 //! IMPLEMENTED: a role created here is persisted in this service's state
-//! (`crate::state`) and read back by `GetRole`.
+//! (`crate::state`) and read back by `GetRole`. Every caller that needs a role's ARN
+//! — a Transfer Family user's `Role`, for one — depends on this create landing.
 //!
 //! A 501 from an operation in this service means "nobody has written it yet", never
 //! "the emulator is broken".

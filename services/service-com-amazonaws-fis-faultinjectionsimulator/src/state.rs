@@ -11,9 +11,10 @@
 //!   `GetExperiment`, enumerated by `ListExperiments` and stopped by `StopExperiment`.
 //!
 //! An experiment template also owns a sub-resource: a TARGET ACCOUNT CONFIGURATION per
-//! targeted account, created by `CreateTargetAccountConfiguration` and read back by
-//! `GetTargetAccountConfiguration`. It is named by the (template, account) pair, so it
-//! is held on the template record and its count is derived from that map.
+//! targeted account, created by `CreateTargetAccountConfiguration`, read back by
+//! `GetTargetAccountConfiguration` and enumerated by `ListTargetAccountConfigurations`. It
+//! is named by the (template, account) pair, so it is held on the template record and its
+//! count is derived from that map.
 //!
 //! Both records are the one copy every handler reads and writes, so a value a create
 //! call returns is the value a later read reports. An experiment also owes the clock a
@@ -49,7 +50,8 @@ use crate::ops::types::{
     ExperimentTemplateSummary, ExperimentTemplateTarget, ExperimentTemplateTargetFilter,
     ExperimentTemplateTargetInputFilter, ReportConfigurationCloudWatchDashboardInput,
     ReportConfigurationS3Output, ReportConfigurationS3OutputInput, ResourceNotFoundException,
-    ServiceQuotaExceededException, TargetAccountConfiguration, ValidationException,
+    ServiceQuotaExceededException, TargetAccountConfiguration, TargetAccountConfigurationSummary,
+    ValidationException,
     ACCOUNT_TARGETING_VALUES, ACTIONS_MODE_VALUES, EMPTY_TARGET_RESOLUTION_MODE_VALUES,
 };
 
@@ -86,9 +88,10 @@ pub const EXPERIMENT_ID_PREFIX: &str = "EXP";
 /// exhaust.
 pub const ID_SUFFIX_LEN: usize = 12;
 
-/// The largest page `ListExperimentTemplates` and `ListExperiments` serve, and the page
-/// size used when a request names no `maxResults`: both `maxResults` members are modelled
-/// `@range(min: 1, max: 100)`.
+/// The largest page a paginated FIS list serves, and the page size used when a request
+/// names no `maxResults`: every `maxResults` member of this service
+/// (`ListExperimentTemplates`, `ListExperiments`, `ListTargetAccountConfigurations`) is
+/// modelled `@range(min: 1, max: 100)`.
 pub const PAGE_LIMIT: i32 = 100;
 
 /// How many experiment templates the store holds before `CreateExperimentTemplate`
@@ -110,6 +113,27 @@ pub const MAX_EXPERIMENTS: usize = 1_000;
 /// rather than a claim about a quota AWS publishes, and it is checked only when a
 /// request would ADD a configuration.
 pub const MAX_TARGET_ACCOUNT_CONFIGURATIONS: usize = 1_000;
+
+/// `TargetAccountId`'s modelled bounds (`@length(min: 12, max: 48)`) — the floor.
+///
+/// The boundary validator applies them to a modelled `accountId` member; they are named
+/// here because [`target_account_page_token_account`] checks them on a `nextToken`, which
+/// the model types as a plain `NextToken`.
+pub const TARGET_ACCOUNT_ID_FLOOR: usize = 12;
+
+/// See [`TARGET_ACCOUNT_ID_FLOOR`] — the ceiling of `TargetAccountId`'s modelled
+/// `@length`.
+pub const TARGET_ACCOUNT_ID_CEILING: usize = 48;
+
+/// The marker every `nextToken` `ListTargetAccountConfigurations` issues starts with.
+///
+/// A target account configuration is named by its `accountId` rather than by an id this
+/// service mints, so there is no minted shape to recognise a page token by (the way
+/// [`is_minted_id`] recognises the token of a template or experiment page). The token
+/// therefore carries the account id the next page resumes at BEHIND this marker, which
+/// makes it self-describing: a value this operation never issued carries no marker and is
+/// refused as a `ValidationException` instead of being read as a resume point.
+pub const TARGET_ACCOUNT_PAGE_TOKEN_PREFIX: &str = "targetAccountConfiguration.";
 
 /// The value FIS applies to `accountTargeting` when the request names none: the
 /// experiment targets the caller's own account (`AccountTargeting` is modelled
@@ -274,6 +298,21 @@ impl TargetAccountConfigurationRecord {
     /// returns: every member is the stored one.
     pub fn to_target_account_configuration(&self) -> TargetAccountConfiguration {
         TargetAccountConfiguration {
+            role_arn: Some(self.role_arn.clone()),
+            account_id: Some(self.account_id.clone()),
+            description: self.description.clone(),
+        }
+    }
+
+    /// The `TargetAccountConfigurationSummary` a page of
+    /// `ListTargetAccountConfigurations` carries.
+    ///
+    /// `TargetAccountConfigurationSummary` declares the same three members as
+    /// `TargetAccountConfiguration`, so a listed configuration reports exactly what a
+    /// `GetTargetAccountConfiguration` of the same name reports — including an absent
+    /// `description` staying absent.
+    pub fn to_summary(&self) -> TargetAccountConfigurationSummary {
+        TargetAccountConfigurationSummary {
             role_arn: Some(self.role_arn.clone()),
             account_id: Some(self.account_id.clone()),
             description: self.description.clone(),
@@ -736,6 +775,28 @@ pub fn is_minted_id(value: &str, prefix: &str) -> bool {
             .all(|b| b.is_ascii_digit() || b.is_ascii_uppercase())
 }
 
+/// The `nextToken` a page of `ListTargetAccountConfigurations` hands back when
+/// configurations remain: the marker of [`TARGET_ACCOUNT_PAGE_TOKEN_PREFIX`] followed by
+/// the `accountId` the next page resumes at.
+///
+/// `NextToken` is modelled `@length(min: 1, max: 1024)`, `pattern ^[\S]+$`: the marker
+/// carries no whitespace, an `accountId` that passed validation carries none either, and
+/// the two together are far under the ceiling.
+pub fn target_account_page_token(account_id: &str) -> String {
+    format!("{TARGET_ACCOUNT_PAGE_TOKEN_PREFIX}{account_id}")
+}
+
+/// The `accountId` the page token `token` resumes at, or `None` when `token` is not one
+/// [`target_account_page_token`] could have issued — the marker followed by a value within
+/// `TargetAccountId`'s modelled bounds.
+pub fn target_account_page_token_account(token: &str) -> Option<&str> {
+    let account_id = token.strip_prefix(TARGET_ACCOUNT_PAGE_TOKEN_PREFIX)?;
+    let length = account_id.chars().count();
+    ((TARGET_ACCOUNT_ID_FLOOR..=TARGET_ACCOUNT_ID_CEILING).contains(&length)
+        && !account_id.chars().any(char::is_whitespace))
+    .then_some(account_id)
+}
+
 /// The ARN of the experiment template `id` names, in `region`.
 pub fn template_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("{TEMPLATE_RESOURCE}/{id}"))
@@ -778,7 +839,7 @@ fn is_region_shaped(value: &str) -> bool {
 
 /// The page size a paginated FIS list serves for `max_results`.
 ///
-/// Both `maxResults` members are modelled `@range(min: 1, max: 100)` and the boundary
+/// Every `maxResults` member is modelled `@range(min: 1, max: 100)` and the boundary
 /// validator refused anything outside it before a handler ran, so the only case left is
 /// an absent value: serve the largest page the model allows. The `clamp` states that
 /// invariant rather than correcting a caller — a value reaching here outside the range is

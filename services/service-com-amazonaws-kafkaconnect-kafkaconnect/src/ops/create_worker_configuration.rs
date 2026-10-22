@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWorkerConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWorkerConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWorkerConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores a worker configuration under a freshly minted `workerConfigurationArn` and
+//! answers with the identity the service assigned it. A name identifies at most one
+//! worker configuration, so a repeat of a stored name is a `ConflictException`. The
+//! configuration is nothing but stored properties, so it is answered `ACTIVE` at once:
+//! `WorkerConfigurationState` has no creating value (only `ACTIVE` and `DELETING`),
+//! hence no transition for the clock to owe.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +167,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWorkerConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWorkerConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWorkerConfiguration"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateWorkerConfigurationErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: Some("the kafkaconnect store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let mut state = store.lock();
+        state.settle_due();
+
+        if let Some(existing) = state.worker_configuration_named(&input.name) {
+            return Err(CreateWorkerConfigurationErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "A worker configuration named {} already exists ({}). Retry your request with another name.",
+                    input.name, existing.arn
+                )),
+            })
+            .into());
+        }
+
+        // The quota on stored worker configurations, metered the way the other
+        // two resources of this service are: the real service answers the same
+        // error once its quota is reached.
+        if state.worker_configuration_quota_reached() {
+            return Err(
+                CreateWorkerConfigurationErrorModeled::TooManyRequestsException(
+                    TooManyRequestsException {
+                        message: Some(format!(
+                            "Limit exceeded. Resource limit reached: this account already holds {} worker configurations.",
+                            crate::state::RESOURCE_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = state.mint_resource_id("worker-configuration", &input.name);
+        let arn = ::engine::emulator_arn(
+            crate::state::ARN_SERVICE,
+            &region,
+            &format!("worker-configuration/{}/{}", input.name, id),
+        );
+        let worker = crate::state::WorkerConfigurationRecord {
+            arn: arn.clone(),
+            name: input.name,
+            description: input.description,
+            properties_file_content: input.properties_file_content,
+            state: crate::state::WORKER_CONFIGURATION_ACTIVE.to_string(),
+            revision: crate::state::FIRST_WORKER_CONFIGURATION_REVISION,
+            creation_time: ::std::time::SystemTime::now(),
+            tags: input.tags.unwrap_or_default(),
+            pending: None,
+        };
+
+        let output = CreateWorkerConfigurationOutput {
+            creation_time: Some(crate::state::date_time(worker.creation_time)),
+            latest_revision: Some(worker.latest_revision()),
+            name: Some(worker.name.clone()),
+            worker_configuration_arn: Some(worker.arn.clone()),
+            worker_configuration_state: Some(worker.state.clone()),
+        };
+        state.worker_configurations.insert(arn, worker);
+        Ok(output)
     }
 }

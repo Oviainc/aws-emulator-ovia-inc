@@ -222,9 +222,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (record_ids, encrypted) =
             match store.ingest_records(&input.delivery_stream_name, records, now) {
                 Ok(stored) => stored,
-                Err(crate::state::StreamRefusal::NoSuchStream) => {
-                    return Err(no_such_stream(&input.delivery_stream_name))
-                }
+                Err(crate::state::StreamRefusal::NoSuchStream) => return Err(no_such_stream()),
                 Err(crate::state::StreamRefusal::NotActive(status)) => {
                     return Err(stream_not_active(&input.delivery_stream_name, status))
                 }
@@ -262,9 +260,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// No stream of that name exists.
-fn no_such_stream(name: &str) -> PutRecordBatchError {
+///
+/// Scoped to the account, and NOT to the name that was probed — the same rule, and the
+/// same data-plane wording, as `PutRecord`'s: see
+/// `crate::service::put_not_found_message`.
+fn no_such_stream() -> PutRecordBatchError {
     PutRecordBatchErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("Firehose stream {name} not found")),
+        message: Some(crate::service::put_not_found_message()),
     })
     .into()
 }

@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetApprovalTeam
-//! Reports one stored approval team, looked up by ARN in [`crate::state`]. An ARN no
-//! stored team carries earns `ResourceNotFoundException` (404).
+//! Reports one stored approval team, looked up by ARN in [`crate::state`]. An ARN
+//! outside the caller's own account is refused with `AccessDeniedException` (403)
+//! BEFORE the lookup ([`crate::state::authorize_resource_arn`]); an ARN inside it that
+//! no stored team carries earns `ResourceNotFoundException` (404).
 //!
 //! `@readonly`: this handler writes nothing of its own. It calls
 //! [`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::materialize_due`] first, which applies only what the
@@ -172,6 +174,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // The account boundary is evaluated BEFORE the resource is resolved: an ARN
+        // outside the caller's account is refused with the modelled
+        // `AccessDeniedException` (403) whatever is stored under it, so a client can
+        // tell "not permitted" from "does not exist".
+        crate::state::authorize_resource_arn(Self::NAME, &input.arn)
+            .map_err(GetApprovalTeamErrorModeled::AccessDeniedException)?;
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetApprovalTeamError::Modeled(GetApprovalTeamErrorModeled::InternalServerException(
                 InternalServerException {

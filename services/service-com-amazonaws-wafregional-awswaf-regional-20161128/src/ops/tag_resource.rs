@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Associates tags with the AWS resource `ResourceARN` names. The tag set is keyed by
+//! `Key`, so a key the resource already carries takes the new value instead of adding a
+//! second entry, and the set is stored on the resource's own record — the one
+//! `CreateRule`'s `Tags` wrote and `ListTagsForResource` reads.
 //!
 //! ## Shape of an operation
 //!
@@ -88,6 +84,8 @@
 //! * `WAFTagOperationException` (HTTP 400)
 //! * `WAFTagOperationInternalErrorException` (HTTP 500)
 
+use ::std::collections::BTreeSet;
+
 #[allow(unused_imports)]
 use super::types::*;
 
@@ -165,18 +163,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::WAFInternalErrorException(WAFInternalErrorException {
+                message: Some(crate::state::MESSAGE_INTERNAL_ERROR.to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // Tags attach to the resource the ARN names. An ARN that names no resource this
+        // service holds — a never-minted id, a kind AWS WAF Classic carries no tags for,
+        // or a string that is no AWS WAF Classic regional ARN at all — references an
+        // object that does not exist, which is what `WAFNonexistentItemException` is.
+        let Some(tags) = state.tags_for_resource_mut(&input.resource_arn) else {
+            return Err(TagResourceErrorModeled::WAFNonexistentItemException(
+                WAFNonexistentItemException {
+                    message: Some(crate::state::MESSAGE_NONEXISTENT_ITEM.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The tag set a successful call would leave: keyed by `Key`, so a key the
+        // resource already carries is re-valued rather than added. The model bounds
+        // `TagList` only from below (`len 1..`), so the per-resource quota is what keeps
+        // the stored tag set bounded — and a request that would exceed it changes
+        // nothing.
+        let resulting: BTreeSet<&str> = tags
+            .keys()
+            .map(String::as_str)
+            .chain(input.tags.iter().map(|tag| tag.key.as_str()))
+            .collect();
+        if resulting.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::WAFLimitsExceededException(
+                WAFLimitsExceededException {
+                    message: Some(crate::state::MESSAGE_LIMITS_EXCEEDED.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A key repeated within one request keeps the last value given for it, the same
+        // way a key already on the resource takes the value this request gives it.
+        for tag in input.tags {
+            tags.insert(tag.key, tag.value);
+        }
+
+        Ok(TagResourceOutput {})
     }
 }

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteRole
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteRole`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteRole::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the stored role named by the request, so `GetRole` stops resolving it. A
+//! name the account does not hold is a `NoSuchEntityException`; a service-linked role
+//! is an `UnmodifiableEntityException` (only the service it is linked to may delete
+//! it); and a role that still holds a policy is a `DeleteConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +179,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteRole` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteRoleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteRole"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteRoleErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // IAM entity names "are not distinguished by case", so the delete finds the
+        // role under the case-folded name whatever case it spelled it in.
+        let key = crate::state::name_key(&input.role_name);
+        let Some(role) = store.roles.get(&key) else {
+            return Err(DeleteRoleErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The role with name {} cannot be found.",
+                        input.role_name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "Service-linked roles are protected Amazon Web Services resources. Only the
+        // service that depends on the service-linked role can modify or delete the
+        // role on your behalf" (`UnmodifiableEntityException`) — so this call, which
+        // is not that service, cannot delete one. The role's PATH is what says it is
+        // service-linked, exactly as this crate's `AttachRolePolicy` reads it, and the
+        // principal that path names is the service the refusal points the caller at.
+        if crate::state::is_service_linked_role_path(&role.path) {
+            let linked_to = crate::state::service_linked_role_principal(&role.path)
+                .unwrap_or("the service it is linked to");
+            return Err(DeleteRoleErrorModeled::UnmodifiableEntityException(
+                UnmodifiableEntityException {
+                    message: Some(format!(
+                        "Service role {} cannot be deleted: only {linked_to} can delete it",
+                        role.role_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Before you delete a role, remove the following attached items: inline
+        // policies, attached managed policies, instance profile" — a role that still
+        // holds one is NOT deleted, and the caller is told what blocks it with the
+        // modelled `DeleteConflictException` ("attempted to delete a resource that has
+        // attached subordinate entities"). Managed policies (`AttachRolePolicy`) and
+        // inline policies (`PutRolePolicy`) are what a role can hold today; an
+        // instance profile is not attachable to a role in this emulator yet, so it
+        // cannot block a delete until the operation that attaches one lands.
+        let attached = store
+            .role_attached_policies
+            .get(&key)
+            .map_or(0, ::std::collections::BTreeSet::len);
+        let embedded = store
+            .role_inline_policies
+            .get(&key)
+            .map_or(0, ::std::collections::BTreeMap::len);
+        if attached > 0 || embedded > 0 {
+            // Only the kinds that actually hold the role back are named, so the
+            // message says what the caller has to remove and nothing else, and each
+            // clause agrees in number with its own count.
+            let mut blockers = Vec::new();
+            if attached > 0 {
+                blockers.push(format!(
+                    "{attached} managed {} must be detached",
+                    if attached == 1 { "policy" } else { "policies" }
+                ));
+            }
+            if embedded > 0 {
+                blockers.push(format!(
+                    "{embedded} inline {} must be deleted",
+                    if embedded == 1 { "policy" } else { "policies" }
+                ));
+            }
+            return Err(DeleteRoleErrorModeled::DeleteConflictException(
+                DeleteConflictException {
+                    message: Some(format!(
+                        "Cannot delete entity: {} from the role {} first.",
+                        blockers.join(", and "),
+                        input.role_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        store.roles.remove(&key);
+        // The role is gone, so the policy sets that hung off it are not account state
+        // any more: leaving them behind would make a later role of the same name look
+        // like it inherited the deleted one's policies.
+        store.role_attached_policies.remove(&key);
+        store.role_inline_policies.remove(&key);
+
+        Ok(DeleteRoleOutput)
     }
 }

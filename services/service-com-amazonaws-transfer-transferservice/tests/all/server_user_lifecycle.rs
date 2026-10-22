@@ -270,7 +270,11 @@ async fn describe_user_reports_exactly_what_create_user_persisted() {
                 "UserName": "abc",
                 "Role": ROLE,
                 "HomeDirectory": null,
-                "HomeDirectoryType": null,
+                // A create that names no `HomeDirectoryType` leaves a PATH user: the
+                // member's documentation pairs PATH with the `HomeDirectory`
+                // parameter and LOGICAL with `HomeDirectoryMappings`, and the type is
+                // resolved ONCE at create time, as the server defaults are.
+                "HomeDirectoryType": "PATH",
                 "HomeDirectoryMappings": null,
                 "Policy": null,
                 "PosixProfile": null,

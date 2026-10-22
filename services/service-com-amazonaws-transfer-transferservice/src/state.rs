@@ -121,6 +121,27 @@ pub const PROTOCOL_AS2: &str = "AS2";
 /// directory (the enum is `[PATH, LOGICAL]`).
 pub const HOME_DIRECTORY_TYPE_LOGICAL: &str = "LOGICAL";
 
+/// `HomeDirectoryType` for a user whose write named none.
+///
+/// `HomeDirectoryType`'s documentation pairs the two values with the member each one
+/// is configured through: "If HomeDirectoryType is LOGICAL, you must provide
+/// mappings, using the HomeDirectoryMappings parameter. If, on the other hand,
+/// HomeDirectoryType is PATH, you provide an absolute path using the HomeDirectory
+/// parameter." [`home_directory_violation`] refuses every write that breaks that
+/// pairing, so a write that names NO type configured a path rather than mappings —
+/// a `PATH` user, which is what the recorded Transfer wire reports for a `CreateUser`
+/// that named no type.
+pub const DEFAULT_HOME_DIRECTORY_TYPE: &str = "PATH";
+
+/// The `HomeDirectoryType` a user write leaves on the stored record.
+///
+/// The caller's value whenever it sent one, else [`DEFAULT_HOME_DIRECTORY_TYPE`].
+/// Every user write resolves the type here, so the stored record carries a type for
+/// every user and the readers project it without defaulting a second time.
+pub fn resolved_home_directory_type(requested: Option<String>) -> String {
+    requested.unwrap_or_else(|| DEFAULT_HOME_DIRECTORY_TYPE.to_string())
+}
+
 /// The page bound a `List*` call uses when the caller sends no `MaxResults`.
 ///
 /// Equal to `MaxResults`' modelled maximum (`range 1..1000`), so an unbounded
@@ -211,6 +232,21 @@ pub const RESOURCE_TYPE_SERVER: &str = "Server";
 
 /// `ResourceType` for the user resource. Same convention as [`RESOURCE_TYPE_SERVER`].
 pub const RESOURCE_TYPE_USER: &str = "User";
+
+/// `ResourceType` for one of a user's SSH public keys, addressed by its
+/// `SshPublicKeyId`. Same convention as [`RESOURCE_TYPE_SERVER`].
+pub const RESOURCE_TYPE_SSH_PUBLIC_KEY: &str = "SshPublicKey";
+
+/// How many SSH public keys ONE user holds before `ImportSshPublicKey` refuses
+/// instead of growing.
+///
+/// AWS Transfer Family's published service quota for a Transfer Family user is 10 SSH
+/// public keys, so that is the bound here; this emulator models no Service Quotas
+/// adjustments, so it is a fixed one. Each stored key is itself bounded by
+/// `SshPublicKeyBody`'s modelled `len 0..2048`, which the framework's boundary
+/// validator enforces before a handler runs, so this bounds a user's key set in bytes
+/// as well as in count. `DeleteSshPublicKey` releases one, `DeleteUser` all of them.
+pub const MAX_SSH_KEYS_PER_USER: usize = 10;
 
 /// The not-found payload for the `resource_type` resource identified by `resource`.
 ///

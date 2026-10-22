@@ -8,7 +8,8 @@
 //! `GetChangeTokenStatus` and the `Create*`, `Update*`, `Get*`, `List*` and `Delete*`
 //! handlers of every resource kind all read and write ONE copy of each resource. The
 //! helpers below (id minting, the change-token protocol, pagination, CIDR parsing,
-//! metric-name validation, filter identity, the `IPSet`/`IPSetSummary`, `Rule`,
+//! metric-name validation, resource-ARN resolution onto the tagged resource's own tag
+//! set, filter identity, the `IPSet`/`IPSetSummary`, `Rule`,
 //! `RateBasedRule`/`RuleSummary`, `RuleGroup`, `SizeConstraintSet`,
 //! `SqlInjectionMatchSet`, `WebACL` and `XssMatchSet`/`XssMatchSetSummary`
 //! projections) are shared by those handlers rather than duplicated per operation.
@@ -331,6 +332,63 @@ pub fn match_field_takes_data(field_type: &str) -> bool {
     field_type == MATCH_FIELD_TYPE_HEADER || field_type == MATCH_FIELD_TYPE_SINGLE_QUERY_ARG
 }
 
+/// The ARN resource type of a `Rule`: the segment before the `RuleId` in
+/// `arn:aws:waf-regional:<region>:<account-id>:rule/<RuleId>`.
+pub const ARN_TYPE_RULE: &str = "rule";
+
+/// The ARN resource type of a `WebACL`, as [`web_acl_arn`] mints it.
+pub const ARN_TYPE_WEB_ACL: &str = "webacl";
+
+/// The ARN resource type of a `RuleGroup`.
+pub const ARN_TYPE_RULE_GROUP: &str = "rulegroup";
+
+/// The ARN resource type of a `RateBasedRule`, which AWS WAF Classic names apart from
+/// a plain `Rule` even though the two are the same kind of resource.
+pub const ARN_TYPE_RATE_BASED_RULE: &str = "ratebasedrule";
+
+/// The resource kinds AWS WAF Classic carries tags for, by their ARN resource type.
+///
+/// Source: `TagResource`'s own documentation — "You can use this action to tag the AWS
+/// resources that you manage through AWS WAF Classic: web ACLs, rule groups, and
+/// rules." Every other kind this service holds (a condition such as an `IPSet` or an
+/// `XssMatchSet`) carries no tags, so an ARN naming one names no tag set.
+pub const TAGGABLE_ARN_TYPES: &[&str] = &[
+    ARN_TYPE_WEB_ACL,
+    ARN_TYPE_RULE_GROUP,
+    ARN_TYPE_RULE,
+    ARN_TYPE_RATE_BASED_RULE,
+];
+
+/// The `(resource type, resource id)` a taggable AWS WAF Classic regional resource ARN
+/// names, or `None` when `arn` names no taggable kind.
+///
+/// An ARN is `arn:<partition>:<service>:<region>:<account-id>:<resource-type>/<id>`, so
+/// this takes six colon-separated fields whose first is `arn`, whose service segment is
+/// [`ARN_SERVICE`], and whose resource field is `<type>/<id>` with a type in
+/// [`TAGGABLE_ARN_TYPES`] and a non-empty id.
+///
+/// The partition, region and account fields are required to be PRESENT but their values
+/// are not matched: this emulator serves a single account and stores no region on a
+/// resource, so the resource id is the only field of an ARN that can identify a record
+/// it holds.
+pub fn parse_taggable_resource_arn(arn: &str) -> Option<(&str, &str)> {
+    let mut fields = arn.split(':');
+    let prefix = fields.next()?;
+    let _partition = fields.next()?;
+    let service = fields.next()?;
+    let _region = fields.next()?;
+    let _account = fields.next()?;
+    let resource = fields.next()?;
+    if fields.next().is_some() || prefix != "arn" || service != ARN_SERVICE {
+        return None;
+    }
+    let (resource_type, resource_id) = resource.split_once('/')?;
+    if resource_id.is_empty() || !TAGGABLE_ARN_TYPES.contains(&resource_type) {
+        return None;
+    }
+    Some((resource_type, resource_id))
+}
+
 /// The most `XssMatchSet`s this emulator stores for the account before
 /// `CreateXssMatchSet` answers its modelled `WAFLimitsExceededException`.
 ///
@@ -531,8 +589,8 @@ pub struct WebACLEntry {
     /// The resource's tags, as a key→value map — a repeated key is one tag, the last
     /// value winning, as an AWS tag set is. At most [`MAX_TAGS_PER_RESOURCE`] entries,
     /// so one record's tag state is bounded; the tagging operations
-    /// (`ListTagsForResource`, `TagResource`, `UntagResource`) will project and update
-    /// it when their own stub issues are implemented.
+    /// (`ListTagsForResource`, `TagResource`, `UntagResource`) project and update it
+    /// through [`ComAmazonawsWafregionalAwswafRegional20161128State::tags_for_resource`].
     pub tags: BTreeMap<String, String>,
     /// `WebACLArn`, minted once at create time so every later read reports the same
     /// ARN rather than one rebuilt from the reading request's region.
@@ -854,10 +912,10 @@ pub struct RuleGroupEntry {
     /// after you create the RuleGroup."
     pub metric_name: String,
     /// The tags the create request carried, keyed by `Key` as `RuleEntry::tags` is, so
-    /// a key repeated in one request keeps the last value given for it. NOTHING READS
-    /// THIS YET: `TagResource`, `UntagResource` and `ListTagsForResource` are still
-    /// scaffold stubs, so no test exercises it — whoever implements them reads the tags
-    /// from here.
+    /// a key repeated in one request keeps the last value given for it. The tagging
+    /// operations (`ListTagsForResource`, `TagResource`, `UntagResource`) read and write
+    /// this same set, through
+    /// [`ComAmazonawsWafregionalAwswafRegional20161128State::tags_for_resource`].
     pub tags: BTreeMap<String, String>,
 }
 
@@ -1030,6 +1088,43 @@ impl ComAmazonawsWafregionalAwswafRegional20161128State {
             record.insync_at = None;
         }
         Some(record.status.clone())
+    }
+
+    /// The tag set of the resource `arn` names, or `None` when this store holds no
+    /// taggable resource under that ARN.
+    ///
+    /// ONE copy of each resource's tag set: a resource's tags live on its own record —
+    /// [`RuleEntry`], [`WebACLEntry`] or [`RuleGroupEntry`], which is also where that
+    /// kind's create operation stored the `Tags` its request carried — so `TagResource`,
+    /// `UntagResource` and `ListTagsForResource` read and write what the create wrote.
+    pub fn tags_for_resource(&self, arn: &str) -> Option<&BTreeMap<String, String>> {
+        let (resource_type, resource_id) = parse_taggable_resource_arn(arn)?;
+        match resource_type {
+            ARN_TYPE_RULE => Some(&self.rules.get(resource_id)?.tags),
+            ARN_TYPE_WEB_ACL => Some(&self.web_acls.get(resource_id)?.tags),
+            ARN_TYPE_RULE_GROUP => Some(&self.rule_groups.get(resource_id)?.tags),
+            // A rate-based rule is a `Rule` with a rate limit, so its tags are the tags
+            // of the `RuleEntry` it holds.
+            ARN_TYPE_RATE_BASED_RULE => Some(&self.rate_based_rules.get(resource_id)?.rule.tags),
+            // Unreachable while every type in `TAGGABLE_ARN_TYPES` has an arm above;
+            // a kind added there without a store answers "no such resource".
+            _ => None,
+        }
+    }
+
+    /// The tag set of the resource `arn` names, for a call that changes it. `None`
+    /// exactly where [`Self::tags_for_resource`] answers `None`.
+    pub fn tags_for_resource_mut(&mut self, arn: &str) -> Option<&mut BTreeMap<String, String>> {
+        let (resource_type, resource_id) = parse_taggable_resource_arn(arn)?;
+        match resource_type {
+            ARN_TYPE_RULE => Some(&mut self.rules.get_mut(resource_id)?.tags),
+            ARN_TYPE_WEB_ACL => Some(&mut self.web_acls.get_mut(resource_id)?.tags),
+            ARN_TYPE_RULE_GROUP => Some(&mut self.rule_groups.get_mut(resource_id)?.tags),
+            ARN_TYPE_RATE_BASED_RULE => {
+                Some(&mut self.rate_based_rules.get_mut(resource_id)?.rule.tags)
+            }
+            _ => None,
+        }
     }
 
     /// Drop the oldest tokens no mutating call can still consume, until at most
