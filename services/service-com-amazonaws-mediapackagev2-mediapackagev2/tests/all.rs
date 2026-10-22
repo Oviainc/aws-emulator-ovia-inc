@@ -29,3 +29,5 @@ mod origin_endpoint_policy;
 mod server_materialised_members;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_origin_endpoint.rs"]
+mod update_origin_endpoint;
