@@ -522,6 +522,28 @@ pub fn not_found(kind: ResourceKind, resource_id: &str) -> ResourceNotFoundExcep
     }
 }
 
+/// The `ResourceNotFoundException` for a group membership the named identity store does
+/// not hold.
+///
+/// AWS's not-found message for this class is a FIXED sentence that names the identity
+/// store ("pool") and the request member rather than the id that was probed:
+/// `DescribeGroupMembership` on a membership id nothing holds answers `Group membership
+/// not found for given pool and membershipId.` (recorded behaviour, repeated across
+/// every recorded rejection of that class), so the message is a rule rather than prose
+/// rebuilt from state. The modelled `ResourceType` / `ResourceId` members still report
+/// which resource was asked for, so [`not_found`] supplies them.
+pub fn membership_not_found(membership_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(MEMBERSHIP_NOT_FOUND_MESSAGE.to_string()),
+        ..not_found(ResourceKind::Membership, membership_id)
+    }
+}
+
+/// AWS's fixed `ResourceNotFoundException` message for a membership id the identity
+/// store does not hold.
+pub const MEMBERSHIP_NOT_FOUND_MESSAGE: &str =
+    "Group membership not found for given pool and membershipId.";
+
 /// The `ResourceNotFoundException` for a resource an ALTERNATE identifier names and
 /// this store does not hold.
 ///

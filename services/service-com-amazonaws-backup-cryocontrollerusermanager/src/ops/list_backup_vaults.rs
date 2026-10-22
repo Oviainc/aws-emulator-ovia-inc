@@ -156,6 +156,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        let now = ::std::time::SystemTime::now();
         // A page size outside the model's `@range` is this service's own
         // `InvalidParameterValueException`, answered before anything is read so
         // the body is the modelled shape carrying `Code` and `Message`.
@@ -171,7 +172,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let store = state.lock();
+        let mut store = state.lock();
+        // Every stored vault is reported here, so every `CREATING` ->
+        // `AVAILABLE` transition the clock has already made due is materialised
+        // first: a list and a describe of the same vault then never disagree
+        // about its state.
+        store.settle_vaults(now);
         // `store.vaults` is a `BTreeMap` keyed by `BackupVaultName`, so this
         // walk is already in name order — which is what makes the name-valued
         // cursor below resolve to the same position on every request.

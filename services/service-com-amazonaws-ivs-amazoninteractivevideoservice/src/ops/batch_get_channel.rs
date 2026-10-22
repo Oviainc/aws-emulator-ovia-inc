@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `GetChannel` over a list of ARNs, answered PER ARN: the call itself succeeds
+//! (HTTP 200) and reports every requested ARN individually — a persisted channel in
+//! `channels`, an ARN this account holds no channel for as a `BatchError` in `errors`
+//! naming that ARN. A pure read: it writes nothing, so two reads around any other
+//! call observe only what that other call did.
+//!
+//! Every resource in this emulator belongs to the one account `engine` mints ARNs
+//! under, and the request carries no caller identity for a handler to scope a read
+//! to, so ownership is not emulated: an ARN naming another account's channel is
+//! simply an ARN this store holds nothing under, and is reported as the per-ARN
+//! not-found error rather than as the modelled `AccessDeniedException`.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +153,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetChannel"))
+        // A malformed ARN, and a list outside `length(1..50)`, never reach here:
+        // `ChannelArnList` and its `ChannelArn` member carry those modelled
+        // constraints, which the framework's constraint walk refuses with a 400
+        // `ValidationException` before `handle` runs.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchGetChannelErrorModeled::ServiceUnavailable(ServiceUnavailable {
+                exception_message: Some("the IVS store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        let store = state.lock();
+        // One verdict per requested ARN, in the order the caller asked for them: a
+        // batch read reports each ARN on its own, so an ARN naming nothing cannot
+        // fail the whole call — that is what the `errors` list is for — and the two
+        // lists together account for every ARN in the request.
+        let mut channels: Vec<Channel> = Vec::with_capacity(input.arns.len());
+        let mut errors: Vec<BatchError> = Vec::new();
+        for arn in &input.arns {
+            match store.channels.get(arn) {
+                Some(channel) => channels.push(channel.clone()),
+                None => errors.push(BatchError {
+                    arn: Some(arn.clone()),
+                    code: Some(NOT_FOUND_CODE.to_string()),
+                    message: Some(format!("channel {arn} does not exist")),
+                }),
+            }
+        }
+
+        // Both lists are always present, even when empty, so a caller reads "no
+        // channel matched" and "no ARN failed" off the same two members rather than
+        // off whether a member is there.
+        Ok(BatchGetChannelOutput {
+            channels: Some(channels),
+            errors: Some(errors),
+            ..Default::default()
+        })
     }
 }
+
+/// The `BatchError$code` reported for a requested ARN this account holds no channel
+/// for.
+///
+/// `BatchError$code` is modelled as a plain `errorCode` string with no enumeration,
+/// and IVS reports the condition under the name of the error shape the single-ARN
+/// read raises for the same ARN — `ResourceNotFoundException`, "Request references a
+/// resource which does not exist" — carried here as a per-ARN batch error code,
+/// because the batch call itself succeeded.
+const NOT_FOUND_CODE: &str = "ResourceNotFoundException";

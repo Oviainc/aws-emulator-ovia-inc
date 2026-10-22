@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetKeyspace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetKeyspace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the keyspace `crate::state` holds under the requested name — its
+//! ARN, replication strategy, replication Regions and per-Region status — and answers the
+//! modelled `ResourceNotFoundException` when no such keyspace is stored. This is the ONLY
+//! file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetKeyspace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The paragraphs below are the scaffold's own notes on how an operation is shaped and
+//! how it reaches state; they still describe this file.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +160,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetKeyspace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetKeyspaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetKeyspace"))
+        // `keyspaceName`'s length and pattern are modelled, so the boundary validator has
+        // already refused a malformed name with 400 `ValidationException` before this
+        // handler runs.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetKeyspaceErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "Amazon Keyspaces could not reach its state store for this request."
+                        .to_string(),
+                ),
+            })
+        })?;
+        let region = crate::state::request_region(ctx);
+
+        let mut store = state.lock();
+        // Reporting, not mutating: `settle` only materialises the status changes the clock
+        // had already made due at this instant, so this report shows what any caller would
+        // have seen now whether or not anybody read the keyspace.
+        store.settle(::std::time::SystemTime::now());
+
+        let Some(keyspace) = store.keyspaces.get(&input.keyspace_name) else {
+            return Err(GetKeyspaceErrorModeled::ResourceNotFoundException(
+                crate::state::keyspace_not_found(&region, &input.keyspace_name),
+            )
+            .into());
+        };
+
+        // "If the replicationStrategy of the keyspace is MULTI_REGION, a list of
+        // replication Regions is returned" — and only then: the modelled minimum length of
+        // both `replicationRegions` and `replicationGroupStatuses` is 2, which a
+        // single-Region keyspace's one Region cannot satisfy. A MULTI_REGION keyspace's
+        // `regionList` is modelled `length 2..`, so the stored list satisfies it.
+        let multi_region = keyspace.replication_strategy == crate::state::MULTI_REGION_STRATEGY;
+
+        Ok(GetKeyspaceOutput {
+            keyspace_name: keyspace.name.clone(),
+            resource_arn: keyspace.resource_arn.clone(),
+            replication_strategy: keyspace.replication_strategy.clone(),
+            replication_regions: multi_region.then(|| keyspace.replication_regions.clone()),
+            // "This shows the summary status of the keyspace after a new Amazon Web
+            // Services Region was added": one entry per Region the keyspace is replicated
+            // in, carrying the keyspace's own status in that Region.
+            replication_group_statuses: multi_region.then(|| {
+                let progress = tables_replication_progress(keyspace);
+                keyspace
+                    .replication_regions
+                    .iter()
+                    .map(|replication_region| ReplicationGroupStatus {
+                        region: replication_region.clone(),
+                        keyspace_status: keyspace.status.clone(),
+                        tables_replication_progress: progress.clone(),
+                    })
+                    .collect()
+            }),
+        })
     }
+}
+
+/// `ReplicationGroupStatus$tablesReplicationProgress`: "the replication progress of tables
+/// in the keyspace ... expressed as a percentage of the newly replicated tables with status
+/// `Active` compared to the total number of tables in the keyspace".
+///
+/// `None` for a keyspace that holds no table at all: there is no proportion of nothing, and
+/// the member is optional. The two-decimal form is what the modelled pattern
+/// `^[0-9]{1,3}(?:[.][0-9]{1,2})?%$` accepts, and `"100.00%"` is exactly its 7-character
+/// maximum length.
+fn tables_replication_progress(keyspace: &crate::state::Keyspace) -> Option<String> {
+    let total = keyspace.tables.len();
+    if total == 0 {
+        return None;
+    }
+    let active = keyspace
+        .tables
+        .values()
+        .filter(|table| table.status == crate::state::TABLE_STATUS_ACTIVE)
+        .count();
+    let percentage = (active as f64) * 100.0 / (total as f64);
+    Some(format!("{percentage:.2}%"))
 }

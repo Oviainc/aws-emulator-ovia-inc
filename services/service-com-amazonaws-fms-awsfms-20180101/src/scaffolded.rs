@@ -42,6 +42,16 @@
 //! operation of it lists (Firewall Manager answers the administrator-authorization
 //! refusal with `AccessDeniedException`, which the model never declares). Delete the
 //! wrapper and the handler has no way to refuse a bad request at all.
+//!
+//! ## Firewall Manager's authorization refusal
+//!
+//! Firewall Manager authorizes some operations against the organisation's
+//! administrator association rather than against the request: an organisation-scoped
+//! call is answered only for a Firewall Manager administrator or the organisation's
+//! management account, and only the account that holds the default-administrator
+//! association may tear it down. [`Scaffolded::access_denied`] is how a handler states
+//! that refusal, and [`crate::state::require_administrator`] is the shared gate that
+//! decides it.
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
@@ -308,8 +318,10 @@ impl<E> Scaffolded<E> {
     /// Refuse the call as unauthorized, with HTTP 400 `AccessDeniedException`.
     ///
     /// Reach for this only where the SERVICE refuses the caller and models no error
-    /// for it. It is NOT a signature check (the emulator verifies every signature
-    /// before a handler runs) and NOT a stand-in for a modeled error: if the
+    /// for it — Firewall Manager authorizes an organisation-scoped call against the
+    /// administrator association, and only the account holding that association may
+    /// tear it down. It is NOT a signature check (the emulator verifies every
+    /// signature before a handler runs) and NOT a stand-in for a modeled error: if the
     /// operation declares one that fits, return that instead. Answer it INSTEAD of a
     /// modeled not-found or invalid-input error wherever the service decides
     /// authorization before it looks the resource up: the refusal must say the same

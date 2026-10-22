@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeProductAsAdmin
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeProductAsAdmin`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeProductAsAdmin::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +144,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeProductAsAdmin` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeProductAsAdminErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeProductAsAdmin"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        // A pure read: this operation reports the record `CreateProduct` stored and
+        // writes nothing, so a later caller sees exactly what this one saw.
+        let state = state.lock();
+
+        // The product is addressed by `Id` or by `Name`, both optional in the model:
+        // a request naming neither identifies no product at all, which this operation's
+        // own `InvalidParametersException` is the refusal for. `Id` is the stronger
+        // identifier, so a request carrying both must agree: a `Name` that is not the
+        // stored product's name contradicts the id and identifies no product, rather
+        // than being ignored in favour of the id.
+        let product = match (&input.id, &input.name) {
+            (Some(id), Some(name)) => state
+                .products
+                .get(id)
+                .filter(|product| &product.name == name),
+            (Some(id), None) => state.products.get(id),
+            (None, Some(name)) => state.products.values().find(|product| &product.name == name),
+            (None, None) => {
+                return Err(
+                    DescribeProductAsAdminErrorModeled::InvalidParametersException(
+                        InvalidParametersException {
+                            message: Some(
+                                "Either Id or Name must be provided to describe a product."
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                )
+            }
+        };
+        // `SourcePortfolioId` narrows the lookup to a product reached through a SHARED
+        // portfolio. No portfolio holds a product yet (`AssociateProductWithPortfolio`
+        // is still scaffolded), so no stored product is reachable through one and a
+        // request that names a source portfolio finds nothing.
+        let product = product.filter(|_| input.source_portfolio_id.is_none());
+
+        let Some(product) = product else {
+            let identifier = input
+                .id
+                .as_deref()
+                .or(input.name.as_deref())
+                .unwrap_or_default();
+            // A request that named a source portfolio is told WHY it found nothing,
+            // rather than being left to read a bare not-found as "no such product".
+            let message = match &input.source_portfolio_id {
+                Some(portfolio) => format!(
+                    "Product {identifier} not found in source portfolio {portfolio}: no \
+                     product is associated with a portfolio in this emulator, so none is \
+                     reachable through one."
+                ),
+                None => format!("Product {identifier} not found."),
+            };
+            return Err(DescribeProductAsAdminErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeProductAsAdminOutput {
+            product_view_detail: Some(product.detail()),
+            provisioning_artifact_summaries: Some(
+                product
+                    .provisioning_artifacts
+                    .values()
+                    .map(crate::state::ProvisioningArtifact::summary)
+                    .collect(),
+            ),
+            tags: Some(product.tag_list()),
+            // Nothing can associate a TagOption or a budget with a product yet (both
+            // association operations are still scaffolded), so the associated sets are
+            // empty rather than absent.
+            tag_options: Some(Vec::new()),
+            budgets: Some(Vec::new()),
+        })
     }
 }

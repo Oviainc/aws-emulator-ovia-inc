@@ -24,7 +24,7 @@
 //! * the dictionary store is BOUNDED: past the quota `CreateDictionary` answers the
 //!   modelled `ServiceQuotaExceededException` (HTTP 402).
 
-use crate::harness::{call, past_the_transition_span, router, REGION, SIGNING_NAME};
+use crate::harness::{call, expected_dictionary_arn, past_the_transition_span, router};
 use serde_json::{json, Value};
 use service_com_amazonaws_elementalinference_elementalinference::state::MAX_DICTIONARIES;
 
@@ -41,16 +41,6 @@ const MAX_ENTRIES_LEN: usize = 40960;
 /// between 1 and 19 characters.
 fn is_dictionary_id(id: &str) -> bool {
     (1..=19).contains(&id.len()) && id.chars().all(|c| c.is_ascii_alphanumeric())
-}
-
-/// The ARN form the model gives a dictionary: `dictionary/<id>` under this service's
-/// namespace, in the request's region and the emulator's account (the modelled
-/// `resourceArn` pattern admits `:(feed|dictionary)/[a-zA-Z0-9]{1,19}`).
-fn expected_arn(id: &str) -> String {
-    format!(
-        "arn:aws:{SIGNING_NAME}:{REGION}:{}:dictionary/{id}",
-        engine::EMULATOR_ACCOUNT_ID
-    )
 }
 
 /// One row of the create table.
@@ -137,7 +127,7 @@ async fn create_dictionary_persists_a_dictionary_get_dictionary_reports_member_f
 
         assert_eq!(
             created["arn"],
-            json!(expected_arn(&id)),
+            json!(expected_dictionary_arn(&id)),
             "case {label:?}: the dictionary ARN names the minted id, got {:?}",
             created["arn"]
         );
