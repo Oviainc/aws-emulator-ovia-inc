@@ -15,6 +15,8 @@
 mod account_information_wire_fidelity;
 #[path = "all/account_settings.rs"]
 mod account_settings;
+#[path = "all/contact_information.rs"]
+mod contact_information;
 #[path = "all/pattern_validation_messages.rs"]
 mod pattern_validation_messages;
 #[path = "all/region_opt_in_listing.rs"]

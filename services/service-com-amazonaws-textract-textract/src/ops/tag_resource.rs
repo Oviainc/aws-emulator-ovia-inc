@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Adds the request's tags to the resource its `ResourceARN` names, in this service's
+//! store, so a later `ListTagsForResource` (and `GetAdapter`, for an adapter) reports
+//! them. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The write is a MERGE of assignments: a key the resource already holds takes the new
+//! value and every other stored pair is left alone, so repeating one call leaves the
+//! resource in the same state. The ARN is resolved through
+//! [`crate::state::ComAmazonawsTextractTextractState::resource_tags_mut`], the one
+//! resolution `UntagResource` and `ListTagsForResource` share.
 //!
 //! ## Shape of an operation
 //!
@@ -156,20 +156,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("Textract state is unavailable".to_string()),
+                    code: None,
+                },
+            )
+            .into());
+        };
+
+        // `AmazonResourceName` carries only a length constraint, so a value that is no
+        // Textract ARN at all reaches this handler. That is a bad parameter rather than a
+        // missing resource — the same refusal, in the same words, as the other two
+        // tagging operations.
+        let Some(resource) = crate::state::parse_resource_arn(&input.resource_arn) else {
+            return Err(TagResourceErrorModeled::InvalidParameterException(
+                crate::state::invalid_resource_arn(&input.resource_arn),
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        let Some(held) = store.resource_tags_mut(&resource) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                crate::state::tagged_resource_not_found(),
+            )
+            .into());
+        };
+
+        // All-or-nothing: a request that would leave the resource holding more tags than
+        // a `TagMap` can express is refused in full, before any pair is applied, so a
+        // refused call changes nothing. Only the keys the resource does not already hold
+        // grow it.
+        let added = input
+            .tags
+            .keys()
+            .filter(|key| !held.contains_key(*key))
+            .count();
+        let merged = held.len() + added;
+        if merged > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "the request would leave the resource with {merged} tags, more than the \
+                         maximum of {} tags per resource",
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    )),
+                    code: None,
+                },
+            )
+            .into());
+        }
+
+        // A merge of assignments: the request's value wins for the keys it names, every
+        // other stored pair stays. Repeating one call therefore changes nothing further.
+        for (key, value) in input.tags {
+            held.insert(key, value);
+        }
+
+        Ok(TagResourceOutput {})
     }
 }
