@@ -10,6 +10,8 @@
 
 use std::sync::Arc;
 
+use aws_smithy_types::date_time::Format;
+use aws_smithy_types::DateTime;
 use bytes::Bytes;
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_amplifyuibuilder_amplifyuibuilder::state::{
@@ -222,6 +224,26 @@ fn at(value: &Value, pointer: &str) -> Value {
     value.pointer(pointer).cloned().unwrap_or(Value::Null)
 }
 
+/// True when `value` is a JSON string an ISO-8601 / RFC 3339 date-time parser accepts —
+/// the wire form `@timestampFormat("date-time")` requires of `Component$createdAt` and
+/// `$modifiedAt`.
+fn is_date_time(value: &Value) -> bool {
+    value
+        .as_str()
+        .is_some_and(|text| DateTime::from_str(text, Format::DateTime).is_ok())
+}
+
+/// The instant a `date-time` member names, in seconds since the epoch. Panics on anything
+/// that is not such a string, so a wrong wire form fails the case that reads it.
+fn epoch_seconds(value: &Value) -> f64 {
+    let text = value
+        .as_str()
+        .unwrap_or_else(|| panic!("expected a date-time string, got {value:?}"));
+    DateTime::from_str(text, Format::DateTime)
+        .unwrap_or_else(|error| panic!("{text:?} is not an ISO-8601 date-time ({error})"))
+        .as_secs_f64()
+}
+
 /// A one-entry JSON object, for a case whose key is computed rather than written out.
 fn one_entry(key: &str, value: Value) -> Value {
     let mut map = Map::new();
@@ -346,7 +368,8 @@ fn create_cases() -> Vec<(&'static str, Value)> {
 
 /// `CreateComponent` persists what it was given and `GetComponent` reports that record:
 /// every member the create carried comes back with the value it was stored with, the id is
-/// a fresh UUID, `createdAt` is set, `modifiedAt` is not, and the two bodies are equal.
+/// a fresh UUID, `createdAt` and `modifiedAt` are date-time strings at the same instant,
+/// and the two bodies are equal.
 #[tokio::test]
 async fn a_created_component_is_read_back_from_what_was_stored() {
     let router = emulator();
@@ -382,14 +405,15 @@ async fn a_created_component_is_read_back_from_what_was_stored() {
             "case {case:?}: the created component must carry the environment it was created under"
         );
         assert!(
-            at(&created.body, "/createdAt").is_number(),
-            "case {case:?}: createdAt must be a timestamp, got {:?}",
+            is_date_time(&at(&created.body, "/createdAt")),
+            "case {case:?}: createdAt must be an ISO-8601 date-time string, got {:?}",
             at(&created.body, "/createdAt")
         );
         assert_eq!(
             at(&created.body, "/modifiedAt"),
-            Value::Null,
-            "case {case:?}: a component nothing has updated carries no modifiedAt, got {:?}",
+            at(&created.body, "/createdAt"),
+            "case {case:?}: a component nothing has updated reports modifiedAt at its \
+             createdAt, got {:?}",
             at(&created.body, "/modifiedAt")
         );
 
@@ -887,8 +911,8 @@ async fn update_component_merges_only_the_members_the_request_carries() {
             at(&before, "/createdAt"),
             "case {case:?}: an update must not move createdAt"
         );
-        let created_at = at(&after, "/createdAt").as_f64().unwrap_or_default();
-        let modified_at = at(&after, "/modifiedAt").as_f64().unwrap_or(f64::MIN);
+        let created_at = epoch_seconds(&at(&after, "/createdAt"));
+        let modified_at = epoch_seconds(&at(&after, "/modifiedAt"));
         assert!(
             modified_at >= created_at,
             "case {case:?}: an updated component carries a modifiedAt at or after its \
