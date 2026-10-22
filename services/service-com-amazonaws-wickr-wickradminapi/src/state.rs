@@ -156,11 +156,11 @@ pub struct ComAmazonawsWickrWickradminapiState {
     pub users: BTreeMap<String, BTreeMap<String, UserRecord>>,
     /// Security groups by `networkId`, then by group id.
     pub security_groups: BTreeMap<String, BTreeMap<String, SecurityGroupRecord>>,
-    /// `userId` by `(networkId, username)`, so checking that a username is free
-    /// is a lookup rather than a scan of the network's users. Maintained only by
-    /// [`Self::insert_user`] and [`Self::remove_network`], which are the only
-    /// writers of `users`, so it cannot drift from it.
-    username_index: BTreeMap<(String, String), String>,
+    /// `userId` by `networkId` then by `username`, so checking that a username is
+    /// free is a lookup on borrowed keys rather than a scan of the network's users.
+    /// Maintained only by [`Self::insert_user`] and [`Self::remove_network`], which
+    /// are the only writers of `users`, so it cannot drift from it.
+    username_index: BTreeMap<String, BTreeMap<String, String>>,
     /// How many network ids this store has minted. Monotonic and never reset, so
     /// a deleted network's id is never handed out again.
     minted_networks: u32,
@@ -204,18 +204,16 @@ impl ComAmazonawsWickrWickradminapiState {
     /// the batch size times a lookup rather than the batch size times the number
     /// of users already stored.
     pub fn user_by_username(&self, network_id: &str, username: &str) -> Option<&UserRecord> {
-        let user_id = self
-            .username_index
-            .get(&(network_id.to_string(), username.to_string()))?;
+        let user_id = self.username_index.get(network_id)?.get(username)?;
         self.users.get(network_id)?.get(user_id)
     }
 
     /// Store `record` under `network_id`, keeping the username index with it.
     pub fn insert_user(&mut self, network_id: &str, record: UserRecord) {
-        self.username_index.insert(
-            (network_id.to_string(), record.username.clone()),
-            record.user_id.clone(),
-        );
+        self.username_index
+            .entry(network_id.to_string())
+            .or_default()
+            .insert(record.username.clone(), record.user_id.clone());
         self.users
             .entry(network_id.to_string())
             .or_default()
@@ -232,8 +230,7 @@ impl ComAmazonawsWickrWickradminapiState {
         self.networks.remove(network_id)?;
         let removed_users = self.users.remove(network_id).unwrap_or_default();
         self.security_groups.remove(network_id);
-        self.username_index
-            .retain(|(network, _), _| network != network_id);
+        self.username_index.remove(network_id);
         Some(removed_users.len())
     }
 }

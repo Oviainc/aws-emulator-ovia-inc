@@ -244,11 +244,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .is_none_or(|group| user.security_group_ids.iter().any(|id| id == group))
         });
 
-        records.sort_by(|left, right| {
-            key(left)
-                .cmp(&key(right))
-                .then_with(|| numeric_key(&left.user_id).cmp(&numeric_key(&right.user_id)))
-        });
+        // `userId` breaks a tie on any other key, so the order is total and two pages
+        // of the same listing cannot interleave. Each record's key is computed once,
+        // not once per comparison.
+        records.sort_by_cached_key(|user| (key(user), numeric_key(&user.user_id)));
         if input.sort_direction.as_deref() == Some(crate::state::SORT_DIRECTION_DESC) {
             records.reverse();
         }
