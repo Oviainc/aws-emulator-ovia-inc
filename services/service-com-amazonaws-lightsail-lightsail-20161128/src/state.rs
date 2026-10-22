@@ -192,6 +192,13 @@ pub const OPERATION_TYPE_STOP_INSTANCE: &str = "StopInstance";
 pub const OPERATION_TYPE_DELETE_INSTANCE: &str = "DeleteInstance";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_DOMAIN: &str = "CreateDomain";
+/// The `operationType` the log entry of a change to a zone's recordsets carries.
+///
+/// The modelled `OperationType` enum has `UpdateDomainEntry` and
+/// `DeleteDomainEntry` but NO `CreateDomainEntry` member, and
+/// `Operation$operationType` targets that enum — so adding an entry to a zone is
+/// logged as the modelled recordset update, not as an unmodelled value.
+pub const OPERATION_TYPE_UPDATE_DOMAIN_ENTRY: &str = "UpdateDomainEntry";
 
 // ---------------------------------------------------------------------------
 // Store bounds
@@ -219,6 +226,13 @@ pub const MAX_INSTANCE_NAMES_PER_REQUEST: usize = 50;
 /// Emulator resource guard, NOT an AWS quota: a create that would exceed it is
 /// refused with the modelled `InvalidInputException`.
 pub const MAX_DOMAINS: usize = 500;
+
+/// The most recordset entries this emulator will hold in one domain.
+///
+/// Emulator resource guard, NOT an AWS quota: an entry is caller-sized and the
+/// zone's entry list grows with every create, so a create that would exceed this
+/// is refused with the modelled `InvalidInputException`.
+pub const MAX_DOMAIN_ENTRIES: usize = 1_000;
 
 /// The most tags one instance may carry.
 ///
@@ -2226,6 +2240,15 @@ impl ComAmazonawsLightsailLightsail20161128State {
         self.domains.insert(domain.name.clone(), domain);
     }
 
+    /// The domain recordset `name` names, for an operation the spec says mutates
+    /// it — adding, changing or removing one of the zone's entries.
+    ///
+    /// `name` is this record's store key, so it must not be reassigned through
+    /// this handle; no operation in this slice renames a zone.
+    pub fn domain_mut(&mut self, name: &str) -> Option<&mut StoredDomain> {
+        self.domains.get_mut(name)
+    }
+
     /// Remove the instance `name` names, answering it. `None` when nothing
     /// matched.
     pub fn remove_instance(&mut self, name: &str) -> Option<StoredInstance> {
@@ -2551,6 +2574,119 @@ pub fn validate_domain_name(domain_name: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The domain entry types a zone may hold, from the modelled `DomainEntry$type`
+/// documentation: "address for IPv4 (A), address for IPv6 (AAAA), canonical name
+/// (CNAME), mail exchanger (MX), name server (NS), start of authority (SOA),
+/// service locator (SRV), or text (TXT)", listed there as the types that "can be
+/// used".
+///
+/// The modelled `DomainEntryType` shape is a plain string, so this list — not a
+/// generated enum — is what an entry's `type` is checked against.
+pub const DOMAIN_ENTRY_TYPES: &[&str] = &["A", "AAAA", "CNAME", "MX", "NS", "SOA", "SRV", "TXT"];
+
+/// The types `DOMAIN_ENTRY_TYPES` admits, for a refusal message.
+pub fn domain_entry_types() -> String {
+    DOMAIN_ENTRY_TYPES.join(", ")
+}
+
+/// Refuse `entry_name` unless it is a DNS name the zone `domain_name` can hold a
+/// recordset for, answering the member and the constraint it broke.
+///
+/// A recordset entry lives INSIDE one zone, so its name is either the zone's own
+/// name (the apex) or a name under it; `member` is the request member the name
+/// came from, so the refusal names what the caller sent.
+///
+/// The syntax rule is DNS's own, and WIDER than [`validate_domain_name`]'s,
+/// because a zone holds entries a zone name may not be: a label may be the `*`
+/// wildcard (leftmost label only, RFC 4592 §2.1.1) and a label may carry an
+/// underscore, which is what an `_tcp` service locator (RFC 2782) or a `_`-prefixed
+/// validation record is made of. Names are compared case-insensitively (RFC 4343).
+pub fn validate_domain_entry_name(
+    member: &str,
+    entry_name: &str,
+    domain_name: &str,
+) -> Result<(), String> {
+    if entry_name.chars().count() > MAX_DOMAIN_NAME_CHARS {
+        return Err(format!(
+            "{member} carries {} characters, more than the {MAX_DOMAIN_NAME_CHARS} a \
+             domain name may have",
+            entry_name.chars().count()
+        ));
+    }
+    let labels: Vec<&str> = entry_name.split('.').collect();
+    if labels.len() < 2 {
+        return Err(format!(
+            "{member} '{entry_name}' is not a domain name: it must carry at least two \
+             dot-separated labels (www.example.com)"
+        ));
+    }
+    for (index, label) in labels.iter().enumerate() {
+        if label.is_empty() {
+            return Err(format!(
+                "{member} '{entry_name}' is not a domain name: every dot-separated label \
+                 must be non-empty"
+            ));
+        }
+        if label.chars().count() > MAX_DOMAIN_LABEL_CHARS {
+            return Err(format!(
+                "{member} label '{label}' carries {} characters, more than the \
+                 {MAX_DOMAIN_LABEL_CHARS} a label may have",
+                label.chars().count()
+            ));
+        }
+        if *label == "*" {
+            if index == 0 {
+                continue;
+            }
+            return Err(format!(
+                "{member} '{entry_name}' is not a domain name: the '*' wildcard is only \
+                 the leftmost label of a name"
+            ));
+        }
+        if !label
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_')
+        {
+            return Err(format!(
+                "{member} label '{label}' is not a domain label: a label carries only \
+                 ASCII letters, digits, hyphens and underscores"
+            ));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(format!(
+                "{member} label '{label}' is not a domain label: a label neither begins \
+                 nor ends with a hyphen"
+            ));
+        }
+    }
+    let name = entry_name.to_ascii_lowercase();
+    let zone = domain_name.to_ascii_lowercase();
+    if name != zone && !name.ends_with(&format!(".{zone}")) {
+        return Err(format!(
+            "{member} '{entry_name}' is not inside the domain '{domain_name}': an entry \
+             names either the domain itself or a name under it"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `entry` is the recordset entry `name`/`entry_type`/`target` describes:
+/// the three values that identify one entry of a zone. Names and types are
+/// compared case-insensitively (RFC 4343, and the type is a DNS record type).
+pub fn is_same_domain_entry(
+    entry: &DomainEntry,
+    name: &str,
+    entry_type: &str,
+    target: &str,
+) -> bool {
+    let same = |stored: &Option<String>, requested: &str| {
+        stored
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case(requested))
+    };
+    same(&entry.name, name) && same(&entry.r#type, entry_type) && entry.target.as_deref() == Some(target)
 }
 
 // ---------------------------------------------------------------------------
