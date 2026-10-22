@@ -17,6 +17,8 @@ mod accessor_lifecycle;
 mod invitations;
 #[path = "all/list_members.rs"]
 mod list_members;
+#[path = "all/modelled_error_payloads.rs"]
+mod modelled_error_payloads;
 #[path = "all/network_and_node_lifecycle.rs"]
 mod network_and_node_lifecycle;
 #[path = "all/proposal_lifecycle.rs"]
