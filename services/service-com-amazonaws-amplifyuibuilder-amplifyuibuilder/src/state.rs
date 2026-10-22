@@ -23,6 +23,15 @@ use crate::ops::types::{
 /// the model constrains `@range(min: 1, max: 100)`.
 pub const COMPONENT_PAGE_LIMIT: i32 = 100;
 
+/// How many components one `ExportComponents` page carries.
+///
+/// `ExportComponentsRequest` models no page-size member (only `nextToken`), so
+/// the length of an export page is the service's own choice rather than
+/// something a caller asks for. This emulator serves the same largest page its
+/// component list does, so a caller walking either operation walks pages of one
+/// bound.
+pub const EXPORT_PAGE_LIMIT: usize = COMPONENT_PAGE_LIMIT as usize;
+
 /// How many components the store holds before `CreateComponent` refuses with the
 /// modelled `ServiceQuotaExceededException`.
 ///
