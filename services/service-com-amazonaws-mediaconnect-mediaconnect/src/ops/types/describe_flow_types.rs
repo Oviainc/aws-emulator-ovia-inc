@@ -11,7 +11,35 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-mediaconnect-mediaconnect.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.mediaconnect#DescribeFlowRequest")]
+// `skip_validation = ["FlowArn"]` — the note every flow operation's `FlowArn` label
+// refers back to.
+//
+// `DescribeFlowRequest$FlowArn` declares its OWN `@pattern`,
+// `^arn:.+:mediaconnect.+:flow:.+$` (`smithy_query(query="shape",
+// shape="DescribeFlowRequest")`), while the `FlowArn` SHAPE it targets declares the much
+// narrower `^arn:(aws[a-zA-Z-]*):mediaconnect:[a-z0-9-]+:[0-9]{12}:flow:[a-zA-Z0-9-]+:
+// [a-zA-Z0-9_-]+$`. The boundary walk captures the shape's trait in preference to the
+// member's, so without this the walk refuses — 400 `BadRequestException` — every label
+// outside the narrow form: a label that is not an ARN at all, and also ARNs the member's
+// own pattern admits (another partition, an account segment that is not twelve digits, a
+// flow id or name outside the narrowed character classes).
+//
+// AWS does neither. A flow ARN is an IDENTIFIER: the recordings show a `{FlowArn}` label
+// that is not an ARN at all answered 404 `NotFoundException`, i.e. the request resolved to
+// no flow rather than being rejected as a malformed member. So the label is handed to the
+// handler unjudged and the STORE decides: an ARN the store holds is served, anything else
+// resolves to no flow and is refused `NotFoundException` with
+// `crate::state::not_found_message`.
+//
+// Only `FlowArn` is skipped; every other member of this input keeps its modelled
+// constraints. `DescribeFlowSourceMetadata` and `DescribeFlowSourceThumbnail` are NOT
+// skipped: their `FlowArn` members declare no pattern of their own, so the narrow shape
+// pattern is the only one the model states for them and the walk enforces what is
+// modelled.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.mediaconnect#DescribeFlowRequest",
+    skip_validation = ["FlowArn"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct DescribeFlowInput {
     pub flow_arn: String,
