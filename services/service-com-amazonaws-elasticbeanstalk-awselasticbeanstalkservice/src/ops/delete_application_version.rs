@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteApplicationVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteApplicationVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteApplicationVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: removes one application version from the store, refusing while an
+//! environment that has not terminated is still deployed from it. This is the ONLY file
+//! to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +163,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteApplicationVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteApplicationVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteApplicationVersion"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteApplicationVersionError::internal_failure(
+                "the Elastic Beanstalk store is unavailable",
+            )
+        })?;
+        let mut store = state.lock();
+        store.materialize_due_transitions();
+
+        // A version is addressed as a version OF an application, so an
+        // application name that resolves to nothing names no version either —
+        // the refusal every operation of this service answers for an
+        // application name it cannot resolve.
+        if !store.applications.contains_key(&input.application_name) {
+            return Err(DeleteApplicationVersionError::invalid_parameter_value(
+                format!("No Application named '{}' found.", input.application_name),
+            ));
+        }
+
+        let key = (input.application_name.clone(), input.version_label.clone());
+        if !store.application_versions.contains_key(&key) {
+            // Deleting a version the application does not have asks for the
+            // state the store is already in, so it succeeds and changes
+            // nothing: the delete is idempotent, and the second call of a
+            // retried delete answers the way the first one did.
+            return Ok(DeleteApplicationVersionOutput);
+        }
+
+        // "You cannot delete an application version that is associated with a
+        // running environment." An environment counts as running until it has
+        // reached `Terminated`: one that is still shutting down is deployed from
+        // this version yet.
+        let deployed_to: Vec<String> = store
+            .environments
+            .values()
+            .filter(|environment| {
+                environment.application_name == input.application_name
+                    && environment.version_label.as_deref() == Some(input.version_label.as_str())
+                    && !environment.is_terminated()
+            })
+            .map(|environment| environment.environment_name.clone())
+            .collect();
+        if !deployed_to.is_empty() {
+            return Err(
+                DeleteApplicationVersionErrorModeled::OperationInProgressException(
+                    OperationInProgressException {
+                        message: Some(format!(
+                            "Cannot delete application version {} of application {} because it \
+                             is still deployed to running environments: {}.",
+                            input.version_label,
+                            input.application_name,
+                            deployed_to.join(", ")
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `DeleteSourceBundle`: "Set to true to delete the source bundle from
+        // your storage bucket. Otherwise, the application version is deleted only
+        // from Elastic Beanstalk and the source bundle remains in Amazon S3."
+        // This emulator persists the version's `SourceBundle` as the bucket/key
+        // REFERENCE the caller supplied and owns no S3 object, so there is no
+        // second object for the flag to delete and no bundle left behind when it
+        // is unset — which is also why neither `SourceBundleDeletionException`
+        // nor `S3LocationNotInServiceRegionException`, both failures of that S3
+        // deletion, is reachable here.
+        let _ = input.delete_source_bundle;
+        store.application_versions.remove(&key);
+
+        Ok(DeleteApplicationVersionOutput)
     }
 }

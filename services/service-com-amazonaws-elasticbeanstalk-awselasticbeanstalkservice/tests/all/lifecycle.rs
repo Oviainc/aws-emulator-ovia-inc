@@ -35,16 +35,16 @@ const TEST_REGION: &str = "us-west-2";
 
 /// Long enough that a status change the clock owed is due. Derived from the
 /// service's own span so the two cannot drift apart.
-const PAST_DUE: Duration = eb::state::STATUS_TRANSITION_SPAN.saturating_add(Duration::from_millis(250));
+pub(crate) const PAST_DUE: Duration = eb::state::STATUS_TRANSITION_SPAN.saturating_add(Duration::from_millis(250));
 
 /// The emulator under test: this one service, mounted in the router the
 /// production binary mounts it in, driven over HTTP.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.register_service(eb::EmulatedService::new(engine));
@@ -52,7 +52,7 @@ impl Emulator {
     }
 
     /// Call `action` with `params`, signed for [`TEST_REGION`].
-    async fn call(&self, action: &str, params: &[(&str, &str)]) -> Answer {
+    pub(crate) async fn call(&self, action: &str, params: &[(&str, &str)]) -> Answer {
         self.call_in_region(TEST_REGION, action, params).await
     }
 
@@ -82,9 +82,9 @@ impl Emulator {
 }
 
 /// One answer from the emulator: its status and its XML body.
-struct Answer {
-    status: u16,
-    body: String,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: String,
 }
 
 impl Answer {
@@ -97,7 +97,7 @@ impl Answer {
     /// Every value at `path` — a `/`-separated element path whose last segment
     /// is the element read and whose earlier segments are the enclosing
     /// elements, e.g. `Environments/member/EnvironmentId` — in document order.
-    fn values_at(&self, path: &str) -> Vec<&str> {
+    pub(crate) fn values_at(&self, path: &str) -> Vec<&str> {
         let mut segments = path.split('/').collect::<Vec<&str>>();
         let tag = segments.pop().expect("a path names at least one element");
         let mut scopes = vec![self.body.as_str()];
@@ -115,12 +115,12 @@ impl Answer {
     }
 
     /// The first value at `path` (see [`Answer::values_at`]).
-    fn value(&self, path: &str) -> Option<&str> {
+    pub(crate) fn value(&self, path: &str) -> Option<&str> {
         self.values_at(path).into_iter().next()
     }
 
     /// As [`Answer::value`], failing the named case when the element is absent.
-    fn expect(&self, path: &str, case: &str) -> &str {
+    pub(crate) fn expect(&self, path: &str, case: &str) -> &str {
         self.value(path).unwrap_or_else(|| {
             panic!(
                 "case {case:?}: expected a {path} element, got status {} and body {}",
@@ -130,7 +130,7 @@ impl Answer {
     }
 
     /// The awsQuery error envelope's `<Code>`, or `""` on a success envelope.
-    fn error_code(&self) -> &str {
+    pub(crate) fn error_code(&self) -> &str {
         self.value("Error/Code").unwrap_or_default()
     }
 }
