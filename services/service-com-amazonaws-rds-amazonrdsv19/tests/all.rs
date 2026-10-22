@@ -25,10 +25,16 @@ mod db_instances;
 mod docdb_query_surface;
 #[path = "all/engine_version_families.rs"]
 mod engine_version_families;
+#[path = "all/event_subscriptions.rs"]
+mod event_subscriptions;
 #[path = "all/existence_and_parameter_guards.rs"]
 mod existence_and_parameter_guards;
+#[path = "all/global_clusters.rs"]
+mod global_clusters;
 #[path = "all/not_found_paths.rs"]
 mod not_found_paths;
+#[path = "all/option_group_deletion.rs"]
+mod option_group_deletion;
 #[path = "all/option_group_options.rs"]
 mod option_group_options;
 #[path = "all/option_group_setting_catalog.rs"]

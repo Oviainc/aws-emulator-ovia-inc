@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDeleteBuilds
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDeleteBuilds`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchDeleteBuilds::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the stored builds the request names: this is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +130,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDeleteBuilds` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDeleteBuildsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDeleteBuilds"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "BatchDeleteBuilds (this engine carries no CodeBuild state)",
+            ));
+        };
+
+        let _ = ctx;
+        let mut guard = state.lock();
+        let mut deleted: Vec<String> = Vec::new();
+        let mut not_deleted: Vec<BuildNotDeleted> = Vec::new();
+        // Two entries naming the same build name one build, so each named build is
+        // reported once: without this the repeat would read as "not deleted" purely
+        // because the first occurrence had just deleted it.
+        let mut seen: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+        for id in &input.ids {
+            if !seen.insert(id.as_str()) {
+                continue;
+            }
+            // AWS states no status precondition for deleting a build (unlike
+            // `StopBuild`, which needs one still running), so a build is removed
+            // whatever status it carries; the only build this emulator cannot delete
+            // is one it holds no record of. A deleted build leaves both the build map
+            // and its project's id index, so every later read — `BatchGetBuilds`,
+            // `ListBuildsForProject`, and `ListBuilds` once its own stub issue is
+            // closed — stops reporting it.
+            if guard.remove_build(id) {
+                deleted.push(id.clone());
+            } else {
+                not_deleted.push(BuildNotDeleted {
+                    id: Some(id.clone()),
+                    // `statusCode` is documented only as "Additional information
+                    // about the build that could not be successfully deleted", and
+                    // CodeBuild builds it from the request: it names the id the
+                    // caller asked for, exactly as given, and says it does not
+                    // exist.
+                    status_code: Some(format!("Build {id} does not exist")),
+                });
+            }
+        }
+
+        Ok(BatchDeleteBuildsOutput {
+            // `buildsDeleted` targets `BuildIds`, bounded at 1..100 entries, so an
+            // empty one is left absent rather than serialized as `[]`.
+            builds_deleted: (!deleted.is_empty()).then_some(deleted),
+            // `BuildsNotDeleted` carries no `@length`, so it is always reported —
+            // `[]` when every named build was deleted. A client reads the member
+            // unconditionally to find out what it has left to deal with.
+            builds_not_deleted: Some(not_deleted),
+        })
     }
 }
+

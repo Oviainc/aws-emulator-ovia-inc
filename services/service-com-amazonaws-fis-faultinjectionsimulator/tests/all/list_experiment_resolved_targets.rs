@@ -312,7 +312,11 @@ fn template_body(label: &str, rows: &[Row]) -> Value {
         "roleArn": "arn:aws:iam::000000000000:role/fis-list-experiment-resolved-targets",
         "stopConditions": [{ "source": "none" }],
         "targets": Value::Object(targets),
-        "actions": { "wait": { "actionId": "aws:fis:wait" } }
+        // `aws:fis:wait` takes a required `duration`, an ISO 8601 duration within the
+        // documented 1 to 720 minutes.
+        "actions": {
+            "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": "PT5M" } }
+        }
     })
 }
 

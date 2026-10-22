@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCommentsForComparedCommit
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCommentsForComparedCommit`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCommentsForComparedCommit::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the comments `crate::state` holds for one repository's
+//! comparison between two commits, a page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -145,6 +138,59 @@ impl From<GetCommentsForComparedCommitErrorModeled> for GetCommentsForComparedCo
     }
 }
 
+/// A commit id named in the request: absent (empty) is `CommitIdRequiredException`,
+/// and anything that is not a git object name is `InvalidCommitIdException`.
+fn checked_commit_id(
+    member: &str,
+    commit_id: &str,
+) -> Result<(), GetCommentsForComparedCommitError> {
+    if commit_id.is_empty() {
+        return Err(GetCommentsForComparedCommitErrorModeled::CommitIdRequiredException(
+            CommitIdRequiredException {
+                message: Some(format!("a commit id is required (member: {member})")),
+            },
+        )
+        .into());
+    }
+    if !crate::state::is_object_id(commit_id) {
+        return Err(GetCommentsForComparedCommitErrorModeled::InvalidCommitIdException(
+            InvalidCommitIdException {
+                message: Some(format!(
+                    "the commit id {commit_id} is not valid (member: {member})"
+                )),
+            },
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// One comment thread: the root comment, then the comments replying to it, each
+/// level in the order it was posted. A comment and its replies are one entry of
+/// the comparison's data, which is why they are collected together.
+fn thread(
+    repository: &crate::state::Repository,
+    root: &crate::state::CommentRecord,
+) -> Vec<Comment> {
+    let mut members: Vec<&crate::state::CommentRecord> = vec![root];
+    let mut next = 0usize;
+    while next < members.len() {
+        let parent = members[next].comment_id.clone();
+        next += 1;
+        let mut replies: Vec<&crate::state::CommentRecord> = repository
+            .comments
+            .values()
+            .filter(|comment| comment.in_reply_to.as_deref() == Some(parent.as_str()))
+            .collect();
+        replies.sort_by_key(|comment| comment.sequence);
+        members.extend(replies);
+    }
+    members
+        .iter()
+        .map(|comment| comment.comment())
+        .collect()
+}
+
 /// The `GetCommentsForComparedCommit` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -181,18 +227,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCommentsForComparedCommit` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCommentsForComparedCommitErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCommentsForComparedCommit"))
+        let _ = ctx;
+        // "A non-zero, non-negative integer used to limit the number of returned
+        // results. The default is 100 comments, but you can configure up to 500."
+        let page_size = match input.max_results {
+            None => crate::state::COMMENTS_PAGE_DEFAULT,
+            Some(max_results)
+                if (1..=crate::state::COMMENTS_PAGE_MAX).contains(&max_results) =>
+            {
+                max_results
+            }
+            Some(max_results) => {
+                return Err(
+                    GetCommentsForComparedCommitErrorModeled::InvalidMaxResultsException(
+                        InvalidMaxResultsException {
+                            message: Some(format!(
+                                "the maximum results value {max_results} is not valid: expected 1 to {}",
+                                crate::state::COMMENTS_PAGE_MAX
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+        let page_size = usize::try_from(page_size).unwrap_or(0);
+
+        checked_commit_id("afterCommitId", &input.after_commit_id)?;
+        // A blank `beforeCommitId` narrows nothing, the same as leaving the optional
+        // member out.
+        let before_commit_id = input
+            .before_commit_id
+            .as_deref()
+            .filter(|commit_id| !commit_id.is_empty());
+        if let Some(before_commit_id) = before_commit_id {
+            checked_commit_id("beforeCommitId", before_commit_id)?;
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let store = state.lock();
+        let repository = store.repositories.get(&input.repository_name).ok_or_else(|| {
+            GetCommentsForComparedCommitErrorModeled::RepositoryDoesNotExistException(
+                RepositoryDoesNotExistException {
+                    message: Some(format!(
+                        "the repository {} does not exist",
+                        input.repository_name
+                    )),
+                },
+            )
+        })?;
+
+        // Both sides of the comparison have to be commits this repository holds.
+        for commit_id in [Some(input.after_commit_id.as_str()), before_commit_id]
+            .into_iter()
+            .flatten()
+        {
+            if !repository.commits.contains_key(commit_id) {
+                return Err(
+                    GetCommentsForComparedCommitErrorModeled::CommitDoesNotExistException(
+                        CommitDoesNotExistException {
+                            message: Some(format!(
+                                "the commit {commit_id} does not exist in the repository {}",
+                                input.repository_name
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The comment threads filed on this comparison: the after side always has
+        // to match, and a named before side narrows the comparison further, while
+        // an absent one reports every comment posted on that after commit. A reply
+        // is reported inside its own thread, not as a thread of its own.
+        let mut roots: Vec<&crate::state::CommentRecord> = repository
+            .comments
+            .values()
+            .filter(|comment| {
+                comment.in_reply_to.is_none()
+                    && comment.comparison.after_commit_id == input.after_commit_id
+                    && before_commit_id.is_none_or(|before_commit_id| {
+                        comment.comparison.before_commit_id.as_deref() == Some(before_commit_id)
+                    })
+            })
+            .collect();
+        roots.sort_by_key(|comment| comment.sequence);
+
+        // The page the continuation token names: an offset into that order, so
+        // paging is stable while nothing is posted.
+        let start = match input.next_token.as_deref() {
+            None => 0usize,
+            Some(token) => token
+                .parse::<usize>()
+                .ok()
+                .filter(|offset| *offset <= roots.len())
+                .ok_or_else(|| {
+                    GetCommentsForComparedCommitErrorModeled::InvalidContinuationTokenException(
+                        InvalidContinuationTokenException {
+                            message: Some(format!(
+                                "the continuation token {token} is not valid"
+                            )),
+                        },
+                    )
+                })?,
+        };
+        let end = roots.len().min(start.saturating_add(page_size));
+
+        let data: Vec<CommentsForComparedCommit> = roots[start..end]
+            .iter()
+            .map(|root| CommentsForComparedCommit {
+                repository_name: Some(repository.name.clone()),
+                before_commit_id: root.comparison.before_commit_id.clone(),
+                after_commit_id: Some(root.comparison.after_commit_id.clone()),
+                before_blob_id: root.comparison.before_blob_id.clone(),
+                after_blob_id: root.comparison.after_blob_id.clone(),
+                location: root.location.clone(),
+                comments: Some(thread(repository, root)),
+            })
+            .collect();
+
+        Ok(GetCommentsForComparedCommitOutput {
+            comments_for_compared_commit_data: Some(data),
+            next_token: (end < roots.len()).then(|| end.to_string()),
+        })
     }
 }

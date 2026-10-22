@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCostEstimation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCostEstimation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the account's cost estimation ([`crate::state::CostEstimationRecord`]), as
+//! `StartCostEstimation` created it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCostEstimation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A REPORT, so it writes nothing: the estimate is created asynchronously, and this
+//! operation derives `ONGOING` / `COMPLETED` (and `TimeRange.EndTime`) from the
+//! completion instant the start fixed, so what it answers depends on the clock alone
+//! and polling it changes nothing. Before any `StartCostEstimation` there is no
+//! estimation to report, which is the modelled `TotalCost` default of 0 and no other
+//! member.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +167,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCostEstimation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCostEstimationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCostEstimation"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetCostEstimationError::Modeled(
+                GetCostEstimationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the DevOps Guru cost estimation store is unavailable"
+                            .to_string(),
+                        retry_after_seconds: 0,
+                    },
+                ),
+            )
+        })?;
+
+        // A token names an offset into THIS collection, so one issued for another
+        // paginated read of this service does not resolve here.
+        let scope = "GetCostEstimation";
+        let invalid_next_token = || -> GetCostEstimationError {
+            GetCostEstimationErrorModeled::ValidationException(ValidationException {
+                message: "NextToken does not name a page of this cost estimation".to_string(),
+                reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                fields: Some(vec![ValidationExceptionField {
+                    name: "NextToken".to_string(),
+                    message: "must be a token returned by an earlier GetCostEstimation"
+                        .to_string(),
+                }]),
+            })
+            .into()
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let guard = state.lock();
+
+        // No estimation has been started, so there is nothing to report: `TotalCost`
+        // is required and defaults to 0, and every other member is absent. The page
+        // token is still resolved, so a stale cursor is refused here too.
+        let Some(estimation) = guard.cost_estimation.as_ref() else {
+            let nothing: Vec<crate::state::ResourceCostRecord> = Vec::new();
+            crate::state::page(&nothing, scope, input.next_token.as_deref())
+                .ok_or_else(invalid_next_token)?;
+            return Ok(GetCostEstimationOutput::default());
+        };
+
+        let (page, next_token) =
+            crate::state::page(&estimation.costs, scope, input.next_token.as_deref())
+                .ok_or_else(invalid_next_token)?;
+
+        let costs: Vec<ServiceResourceCost> = page
+            .iter()
+            .map(|cost| ServiceResourceCost {
+                r#type: Some(cost.resource_type.clone()),
+                state: Some(cost.state.clone()),
+                count: cost.count,
+                unit_cost: cost.unit_cost,
+                cost: cost.cost,
+            })
+            .collect();
+
+        // `TotalCost` is "the estimated monthly cost to analyze the Amazon Web Services
+        // resources": the whole estimation's cost, so it sums every line the estimation
+        // holds rather than only the page being returned. A paginated walk therefore
+        // reports the same total on every page instead of a partial one.
+        let total_cost = crate::state::round_cost(
+            estimation.costs.iter().map(|cost| cost.cost).sum(),
+        );
+
+        Ok(GetCostEstimationOutput {
+            resource_collection: Some(CostEstimationResourceCollectionFilter {
+                cloud_formation: estimation.stack_names.as_ref().map(|stack_names| {
+                    CloudFormationCostEstimationResourceCollectionFilter {
+                        stack_names: Some(stack_names.clone()),
+                    }
+                }),
+                tags: estimation.tags.as_ref().map(|tags| {
+                    tags.iter()
+                        .map(|(app_boundary_key, tag_values)| {
+                            TagCostEstimationResourceCollectionFilter {
+                                app_boundary_key: app_boundary_key.clone(),
+                                tag_values: tag_values.clone(),
+                            }
+                        })
+                        .collect()
+                }),
+            }),
+            status: Some(estimation.status(now).to_string()),
+            costs: Some(costs),
+            time_range: Some(CostEstimationTimeRange {
+                start_time: Some(::aws_smithy_types::DateTime::from(estimation.started_at)),
+                end_time: estimation
+                    .end_time(now)
+                    .map(::aws_smithy_types::DateTime::from),
+            }),
+            total_cost,
+            next_token,
+        })
     }
 }

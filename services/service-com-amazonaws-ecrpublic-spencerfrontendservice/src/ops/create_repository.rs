@@ -241,6 +241,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at,
             catalog_data,
             tags,
+            // A new repository carries no repository policy until `SetRepositoryPolicy`
+            // applies one.
+            policy_text: None,
             images: ::std::collections::BTreeMap::new(),
             tag_index: ::std::collections::BTreeMap::new(),
         };
