@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDictionaries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDictionaries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDictionaries::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: enumerates the persisted dictionaries as `DictionarySummary` items in
+//! stable id order, one page at a time, exactly as `ListFeeds` does for feeds.
+//! Reporting only: it materialises the transitions the clock already owes (they were
+//! due at this instant whether or not anybody called) and writes nothing else.
 //!
 //! ## Shape of an operation
 //!
@@ -115,6 +110,23 @@ impl From<ListDictionariesErrorModeled> for ListDictionariesError {
     }
 }
 
+/// The most dictionaries one page may carry, whatever the request asks for: the
+/// `@range` maximum the model gives `maxResults`
+/// (`smithy_query(query="operation",operation="ListDictionaries")` gives it the range
+/// `{min: 1, max: 100}`, which the member's own documentation repeats as "Valid range:
+/// 1 to 100"). Clamping here rather than trusting the boundary keeps one small request
+/// from serialising a response proportional to the whole store, and
+/// [`crate::state::MAX_DICTIONARIES`] bounds that store in turn.
+const MAX_PAGE_SIZE: usize = 100;
+
+/// The page size this operation uses when a request omits `maxResults`.
+///
+/// AWS documents no default for it (`ListDictionariesRequest$maxResults` states only
+/// the valid range, unlike `ListFeedsRequest$maxResults` which documents a default of
+/// 10), so it is [`MAX_PAGE_SIZE`], the model's own ceiling: a request that asks for no
+/// page size still cannot be answered with more than the modelled maximum.
+const DEFAULT_MAX_RESULTS: usize = MAX_PAGE_SIZE;
+
 /// The `ListDictionaries` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -152,17 +164,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDictionaries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDictionariesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDictionaries"))
+        // request metadata, and this operation needs none of it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListDictionariesErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the com.amazonaws.elementalinference state store is unavailable"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A token that is not a pagination token at all cannot name a page, so it is
+        // refused rather than silently treated as the first page.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(id) => Some(id),
+                None => {
+                    return Err(ListDictionariesErrorModeled::ValidationException(
+                        ValidationException {
+                            message: "nextToken is not a valid pagination token.".to_string(),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+        // `maxResults` is modelled with range 1..100, so the boundary has already
+        // refused anything outside it; the clamp is the server-side bound that does
+        // not depend on that, so a page can never exceed MAX_PAGE_SIZE items.
+        let page_size = input
+            .max_results
+            .map_or(DEFAULT_MAX_RESULTS, |max| max.max(1) as usize)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        let mut state = state.lock();
+        state.settle_due_transitions(std::time::Instant::now());
+
+        // BTreeMap order, so paging is stable and resuming after an id that has since
+        // been deleted still continues at the next dictionary.
+        let mut remaining = state.dictionaries.iter().filter(|(id, _)| {
+            resume_after
+                .as_deref()
+                .is_none_or(|after| id.as_str() > after)
+        });
+        let page: Vec<(&String, &crate::state::Dictionary)> =
+            remaining.by_ref().take(page_size).collect();
+        // A token only when a further dictionary is actually there to be fetched.
+        let has_more = remaining.next().is_some();
+        // Which feeds reference a dictionary is DERIVED from the feed store, so the
+        // status reported here is the same one `GetDictionary` reports for that record.
+        let dictionaries: Vec<DictionarySummary> = page
+            .iter()
+            .map(|(id, dictionary)| dictionary.summary(&state.feeds_referencing(id)))
+            .collect();
+        let next_token = match (has_more, dictionaries.last()) {
+            (true, Some(last)) => Some(crate::state::encode_page_token(&last.id)),
+            _ => None,
+        };
+
+        Ok(ListDictionariesOutput {
+            dictionaries,
+            next_token,
+        })
     }
 }

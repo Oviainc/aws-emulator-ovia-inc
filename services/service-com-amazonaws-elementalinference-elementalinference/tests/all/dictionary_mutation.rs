@@ -27,6 +27,7 @@
 
 use crate::harness::{
     call, expected_dictionary_arn, output_config, past_the_transition_span, router,
+    subtitling_output,
 };
 use serde_json::{json, Value};
 use service_com_amazonaws_elementalinference_elementalinference::state::{
@@ -69,19 +70,6 @@ async fn export_entries(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
         None,
     )
     .await
-}
-
-/// One output whose subtitling config names `dictionary` (`SubtitlingConfig$dictionary`:
-/// "the ID of a custom dictionary"), or names none when it is `None`.
-fn subtitling_output(name: &str, dictionary: Option<&str>) -> Value {
-    let mut config = output_config("subtitling");
-    if let Some(dictionary) = dictionary {
-        config["subtitling"]
-            .as_object_mut()
-            .expect("the subtitling config is an object")
-            .insert("dictionary".to_string(), json!(dictionary));
-    }
-    json!({"name": name, "outputConfig": config, "status": "ENABLED"})
 }
 
 /// One output of the `kind` config the harness builds, which names no dictionary.

@@ -116,6 +116,22 @@ pub fn output_config(kind: &str) -> Value {
     }
 }
 
+/// One output whose subtitling config names `dictionary` (`SubtitlingConfig$dictionary`:
+/// "the ID of a custom dictionary"), or names none when it is `None`.
+///
+/// A subtitling output is the ONLY way a feed references a dictionary, so this is the
+/// one builder every suite that needs that reference goes through.
+pub fn subtitling_output(name: &str, dictionary: Option<&str>) -> Value {
+    let mut config = output_config("subtitling");
+    if let Some(dictionary) = dictionary {
+        config["subtitling"]
+            .as_object_mut()
+            .expect("the subtitling config is an object")
+            .insert("dictionary".to_string(), json!(dictionary));
+    }
+    json!({"name": name, "outputConfig": config, "status": "ENABLED"})
+}
+
 /// A `CreateFeed` body with one enabled cropping output and no optional members: the
 /// smallest feed a suite can create when the feed's own shape is not what it is
 /// testing.

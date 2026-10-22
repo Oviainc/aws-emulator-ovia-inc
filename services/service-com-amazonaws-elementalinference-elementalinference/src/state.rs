@@ -39,7 +39,8 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::ops::types::{
-    AspectRatio, Competitor, FeedAssociation, FeedSummary, FixtureSummary, GetOutput, OutputConfig,
+    AspectRatio, Competitor, DictionarySummary, FeedAssociation, FeedSummary, FixtureSummary,
+    GetOutput, OutputConfig,
 };
 
 /// This service's SigV4 signing name and ARN namespace (`OPERATIONS.md`, "Wire
@@ -302,6 +303,24 @@ impl Dictionary {
     /// moment the first tag is added.
     pub fn tag_map(&self) -> std::collections::HashMap<String, String> {
         self.tags.clone().into_iter().collect()
+    }
+
+    /// The `DictionarySummary` projection `ListDictionaries` reports — the dictionary's
+    /// counterpart of [`Feed::summary`].
+    ///
+    /// `references` is the feeds that currently reference this dictionary
+    /// ([`ComAmazonawsElementalinferenceElementalinferenceState::feeds_referencing`]),
+    /// so the summary's `status` is the SAME reported status `GetDictionary` answers
+    /// with ([`Self::reported_status`]) and a list and a get cannot disagree about one
+    /// stored dictionary.
+    pub fn summary(&self, references: &[String]) -> DictionarySummary {
+        DictionarySummary {
+            arn: self.arn.clone(),
+            id: self.id.clone(),
+            name: self.name.clone(),
+            language: self.language.clone(),
+            status: self.reported_status(references).to_string(),
+        }
     }
 }
 
