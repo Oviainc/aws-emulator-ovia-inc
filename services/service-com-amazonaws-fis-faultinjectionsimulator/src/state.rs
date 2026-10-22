@@ -35,7 +35,8 @@ use crate::ops::types::{
     ExperimentReportConfigurationDataSources, ExperimentReportConfigurationOutputs,
     ExperimentReportConfigurationOutputsS3Configuration, ExperimentS3LogConfiguration,
     ExperimentState, ExperimentStopCondition, ExperimentSummary, ExperimentTarget,
-    ExperimentTargetFilter, ExperimentTemplate, ExperimentTemplateAction,
+    ExperimentTargetAccountConfiguration, ExperimentTargetFilter, ExperimentTemplate,
+    ExperimentTemplateAction,
     ExperimentTemplateCloudWatchLogsLogConfiguration,
     ExperimentTemplateCloudWatchLogsLogConfigurationInput, ExperimentTemplateExperimentOptions,
     ExperimentTemplateLogConfiguration, ExperimentTemplateReportConfiguration,
@@ -251,6 +252,23 @@ impl TargetAccountConfigurationRecord {
     /// returns: every member is the stored one.
     pub fn to_target_account_configuration(&self) -> TargetAccountConfiguration {
         TargetAccountConfiguration {
+            role_arn: Some(self.role_arn.clone()),
+            account_id: Some(self.account_id.clone()),
+            description: self.description.clone(),
+        }
+    }
+
+    /// The same record as an `ExperimentTargetAccountConfiguration` — the shape an
+    /// EXPERIMENT's target account configuration is reported as.
+    ///
+    /// `ExperimentTargetAccountConfiguration` and `TargetAccountConfiguration` carry the
+    /// same three members (`roleArn`, `accountId`, `description`), so an experiment
+    /// reports the configuration its template held when it was started, member for
+    /// member.
+    pub fn to_experiment_target_account_configuration(
+        &self,
+    ) -> ExperimentTargetAccountConfiguration {
+        ExperimentTargetAccountConfiguration {
             role_arn: Some(self.role_arn.clone()),
             account_id: Some(self.account_id.clone()),
             description: self.description.clone(),
@@ -871,6 +889,21 @@ pub fn target_account_configuration_not_found(
         message: Some(format!(
             "No target account configuration found for account {account_id} \
              in experiment template {experiment_template_id}"
+        )),
+    }
+}
+
+/// The `ResourceNotFoundException` payload for an (experiment, account) pair that names
+/// no target account configuration on that experiment's snapshot — "the specified
+/// resource cannot be found".
+pub fn experiment_target_account_configuration_not_found(
+    experiment_id: &str,
+    account_id: &str,
+) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "No target account configuration found for account {account_id} \
+             in experiment {experiment_id}"
         )),
     }
 }
