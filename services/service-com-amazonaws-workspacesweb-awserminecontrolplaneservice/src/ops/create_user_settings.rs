@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateUserSettings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateUserSettings`'s real behaviour. Implement it here — this is
+//! Creates a user-settings resource and PERSISTS the whole record under a freshly
+//! minted `userSettingsArn`, which is what the response reports. A replayed
+//! `clientToken` returns the first resource rather than minting a second one. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateUserSettings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -119,6 +114,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state as st;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -194,18 +190,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateUserSettings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateUserSettingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateUserSettings"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateUserSettingsErrorModeled::InternalServerException(st::state_unavailable())
+        })?;
+
+        // Every `EnabledType` member of this operation, required or optional, is checked
+        // against the one value set the model declares for that shape.
+        for (member, value) in [
+            ("copyAllowed", Some(input.copy_allowed.as_str())),
+            ("pasteAllowed", Some(input.paste_allowed.as_str())),
+            ("downloadAllowed", Some(input.download_allowed.as_str())),
+            ("uploadAllowed", Some(input.upload_allowed.as_str())),
+            ("printAllowed", Some(input.print_allowed.as_str())),
+            ("deepLinkAllowed", input.deep_link_allowed.as_deref()),
+            ("webAuthnAllowed", input.web_authn_allowed.as_deref()),
+        ] {
+            if let Some(value) = value {
+                st::require_enum_value(member, value, ENABLED_TYPE_VALUES)
+                    .map_err(CreateUserSettingsErrorModeled::ValidationException)?;
+            }
+        }
+
+        let region = st::region_for(&ctx.parts().headers);
+        let client_token = input.client_token.as_deref();
+        let uploaded_at = std::time::SystemTime::now();
+
+        // A branding configuration is stored, not discarded: each image's MIME type and
+        // file extension are derived from the image itself (the blob's own signature, or
+        // the s3Uri's extension when only the key is reachable) and its upload timestamp
+        // is this instant, which is what the modelled `BrandingConfiguration` reports
+        // back. An image of no type the model's `MimeType` declares is refused rather
+        // than accepted and dropped.
+        let branding_configuration = match input.branding_configuration_input.as_ref() {
+            None => None,
+            Some(branding) => Some(
+                st::branding_configuration(branding, uploaded_at)
+                    .map_err(CreateUserSettingsErrorModeled::ValidationException)?,
+            ),
+        };
+
+        let mut store = state.lock();
+
+        if let Some(arn) = store.replayed_arn(Self::NAME, client_token) {
+            if let Some(existing) = store.user_settings.get(&arn) {
+                return Ok(CreateUserSettingsOutput {
+                    user_settings_arn: existing.user_settings_arn.clone(),
+                });
+            }
+        }
+
+        // A stored user-settings record is process memory and a caller can mint one per
+        // request, so the store has a capacity bound. The replay above is checked first,
+        // so a retry of a resource that already exists still succeeds at the bound.
+        if store.user_settings.len() >= st::MAX_USER_SETTINGS {
+            return Err(
+                CreateUserSettingsErrorModeled::ServiceQuotaExceededException(st::quota_exceeded(
+                    st::USER_SETTINGS_KIND,
+                    st::MAX_USER_SETTINGS,
+                ))
+                .into(),
+            );
+        }
+
+        let user_settings_arn = st::resource_arn(
+            &region,
+            st::USER_SETTINGS_KIND,
+            &st::new_resource_id(store.next_mint(), uploaded_at),
+        );
+        let record = crate::state::UserSettingsRecord {
+            user_settings_arn: user_settings_arn.clone(),
+            copy_allowed: input.copy_allowed,
+            paste_allowed: input.paste_allowed,
+            download_allowed: input.download_allowed,
+            upload_allowed: input.upload_allowed,
+            print_allowed: input.print_allowed,
+            disconnect_timeout_in_minutes: input.disconnect_timeout_in_minutes,
+            idle_disconnect_timeout_in_minutes: input.idle_disconnect_timeout_in_minutes,
+            cookie_synchronization_configuration: input.cookie_synchronization_configuration,
+            toolbar_configuration: input.toolbar_configuration,
+            deep_link_allowed: input.deep_link_allowed,
+            web_authn_allowed: input.web_authn_allowed,
+            customer_managed_key: input.customer_managed_key,
+            additional_encryption_context: input.additional_encryption_context,
+            branding_configuration,
+            associated_portal_arns: Vec::new(),
+            tags: input.tags.unwrap_or_default(),
+        };
+        store
+            .user_settings
+            .insert(user_settings_arn.clone(), record);
+        store.remember_token(Self::NAME, client_token, &user_settings_arn);
+
+        let stored = store.user_settings.get(&user_settings_arn).ok_or_else(|| {
+            CreateUserSettingsErrorModeled::InternalServerException(st::state_unavailable())
+        })?;
+        let output = CreateUserSettingsOutput {
+            user_settings_arn: stored.user_settings_arn.clone(),
+        };
+        st::audit(
+            Self::NAME,
+            ctx.parts(),
+            &output.user_settings_arn,
+            "created",
+        );
+        Ok(output)
     }
 }

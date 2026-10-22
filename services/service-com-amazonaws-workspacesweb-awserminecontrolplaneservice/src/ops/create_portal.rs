@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePortal
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePortal`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePortal::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a web portal and PERSISTS it in this service's store: the response is read
+//! back out of the stored record, and a replayed `clientToken` returns the first portal
+//! rather than minting a second one. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -107,6 +101,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state as st;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -182,18 +177,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePortal` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePortalErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePortal"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreatePortalErrorModeled::InternalServerException(st::state_unavailable())
+        })?;
+
+        // `authenticationType` is the one member the model documents a default for
+        // ("Defaults to Standard"); every other optional member is stored, and later
+        // reported, exactly as the request left it - absent when it named none.
+        let authentication_type = input
+            .authentication_type
+            .unwrap_or_else(|| st::DEFAULT_AUTHENTICATION_TYPE.to_string());
+        st::require_enum_value(
+            "authenticationType",
+            &authentication_type,
+            AUTHENTICATION_TYPE_VALUES,
+        )
+        .map_err(CreatePortalErrorModeled::ValidationException)?;
+        if let Some(instance_type) = input.instance_type.as_deref() {
+            st::require_enum_value("instanceType", instance_type, INSTANCE_TYPE_VALUES)
+                .map_err(CreatePortalErrorModeled::ValidationException)?;
+        }
+
+        let region = st::region_for(&ctx.parts().headers);
+        let client_token = input.client_token.as_deref();
+
+        let mut store = state.lock();
+
+        // A replayed client token answers with the portal the first call created, read
+        // back out of the store - never with a second portal.
+        if let Some(arn) = store.replayed_arn(Self::NAME, client_token) {
+            if let Some(existing) = store.portals.get(&arn) {
+                return Ok(CreatePortalOutput {
+                    portal_arn: existing.portal_arn.clone(),
+                    portal_endpoint: existing.portal_endpoint.clone(),
+                });
+            }
+        }
+
+        // A stored portal is process memory and a caller can mint one per request, so
+        // the store has a capacity bound. The replay above is checked first, so a retry
+        // of a portal that already exists still succeeds at the bound.
+        if store.portals.len() >= st::MAX_PORTALS {
+            return Err(CreatePortalErrorModeled::ServiceQuotaExceededException(
+                st::quota_exceeded(st::PORTAL_KIND, st::MAX_PORTALS),
+            )
+            .into());
+        }
+
+        let id = st::new_resource_id(store.next_mint(), std::time::SystemTime::now());
+        let portal_arn = st::resource_arn(&region, st::PORTAL_KIND, &id);
+        let record = crate::state::PortalRecord {
+            portal_arn: portal_arn.clone(),
+            portal_endpoint: st::portal_endpoint_for(&region, &id),
+            display_name: input.display_name,
+            creation_date: std::time::SystemTime::now(),
+            authentication_type,
+            instance_type: input.instance_type,
+            max_concurrent_sessions: input.max_concurrent_sessions,
+            customer_managed_key: input.customer_managed_key,
+            additional_encryption_context: input.additional_encryption_context,
+            portal_custom_domain: input.portal_custom_domain,
+            status_reason: None,
+            browser_settings_arn: None,
+            network_settings_arn: None,
+            user_settings_arn: None,
+            trust_store_arn: None,
+            ip_access_settings_arn: None,
+            data_protection_settings_arn: None,
+            user_access_logging_settings_arn: None,
+            session_logger_arn: None,
+            tags: input.tags.unwrap_or_default(),
+            // A brand-new portal has neither its network nor its user settings, so it
+            // reports `Incomplete` until both are associated.
+            fully_configured_since: None,
+        };
+        store.portals.insert(portal_arn.clone(), record);
+        store.remember_token(Self::NAME, client_token, &portal_arn);
+
+        // Read the response back out of the stored record.
+        let stored = store.portals.get(&portal_arn).ok_or_else(|| {
+            CreatePortalErrorModeled::InternalServerException(st::state_unavailable())
+        })?;
+        let output = CreatePortalOutput {
+            portal_arn: stored.portal_arn.clone(),
+            portal_endpoint: stored.portal_endpoint.clone(),
+        };
+        st::audit(Self::NAME, ctx.parts(), &output.portal_arn, "created");
+        Ok(output)
     }
 }
