@@ -25,11 +25,110 @@ pub struct InternalServerException {
     pub message: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.invoicing#ResourceNotFoundException")]
+/// `ResourceNotFoundException` — hand-written rather than expanded from the model,
+/// because the ARN member's WIRE NAME is not the model's member name.
+///
+/// The model spells that member `resourceName` (`smithy_query(query="shape",
+/// shape="ResourceNotFoundException")`), but every recorded 404 of this service
+/// carries the requested ARN under the key `resourceId`: Invoicing is served by the
+/// `awsinsightsindexservice` backend — the recorded error bodies' `__type` values are
+/// stamped in that namespace — and the member name that backend serializes is what
+/// reaches a client. The awsJson codecs take a member's NAME as its JSON key
+/// (`@jsonName` is honoured by restJson1 only), so the wire name has to be set on the
+/// member schema itself, which the `#[smithy_macros::smithy(shape = …)]` expansion
+/// derives from the model and cannot be told.
+///
+/// Everything below is what that expansion emits for an `@error` structure — the
+/// member statics, the `SCHEMA_*` static each operation's error enum references,
+/// `shape_name`, `Display`, `Error` and `SerializableStruct` — with the one member
+/// name changed.
 #[derive(Debug, Clone, Default)]
 pub struct ResourceNotFoundException {
     pub message: Option<String>,
-    pub resource_name: Option<String>,
+    /// The model's `resourceName`: the ARN of the resource that was not found.
+    /// Serialized as `resourceId` (see the note above).
+    pub resource_id: Option<String>,
+}
+
+static RESOURCE_NOT_FOUND_EXCEPTION_M_MESSAGE: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.invoicing#ResourceNotFoundException$message",
+            "com.amazonaws.invoicing",
+            "message",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "message",
+        0,
+    )
+    .with_xml_name("Message");
+
+/// The ARN member: the model's `resourceName`, wired as `resourceId`.
+static RESOURCE_NOT_FOUND_EXCEPTION_M_RESOURCE_ID: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.invoicing#ResourceNotFoundException$resourceName",
+            "com.amazonaws.invoicing",
+            "resourceName",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        // THE wire key on the awsJson protocols, which read the member name.
+        "resourceId",
+        1,
+    )
+    // Carried as well, so a codec that honours `@jsonName` (restJson1) spells the
+    // member the same way the awsJson codecs do here.
+    .with_json_name("resourceId");
+
+pub static SCHEMA_RESOURCE_NOT_FOUND_EXCEPTION: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.invoicing#ResourceNotFoundException",
+            "com.amazonaws.invoicing",
+            "ResourceNotFoundException",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &RESOURCE_NOT_FOUND_EXCEPTION_M_MESSAGE,
+            &RESOURCE_NOT_FOUND_EXCEPTION_M_RESOURCE_ID,
+        ],
+    );
+
+impl ResourceNotFoundException {
+    /// The wire error code (`__type`): the model's shape name, unchanged.
+    pub const fn shape_name() -> &'static str {
+        "ResourceNotFoundException"
+    }
+}
+
+impl ::std::fmt::Display for ResourceNotFoundException {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        write!(f, "ResourceNotFoundException")?;
+        if let Some(message) = &self.message {
+            write!(f, ": {message}")?;
+        }
+        Ok(())
+    }
+}
+
+impl ::std::error::Error for ResourceNotFoundException {}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for ResourceNotFoundException {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(message) = self.message.as_ref() {
+            serializer.write_string(&RESOURCE_NOT_FOUND_EXCEPTION_M_MESSAGE, message.as_str())?;
+        }
+        if let Some(resource_id) = self.resource_id.as_ref() {
+            serializer.write_string(
+                &RESOURCE_NOT_FOUND_EXCEPTION_M_RESOURCE_ID,
+                resource_id.as_str(),
+            )?;
+        }
+        Ok(())
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.invoicing#ThrottlingException")]

@@ -3,9 +3,10 @@
 //! Engine state for the com-amazonaws-invoicing-invoicing service.
 //!
 //! The invoice-unit lifecycle (`CreateInvoiceUnit` / `GetInvoiceUnit` /
-//! `ListInvoiceUnits` / `UpdateInvoiceUnit` / `DeleteInvoiceUnit` /
-//! `ListTagsForResource`) is served entirely from the maps below: every response those
-//! operations return is computed from what an earlier request stored here.
+//! `ListInvoiceUnits` / `UpdateInvoiceUnit` / `DeleteInvoiceUnit`) and the tag plane
+//! (`TagResource` / `UntagResource` / `ListTagsForResource`) are served entirely from
+//! the maps below: every response those operations return is computed from what an
+//! earlier request stored here.
 //!
 //! An invoice unit keeps its superseded configurations as well as its current one,
 //! because `GetInvoiceUnit` and `ListInvoiceUnits` both accept `AsOf` and the model
@@ -18,8 +19,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ::aws_smithy_types::DateTime;
 
+use ::aws_smithy_schema_server::constraints;
+use ::smithy_server_runtime::Violation;
+
 use crate::ops::types::{
     InternalServerException, InvoiceUnit, InvoiceUnitRule, ResourceNotFoundException, ResourceTag,
+    ValidationException, ValidationExceptionField,
 };
 
 /// Per-service state for com-amazonaws-invoicing-invoicing. A handler reaches it through [`service_state`].
@@ -29,8 +34,9 @@ pub struct ComAmazonawsInvoicingInvoicingState {
     /// `BTreeMap` so `ListInvoiceUnits` walks a stable, deterministic order and a
     /// pagination token (a position in that order) stays meaningful across calls.
     pub invoice_units: BTreeMap<String, StoredInvoiceUnit>,
-    /// `ResourceTags` per resource ARN, as `CreateInvoiceUnit` persisted them and
-    /// `ListTagsForResource` reports them.
+    /// `ResourceTags` per resource ARN, as `CreateInvoiceUnit` and `TagResource`
+    /// persisted them and `ListTagsForResource` reports them. One tag per key: a
+    /// later write of a key already set replaces that key's value.
     pub resource_tags: BTreeMap<String, BTreeMap<String, String>>,
     /// The result an `@idempotent` operation already produced for a `ClientToken`,
     /// keyed by `(operation, target, token)`: one token replayed against another
@@ -53,6 +59,13 @@ type IdempotencyKey = (String, String, String);
 /// (account-adjustable) maximum is reached; this constant is the emulator's maximum, and
 /// it also bounds the registry and the per-request walks over it.
 pub const MAX_INVOICE_UNITS: usize = 1000;
+
+/// How many tags one resource holds. `ResourceTagList` is modelled `length 0..200`
+/// both as `TagResource`'s input and as `ListTagsForResource`'s output
+/// (`smithy_query(query="operation", operation="TagResource,ListTagsForResource")`),
+/// so a resource cannot hold more tags than that and still be reportable; a write
+/// past it is the modelled `ServiceQuotaExceededException` (HTTP 402).
+pub const MAX_RESOURCE_TAGS: usize = 200;
 
 /// How many `@idempotent` replay records this service keeps, across every operation and
 /// `ClientToken`. The key is caller-supplied, so without a bound a long-lived emulator
@@ -239,11 +252,65 @@ pub fn resource_tag_list(tags: &BTreeMap<String, String>) -> Vec<ResourceTag> {
         .collect()
 }
 
-/// The 404 every reader of an invoice unit answers for an ARN that is not in state.
+/// The message a `ResourceNotFoundException` of this service carries: a CONSTANT, the
+/// same sentence whatever was asked for.
+///
+/// The shape's own documentation gives it (`smithy_query(query="shape",
+/// shape="ResourceNotFoundException")` -> "The resource could not be found."), and the
+/// recorded 404s answer with exactly that sentence — the resource that was not found
+/// travels in its own member instead of being spliced into the prose, so a client can
+/// read it mechanically and a client matching the documented sentence still matches.
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The resource could not be found.";
+
+/// The 404 any operation of this service answers for an ARN that is not in state: the
+/// constant message, plus `arn` in the shape's own ARN member.
 pub fn no_such_resource(arn: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!("The resource {arn} was not found")),
-        resource_name: Some(arn.to_string()),
+        message: Some(RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+        resource_id: Some(arn.to_string()),
+    }
+}
+
+/// `ValidationExceptionReason$fieldValidationFailed` — a named member of the request
+/// carries a value the service does not accept. One of the values the modelled
+/// `ValidationExceptionReason` enum admits ([`VALIDATION_EXCEPTION_REASON_VALUES`]).
+///
+/// [`VALIDATION_EXCEPTION_REASON_VALUES`]: crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES
+pub const REASON_FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
+
+/// How many violations one refusal states. Each one is rendered TWICE into the body (a
+/// clause of `message` and a `fieldList` entry) and each clause interpolates the
+/// rejected value, so an unbounded count turns a small request into an arbitrarily
+/// large refusal. The bound is the boundary validator's own (`MAX_VIOLATIONS` in
+/// `aws_smithy_schema_server::constraints`), so the two refusal paths read alike.
+const MAX_VIOLATIONS: usize = 100;
+
+/// The 400 `ValidationException` that states `violations` — a member constraint the
+/// request failed — in the shape's own modelled members.
+///
+/// ONE rendering for every refused member, wherever the refusal is found: `message` is
+/// the `N validation error(s) detected: …` envelope the boundary validator words,
+/// `reason` is [`REASON_FIELD_VALIDATION_FAILED`], and `fieldList` carries one entry
+/// per violation — `name` the dotted member path, `message` that violation's own
+/// clause naming the constraint it failed. A client can therefore branch on `reason`
+/// and report which member was rejected and why, instead of parsing the prose.
+pub fn field_validation_failed(violations: &[Violation]) -> ValidationException {
+    let violations = &violations[..violations.len().min(MAX_VIOLATIONS)];
+    ValidationException {
+        message: constraints::envelope(violations).or_else(|| {
+            Some("The input fails to satisfy the constraints specified by an Amazon Web Services service.".to_string())
+        }),
+        resource_name: None,
+        reason: Some(REASON_FIELD_VALIDATION_FAILED.to_string()),
+        field_list: Some(
+            violations
+                .iter()
+                .map(|violation| ValidationExceptionField {
+                    name: violation.path.clone(),
+                    message: violation.message(),
+                })
+                .collect(),
+        ),
     }
 }
 

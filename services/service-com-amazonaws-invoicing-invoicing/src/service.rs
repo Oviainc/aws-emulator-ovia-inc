@@ -13,7 +13,7 @@
 //! table — built from the Smithy model at compile time. You do not edit the
 //! entry; you edit the behavioral seams below.
 //!
-//! Five opt-in seams are yours to change; every one defaults to the framework's
+//! Six opt-in seams are yours to change; every one defaults to the framework's
 //! own behaviour, so an unedited service still routes and answers correctly:
 //!
 //! - `can_handle` — which requests this service claims. The default matches the
@@ -22,7 +22,10 @@
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
 //!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//!   generated routing table. This service returns `Some` for the operations it
+//!   implements, so that a refused input is stated in the modelled
+//!   `ValidationException` and the tag plane announces its own media type (see
+//!   [`FrontDoor`]).
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -34,14 +37,40 @@
 //!   failure the orchestrator detects up front (e.g. a malformed `aws-chunked`
 //!   body). The default returns `None`, keeping the entry's protocol-correct
 //!   rendering. Return `Some(resp)` to reword it if desired.
+//! - `override_protocol` — the codec this service's own responses are serialized
+//!   in. The default returns `None`, keeping the model-derived protocol; this
+//!   service overrides it (see "The media type this service announces" below).
 //!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## The media types this service announces
+//!
+//! The model declares the `awsJson1_0` protocol trait, but every recorded response of
+//! an INVOICE-UNIT operation — a success and a modelled failure its handler raises
+//! alike — announces `application/x-amz-json-1.1`, and the media type a client reads
+//! is what it keys content negotiation, deserializer selection and any protocol
+//! assertion off. `override_protocol` below therefore serves the awsJson `1.1` codec
+//! service-wide: the JSON framing is byte-identical to `1.0`, so a request sent with
+//! either media type still reads, and only the announced media type changes.
+//!
+//! The TAG operations — `ListTagsForResource`, `TagResource`, `UntagResource` — are a
+//! different plane of this API, and their recorded responses announce the awsJson
+//! `1.0` media type the model's protocol trait declares. [`FrontDoor`] therefore
+//! stamps [`TAG_PLANE_MEDIA_TYPE`] on what they answer, so each plane announces the
+//! media type its own recorded responses carry.
+//!
+//! A refusal of the REQUEST is not a response the service produced — the input
+//! validator in FRONT of the service answers it — so the routing, transport and
+//! refusal envelopes keep the media type the model's protocol trait declares, which
+//! is the one seam `override_protocol` deliberately does not reach, and which is the
+//! media type the recorded refusals carry too.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, Refusal, Refused,
+    ServerHttpProtocol, Service, Violation,
 };
 use std::sync::Arc;
 
@@ -52,6 +81,270 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The codec this service answers in (awsJson `1.1`; see the module docs). Built
+    /// once here because [`Service::override_protocol`] hands back a borrow of it.
+    protocol: aws_smithy_schema_server::rpc::HttpRpcServerProtocol<
+        aws_smithy_schema_server::json::JsonCodec,
+    >,
+    /// Answers the operations this service serves in front of the generated walk; see
+    /// [`FrontDoor`].
+    front_door: FrontDoor<Eng>,
+}
+
+/// The HTTP status the model gives `ValidationException`
+/// (`smithy_query(query="shape", shape="ValidationException")`: `@error("client")`,
+/// `httpError 400`).
+const VALIDATION_EXCEPTION_STATUS: u16 = 400;
+
+/// The media type the TAG operations of this service answer in: the awsJson `1.0`
+/// media type the model's protocol trait declares, rather than the `1.1` every
+/// invoice-unit response announces (see the module docs).
+///
+/// Recorded behaviour: `ListTagsForResource`'s recorded 200 carries this media type
+/// while every recorded invoice-unit response carries `…-1.1` — tagging is a separate
+/// plane of this API, served by the tagging front end rather than by the backend that
+/// answers for an invoice unit. `TagResource` and `UntagResource` belong to that same
+/// plane and announce it too.
+const TAG_PLANE_MEDIA_TYPE: &str = "application/x-amz-json-1.0";
+
+/// One operation [`FrontDoor`] serves: the routing key the model names it by, how a
+/// request for it is read and validated against ITS input shape, and the media type it
+/// announces when that is not the service-wide one.
+struct ServedOperation {
+    /// The operation's routing key — read off the operation, never spelled out.
+    name: &'static str,
+    /// The violations in a request for this operation, found the way the generated
+    /// walk finds them. `None` when there is no structured refusal to restate.
+    violations: fn(
+        &dyn ServerHttpProtocol,
+        &aws_smithy_runtime_api::http::Request,
+    ) -> Option<Vec<Violation>>,
+    /// The media type this operation's responses announce, when it is NOT the one
+    /// `override_protocol` serves service-wide: `Some(TAG_PLANE_MEDIA_TYPE)` for the
+    /// tag plane, `None` for an invoice-unit operation.
+    media_type: Option<&'static str>,
+}
+
+/// Serves the operations of this service that are answered in front of the generated
+/// walk, for two reasons the generated walk cannot reach on its own:
+///
+/// 1. A REFUSED INPUT is stated in this service's own modelled `ValidationException`
+///    instead of the framework's generic refusal body. `ValidationException` models
+///    `reason` (one of `ValidationExceptionReason`'s values) and `fieldList`
+///    (`ValidationExceptionField{name, message}`) beside `message`, and the framework
+///    validates every modelled constraint — `InvoiceReceiver`'s `@pattern`, `Name`'s
+///    length and pattern, `MaxResults`' range, the ARN patterns — BEFORE a handler
+///    runs, rendering a violation as the protocol's generic refusal body, which
+///    carries `message` alone. A client deserializing that error gets a null `reason`
+///    and an empty field list, so it can neither branch on the reason nor report which
+///    member was rejected. The refusal is therefore stated HERE, where the violations
+///    the boundary found are still in hand, through the one rendering
+///    [`crate::state::field_validation_failed`] owns; a request with no violation is
+///    handed to the generated walk unchanged.
+/// 2. The TAG operations announce [`TAG_PLANE_MEDIA_TYPE`] rather than the media type
+///    `override_protocol` serves service-wide (see the module docs): the media type is
+///    a property of the plane that answers, and `override_protocol` is one choice for
+///    the whole service, so the per-plane part is stamped here, on everything those
+///    operations answer — a success and a modelled failure alike.
+///
+/// Only the operations this emulator IMPLEMENTS are served here. A scaffolded
+/// operation answers HTTP 501 and asserts nothing about its behaviour, so restating
+/// its refusals or its media type would claim a fidelity it does not have; each of
+/// those is its own stub issue.
+///
+/// Generic over the engine type for the same reason the rest of this file is: the
+/// operations whose schemas and routing keys it reads are, so naming a concrete engine
+/// here would let this seam drift from the service the router mounts.
+struct FrontDoor<Eng>(::std::marker::PhantomData<Eng>);
+
+impl<Eng: Send + Sync + 'static> FrontDoor<Eng> {
+    /// Every operation this seam serves. Each entry names the operation through its own
+    /// `Operation` impl, so the routing key and the input schema come from the model.
+    fn operations() -> [ServedOperation; 8] {
+        use crate::ops;
+        [
+            ServedOperation {
+                name: <ops::create_invoice_unit::CreateInvoiceUnit<Eng> as Operation>::NAME,
+                violations: |protocol, req| {
+                    Self::violations::<ops::types::CreateInvoiceUnitInput>(
+                        protocol,
+                        req,
+                        <ops::create_invoice_unit::CreateInvoiceUnit<Eng> as Operation>::INPUT_SCHEMA,
+                    )
+                },
+                media_type: None,
+            },
+            ServedOperation {
+                name: <ops::get_invoice_unit::GetInvoiceUnit<Eng> as Operation>::NAME,
+                violations: |protocol, req| {
+                    Self::violations::<ops::types::GetInvoiceUnitInput>(
+                        protocol,
+                        req,
+                        <ops::get_invoice_unit::GetInvoiceUnit<Eng> as Operation>::INPUT_SCHEMA,
+                    )
+                },
+                media_type: None,
+            },
+            ServedOperation {
+                name: <ops::list_invoice_units::ListInvoiceUnits<Eng> as Operation>::NAME,
+                violations: |protocol, req| {
+                    Self::violations::<ops::types::ListInvoiceUnitsInput>(
+                        protocol,
+                        req,
+                        <ops::list_invoice_units::ListInvoiceUnits<Eng> as Operation>::INPUT_SCHEMA,
+                    )
+                },
+                media_type: None,
+            },
+            ServedOperation {
+                name: <ops::update_invoice_unit::UpdateInvoiceUnit<Eng> as Operation>::NAME,
+                violations: |protocol, req| {
+                    Self::violations::<ops::types::UpdateInvoiceUnitInput>(
+                        protocol,
+                        req,
+                        <ops::update_invoice_unit::UpdateInvoiceUnit<Eng> as Operation>::INPUT_SCHEMA,
+                    )
+                },
+                media_type: None,
+            },
+            ServedOperation {
+                name: <ops::delete_invoice_unit::DeleteInvoiceUnit<Eng> as Operation>::NAME,
+                violations: |protocol, req| {
+                    Self::violations::<ops::types::DeleteInvoiceUnitInput>(
+                        protocol,
+                        req,
+                        <ops::delete_invoice_unit::DeleteInvoiceUnit<Eng> as Operation>::INPUT_SCHEMA,
+                    )
+                },
+                media_type: None,
+            },
+            ServedOperation {
+                name: <ops::list_tags_for_resource::ListTagsForResource<Eng> as Operation>::NAME,
+                violations: |protocol, req| {
+                    Self::violations::<ops::types::ListTagsForResourceInput>(
+                        protocol,
+                        req,
+                        <ops::list_tags_for_resource::ListTagsForResource<Eng> as Operation>::INPUT_SCHEMA,
+                    )
+                },
+                media_type: Some(TAG_PLANE_MEDIA_TYPE),
+            },
+            ServedOperation {
+                name: <ops::tag_resource::TagResource<Eng> as Operation>::NAME,
+                violations: |protocol, req| {
+                    Self::violations::<ops::types::TagResourceInput>(
+                        protocol,
+                        req,
+                        <ops::tag_resource::TagResource<Eng> as Operation>::INPUT_SCHEMA,
+                    )
+                },
+                media_type: Some(TAG_PLANE_MEDIA_TYPE),
+            },
+            ServedOperation {
+                name: <ops::untag_resource::UntagResource<Eng> as Operation>::NAME,
+                violations: |protocol, req| {
+                    Self::violations::<ops::types::UntagResourceInput>(
+                        protocol,
+                        req,
+                        <ops::untag_resource::UntagResource<Eng> as Operation>::INPUT_SCHEMA,
+                    )
+                },
+                media_type: Some(TAG_PLANE_MEDIA_TYPE),
+            },
+        ]
+    }
+
+    /// The violations in `req` read against `schema`, the way the framework's own walk
+    /// reads them: deserialize the input, then validate the built value.
+    ///
+    /// `None` means the request carries no structured refusal — either it is valid, or
+    /// it failed in a way that has no member-level form (a body the codec cannot read
+    /// at all), which the generated walk renders itself.
+    fn violations<I>(
+        protocol: &dyn ServerHttpProtocol,
+        req: &aws_smithy_runtime_api::http::Request,
+        schema: &'static aws_smithy_schema::Schema,
+    ) -> Option<Vec<Violation>>
+    where
+        I: DeserializableStruct + aws_smithy_schema::serde::SerializableStruct,
+    {
+        let error = match protocol.deserialize_input(req, schema) {
+            Ok(mut deser) => {
+                match <I as DeserializableStruct>::deserialize(&mut *deser) {
+                    // A built input: every modelled constraint, in one walk.
+                    Ok(input) => {
+                        let violations =
+                            aws_smithy_schema_server::constraints::validate(&input, schema);
+                        return (!violations.is_empty()).then_some(violations);
+                    }
+                    // Absence is found while READING the request, so it arrives as a
+                    // codec error; `refusal_of` gives it the same structured form a
+                    // constraint violation has.
+                    Err(e) => aws_smithy_schema_server::ProtocolError::Serde(e),
+                }
+            }
+            Err(e) => e,
+        };
+        match smithy_server_runtime::refusal_of(&error) {
+            Some(Refusal::Invalid(violations)) if !violations.is_empty() => Some(violations),
+            _ => None,
+        }
+    }
+}
+
+impl<Eng: Send + Sync + 'static> ErasedOperation for FrontDoor<Eng> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r aws_smithy_runtime_api::http::Request,
+        ctx: &'r smithy_server_runtime::OperationContext<'r>,
+    ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
+        Box::pin(async move {
+            // The MODEL-DERIVED protocol, not this service's own override: a refusal of
+            // the request is answered by the input validator in front of the service,
+            // which reads and announces the protocol the model declares (see the module
+            // docs on the media types). The codec is the same JSON either way, so the
+            // request reads identically.
+            let protocol = svc.definition().protocol();
+            let Ok(routing_key) = protocol.routing_key(req) else {
+                return svc.definition().routing_error_response(req);
+            };
+            let served = Self::operations()
+                .into_iter()
+                .find(|entry| entry.name == routing_key);
+            let Some(entry) = served else {
+                return svc.definition().routing_error_response(req);
+            };
+            if let Some(violations) = (entry.violations)(protocol, req) {
+                let modelled = crate::state::field_validation_failed(&violations);
+                return protocol
+                    .serialize_error(
+                        &modelled,
+                        &crate::ops::types::SCHEMA_VALIDATION_EXCEPTION,
+                        crate::ops::types::ValidationException::shape_name(),
+                        VALIDATION_EXCEPTION_STATUS,
+                    )
+                    .unwrap_or_else(|e| svc.definition().framework_error_response(e));
+            }
+            // Nothing to restate: run the generated deserialize -> validate -> handle
+            // -> serialize walk. Reached through the routing table rather than through
+            // `override_operation`, which would route straight back here. The walk
+            // reads and validates the body again — the price of answering a refusal in
+            // the modelled shape, paid once per request on a body the transport has
+            // already bounded.
+            let mut response = match svc.definition().routing_table().get(entry.name) {
+                Some(op) => op.run(svc, req, ctx).await,
+                None => return svc.definition().routing_error_response(req),
+            };
+            // This operation's own plane announces its own media type: replace the one
+            // the service-wide protocol stamped on the body it just serialized. The
+            // bytes are unchanged — only the media type naming them differs.
+            if let Some(media_type) = entry.media_type {
+                response.headers_mut().insert("content-type", media_type);
+            }
+            response
+        })
+    }
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -61,6 +354,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            protocol: aws_smithy_schema_server::rpc::AwsJson11(),
+            front_door: FrontDoor(::std::marker::PhantomData),
         }
     }
 }
@@ -87,26 +382,40 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // The invoice-unit and tag operations need it: a refused input is stated in
+        // this service's own modelled `ValidationException` — with the modelled
+        // `reason` and `fieldList` — instead of the framework's generic refusal body,
+        // and the tag plane announces its own media type. See [`FrontDoor`] for why
+        // neither can be done from inside `handle`. The operation names are read from
+        // the model, not spelled out, and a request naming any other operation is left
+        // to the generated routing table.
+        let routing_key = self.definition().protocol().routing_key(req).ok()?;
+        FrontDoor::<Eng>::operations()
+            .iter()
+            .any(|entry| entry.name == routing_key)
+            .then_some(&self.front_door as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
+        // Nothing to reword here: a refusal of an implemented operation never reaches
+        // this seam — [`FrontDoor`] answers it BEFORE the framework renders it, because
+        // the words are not the problem: the generic refusal body cannot carry the
+        // modelled `reason`/`fieldList` members at all, and `Refused` is only a code
+        // and a message. Every other operation is a scaffold answering 501, whose
+        // refusals keep the framework's conventional wording.
         let _ = refusal;
         None
+    }
+
+    fn override_protocol(&self) -> Option<&dyn ServerHttpProtocol> {
+        // Every response this SERVICE produces — a success and a modelled failure its
+        // handler raises — is serialized by the protocol returned here, so this is
+        // where the media type it announces is decided for the service as a whole. See
+        // the module docs: every recorded invoice-unit response carries the awsJson
+        // `1.1` media type, which is what a client keys its parsing off. The tag
+        // plane's own media type is stamped by [`FrontDoor`], which serves those three
+        // operations.
+        Some(&self.protocol)
     }
 
     fn override_routing_error(
@@ -115,10 +424,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this when a request reached this service but named no
         // modeled operation — neither `override_operation` nor the generated
-        // routing table resolved it. Returning `None` renders the protocol-correct
-        // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
+        // routing table resolved it. Left to the entry's protocol-correct default
+        // (awsJson -> 404 in the media type the model's protocol trait declares):
+        // naming no operation is refused in FRONT of the service, so it is not a
+        // response the service produced.
         let _ = req;
         None
     }
@@ -130,9 +439,8 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The router calls this on a transport-level failure it detects up front —
         // before (or instead of) naming an operation — such as a malformed
         // `aws-chunked` body. Returning `None` keeps the entry's protocol-correct
-        // rendering. Return `Some(resp)` to reword that failure in your own
-        // envelope. The error is borrowed, so the default renderer can still
-        // consume it on `None`.
+        // rendering. The error arrives BORROWED and is not `Clone`, so it cannot be
+        // re-rendered here; the default renderer consumes the owned one.
         let _ = error;
         None
     }
