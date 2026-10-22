@@ -50,7 +50,10 @@ fn is_billing_adjustment_id(value: &str) -> bool {
 
 /// One entry of a batch, with the members
 /// `BatchCreateBillingAdjustmentRequestEntry` requires.
-fn entry(agreement: &str, invoice: &str, amount: &str, token: &str) -> Value {
+///
+/// `pub(crate)` because `error_bodies.rs` stores adjustment requests through
+/// the same wire helpers rather than building a second harness.
+pub(crate) fn entry(agreement: &str, invoice: &str, amount: &str, token: &str) -> Value {
     json!({
         "agreementId": agreement,
         "originalInvoiceId": invoice,
@@ -63,7 +66,7 @@ fn entry(agreement: &str, invoice: &str, amount: &str, token: &str) -> Value {
     })
 }
 
-async fn submit(router: &MultiServiceRouter, entries: Vec<Value>) -> Answer {
+pub(crate) async fn submit(router: &MultiServiceRouter, entries: Vec<Value>) -> Answer {
     call(
         router,
         "BatchCreateBillingAdjustmentRequest",
@@ -76,7 +79,7 @@ async fn list(router: &MultiServiceRouter, request: Value) -> Answer {
     call(router, "ListBillingAdjustmentRequests", request).await
 }
 
-async fn get(router: &MultiServiceRouter, agreement: &str, id: &str) -> Answer {
+pub(crate) async fn get(router: &MultiServiceRouter, agreement: &str, id: &str) -> Answer {
     call(
         router,
         "GetBillingAdjustmentRequest",

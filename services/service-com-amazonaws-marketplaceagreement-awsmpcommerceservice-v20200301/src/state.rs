@@ -39,6 +39,7 @@
 //! this emulator reports.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
@@ -1430,6 +1431,33 @@ pub fn payment_request_scope(
 // Modelled failures
 // ---------------------------------------------------------------------------
 
+/// The source of the `requestId` every error body of this service carries.
+///
+/// Process-wide rather than a field of the store: an error is also answered
+/// where the store is not reached at all — the boundary refusal
+/// ([`validation_exception_for`], raised from `crate::service` before any
+/// handler runs) and [`store_unavailable`] — and a refused READ must not write
+/// to the state it refused.
+static ERROR_REQUEST_IDS: AtomicU64 = AtomicU64::new(1);
+
+/// The `requestId` for ONE error body: "The unique identifier associated with
+/// the error" (`smithy_query(query="shape", shape="ValidationException")`),
+/// which every exception shape this service models carries
+/// (`ValidationException`, `ResourceNotFoundException`, `ConflictException`,
+/// `ThrottlingException`, `AccessDeniedException`, `InternalServerException`).
+///
+/// `RequestId` is `@length(min: 1, max: 128)` `^[A-Za-z0-9-]+$`
+/// (`smithy_query(query="shape", shape="RequestId")`), so the value is rendered
+/// as a 36-character hyphenated UUID — the form AWS request identifiers take.
+/// The low bits are a monotonic counter rather than randomness, which makes the
+/// value unique for the life of the process without deriving anything from the
+/// request it reports on: nothing a caller sends can predict or collide with
+/// another error's id.
+pub fn next_request_id() -> String {
+    let minted = ERROR_REQUEST_IDS.fetch_add(1, Ordering::Relaxed);
+    format!("00000000-0000-4000-8000-{minted:012x}")
+}
+
 /// The `ValidationExceptionReason` for a refusal this service cannot place on a
 /// named member of the request: the modelled catch-all.
 pub const REASON_OTHER: &str = "OTHER";
@@ -1450,6 +1478,16 @@ pub const VALIDATION_MESSAGE_FALLBACK: &str =
 /// not acceptable — invalid when it carried a value, absent when it carried
 /// none, which is the distinction `ValidationExceptionReason`'s own
 /// `INVALID_…`/`MISSING_…` pairs draw.
+///
+/// The WORDING is this service's own and is deliberately one sentence per
+/// kind: no rule the model or the documentation states produces this text, and
+/// the recorded AWS responses do not agree with each other on it — a recorded
+/// refusal of a `partyType` on one listing operation states the sentence
+/// without a closing full stop while the recorded refusal of the SAME member on
+/// a sibling listing operation states it with one. So there is nothing to
+/// derive and no per-member wording to guess; the machine-readable part a
+/// client branches on is `reason` and `fields[].name`, which this service does
+/// state per member.
 pub const FIELD_INVALID: &str = "Member is invalid.";
 /// See [`FIELD_INVALID`].
 pub const FIELD_MISSING: &str = "Member must not be null.";
@@ -1598,7 +1636,7 @@ pub fn validation_message(reason: &str) -> String {
 /// (`filters.1.member.name`).
 pub fn validation_exception(reason: &str, path: impl Into<String>) -> ValidationException {
     ValidationException {
-        request_id: None,
+        request_id: Some(next_request_id()),
         message: Some(validation_message(reason)),
         reason: Some(reason.to_string()),
         fields: Some(vec![ValidationExceptionField {
@@ -1642,7 +1680,7 @@ pub fn validation_exception_for(
         });
     }
     ValidationException {
-        request_id: None,
+        request_id: Some(next_request_id()),
         message: Some(validation_message(&reason)),
         reason: Some(reason),
         fields: Some(fields),
@@ -1715,7 +1753,7 @@ pub const REASON_UNSUPPORTED_FILTERS: &str = "UNSUPPORTED_FILTERS";
 /// `message` states the combination rather than one bad member.
 pub fn unsupported_filter_combination(path: impl Into<String>) -> ValidationException {
     ValidationException {
-        request_id: None,
+        request_id: Some(next_request_id()),
         message: Some(UNSUPPORTED_FILTER_COMBINATION_MESSAGE.to_string()),
         reason: Some(REASON_UNSUPPORTED_FILTERS.to_string()),
         fields: Some(vec![ValidationExceptionField {
@@ -1730,7 +1768,7 @@ pub fn unsupported_filter_combination(path: impl Into<String>) -> ValidationExce
 /// stored, rather than letting state grow without end.
 pub fn store_full(resource_type: &str, quota: usize) -> ThrottlingException {
     ThrottlingException {
-        request_id: None,
+        request_id: Some(next_request_id()),
         message: Some(format!(
             "this emulator already holds the maximum of {quota} {resource_type} records; \
              release some before creating another"
@@ -1741,7 +1779,7 @@ pub fn store_full(resource_type: &str, quota: usize) -> ThrottlingException {
 /// The `ResourceNotFoundException` for an agreement id that names no agreement.
 pub fn agreement_not_found(id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        request_id: None,
+        request_id: Some(next_request_id()),
         message: Some(does_not_exist("agreement")),
         resource_id: Some(id.to_string()),
         resource_type: Some(RESOURCE_TYPE_AGREEMENT.to_string()),
@@ -1751,7 +1789,7 @@ pub fn agreement_not_found(id: &str) -> ResourceNotFoundException {
 /// The `ResourceNotFoundException` for an agreement request id that names none.
 pub fn agreement_request_not_found(id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        request_id: None,
+        request_id: Some(next_request_id()),
         message: Some(does_not_exist("agreement request")),
         resource_id: Some(id.to_string()),
         resource_type: Some(RESOURCE_TYPE_AGREEMENT_REQUEST.to_string()),
@@ -1762,7 +1800,7 @@ pub fn agreement_request_not_found(id: &str) -> ResourceNotFoundException {
 /// request id pair that names no stored request.
 pub fn billing_adjustment_not_found(id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        request_id: None,
+        request_id: Some(next_request_id()),
         message: Some(does_not_exist("billing adjustment request")),
         resource_id: Some(id.to_string()),
         resource_type: Some(RESOURCE_TYPE_BILLING_ADJUSTMENT_REQUEST.to_string()),
@@ -1772,7 +1810,7 @@ pub fn billing_adjustment_not_found(id: &str) -> ResourceNotFoundException {
 /// A `ConflictException` for an operation the resource's current state refuses.
 pub fn conflict(resource_type: &str, id: &str, detail: impl Into<String>) -> ConflictException {
     ConflictException {
-        request_id: None,
+        request_id: Some(next_request_id()),
         message: Some(detail.into()),
         resource_id: Some(id.to_string()),
         resource_type: Some(resource_type.to_string()),
@@ -1800,7 +1838,7 @@ pub fn audit(operation: &str, outcome: &str, resource: &str, parts: &::http::req
 /// carry this service's store — never a freshly built engine.
 pub fn store_unavailable() -> InternalServerException {
     InternalServerException {
-        request_id: None,
+        request_id: Some(next_request_id()),
         message: Some("the marketplace agreement store is unavailable".to_string()),
     }
 }
