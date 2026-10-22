@@ -189,10 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            CreateChannelErrorModeled::InternalServerException(InternalServerException {
-                exception_message: Some("the IVS store is unavailable".to_string()),
-                ..Default::default()
-            })
+            crate::state::store_unavailable(CreateChannelErrorModeled::InternalServerException)
         })?;
         let region = crate::state::request_region(ctx.parts());
 
@@ -210,10 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.multitrack_input_configuration.as_ref(),
         )
         .map_err(|message| {
-            CreateChannelErrorModeled::ValidationException(ValidationException {
-                exception_message: Some(message),
-                ..Default::default()
-            })
+            crate::state::validation(CreateChannelErrorModeled::ValidationException, message)
         })?;
 
         let mut store = state.lock();
@@ -221,16 +215,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the life of the process, so the growth is capped; past the cap the service
         // answers the quota error it models rather than accepting another entry.
         if store.channels.len() >= crate::state::MAX_CHANNELS {
-            return Err(CreateChannelErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    exception_message: Some(format!(
-                        "the number of channels would exceed the limit of {}",
-                        crate::state::MAX_CHANNELS
-                    )),
-                    ..Default::default()
-                },
-            )
-            .into());
+            return Err(crate::state::quota_exceeded(
+                CreateChannelErrorModeled::ServiceQuotaExceededException,
+                crate::state::CHANNEL_QUOTA_RESOURCE,
+                crate::state::MAX_CHANNELS,
+            ));
         }
         let channel_id = store.mint_hex("channel", 6);
         let ingest_id = store.mint_hex("ingest", 6);

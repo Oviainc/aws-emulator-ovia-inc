@@ -40,10 +40,59 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+use aws_smithy_schema_server::constraints::Violation;
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+/// The wire error code (`__type`) a request refused by the protocol validation
+/// stage carries — the stage that runs BEFORE any handler, so none of the three
+/// errors the pi model declares on its operations
+/// (`InternalServiceError`/`InvalidArgumentException`/`NotAuthorizedException`)
+/// is reachable from it. Recorded behaviour: Performance Insights answers a
+/// violation of a modelled input constraint with `ValidationException`, a shape
+/// its own model does not declare precisely because the validation framework,
+/// not the service, emits it.
+pub const VALIDATION_EXCEPTION_CODE: &str = "ValidationException";
+
+/// How this service words a request whose START time does not precede its END
+/// time — a cross-member ordering rule no single-member `@range`, `@length` or
+/// `@pattern` can express, so the validation stage passes it and the handler
+/// refuses it with the modelled `InvalidArgumentException`.
+///
+/// ONE constant for the whole service: the sentence names no member, no
+/// operation and nothing from the request, and Performance Insights was recorded
+/// answering this same condition with it on two unrelated operations
+/// (`GetResourceMetrics` and `CreatePerformanceAnalysisReport`). Every handler
+/// that enforces the ordering reads it from here so a second wording cannot
+/// appear beside it.
+pub const TIME_RANGE_ORDERING_MESSAGE: &str =
+    "Specify a start time that is before or equal to the end time.";
+
+/// The message the validation stage states for `violations`.
+///
+/// The template names the MEMBER and nothing else: the offending value is not
+/// echoed and the Smithy constraint that rejected it is not quoted. That is what
+/// Performance Insights was recorded doing for a `@range` violation on an
+/// integer, a `@length` violation on a list and a `@pattern` violation on a
+/// string alike — three constraint kinds, one sentence — so the template is a
+/// property of the stage rather than of the constraint. Suppressing the value
+/// also means a caller's own input never comes back out of the service in an
+/// error a client may log.
+///
+/// Several violations are stated as several clauses in one envelope, in the order
+/// the validating walk found them; only the SINGLE-violation form is recorded, so
+/// the per-member clause is AWS's and both the join and the clause order are this
+/// emulator's choice — a future recording of a multi-violation refusal is what
+/// would settle them, and this is the one place to adjust.
+fn validation_stage_message(violations: &[Violation]) -> String {
+    let clauses: Vec<String> = violations
+        .iter()
+        .map(|violation| format!("Value at '{}' failed to satisfy constraints", violation.path))
+        .collect();
+    format!("Validation error(s) detected: {}.", clauses.join("; "))
+}
 
 /// The `com-amazonaws-pi-performanceinsightsv20180227` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -96,23 +145,23 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // Performance Insights has no `ValidationException`: every bad argument —
-        // an absent required member, a value outside a modelled `length`,
-        // `range`, `pattern` or enum value set — is reported as
-        // `InvalidArgumentException` (HTTP 400), which is the client-input error
-        // its model declares on all 14 operations. Both the code and the message
-        // are replaced, so a client branching on the code sees the same code the
-        // handlers return for the same class of failure. An authentication
-        // refusal keeps the framework's wording: the service does not word it.
+        // A request that breaks a rule the MODEL declares — an absent required
+        // member, or a value outside a `length`, `range`, `pattern`, enum value
+        // set or `uniqueItems` — is refused by the validation stage of the
+        // request walk, before this service's handler runs. Performance Insights
+        // answers that stage's refusals with `ValidationException` and the
+        // framework template, NOT with the `InvalidArgumentException` its model
+        // declares: that error belongs to the handler, which such a request never
+        // reaches. The code and the message travel together, so both are stated
+        // here. An authentication refusal keeps the framework's wording: the
+        // service does not word it.
         match refusal {
-            Refusal::Invalid(violations) => Some(Refused {
-                code: "InvalidArgumentException".to_string(),
-                message: violations
-                    .iter()
-                    .map(aws_smithy_schema_server::constraints::Violation::message)
-                    .collect::<Vec<_>>()
-                    .join("; "),
+            Refusal::Invalid(violations) if !violations.is_empty() => Some(Refused {
+                code: VALIDATION_EXCEPTION_CODE.to_string(),
+                message: validation_stage_message(violations),
             }),
+            // Nothing to state a clause about, and no authentication wording of
+            // our own: keep the framework's.
             _ => None,
         }
     }

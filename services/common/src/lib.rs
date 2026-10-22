@@ -3,12 +3,14 @@
 #![forbid(unsafe_code)]
 //! Code more than one emulated service needs, as a path dependency.
 //!
-//! Today that is three things: [`claims_request`], the request-claim rule a
+//! Today that is four things: [`claims_request`], the request-claim rule a
 //! service whose SigV4 signing name is SHARED with other services uses for its
-//! `Service::can_handle`; [`stable_hex_id`], the one deterministic mixing
-//! function a service derives a wire-visible id with; and [`network`], the
-//! contract the account's EC2 network — which subnets a Region has — is modelled
-//! against, so no two services answer "does this subnet exist" differently.
+//! `Service::can_handle`; [`nth_path_segment`], for the rarer case of two such
+//! services publishing the SAME path space; [`stable_hex_id`], the one
+//! deterministic mixing function a service derives a wire-visible id with; and
+//! [`network`], the contract the account's EC2 network — which subnets a Region
+//! has — is modelled against, so no two services answer "does this subnet exist"
+//! differently.
 //!
 //! # Why a shared rule
 //!
@@ -16,10 +18,12 @@
 //! first, which carries the SIGNING name — and several AWS services sign under one
 //! name while serving distinct endpoints. Every AWS Marketplace-family service signs
 //! as `aws-marketplace` (Marketplace Catalog, Reporting, Deployment, Discovery,
-//! Agreement, Entitlement, Metering), `iam` is shared, and so is `sagemaker`. A
-//! service that claims on the signing name alone therefore claims its peers' traffic
-//! too, every claimant is a claimant for every request, and the router — which
-//! refuses to pick one — answers `500 AmbiguousService` to all of them.
+//! Agreement, Entitlement, Metering), `iam` is shared, and so is `sagemaker` (nine
+//! services: the control plane plus the metrics, a2i-runtime, edge,
+//! featurestore-runtime, job-runtime, training-session-runtime and two runtime
+//! endpoints). A service that claims on the signing name alone therefore claims its
+//! peers' traffic too, every claimant is a claimant for every request, and the
+//! router — which refuses to pick one — answers `500 AmbiguousService` to all of them.
 //!
 //! The rule below is the fix, stated once: a service claims a request when the
 //! signing name matches AND the request addresses that service's OWN modelled wire
@@ -40,6 +44,14 @@
 //! sentinels) for all of them and they all keep claiming everything. The RPC
 //! conjunct is what separates them.
 //!
+//! Two REST peers can also publish the same first path segment — the two SageMaker
+//! Runtime endpoints both bind `/endpoints/{EndpointName}/…` and even share an
+//! `endpointPrefix` — and then the first segment separates nothing either. The segment
+//! their modelled URIs actually differ at does, which is what [`nth_path_segment`] reads
+//! and what [`addresses_runtime_bidirectional_stream`] states once for that pair: the
+//! service that owns the narrower space claims it, its peer claims the complement, so a
+//! path inside the shared space always has exactly one claimant.
+//!
 //! # Services still carrying their own copy
 //!
 //! The path half of the rule predates this crate and is inlined in the `can_handle` of
@@ -47,8 +59,10 @@
 //! `grep -rln 'fn claims_modeled_path' services/*/src/service.rs` lists them (today:
 //! `connect`, `connectcontactlens`, `iam`, `iamtoolbox`, `chimesdkmeetings`,
 //! `personalizeevents`, `personalizeruntime`, `signerdata`, and the marketplace family
-//! before this crate existed; `s3` carries only `first_path_segment`). Those copies are to be
-//! MIGRATED onto [`claims_request`] (they are REST-only cases, so the call is
+//! before this crate existed; `s3` carries only `first_path_segment`, and `appconfig`,
+//! `appconfigdata`, `ivs` and `ivsrealtime` carry a `can_handle_parts` shim that calls the
+//! framework helper on a rebuilt request). Those copies are to be MIGRATED onto
+//! [`claims_request`] (they are REST-only cases, so the call is
 //! `claims_request(parts, signing_name, crate::ROUTE_PATH_SEGMENTS, None)`); they are
 //! left in place here only because this change does not own those services' issues and
 //! each is covered by its own routing suite under `core/router/tests/all/`. Nothing new
@@ -235,6 +249,49 @@ fn first_path_segment(path: &str) -> Option<&str> {
     (!segment.is_empty()).then_some(segment)
 }
 
+/// The `index`-th (0-based) `/`-separated segment of a URI path, or `None` when the path
+/// has no such segment.
+///
+/// For two peers under one signing name whose modelled URIs share their first path
+/// segment, so that [`claims_modeled_path`] cannot separate them: the segment their URIs
+/// differ at decides instead. Leading `/` is ignored and empty segments are NOT skipped,
+/// so the index is the position in the URI as written.
+///
+/// That last part is deliberately UNLIKE [`first_path_segment`], which maps an empty
+/// first segment to `None` so that a ROOT path can be told from a named one. Here an
+/// empty segment is reported as `Some("")`: a caller is comparing a deeper segment
+/// against a literal its model binds, which is never empty, so an empty segment must
+/// compare unequal rather than disappear.
+pub fn nth_path_segment(path: &str, index: usize) -> Option<&str> {
+    path.trim_start_matches('/').split('/').nth(index)
+}
+
+/// The index, in `/endpoints/{EndpointName}/<operation>`, of the segment the two
+/// SageMaker Runtime endpoints' modelled URIs differ at.
+const RUNTIME_INVOCATION_SEGMENT_INDEX: usize = 2;
+
+/// That segment's value for the ONE operation the SageMaker Runtime HTTP2 endpoint binds.
+///
+/// Source: `smithy_query(query="digest")` on both models — HTTP2 binds only
+/// `POST /endpoints/{EndpointName}/invocations-bidirectional-stream`, while SageMaker
+/// Runtime binds `…/invocations`, `…/async-invocations` and
+/// `…/invocations-response-stream` under the same prefix.
+const RUNTIME_BIDIRECTIONAL_STREAM_SEGMENT: &str = "invocations-bidirectional-stream";
+
+/// Whether `path` addresses the bidirectional-stream invocation — the one operation that
+/// separates the two emulated SageMaker Runtime endpoints.
+///
+/// Those two share their SigV4 signing name, their `runtime.sagemaker` endpointPrefix AND
+/// their first URI path segment (`endpoints`), so [`claims_request`] alone leaves both
+/// claiming each other's traffic. The HTTP2 endpoint claims a path this answers `true`
+/// for; its sibling claims the complement. Both sides read this ONE predicate rather
+/// than a constant of their own, so the two claims cannot drift into zero or two
+/// claimants for the space they share.
+pub fn addresses_runtime_bidirectional_stream(path: &str) -> bool {
+    nth_path_segment(path, RUNTIME_INVOCATION_SEGMENT_INDEX)
+        == Some(RUNTIME_BIDIRECTIONAL_STREAM_SEGMENT)
+}
+
 /// The `<Service>` of an `rpcv2Cbor` URI `/service/<Service>/operation/<Operation>`,
 /// or `None` for any other path.
 fn rpcv2_cbor_service_named(path: &str) -> Option<&str> {
@@ -270,8 +327,9 @@ fn strip_version_suffix(name: &str) -> &str {
 #[cfg(test)]
 mod tests {
     //! The claim rule over the shapes a shared signing name produces: two REST peers
-    //! with disjoint path spaces, and RPC peers that all post to one path and are
-    //! separated only by the service they name.
+    //! with disjoint path spaces, RPC peers that all post to one path and are
+    //! separated only by the service they name, and two REST peers that share a path
+    //! space and are separated by a deeper segment.
 
     use super::*;
 
@@ -462,6 +520,89 @@ mod tests {
             assert_eq!(
                 claimed, expected,
                 "case {case:?}: expected claimed == {expected}, got {claimed}"
+            );
+        }
+    }
+
+    /// The segment index is the position in the path as written, whatever the leading or
+    /// trailing slashes — the reader two peers sharing a path space are separated by.
+    #[test]
+    fn nth_path_segment_reads_the_position_in_the_path() {
+        // (case, path, index, expected)
+        let rows: [(&str, &str, usize, Option<&str>); 9] = [
+            ("first of three", "/endpoints/ep-1/invocations", 0, Some("endpoints")),
+            ("second of three", "/endpoints/ep-1/invocations", 1, Some("ep-1")),
+            ("third of three", "/endpoints/ep-1/invocations", 2, Some("invocations")),
+            (
+                "third of three, the sibling's operation",
+                "/endpoints/ep-1/invocations-bidirectional-stream",
+                2,
+                Some("invocations-bidirectional-stream"),
+            ),
+            ("past the end", "/endpoints/ep-1", 2, None),
+            ("no leading slash", "endpoints/ep-1/invocations", 2, Some("invocations")),
+            ("trailing slash leaves an empty segment", "/endpoints/ep-1/", 2, Some("")),
+            ("the root path", "/", 0, Some("")),
+            ("the empty path", "", 0, Some("")),
+        ];
+
+        for (case, path, index, expected) in rows {
+            let actual = nth_path_segment(path, index);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: segment {index} of {path:?} expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// The one predicate both SageMaker Runtime endpoints read: true for exactly the
+    /// invocation the HTTP2 one binds, false for every other path in the space they
+    /// share, so the two complementary claims cannot leave a path with zero or two
+    /// claimants.
+    #[test]
+    fn the_bidirectional_stream_invocation_is_told_from_every_other_invocation() {
+        // (case, path, expected) — the four invocations the two models bind
+        // (`smithy_query(query="digest")` on each), plus paths around them.
+        let rows: [(&str, &str, bool); 8] = [
+            (
+                "the HTTP2 endpoint's own invocation",
+                "/endpoints/ep-1/invocations-bidirectional-stream",
+                true,
+            ),
+            ("the sibling's invocations", "/endpoints/ep-1/invocations", false),
+            (
+                "the sibling's async invocations",
+                "/endpoints/ep-1/async-invocations",
+                false,
+            ),
+            (
+                "the sibling's response stream",
+                "/endpoints/ep-1/invocations-response-stream",
+                false,
+            ),
+            (
+                "an invocation neither model binds",
+                "/endpoints/ep-1/no-such-invocation",
+                false,
+            ),
+            ("no invocation segment at all", "/endpoints/ep-1", false),
+            (
+                "the segment at the wrong depth",
+                "/endpoints/invocations-bidirectional-stream",
+                false,
+            ),
+            (
+                "an endpoint name that looks like the segment",
+                "/endpoints/invocations-bidirectional-stream/invocations",
+                false,
+            ),
+        ];
+
+        for (case, path, expected) in rows {
+            let actual = addresses_runtime_bidirectional_stream(path);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: {path:?} expected {expected}, got {actual}"
             );
         }
     }

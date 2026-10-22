@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutMetadata
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutMetadata`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutMetadata::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Inserts timed metadata into a channel's ACTIVE stream, so it acts on the ingest, not
+//! on the channel record: the channel must exist (else `ResourceNotFoundException`) and
+//! must be ingesting (else `ChannelNotBroadcasting`). Whether a channel is ingesting is
+//! read through [`crate::state::is_broadcasting`], the one place this service answers
+//! that question.
+//!
+//! It writes nothing to this service's state: metadata travels in the stream, and there
+//! is no stream to carry it unless an ingest is live.
 //!
 //! ## Shape of an operation
 //!
@@ -112,11 +112,19 @@ impl ::aws_smithy_schema::serde::SerializableStruct for PutMetadataOutput {
 // here — hence the `PutMetadataError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ivs#PutMetadata")]
+// `extra_errors`: `InternalServerException` is a shape this SERVICE models (it is the
+// 500 every other IVS operation declares) that this operation's model does not list.
+// The handler needs it for the one failure that is the emulator's own rather than the
+// request's: its store being unreachable.
+#[smithy_macros::operation_error(
+    "com.amazonaws.ivs#PutMetadata",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum PutMetadataErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ChannelNotBroadcasting(ChannelNotBroadcasting),
+    InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
@@ -173,18 +181,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutMetadata` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutMetadataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutMetadata"))
+        // `channelArn` and `metadata` both carry modelled constraints the framework's
+        // walk has already enforced (`ChannelArn`'s pattern, `StreamMetadata`'s minimum
+        // length), so reaching here means the request is well formed.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::store_unavailable(PutMetadataErrorModeled::InternalServerException)
+        })?;
+
+        let store = state.lock();
+        if !crate::state::channel_exists(&store, &input.channel_arn) {
+            return Err(crate::state::resource_not_found(
+                PutMetadataErrorModeled::ResourceNotFoundException,
+                &input.channel_arn,
+            ));
+        }
+        if !crate::state::is_broadcasting(&store, &input.channel_arn) {
+            return Err(crate::state::channel_not_broadcasting(
+                PutMetadataErrorModeled::ChannelNotBroadcasting,
+                &input.channel_arn,
+            ));
+        }
+
+        // The metadata is carried by the live stream, which is the ingest's to hold, so
+        // an accepted call changes nothing a later caller of this service can read.
+        Ok(PutMetadataOutput)
     }
 }

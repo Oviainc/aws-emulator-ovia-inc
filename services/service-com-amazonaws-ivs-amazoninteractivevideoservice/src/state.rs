@@ -2,18 +2,25 @@
 
 //! Engine state for the com-amazonaws-ivs-amazoninteractivevideoservice service,
 //! plus the few rules more than one operation in the channel lifecycle applies
-//! (ARN minting, id minting, pagination tokens, and the two type-dependent
-//! `Channel` rules the model documents).
+//! (ARN minting, id minting, pagination tokens, the two type-dependent `Channel`
+//! rules the model documents, how this service WORDS the failures it answers, and
+//! the modelled constraints it enforces in its own handlers).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::LazyLock;
 use std::time::{Duration, SystemTime};
 
+use regex::Regex;
 use sha2::{Digest, Sha256};
+use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
-    AdConfiguration, Channel, MultitrackInputConfiguration, RecordingConfiguration,
-    RenditionConfiguration, Stream, StreamKey, ThumbnailConfiguration,
+    AdConfiguration, Channel, ChannelNotBroadcasting, InternalServerException,
+    MultitrackInputConfiguration, RecordingConfiguration, RenditionConfiguration,
+    ResourceNotFoundException, ServiceQuotaExceededException, Stream, StreamKey,
+    ThumbnailConfiguration, ValidationException,
 };
+use crate::scaffolded::Scaffolded;
 
 /// The region every minted ARN falls back to when the request carries no SigV4
 /// credential scope to read one from (an unsigned, anonymous call).
@@ -202,15 +209,19 @@ pub const MAX_RECORDING_CONFIGURATIONS: usize = 1_000;
 /// From the model doc on `RenditionConfiguration$renditionSelection`: "If `CUSTOM`
 /// is specified, a set of renditions must be specified in the `renditions` field."
 /// An absent or empty list names no rendition, so neither is a set.
+///
+/// The refusal is stated the way this service states a cross-member rejection (see
+/// [`member_constraint_message`]), the same form — including the snake_case member
+/// name the recorded multitrack refusal uses — as the multitrack/container-format
+/// pair, so one class of refusal reads one way across the service.
 pub fn check_rendition_configuration(rendition: &RenditionConfiguration) -> Result<(), String> {
     let selection = rendition.rendition_selection.as_deref().unwrap_or("");
     let renditions = rendition.renditions.as_deref().unwrap_or(&[]);
     if selection == "CUSTOM" && renditions.is_empty() {
-        return Err(
-            "renditionConfiguration.renditions is required to name at least one rendition \
-             when renditionConfiguration.renditionSelection is CUSTOM"
-                .to_string(),
-        );
+        return Err(member_constraint_message(
+            "rendition_configuration.renditions",
+            "invalid value for rendition configuration rendition selection and renditions",
+        ));
     }
     Ok(())
 }
@@ -265,23 +276,48 @@ pub fn effective_thumbnail_configuration(
     })
 }
 
-/// The ceiling on how many channels this store holds, and on how many stream keys
-/// one channel holds: the two caps that bound caller-driven growth.
+/// The ceiling on how many channels this store holds: the cap that bounds
+/// caller-driven growth.
 ///
 /// A generated emulator keeps its resources in memory for the life of the process
 /// and a create is the only thing that adds one, so the store needs a maximum entry
 /// count — neither a TTL nor an eviction policy is available to it, because
-/// `GetChannel` must still answer what `CreateChannel` created. The two operations
-/// that grow the store refuse past these caps with the service's own modelled
-/// `ServiceQuotaExceededException` (HTTP 402), which IVS declares on exactly those
-/// two operations and on no read. The numbers are the emulator's own bound, not a
-/// published AWS default: AWS publishes both quotas as adjustable, so no single
-/// value is the contract, and the caps are set high enough that no ordinary workflow
-/// meets one.
+/// `GetChannel` must still answer what `CreateChannel` created. `CreateChannel`
+/// refuses past this cap with the service's own modelled
+/// `ServiceQuotaExceededException` (HTTP 402), which IVS declares on it. The number is
+/// the emulator's own bound, not a published AWS default: AWS publishes the channel
+/// quota as adjustable, so no single value is the contract, and the cap is set high
+/// enough that no ordinary workflow meets it.
 pub const MAX_CHANNELS: usize = 5_000;
 
-/// See [`MAX_CHANNELS`].
-pub const MAX_STREAM_KEYS_PER_CHANNEL: usize = 100;
+/// How many stream keys one channel may hold.
+///
+/// Unlike [`MAX_CHANNELS`] this is not an emulator-chosen bound: a channel is created
+/// WITH its one stream key and the quota is one key per channel, so the recorded
+/// behaviour is that a second `CreateStreamKey` on the same channel is refused with
+/// `ServiceQuotaExceededException` (HTTP 402) and that deleting the existing key frees
+/// the slot again. `CreateStreamKey` is the only operation that can exceed it.
+pub const MAX_STREAM_KEYS_PER_CHANNEL: usize = 1;
+
+/// The name the stream-key quota's refusal states — the quota is on the resource, so
+/// the message names the resource type rather than the operation. See
+/// [`quota_exceeded_message`].
+pub const STREAM_KEY_QUOTA_RESOURCE: &str = "stream-key";
+
+/// The same, for the channel cap [`MAX_CHANNELS`] bounds.
+pub const CHANNEL_QUOTA_RESOURCE: &str = "channel";
+
+/// The same, for the recording-configuration cap [`MAX_RECORDING_CONFIGURATIONS`]
+/// bounds.
+pub const RECORDING_CONFIGURATION_QUOTA_RESOURCE: &str = "recording-configuration";
+
+/// The same, for the ad-configuration cap [`MAX_AD_CONFIGURATIONS`] bounds.
+pub const AD_CONFIGURATION_QUOTA_RESOURCE: &str = "ad-configuration";
+
+/// The same, for the cap on how many `(channelArn, viewerId)` pairs this store tracks a
+/// viewer-session revocation for ([`MAX_VIEWER_SESSION_REVOCATIONS`]). Both surfaces
+/// that start a revocation state it, so neither words that refusal on its own.
+pub const VIEWER_SESSION_REVOCATION_QUOTA_RESOURCE: &str = "viewer-session-revocation";
 
 /// The ceiling on how many `(channelArn, viewerId)` pairs this store tracks a
 /// viewer-session revocation for — a caller-driven growth path bounded for the same
@@ -505,17 +541,40 @@ pub fn effective_preset(channel_type: &str, requested: Option<&str>) -> String {
 /// `multitrackInputConfiguration` is specified and `enabled` is `true`, then
 /// `containerFormat` is required and must be set to `FRAGMENTED_MP4`. Otherwise,
 /// `containerFormat` may be set to `TS` or `FRAGMENTED_MP4`."
+///
+/// The refusal is stated the way IVS states a cross-member rejection (see
+/// [`member_constraint_message`]): it names the member whose value cannot hold and the
+/// constraint the pair violated.
 pub fn check_container_format(
     container_format: &str,
     multitrack: Option<&MultitrackInputConfiguration>,
 ) -> Result<(), String> {
     if multitrack.is_some_and(|config| config.enabled) && container_format != "FRAGMENTED_MP4" {
-        return Err(format!(
-            "containerFormat must be FRAGMENTED_MP4 when multitrackInputConfiguration is enabled, got {container_format}"
+        return Err(member_constraint_message(
+            MULTITRACK_ENABLED_MEMBER,
+            MULTITRACK_CONTAINER_FORMAT_CONSTRAINT,
         ));
     }
     Ok(())
 }
+
+/// The member a multitrack/container-format rejection names: the `enabled` flag of the
+/// request's `multitrackInputConfiguration`, which is the value that makes
+/// `containerFormat` constrained at all.
+///
+/// Spelled in snake_case because that is how the RECORDED refusal spells it
+/// ("Request member: multitrack_input_configuration.enabled failed to satisfy the
+/// constraints: …"), not by analogy with anything else: this message is IVS's own text
+/// for a cross-member rejection, where the member name is part of what was recorded. It
+/// is NOT the dotted lowerCamel path [`MemberRule::path`] and
+/// [`violation_clause`] use — those state a CONSTRAINT-WALK violation, whose path the
+/// framework builds from the member names the request sends.
+const MULTITRACK_ENABLED_MEMBER: &str = "multitrack_input_configuration.enabled";
+
+/// The constraint a multitrack/container-format rejection names: the pair of values that
+/// cannot hold together, from the `Channel$containerFormat` model doc.
+const MULTITRACK_CONTAINER_FORMAT_CONSTRAINT: &str =
+    "invalid value for multitrack input configuration enabled and container format";
 
 /// The stamp a `ListChannels` page token carries, so a token issued for one list
 /// cannot be replayed against another.
@@ -604,3 +663,538 @@ pub fn page<'a, T>(
         next_token,
     )
 }
+
+// =============================================================================
+// How this service WORDS the failures it answers
+// =============================================================================
+//
+// Every message below is built from the REQUEST (the ARN it named, the member it
+// sent, the quota it met) by one rule, stated once here and used by every handler
+// that answers that failure, so two operations cannot word the same refusal two
+// ways. The error CODE and the HTTP status are not here: they stay model-derived,
+// on the modelled error shape the operation declares (see
+// `crate::scaffolded::Scaffolded::stated`).
+
+/// How IVS states a request that named a resource it does not hold: the ARN the
+/// request named, under a fixed template.
+///
+/// Recorded identically for `GetChannel`, `UpdateChannel`, `CreateStreamKey`,
+/// `GetPlaybackKeyPair` and `StartViewerSessionRevocation`, which is what makes it a
+/// rule of the service rather than wording of one operation.
+pub fn resource_not_found_message(arn: &str) -> String {
+    format!("Resource: {arn} not found")
+}
+
+/// How IVS states an operation on a channel that is not currently ingesting
+/// (`ChannelNotBroadcasting`, HTTP 404): it names the channel ARN the request sent.
+pub fn channel_offline_message(channel_arn: &str) -> String {
+    format!("Channel: {channel_arn} is not currently online")
+}
+
+/// How IVS states a quota refusal (`ServiceQuotaExceededException`, HTTP 402): it names
+/// the resource the quota is on and the limit that was reached, not the operation.
+pub fn quota_exceeded_message(resource: &str, limit: usize) -> String {
+    format!("Resource: {resource} quota exceeded limit: {limit}")
+}
+
+/// How IVS states a rejection of one member's VALUE for a reason the model cannot
+/// express — a pair of members that cannot hold together: it names the member and the
+/// constraint the request violated.
+///
+/// Recorded for the multitrack/container-format pair (see [`check_container_format`]).
+pub fn member_constraint_message(member: &str, constraint: &str) -> String {
+    format!("Request member: {member} failed to satisfy the constraints: {constraint}")
+}
+
+/// How IVS states a value outside a modelled `@pattern`: the operation, the dotted
+/// member path, and the pattern itself.
+pub fn pattern_violation_message(operation: &str, path: &str, pattern: &str) -> String {
+    format!("{operation}.{path} does not match the required pattern {pattern}")
+}
+
+/// How IVS states a value below a modelled `@length` minimum: the operation, the dotted
+/// member path, the minimum, and what the request actually sent.
+pub fn min_length_violation_message(
+    operation: &str,
+    path: &str,
+    minimum: usize,
+    found: usize,
+) -> String {
+    format!("{operation}.{path} is required to have a minimum length of {minimum}, found {found}")
+}
+
+/// How IVS states a value above a modelled `@length` maximum. The minimum form above is
+/// the recorded one; this is that same sentence with the bound it states, because one
+/// derivation covers both ends of a `@length`.
+pub fn max_length_violation_message(
+    operation: &str,
+    path: &str,
+    maximum: usize,
+    found: usize,
+) -> String {
+    format!("{operation}.{path} is required to have a maximum length of {maximum}, found {found}")
+}
+
+/// The wire error code IVS's TAGGING surface answers for an ARN that names no resource.
+///
+/// It is NOT the `ResourceNotFoundException` the rest of the service answers and the
+/// model declares for these three operations: the recorded responses for
+/// `ListTagsForResource` / `TagResource` / `UntagResource` carry the distinct code
+/// `NotFoundException`, which is why it travels as
+/// `crate::scaffolded::Scaffolded::unmodeled` rather than as a modelled variant.
+pub const TAGGING_NOT_FOUND_CODE: &str = "NotFoundException";
+
+/// The HTTP status that recorded tagging not-found response carries.
+pub const TAGGING_NOT_FOUND_STATUS: u16 = 404;
+
+/// The text that recorded tagging not-found response carries: one fixed,
+/// resource-agnostic string, built from nothing in the request.
+pub const TAGGING_NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
+// The failures themselves, each built once from its message rule. `variant` is the
+// operation's OWN modelled error constructor — `GetChannelErrorModeled::
+// ResourceNotFoundException`, say — so the compiler still refuses a failure the
+// operation's model does not declare, and the error code and HTTP status stay derived
+// from that modelled shape. Only the BODY is this service's own rendering: AWS puts the
+// text under the key `message`, which the modelled `exceptionMessage` member is not (see
+// `crate::scaffolded::STATED_MESSAGE`). The modelled struct is filled in with the same
+// text, so the error is complete as a Rust value too.
+
+/// The `ResourceNotFoundException` (HTTP 404) this service answers when a request names
+/// a resource it does not hold. See [`resource_not_found_message`].
+pub fn resource_not_found<E>(
+    variant: fn(ResourceNotFoundException) -> E,
+    arn: &str,
+) -> Scaffolded<E> {
+    let message = resource_not_found_message(arn);
+    Scaffolded::stated(
+        variant(ResourceNotFoundException {
+            exception_message: Some(message.clone()),
+            ..Default::default()
+        }),
+        message,
+    )
+}
+
+/// The `ChannelNotBroadcasting` (HTTP 404) this service answers when an operation needs
+/// a channel that is ingesting and the channel is not. See [`channel_offline_message`].
+pub fn channel_not_broadcasting<E>(
+    variant: fn(ChannelNotBroadcasting) -> E,
+    channel_arn: &str,
+) -> Scaffolded<E> {
+    let message = channel_offline_message(channel_arn);
+    Scaffolded::stated(
+        variant(ChannelNotBroadcasting {
+            exception_message: Some(message.clone()),
+            ..Default::default()
+        }),
+        message,
+    )
+}
+
+/// The `ServiceQuotaExceededException` (HTTP 402) this service answers when a create
+/// would exceed a quota. See [`quota_exceeded_message`].
+pub fn quota_exceeded<E>(
+    variant: fn(ServiceQuotaExceededException) -> E,
+    resource: &str,
+    limit: usize,
+) -> Scaffolded<E> {
+    let message = quota_exceeded_message(resource, limit);
+    Scaffolded::stated(
+        variant(ServiceQuotaExceededException {
+            exception_message: Some(message.clone()),
+            ..Default::default()
+        }),
+        message,
+    )
+}
+
+/// The `ValidationException` (HTTP 400) this service answers for a request it refuses on
+/// its own, with `message` from one of the rules above.
+pub fn validation<E>(variant: fn(ValidationException) -> E, message: String) -> Scaffolded<E> {
+    Scaffolded::stated(
+        variant(ValidationException {
+            exception_message: Some(message.clone()),
+            ..Default::default()
+        }),
+        message,
+    )
+}
+
+/// The `InternalServerException` (HTTP 500) a handler answers when this service's store
+/// is unreachable — the one failure that is the emulator's own, not the request's.
+pub fn store_unavailable<E>(variant: fn(InternalServerException) -> E) -> Scaffolded<E> {
+    let message = STORE_UNAVAILABLE_MESSAGE.to_string();
+    Scaffolded::stated(
+        variant(InternalServerException {
+            exception_message: Some(message.clone()),
+            ..Default::default()
+        }),
+        message,
+    )
+}
+
+/// The text [`store_unavailable`] states. AWS documents no message for this (it is an
+/// emulator fault, not a service behaviour), so it says plainly what failed.
+pub const STORE_UNAVAILABLE_MESSAGE: &str = "the IVS store is unavailable";
+
+/// The not-found the TAGGING surface answers for an ARN naming no resource:
+/// [`TAGGING_NOT_FOUND_CODE`] with [`TAGGING_NOT_FOUND_STATUS`], which is not the
+/// modelled error shape — hence the unmodelled channel.
+pub fn tagging_not_found<E>() -> Scaffolded<E> {
+    Scaffolded::unmodeled(
+        TAGGING_NOT_FOUND_CODE,
+        TAGGING_NOT_FOUND_STATUS,
+        TAGGING_NOT_FOUND_MESSAGE,
+    )
+}
+
+// =============================================================================
+// How this service states a CONSTRAINT refusal
+// =============================================================================
+//
+// The framework's constraint walk runs between deserialize and `handle` and words a
+// violation the same way for every service ("1 validation error detected: Value '…' at
+// '…' failed to satisfy constraint: …"). IVS words it from the OPERATION and the member
+// path instead ("CreateChannel.name does not match the required pattern …"), and the
+// operation is not reachable at the framework's refusal seam — `Service::override_refusal`
+// is handed the violations alone. `crate::service`'s per-operation wrapper collects the
+// framework's OWN violations and brings the operation with it; the sentences are here,
+// beside the message rules above, and not one modelled constraint is restated: every
+// bound and pattern a clause prints comes off the `Violation` the walk produced.
+
+/// One violation as this service states it: the operation, the dotted member path and
+/// the constraint the request violated.
+///
+/// The `@pattern` and `@length` forms are the recorded ones. The remaining kinds are
+/// derived from them by the same construction — the operation and member path, then the
+/// requirement — because AWS's exact wording for those is not recorded; the ERROR CODE
+/// and status they travel with are the modelled ones either way.
+pub fn violation_clause(operation: &str, violation: &Violation) -> String {
+    let path = violation.path.as_str();
+    match &violation.kind {
+        ViolationKind::Pattern(pattern) => pattern_violation_message(operation, path, pattern),
+        ViolationKind::MinLength(minimum) => min_length_violation_message(
+            operation,
+            path,
+            usize::try_from(*minimum).unwrap_or(0),
+            found_length(violation),
+        ),
+        ViolationKind::MaxLength(maximum) => max_length_violation_message(
+            operation,
+            path,
+            usize::try_from(*maximum).unwrap_or(0),
+            found_length(violation),
+        ),
+        ViolationKind::MissingRequiredMember => format!("{operation}.{path} is required"),
+        ViolationKind::MinValue(minimum) => {
+            format!("{operation}.{path} is required to have a minimum value of {minimum}")
+        }
+        ViolationKind::MaxValue(maximum) => {
+            format!("{operation}.{path} is required to have a maximum value of {maximum}")
+        }
+        ViolationKind::EnumValue(allowed) => format!(
+            "{operation}.{path} is required to be one of [{}]",
+            allowed.join(", ")
+        ),
+        ViolationKind::UniqueItems => {
+            format!("{operation}.{path} is required to have unique values")
+        }
+        // `ViolationKind` is `#[non_exhaustive]`: a constraint class the framework gains
+        // later is stated in the same construction rather than silently unworded.
+        _ => format!("{operation}.{path} does not satisfy the constraint the model declares"),
+    }
+}
+
+/// `violations` as this service states them for `operation`, or `None` when there is
+/// nothing to refuse.
+///
+/// Each recorded refusal carries ONE violation and states its sentence alone — no count
+/// prefix, unlike the framework's envelope — so one violation is its clause; several are
+/// joined, in the order the walk collected them.
+pub fn stated_violations(operation: &str, violations: &[Violation]) -> Option<String> {
+    match violations {
+        [] => None,
+        [only] => Some(violation_clause(operation, only)),
+        many => Some(
+            many.iter()
+                .map(|violation| violation_clause(operation, violation))
+                .collect::<Vec<String>>()
+                .join("; "),
+        ),
+    }
+}
+
+/// The length the request actually sent, for a `@length` violation.
+///
+/// A `Violation` carries WHAT was sent, not its size, so the size is read off that
+/// rendering: the framework renders a collection as `"<n> items"` and a string as the
+/// string itself. A string longer than the framework's 256-character echo cap arrives
+/// elided, which is the one case this count is short — it affects the number in the
+/// message and nothing about the refusal.
+fn found_length(violation: &Violation) -> usize {
+    let Some(value) = violation.value.as_deref() else {
+        return 0;
+    };
+    value
+        .strip_suffix(" items")
+        .and_then(|count| count.parse().ok())
+        .unwrap_or_else(|| value.chars().count())
+}
+
+/// The violation for a `@required` member the request did not send.
+///
+/// Absence is found while READING the request, so it arrives as a codec error rather
+/// than from the constraint walk; this is the same `Violation` the framework's own
+/// `refusal_of` builds for it, so one refusal is not stated two ways.
+pub fn missing_member_violation(member_name: String) -> Violation {
+    Violation {
+        path: member_name,
+        kind: ViolationKind::MissingRequiredMember,
+        value: None,
+    }
+}
+
+// =============================================================================
+// The two constraints this service enforces in its OWN handlers
+// =============================================================================
+//
+// Everything the model declares is enforced by the framework's walk and stated by
+// `violation_clause` above. These two are different, and each says why:
+// `RESOURCE_ARN` RELAXES a modelled pattern no IVS ARN can satisfy (so the walk must
+// not see it, hence the member's `skip_validation`), and `TAGS` bounds the RESOURCE's
+// whole tag set, which no single request's input shape expresses.
+
+/// A modelled `@pattern`: the source text, which the refusal message prints, beside the
+/// compiled form the check runs.
+pub struct ModelPattern {
+    /// The pattern exactly as the model declares it.
+    pub source: &'static str,
+    /// The same pattern, compiled once on first use.
+    compiled: LazyLock<Regex>,
+}
+
+impl ModelPattern {
+    /// Whether `value` satisfies the pattern.
+    pub fn matches(&self, value: &str) -> bool {
+        self.compiled.is_match(value)
+    }
+}
+
+impl std::fmt::Debug for ModelPattern {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelPattern")
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Declare a [`ModelPattern`] from one literal, so the text the message prints and the
+/// expression the check runs can never be two different patterns.
+macro_rules! model_pattern {
+    ($name:ident, $source:literal) => {
+        static $name: ModelPattern = ModelPattern {
+            source: $source,
+            compiled: LazyLock::new(|| {
+                Regex::new($source).expect("a pattern this service's model declares compiles")
+            }),
+        };
+    };
+}
+
+model_pattern!(
+    RESOURCE_ARN_PATTERN,
+    "^arn:aws:ivs:[a-z0-9-]+:[0-9]+:[a-z-]+/[a-zA-Z0-9-]+$"
+);
+
+/// One member's constraints, checked by the handler and stated the way
+/// [`violation_clause`] states the framework's.
+#[derive(Debug)]
+pub struct MemberRule {
+    /// The dotted member path the message names, as the request spells it (lowerCamel,
+    /// and qualified for a member of a nested structure).
+    pub path: &'static str,
+    /// The `@length` minimum, if the member has one.
+    pub min_length: Option<usize>,
+    /// The `@length` maximum, if the member has one.
+    pub max_length: Option<usize>,
+    /// The `@pattern`, if the member has one.
+    pub pattern: Option<&'static ModelPattern>,
+}
+
+impl MemberRule {
+    /// Check a string member of `operation`'s request. `Err` is the text to put on the
+    /// `ValidationException`.
+    ///
+    /// The bounds are checked before the pattern, so a value that breaks both is
+    /// reported against its length — the order the framework's own walk uses.
+    pub fn check(&self, operation: &str, value: &str) -> Result<(), String> {
+        self.check_length(operation, value.chars().count())?;
+        match self.pattern {
+            Some(pattern) if !pattern.matches(value) => Err(pattern_violation_message(
+                operation,
+                self.path,
+                pattern.source,
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// Check a collection member's entry count against the `@length`: a list's elements
+    /// or a map's entries, which is what `@length` bounds on a collection.
+    pub fn check_length(&self, operation: &str, found: usize) -> Result<(), String> {
+        if let Some(minimum) = self.min_length {
+            if found < minimum {
+                return Err(min_length_violation_message(
+                    operation, self.path, minimum, found,
+                ));
+            }
+        }
+        if let Some(maximum) = self.max_length {
+            if found > maximum {
+                return Err(max_length_violation_message(
+                    operation, self.path, maximum, found,
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The `resourceArn` of `ListTagsForResource` / `TagResource` / `UntagResource` ->
+/// `ResourceArn`: `@length(1..128)` and
+/// `@pattern("^arn:aws:ivs:[a-z0-9-]+:[0-9]+:[a-z-]/[a-zA-Z0-9-]+$")`.
+///
+/// The pattern enforced here repeats the resource-type group (`[a-z-]+`) where the
+/// model writes it once (`[a-z-]`). Taken literally the modelled group matches exactly
+/// ONE character, so no IVS ARN that exists — `channel/…`, `stream-key/…`,
+/// `playback-key/…` — could ever satisfy it, and the recordings show AWS accepting a
+/// channel ARN here and round-tripping its tags, and answering a well-formed
+/// `playback-key/…` ARN with a not-found rather than a validation error. The repeated
+/// group is the only reading of the model under which the recorded behaviour is
+/// possible; everything else about the pattern, and the length, is the model's. Because
+/// the modelled pattern cannot be enforced as written, the member carries
+/// `skip_validation` and this rule takes its place.
+pub static RESOURCE_ARN: MemberRule = MemberRule {
+    path: "resourceArn",
+    min_length: Some(1),
+    max_length: Some(128),
+    pattern: Some(&RESOURCE_ARN_PATTERN),
+};
+
+/// The `tags` a resource carries -> `Tags`: `@length(0..50)` on the map
+/// (`smithy_query(query="shape", shape="Tags")`).
+///
+/// The walk bounds the map ONE REQUEST sent; the quota is on the resource, so
+/// `TagResource` checks the set its call would leave behind — which is a rule about
+/// stored state, not about an input shape, and so cannot come from the walk.
+pub static TAGS: MemberRule = MemberRule {
+    path: "tags",
+    min_length: Some(0),
+    max_length: Some(50),
+    pattern: None,
+};
+
+/// Whether the channel `channel_arn` names is ingesting right now — the state
+/// `PutMetadata`, `StopStream` and `InsertAdBreak` need before they can act.
+///
+/// It is [`live_stream`] read as a yes/no, so every operation that needs an ACTIVE
+/// stream agrees with `GetStream` about whether there is one: a channel is broadcasting
+/// exactly when this store holds a `LIVE` stream for it. A channel goes live only by
+/// PUBLISHING to the ingest endpoint `CreateChannel` advertises (the control plane has
+/// no operation that starts a stream), and this emulator serves no ingest data plane, so
+/// no channel is ingesting today and those operations answer the
+/// `ChannelNotBroadcasting` their models declare for exactly this case — from the
+/// absence of a stream in the store, never from a status invented for work nothing ran.
+pub fn is_broadcasting(
+    state: &ComAmazonawsIvsAmazoninteractivevideoserviceState,
+    channel_arn: &str,
+) -> bool {
+    live_stream(state, channel_arn).is_some()
+}
+
+/// End the stream `channel_arn` is ingesting, so the channel stops broadcasting.
+///
+/// `StopStream` disconnects the ingest session, after which the channel has no active
+/// stream: `GetStream` answers `ChannelNotBroadcasting` again and so do the operations
+/// that need one. The record is dropped rather than left behind in another state —
+/// `GetStream` reports the ACTIVE stream, and a stream that has ended is not one.
+pub fn end_stream(
+    state: &mut ComAmazonawsIvsAmazoninteractivevideoserviceState,
+    channel_arn: &str,
+) {
+    state.streams.remove(channel_arn);
+}
+
+/// Whether this store holds the channel `channel_arn` names.
+pub fn channel_exists(
+    state: &ComAmazonawsIvsAmazoninteractivevideoserviceState,
+    channel_arn: &str,
+) -> bool {
+    state.channels.contains_key(channel_arn)
+}
+
+// =============================================================================
+// Resources addressed by ARN: the tagging surface
+// =============================================================================
+
+/// The resource type an IVS ARN names (`channel`, `stream-key`, `playback-key`, …), or
+/// `None` when the string is not an IVS resource ARN at all.
+///
+/// The type is the sixth `:`-field up to its `/`, from the ARN form every ARN shape in
+/// this model pins: `arn:aws:ivs:<region>:<account>:<type>/<id>`.
+pub fn arn_resource_type(arn: &str) -> Option<&str> {
+    arn.split(':').nth(5)?.split('/').next()
+}
+
+/// The tags attached to the resource `arn` names, or `None` when this store holds no
+/// such resource.
+///
+/// Only the resource types this service can create are reachable: a channel
+/// (`CreateChannel`), a stream key (`CreateChannel` / `CreateStreamKey`) and a recording
+/// configuration (`CreateRecordingConfiguration`). Every other IVS resource type's
+/// create is still a scaffold stub, so this store holds none of them, and a well-formed
+/// ARN naming one is answered exactly as an ARN naming a deleted resource is — not found.
+pub fn resource_tags(
+    state: &ComAmazonawsIvsAmazoninteractivevideoserviceState,
+    arn: &str,
+) -> Option<HashMap<String, String>> {
+    match arn_resource_type(arn)? {
+        "channel" => state
+            .channels
+            .get(arn)
+            .map(|channel| channel.tags.clone().unwrap_or_default()),
+        "stream-key" => state
+            .stream_keys
+            .get(arn)
+            .map(|key| key.tags.clone().unwrap_or_default()),
+        "recording-configuration" => state
+            .recording_configurations
+            .get(arn)
+            .map(|record| record.configuration.tags.clone().unwrap_or_default()),
+        _ => None,
+    }
+}
+
+/// The `tags` member of the resource `arn` names, to be changed in place.
+///
+/// It hands back the stored `Option` ITSELF rather than a map, so a call that adds no
+/// entry — an `UntagResource` naming keys the resource does not carry, say — leaves a
+/// record whose `tags` was absent absent, instead of flipping every later read of that
+/// resource from no `tags` member to an empty one. `None` when this store holds no such
+/// resource; see [`resource_tags`].
+pub fn resource_tags_entry<'a>(
+    state: &'a mut ComAmazonawsIvsAmazoninteractivevideoserviceState,
+    arn: &str,
+) -> Option<&'a mut Option<HashMap<String, String>>> {
+    match arn_resource_type(arn)? {
+        "channel" => state.channels.get_mut(arn).map(|channel| &mut channel.tags),
+        "stream-key" => state.stream_keys.get_mut(arn).map(|key| &mut key.tags),
+        "recording-configuration" => state
+            .recording_configurations
+            .get_mut(arn)
+            .map(|record| &mut record.configuration.tags),
+        _ => None,
+    }
+}
+

@@ -171,9 +171,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Disabling Security Hub CSPM deletes the hub's findings with it, so the
-        // account keeps nothing from the subscription it just ended.
+        // account keeps nothing from the subscription it just ended — including the
+        // custom insights that were saved queries over those findings.
         store
             .findings
+            .retain(|key, _| key.account_id != account_id || key.region != region);
+        store
+            .insights
             .retain(|key, _| key.account_id != account_id || key.region != region);
         // The standards the hub had enabled end with it too: a standard can only be
         // enabled for a subscribed account, so none survives the hub.

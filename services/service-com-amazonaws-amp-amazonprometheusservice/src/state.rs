@@ -24,6 +24,25 @@ pub const STATUS_ACTIVE: &str = "ACTIVE";
 /// See [`STATUS_CREATING`].
 pub const STATUS_DELETING: &str = "DELETING";
 
+/// `LoggingConfigurationStatusCode` values a rules-and-alerting logging configuration
+/// moves through here. Each is an entry of the modelled
+/// `com.amazonaws.amp#LoggingConfigurationStatusCode` enum, whose own documentation
+/// states the lifecycle rule this crate enforces: `CREATING` — "Logging configuration
+/// is being created. Update/Deletion is disallowed until logging configuration is
+/// ACTIVE and workspace status is ACTIVE."; `ACTIVE` — "Logging configuration has been
+/// created/updated." (`crate::ops::types::LOGGING_CONFIGURATION_STATUS_CODE_VALUES`
+/// carries the full list.)
+pub const LOGGING_STATUS_CREATING: &str = "CREATING";
+/// See [`LOGGING_STATUS_CREATING`].
+pub const LOGGING_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// The `resourceType` the modelled `ResourceNotFoundException` reports for a workspace's
+/// rules-and-alerting logging configuration. The member is a free-form `String`
+/// documented as "Type of the resource affected", so the emulator reports this
+/// resource's name in the service's `AWS::APS::` namespace, the way
+/// [`WORKSPACE_RESOURCE_TYPE`] does for the workspace itself.
+pub const LOGGING_CONFIGURATION_RESOURCE_TYPE: &str = "AWS::APS::LoggingConfiguration";
+
 /// How long a workspace stays in a transient status before the clock owes the next
 /// transition (`CREATING` -> `ACTIVE`, `DELETING` -> removed).
 ///
@@ -92,6 +111,50 @@ pub struct Workspace {
     /// deletion, so replaying that exact call stays idempotent rather than
     /// conflicting with the deletion it already started.
     pub delete_token: Option<String>,
+    /// This workspace's rules-and-alerting logging configuration, when it has one.
+    ///
+    /// `/workspaces/{workspaceId}/logging` names at most ONE such configuration per
+    /// workspace — `LoggingConfigurationMetadata` is a single structure keyed by nothing
+    /// but the workspace — so it lives ON the workspace record: a workspace that goes
+    /// away takes its logging configuration with it.
+    pub logging_configuration: Option<LoggingConfiguration>,
+}
+
+/// One stored rules-and-alerting logging configuration: every member
+/// `LoggingConfigurationMetadata` reports, plus the bookkeeping its lifecycle needs.
+#[derive(Debug, Clone)]
+pub struct LoggingConfiguration {
+    /// The CloudWatch log group the vended log data is published to.
+    pub log_group_arn: String,
+    /// One of [`LOGGING_STATUS_CREATING`], [`LOGGING_STATUS_ACTIVE`].
+    pub status_code: String,
+    /// `LoggingConfigurationStatus$statusReason` — "If failed, the reason for the
+    /// failure", so `None` while nothing has failed.
+    pub status_reason: Option<String>,
+    pub created_at: SystemTime,
+    /// When the configuration was most recently CHANGED, i.e. by the call that created
+    /// it or last updated what it points at — not by the clock moving its status on.
+    pub modified_at: SystemTime,
+    /// When the clock owes this configuration's move out of a transient status
+    /// (`CREATING` -> `ACTIVE`), if one is pending.
+    pub transition_due: Option<SystemTime>,
+    /// The `clientToken` of the call that created it, so replaying that exact call is
+    /// idempotent rather than a second create.
+    pub client_token: Option<String>,
+}
+
+impl LoggingConfiguration {
+    /// Apply the transition the clock already owes this configuration at `now`.
+    ///
+    /// The due instant was recorded by the call that started the transition, so it is
+    /// owed whether or not anybody calls again. Every transient status this emulator
+    /// puts a configuration in resolves to `ACTIVE`.
+    fn materialize_due(&mut self, now: SystemTime) {
+        if self.transition_due.is_some_and(|due| now >= due) {
+            self.transition_due = None;
+            self.status_code = LOGGING_STATUS_ACTIVE.to_string();
+        }
+    }
 }
 
 /// Per-service state for com-amazonaws-amp-amazonprometheusservice. A handler reaches it through [`service_state`].
@@ -120,6 +183,9 @@ impl ComAmazonawsAmpAmazonprometheusserviceState {
     pub fn materialize_due(&mut self, now: SystemTime) {
         let mut deleted: Vec<String> = Vec::new();
         for workspace in self.workspaces.values_mut() {
+            if let Some(logging) = workspace.logging_configuration.as_mut() {
+                logging.materialize_due(now);
+            }
             let Some(due) = workspace.transition_due else {
                 continue;
             };
@@ -128,6 +194,7 @@ impl ComAmazonawsAmpAmazonprometheusserviceState {
             }
             workspace.transition_due = None;
             if workspace.status_code == STATUS_DELETING {
+                // Dropping the workspace drops its logging configuration with it.
                 deleted.push(workspace.workspace_id.clone());
             } else {
                 workspace.status_code = STATUS_ACTIVE.to_string();
@@ -251,6 +318,17 @@ pub fn reserved_tag_key<'a, I: IntoIterator<Item = &'a String>>(keys: I) -> Opti
         .map(String::as_str)
         .filter(|key| key.starts_with(RESERVED_TAG_KEY_PREFIX))
         .min()
+}
+
+/// The stored configuration's status, as the modelled `LoggingConfigurationStatus` the
+/// logging operations answer with — so every one of them reports it the same way.
+pub fn logging_configuration_status(
+    logging: &LoggingConfiguration,
+) -> crate::ops::types::LoggingConfigurationStatus {
+    crate::ops::types::LoggingConfigurationStatus {
+        status_code: logging.status_code.clone(),
+        status_reason: logging.status_reason.clone(),
+    }
 }
 
 /// The stored tags as the `TagMap` the wire shapes carry. Always a map, empty when

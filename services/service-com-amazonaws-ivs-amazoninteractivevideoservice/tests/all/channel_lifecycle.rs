@@ -678,42 +678,48 @@ async fn stream_keys_belong_to_the_channel_that_owns_them() {
     let first_arn = text(&first["channel"], "arn");
     let second_arn = ivs.create_arn(json!({ "name": "second" })).await;
 
-    // Rows differ in how many extra keys are added and whether they carry tags.
-    let cases: Vec<(&str, Vec<Value>)> = vec![
-        ("one extra key, untagged", vec![json!({})]),
+    // Rows differ in whether the channel was created with tags, so the key the create
+    // minted is checked under more than one shape of request. A channel's stream-key
+    // quota is one key (`MAX_STREAM_KEYS_PER_CHANNEL`), which `CreateChannel` has
+    // already filled, so a further key cannot be added to a channel at all.
+    let cases: Vec<(&str, Value)> = vec![
+        ("untagged channel", json!({ "name": "owner" })),
         (
-            "two extra keys, one tagged",
-            vec![json!({}), json!({ "tags": { "purpose": "backup" } })],
+            "channel created with tags",
+            json!({ "name": "ownerTagged", "tags": { "purpose": "backup" } }),
         ),
     ];
 
-    for (case, extras) in cases {
+    for (case, create) in cases {
         let ivs = Ivs::new();
-        let created = ivs.create(json!({ "name": "owner" })).await;
+        let created = ivs.create(create).await;
         let owner = text(&created["channel"], "arn");
-        let mut expected = BTreeSet::new();
         let minted = &created["streamKey"];
+        let mut expected = BTreeSet::new();
         expected.insert(text(minted, "arn"));
+        assert!(
+            arn_is_well_formed(&text(minted, "arn"), STREAM_KEY_ARN_PREFIX),
+            "case {case:?}: a minted stream-key arn must satisfy the modelled pattern, \
+             got {minted}"
+        );
+        assert_eq!(
+            text(minted, "channelArn"),
+            owner,
+            "case {case:?}: the minted key must name the channel it was created with"
+        );
 
-        for extra in &extras {
-            let mut request = extra.clone();
-            request["channelArn"] = json!(owner);
-            let key = ivs.ok("CreateStreamKey", request).await["streamKey"].clone();
-            assert!(
-                arn_is_well_formed(&text(&key, "arn"), STREAM_KEY_ARN_PREFIX),
-                "case {case:?}: a minted stream-key arn must satisfy the modelled pattern, \
-                 got {key}"
-            );
-            assert_eq!(
-                text(&key, "channelArn"),
-                owner,
-                "case {case:?}: a new key must name the channel it was created for"
-            );
-            assert!(
-                expected.insert(text(&key, "arn")),
-                "case {case:?}: two CreateStreamKey calls must not mint the same arn, got {key}"
-            );
-        }
+        let refused = ivs
+            .call("CreateStreamKey", &json!({ "channelArn": owner }))
+            .await;
+        assert_eq!(
+            (refused.status, refused.error_code.as_str()),
+            (402, "ServiceQuotaExceededException"),
+            "case {case:?}: a second key on a channel already at its quota must be \
+             refused, got {} {} {}",
+            refused.status,
+            refused.error_code,
+            refused.body
+        );
 
         let listed = ivs.ok("ListStreamKeys", json!({ "channelArn": owner })).await;
         let got: BTreeSet<String> = listed["streamKeys"]
@@ -724,8 +730,8 @@ async fn stream_keys_belong_to_the_channel_that_owns_them() {
             .collect();
         assert_eq!(
             got, expected,
-            "case {case:?}: ListStreamKeys must answer the key CreateChannel minted plus \
-             every key CreateStreamKey added, got {listed}"
+            "case {case:?}: ListStreamKeys must answer exactly the key CreateChannel \
+             minted, and the refused call must have added none, got {listed}"
         );
         for summary in listed["streamKeys"].as_array().expect("a list") {
             assert_eq!(
@@ -1013,49 +1019,50 @@ async fn a_create_past_its_cap_is_refused_rather_than_growing_the_store() {
         MAX_CHANNELS, MAX_STREAM_KEYS_PER_CHANNEL,
     };
 
-    // The stream-key cap, counted per channel: CreateChannel mints the first key,
-    // so the cap is reached after MAX_STREAM_KEYS_PER_CHANNEL - 1 more.
+    // The stream-key quota, counted per channel: CreateChannel mints the channel's one
+    // key, so the quota is already reached and the next CreateStreamKey on that channel
+    // is refused.
     let ivs = Ivs::new();
     let owner = ivs.create_arn(json!({ "name": "keyed" })).await;
     let other = ivs.create_arn(json!({ "name": "other" })).await;
-    for index in 1..MAX_STREAM_KEYS_PER_CHANNEL {
-        let reply = ivs
-            .call("CreateStreamKey", &json!({ "channelArn": owner }))
-            .await;
-        assert_eq!(
-            reply.status, 200,
-            "case key {index} of {MAX_STREAM_KEYS_PER_CHANNEL}: expected HTTP 200, got {} {}",
-            reply.status, reply.body
-        );
-    }
+    let created_keys = ivs
+        .ok("ListStreamKeys", json!({ "channelArn": owner, "maxResults": 50 }))
+        .await;
+    assert_eq!(
+        created_keys["streamKeys"].as_array().map(Vec::len),
+        Some(MAX_STREAM_KEYS_PER_CHANNEL),
+        "case a fresh channel: CreateChannel mints the channel's whole quota of keys, \
+         got {created_keys}"
+    );
     let reply = ivs
         .call("CreateStreamKey", &json!({ "channelArn": owner }))
         .await;
     assert_eq!(
         (reply.status, reply.error_code.as_str()),
         (402, "ServiceQuotaExceededException"),
-        "case one key past the cap: expected 402 ServiceQuotaExceededException, got {} {} {}",
+        "case one key past the quota: expected 402 ServiceQuotaExceededException, got {} {} {}",
         reply.status,
         reply.error_code,
         reply.body
     );
-    // The cap is per channel, so another channel is unaffected, and the refused
-    // call added nothing.
+    // The quota is per channel, so the refused call added nothing to this channel and
+    // left the other channel holding its own key.
     let listed = ivs
         .ok("ListStreamKeys", json!({ "channelArn": owner, "maxResults": 50 }))
         .await;
     assert_eq!(
         listed["streamKeys"].as_array().map(Vec::len),
-        Some(50),
-        "case at the cap: a page holds at most maxResults keys, got {listed}"
+        Some(MAX_STREAM_KEYS_PER_CHANNEL),
+        "case at the quota: the channel holds exactly its quota of keys, got {listed}"
     );
-    let reply = ivs
-        .call("CreateStreamKey", &json!({ "channelArn": other }))
+    let others = ivs
+        .ok("ListStreamKeys", json!({ "channelArn": other, "maxResults": 50 }))
         .await;
     assert_eq!(
-        reply.status, 200,
-        "case another channel at its own count: expected HTTP 200, got {} {}",
-        reply.status, reply.body
+        others["streamKeys"].as_array().map(Vec::len),
+        Some(MAX_STREAM_KEYS_PER_CHANNEL),
+        "case another channel: a refusal on one channel must not change another \
+         channel's keys, got {others}"
     );
 
     // The channel cap, on a store of its own.

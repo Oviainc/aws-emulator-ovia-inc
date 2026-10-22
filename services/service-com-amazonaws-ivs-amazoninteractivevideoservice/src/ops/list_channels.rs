@@ -163,10 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            ListChannelsErrorModeled::InternalServerException(InternalServerException {
-                exception_message: Some("the IVS store is unavailable".to_string()),
-                ..Default::default()
-            })
+            crate::state::store_unavailable(ListChannelsErrorModeled::InternalServerException)
         })?;
 
         // The resume point the caller's token names. A token this service did not
@@ -175,13 +172,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(token) => Some(
                 crate::state::decode_page_token(crate::state::CHANNEL_PAGE, token).ok_or_else(
                     || {
-                        ListChannelsErrorModeled::ValidationException(ValidationException {
-                            exception_message: Some(
-                                "nextToken is not a pagination token this service issued"
-                                    .to_string(),
-                            ),
-                            ..Default::default()
-                        })
+                        crate::state::validation(
+                            ListChannelsErrorModeled::ValidationException,
+                            UNISSUED_PAGE_TOKEN.to_string(),
+                        )
                     },
                 )?,
             ),
@@ -213,6 +207,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// (`MaxChannelResults`, `range(min: 1, max: 100)`), and so also the page size an
 /// absent `maxResults` means.
 const MAX_CHANNEL_RESULTS: i32 = 100;
+
+/// What this operation says about a `nextToken` it did not issue: a bad request, which
+/// is a different answer from a page that happens to be empty.
+const UNISSUED_PAGE_TOKEN: &str = "nextToken is not a pagination token this service issued";
 
 /// Whether a channel satisfies every `filterBy*` member the caller sent. Each
 /// filter is an exact match on the member it names, and an absent filter matches

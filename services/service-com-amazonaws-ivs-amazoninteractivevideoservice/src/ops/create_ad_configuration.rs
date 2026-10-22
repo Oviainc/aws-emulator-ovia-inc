@@ -166,14 +166,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `mediaTailorPlaybackConfigurations` (required, 1..3 items), `name` (the
         // `AdConfigurationName` pattern and length) and `postRollConfiguration`'s
-        // `durationSeconds` (1..300) are modelled constraints, so the framework's
-        // constraint walk has already refused anything outside them with a 400
-        // `ValidationException` before this handler runs.
+        // `durationSeconds` (1..300) are modelled constraints, so the request has
+        // already been refused with a 400 `ValidationException` before this handler
+        // runs if it broke one of them.
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            CreateAdConfigurationErrorModeled::InternalServerException(InternalServerException {
-                exception_message: Some("the IVS store is unavailable".to_string()),
-                ..Default::default()
-            })
+            crate::state::store_unavailable(
+                CreateAdConfigurationErrorModeled::InternalServerException,
+            )
         })?;
         let region = crate::state::request_region(ctx.parts());
 
@@ -182,18 +181,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service answers the quota error it models rather than growing without
         // bound. See `crate::state::MAX_AD_CONFIGURATIONS`.
         if store.ad_configurations.len() >= crate::state::MAX_AD_CONFIGURATIONS {
-            return Err(
-                CreateAdConfigurationErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException {
-                        exception_message: Some(format!(
-                            "the number of ad configurations would exceed the limit of {}",
-                            crate::state::MAX_AD_CONFIGURATIONS
-                        )),
-                        ..Default::default()
-                    },
-                )
-                .into(),
-            );
+            return Err(crate::state::quota_exceeded(
+                CreateAdConfigurationErrorModeled::ServiceQuotaExceededException,
+                crate::state::AD_CONFIGURATION_QUOTA_RESOURCE,
+                crate::state::MAX_AD_CONFIGURATIONS,
+            ));
         }
         let id = store.mint_hex("ad-configuration", 6);
         let arn = crate::state::ad_configuration_arn(&region, &id);

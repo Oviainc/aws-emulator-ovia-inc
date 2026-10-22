@@ -26,6 +26,10 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Hex codec for those ids and for the opaque `PaginationToken` this service issues.
 hex = { workspace = true }
+# The modelled `@pattern` this service enforces itself (the tagging `ResourceArn`, whose
+# modelled pattern no IVS ARN can satisfy) is run through the same regex engine the
+# framework's own constraint walk uses, at the minor version that walk pins.
+regex = "1.12"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

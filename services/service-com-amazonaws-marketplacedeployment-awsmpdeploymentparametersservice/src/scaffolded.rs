@@ -40,6 +40,14 @@
 //! place it can return an error its own model does not declare — `validation` above,
 //! for a service whose model carries no client-input error. Delete the wrapper and the
 //! handler has no way to refuse a bad request at all.
+//!
+//! ## The front door's refusal
+//!
+//! [`FrontDoorRefusal`] is NOT an operation error: it is what the AWS gateway in front
+//! of this service answers before the service runs, so it is answered pre-dispatch in
+//! `crate::service` rather than from a handler. It lives here because its wire facts
+//! (status, code, message) and the synthetic shape its body renders through belong
+//! beside the other shapes this service emits that the model does not declare.
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
@@ -255,6 +263,95 @@ impl std::error::Error for NotFound {}
 impl SerializableStruct for NotFound {
     fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
         s.write_string(&NOT_FOUND_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
+/// The `message` member of the synthetic front-door refusal shape.
+static FRONT_DOOR_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#FrontDoorRefusal$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic front-door refusal shape — the BODY of a refusal stated by
+/// the AWS front door that fronts this service, which never reaches the service at all.
+///
+/// In the `smithy.framework` namespace for the same reason as
+/// [`NOT_IMPLEMENTED_SCHEMA`]: `ForbiddenException` is NOT a shape this service's model
+/// declares (its modelled client-input errors are `ValidationException` and
+/// `AccessDeniedException`), so the shape must not collide with a modelled one. The
+/// schema only shapes the body (`{"message": …}`); the wire error code and the status
+/// travel beside it, on [`FrontDoorRefusal`].
+pub static FRONT_DOOR_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#FrontDoorRefusal",
+        "smithy.framework",
+        "FrontDoorRefusal",
+    ),
+    ShapeType::Structure,
+    &[&FRONT_DOOR_MESSAGE],
+);
+
+/// The wire error code of the front door's refusal of an oversized secret payload.
+pub const FORBIDDEN_CODE: &str = "ForbiddenException";
+
+/// The HTTP status of that refusal. 403, not the 400 a modelled input error carries:
+/// the front door refuses the request before the service sees it, so the answer is the
+/// gateway's own non-retryable refusal rather than a modelled `ValidationException`.
+pub const FORBIDDEN_STATUS: u16 = 403;
+
+/// The front door's own text for that refusal: ONE constant, carrying nothing from the
+/// request — a gateway that refuses a payload it will not forward names neither the
+/// member nor the bound (that is the SERVICE's `ValidationException`, which does), and
+/// an oversized `@sensitive` value must not be echoed back at all.
+pub const FORBIDDEN_TEXT: &str = "Forbidden";
+
+/// One refusal stated by the AWS front door — the gateway in front of this service,
+/// which judges the request envelope BEFORE the modelled constraint walk runs.
+///
+/// It carries its own wire code and status because the shape is not in the model.
+/// Today there is one such refusal: [`forbidden`](Self::forbidden), HTTP 403
+/// `ForbiddenException`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrontDoorRefusal {
+    /// The wire error code (`__type` and `x-amzn-errortype`).
+    pub code: &'static str,
+    /// The HTTP status.
+    pub status: u16,
+    /// The front door's constant message for this refusal.
+    pub message: &'static str,
+}
+
+impl FrontDoorRefusal {
+    /// The refusal of a request the front door will not forward: HTTP 403
+    /// `ForbiddenException`, message [`FORBIDDEN_TEXT`].
+    pub const fn forbidden() -> Self {
+        Self {
+            code: FORBIDDEN_CODE,
+            status: FORBIDDEN_STATUS,
+            message: FORBIDDEN_TEXT,
+        }
+    }
+}
+
+impl std::fmt::Display for FrontDoorRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for FrontDoorRefusal {}
+
+impl SerializableStruct for FrontDoorRefusal {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&FRONT_DOOR_MESSAGE, self.message)?;
         Ok(())
     }
 }

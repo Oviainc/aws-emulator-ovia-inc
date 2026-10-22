@@ -237,6 +237,88 @@ pub const FINDING_SCHEMA_VERSION: &str = "2.0";
 /// `arn:aws:...`).
 pub const PARTITION: &str = "aws";
 
+// ---------------------------------------------------------------------------
+// Client rejections
+//
+// GuardDuty classifies a rejection by the REQUEST, not by what the store holds:
+// a value that is not a well-formed id for its member is a parameter-validation
+// failure, a well-formed id this account/Region does not own is an ownership
+// failure, and neither message quotes the caller's value or the endpoint's
+// Region back at them. The messages are built here, once, so every operation
+// rejects the same input the same way.
+// ---------------------------------------------------------------------------
+
+/// The wire name of the `DetectorId` member, as the request carries it
+/// (`smithy_query(operation="GetDetector")` renders `DetectorId` with the
+/// `jsonName`/URI label `detectorId`). It is what a rejection names.
+pub const DETECTOR_ID_MEMBER: &str = "detectorId";
+
+/// The wire name of the `NextToken` member every paginated operation here carries
+/// (`smithy_query(operation="ListDetectors")`), for the same reason.
+pub const NEXT_TOKEN_MEMBER: &str = "nextToken";
+
+/// The length of a GuardDuty detector id: the 32 hexadecimal characters
+/// [`ComAmazonawsGuarddutyGuarddutyapiserviceState::mint_id`] mints, which is the
+/// form every id this service hands out has. The model's own constraint
+/// (`DetectorId`, len 1..300 — `smithy_query(shape="DetectorId")`) is far wider
+/// than the id format, which is why a syntactically impossible id reaches the
+/// handler at all instead of being refused at the boundary.
+pub const DETECTOR_ID_LEN: usize = 32;
+
+/// Is `id` a syntactically well-formed `DetectorId`?
+///
+/// Form only: a well-formed id need not exist. Case is not significant, so an id
+/// a caller upper-cased is still well formed — and is then refused as not owned,
+/// which is the ownership failure and not a parameter one.
+pub fn is_detector_id(id: &str) -> bool {
+    id.len() == DETECTOR_ID_LEN && id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The message for a member whose VALUE cannot be a value of that member at all.
+pub fn invalid_parameter_message(member: &str) -> String {
+    format!("The request is rejected because the parameter {member} has an invalid value.")
+}
+
+/// The message for a well-formed id that this account does not own — an id
+/// another account created, or one a delete removed. GuardDuty does not
+/// distinguish "never existed" from "belongs to someone else": both are the same
+/// refusal, which is also what keeps one account from probing another's ids.
+pub fn not_owned_message(member: &str) -> String {
+    format!(
+        "The request is rejected because the input {member} is not owned by the current account."
+    )
+}
+
+/// The message a second `CreateDetector` is refused with. "You can have only one
+/// detector per account per Region"
+/// (`smithy_query(query="doc",shape="CreateDetector")`); the Region is the one the
+/// request was signed for, so the rejection does not name it.
+pub const DETECTOR_ALREADY_EXISTS_MESSAGE: &str =
+    "The request is rejected because a detector already exists for the current account.";
+
+/// Classify a `DetectorId` the store does not resolve: a value that is not a
+/// detector id at all is a parameter failure, a well-formed one this
+/// account/Region does not hold is an ownership failure.
+pub fn detector_id_rejection(detector_id: &str) -> String {
+    if is_detector_id(detector_id) {
+        not_owned_message(DETECTOR_ID_MEMBER)
+    } else {
+        invalid_parameter_message(DETECTOR_ID_MEMBER)
+    }
+}
+
+/// The modelled server fault a handler answers when the engine it was built over
+/// holds no state for this service.
+///
+/// `Type` is "The error type" (`smithy_query(shape="InternalServerErrorException")`)
+/// — the error class, the same value the body's `__type` discriminator carries.
+pub fn state_unavailable() -> crate::ops::types::shared_types::InternalServerErrorException {
+    crate::ops::types::shared_types::InternalServerErrorException {
+        message: Some("the GuardDuty state store is unavailable".to_string()),
+        r#type: Some("InternalServerErrorException".to_string()),
+    }
+}
+
 /// A configured detector feature and when its status last changed.
 #[derive(Debug, Clone)]
 pub struct FeatureRecord {

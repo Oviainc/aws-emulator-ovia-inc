@@ -149,10 +149,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refuses with a 400 `ValidationException` before `handle` runs.
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            GetStreamKeyErrorModeled::InternalServerException(InternalServerException {
-                exception_message: Some("the IVS store is unavailable".to_string()),
-                ..Default::default()
-            })
+            crate::state::store_unavailable(GetStreamKeyErrorModeled::InternalServerException)
         })?;
         let stream_key = state
             .lock()
@@ -160,10 +157,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&input.arn)
             .cloned()
             .ok_or_else(|| {
-                GetStreamKeyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    exception_message: Some(format!("stream key {} does not exist", input.arn)),
-                    ..Default::default()
-                })
+                crate::state::resource_not_found(
+                    GetStreamKeyErrorModeled::ResourceNotFoundException,
+                    &input.arn,
+                )
             })?;
 
         Ok(GetStreamKeyOutput {

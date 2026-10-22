@@ -56,21 +56,31 @@ async fn a_persisted_stream_key_is_read_back_member_for_member() {
             "an extra key with an empty tag map",
             json!({ "tags": {} }),
         ),
+        ("an extra key on a channel of another type", json!({})),
     ] {
+        // A channel's stream-key quota is one key, which `CreateChannel` has already
+        // filled, so a key from `CreateStreamKey` needs the slot freed first — the
+        // delete-then-create a client rotates a key with. Each row gets its own
+        // channel, so the keys the rows before it minted stay readable.
+        let channel = ivs.create(json!({ "name": "extraKeyOwner" })).await;
+        let channel_arn = text(&channel["channel"], "arn");
+        let freed = ivs
+            .call(
+                "DeleteStreamKey",
+                &json!({ "arn": text(&channel["streamKey"], "arn") }),
+            )
+            .await;
+        assert_eq!(
+            freed.status, 204,
+            "case {label:?}: deleting the channel's key must free its quota slot, got \
+             {} {}",
+            freed.status, freed.body
+        );
         let mut body = request.clone();
-        body["channelArn"] = json!(first_arn);
+        body["channelArn"] = json!(channel_arn);
         let created = ivs.ok("CreateStreamKey", body).await;
         cases.push((label.to_string(), created["streamKey"].clone()));
     }
-    // One more on the other channel, so the read is not only exercised against the
-    // channel that owns most of the keys.
-    let on_second = ivs
-        .ok("CreateStreamKey", json!({ "channelArn": second_arn }))
-        .await;
-    cases.push((
-        "an extra key on the second channel".to_string(),
-        on_second["streamKey"].clone(),
-    ));
 
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for (case, minted) in &cases {

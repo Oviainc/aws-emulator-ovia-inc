@@ -257,6 +257,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             kms_key_arn: input.kms_key_arn,
             transition_due: Some(now + crate::state::TRANSITION_DELAY),
             delete_token: None,
+            // A new workspace has no logging configuration until
+            // `CreateLoggingConfiguration` gives it one.
+            logging_configuration: None,
             workspace_id: workspace_id.clone(),
         };
 

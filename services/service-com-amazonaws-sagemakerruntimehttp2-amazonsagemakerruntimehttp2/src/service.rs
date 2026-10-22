@@ -99,12 +99,23 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // operation binds (the `/endpoints/…` space), which is what `claims_request`
         // matches against the generated `ROUTE_PATH_SEGMENTS` when a service declares no
         // RPC protocol.
+        //
+        // That path space is the ONE in the family that is not disjoint: the SageMaker
+        // Runtime endpoint signs as `sagemaker` too, publishes the SAME
+        // `runtime.sagemaker` endpointPrefix, and binds its three operations under the
+        // same `/endpoints/{EndpointName}/` prefix, so the first segment leaves the two
+        // of them claiming each other's traffic. The segment their modelled URIs differ
+        // at is the third, and `service_common::addresses_runtime_bidirectional_stream`
+        // states that split once for both sides: this service claims only the ONE
+        // invocation its model binds (`…/invocations-bidirectional-stream`), and the
+        // sibling claims the complement, so a path in the space they share always has
+        // exactly one claimant.
         service_common::claims_request(
             parts,
             self.entry.identity().signing_name(),
             crate::ROUTE_PATH_SEGMENTS,
             None,
-        )
+        ) && service_common::addresses_runtime_bidirectional_stream(parts.uri.path())
     }
 
     fn override_operation(
