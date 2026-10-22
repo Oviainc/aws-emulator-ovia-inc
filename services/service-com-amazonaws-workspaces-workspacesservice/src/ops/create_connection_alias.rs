@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConnectionAlias
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConnectionAlias`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConnectionAlias::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: the connection string is persisted in this service's state under a
+//! freshly minted `AliasId`, which is what the response reports. The alias enters
+//! `CREATING` and the clock settles it to `CREATED`; a connection string a stored alias
+//! already holds is refused with `ResourceAlreadyExistsException`.
 //!
 //! ## Shape of an operation
 //!
@@ -92,7 +88,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-workspaces-workspacesse
 // here — hence the `CreateConnectionAliasError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.workspaces#CreateConnectionAlias")]
+// `InternalServerException` is widened in with `extra_errors`: the service models it
+// ("Unexpected server error occured.") but does not list it on this operation, and it
+// is the only shape that can carry the one fault this handler can hit — the engine not
+// being the in-memory engine this service's store lives in.
+#[smithy_macros::operation_error(
+    "com.amazonaws.workspaces#CreateConnectionAlias",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum CreateConnectionAliasErrorModeled {
     AccessDeniedException(AccessDeniedException),
@@ -101,6 +104,7 @@ pub enum CreateConnectionAliasErrorModeled {
     OperationNotSupportedException(OperationNotSupportedException),
     ResourceAlreadyExistsException(ResourceAlreadyExistsException),
     ResourceLimitExceededException(ResourceLimitExceededException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -154,18 +158,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConnectionAlias` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConnectionAliasErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConnectionAlias"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateConnectionAliasErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the WorkSpaces state store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+        // Clear any transition the clock already owes before judging whether the
+        // connection string is still held: an alias whose deletion has completed
+        // holds nothing.
+        state.settle();
+
+        let created =
+            state.create_connection_alias(&input.connection_string, input.tags.unwrap_or_default());
+        match created {
+            Ok(record) => Ok(CreateConnectionAliasOutput {
+                alias_id: Some(record.alias_id),
+            }),
+            Err(crate::state::ConnectionAliasCreateError::AlreadyExists { alias_id }) => Err(
+                CreateConnectionAliasErrorModeled::ResourceAlreadyExistsException(
+                    ResourceAlreadyExistsException {
+                        message: Some(format!(
+                            "The connection string {} is already used by connection alias {alias_id}.",
+                            input.connection_string
+                        )),
+                    },
+                )
+                .into(),
+            ),
+            Err(crate::state::ConnectionAliasCreateError::LimitExceeded) => Err(
+                CreateConnectionAliasErrorModeled::ResourceLimitExceededException(
+                    ResourceLimitExceededException {
+                        message: Some(format!(
+                            "Your resource limits have been exceeded: at most {} connection aliases can exist.",
+                            crate::state::MAX_STORED_CONNECTION_ALIASES
+                        )),
+                    },
+                )
+                .into(),
+            ),
+        }
     }
 }
