@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAccountSetting
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAccountSetting`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAccountSetting::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one of this registry's account settings, as
+//! `state::...State::account_settings` holds it — or its documented default while no
+//! `PutAccountSetting` has changed it. A read, so it writes nothing. A name this
+//! registry does not serve is refused with the modelled `InvalidParameterException`.
 //!
 //! ## Shape of an operation
 //!
@@ -107,6 +102,14 @@ impl From<GetAccountSettingErrorModeled> for GetAccountSettingError {
     }
 }
 
+/// A setting name this registry does not serve: `InvalidParameterException` — "The
+/// specified parameter is invalid. Review the available parameters for the API request."
+fn invalid_parameter(fault: crate::state::Fault) -> GetAccountSettingErrorModeled {
+    GetAccountSettingErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(fault.message().to_string()),
+    })
+}
+
 /// The `GetAccountSetting` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -141,20 +144,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAccountSetting` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAccountSettingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAccountSetting"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetAccountSettingErrorModeled::ServerException(ServerException {
+                message: Some("the ecr account setting store is unavailable".to_string()),
+            })
+            .into());
+        };
+
+        // "Retrieves the account setting value for the specified setting name" — a
+        // report, so nothing is written here: a setting nobody has set reports its
+        // documented default and stays unset, which is what the next caller sees too.
+        let value = state
+            .lock()
+            .account_setting(&input.name)
+            .map_err(invalid_parameter)?;
+
+        Ok(GetAccountSettingOutput {
+            name: Some(input.name),
+            value: Some(value),
+        })
     }
 }

@@ -171,20 +171,26 @@ async fn each_service_sharing_a_signing_name_serves_its_own_path_space() {
         ),
         (
             // IAM owns `POST /` (awsQuery names the operation in the `Action` field).
-            // CreateRole is still scaffolded, so IAM answers 501 NotImplemented — in its
-            // own XML envelope, which is the point: the ambiguity refusal was JSON that
-            // an awsQuery client reports as a parse failure, with no error code at all.
+            // `CreateRole` is implemented, so IAM answers its own 200 for a fresh role
+            // name — in its own XML envelope, which is the point: the ambiguity refusal
+            // was JSON that an awsQuery client reports as a parse failure, with no error
+            // code at all. IAM Toolbox could not produce this answer: it claims only
+            // `/authorization-details/…`, and neither routing failure (404
+            // `UnknownService`, 500 `AmbiguousService`) is a 200 either.
             "iam CreateRole",
             Call {
                 signing_name: "iam",
                 method: "POST",
                 uri: "https://emulator.local/",
                 headers: &[("content-type", "application/x-www-form-urlencoded")],
+                // The trust policy, form-encoded:
+                // `{"Statement":[{"Effect":"Allow"}]}`.
                 body: "Action=CreateRole&Version=2010-05-08&RoleName=routing-check-role\
-                       &AssumeRolePolicyDocument=%7B%22Version%22%3A%222012-10-17%22%7D",
+                       &AssumeRolePolicyDocument=%7B%22Statement%22%3A%5B%7B%22Effect%22\
+                       %3A%22Allow%22%7D%5D%7D",
             },
-            501,
-            Some("NotImplemented"),
+            200,
+            None,
         ),
         (
             // IAM Toolbox owns `/authorization-details/…`, and its one operation IS
