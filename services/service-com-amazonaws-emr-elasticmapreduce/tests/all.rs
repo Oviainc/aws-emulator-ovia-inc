@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/job_flow_lifecycle.rs"]
 mod job_flow_lifecycle;
+#[path = "all/release_label_catalog.rs"]
+mod release_label_catalog;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
