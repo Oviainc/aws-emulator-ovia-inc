@@ -10,94 +10,16 @@
 //! class, batch size and ordering, time window, page size, ordering key, identifier
 //! form); the values any one issue happens to mention are single rows.
 
-use std::sync::Arc;
-
 use serde_json::{json, Value};
+
+use crate::harness::{Logs, REGION};
 
 /// A log group class the model declares. Source: the `LogGroupClass` enum, surfaced in
 /// the crate as `LOG_GROUP_CLASS_VALUES` ("DELIVERY", "INFREQUENT_ACCESS", "STANDARD").
 const LOG_GROUP_CLASSES: &[&str] = &["STANDARD", "INFREQUENT_ACCESS", "DELIVERY"];
 
-/// The region the test's SigV4 credential scope names, so an ARN built from the request
-/// is distinguishable from one built from a hardcoded default.
-const REGION: &str = "eu-west-2";
-
 /// The account id every emulated ARN carries.
 const ACCOUNT: &str = "000000000000";
-
-/// One service mounted on one shared engine, reached over the wire.
-struct Logs {
-    router: smithy_server_runtime::MultiServiceRouter,
-}
-
-impl Logs {
-    fn new() -> Self {
-        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-        let mut router = smithy_server_runtime::MultiServiceRouter::new();
-        router.set_request_authentication(false);
-        router.register_service(
-            service_com_amazonaws_cloudwatchlogs_logs_20140328::EmulatedService::new(engine),
-        );
-        Self { router }
-    }
-
-    /// Call one operation, returning its HTTP status and parsed JSON body.
-    async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
-        let request = http::Request::builder()
-            .method("POST")
-            .uri("/")
-            .header("content-type", "application/x-amz-json-1.1")
-            .header("x-amz-target", format!("Logs_20140328.{operation}"))
-            .header(
-                "authorization",
-                format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/logs/aws4_request, \
-                     SignedHeaders=host;x-amz-target, Signature=0123456789abcdef"
-                ),
-            )
-            .body(bytes::Bytes::from(
-                serde_json::to_vec(body).expect("the request body serializes"),
-            ))
-            .expect("a valid request");
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let parsed = if response.body().is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-        };
-        (status, parsed)
-    }
-
-    /// Call one operation that must succeed, returning its response body.
-    async fn ok(&self, operation: &str, body: &Value) -> Value {
-        let (status, parsed) = self.call(operation, body).await;
-        assert_eq!(
-            status, 200,
-            "{operation} {body}: expected HTTP 200, got {status} {parsed}"
-        );
-        parsed
-    }
-
-    /// Call one operation that must fail, returning its wire error code.
-    async fn err(&self, operation: &str, body: &Value) -> String {
-        let (status, parsed) = self.call(operation, body).await;
-        assert_eq!(
-            status, 400,
-            "{operation} {body}: expected HTTP 400, got {status} {parsed}"
-        );
-        error_code(&parsed)
-    }
-}
-
-/// The wire error code of an awsJson error body (`__type`, which may carry a namespace).
-fn error_code(body: &Value) -> String {
-    let raw = body
-        .get("__type")
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("an error body must carry __type, got {body}"));
-    raw.rsplit(['#', '/']).next().unwrap_or(raw).to_string()
-}
 
 /// The `message` values of a `GetLogEvents` page, in the order returned.
 fn messages(page: &Value) -> Vec<String> {
