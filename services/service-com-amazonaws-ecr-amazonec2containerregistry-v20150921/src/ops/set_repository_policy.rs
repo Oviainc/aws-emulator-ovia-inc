@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetRepositoryPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetRepositoryPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetRepositoryPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies a repository policy to one repository of this emulator's registry: the
+//! document is validated as a resource-based IAM policy by the crate's shared
+//! [`crate::state::validate_resource_policy`] — the same grammar `PutRegistryPolicy`
+//! uses — and then persisted on the repository's record in [`crate::state`], where
+//! `GetRepositoryPolicy` reads it back and `DeleteRepositoryPolicy` removes it. Unlike a
+//! REGISTRY policy, a repository policy may grant to every principal (that is how a
+//! repository is shared publicly), so this operation adds no principal rule of its own;
+//! what it does add is the lock-out rule the `force` flag exists for.
 //!
 //! ## Shape of an operation
 //!
@@ -125,6 +124,71 @@ impl From<SetRepositoryPolicyErrorModeled> for SetRepositoryPolicyError {
     }
 }
 
+/// The action a repository policy has to leave grantable for another policy to be
+/// settable later, lowercased for a case-insensitive comparison against the policy's
+/// own `Action` patterns.
+const SET_POLICY_ACTION: &str = "ecr:setrepositorypolicy";
+
+/// The `Effect` that takes a permission away: the one of
+/// [`crate::state::POLICY_EFFECTS`] a lock-out is written with.
+const DENY_EFFECT: &str = "Deny";
+
+/// The `Principal` wildcard: a statement naming it applies to every principal.
+const EVERY_PRINCIPAL: &str = "*";
+
+/// Map a shared-state failure onto this operation's own modelled errors.
+fn fault_error(fault: crate::state::Fault) -> SetRepositoryPolicyErrorModeled {
+    let message = Some(fault.message().to_string());
+    match fault {
+        crate::state::Fault::RepositoryNotFound(_) => {
+            SetRepositoryPolicyErrorModeled::RepositoryNotFoundException(
+                RepositoryNotFoundException { message },
+            )
+        }
+        // `ImageNotFound` cannot arise here: this operation resolves no image.
+        _ => SetRepositoryPolicyErrorModeled::InvalidParameterException(
+            InvalidParameterException { message },
+        ),
+    }
+}
+
+/// Whether `statement` denies `ecr:SetRepositoryPolicy` to every principal, which is
+/// what makes a policy one that "would prevent you from setting another policy in the
+/// future".
+///
+/// Only a `Deny` aimed at the wildcard principal counts: a deny scoped to some other
+/// principal still leaves the policy settable. `Action` names the actions a statement
+/// applies to and `NotAction` the ones it does NOT, so a deny whose `NotAction` leaves
+/// this action out denies it just as an `Action` naming it does. The patterns are
+/// matched with the crate's own `*` glob, so `ecr:*`, `ecr:Set*` and `*` all cover the
+/// action.
+///
+/// Called from [`crate::state::validate_resource_policy`]'s per-statement callback, so
+/// the grammar it enforces already holds here: a string `Effect` of `Allow` or `Deny`,
+/// at least one `Action` or `NotAction`, and a `Principal`.
+fn denies_setting_policy(statement: &::serde_json::Map<String, ::serde_json::Value>) -> bool {
+    let denies =
+        statement.get("Effect").and_then(::serde_json::Value::as_str) == Some(DENY_EFFECT);
+    if !denies {
+        return false;
+    }
+    let covers_action = |key: &str| {
+        statement.get(key).is_some_and(|element| {
+            crate::state::policy_values(element).iter().any(|pattern| {
+                crate::state::wildcard_matches(&pattern.to_lowercase(), SET_POLICY_ACTION)
+            })
+        })
+    };
+    let denies_action = covers_action("Action")
+        || (statement.contains_key("NotAction") && !covers_action("NotAction"));
+    if !denies_action {
+        return false;
+    }
+    statement
+        .get("Principal")
+        .is_some_and(|principal| crate::state::policy_values(principal).contains(&EVERY_PRINCIPAL))
+}
+
 /// The `SetRepositoryPolicy` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -161,18 +225,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetRepositoryPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetRepositoryPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetRepositoryPolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(SetRepositoryPolicyErrorModeled::ServerException(ServerException {
+                message: Some("the ecr repository store is unavailable".to_string()),
+            })
+            .into());
+        };
+        let _ = ctx;
+
+        // `registryId` names the registry holding the repository; this emulator serves
+        // exactly one registry — its own account's.
+        crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
+
+        let mut store = state.lock();
+        // The repository the policy is for is resolved FIRST: a policy for a repository
+        // that does not exist is reported as the missing repository, whatever else is
+        // wrong with the document.
+        store
+            .repository(&input.repository_name)
+            .map_err(fault_error)?;
+
+        crate::state::validate_resource_policy("policyText", &input.policy_text, |statement| {
+            // "If the policy you are attempting to set on a repository policy would
+            // prevent you from setting another policy in the future, you must force
+            // the SetRepositoryPolicy operation. This is intended to prevent
+            // accidental repository lock outs."
+            if input.force || !denies_setting_policy(statement) {
+                return Ok(());
+            }
+            Err(crate::state::Fault::InvalidParameter(format!(
+                "the policy denies 'ecr:SetRepositoryPolicy' to every principal, which \
+                 would prevent another policy from being set on repository '{}'; set \
+                 force to true to apply it anyway",
+                input.repository_name
+            )))
+        })
+        .map_err(fault_error)?;
+
+        let repo = store
+            .repository_mut(&input.repository_name)
+            .map_err(fault_error)?;
+        // The policy replaces whatever the repository carried: one repository holds one
+        // policy, and it is stored exactly as the caller wrote it so a later read
+        // reports the same document.
+        repo.policy_text = Some(input.policy_text);
+
+        Ok(SetRepositoryPolicyOutput {
+            registry_id: Some(repo.registry_id.clone()),
+            repository_name: Some(repo.name.clone()),
+            policy_text: repo.policy_text.clone(),
+        })
     }
 }

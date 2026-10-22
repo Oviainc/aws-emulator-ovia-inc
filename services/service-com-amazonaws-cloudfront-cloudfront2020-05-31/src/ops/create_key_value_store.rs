@@ -162,6 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::state::store_unavailable());
         };
+        let _ = ctx;
 
         // "You can also import key value store data in JSON format from an S3 bucket by
         // providing a valid ImportSource that you own." Importing means reading the S3
@@ -231,10 +232,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags,
         };
         let key_value_store = stored.to_key_value_store();
-        let location = crate::state::location_uri(
-            ctx.parts(),
-            &crate::state::key_value_store_path(&stored.name),
-        );
+        let location =
+            crate::state::location_uri(&crate::state::key_value_store_path(&stored.name));
         store.key_value_stores.insert(input.name, stored);
 
         Ok(CreateKeyValueStoreOutput {

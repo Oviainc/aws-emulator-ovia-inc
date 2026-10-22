@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBlueprints
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListBlueprints`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListBlueprints::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -139,6 +130,12 @@ impl<Eng> ListBlueprints<Eng> {
     }
 }
 
+/// `resourceOwner` values, from `smithy_query(shape="ResourceOwner")`.
+const RESOURCE_OWNER_ACCOUNT: &str = "ACCOUNT";
+
+/// `blueprintStageFilter`'s wildcard, from `smithy_query(shape="BlueprintStageFilter")`.
+const STAGE_FILTER_ALL: &str = "ALL";
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListBlueprints<Eng>
 {
@@ -156,18 +153,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListBlueprints` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListBlueprintsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListBlueprintsError::Modeled(ListBlueprintsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Bedrock Data Automation store is unavailable".to_string()),
+                },
+            ))
+        })?;
+        // A read: it only projects what is already stored.
+        let store = state.lock();
+
+        // `projectFilter` narrows the listing to the blueprints a Data Automation
+        // project references. No project can exist yet (the project operations are
+        // still scaffolded), so any project ARN named here is one that does not
+        // exist — the modeled 404, never a silently unfiltered page.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListBlueprints"))
+        // TODO(data-automation-project slice): when CreateDataAutomationProject
+        // and friends are implemented, replace this unconditional refusal with a
+        // real lookup: refuse only a project ARN the store does not hold, and
+        // otherwise narrow the page to the blueprints that project references.
+        if let Some(filter) = input.project_filter.as_ref() {
+            return Err(ListBlueprintsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "data automation project {} does not exist",
+                        filter.project_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::PageCursor::from_token(token).ok_or_else(|| {
+                ListBlueprintsError::Modeled(ListBlueprintsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some("nextToken is not a token this service issued".to_string()),
+                        field_list: Some(vec![ValidationExceptionField {
+                            name: "nextToken".to_string(),
+                            message: "must be a nextToken returned by a previous ListBlueprints call"
+                                .to_string(),
+                        }]),
+                    },
+                ))
+            })?),
+        };
+
+        // `resourceOwner` selects whose blueprints to list and defaults to the
+        // caller's own account. Every blueprint this emulator stores was created
+        // through CreateBlueprint, so it is ACCOUNT-owned; SERVICE names the
+        // AWS-managed catalog, of which none is stored.
+        //
+        // TODO(public-blueprint-catalog slice): when the AWS-managed
+        // `bedrock-data-automation-public-*` blueprints are seeded, this must
+        // become a per-record owner predicate instead of a whole-list
+        // short-circuit.
+        let owner = input
+            .resource_owner
+            .as_deref()
+            .unwrap_or(RESOURCE_OWNER_ACCOUNT);
+        let stage_filter = input.blueprint_stage_filter.as_deref();
+
+        let matching: Vec<&crate::state::BlueprintRecord> = if owner == RESOURCE_OWNER_ACCOUNT {
+            store
+                .blueprints_in_order()
+                .into_iter()
+                .filter(|record| {
+                    input
+                        .blueprint_arn
+                        .as_deref()
+                        .is_none_or(|arn| arn == record.blueprint_arn)
+                })
+                .filter(|record| {
+                    stage_filter.is_none_or(|stage| {
+                        stage == STAGE_FILTER_ALL || stage == record.blueprint_stage
+                    })
+                })
+                .filter(|record| cursor.as_ref().is_none_or(|c| c.precedes(record)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // `maxResults` caps the page; absent, the server's own page limit does,
+        // so a listing never serialises more than one modeled-maximum page.
+        // The modeled range is 1..1000, so a value reaching this handler is in
+        // range; clamping to 1 at the bottom keeps a page honest (never a
+        // plausible-looking empty page) if that ever changes.
+        let limit = input
+            .max_results
+            .unwrap_or(crate::state::BLUEPRINT_PAGE_LIMIT)
+            .clamp(1, crate::state::BLUEPRINT_PAGE_LIMIT) as usize;
+        let page = &matching[..limit.min(matching.len())];
+
+        // A token is handed back only when something is left AFTER this page, so
+        // the last page of a listing never carries one.
+        let next_token = page
+            .last()
+            .filter(|_| matching.len() > page.len())
+            .map(|record| crate::state::PageCursor::after(record).to_token());
+
+        Ok(ListBlueprintsOutput {
+            blueprints: page.iter().map(|record| record.to_summary()).collect(),
+            next_token,
+        })
     }
 }

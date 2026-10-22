@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCentralizationRuleForOrganization
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCentralizationRuleForOrganization`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCentralizationRuleForOrganization::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores one organization centralization rule in [`crate::state`], keyed by the
+//! region the request was signed for and the rule's name, and answers the ARN it
+//! minted for it. The rule starts out `Provisioning` and comes due `Healthy`.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +156,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCentralizationRuleForOrganization` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCentralizationRuleForOrganizationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCentralizationRuleForOrganization"))
+        // `RuleName`'s 1..100 length and `^[0-9A-Za-z-_.#/]+$` pattern, `Rule`'s
+        // presence and its required `Source.Regions` / `Destination.Region`, and the
+        // `Tags` map's 1..50 length are modelled, so the centralized walk has already
+        // refused anything outside them with a 400 `ValidationException` before this
+        // body runs. What is left — the enum value sets and the regions a rule may
+        // name, which the model does not carry — is in `centralization_rule_rejection`.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateCentralizationRuleForOrganizationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the centralization rule store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+
+        if let Some(why) = crate::state::centralization_rule_rejection(&input.rule, &region) {
+            return Err(
+                CreateCentralizationRuleForOrganizationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(why),
+                        ..Default::default()
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let created_at = crate::state::now_epoch_millis();
+
+        let mut store = state.lock();
+
+        // A rule name identifies the rule within the region it was created in, so a
+        // second create cannot take a name already in use there.
+        if store.centralization_name_taken(&region, &input.rule_name) {
+            return Err(
+                CreateCentralizationRuleForOrganizationErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(format!(
+                            "a centralization rule named '{}' already exists in {region}",
+                            input.rule_name
+                        )),
+                        resource_id: Some(input.rule_name.clone()),
+                        resource_type: Some("centralization-rule".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The store is finite: a create that would take it past the cap is refused
+        // BEFORE a record is allocated.
+        if store.centralization_rule_count() >= crate::state::MAX_CENTRALIZATION_RULES {
+            return Err(
+                CreateCentralizationRuleForOrganizationErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "this organization already holds the maximum of {} centralization \
+                             rules",
+                            crate::state::MAX_CENTRALIZATION_RULES
+                        )),
+                        resource_type: Some("centralization-rule".to_string()),
+                        service_code: Some(crate::state::ARN_SERVICE.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let rule_arn = crate::state::centralization_rule_arn(&region, &input.rule_name);
+        store.insert_centralization_rule(crate::state::StoredCentralizationRule {
+            rule_name: input.rule_name,
+            created_region: region,
+            rule_arn: rule_arn.clone(),
+            rule: ::std::sync::Arc::new(input.rule),
+            creator_account_id: ::engine::emulator_account_id().to_string(),
+            created_timestamp_ms: created_at,
+            last_update_timestamp_ms: created_at,
+            provisioned_at_ms: created_at
+                .saturating_add(crate::state::CENTRALIZATION_PROVISIONING_DELAY_MS),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+        });
+
+        Ok(CreateCentralizationRuleForOrganizationOutput {
+            rule_arn: Some(rule_arn),
+        })
     }
 }

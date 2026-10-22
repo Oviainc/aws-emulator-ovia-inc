@@ -19,6 +19,7 @@ pub mod batch_get_service_level_objective_budget_report_types;
 pub mod batch_update_exclusion_windows_types;
 pub mod create_instrumentation_configuration_types;
 pub mod create_service_level_objective_types;
+pub mod delete_grouping_configuration_types;
 pub mod delete_instrumentation_configuration_types;
 pub mod delete_service_level_objective_types;
 pub mod get_instrumentation_configuration_status_types;
@@ -55,6 +56,8 @@ pub use batch_update_exclusion_windows_types::*;
 pub use create_instrumentation_configuration_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use create_service_level_objective_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use delete_grouping_configuration_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use delete_instrumentation_configuration_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

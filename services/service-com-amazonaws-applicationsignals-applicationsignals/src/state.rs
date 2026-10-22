@@ -15,12 +15,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
 
 use crate::ops::types::{
-    DependencyConfig, Goal, Interval, MetricDataQuery, MetricSource,
-    MonitoredRequestCountMetricDataQueries, RequestBasedServiceLevelIndicator,
-    RequestBasedServiceLevelIndicatorConfig, RequestBasedServiceLevelIndicatorMetric,
-    ResourceNotFoundException, RollingInterval, ServiceLevelIndicator,
-    ServiceLevelIndicatorConfig, ServiceLevelIndicatorMetric, ServiceLevelObjective,
-    ServiceLevelObjectiveSummary,
+    DependencyConfig, Goal, GroupingAttributeDefinition, GroupingConfiguration, Interval,
+    MetricDataQuery, MetricSource, MonitoredRequestCountMetricDataQueries,
+    RequestBasedServiceLevelIndicator, RequestBasedServiceLevelIndicatorConfig,
+    RequestBasedServiceLevelIndicatorMetric, ResourceNotFoundException, RollingInterval,
+    ServiceLevelIndicator, ServiceLevelIndicatorConfig, ServiceLevelIndicatorMetric,
+    ServiceLevelObjective, ServiceLevelObjectiveSummary,
 };
 
 /// This service's SigV4 signing name, which is also its ARN namespace
@@ -109,6 +109,15 @@ pub struct ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// by (`TagResource`/`ListTagsForResource` take a `ResourceArn`). One entry per
     /// accepted create, so [`MAX_SLOS`] bounds this map too.
     pub tags: BTreeMap<String, BTreeMap<String, String>>,
+    /// This account's grouping configuration, or `None` while none is configured.
+    ///
+    /// At most ONE configuration exists: `PutGroupingConfiguration` "creates or updates the
+    /// grouping configuration for this account", so a second put REPLACES the first rather
+    /// than adding a record, and `DeleteGroupingConfiguration` "deletes the grouping
+    /// configuration for this account", which returns the store to `None`. The single slot
+    /// is also why this is an `Option` rather than a map: like `slos`, this store is one
+    /// account's and one Region's.
+    pub grouping_configuration: Option<GroupingConfiguration>,
 }
 
 impl ComAmazonawsApplicationsignalsApplicationsignalsState {
@@ -131,6 +140,32 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
             self.tags.remove(&slo.arn);
         }
         removed
+    }
+
+    /// Replace this account's grouping configuration with `definitions`, stamping
+    /// `updated_at` as the moment it was last written, and hand back the record that was
+    /// stored. The stored record — never the request — is what the writer answers with and
+    /// what a later read reports, so the two can never disagree.
+    pub fn put_grouping_configuration(
+        &mut self,
+        definitions: Vec<GroupingAttributeDefinition>,
+        updated_at: ::aws_smithy_types::DateTime,
+    ) -> GroupingConfiguration {
+        let configuration = GroupingConfiguration {
+            grouping_attribute_definitions: definitions,
+            updated_at,
+        };
+        self.grouping_configuration = Some(configuration.clone());
+        configuration
+    }
+
+    /// Remove this account's grouping configuration, answering whether one was configured.
+    ///
+    /// Idempotent: clearing an account that has no configuration leaves the store `None`
+    /// and is not an error, which is what the operation's `@idempotent` trait and its empty
+    /// modelled error set (no not-found error) require.
+    pub fn clear_grouping_configuration(&mut self) -> bool {
+        self.grouping_configuration.take().is_some()
     }
 
     /// Whether another SLO would put this service over its [`MAX_SLOS`] quota.

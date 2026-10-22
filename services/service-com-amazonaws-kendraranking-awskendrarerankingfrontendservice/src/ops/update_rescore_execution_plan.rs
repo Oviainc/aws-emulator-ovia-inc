@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRescoreExecutionPlan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRescoreExecutionPlan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRescoreExecutionPlan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the members the request carries on a stored rescore execution plan — an
+//! absent member keeps its stored value — stamps `UpdatedAt`, and puts the plan through
+//! a transient `UPDATING` status before the clock owes it `ACTIVE` again, which
+//! `DescribeRescoreExecutionPlan` and `ListRescoreExecutionPlans` read back. A plan
+//! that is not `ACTIVE` when the call arrives is refused with the modelled
+//! `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -190,18 +188,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRescoreExecutionPlan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRescoreExecutionPlanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRescoreExecutionPlan"))
+        // Every modelled constraint on the input (`Id`'s 36 characters and pattern,
+        // `Name`'s length and pattern, `Description`'s, and
+        // `CapacityUnits.RescoreCapacityUnits >= 0`) is already refused with a 400
+        // `ValidationException` before this handler runs.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateRescoreExecutionPlanErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the rescore execution plan store is unavailable on this engine"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = crate::state::now_millis();
+        let mut store = state.lock();
+        let Some(plan) = store.plans.get_mut(&input.id) else {
+            return Err(
+                UpdateRescoreExecutionPlanErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Rescore execution plan {} was not found.",
+                            input.id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A transition the clock already owes is materialised first, so this call
+        // decides against the status a reader sees now rather than a stale one.
+        plan.settle_status(now);
+        // A plan the service is still provisioning cannot take another change: that is
+        // the modelled `ConflictException` ("A conflict occurred with the request").
+        if plan.status != crate::state::STATUS_ACTIVE {
+            return Err(
+                UpdateRescoreExecutionPlanErrorModeled::ConflictException(ConflictException {
+                    message: Some(format!(
+                        "Rescore execution plan {} is {} and can only be updated while it is {}.",
+                        plan.id,
+                        plan.status,
+                        crate::state::STATUS_ACTIVE
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // Only the members the request carries are replaced; an absent member leaves the
+        // stored value as it was, which is what makes a `Name`-only update keep the
+        // plan's description and capacity.
+        if let Some(name) = input.name {
+            plan.name = name;
+        }
+        if let Some(description) = input.description {
+            plan.description = Some(description);
+        }
+        if let Some(capacity_units) = input.capacity_units {
+            plan.capacity_units = Some(capacity_units);
+        }
+        plan.updated_at_millis = now;
+        // The plan is re-provisioned after this call returns: it leaves `ACTIVE` for
+        // `UPDATING` and the clock owes it `ACTIVE` again a span later. That span is the
+        // window in which a concurrent delete or update is refused with
+        // `ConflictException`.
+        plan.begin_transition(
+            crate::state::STATUS_UPDATING,
+            crate::state::STATUS_ACTIVE,
+            now,
+        );
+
+        Ok(UpdateRescoreExecutionPlanOutput)
     }
 }

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSchema
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSchema`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSchema::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the one Cedar schema a policy store holds: the text `PutSchema`
+//! stored, the namespaces read out of it and its timestamps. A store that holds
+//! no schema has no schema resource to report, so the call answers 404.
 //!
 //! ## Shape of an operation
 //!
@@ -90,10 +85,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-verifiedpermissions-ver
 // here — hence the `GetSchemaError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.verifiedpermissions#GetSchema")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.verifiedpermissions#GetSchema",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum GetSchemaErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -147,18 +146,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSchema` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSchemaErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSchema"))
+        // Reporting only: nothing here writes.
+        let _ = ctx;
+        let store_not_found = || {
+            GetSchemaErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!(
+                    "No policy store exists with the input ID: {}",
+                    input.policy_store_id
+                ),
+                resource_id: input.policy_store_id.clone(),
+                resource_type: "POLICY_STORE".to_string(),
+            })
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetSchemaErrorModeled::InternalServerException(InternalServerException {
+                message: "the service state store is unavailable".to_string(),
+            })
+        })?;
+        let state = state.lock();
+        let store_id = state
+            .resolve_store_id(&input.policy_store_id)
+            .ok_or_else(store_not_found)?;
+        let store = state
+            .policy_stores
+            .get(&store_id)
+            .ok_or_else(store_not_found)?;
+        // A store without a schema has no schema to retrieve: the missing
+        // resource is the SCHEMA, not the store.
+        let schema = store.schema.as_ref().ok_or_else(|| {
+            GetSchemaErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("No schema exists in the policy store with ID: {store_id}"),
+                resource_id: store_id.clone(),
+                resource_type: "SCHEMA".to_string(),
+            })
+        })?;
+
+        Ok(GetSchemaOutput {
+            policy_store_id: store_id.clone(),
+            schema: schema.cedar_json.clone(),
+            created_date: schema.created_date,
+            last_updated_date: schema.last_updated_date,
+            // Modelled optional here (unlike on `PutSchema`), but a stored schema
+            // always knows its namespaces, so they are always reported.
+            namespaces: Some(schema.namespaces.clone()),
+        })
     }
 }

@@ -11,7 +11,22 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-accessanalyzer-accessanalyzer.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.accessanalyzer#ListPolicyGenerationsRequest")]
+// `principalArn` and `maxResults` are the two members whose modelled constraints this
+// OPERATION refuses itself (`@pattern` on `PrincipalArn`, `@range(min: 1)` on
+// `maxResults`), rather than letting the framework's boundary validator refuse them.
+//
+// The model marks BOTH `message` and `reason` `@required` on this service's
+// `ValidationException`, and `reason` is what a client branches on; the framework's
+// pre-handler refusal is worded through `Refused { code, message }`
+// (`vendor/smithy-server-runtime/src/pre_dispatch.rs`), which cannot carry a modelled
+// member, so a refusal raised there is a `ValidationException` with no `reason` at all.
+// `skip_validation` drops only these two members' constraint traits, so the handler
+// raises the modelled refusal (see `ops::list_policy_generations`); every other member of
+// this shape is still validated at the boundary.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.accessanalyzer#ListPolicyGenerationsRequest",
+    skip_validation = ["principalArn", "maxResults"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListPolicyGenerationsInput {
     pub principal_arn: Option<String>,

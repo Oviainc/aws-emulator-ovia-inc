@@ -1,16 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetListener
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetListener`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetListener::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
+//! Implemented: reports the listener `CreateListener` persisted in
+//! [`crate::state::ComAmazonawsVpclatticeMercurycontrolplaneState::listeners`]. A
+//! `@readonly` report: it writes nothing.
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -133,6 +127,16 @@ impl From<GetListenerErrorModeled> for GetListenerError {
     }
 }
 
+/// HTTP 404 for an identifier that names no persisted listener of this service.
+fn not_found(identifier: &str, resource_type: &str) -> GetListenerError {
+    GetListenerErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: format!("{resource_type} {identifier} not found"),
+        resource_id: identifier.to_string(),
+        resource_type: resource_type.to_string(),
+    })
+    .into()
+}
+
 /// The `GetListener` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -169,18 +173,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetListener` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetListenerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetListener"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetListenerErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the vpc-lattice state store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        // Both identifiers are modelled as either the bare id or the resource's ARN.
+        let Some(service_id) = crate::state::id_from_identifier(
+            &input.service_identifier,
+            crate::state::PREFIX_SERVICE,
+        ) else {
+            return Err(not_found(
+                &input.service_identifier,
+                crate::state::KIND_SERVICE,
+            ));
+        };
+        let Some(listener_id) = crate::state::id_from_identifier(
+            &input.listener_identifier,
+            crate::state::PREFIX_LISTENER,
+        ) else {
+            return Err(not_found(
+                &input.listener_identifier,
+                crate::state::KIND_LISTENER,
+            ));
+        };
+        let store = state.lock();
+        if !store.services.contains_key(&service_id) {
+            return Err(not_found(
+                &input.service_identifier,
+                crate::state::KIND_SERVICE,
+            ));
+        }
+        // A listener is a resource OF its service: one stored under a different service
+        // is not reachable through this one.
+        let Some(listener) = store
+            .listeners
+            .get(&listener_id)
+            .filter(|listener| listener.service_id == service_id)
+        else {
+            return Err(not_found(
+                &input.listener_identifier,
+                crate::state::KIND_LISTENER,
+            ));
+        };
+        Ok(GetListenerOutput {
+            id: Some(listener.id.clone()),
+            arn: Some(listener.arn.clone()),
+            name: Some(listener.name.clone()),
+            protocol: Some(listener.protocol.clone()),
+            port: Some(listener.port),
+            service_id: Some(listener.service_id.clone()),
+            service_arn: Some(listener.service_arn.clone()),
+            default_action: Some(listener.default_action.clone()),
+            created_at: Some(crate::state::timestamp(listener.created_at)),
+            last_updated_at: Some(crate::state::timestamp(listener.last_updated_at)),
+        })
     }
 }

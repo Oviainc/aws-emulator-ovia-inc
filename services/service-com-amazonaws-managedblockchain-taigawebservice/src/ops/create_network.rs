@@ -261,7 +261,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             kms_key_arn,
         };
 
-        let network = crate::state::StoredNetwork {
+        let mut network = crate::state::StoredNetwork {
             id: network_id.clone(),
             name: input.name,
             description: input.description,
@@ -282,10 +282,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: crate::state::map_in(input.tags),
             arn: crate::state::network_arn(&region, &network_id),
             vpc_endpoint_service_name: crate::state::vpc_endpoint_service_name(&region, &network_id),
-            members: ::std::collections::BTreeMap::from([(member_id.clone(), member)]),
+            // Every member is added through `insert_member` below, the one path that
+            // enforces this emulator's per-network member ceiling.
+            members: ::std::collections::BTreeMap::new(),
             nodes: ::std::collections::BTreeMap::new(),
             proposals: ::std::collections::BTreeMap::new(),
         };
+
+        // The member map was built empty just above, so this refusal cannot fire on a
+        // brand-new network: it is here because `insert_member` is the ONE door that
+        // enforces the per-network member ceiling, and every path that adds a member —
+        // this one and whatever later implements `CreateMember` — answers it the same
+        // modelled way.
+        if network.insert_member(member).is_err() {
+            return Err(CreateNetworkErrorModeled::ResourceLimitExceededException(
+                ResourceLimitExceededException {
+                    message: Some(format!(
+                        "network {network_id} already holds the maximum of {} members",
+                        crate::state::MAX_MEMBERS_PER_NETWORK
+                    )),
+                },
+            )
+            .into());
+        }
 
         guard.networks.insert(network_id.clone(), network);
         guard.remember_idempotent(

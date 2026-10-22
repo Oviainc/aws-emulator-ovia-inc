@@ -345,6 +345,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect(),
             instances: std::collections::BTreeMap::new(),
             instances_revision: 0,
+            // A new service carries no service-level attributes until
+            // `UpdateServiceAttributes` writes some.
+            attributes: std::collections::BTreeMap::new(),
         };
         state
             .service_ids_by_namespace_and_name

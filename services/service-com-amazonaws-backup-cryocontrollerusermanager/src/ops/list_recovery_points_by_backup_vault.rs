@@ -4,6 +4,9 @@
 //!
 //! Pages the recovery points `StartBackupJob` stored in the named vault, in the
 //! order they were stored, after applying the `By*` filters the model declares.
+//! The vault is resolved through [`crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::visible_vault`],
+//! so a vault outside the caller's visibility is refused with 403
+//! `AccessDeniedException` before any existence lookup.
 //!
 //! ## Shape of an operation
 //!
@@ -207,30 +210,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // One account's vaults are the only ones this emulator holds.
-        let wrong_account = input
-            .backup_vault_account_id
-            .as_deref()
-            .is_some_and(|account| account != ::engine::emulator_account_id());
-        let Some(vault) = store
-            .vaults
-            .get(&input.backup_vault_name)
-            .filter(|_| !wrong_account)
-            .cloned()
-        else {
-            return Err(
-                ListRecoveryPointsByBackupVaultErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "Backup vault {} not found",
-                            input.backup_vault_name
-                        )),
-                        ..Default::default()
-                    },
-                )
-                .into(),
-            );
-        };
+        // A vault-scoped read decides access before existence: see
+        // `state::visible_vault`, the step every vault-scoped read shares. A vault
+        // this account does not hold, or one addressed with another account's
+        // `BackupVaultAccountId` (the `backupVaultAccountId` query parameter, the
+        // documented cross-account path), is refused with 403 `AccessDeniedException`
+        // rather than reported as missing.
+        let vault = store
+            .visible_vault(
+                &input.backup_vault_name,
+                input.backup_vault_account_id.as_deref(),
+            )?
+            .clone();
 
         // Validated and resolved first, so a refused request writes nothing.
         // This is the one write a read performs: a recovery point whose settle

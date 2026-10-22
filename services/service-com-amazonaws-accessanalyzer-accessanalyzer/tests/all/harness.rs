@@ -153,6 +153,20 @@ impl Emulator {
         )
         .await
     }
+
+    pub async fn delete_archive_rule(&self, analyzer: &str, rule: &str) -> Reply {
+        self.send(
+            "DELETE",
+            &format!("/analyzer/{analyzer}/archive-rule/{rule}"),
+            None,
+        )
+        .await
+    }
+
+    pub async fn list_policy_generations(&self, query: &str) -> Reply {
+        self.send("GET", &format!("/policy/generation{query}"), None)
+            .await
+    }
 }
 
 /// The ARN an analyzer of `name` must carry:

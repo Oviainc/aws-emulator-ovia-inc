@@ -2,15 +2,18 @@
 
 //! Engine state for the com-amazonaws-b2bi-b2bi service.
 //!
-//! The service's three primary resources — Profile, Capability and Partnership — are
-//! persisted here, under the single shared engine, so a create is observable by every
+//! The service's primary resources — Profile, Capability, Partnership and Transformer —
+//! are persisted here, under the single shared engine, so a create is observable by every
 //! later Get/List/Delete. Each collection keeps BOTH a `HashMap` keyed by the resource's
 //! generated id (the lookup every Get/Delete does) and a `Vec` of ids in insertion
 //! order (the stable enumeration the `@paginated` List operations page through).
 
 use std::collections::{HashMap, VecDeque};
 
-use crate::ops::types::{CapabilityConfiguration, CapabilityOptions, S3Location, Tag};
+use crate::ops::types::{
+    CapabilityConfiguration, CapabilityOptions, EdiType, InputConversion, Mapping,
+    OutputConversion, S3Location, SampleDocuments, Tag,
+};
 
 /// The region an emulated ARN carries when the request's SigV4 scope does not name one
 /// (the emulator's documented default — see `engine::emulator_arn`).
@@ -22,6 +25,16 @@ pub const STATE_UNAVAILABLE: &str = "the b2bi service store is unavailable";
 
 /// The value of the modelled `Logging` enum that turns a profile's logging on.
 pub const LOGGING_ENABLED: &str = "ENABLED";
+
+/// The `TransformerStatus` a freshly created transformer carries.
+///
+/// `inactive`: the model's own doc for `CreateTransformerResponse$status` says "Returns
+/// the state of the newly created transformer. The transformer can be either active or
+/// inactive. For the transformer to be used in a capability, its status must active" —
+/// i.e. a new transformer is not usable until a caller moves it, so creation cannot be
+/// what makes it `active`. The move is an explicit `UpdateTransformer`, not a transition
+/// the clock owes: `inactive` is a resting state, not a transient one.
+pub const TRANSFORMER_STATUS_INACTIVE: &str = "inactive";
 
 /// How many hex digits follow the resource-type prefix in a generated id.
 ///
@@ -86,6 +99,30 @@ pub struct Capability {
     pub tags: Vec<Tag>,
 }
 
+/// A transformer: the EDI <-> JSON/XML translation a capability references by id.
+///
+/// Every member is persisted as the create supplied it — including the four members the
+/// model marks `@deprecated` (`fileFormat`, `mappingTemplate`, `ediType`,
+/// `sampleDocument`) — so a later read cannot disagree with what was created.
+#[derive(Debug, Clone)]
+pub struct Transformer {
+    pub transformer_id: String,
+    pub transformer_arn: String,
+    pub name: String,
+    pub status: String,
+    pub file_format: Option<String>,
+    pub mapping_template: Option<String>,
+    pub edi_type: Option<EdiType>,
+    pub sample_document: Option<String>,
+    pub input_conversion: Option<InputConversion>,
+    pub mapping: Option<Mapping>,
+    pub output_conversion: Option<OutputConversion>,
+    pub sample_documents: Option<SampleDocuments>,
+    pub created_at: ::aws_smithy_types::DateTime,
+    pub modified_at: Option<::aws_smithy_types::DateTime>,
+    pub tags: Vec<Tag>,
+}
+
 /// A partnership: one trading partner, under a profile, bound to a set of capabilities.
 #[derive(Debug, Clone)]
 pub struct Partnership {
@@ -115,6 +152,10 @@ pub struct ComAmazonawsB2biB2biState {
     pub partnerships: HashMap<String, Partnership>,
     /// `partnerships` in creation order, for `ListPartnerships` paging.
     pub partnership_order: Vec<String>,
+    /// The transformers this service holds, keyed by `transformerId`.
+    pub transformers: HashMap<String, Transformer>,
+    /// `transformers` in creation order, for `ListTransformers` paging.
+    pub transformer_order: Vec<String>,
     /// `@idempotencyToken` replay: [`idempotency_key`] -> the id of the resource the
     /// first call with that token created. Bounded by [`MAX_IDEMPOTENCY_ENTRIES`].
     pub idempotency: HashMap<String, String>,
@@ -139,6 +180,11 @@ impl ComAmazonawsB2biB2biState {
         self.partnerships.len() < MAX_RECORDS_PER_STORE
     }
 
+    /// Whether the transformer store is below [`MAX_RECORDS_PER_STORE`].
+    pub fn accepts_another_transformer(&self) -> bool {
+        self.transformers.len() < MAX_RECORDS_PER_STORE
+    }
+
     /// Remember that `key` minted `id`, evicting the oldest remembered token once
     /// [`MAX_IDEMPOTENCY_ENTRIES`] are held — so a caller cannot grow this map without
     /// limit by sending a fresh `clientToken` on every request.
@@ -157,13 +203,14 @@ impl ComAmazonawsB2biB2biState {
     /// no resource with that ARN.
     ///
     /// Every taggable resource this service persists — profile, capability,
-    /// partnership — keeps the tags it was created with on its own record, so the tag
+    /// partnership, transformer — keeps the tags it was created with on its own record,
+    /// so the tag
     /// list is looked up by the very ARN the create stored and handed back. An ARN that
     /// differs from a stored one in any field (its region or its account, say) names no
     /// resource here, which is what AWS reports as `ResourceNotFoundException`: "the
     /// resource exists in a region other than the region specified in the API call".
     ///
-    /// The scan is linear over at most three times [`MAX_RECORDS_PER_STORE`] records,
+    /// The scan is linear over at most four times [`MAX_RECORDS_PER_STORE`] records,
     /// the same bound the List operations' scans carry.
     pub fn tags_by_arn(&self, arn: &str) -> Option<&Vec<Tag>> {
         self.profiles
@@ -181,6 +228,12 @@ impl ComAmazonawsB2biB2biState {
                     .values()
                     .find(|partnership| partnership.partnership_arn == arn)
                     .map(|partnership| &partnership.tags)
+            })
+            .or_else(|| {
+                self.transformers
+                    .values()
+                    .find(|transformer| transformer.transformer_arn == arn)
+                    .map(|transformer| &transformer.tags)
             })
     }
 

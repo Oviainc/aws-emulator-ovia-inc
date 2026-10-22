@@ -184,6 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_or(usize::MAX, |requested| requested.max(0) as usize);
 
         let store = state.lock();
+        let now = crate::state::now_millis();
         // `plans` is a BTreeMap, so this walk is in ascending id order: paging from the
         // last id returned visits every plan exactly once, and a deleted plan is simply
         // no longer there.
@@ -201,7 +202,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 id: Some(plan.id.clone()),
                 created_at: Some(crate::state::timestamp(plan.created_at_millis)),
                 updated_at: Some(crate::state::timestamp(plan.updated_at_millis)),
-                status: Some(plan.status.clone()),
+                // The same clock-owed status `DescribeRescoreExecutionPlan` reports, so
+                // the two readers never disagree about a plan mid-transition.
+                status: Some(plan.status_at(now).to_string()),
             })
             .collect();
 

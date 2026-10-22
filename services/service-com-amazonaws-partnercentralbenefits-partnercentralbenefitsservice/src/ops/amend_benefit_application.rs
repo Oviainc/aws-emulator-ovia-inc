@@ -1,15 +1,41 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AmendBenefitApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AmendBenefitApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Applies a list of field amendments to one stored benefit application in
+//! [`crate::state`], bumps its revision and `UpdatedAt`, and records the amendment.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AmendBenefitApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The operation answers in this order, which is the order AWS reports:
+//!
+//! 1. request-shape validation — the centralized walk, before this handler runs;
+//! 2. the partner-entitlement gate — a caller holding no active AWS partner benefit is
+//!    refused with `AccessDeniedException` (see [`crate::state::ENTITLEMENT_REQUIRED`]),
+//!    so it never learns whether the application it named exists;
+//! 3. the `ClientToken` replay check — a retry of an amendment already applied changes
+//!    nothing and answers success;
+//! 4. optimistic concurrency — the request's `Revision` must be the application's
+//!    current one, else `ConflictException`;
+//! 5. the amendments themselves, applied to a copy so that a request carrying one that
+//!    cannot be applied leaves the stored application exactly as it was.
+//!
+//! ## What a `FieldPath` may name
+//!
+//! `Name`, `Description`, or `BenefitApplicationDetails` followed by a `.`-separated
+//! path into that document — each optionally written in JSON-path form (`$.Name`).
+//! Those are the members a caller supplies and `UpdateBenefitApplication` also writes;
+//! everything else on the record is service-owned, so a path naming one is refused with
+//! the modelled `ValidationException`, as is a `NewValue` outside the modelled length of
+//! the member the path names.
+//!
+//! The members the model leaves unconstrained carry this service's own bounds, so no
+//! request and no sequence of requests can grow one record without limit: at most
+//! [`crate::state::MAX_AMENDMENTS_PER_REQUEST`] amendments per request, a `FieldPath` of
+//! at most [`crate::state::MAX_FIELD_PATH_LEN`] bytes and
+//! [`crate::state::MAX_DETAILS_DEPTH`] segments, a details value of at most
+//! [`crate::state::MAX_DETAILS_VALUE_LEN`], an `AmendmentReason` and a `ClientToken`
+//! within the lengths the model gives them
+//! ([`crate::state::MAX_AMENDMENT_REASON_LEN`], [`crate::state::MAX_CLIENT_TOKEN_LEN`] —
+//! the two strings the record keeps), and an amended document still within
+//! [`crate::state::details_rejection`]'s depth, member-count and byte bounds.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +112,236 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::HashMap;
+
+use ::aws_smithy_types::Document;
+use smithy_server_runtime::ViolationKind;
+
+/// The benefit-application member `Name` amends, as the model spells it on the wire.
+const FIELD_NAME: &str = "Name";
+/// The benefit-application member `Description` amends.
+const FIELD_DESCRIPTION: &str = "Description";
+/// The benefit-application member a `BenefitApplicationDetails...` path amends.
+const FIELD_DETAILS: &str = "BenefitApplicationDetails";
+
+/// The members of a benefit application an amendment may write.
+///
+/// They are the members a caller supplies and `UpdateBenefitApplication` also writes;
+/// everything else on the record is service-owned (its identity, its status, the
+/// programs of the benefit it requests) and no amendment reaches it.
+const AMENDABLE_FIELDS: &[&str] = &[FIELD_NAME, FIELD_DESCRIPTION, FIELD_DETAILS];
+
+/// The longest value `Name` accepts: the modelled `BenefitApplicationName`
+/// `@length(min: 1, max: 255)`. `Amendment$NewValue` is an unconstrained `String`, so
+/// the target member's own constraint is enforced here.
+const NAME_MAX_LEN: usize = 255;
+
+/// The longest value `Description` accepts: the modelled
+/// `BenefitApplicationDescription` `@length(min: 1, max: 1000)`.
+const DESCRIPTION_MAX_LEN: usize = 1000;
+
+/// The shortest value either string member accepts, from those same `@length` traits.
+const MIN_LEN: usize = 1;
+
+/// Why one amendment cannot be applied: the input member to report, and the constraint
+/// clause it failed.
+struct AmendmentRefusal {
+    member: String,
+    clause: String,
+}
+
+impl AmendmentRefusal {
+    fn new(member: String, clause: String) -> Self {
+        Self { member, clause }
+    }
+}
+
+/// The path of one member of `Amendments[position]`, spelled the way this service's
+/// validation messages spell a member path: members in lowerCamel, a list element as
+/// its 1-BASED position followed by the collection step `member` (see
+/// `smithy_schema_server::constraints::path`, which spells the paths the centralized
+/// walk reports) — e.g. `amendments.1.member.fieldPath`.
+fn member_path(position: usize, member: &str) -> String {
+    format!("amendments.{}.member.{member}", position + 1)
+}
+
+/// The segments of one `FieldPath`: a field name, optionally written in JSON-path form
+/// (`$.Name`), with `.`-separated member names below it.
+///
+/// `None` for a path this service cannot read: one longer than
+/// [`crate::state::MAX_FIELD_PATH_LEN`], one with an empty segment, or one with more
+/// than [`crate::state::MAX_DETAILS_DEPTH`] segments. `FieldPath` is an unconstrained
+/// `String`, so those two bounds are what keep the walk below from recursing without
+/// limit and the path from being stored at arbitrary length.
+fn path_segments(field_path: &str) -> Option<Vec<&str>> {
+    if field_path.len() > crate::state::MAX_FIELD_PATH_LEN {
+        return None;
+    }
+    let segments: Vec<&str> = field_path
+        .strip_prefix("$.")
+        .unwrap_or(field_path)
+        .split('.')
+        .collect();
+    (segments.iter().all(|segment| !segment.is_empty())
+        && segments.len() <= crate::state::MAX_DETAILS_DEPTH)
+    .then_some(segments)
+}
+
+/// Write `value` at `path` inside `document`, creating the objects the path needs.
+///
+/// An empty path replaces `document` itself, so a `FieldPath` that names the details
+/// member alone sets the whole document to the new value. `Err(depth)` reports the
+/// 0-based path segment whose parent is not an object, so nothing below it can be
+/// written.
+fn set_document_member(document: &mut Document, path: &[&str], value: &str) -> Result<(), usize> {
+    let Some((head, rest)) = path.split_first() else {
+        *document = Document::String(value.to_string());
+        return Ok(());
+    };
+    let Document::Object(members) = document else {
+        return Err(0);
+    };
+    let child = members
+        .entry((*head).to_string())
+        .or_insert_with(|| Document::Object(HashMap::new()));
+    set_document_member(child, rest, value).map_err(|depth| depth + 1)
+}
+
+/// Whether `value` satisfies the `@length(min: min, max: max)` of the member it is
+/// written to or stored in.
+///
+/// The requirement is worded by [`crate::service::constraint_requirement`] — the same
+/// words the centralized walk uses for a length — so an in-handler refusal of a length
+/// cannot drift from the walk's refusal of one.
+fn length_clause(value: &str, min: usize, max: usize) -> Option<String> {
+    let length = value.chars().count();
+    let kind = if length < min {
+        ViolationKind::MinLength(min as i64)
+    } else if length > max {
+        ViolationKind::MaxLength(max as i64)
+    } else {
+        return None;
+    };
+    crate::service::constraint_requirement(&kind)
+}
+
+/// One refusal of an input member, as this operation's modelled `ValidationException`.
+///
+/// The message is rendered by the same two helpers the centralized walk's refusals go
+/// through ([`crate::service::member_clause`] and
+/// [`crate::service::validation_envelope`]): it names the member path and the
+/// requirement it failed, and echoes NOTHING of the rejected value.
+fn refused(member: &str, clause: &str) -> AmendBenefitApplicationError {
+    let rendered = crate::service::member_clause(member, clause, false);
+    AmendBenefitApplicationErrorModeled::ValidationException(ValidationException {
+        message: crate::service::validation_envelope(std::slice::from_ref(&rendered))
+            .unwrap_or(rendered),
+        reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
+        field_list: Some(crate::state::validation_field(
+            member,
+            clause,
+            crate::state::VALIDATION_CODE_INVALID_VALUE,
+        )),
+    })
+    .into()
+}
+
+/// The number of amendments one request may carry, as the clause states it — a length
+/// bound on the list, worded like any other.
+fn amendments_length_clause(count: usize) -> Option<String> {
+    (count > crate::state::MAX_AMENDMENTS_PER_REQUEST).then(|| {
+        crate::service::constraint_requirement(&ViolationKind::MaxLength(
+            crate::state::MAX_AMENDMENTS_PER_REQUEST as i64,
+        ))
+        .unwrap_or_default()
+    })
+}
+
+/// Apply one amendment to `application`, or report why it cannot be applied.
+///
+/// The caller applies amendments to a COPY of the stored application, so a refusal here
+/// leaves the store untouched however many amendments were applied before it.
+fn apply_amendment(
+    application: &mut crate::state::BenefitApplication,
+    position: usize,
+    amendment: &Amendment,
+) -> Result<(), AmendmentRefusal> {
+    let unamendable = || {
+        AmendmentRefusal::new(
+            member_path(position, "fieldPath"),
+            format!(
+                "Member must name one of the amendable fields ({}), or a `.`-separated path \
+                 into {FIELD_DETAILS}",
+                AMENDABLE_FIELDS.join(", ")
+            ),
+        )
+    };
+
+    let segments = path_segments(&amendment.field_path).ok_or_else(&unamendable)?;
+    let (head, rest) = segments
+        .split_first()
+        .expect("`split('.')` yields at least one segment");
+
+    match *head {
+        FIELD_NAME if rest.is_empty() => {
+            if let Some(clause) = length_clause(&amendment.new_value, MIN_LEN, NAME_MAX_LEN) {
+                return Err(AmendmentRefusal::new(
+                    member_path(position, "newValue"),
+                    clause,
+                ));
+            }
+            application.name = Some(amendment.new_value.clone());
+        }
+        FIELD_DESCRIPTION if rest.is_empty() => {
+            if let Some(clause) = length_clause(&amendment.new_value, MIN_LEN, DESCRIPTION_MAX_LEN)
+            {
+                return Err(AmendmentRefusal::new(
+                    member_path(position, "newValue"),
+                    clause,
+                ));
+            }
+            application.description = Some(amendment.new_value.clone());
+        }
+        FIELD_DETAILS => {
+            // The details member is modelled as a `Document`, so a path may reach into
+            // it; a member the document does not hold yet is created, which is what
+            // lets an amendment add a field as well as change one. A path naming the
+            // member ALONE (no segment below it) sets the whole document to the new
+            // value, which is deliberate: the member is a `Document`, and a string is
+            // one. The model constrains a leaf of the document not at all, so the one
+            // bound on a value written here is this service's own.
+            // A leaf of the document carries no modelled length at all (and an empty
+            // string is a valid member of a document), so the only bound on a value
+            // written here is this service's own maximum.
+            if let Some(clause) = length_clause(
+                &amendment.new_value,
+                0,
+                crate::state::MAX_DETAILS_VALUE_LEN,
+            ) {
+                return Err(AmendmentRefusal::new(
+                    member_path(position, "newValue"),
+                    clause,
+                ));
+            }
+            let document = application
+                .benefit_application_details
+                .get_or_insert_with(|| Document::Object(HashMap::new()));
+            set_document_member(document, rest, &amendment.new_value).map_err(|depth| {
+                AmendmentRefusal::new(
+                    member_path(position, "fieldPath"),
+                    format!(
+                        "Member must name a member of an object: segment {} of the path names a \
+                         value that is not an object",
+                        depth + 1
+                    ),
+                )
+            })?;
+        }
+        _ => return Err(unamendable()),
+    }
+    Ok(())
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -159,26 +415,143 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // The entitlement gate is a service-wide stage, so it sits ahead of this
-        // (unwritten) body too: a caller whose account holds no active AWS partner
-        // benefit is refused with the modelled `AccessDeniedException`, which is the
-        // WHOLE answer the service gives such a request — no unimplemented behaviour is
-        // involved. An entitled caller still gets the 501 below.
+        let _ = ctx;
+        // The entitlement gate, ahead of everything else this handler does — see
+        // [`crate::state::entitlement_refusal`]. It takes the store lock itself, so it
+        // runs before this handler takes one.
         if let Some(denied) = crate::state::entitlement_refusal(&*self.engine) {
             return Err(AmendBenefitApplicationErrorModeled::AccessDeniedException(denied).into());
         }
-        // Implement `AmendBenefitApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AmendBenefitApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AmendBenefitApplication"))
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AmendBenefitApplicationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STORE_UNAVAILABLE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // An amendment request has to name what it amends, and no more fields than this
+        // service applies in one request: the model requires the list but constrains no
+        // length, so both bounds live here — ahead of the store lock, so the loop that
+        // applies them runs under the lock with a cited bound.
+        if input.amendments.is_empty() {
+            return Err(refused(
+                "amendments",
+                "Member must name at least one field to amend",
+            ));
+        }
+        if let Some(clause) = amendments_length_clause(input.amendments.len()) {
+            return Err(refused("amendments", &clause));
+        }
+
+        // The two caller-chosen strings this operation PERSISTS, checked at the door of
+        // the store whose byte accounting cites these bounds. The model constrains both
+        // (`AmendmentReason` `@length(max: 1000)`, `ClientToken` `@length(min: 1, max:
+        // 64)`), so the centralized walk refuses a longer one first; this is the
+        // enforcement the store itself relies on, not a restatement of the walk's job.
+        if let Some(clause) = length_clause(
+            &input.amendment_reason,
+            0,
+            crate::state::MAX_AMENDMENT_REASON_LEN,
+        ) {
+            return Err(refused("amendmentReason", &clause));
+        }
+        if let Some(clause) =
+            length_clause(&input.client_token, MIN_LEN, crate::state::MAX_CLIENT_TOKEN_LEN)
+        {
+            return Err(refused("clientToken", &clause));
+        }
+
+        let now = crate::state::now_millis();
+        let mut store = state.lock();
+
+        let Some(application) = store.application_mut(&input.catalog, &input.identifier) else {
+            return Err(
+                AmendBenefitApplicationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::not_found_message(
+                            crate::state::APPLICATION_KIND,
+                            &input.identifier,
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A retry of an amendment that already succeeded applies nothing a second time.
+        // It is checked BEFORE the revision, because the first call moved the revision
+        // the retry still carries.
+        if application
+            .applied_amendment(&input.client_token)
+            .is_some()
+        {
+            return Ok(AmendBenefitApplicationOutput {});
+        }
+
+        if application.revision_text() != input.revision {
+            return Err(AmendBenefitApplicationErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "benefit application {} is at revision {}, not {}",
+                        application.id,
+                        application.revision_text(),
+                        input.revision
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // Every amendment is applied to a copy, in request order, so two amendments of
+        // one path leave the last one's value and a request carrying one that cannot be
+        // applied changes nothing at all.
+        let mut amended = application.clone();
+        for (position, amendment) in input.amendments.iter().enumerate() {
+            if let Err(refusal) = apply_amendment(&mut amended, position, amendment) {
+                return Err(refused(&refusal.member, &refusal.clause));
+            }
+        }
+
+        // An amendment can nest the details document deeper, so the bound the create and
+        // the update enforce on a supplied document is enforced on the amended one too,
+        // and refused exactly as they refuse it.
+        if let Some(why) =
+            crate::state::details_rejection(amended.benefit_application_details.as_ref())
+        {
+            return Err(AmendBenefitApplicationErrorModeled::ValidationException(
+                ValidationException {
+                    message: why.clone(),
+                    reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
+                    field_list: Some(crate::state::validation_field(
+                        "BenefitApplicationDetails",
+                        &why,
+                        crate::state::VALIDATION_CODE_INVALID_VALUE,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        amended.revise(now);
+        amended.record_amendment(crate::state::AppliedAmendment {
+            client_token: input.client_token.clone(),
+            reason: input.amendment_reason.clone(),
+            field_paths: input
+                .amendments
+                .iter()
+                .map(|amendment| amendment.field_path.clone())
+                .collect(),
+            applied_at_millis: amended.updated_at_millis,
+            revision: amended.revision,
+        });
+        *application = amended;
+
+        // The model binds no member on this operation's output: what the amendment did
+        // is read back through `GetBenefitApplication`, whose `Revision` is the one this
+        // call produced.
+        Ok(AmendBenefitApplicationOutput {})
     }
 }

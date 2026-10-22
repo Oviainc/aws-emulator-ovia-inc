@@ -10,86 +10,16 @@
 //! for a request outside a constraint.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
-use bytes::Bytes;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use service_com_amazonaws_kendraranking_awskendrarerankingfrontendservice::EmulatedService;
-
-/// The `X-Amz-Target` prefix every request to this awsJson1_0 service carries (see the
-/// crate's `OPERATIONS.md`).
-const TARGET_PREFIX: &str = "AWSKendraRerankingFrontendService.";
+use crate::harness::{call, call_in, create_plan, emulator, error_code};
 
 /// A 36-character `RescoreExecutionPlanId` that no `CreateRescoreExecutionPlan` call in
 /// these tests mints, for the not-found cases.
 const UNKNOWN_PLAN_ID: &str = "00000000-0000-4000-8000-000000000000";
 
-/// One emulator holding this service, over the single shared engine the router builds.
-fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    // These tests exercise the modeled behaviour, not signature verification.
-    router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
-}
-
-/// Call `operation` with `body`, signed for `region`, and return its status and body.
-async fn call_in(
-    router: &MultiServiceRouter,
-    region: &str,
-    operation: &str,
-    body: Value,
-) -> (u16, Value) {
-    let request = ::http::Request::builder()
-        .method("POST")
-        .uri("/")
-        .header("content-type", "application/x-amz-json-1.0")
-        .header("x-amz-target", format!("{TARGET_PREFIX}{operation}"))
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 \
-                 Credential=AKIDEXAMPLE/20240101/{region}/kendra-ranking/aws4_request, \
-                 SignedHeaders=host, Signature=deadbeef"
-            ),
-        )
-        .body(Bytes::from(body.to_string()))
-        .expect("build the request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let parsed = if response.body().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(response.body()).unwrap_or_else(|_| {
-            json!({ "unparsed": String::from_utf8_lossy(response.body()).to_string() })
-        })
-    };
-    (status, parsed)
-}
-
-/// [`call_in`] for the emulator's default region.
-async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
-    call_in(router, "us-east-1", operation, body).await
-}
-
-/// The wire error code of an error body (`__type`), without any namespace prefix.
-fn error_code(body: &Value) -> String {
-    let raw = body["__type"].as_str().unwrap_or_default();
-    raw.rsplit('#').next().unwrap_or(raw).to_string()
-}
-
-/// Create a plan named `name` and return its id.
-async fn create_plan(router: &MultiServiceRouter, name: &str) -> String {
-    let (status, body) = call(router, "CreateRescoreExecutionPlan", json!({ "Name": name })).await;
-    assert_eq!(status, 200, "create {name}: unexpected answer {body}");
-    body["Id"]
-        .as_str()
-        .unwrap_or_else(|| panic!("create {name}: no Id in {body}"))
-        .to_string()
-}
 
 /// The `DocumentId`s of a `Rescore` answer, in the order the service returned them.
 fn result_document_ids(body: &Value) -> Vec<String> {
@@ -894,13 +824,10 @@ async fn an_operation_this_slice_leaves_unimplemented_still_answers_501() {
         call(&router, "DescribeRescoreExecutionPlan", json!({ "Id": plan })).await;
     let arn = described["Arn"].as_str().unwrap_or_default().to_string();
 
-    // UpdateRescoreExecutionPlan and the tagging operations are out of scope for this
-    // slice and must keep saying so rather than answering a hollow 200.
+    // The tagging operations are out of scope for this slice and must keep saying so
+    // rather than answering a hollow 200. `UpdateRescoreExecutionPlan` is implemented —
+    // see `tests/all/plan_update.rs`.
     let cases: Vec<(&str, Value)> = vec![
-        (
-            "UpdateRescoreExecutionPlan",
-            json!({ "Id": plan, "Name": "renamed" }),
-        ),
         (
             "TagResource",
             json!({ "ResourceARN": arn, "Tags": [{ "Key": "k", "Value": "v" }] }),

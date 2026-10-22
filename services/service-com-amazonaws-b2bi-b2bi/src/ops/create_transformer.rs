@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTransformer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTransformer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints a transformer, persists every supplied member verbatim, and answers with the
+//! STORED record so a later `GetTransformer` returns exactly what was created.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTransformer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A transformer is created `inactive` (see [`crate::state::TRANSFORMER_STATUS_INACTIVE`]),
+//! and a request that mixes the model's `@deprecated` configuration members with the
+//! members that replace them is refused with the modelled `ValidationException` rather
+//! than stored.
 //!
 //! ## Shape of an operation
 //!
@@ -191,6 +189,142 @@ impl From<CreateTransformerErrorModeled> for CreateTransformerError {
     }
 }
 
+/// The members the model marks `@deprecated` on `CreateTransformerRequest`, in the order
+/// a refusal names them.
+///
+/// Source: the `deprecated` trait ("This is a legacy trait. Please use input-conversion or
+/// output-conversion.") on `CreateTransformerRequest$fileFormat`, `$mappingTemplate`,
+/// `$ediType` and `$sampleDocument` —
+/// `smithy_query(query="operation",operation="CreateTransformer")`.
+pub const LEGACY_MEMBERS: &[&str] = &[
+    "ediType",
+    "fileFormat",
+    "mappingTemplate",
+    "sampleDocument",
+];
+
+/// The members that replace [`LEGACY_MEMBERS`], in the order a refusal names them.
+///
+/// Source: the same operation's remaining configuration members, which carry no
+/// `deprecated` trait, and the operation doc: "Use the mapping data type in place of
+/// mappingTemplate and fileFormat. Use the sampleDocuments data type in place of
+/// sampleDocument. Use either the inputConversion or outputConversion in place of
+/// ediType".
+pub const CURRENT_MEMBERS: &[&str] = &[
+    "inputConversion",
+    "mapping",
+    "outputConversion",
+    "sampleDocuments",
+];
+
+/// Which of [`LEGACY_MEMBERS`] this request names.
+fn legacy_members_present(input: &CreateTransformerInput) -> Vec<&'static str> {
+    [
+        ("ediType", input.edi_type.is_some()),
+        ("fileFormat", input.file_format.is_some()),
+        ("mappingTemplate", input.mapping_template.is_some()),
+        ("sampleDocument", input.sample_document.is_some()),
+    ]
+    .into_iter()
+    .filter(|(_, present)| *present)
+    .map(|(member, _)| member)
+    .collect()
+}
+
+/// Which of [`CURRENT_MEMBERS`] this request names.
+fn current_members_present(input: &CreateTransformerInput) -> Vec<&'static str> {
+    [
+        ("inputConversion", input.input_conversion.is_some()),
+        ("mapping", input.mapping.is_some()),
+        ("outputConversion", input.output_conversion.is_some()),
+        ("sampleDocuments", input.sample_documents.is_some()),
+    ]
+    .into_iter()
+    .filter(|(_, present)| *present)
+    .map(|(member, _)| member)
+    .collect()
+}
+
+/// The modelled refusal for a request that configures the transformer in BOTH styles at
+/// once: the deprecated members and the ones that replace them describe the same
+/// conversion two ways, so a record built from both would be ambiguous.
+///
+/// This is RECORDED AWS behaviour, not an inference from the `deprecated` trait: the
+/// corpus issue `issues/.../20261022T031134Z-b2bi-tagging-test-harness-and-transformer-
+/// operations-answer.md` (cause 5, trace
+/// `b2bi.create-transformer-mixed-legacy-and-new-fields-error`) records that "a request
+/// that mixes the deprecated legacy fields (fileFormat/mappingTemplate/ediType) with the
+/// new inputConversion field is refused with ValidationException and creates nothing",
+/// with the recorded message example "A Transformer must use the fields input, mapping,
+/// and output, or the fields fileFormat, ...".
+///
+/// The HTTP status (400) and the error code (`ValidationException`) are what that
+/// recording requires; the recorded text is only an example, so the message here is built
+/// from the REQUEST — it names the members this caller actually sent in each style — so a
+/// caller can fix the request from the text alone.
+///
+/// Only the overlap is refused. A request that names NEITHER style is stored as supplied:
+/// no recording or model constraint says the real service refuses an unconfigured
+/// transformer, and refusing a request AWS may serve is the worse error.
+fn mixed_configuration_styles(
+    legacy: &[&'static str],
+    current: &[&'static str],
+) -> CreateTransformerError {
+    CreateTransformerErrorModeled::ValidationException(ValidationException {
+        message: format!(
+            "A transformer must be configured with the fields {} or with the legacy fields \
+             {}, not both: this request specifies {} and {}",
+            CURRENT_MEMBERS.join(", "),
+            LEGACY_MEMBERS.join(", "),
+            current.join(", "),
+            legacy.join(", "),
+        ),
+    })
+    .into()
+}
+
+/// The modelled refusal for a store already holding
+/// [`crate::state::MAX_RECORDS_PER_STORE`] transformers: this emulator will not grow its
+/// transformer store further, so the request is refused rather than served by allocating
+/// more.
+///
+/// `quotaCode` and `serviceCode` name the limit that was actually reached — this
+/// emulator's own storage bound and this service's own code — rather than an AWS quota
+/// code, which only AWS can assign.
+fn store_full() -> CreateTransformerError {
+    CreateTransformerErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException {
+        message: format!(
+            "this emulator stores at most {} transformers",
+            crate::state::MAX_RECORDS_PER_STORE
+        ),
+        resource_id: ::engine::emulator_account_id().to_string(),
+        resource_type: "transformer".to_string(),
+        service_code: "b2bi".to_string(),
+        quota_code: "TransformersPerAccount".to_string(),
+    })
+    .into()
+}
+
+/// The response for a stored transformer — every member read back off the record, so a
+/// create and a later `GetTransformer` cannot disagree.
+fn stored_transformer_response(transformer: &crate::state::Transformer) -> CreateTransformerOutput {
+    CreateTransformerOutput {
+        transformer_id: transformer.transformer_id.clone(),
+        transformer_arn: transformer.transformer_arn.clone(),
+        name: transformer.name.clone(),
+        status: transformer.status.clone(),
+        created_at: transformer.created_at,
+        file_format: transformer.file_format.clone(),
+        mapping_template: transformer.mapping_template.clone(),
+        edi_type: transformer.edi_type.clone(),
+        sample_document: transformer.sample_document.clone(),
+        input_conversion: transformer.input_conversion.clone(),
+        mapping: transformer.mapping.clone(),
+        output_conversion: transformer.output_conversion.clone(),
+        sample_documents: transformer.sample_documents.clone(),
+    }
+}
+
 /// The `CreateTransformer` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -227,18 +361,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTransformer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTransformerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // A transformer is configured in exactly one of the two styles the model offers:
+        // the deprecated members, or the ones that replace them. Checked before the store
+        // is touched, so a refused request persists nothing.
+        let legacy = legacy_members_present(&input);
+        let current = current_members_present(&input);
+        if !legacy.is_empty() && !current.is_empty() {
+            return Err(mixed_configuration_styles(&legacy, &current));
+        }
+
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateTransformerErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STATE_UNAVAILABLE.to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let mut state = store.lock();
+
+        // `clientToken` is this operation's `@idempotencyToken`: a repeat carrying the
+        // same token answers with the transformer the first call created, not a second one.
+        // The model's prose calls the member "Reserved for future use", but the trait and
+        // the recorded behaviour (trace
+        // `b2bi.create-transformer-idempotent-token-concurrent-dedup`: concurrent creates
+        // sharing one token yield exactly ONE transformer, and a later replay of that token
+        // answers with the original transformerId) both say it dedupes, so the trait wins.
+        // Lookup and insert happen under one hold of the state lock, so concurrent racers
+        // sharing a token cannot each mint one.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTransformer"))
+        // That recording also has the LOSING racers answered with `ConflictException`.
+        // Serialised behind the state lock there are no losers here: every racer sees the
+        // one transformer the first of them created, which satisfies the "exactly one
+        // transformer" property the recording turns on. The separate, still-open
+        // transformer-operations issue
+        // (`20261022T031134Z-b2bi-tagging-test-harness-and-transformer-operations-answer.md`,
+        // cause 5) owns the in-flight `ConflictException` wording, which needs a
+        // genuinely asynchronous create to be observable at all.
+        let idempotency_key = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::idempotency_key("transformer", token));
+        if let Some(key) = idempotency_key.as_deref() {
+            if let Some(existing) = state
+                .idempotency
+                .get(key)
+                .and_then(|id| state.transformers.get(id))
+            {
+                return Ok(stored_transformer_response(existing));
+            }
+        }
+
+        // Residency bound: this store holds at most `MAX_RECORDS_PER_STORE` transformers,
+        // so repeated creates cannot grow the emulator's memory without limit. Checked
+        // AFTER the idempotency replay, so a replay still answers from a full store.
+        if !state.accepts_another_transformer() {
+            return Err(store_full());
+        }
+
+        let mut transformer_id = crate::state::new_resource_id("t");
+        while state.transformers.contains_key(&transformer_id) {
+            transformer_id = crate::state::new_resource_id("t");
+        }
+        let region = crate::state::request_region(ctx.parts());
+        let transformer = crate::state::Transformer {
+            transformer_arn: ::engine::emulator_arn(
+                "b2bi",
+                &region,
+                &format!("transformer/{transformer_id}"),
+            ),
+            transformer_id,
+            name: input.name,
+            status: crate::state::TRANSFORMER_STATUS_INACTIVE.to_string(),
+            file_format: input.file_format,
+            mapping_template: input.mapping_template,
+            edi_type: input.edi_type,
+            sample_document: input.sample_document,
+            input_conversion: input.input_conversion,
+            mapping: input.mapping,
+            output_conversion: input.output_conversion,
+            sample_documents: input.sample_documents,
+            created_at: crate::state::now(),
+            modified_at: None,
+            tags: input.tags.unwrap_or_default(),
+        };
+
+        let response = stored_transformer_response(&transformer);
+        let transformer_id = transformer.transformer_id.clone();
+        state
+            .transformers
+            .insert(transformer_id.clone(), transformer);
+        state.transformer_order.push(transformer_id.clone());
+        if let Some(key) = idempotency_key {
+            state.record_idempotency(key, &transformer_id);
+        }
+        Ok(response)
     }
 }

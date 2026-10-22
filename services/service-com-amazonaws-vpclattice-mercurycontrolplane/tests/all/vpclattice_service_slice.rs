@@ -170,13 +170,13 @@ pub(crate) fn as_label(value: &str) -> String {
 /// A timestamp member is present and carries a real instant. restJson1 renders a
 /// timestamp as epoch seconds unless the member says otherwise, so either a JSON
 /// number or a date-time string counts.
-fn is_timestamp(value: &serde_json::Value) -> bool {
+pub(crate) fn is_timestamp(value: &serde_json::Value) -> bool {
     value.as_f64().is_some_and(|secs| secs > 0.0) || value.as_str().is_some_and(|s| !s.is_empty())
 }
 
 /// An id of `prefix` plus 17 `[0-9a-z]` characters — the shape every modelled id
 /// pattern of this service demands.
-fn is_lattice_id(value: &str, prefix: &str) -> bool {
+pub(crate) fn is_lattice_id(value: &str, prefix: &str) -> bool {
     value.strip_prefix(prefix).is_some_and(|suffix| {
         suffix.len() == 17
             && suffix
@@ -186,7 +186,7 @@ fn is_lattice_id(value: &str, prefix: &str) -> bool {
 }
 
 /// The ARN the emulator must build for `kind`/`id` in the request's region.
-fn expected_arn(kind: &str, id: &str) -> String {
+pub(crate) fn expected_arn(kind: &str, id: &str) -> String {
     format!(
         "arn:aws:vpc-lattice:{REGION}:{}:{kind}/{id}",
         state::account_id()

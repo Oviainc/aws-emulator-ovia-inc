@@ -215,6 +215,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation(why));
         }
 
+        // The tags the create carries are bounded exactly as `TagQueue`'s are, so the
+        // per-queue tag cap cannot be exceeded at create time either. The queue does
+        // not exist yet, so the merge is against an empty map.
+        let tags = input.tags.unwrap_or_default();
+        if let Some(why) = state::tag_refusal(&::std::collections::BTreeMap::new(), &tags) {
+            return Err(crate::scaffolded::Scaffolded::validation(why));
+        }
+
         let supplied = input.attributes.unwrap_or_default();
         // "If you don't specify the FifoQueue attribute, Amazon SQS creates a standard
         // queue" — and it is being FIFO that makes the FIFO-only attributes applicable.
@@ -302,7 +310,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             url: url.clone(),
             arn: state::queue_arn(&region, &input.queue_name),
             attributes,
-            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            tags: tags.into_iter().collect(),
             created_at: now,
             // Nothing has changed the queue yet, so it was last modified when it was
             // created.

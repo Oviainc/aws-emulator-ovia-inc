@@ -7,8 +7,8 @@
 //! The rules under test:
 //!
 //! * a vault is a stored resource: a create is visible to every later read of
-//!   the same name, and a delete makes every one of them 400
-//!   `ResourceNotFoundException`;
+//!   the same name, and a delete makes every vault-scoped read of it 403
+//!   `AccessDeniedException`;
 //! * a value outside what the model admits is refused with this service's
 //!   `InvalidParameterValueException`, an absent required member with
 //!   `MissingParameterValueException`;
@@ -137,7 +137,9 @@ fn name_of_length(length: usize) -> String {
 }
 
 /// A vault round-trips: create, describe, list, delete, then every read of the
-/// deleted name is `ResourceNotFoundException`.
+/// deleted name is refused with 403 `AccessDeniedException` (the access decision
+/// a vault-scoped read makes before it looks the vault up — see
+/// `vault_read_visibility.rs`).
 ///
 /// The table spans the whole `BackupVaultName` length bound (2 and 50, the
 /// published ends, plus interior lengths) and both punctuation characters the
@@ -238,8 +240,8 @@ async fn a_created_vault_round_trips_and_a_deleted_one_is_gone() {
         let (status, gone) = call(&router, "GET", &format!("/backup-vaults/{case}"), None).await;
         assert_eq!(
             (status, error_code(&gone).as_str()),
-            (400, "ResourceNotFoundException"),
-            "case {case:?}: describe after delete must 400 ResourceNotFoundException, got {status} {gone:?}"
+            (403, "AccessDeniedException"),
+            "case {case:?}: describe after delete must 403 AccessDeniedException, got {status} {gone:?}"
         );
         let (status, gone) = call(
             &router,
@@ -250,8 +252,8 @@ async fn a_created_vault_round_trips_and_a_deleted_one_is_gone() {
         .await;
         assert_eq!(
             (status, error_code(&gone).as_str()),
-            (400, "ResourceNotFoundException"),
-            "case {case:?}: listing a deleted vault's recovery points must 400, got {status} {gone:?}"
+            (403, "AccessDeniedException"),
+            "case {case:?}: listing a deleted vault's recovery points must 403, got {status} {gone:?}"
         );
         let (_, listed) = call(&router, "GET", "/backup-vaults", None).await;
         let remaining = listed["BackupVaultList"].as_array().cloned().unwrap_or_default();
@@ -844,6 +846,11 @@ async fn an_unrecognised_cursor_is_refused() {
 /// Everything that names a resource this service does not hold is
 /// `ResourceNotFoundException`; an absent required member is
 /// `MissingParameterValueException`.
+///
+/// The vault-scoped READS are deliberately absent from this table: they decide
+/// access before existence and so answer 403 `AccessDeniedException` instead —
+/// `vault_read_visibility.rs` covers them. A mutation names the resource it could
+/// not act on, which is what the rows below assert.
 #[tokio::test]
 async fn unknown_resources_and_absent_members_are_refused_by_their_own_code() {
     let router = router();
@@ -855,21 +862,9 @@ async fn unknown_resources_and_absent_members_are_refused_by_their_own_code() {
     );
     let not_found: Vec<(&str, &str, &str, Option<&str>)> = vec![
         (
-            "describe a vault that was never created",
-            "GET",
-            "/backup-vaults/never-created",
-            None,
-        ),
-        (
             "delete a vault that was never created",
             "DELETE",
             "/backup-vaults/never-created",
-            None,
-        ),
-        (
-            "list the recovery points of a vault that was never created",
-            "GET",
-            "/backup-vaults/never-created/recovery-points",
             None,
         ),
         (
@@ -921,9 +916,10 @@ async fn unknown_resources_and_absent_members_are_refused_by_their_own_code() {
 }
 
 /// A vault belongs to one account, and this emulator holds exactly one: a read
-/// that names another account's vault finds nothing.
+/// that names another account's vault is refused for lack of privileges rather
+/// than told the vault is absent.
 #[tokio::test]
-async fn a_read_scoped_to_another_account_finds_nothing() {
+async fn a_read_scoped_to_another_account_is_denied() {
     let router = router();
     let (status, _) = create_vault(&router, "scoped-vault", "{}").await;
     assert_eq!(status, 200, "setup: CreateBackupVault should succeed");
@@ -942,8 +938,8 @@ async fn a_read_scoped_to_another_account_finds_nothing() {
         } else {
             assert_eq!(
                 (status, error_code(&body).as_str()),
-                (400, "ResourceNotFoundException"),
-                "case {case:?}: expected 400 ResourceNotFoundException, got {status} {body:?}"
+                (403, "AccessDeniedException"),
+                "case {case:?}: expected 403 AccessDeniedException, got {status} {body:?}"
             );
         }
     }

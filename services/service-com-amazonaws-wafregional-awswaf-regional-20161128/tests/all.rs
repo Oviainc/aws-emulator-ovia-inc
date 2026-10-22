@@ -21,3 +21,5 @@ mod sql_injection_match_set;
 mod state_roundtrip;
 #[path = "all/wire.rs"]
 mod wire;
+#[path = "all/xss_match_set_lifecycle.rs"]
+mod xss_match_set_lifecycle;

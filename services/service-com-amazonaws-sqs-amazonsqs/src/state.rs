@@ -21,7 +21,7 @@
 //! they are reported by NO value here rather than by a made-up one — see
 //! [`MESSAGE_PLANE_ATTRIBUTES`].
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::SystemTime;
 
 use crate::ops::types::{
@@ -56,6 +56,23 @@ pub const FIFO_QUEUE_NAME_SUFFIX: &str = ".fifo";
 
 /// The attribute that designates a queue as FIFO.
 pub const FIFO_QUEUE_ATTRIBUTE: &str = "FifoQueue";
+
+/// How many cost allocation tags one queue may carry.
+///
+/// The `TagQueue`/`CreateQueueRequest$tags` documentation makes 50 the guideline
+/// ("Adding more than 50 tags to a queue isn't recommended") and points at "Quotas
+/// related to queues" for "a full list of tag restrictions", which publishes 50 tags
+/// per queue. It is enforced here as a bound, over the tag set a call would LEAVE the
+/// queue with, so no sequence of tagging calls grows one queue's map without limit.
+pub const MAX_TAGS_PER_QUEUE: usize = 50;
+
+/// The longest tag key a queue accepts: 128 characters, per the same "Quotas related
+/// to queues" tag restrictions.
+pub const MAX_TAG_KEY_LENGTH: usize = 128;
+
+/// The longest tag value a queue accepts: 256 characters, per the same "Quotas related
+/// to queues" tag restrictions.
+pub const MAX_TAG_VALUE_LENGTH: usize = 256;
 
 /// Attributes `GetQueueAttributes` reports but no caller sets: they are properties of
 /// the queue record itself, so [`Queue::reported_attributes`] derives each one.
@@ -290,7 +307,11 @@ pub struct Queue {
     /// overlaid on the documented defaults, plus whatever a later
     /// `SetQueueAttributes` changed. Name-ordered so the reported map is stable.
     pub attributes: BTreeMap<String, String>,
-    /// Exactly the `tags` map the create carried.
+    /// The queue's cost allocation tags: what the create carried, plus every tag a
+    /// later `TagQueue` added or overwrote, bounded by [`MAX_TAGS_PER_QUEUE`].
+    /// Key-ordered so the map `ListQueueTags` reports is stable, and case-sensitive
+    /// (keys differing only in case are different tags), as the `TagQueue`
+    /// documentation states.
     pub tags: BTreeMap<String, String>,
     pub created_at: SystemTime,
     /// When an attribute of this queue last changed; equals `created_at` until a
@@ -510,6 +531,47 @@ pub fn queue_name_refusal(name: &str) -> Option<String> {
     {
         return Some(format!(
             "QueueName {name} is invalid: a queue name may hold only alphanumeric characters, hyphens (-) and underscores (_), optionally followed by the {FIFO_QUEUE_NAME_SUFFIX} suffix"
+        ));
+    }
+    None
+}
+
+/// Why a `tags` map a caller supplied was refused, as the text of the refusal a caller
+/// has to fix the request from, or `None` when the map is acceptable.
+///
+/// `existing` is the tag map the queue carries today, so the count is checked against
+/// what the call would LEAVE the queue with: a key the request repeats overwrites the
+/// existing tag rather than adding one. Keys are visited in order, so a map with two
+/// bad tags is always refused for the same one.
+///
+/// The rules are the tag restrictions the `tags` member's own documentation points at:
+/// at most [`MAX_TAGS_PER_QUEUE`] tags per queue, a key of 1 to
+/// [`MAX_TAG_KEY_LENGTH`] characters and a value of up to [`MAX_TAG_VALUE_LENGTH`].
+pub fn tag_refusal(
+    existing: &BTreeMap<String, String>,
+    supplied: &HashMap<String, String>,
+) -> Option<String> {
+    let mut keys: Vec<&String> = supplied.keys().collect();
+    keys.sort();
+    for key in &keys {
+        let length = key.chars().count();
+        if length == 0 || length > MAX_TAG_KEY_LENGTH {
+            return Some(format!(
+                "Tag key is invalid: a tag key must be between 1 and {MAX_TAG_KEY_LENGTH} characters long, but was {length}"
+            ));
+        }
+        let value_length = supplied[*key].chars().count();
+        if value_length > MAX_TAG_VALUE_LENGTH {
+            return Some(format!(
+                "The value of tag key {key} is invalid: a tag value may hold up to {MAX_TAG_VALUE_LENGTH} characters, but was {value_length}"
+            ));
+        }
+    }
+    let merged: BTreeSet<&String> = existing.keys().chain(supplied.keys()).collect();
+    if merged.len() > MAX_TAGS_PER_QUEUE {
+        return Some(format!(
+            "A queue may carry up to {MAX_TAGS_PER_QUEUE} tags, but this request would leave it with {}",
+            merged.len()
         ));
     }
     None
