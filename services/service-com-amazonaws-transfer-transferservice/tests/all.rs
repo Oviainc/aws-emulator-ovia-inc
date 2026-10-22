@@ -21,6 +21,14 @@ mod connector_configuration;
 mod connector_listing;
 #[path = "all/error_message_rules.rs"]
 mod error_message_rules;
+// `workflow_step_contract` is declared HERE rather than in its alphabetical place at the
+// end of this list, for the reason `service-com-amazonaws-iotsitewise-awsiotsitewise`
+// records for its own out-of-place suite: a suite this crate gains is inserted into the
+// sorted list or appended after it, so those are the lines a concurrent change also
+// edits, and this declaration kept landing on top of one. Fold it into the list once the
+// churn settles.
+#[path = "all/workflow_step_contract.rs"]
+mod workflow_step_contract;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/host_key_lifecycle.rs"]
