@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteLifecyclePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteLifecyclePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes the lifecycle policy from a repository, reporting the policy that was
+//! removed: the repository keeps its images and goes back to carrying no policy, so a
+//! later `GetLifecyclePolicy` is refused with `LifecyclePolicyNotFoundException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteLifecyclePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deleting when nothing is set is refused the same way — the delete is not a silent
+//! no-op success, because that is how a caller tells "never set" from "just removed".
 //!
 //! ## Shape of an operation
 //!
@@ -123,6 +120,27 @@ impl From<DeleteLifecyclePolicyErrorModeled> for DeleteLifecyclePolicyError {
     }
 }
 
+/// Map a shared-state failure onto this operation's own modelled errors.
+fn fault_error(fault: crate::state::Fault) -> DeleteLifecyclePolicyErrorModeled {
+    let message = Some(fault.message().to_string());
+    match fault {
+        crate::state::Fault::RepositoryNotFound(_) => {
+            DeleteLifecyclePolicyErrorModeled::RepositoryNotFoundException(
+                RepositoryNotFoundException { message },
+            )
+        }
+        crate::state::Fault::LifecyclePolicyNotFound(_) => {
+            DeleteLifecyclePolicyErrorModeled::LifecyclePolicyNotFoundException(
+                LifecyclePolicyNotFoundException { message },
+            )
+        }
+        // `ImageNotFound` cannot arise here: this delete resolves no image.
+        _ => DeleteLifecyclePolicyErrorModeled::InvalidParameterException(
+            InvalidParameterException { message },
+        ),
+    }
+}
+
 /// The `DeleteLifecyclePolicy` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -159,18 +177,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteLifecyclePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteLifecyclePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteLifecyclePolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteLifecyclePolicyErrorModeled::ServerException(ServerException {
+                    message: Some("the ecr repository store is unavailable".to_string()),
+                })
+                .into(),
+            );
+        };
+        let _ = ctx;
+
+        crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
+
+        let mut store = state.lock();
+        let repo = store
+            .repository_mut(&input.repository_name)
+            .map_err(fault_error)?;
+        // `take` is the removal and the report in one step: what comes back is the policy
+        // that was in place, and the repository is left carrying none.
+        let removed = repo.lifecycle_policy.take().ok_or_else(|| {
+            fault_error(crate::state::Fault::LifecyclePolicyNotFound(
+                crate::state::lifecycle_policy_not_found_message(&repo.name),
+            ))
+        })?;
+
+        Ok(DeleteLifecyclePolicyOutput {
+            registry_id: Some(repo.registry_id.clone()),
+            repository_name: Some(repo.name.clone()),
+            lifecycle_policy_text: Some(removed),
+            // See `GetLifecyclePolicy`: no policy has been run, so there is no
+            // evaluation instant to report for the one just removed.
+            last_evaluated_at: None,
+        })
     }
 }

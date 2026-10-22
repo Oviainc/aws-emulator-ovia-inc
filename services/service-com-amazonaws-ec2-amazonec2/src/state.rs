@@ -2,6 +2,17 @@
 
 //! Engine state for the com-amazonaws-ec2-amazonec2 service.
 //!
+//! This module owns the EC2 instance lifecycle: the reservations `RunInstances`
+//! mints, the instances inside them, their tags, and the clock-owed state
+//! transitions `Start`/`Stop`/`TerminateInstances` start. The projection of a
+//! stored instance into the modelled `Instance` shape lives here too, so
+//! `RunInstances` and `DescribeInstances` cannot report the same instance
+//! differently.
+//!
+//! Each operation's own validation and orchestration stays in its
+//! `src/ops/<operation>.rs` file; only the data model and the primitives several
+//! operations share live here.
+//!
 //! ## Availability Zones are facts of a Region, not stored resources
 //!
 //! Nothing in the EC2 API creates, renames or deletes an Availability Zone: AWS
@@ -28,17 +39,356 @@
 //! as they are implemented, and should be validated against
 //! [`availability_zones_in_region`] rather than against a second zone list.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    AvailabilityZone, AvailabilityZoneMessage, BlockPublicAccessStates, INSTANCE_TYPE_VALUES,
-    InstanceTypeOffering, LOCATION_TYPE_VALUES, Tag, Vpc, VpcCidrBlockAssociation,
+    AvailabilityZone, AvailabilityZoneMessage, BlockPublicAccessStates, GroupIdentifier,
+    INSTANCE_TYPE_VALUES, Instance, InstanceState, InstanceTypeOffering, LOCATION_TYPE_VALUES,
+    Monitoring, Placement, RunInstancesOutput, StateReason, Tag, Vpc, VpcCidrBlockAssociation,
     VpcCidrBlockState,
 };
 
+/// The `Reservation` shape, under the name the scaffold generated for it.
+///
+/// `com.amazonaws.ec2#Reservation` is both `RunInstances`'s output shape and the
+/// member type of `DescribeInstances`'s `Reservations` list, so the generator
+/// emitted it once under the output name. This alias lets the code read as the
+/// model does.
+pub type ReservationView = RunInstancesOutput;
+
+/// The one region whose Amazon-provided private DNS suffix is `ec2.internal`
+/// rather than `<region>.compute.internal`.
+pub const EC2_INTERNAL_REGION: &str = "us-east-1";
+
 /// The Region a request belongs to when it carries no SigV4 credential scope to read
 /// one from — `::engine::emulator_arn`'s documented default Region.
-pub const DEFAULT_REGION: &str = "us-east-1";
+pub const DEFAULT_REGION: &str = EC2_INTERNAL_REGION;
+
+/// The instance type `RunInstances` launches when the request names none.
+///
+/// AWS documents `m1.small` as `RunInstances`'s default instance type.
+pub const DEFAULT_INSTANCE_TYPE: &str = "m1.small";
+
+/// The maximum number of tags one EC2 resource may carry.
+///
+/// From the `CreateTags` documentation: "Each resource can have a maximum of 50
+/// tags."
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The maximum number of resource or instance ids one request may name.
+///
+/// Documented on `CreateTags$Resources` ("Up to 1000 resource IDs") and on
+/// `TerminateInstances$InstanceIds` ("Up to 1000 instance IDs"); the model declares
+/// no `@length`, so the handler is the only place the bound can exist.
+pub const MAX_RESOURCE_IDS: usize = 1000;
+
+/// The most instances one `RunInstances` call may launch here.
+///
+/// The real service bounds `MaxCount` by the account's instance-type quota and
+/// answers `InstanceLimitExceeded` above it. This emulator has no quota service, so
+/// the ceiling is a fixed CHOSEN one. It is what keeps a single request's work and
+/// allocation bounded: `MaxCount` arrives as a plain `i32` with no modelled
+/// `@range`, so without this a request could ask for `i32::MAX` records.
+pub const MAX_INSTANCES_PER_RUN: i32 = 64;
+
+/// The most instances this emulator holds at once.
+///
+/// Also CHOSEN. Terminated instances are kept (the real service reports them for a
+/// while), so without a ceiling repeated launches would grow memory without bound.
+/// At most one reservation and one client token exist per launch, and every launch
+/// mints at least one instance, so this bounds those two maps too.
+pub const MAX_STORED_INSTANCES: usize = 4096;
+
+/// The most filters one `DescribeInstances` call may carry.
+///
+/// CHOSEN, for the same reason: matching cost is the product of filters, values and
+/// stored instances, and the model bounds none of the three.
+pub const MAX_FILTERS: usize = 32;
+
+/// The most values one `DescribeInstances` filter may carry. CHOSEN, see
+/// [`MAX_FILTERS`].
+pub const MAX_FILTER_VALUES: usize = 64;
+
+/// The largest page `DescribeInstances` will serve, and the page size it uses when
+/// the request names none.
+///
+/// AWS documents `MaxResults` for this operation with a maximum of 1000. Applying it
+/// as the DEFAULT too is what stops a parameterless describe from materialising the
+/// whole store in one response.
+pub const MAX_PAGE_SIZE: usize = 1000;
+
+/// The most matcher steps one `DescribeInstances` may spend on filtering.
+///
+/// CHOSEN, and it is the bound the per-factor caps cannot give: capping instances,
+/// filters, values and value length each on their own still leaves their PRODUCT
+/// free. The describe counts the comparisons it makes against this ceiling, which is
+/// what keeps one request's filtering — and therefore the time it holds the state
+/// lock — bounded however the caller combines the factors.
+pub const MAX_FILTER_MATCH_STEPS: u64 = 2_000_000;
+
+/// A countdown of matcher steps shared by every comparison one request makes.
+///
+/// Spending is saturating and the budget never refills, so once it is gone every
+/// further comparison answers "no match" immediately and the caller sees
+/// [`Self::exhausted`] — which is a different answer from "nothing matched" and is
+/// reported as such.
+#[derive(Debug)]
+pub struct MatchBudget {
+    remaining: u64,
+}
+
+impl MatchBudget {
+    /// A budget of `steps` matcher steps.
+    pub fn new(steps: u64) -> Self {
+        Self { remaining: steps }
+    }
+
+    /// A budget nothing can exhaust, for a comparison made once.
+    pub fn unlimited() -> Self {
+        Self { remaining: u64::MAX }
+    }
+
+    /// Charge one step; `false` once the budget is gone.
+    pub fn spend(&mut self) -> bool {
+        if self.remaining == 0 {
+            return false;
+        }
+        self.remaining -= 1;
+        true
+    }
+
+    /// Whether the budget ran out.
+    pub fn exhausted(&self) -> bool {
+        self.remaining == 0
+    }
+}
+
+/// The most bytes one `DescribeInstances` filter value may carry.
+///
+/// A capped NUMBER of comparisons is not a capped amount of work: the matcher's
+/// cost is the product of the pattern's length and the value's, so the per-item
+/// size needs a bound of its own. It is derived from [`MAX_TAG_VALUE_CHARS`] — the
+/// longest value this store can hold — times UTF-8's maximum bytes per character,
+/// so every stored value stays matchable by an exact filter.
+pub const MAX_FILTER_VALUE_BYTES: usize = MAX_TAG_VALUE_CHARS * 4;
+
+/// The most user data one launch may carry.
+///
+/// AWS documents a 16 KB limit on instance user data; the model declares no
+/// `@length` on `RunInstancesUserData`, so the handler is the only place it can be
+/// enforced. It is a BYTE bound, which a count bound cannot give: one request's
+/// user data is otherwise cloned into every instance the request mints.
+pub const MAX_USER_DATA_BYTES: usize = 16 * 1024;
+
+/// The most security groups one instance may be launched with.
+///
+/// AWS documents a maximum of 16 security groups per network interface; the model
+/// declares no `@length` on `SecurityGroupIds`/`SecurityGroups`, and the list is
+/// cloned into every instance the request mints.
+pub const MAX_SECURITY_GROUPS_PER_INSTANCE: usize = 16;
+
+/// The most characters a tag key may carry. From `Tag$Key`'s own doc: "Tag keys are
+/// case-sensitive and accept a maximum of 127 Unicode characters."
+pub const MAX_TAG_KEY_CHARS: usize = 127;
+
+/// The most characters a tag value may carry. From `Tag$Value`'s own doc: "Tag
+/// values are case-sensitive and accept a maximum of 256 Unicode characters."
+pub const MAX_TAG_VALUE_CHARS: usize = 256;
+
+/// The most caller-chosen BYTES this emulator holds across every stored instance:
+/// user data, client tokens, tags and security-group names.
+///
+/// CHOSEN, and it is the companion [`MAX_STORED_INSTANCES`] needs: a count-only
+/// ceiling admits gigabytes, because each of those records holds strings the caller
+/// chose the length of.
+pub const MAX_STORED_BYTES: usize = 64 * 1024 * 1024;
+
+/// How many candidate addresses [`ComAmazonawsEc2Amazonec2State::allocate_private_ip`]
+/// may probe before giving up, so the search cannot spin.
+const MAX_PRIVATE_IP_PROBES: u32 = 1 << 16;
+
+/// How long after the call that starts it a clock-owed instance transition falls
+/// due (`pending` -> `running`, `stopping` -> `stopped`, `shutting-down` ->
+/// `terminated`).
+///
+/// CHOSEN, not an AWS-documented duration: the real service takes tens of
+/// seconds. It is deliberately NON-ZERO, so a caller that reads straight after
+/// the call still observes the transient state and the state errors that go with
+/// it, and short enough that a test can wait it out. The due instant is stored;
+/// nothing sleeps for it.
+pub const TRANSITION_DELAY: Duration = Duration::from_millis(500);
+
+/// The `DescribeInstances` filter names this slice resolves.
+///
+/// Source: the `Filters` member documentation of
+/// `com.amazonaws.ec2#DescribeInstancesRequest`
+/// (`smithy_query(query="doc",shape="DescribeInstancesRequest",member="Filters")`).
+/// It lists many more; the ones here are those whose value this slice actually
+/// stores. `tag:<key>` is matched separately because its name carries the key.
+pub const SUPPORTED_INSTANCE_FILTERS: &[&str] = &[
+    "architecture",
+    "availability-zone",
+    "client-token",
+    "ebs-optimized",
+    "image-id",
+    "instance-id",
+    "instance-state-code",
+    "instance-state-name",
+    "instance-type",
+    "instance.group-id",
+    "instance.group-name",
+    "key-name",
+    "launch-index",
+    "monitoring-state",
+    "owner-id",
+    "private-dns-name",
+    "private-ip-address",
+    "reservation-id",
+    "subnet-id",
+    "tag-key",
+];
+
+/// The prefix of the `tag:<key>` filter family.
+pub const TAG_FILTER_PREFIX: &str = "tag:";
+
+/// Tag keys starting with this prefix are reserved for AWS and cannot be set
+/// through `CreateTags`.
+pub const RESERVED_TAG_PREFIX: &str = "aws:";
+
+/// The resource types `RunInstances`'s `TagSpecifications` accepts.
+///
+/// From the member's documentation: "You can specify tags for the following
+/// resources only: Instances Volumes Spot Instance requests Network interfaces".
+/// Only the `instance` entry has a resource this slice stores; the others are
+/// accepted and carry no instance tags.
+pub const RUN_INSTANCES_TAGGABLE_RESOURCES: &[&str] = &[
+    "instance",
+    "volume",
+    "spot-instances-request",
+    "network-interface",
+];
+
+/// One of the six states `com.amazonaws.ec2#InstanceStateName` models.
+///
+/// The numeric codes are the ones the `instance-state-code` filter documents:
+/// "0 (pending), 16 (running), 32 (shutting-down), 48 (terminated), 64
+/// (stopping), and 80 (stopped)".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InstanceStateName {
+    #[default]
+    Pending,
+    Running,
+    ShuttingDown,
+    Terminated,
+    Stopping,
+    Stopped,
+}
+
+impl InstanceStateName {
+    /// The wire name of this state.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::ShuttingDown => "shutting-down",
+            Self::Terminated => "terminated",
+            Self::Stopping => "stopping",
+            Self::Stopped => "stopped",
+        }
+    }
+
+    /// The 16-bit state code EC2 reports beside the name.
+    pub fn code(self) -> i32 {
+        match self {
+            Self::Pending => 0,
+            Self::Running => 16,
+            Self::ShuttingDown => 32,
+            Self::Terminated => 48,
+            Self::Stopping => 64,
+            Self::Stopped => 80,
+        }
+    }
+
+    /// The modelled `InstanceState` for this state.
+    pub fn view(self) -> InstanceState {
+        InstanceState {
+            code: Some(self.code()),
+            name: Some(self.as_str().to_string()),
+        }
+    }
+
+    /// Whether the instance is on its way to, or already in, `terminated` — the
+    /// one end state an instance never leaves.
+    pub fn is_terminating(self) -> bool {
+        matches!(self, Self::ShuttingDown | Self::Terminated)
+    }
+}
+
+/// A state change the CLOCK owes an instance: the state it moves to, and the
+/// instant from which that move is due.
+#[derive(Debug, Clone)]
+pub struct PendingTransition {
+    pub to: InstanceStateName,
+    pub due_at: Instant,
+}
+
+impl PendingTransition {
+    /// A transition to `to`, due [`TRANSITION_DELAY`] from now.
+    pub fn starting_now(to: InstanceStateName) -> Self {
+        Self {
+            to,
+            due_at: Instant::now() + TRANSITION_DELAY,
+        }
+    }
+}
+
+/// One stored EC2 instance.
+#[derive(Debug, Clone)]
+pub struct InstanceRecord {
+    pub instance_id: String,
+    pub reservation_id: String,
+    pub image_id: Option<String>,
+    pub instance_type: String,
+    pub key_name: Option<String>,
+    pub subnet_id: Option<String>,
+    /// The security groups the launch named, as `(group id, group name)`: a
+    /// request may name either.
+    pub security_groups: Vec<(Option<String>, Option<String>)>,
+    pub private_ip: String,
+    pub private_dns_name: String,
+    pub public_ip: Option<String>,
+    pub state: InstanceStateName,
+    /// The next state the clock owes this instance, if any.
+    pub pending_transition: Option<PendingTransition>,
+    pub state_transition_reason: Option<String>,
+    /// The `StateReason` code and message, set when the caller moved the state.
+    pub state_reason: Option<(String, String)>,
+    pub launch_time: SystemTime,
+    pub ami_launch_index: i32,
+    /// Stored because the launch supplied it; `DescribeInstances` never reports user
+    /// data (the real service returns it from `DescribeInstanceAttribute`, which is
+    /// still a stub).
+    pub user_data: Option<String>,
+    pub placement_az: String,
+    pub monitoring_state: String,
+    pub architecture: String,
+    pub ebs_optimized: bool,
+    pub hibernation_configured: bool,
+    pub disable_api_termination: bool,
+    pub tags: BTreeMap<String, String>,
+    pub client_token: Option<String>,
+}
+
+/// One stored reservation: the unit of state one `RunInstances` call creates.
+#[derive(Debug, Clone, Default)]
+pub struct ReservationRecord {
+    pub reservation_id: String,
+    pub owner_id: String,
+    pub requester_id: Option<String>,
+    /// Its instances, in launch order (so index == `ami_launch_index`).
+    pub instance_ids: Vec<String>,
+}
 
 /// How many Availability Zones a Region reports.
 ///
@@ -133,6 +483,25 @@ pub const BLOCK_PUBLIC_ACCESS_OFF: &str = "off";
 /// Per-service state for com-amazonaws-ec2-amazonec2. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsEc2Amazonec2State {
+    /// Reservations by `ReservationId`.
+    pub reservations: HashMap<String, ReservationRecord>,
+    /// Reservation ids in launch order: the stable order `DescribeInstances`
+    /// reports and pages over.
+    pub reservation_order: Vec<String>,
+    /// Instances by `InstanceId`.
+    pub instances: HashMap<String, InstanceRecord>,
+    /// A `RunInstances` `ClientToken` and the reservation it minted, so a repeat
+    /// of the same request returns that reservation instead of launching again.
+    pub client_tokens: HashMap<String, String>,
+    /// Every primary private address in use, so allocating the next one is a
+    /// constant-time check rather than a scan of every stored instance.
+    assigned_private_ips: ::std::collections::HashSet<String>,
+    /// The caller-chosen bytes the stored instances hold, bounded by
+    /// [`MAX_STORED_BYTES`].
+    stored_bytes: usize,
+    next_instance: u64,
+    next_reservation: u64,
+    next_private_ip: u32,
     /// Every VPC the account holds, by `VpcId`.
     ///
     /// Availability Zones are NOT here: they are derived from the Region (see the
@@ -148,6 +517,15 @@ pub struct ComAmazonawsEc2Amazonec2State {
 impl Default for ComAmazonawsEc2Amazonec2State {
     fn default() -> Self {
         let mut state = Self {
+            reservations: HashMap::new(),
+            reservation_order: Vec::new(),
+            instances: HashMap::new(),
+            client_tokens: HashMap::new(),
+            assigned_private_ips: ::std::collections::HashSet::new(),
+            stored_bytes: 0,
+            next_instance: 0,
+            next_reservation: 0,
+            next_private_ip: 0,
             vpcs: BTreeMap::new(),
             id_counter: 0,
         };
@@ -220,6 +598,506 @@ impl ComAmazonawsEc2Amazonec2State {
         self.vpcs.insert(vpc_id.clone(), vpc);
         vpc_id
     }
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// A fresh, unused `r-` reservation id.
+    pub fn mint_reservation_id(&mut self) -> String {
+        self.next_reservation += 1;
+        format!("r-{:017x}", self.next_reservation)
+    }
+
+    /// A fresh, unused `i-` instance id.
+    pub fn mint_instance_id(&mut self) -> String {
+        self.next_instance += 1;
+        format!("i-{:017x}", self.next_instance)
+    }
+
+    /// The next unused primary private IPv4 address, or `None` when the search is
+    /// exhausted.
+    ///
+    /// Drawn from `172.31.0.0/16`, the CIDR AWS gives a default VPC, skipping the
+    /// first four addresses of each `/24` (AWS reserves them) and the broadcast
+    /// address. An address already in use is skipped in constant time, and the
+    /// search probes at most [`MAX_PRIVATE_IP_PROBES`] candidates so it cannot spin.
+    pub fn allocate_private_ip(&mut self) -> Option<String> {
+        for _ in 0..MAX_PRIVATE_IP_PROBES {
+            let host = self.next_private_ip;
+            self.next_private_ip = self.next_private_ip.wrapping_add(1);
+            let candidate = format!("172.31.{}.{}", (host / 251) % 256, 4 + host % 251);
+            if !self.assigned_private_ips.contains(&candidate) {
+                // Recorded here, not only in `insert_instance`, so a caller that
+                // allocates several addresses before storing any instance cannot be
+                // handed the same one twice.
+                self.assigned_private_ips.insert(candidate.clone());
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    /// Whether a stored instance already holds `address` as its primary private
+    /// IPv4 address.
+    pub fn private_ip_in_use(&self, address: &str) -> bool {
+        self.assigned_private_ips.contains(address)
+    }
+
+    /// Give an address allocated by [`Self::allocate_private_ip`] back to the pool.
+    ///
+    /// A launch takes one address per instance before storing any of them, so a
+    /// launch that fails part way must hand back what it took or the pool shrinks
+    /// for addresses no instance ever held.
+    pub fn release_private_ip(&mut self, address: &str) {
+        self.assigned_private_ips.remove(address);
+    }
+
+    /// Store a launched instance, appending it to its reservation.
+    pub fn insert_instance(&mut self, record: InstanceRecord) {
+        if let Some(reservation) = self.reservations.get_mut(&record.reservation_id) {
+            reservation.instance_ids.push(record.instance_id.clone());
+        }
+        self.assigned_private_ips.insert(record.private_ip.clone());
+        self.stored_bytes = self
+            .stored_bytes
+            .saturating_add(instance_payload_bytes(&record));
+        self.instances.insert(record.instance_id.clone(), record);
+    }
+
+    /// The caller-chosen bytes stored right now.
+    pub fn stored_bytes(&self) -> usize {
+        self.stored_bytes
+    }
+
+    /// Would storing `bytes` more caller-chosen bytes cross [`MAX_STORED_BYTES`]?
+    pub fn would_exceed_stored_bytes(&self, bytes: usize) -> bool {
+        self.stored_bytes.saturating_add(bytes) > MAX_STORED_BYTES
+    }
+
+    /// Account for `bytes` more caller-chosen bytes, written onto records that are
+    /// already stored (a tag write).
+    pub fn add_stored_bytes(&mut self, bytes: usize) {
+        self.stored_bytes = self.stored_bytes.saturating_add(bytes);
+    }
+
+    /// Store a new reservation, keeping the launch order it reports in.
+    pub fn insert_reservation(&mut self, record: ReservationRecord) {
+        self.reservation_order.push(record.reservation_id.clone());
+        self.reservations
+            .insert(record.reservation_id.clone(), record);
+    }
+
+    /// Apply every clock-owed transition that has come due.
+    ///
+    /// A reporting operation may call this: each move was already owed at this
+    /// instant whether or not anybody asked, so materialising it changes nothing
+    /// a later caller would otherwise have seen.
+    pub fn materialize_due_transitions(&mut self) {
+        let now = Instant::now();
+        for instance in self.instances.values_mut() {
+            let due = instance
+                .pending_transition
+                .as_ref()
+                .filter(|pending| now >= pending.due_at)
+                .map(|pending| pending.to);
+            if let Some(state) = due {
+                instance.state = state;
+                instance.pending_transition = None;
+            }
+        }
+    }
+
+    /// The modelled `Instance` for one stored instance.
+    pub fn instance_view(&self, instance: &InstanceRecord) -> Instance {
+        Instance {
+            instance_id: Some(instance.instance_id.clone()),
+            image_id: instance.image_id.clone(),
+            instance_type: Some(instance.instance_type.clone()),
+            key_name: instance.key_name.clone(),
+            subnet_id: instance.subnet_id.clone(),
+            // VPCs are not modelled yet, so `vpcId` stays absent rather than
+            // carrying an invented id.
+            state: Some(instance.state.view()),
+            // EC2 reports an empty reason while the instance has not been moved
+            // by a caller, so the member is always present.
+            state_transition_reason: Some(
+                instance.state_transition_reason.clone().unwrap_or_default(),
+            ),
+            state_reason: instance
+                .state_reason
+                .as_ref()
+                .map(|(code, message)| StateReason {
+                    code: Some(code.clone()),
+                    message: Some(message.clone()),
+                }),
+            private_ip_address: Some(instance.private_ip.clone()),
+            // Documented on `Instance$privateDnsName`: "This name is not available
+            // until the instance enters the running state."
+            private_dns_name: (instance.state != InstanceStateName::Pending)
+                .then(|| instance.private_dns_name.clone()),
+            public_ip_address: instance.public_ip.clone(),
+            launch_time: Some(system_time_to_date_time(instance.launch_time)),
+            ami_launch_index: Some(instance.ami_launch_index),
+            architecture: Some(instance.architecture.clone()),
+            ebs_optimized: Some(instance.ebs_optimized),
+            monitoring: Some(Monitoring {
+                state: Some(instance.monitoring_state.clone()),
+            }),
+            placement: Some(Placement {
+                availability_zone: Some(instance.placement_az.clone()),
+                ..Default::default()
+            }),
+            security_groups: Some(
+                instance
+                    .security_groups
+                    .iter()
+                    .map(|(group_id, group_name)| GroupIdentifier {
+                        group_id: group_id.clone(),
+                        group_name: group_name.clone(),
+                    })
+                    .collect(),
+            ),
+            client_token: instance.client_token.clone(),
+            tags: Some(tag_list(&instance.tags)),
+            ..Default::default()
+        }
+    }
+
+    /// The modelled `Reservation` for `reservation_id`, carrying exactly
+    /// `instance_ids` (which the caller has already filtered and ordered).
+    pub fn reservation_view(
+        &self,
+        reservation_id: &str,
+        instance_ids: &[String],
+    ) -> Option<ReservationView> {
+        let reservation = self.reservations.get(reservation_id)?;
+        Some(ReservationView {
+            reservation_id: Some(reservation.reservation_id.clone()),
+            owner_id: Some(reservation.owner_id.clone()),
+            requester_id: reservation.requester_id.clone(),
+            // `Reservation$groups` is documented "Not supported", so it stays absent.
+            groups: None,
+            instances: Some(
+                instance_ids
+                    .iter()
+                    .filter_map(|id| self.instances.get(id))
+                    .map(|instance| self.instance_view(instance))
+                    .collect(),
+            ),
+        })
+    }
+
+    /// The modelled `Reservation` for `reservation_id` with every instance it holds.
+    pub fn whole_reservation_view(&self, reservation_id: &str) -> Option<ReservationView> {
+        let instance_ids = self.reservations.get(reservation_id)?.instance_ids.clone();
+        self.reservation_view(reservation_id, &instance_ids)
+    }
+
+    /// The values a filter NAME reads off one instance, or `None` when this slice
+    /// does not resolve that name.
+    ///
+    /// A name that resolves to an empty list simply matches nothing — which is
+    /// different from a name the service does not know, and which the caller
+    /// refuses with `InvalidParameterValue`.
+    pub fn filter_values(
+        &self,
+        reservation: &ReservationRecord,
+        instance: &InstanceRecord,
+        name: &str,
+    ) -> Option<Vec<String>> {
+        if let Some(key) = name.strip_prefix(TAG_FILTER_PREFIX) {
+            return Some(instance.tags.get(key).cloned().into_iter().collect());
+        }
+        let single = |value: Option<String>| Some(value.into_iter().collect::<Vec<_>>());
+        match name {
+            "architecture" => single(Some(instance.architecture.clone())),
+            "availability-zone" => single(Some(instance.placement_az.clone())),
+            "client-token" => single(instance.client_token.clone()),
+            "ebs-optimized" => single(Some(instance.ebs_optimized.to_string())),
+            "image-id" => single(instance.image_id.clone()),
+            "instance-id" => single(Some(instance.instance_id.clone())),
+            "instance-state-code" => single(Some(instance.state.code().to_string())),
+            "instance-state-name" => single(Some(instance.state.as_str().to_string())),
+            "instance-type" => single(Some(instance.instance_type.clone())),
+            "instance.group-id" => Some(
+                instance
+                    .security_groups
+                    .iter()
+                    .filter_map(|(group_id, _)| group_id.clone())
+                    .collect(),
+            ),
+            "instance.group-name" => Some(
+                instance
+                    .security_groups
+                    .iter()
+                    .filter_map(|(_, group_name)| group_name.clone())
+                    .collect(),
+            ),
+            "key-name" => single(instance.key_name.clone()),
+            "launch-index" => single(Some(instance.ami_launch_index.to_string())),
+            "monitoring-state" => single(Some(instance.monitoring_state.clone())),
+            "owner-id" => single(Some(reservation.owner_id.clone())),
+            // Matches what the instance REPORTS as its private DNS name, which is
+            // nothing until it runs.
+            "private-dns-name" => single(
+                (instance.state != InstanceStateName::Pending)
+                    .then(|| instance.private_dns_name.clone()),
+            ),
+            "private-ip-address" => single(Some(instance.private_ip.clone())),
+            "reservation-id" => single(Some(instance.reservation_id.clone())),
+            "subnet-id" => single(instance.subnet_id.clone()),
+            "tag-key" => Some(instance.tags.keys().cloned().collect()),
+            _ => None,
+        }
+    }
+
+    /// Whether one instance satisfies EVERY filter, charging the comparisons it makes
+    /// to `budget`.
+    ///
+    /// EC2 combines filters with AND and a single filter's values with OR, and a
+    /// value may carry EC2's wildcards (see [`filter_value_matches`]). The budget is
+    /// what bounds the PRODUCT of instances, filters, values and value length, none
+    /// of which a per-factor cap can do on its own.
+    pub fn instance_matches(
+        &self,
+        reservation: &ReservationRecord,
+        instance: &InstanceRecord,
+        filters: &[CompiledFilter],
+        budget: &mut MatchBudget,
+    ) -> bool {
+        // One step per candidate, so even an unfiltered scan is charged and cannot
+        // walk the whole store for free.
+        if !budget.spend() {
+            return false;
+        }
+        filters.iter().all(|filter| {
+            let Some(held) = self.filter_values(reservation, instance, &filter.name) else {
+                return false;
+            };
+            filter.patterns.iter().any(|pattern| {
+                held.iter()
+                    .any(|value| pattern.matches_within(value, budget))
+            })
+        })
+    }
+}
+
+/// One `DescribeInstances` filter: its name and its values parsed ONCE into
+/// [`FilterPattern`]s.
+#[derive(Debug, Clone)]
+pub struct CompiledFilter {
+    pub name: String,
+    pub patterns: Vec<FilterPattern>,
+}
+
+impl CompiledFilter {
+    /// Parse a filter name and its values.
+    pub fn new(name: String, values: Vec<String>) -> Self {
+        let patterns = values
+            .iter()
+            .map(|value| FilterPattern::compile(value))
+            .collect();
+        Self { name, patterns }
+    }
+}
+
+/// Whether this slice resolves `name` as a `DescribeInstances` filter.
+pub fn filter_name_supported(name: &str) -> bool {
+    name.starts_with(TAG_FILTER_PREFIX) || SUPPORTED_INSTANCE_FILTERS.contains(&name)
+}
+
+/// The caller-chosen bytes one stored instance holds.
+///
+/// Only the members whose length the REQUEST chose count: an id, a state or a
+/// timestamp this emulator mints is a fixed size.
+pub fn instance_payload_bytes(record: &InstanceRecord) -> usize {
+    record.user_data.as_ref().map_or(0, String::len)
+        + record.client_token.as_ref().map_or(0, String::len)
+        + tag_bytes(&record.tags)
+        + record
+            .security_groups
+            .iter()
+            .map(|(group_id, group_name)| {
+                group_id.as_ref().map_or(0, String::len)
+                    + group_name.as_ref().map_or(0, String::len)
+            })
+            .sum::<usize>()
+}
+
+/// The bytes a tag map holds.
+pub fn tag_bytes(tags: &BTreeMap<String, String>) -> usize {
+    tags.iter().map(|(key, value)| key.len() + value.len()).sum()
+}
+
+/// The bytes a modelled `Tag` list holds.
+pub fn tag_list_bytes(tags: &[Tag]) -> usize {
+    tags.iter()
+        .map(|tag| {
+            tag.key.as_ref().map_or(0, String::len) + tag.value.as_ref().map_or(0, String::len)
+        })
+        .sum()
+}
+
+/// Merge `updates` into a modelled `Tag` list, overwriting a key already present.
+///
+/// The same rule `CreateTags` documents: "When you specify an existing tag key, the
+/// value is overwritten with the new value."
+pub fn merge_tag_list(existing: &mut Vec<Tag>, updates: &[(String, String)]) {
+    for (key, value) in updates {
+        match existing
+            .iter_mut()
+            .find(|tag| tag.key.as_deref() == Some(key.as_str()))
+        {
+            Some(tag) => tag.value = Some(value.clone()),
+            None => existing.push(Tag {
+                key: Some(key.clone()),
+                value: Some(value.clone()),
+            }),
+        }
+    }
+}
+
+/// Refuse a tag whose key or value is longer than EC2 documents.
+pub fn validate_tag_size<E>(
+    key: &str,
+    value: &str,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    if key.chars().count() > MAX_TAG_KEY_CHARS {
+        return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
+            "A tag key accepts at most {MAX_TAG_KEY_CHARS} characters"
+        )));
+    }
+    if value.chars().count() > MAX_TAG_VALUE_CHARS {
+        return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
+            "The value of tag key '{key}' accepts at most {MAX_TAG_VALUE_CHARS} characters"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `id` is a well-formed EC2 instance id.
+///
+/// An instance id is `i-` followed by 8 or 17 lowercase hexadecimal digits — the
+/// short and the long id form. EC2 answers `InvalidInstanceID.Malformed` for
+/// anything else, BEFORE it looks the id up, which is a different answer from
+/// `InvalidInstanceID.NotFound` for a well-formed id nothing was launched for.
+pub fn instance_id_is_well_formed(id: &str) -> bool {
+    let Some(suffix) = id.strip_prefix("i-") else {
+        return false;
+    };
+    matches!(suffix.len(), 8 | 17)
+        && suffix
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Refuse an instance id the request named that this service cannot resolve: a
+/// malformed one before an unknown one, the way the service orders the two.
+pub fn require_known_instance<E>(
+    store: &ComAmazonawsEc2Amazonec2State,
+    instance_id: &str,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    if !instance_id_is_well_formed(instance_id) {
+        return Err(crate::scaffolded::Scaffolded::invalid_instance_id_malformed(
+            instance_id,
+        ));
+    }
+    if !store.instances.contains_key(instance_id) {
+        return Err(crate::scaffolded::Scaffolded::invalid_instance_id_not_found(
+            instance_id,
+        ));
+    }
+    Ok(())
+}
+
+/// `ids` in request order with repeats dropped.
+///
+/// One instance gets one answer however many times a batch names it; processing a
+/// repeat twice would report a state change from a state the caller never saw.
+pub fn deduplicate_ids(ids: &[String]) -> Vec<String> {
+    let mut seen = ::std::collections::HashSet::new();
+    ids.iter()
+        .filter(|id| seen.insert((*id).clone()))
+        .cloned()
+        .collect()
+}
+
+/// The modelled `Tag` list for a stored tag map, ordered by key.
+pub fn tag_list(tags: &BTreeMap<String, String>) -> Vec<Tag> {
+    tags.iter()
+        .map(|(key, value)| Tag {
+            key: Some(key.clone()),
+            value: Some(value.clone()),
+        })
+        .collect()
+}
+
+/// The private IPv4 DNS hostname EC2 gives an instance for its primary private
+/// address.
+///
+/// AWS builds the `ip-name` style hostname as `ip-<dash-separated address>`
+/// followed by `.ec2.internal` in `us-east-1` and `.<region>.compute.internal`
+/// in every other region.
+pub fn private_dns_name(private_ip: &str, region: &str) -> String {
+    let host = private_ip.replace('.', "-");
+    if region == EC2_INTERNAL_REGION {
+        format!("ip-{host}.ec2.internal")
+    } else {
+        format!("ip-{host}.{region}.compute.internal")
+    }
+}
+
+/// The processor architecture an instance type runs on.
+///
+/// AWS names an instance type `<family><generation><capabilities>.<size>` and
+/// defines `g` among the capability letters as "AWS Graviton processor", which is
+/// `arm64`; `a1` is the first Graviton family and predates that letter, and the
+/// `mac` families run Apple silicon from their second generation on. Every other
+/// family is `x86_64`. The value is one of `ARCHITECTURE_VALUES_VALUES` in
+/// `ops/types/shared_types.rs`.
+pub fn architecture_for(instance_type: &str) -> String {
+    let family = instance_type.split('.').next().unwrap_or_default();
+    if family.starts_with("mac") {
+        return if family == "mac1" {
+            "x86_64_mac".to_string()
+        } else {
+            "arm64_mac".to_string()
+        };
+    }
+    if family == "a1" {
+        return "arm64".to_string();
+    }
+    let capabilities: String = family
+        .chars()
+        .skip_while(char::is_ascii_alphabetic)
+        .skip_while(char::is_ascii_digit)
+        .collect();
+    if capabilities.contains('g') {
+        "arm64".to_string()
+    } else {
+        "x86_64".to_string()
+    }
+}
+
+/// The reason EC2 records on a state change a caller asked for, naming the
+/// instant it happened.
+pub fn user_initiated_reason(at: SystemTime) -> String {
+    format!("User initiated ({})", iso8601_utc(at))
+}
+
+/// `at` as an RFC 3339 / ISO 8601 UTC timestamp.
+pub fn iso8601_utc(at: SystemTime) -> String {
+    system_time_to_date_time(at)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_default()
+}
+
+/// A `SystemTime` as the modelled timestamp type.
+pub fn system_time_to_date_time(at: SystemTime) -> ::aws_smithy_types::DateTime {
+    let seconds = at
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    ::aws_smithy_types::DateTime::from_secs_f64(seconds)
 }
 
 /// One Availability Zone of one Region, as the describe reads it.
@@ -561,7 +1439,18 @@ impl FilterPattern {
     }
 
     /// Does this filter value match `value`?
+    ///
+    /// Unbudgeted, for a comparison made once; a describe that scans many candidates
+    /// uses [`Self::matches_within`] so one request's total work is bounded.
     pub fn matches(&self, value: &str) -> bool {
+        self.matches_within(value, &mut MatchBudget::unlimited())
+    }
+
+    /// [`Self::matches`], charging every step it takes to `budget`.
+    ///
+    /// Answers `false` as soon as the budget is spent; the caller tells that apart
+    /// from a genuine non-match with [`MatchBudget::exhausted`].
+    pub fn matches_within(&self, value: &str, budget: &mut MatchBudget) -> bool {
         let tokens = &self.tokens;
         let value: Vec<char> = value.chars().collect();
         // Greedy match with one backtrack point per `*`, which is all a pattern with no
@@ -570,6 +1459,9 @@ impl FilterPattern {
         let (mut token, mut position) = (0usize, 0usize);
         let mut backtrack: Option<(usize, usize)> = None;
         while position < value.len() {
+            if !budget.spend() {
+                return false;
+            }
             let matched = match tokens.get(token) {
                 Some(FilterToken::Many) => {
                     backtrack = Some((token, position));
@@ -677,6 +1569,21 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsEc2Amazonec2State>)
+}
+
+/// [`service_state`], with the "mounted on an engine that holds no state" case
+/// already turned into the server error every handler answers it with.
+pub fn require_service_state<Eng: Send + Sync + 'static, E>(
+    engine: &Eng,
+) -> Result<
+    ::engine::ServiceState<ComAmazonawsEc2Amazonec2State>,
+    crate::scaffolded::Scaffolded<E>,
+> {
+    service_state(engine).ok_or_else(|| {
+        crate::scaffolded::Scaffolded::internal_error(
+            "the EC2 emulator is mounted on an engine that holds no state",
+        )
+    })
 }
 
 /// The marker every token this service mints carries, ahead of the checksum and the

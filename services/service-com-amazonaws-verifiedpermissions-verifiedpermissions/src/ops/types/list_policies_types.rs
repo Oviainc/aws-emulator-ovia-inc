@@ -44,7 +44,11 @@ pub struct ListPoliciesOutput {
     pub policies: Vec<PolicyItem>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.verifiedpermissions#PolicyItem")]
+/// `createdDate`/`lastUpdatedDate` target `TimestampFormat`
+/// (`@timestampFormat("date-time")`), so this shape's schema comes from
+/// `vp_schema_and_codec!` rather than `#[smithy_macros::smithy(shape = ...)]` — see
+/// `types/date_time_wire.rs`. Member set, order and requiredness from
+/// `smithy_query(query="shape", shape="PolicyItem")`.
 #[derive(Debug, Clone)]
 pub struct PolicyItem {
     pub policy_store_id: String,
@@ -59,6 +63,25 @@ pub struct PolicyItem {
     pub effect: Option<String>,
     pub name: Option<String>,
 }
+
+vp_schema_and_codec!(
+    PolicyItem,
+    POLICY_ITEM_SCHEMA,
+    "com.amazonaws.verifiedpermissions#PolicyItem",
+    "com.amazonaws.verifiedpermissions",
+    "PolicyItem",
+    (M_POLICY_STORE_ID, policy_store_id, "policyStoreId", 0, req, string),
+    (M_POLICY_ID, policy_id, "policyId", 1, req, string),
+    (M_POLICY_TYPE, policy_type, "policyType", 2, req, string),
+    (M_PRINCIPAL, principal, "principal", 3, opt, struct_of(EntityIdentifier)),
+    (M_RESOURCE, resource, "resource", 4, opt, struct_of(EntityIdentifier)),
+    (M_ACTIONS, actions, "actions", 5, opt, list_of(ActionIdentifier)),
+    (M_DEFINITION, definition, "definition", 6, req, union_of(PolicyDefinitionItem)),
+    (M_CREATED_DATE, created_date, "createdDate", 7, req, date_time),
+    (M_LAST_UPDATED_DATE, last_updated_date, "lastUpdatedDate", 8, req, date_time),
+    (M_EFFECT, effect, "effect", 9, opt, string),
+    (M_NAME, name, "name", 10, opt, string),
+);
 
 #[smithy_macros::smithy(union_for = "com.amazonaws.verifiedpermissions#PolicyDefinitionItem")]
 #[allow(clippy::large_enum_variant)]

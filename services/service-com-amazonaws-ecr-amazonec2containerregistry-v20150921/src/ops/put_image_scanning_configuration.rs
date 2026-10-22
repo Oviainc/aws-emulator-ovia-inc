@@ -125,10 +125,11 @@ impl From<PutImageScanningConfigurationErrorModeled> for PutImageScanningConfigu
 /// Map a shared-state failure onto this operation's own modelled errors.
 ///
 /// Only two of the shared failures are reachable here: a repository this registry does
-/// not hold, and a request naming another registry. This operation looks no image up,
-/// so [`crate::state::Fault::ImageNotFound`] is not raised on its path; it is folded
-/// into the same `InvalidParameterException` as any other unusable parameter rather
-/// than onto an error this operation does not model.
+/// not hold, and a request naming another registry. This operation looks no image up and
+/// resolves no lifecycle policy, so [`crate::state::Fault::ImageNotFound`] and
+/// [`crate::state::Fault::LifecyclePolicyNotFound`] are not raised on its path; they are
+/// folded into the same `InvalidParameterException` as any other unusable parameter
+/// rather than onto an error this operation does not model.
 fn fault_error(fault: crate::state::Fault) -> PutImageScanningConfigurationErrorModeled {
     let message = Some(fault.message().to_string());
     match fault {
@@ -139,6 +140,7 @@ fn fault_error(fault: crate::state::Fault) -> PutImageScanningConfigurationError
         }
         crate::state::Fault::InvalidParameter(_)
         | crate::state::Fault::ImageNotFound(_)
+        | crate::state::Fault::LifecyclePolicyNotFound(_)
         | crate::state::Fault::InvalidTagParameter(_)
         | crate::state::Fault::TooManyTags(_) => {
             PutImageScanningConfigurationErrorModeled::InvalidParameterException(

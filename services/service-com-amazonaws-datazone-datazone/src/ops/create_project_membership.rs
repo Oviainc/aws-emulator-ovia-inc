@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateProjectMembership
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateProjectMembership`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateProjectMembership::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores one membership on a PERSISTED project: the principal the `Member` union
+//! names holds the requested designation, so `ListProjectMemberships` reports it and a
+//! `DeleteProjectMembership` can take it away again.
+//!
+//! One principal holds at most ONE designation in a project, and this operation models
+//! no `ConflictException`, so re-adding a member replaces its designation rather than
+//! storing a second membership for it.
+//!
+//! The member must be a principal the domain can hold a membership for: a group needs a
+//! group profile in the domain, a user does not (see
+//! [`crate::state::resolve_membership_principal`]).
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +153,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateProjectMembership` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateProjectMembershipErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateProjectMembership"))
+        let _ = ctx;
+        use crate::state::{
+            membership_from_request, now_ms, MembershipRefusal, DOMAIN_STATUS_DELETING,
+            MAX_MEMBERSHIPS_PER_PROJECT,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateProjectMembershipErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        let now = now_ms();
+        store.settle_clock(now);
+
+        let domain = store
+            .domains
+            .get_mut(&input.domain_identifier)
+            .filter(|d| d.status != DOMAIN_STATUS_DELETING)
+            .ok_or_else(|| {
+                CreateProjectMembershipErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("Domain {} was not found", input.domain_identifier),
+                    },
+                )
+            })?;
+        let project = domain
+            .projects
+            .get_mut(&input.project_identifier)
+            .ok_or_else(|| {
+                CreateProjectMembershipErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("Project {} was not found", input.project_identifier),
+                    },
+                )
+            })?;
+
+        // The domain and the project are there; now the membership the body asks for.
+        let (key, membership) = membership_from_request(
+            &input.member,
+            &input.designation,
+            input.user_created_designation_id.as_deref(),
+            &input.domain_identifier,
+        )
+        .map_err(|refusal| match refusal {
+            MembershipRefusal::Invalid(message) => {
+                CreateProjectMembershipErrorModeled::ValidationException(ValidationException {
+                    message,
+                })
+                .into()
+            }
+            MembershipRefusal::ProfileNotFound(message) => {
+                CreateProjectMembershipErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException { message },
+                )
+                .into()
+            }
+            MembershipRefusal::Unserved(what) => crate::scaffolded::Scaffolded::not_implemented(
+                &format!("CreateProjectMembership with {what}"),
+            ),
+        })?;
+
+        // The store is bounded, so an add loop cannot grow the emulator's heap without
+        // limit. Replacing an existing member's designation adds nothing, so it is
+        // never refused. This operation models no quota error, so the refusal is the
+        // bad-request one it does model.
+        if project.memberships.len() >= MAX_MEMBERSHIPS_PER_PROJECT
+            && !project.memberships.contains_key(&key)
+        {
+            return Err(CreateProjectMembershipErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "this emulator stores at most {MAX_MEMBERSHIPS_PER_PROJECT} memberships in one project"
+                    ),
+                },
+            )
+            .into());
+        }
+        project.memberships.insert(key, membership);
+
+        Ok(CreateProjectMembershipOutput {})
     }
 }

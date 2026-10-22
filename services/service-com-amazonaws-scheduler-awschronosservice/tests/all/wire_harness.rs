@@ -8,6 +8,7 @@
 //! state lives in one shared engine for the whole router, so a value written by
 //! one request is read back by the next.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use smithy_server_runtime::MultiServiceRouter;
@@ -98,4 +99,57 @@ pub fn error_code(body: &serde_json::Value) -> String {
         .next()
         .unwrap_or("")
         .to_string()
+}
+
+/// Percent-encode one URI path segment or query value, the way an SDK does: an
+/// ARN carries `:` and `/`, and `/tags/{ResourceArn}` is a single (non-greedy)
+/// label, so everything but the unreserved characters has to be encoded for the
+/// value to survive the server's percent-decode unchanged.
+pub fn encode_label(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(char::from(*byte));
+            }
+            other => encoded.push_str(&format!("%{other:02X}")),
+        }
+    }
+    encoded
+}
+
+/// The ARN `CreateScheduleGroup` mints for `name` in `region`.
+pub fn group_arn(region: &str, name: &str) -> String {
+    format!(
+        "arn:aws:scheduler:{region}:{}:schedule-group/{name}",
+        account_id()
+    )
+}
+
+/// `GET /tags/{ResourceArn}`: `ResourceArn` is a non-greedy `@httpLabel`, so it
+/// travels as ONE percent-encoded path segment.
+pub async fn list_tags(router: &MultiServiceRouter, arn: &str) -> (u16, serde_json::Value) {
+    call(router, "GET", &format!("/tags/{}", encode_label(arn)), None).await
+}
+
+/// `ListTagsForResource`'s answer as the map it represents, so a comparison does
+/// not depend on an order AWS never promises.
+pub fn tags_of(body: &serde_json::Value) -> BTreeMap<String, String> {
+    body.get("Tags")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("no Tags list in {body}"))
+        .iter()
+        .map(|tag| {
+            (
+                tag.get("Key")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                tag.get("Value")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        })
+        .collect()
 }

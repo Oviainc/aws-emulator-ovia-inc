@@ -61,7 +61,7 @@ fn is_resource_id(value: &str) -> bool {
 }
 
 /// `NextToken`'s `^[a-zA-Z0-9+/=_-]+$` and `@length(max: 8192)`.
-fn is_next_token(value: &str) -> bool {
+pub(crate) fn is_next_token(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 8192
         && value
@@ -70,7 +70,10 @@ fn is_next_token(value: &str) -> bool {
 }
 
 /// One emulator: a router carrying only this service, over one shared engine.
-fn emulator() -> MultiServiceRouter {
+///
+/// `pub(crate)` because the billing-adjustment suite beside this one drives the
+/// same emulator over the same wire helpers.
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -79,26 +82,26 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// What the emulator answered: the HTTP status and the JSON body.
-struct Answer {
-    status: u16,
-    body: Value,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
 }
 
 impl Answer {
     /// The wire error code (`__type`) without any namespace prefix, or the
     /// empty string on a success.
-    fn error_code(&self) -> &str {
+    pub(crate) fn error_code(&self) -> &str {
         let code = self.body["__type"].as_str().unwrap_or_default();
         code.rsplit('#').next().unwrap_or(code)
     }
 
     /// The `reason` a modelled `ValidationException` carries — one of
     /// `ValidationExceptionReason`'s values, which is what a client branches on.
-    fn reason(&self) -> &str {
+    pub(crate) fn reason(&self) -> &str {
         self.body["reason"].as_str().unwrap_or_default()
     }
 
-    fn str_at(&self, pointer: &str) -> String {
+    pub(crate) fn str_at(&self, pointer: &str) -> String {
         self.body
             .pointer(pointer)
             .and_then(Value::as_str)
@@ -107,7 +110,7 @@ impl Answer {
     }
 }
 
-async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> Answer {
+pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> Answer {
     call_as(router, operation, body, SIGNED_FOR_US_EAST_1).await
 }
 
@@ -175,7 +178,7 @@ async fn cancel(router: &MultiServiceRouter, agreement_id: &str) -> Answer {
 
 /// A requested term that carries no configuration: its kind is whatever its id
 /// names.
-fn term(id: &str) -> Value {
+pub(crate) fn term(id: &str) -> Value {
     json!({"id": id})
 }
 
@@ -229,7 +232,11 @@ fn new_request(proposal: &str, terms: Vec<Value>) -> Value {
 }
 
 /// Create and accept one agreement over `terms`, answering its agreement id.
-async fn agreement_over(router: &MultiServiceRouter, proposal: &str, terms: Vec<Value>) -> String {
+pub(crate) async fn agreement_over(
+    router: &MultiServiceRouter,
+    proposal: &str,
+    terms: Vec<Value>,
+) -> String {
     let created = create(router, new_request(proposal, terms)).await;
     assert_eq!(
         created.status, 200,

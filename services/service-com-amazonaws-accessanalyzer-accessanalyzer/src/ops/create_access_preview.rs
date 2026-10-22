@@ -176,14 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.configurations.len()
             );
             return Err(CreateAccessPreviewErrorModeled::ValidationException(
-                ValidationException {
-                    message: message.clone(),
-                    reason: crate::state::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
-                    field_list: Some(vec![ValidationExceptionField {
-                        name: "configurations".to_string(),
-                        message,
-                    }]),
-                },
+                crate::state::field_validation_exception("configurations", message),
             )
             .into());
         }
@@ -215,14 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 analyzer.status
             );
             return Err(CreateAccessPreviewErrorModeled::ValidationException(
-                ValidationException {
-                    message: message.clone(),
-                    reason: crate::state::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
-                    field_list: Some(vec![ValidationExceptionField {
-                        name: "analyzerArn".to_string(),
-                        message,
-                    }]),
-                },
+                crate::state::field_validation_exception("analyzerArn", message),
             )
             .into());
         }

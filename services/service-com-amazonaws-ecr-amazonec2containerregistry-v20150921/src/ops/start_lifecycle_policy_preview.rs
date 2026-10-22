@@ -138,6 +138,11 @@ fn fault_error(fault: crate::state::Fault) -> StartLifecyclePolicyPreviewErrorMo
                 RepositoryNotFoundException { message },
             )
         }
+        crate::state::Fault::LifecyclePolicyNotFound(_) => {
+            StartLifecyclePolicyPreviewErrorModeled::LifecyclePolicyNotFoundException(
+                LifecyclePolicyNotFoundException { message },
+            )
+        }
         // A malformed policy document, and a registry that is not this one, are each a
         // parameter this operation cannot honour. The remaining kinds are unreachable
         // here — this operation names no image and carries no tags — and an invalid
@@ -237,16 +242,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let policy_text = match input.lifecycle_policy_text {
             Some(text) => text,
             None => repo.lifecycle_policy.clone().ok_or_else(|| {
-                StartLifecyclePolicyPreviewErrorModeled::LifecyclePolicyNotFoundException(
-                    LifecyclePolicyNotFoundException {
-                        message: Some(format!(
-                            "Lifecycle policy does not exist for the repository with \
-                             name '{}' in the registry with id '{}'",
-                            repo.name,
-                            crate::state::registry_id()
-                        )),
-                    },
-                )
+                fault_error(crate::state::Fault::LifecyclePolicyNotFound(
+                    crate::state::lifecycle_policy_not_found_message(&repo.name),
+                ))
             })?,
         };
         let rules = crate::state::parse_lifecycle_policy(&policy_text).map_err(fault_error)?;

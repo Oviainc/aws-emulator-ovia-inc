@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDBEngineVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDBEngineVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation reports this service's DB engine version catalogue,
+//! narrowed by the request's `Engine`, `EngineVersion` and `DBParameterGroupFamily`
+//! members, its `Filters`, `DefaultOnly` and `IncludeAll`, and paged by `MaxRecords` /
+//! `Marker`. This is the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDBEngineVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An engine version is this service's own reference data, not caller state: it exists
+//! for every caller, no request creates it, and it reads the same before and after one.
+//! The one engine-version kind that IS caller state — a CUSTOM engine version, the
+//! `custom-oracle-*` engines — is minted by `CreateCustomDBEngineVersion`, which is
+//! still a scaffolded 501, so this service holds none and reports none for those
+//! engines. When that operation is implemented its records join this report.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +175,878 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDBEngineVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDBEngineVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDBEngineVersions"))
+        // This operation reports reference data: it holds no per-caller records, so it
+        // reads neither this service's store nor the request context. Both are bound so
+        // the generated signature stays as it is.
+        let _ = (ctx, &self.engine);
+
+        let page_size = crate::state::check_max_records(input.max_records)
+            .map_err(DescribeDBEngineVersionsError::validation)?;
+        let filters = input.filters.clone().unwrap_or_default();
+        check_filter_names(&filters).map_err(DescribeDBEngineVersionsError::validation)?;
+        crate::state::check_filter_terms(&filters)
+            .map_err(DescribeDBEngineVersionsError::validation)?;
+
+        let mut matching: Vec<(String, CreateCustomDBEngineVersionOutput)> = catalogue()
+            .filter(|(_, entry, facts)| matches_request(entry, facts, &input, &filters))
+            .map(|(index, entry, facts)| {
+                (
+                    format!("{}#{}", entry.engine, entry.engine_version),
+                    to_wire(entry, facts, index, &input),
+                )
+            })
+            .collect();
+        // `paginate` resumes at the first key at or past the `Marker`, so the report is
+        // cut from ONE total order over `(Engine, EngineVersion)`: a page boundary
+        // cannot drift between calls.
+        matching.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        let page = crate::state::paginate(matching, input.marker.as_deref(), page_size);
+        Ok(DescribeDBEngineVersionsOutput {
+            marker: page.next_marker,
+            db_engine_versions: Some(page.items),
+        })
+    }
+}
+
+/// The filter names this operation's `Filters` member documents: "`db-parameter-group-family`",
+/// "`engine`", "`engine-mode`", "`engine-version`" and "`status`". Any other name is
+/// refused with a 400 rather than ignored, because ignoring a filter would report
+/// versions the caller excluded.
+const SUPPORTED_FILTER_NAMES: [&str; 5] = [
+    "db-parameter-group-family",
+    "engine",
+    "engine-mode",
+    "engine-version",
+    "status",
+];
+
+/// Refuse a filter this operation does not support. "Filter names are case-sensitive."
+fn check_filter_names(filters: &[Filter]) -> Result<(), String> {
+    for filter in filters {
+        if !SUPPORTED_FILTER_NAMES.contains(&filter.name.as_str()) {
+            return Err(format!(
+                "unrecognized filter name: {}; supported filters are {}",
+                filter.name,
+                SUPPORTED_FILTER_NAMES.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// An engine version that can be ordered. The `status` filter's member documents
+/// exactly two valid statuses, "`available`" and "`deprecated`".
+pub(crate) const STATUS_AVAILABLE: &str = "available";
+
+/// An engine version AWS no longer offers for a new instance. `IncludeAll` is what asks
+/// for these: "Specifies whether to also list the engine versions that aren't available.
+/// The default is to list only available engine versions."
+const STATUS_DEPRECATED: &str = "deprecated";
+
+/// The `SupportedEngineModes` of a non-Aurora engine. The `engine-mode` filter's member
+/// documents the five valid modes (`global`, `multimaster`, `parallelquery`,
+/// `provisioned`, `serverless`); an RDS DB instance engine runs only `provisioned`.
+const PROVISIONED_ONLY: &[&str] = &["provisioned"];
+
+/// The `SupportedEngineModes` of an Aurora engine, which also runs Aurora Serverless.
+const AURORA_MODES: &[&str] = &["provisioned", "serverless"];
+
+/// Whether an entry is the default version of its engine, of its major version only, or
+/// of neither.
+///
+/// One value rather than two booleans because the two are not independent: the default
+/// version of an engine is necessarily the default of its own major version, and
+/// `DefaultOnly` reads both ("only the default version of the specified engine **or** the
+/// engine and major version combination").
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DefaultLevel {
+    /// The engine's default version — and so its major version's default too.
+    Engine,
+    /// The default version of its major version, but not of the engine.
+    Major,
+    /// Neither.
+    Neither,
+}
+
+impl DefaultLevel {
+    /// Whether this is the engine's own default version.
+    const fn is_engine_default(self) -> bool {
+        matches!(self, Self::Engine)
+    }
+
+    /// Whether this is the default version of its (engine, major version) combination.
+    const fn is_major_default(self) -> bool {
+        matches!(self, Self::Engine | Self::Major)
+    }
+}
+
+/// What this service reports about one DB engine, shared by every version of it.
+///
+/// `pub(crate)` because `DescribeOrderableDBInstanceOptions` reports on the same engines
+/// and must not disagree with this report about them.
+pub(crate) struct EngineFacts {
+    /// The engine name, one of the values this operation's `Engine` member lists.
+    pub(crate) engine: &'static str,
+    /// The product name `DBEngineVersionDescription` is built from ("MySQL 8.0.39").
+    pub(crate) product: &'static str,
+    /// `DBEngineDescription`.
+    pub(crate) description: &'static str,
+    /// `SupportedEngineModes`.
+    pub(crate) engine_modes: &'static [&'static str],
+    /// `SupportsReadReplica`.
+    pub(crate) supports_read_replica: bool,
+    /// `SupportsGlobalDatabases` — an Aurora global database.
+    pub(crate) supports_global_databases: bool,
+    /// `SupportsParallelQuery` — Aurora MySQL's parallel query.
+    pub(crate) supports_parallel_query: bool,
+    /// `SupportsBabelfish` — Babelfish for Aurora PostgreSQL.
+    pub(crate) supports_babelfish: bool,
+    /// `ExportableLogTypes`, and so `SupportsLogExportsToCloudwatchLogs` when non-empty.
+    pub(crate) exportable_log_types: &'static [&'static str],
+    /// `(name, description)` pairs for `SupportedCharacterSets`, whose first entry is
+    /// also `DefaultCharacterSet`. Empty for an engine that takes no `CharacterSetName`.
+    pub(crate) character_sets: &'static [(&'static str, &'static str)],
+    /// `SupportedTimezones`. Empty for an engine that takes no `Timezone`.
+    pub(crate) timezones: &'static [&'static str],
+}
+
+/// The character sets an Oracle engine reports: `CreateDBInstance`'s `CharacterSetName`
+/// is an Oracle-only member, and `AL32UTF8` is the engine's default.
+const ORACLE_CHARACTER_SETS: &[(&str, &str)] = &[
+    ("AL32UTF8", "Unicode 5.0 UTF-8 Universal character set"),
+    ("WE8ISO8859P15", "ISO 8859-15 West European"),
+];
+
+/// The time zones a Microsoft SQL Server engine reports: `CreateDBInstance`'s `Timezone`
+/// is a SQL Server member, and the names are the Windows time-zone names that engine
+/// takes. A representative span of the published list, not all of it — the member is
+/// reported only when `ListSupportedTimezones` asks for it.
+const SQLSERVER_TIMEZONES: &[&str] = &[
+    "Alaskan Standard Time",
+    "Central Standard Time",
+    "GMT Standard Time",
+    "Tokyo Standard Time",
+];
+
+/// The log types a MySQL-family engine can export to CloudWatch Logs.
+const MYSQL_LOG_TYPES: &[&str] = &["audit", "error", "general", "slowquery"];
+
+/// The log types an Oracle engine can export to CloudWatch Logs.
+const ORACLE_LOG_TYPES: &[&str] = &["alert", "audit", "listener", "trace", "oemagent"];
+
+/// The log types a Microsoft SQL Server engine can export to CloudWatch Logs.
+const SQLSERVER_LOG_TYPES: &[&str] = &["agent", "error"];
+
+/// The log types a Db2 engine can export to CloudWatch Logs.
+const DB2_LOG_TYPES: &[&str] = &["diag.log", "notify.log"];
+
+/// Every DB engine this service reports versions for.
+///
+/// The engine names are exactly the `Engine` member's published "Valid Values"
+/// (`smithy_query(query="doc",shape="DescribeDBEngineVersionsMessage",member="Engine")`),
+/// minus the four `custom-oracle-*` engines: a custom engine version is a record the
+/// account creates with `CreateCustomDBEngineVersion`, so this service reports one only
+/// once that operation stores one, never as catalogue data.
+///
+/// The per-engine facts (engine modes, read replica / global database / parallel query /
+/// Babelfish support, exportable log types, character sets and time zones) are this
+/// emulator's published reference data for those engines, as the RDS engine feature
+/// matrix states them. They are the same for every caller and no request changes them.
+pub(crate) const ENGINES: &[EngineFacts] = &[
+    EngineFacts {
+        engine: "aurora-mysql",
+        product: "Aurora MySQL",
+        description: "Aurora MySQL",
+        engine_modes: AURORA_MODES,
+        supports_read_replica: true,
+        supports_global_databases: true,
+        supports_parallel_query: true,
+        supports_babelfish: false,
+        exportable_log_types: MYSQL_LOG_TYPES,
+        character_sets: &[],
+        timezones: &[],
+    },
+    EngineFacts {
+        engine: "aurora-postgresql",
+        product: "Aurora PostgreSQL",
+        description: "Aurora PostgreSQL",
+        engine_modes: AURORA_MODES,
+        supports_read_replica: true,
+        supports_global_databases: true,
+        supports_parallel_query: false,
+        supports_babelfish: true,
+        exportable_log_types: &["postgresql"],
+        character_sets: &[],
+        timezones: &[],
+    },
+    EngineFacts {
+        engine: "db2-ae",
+        product: "Db2",
+        description: "Db2 Advanced Edition",
+        engine_modes: PROVISIONED_ONLY,
+        supports_read_replica: true,
+        supports_global_databases: false,
+        supports_parallel_query: false,
+        supports_babelfish: false,
+        exportable_log_types: DB2_LOG_TYPES,
+        character_sets: &[],
+        timezones: &[],
+    },
+    EngineFacts {
+        engine: "db2-ce",
+        product: "Db2",
+        description: "Db2 Community Edition",
+        engine_modes: PROVISIONED_ONLY,
+        supports_read_replica: false,
+        supports_global_databases: false,
+        supports_parallel_query: false,
+        supports_babelfish: false,
+        exportable_log_types: DB2_LOG_TYPES,
+        character_sets: &[],
+        timezones: &[],
+    },
+    EngineFacts {
+        engine: "db2-se",
+        product: "Db2",
+        description: "Db2 Standard Edition",
+        engine_modes: PROVISIONED_ONLY,
+        supports_read_replica: true,
+        supports_global_databases: false,
+        supports_parallel_query: false,
+        supports_babelfish: false,
+        exportable_log_types: DB2_LOG_TYPES,
+        character_sets: &[],
+        timezones: &[],
+    },
+    EngineFacts {
+        engine: "mariadb",
+        product: "MariaDB",
+        description: "MariaDB Community Edition",
+        engine_modes: PROVISIONED_ONLY,
+        supports_read_replica: true,
+        supports_global_databases: false,
+        supports_parallel_query: false,
+        supports_babelfish: false,
+        exportable_log_types: MYSQL_LOG_TYPES,
+        character_sets: &[],
+        timezones: &[],
+    },
+    EngineFacts {
+        engine: "mysql",
+        product: "MySQL",
+        description: "MySQL Community Edition",
+        engine_modes: PROVISIONED_ONLY,
+        supports_read_replica: true,
+        supports_global_databases: false,
+        supports_parallel_query: false,
+        supports_babelfish: false,
+        exportable_log_types: MYSQL_LOG_TYPES,
+        character_sets: &[],
+        timezones: &[],
+    },
+    EngineFacts {
+        engine: "oracle-ee",
+        product: "Oracle Database Enterprise Edition",
+        description: "Oracle Database Enterprise Edition",
+        engine_modes: PROVISIONED_ONLY,
+        supports_read_replica: true,
+        supports_global_databases: false,
+        supports_parallel_query: false,
+        supports_babelfish: false,
+        exportable_log_types: ORACLE_LOG_TYPES,
+        character_sets: ORACLE_CHARACTER_SETS,
+        timezones: &[],
+    },
+    EngineFacts {
+        engine: "oracle-ee-cdb",
+        product: "Oracle Database Enterprise Edition (CDB)",
+        description: "Oracle Database Enterprise Edition (multi-tenant architecture)",
+        engine_modes: PROVISIONED_ONLY,
+        supports_read_replica: true,
+        supports_global_databases: false,
+        supports_parallel_query: false,
+        supports_babelfish: false,
+        exportable_log_types: ORACLE_LOG_TYPES,
+        character_sets: ORACLE_CHARACTER_SETS,
+        timezones: &[],
+    },
+    EngineFacts {
+        engine: "oracle-se2",
+        product: "Oracle Database Standard Edition Two",
+        description: "Oracle Database Standard Edition Two",
+        engine_modes: PROVISIONED_ONLY,
+        supports_read_replica: false,
+        supports_global_databases: false,
+        supports_parallel_query: false,
+        supports_babelfish: false,
+        exportable_log_types: ORACLE_LOG_TYPES,
+        character_sets: ORACLE_CHARACTER_SETS,
+        timezones: &[],
+    },
+    EngineFacts {
+        engine: "oracle-se2-cdb",
+        product: "Oracle Database Standard Edition Two (CDB)",
+        description: "Oracle Database Standard Edition Two (multi-tenant architecture)",
+        engine_modes: PROVISIONED_ONLY,
+        supports_read_replica: false,
+        supports_global_databases: false,
+        supports_parallel_query: false,
+        supports_babelfish: false,
+        exportable_log_types: ORACLE_LOG_TYPES,
+        character_sets: ORACLE_CHARACTER_SETS,
+        timezones: &[],
+    },
+    EngineFacts {
+        engine: "postgres",
+        product: "PostgreSQL",
+        description: "PostgreSQL",
+        engine_modes: PROVISIONED_ONLY,
+        supports_read_replica: true,
+        supports_global_databases: false,
+        supports_parallel_query: false,
+        supports_babelfish: false,
+        exportable_log_types: &["postgresql", "upgrade"],
+        character_sets: &[],
+        timezones: &[],
+    },
+    EngineFacts {
+        engine: "sqlserver-dev-ee",
+        product: "Microsoft SQL Server Developer Edition",
+        description: "Microsoft SQL Server Developer Edition",
+        engine_modes: PROVISIONED_ONLY,
+        supports_read_replica: false,
+        supports_global_databases: false,
+        supports_parallel_query: false,
+        supports_babelfish: false,
+        exportable_log_types: SQLSERVER_LOG_TYPES,
+        character_sets: &[],
+        timezones: SQLSERVER_TIMEZONES,
+    },
+    EngineFacts {
+        engine: "sqlserver-ee",
+        product: "Microsoft SQL Server Enterprise Edition",
+        description: "Microsoft SQL Server Enterprise Edition",
+        engine_modes: PROVISIONED_ONLY,
+        supports_read_replica: true,
+        supports_global_databases: false,
+        supports_parallel_query: false,
+        supports_babelfish: false,
+        exportable_log_types: SQLSERVER_LOG_TYPES,
+        character_sets: &[],
+        timezones: SQLSERVER_TIMEZONES,
+    },
+    EngineFacts {
+        engine: "sqlserver-ex",
+        product: "Microsoft SQL Server Express Edition",
+        description: "Microsoft SQL Server Express Edition",
+        engine_modes: PROVISIONED_ONLY,
+        supports_read_replica: false,
+        supports_global_databases: false,
+        supports_parallel_query: false,
+        supports_babelfish: false,
+        exportable_log_types: SQLSERVER_LOG_TYPES,
+        character_sets: &[],
+        timezones: SQLSERVER_TIMEZONES,
+    },
+    EngineFacts {
+        engine: "sqlserver-se",
+        product: "Microsoft SQL Server Standard Edition",
+        description: "Microsoft SQL Server Standard Edition",
+        engine_modes: PROVISIONED_ONLY,
+        supports_read_replica: true,
+        supports_global_databases: false,
+        supports_parallel_query: false,
+        supports_babelfish: false,
+        exportable_log_types: SQLSERVER_LOG_TYPES,
+        character_sets: &[],
+        timezones: SQLSERVER_TIMEZONES,
+    },
+    EngineFacts {
+        engine: "sqlserver-web",
+        product: "Microsoft SQL Server Web Edition",
+        description: "Microsoft SQL Server Web Edition",
+        engine_modes: PROVISIONED_ONLY,
+        supports_read_replica: false,
+        supports_global_databases: false,
+        supports_parallel_query: false,
+        supports_babelfish: false,
+        exportable_log_types: SQLSERVER_LOG_TYPES,
+        character_sets: &[],
+        timezones: SQLSERVER_TIMEZONES,
+    },
+];
+
+/// One engine version in this service's catalogue.
+///
+/// `pub(crate)` for the same reason as [`EngineFacts`]: an orderable DB instance option
+/// is offered for an engine version, and only for one this report carries.
+pub(crate) struct CatalogVersion {
+    /// `Engine`, which must name an entry of [`ENGINES`].
+    pub(crate) engine: &'static str,
+    /// `EngineVersion`.
+    pub(crate) engine_version: &'static str,
+    /// `MajorEngineVersion` — the part of the version an upgrade within it is a MINOR
+    /// upgrade of, in the form that engine writes it (`8.0`, `16`, `15.00`, `19`).
+    pub(crate) major_engine_version: &'static str,
+    /// `DBParameterGroupFamily`.
+    pub(crate) parameter_group_family: &'static str,
+    /// `Status`: [`STATUS_AVAILABLE`] or [`STATUS_DEPRECATED`].
+    pub(crate) status: &'static str,
+    /// Whether this is the default version of its engine, of its major version, or of
+    /// neither — what `DefaultOnly` selects on.
+    pub(crate) default_level: DefaultLevel,
+}
+
+/// One catalogue row, so the table below reads as a table.
+///
+/// Columns, in order: engine, engine version, major engine version, DB parameter group
+/// family, status, default level.
+const fn row(
+    engine: &'static str,
+    engine_version: &'static str,
+    major_engine_version: &'static str,
+    parameter_group_family: &'static str,
+    status: &'static str,
+    default_level: DefaultLevel,
+) -> CatalogVersion {
+    CatalogVersion {
+        engine,
+        engine_version,
+        major_engine_version,
+        parameter_group_family,
+        status,
+        default_level,
+    }
+}
+
+/// The DB engine versions this service reports.
+///
+/// Reference data, like the engine facts above: AWS publishes an engine-version list per
+/// engine and no request changes it, so this is the list this emulator publishes. It is
+/// NOT the real service's live list, which moves with every RDS release; what a caller
+/// can rely on is the shape of each entry, that one version per engine is that engine's
+/// default and one per major version is that major version's, that a deprecated version
+/// is reported only when `IncludeAll` asks for it, and that the `ValidUpgradeTarget` of
+/// an entry is the engine's own later versions.
+///
+/// Rows are grouped by engine and, WITHIN an engine, listed in ascending version order:
+/// `valid_upgrade_targets` reads that order to decide which versions an entry can be
+/// upgraded to.
+pub(crate) const CATALOG: &[CatalogVersion] = &[
+    row(
+        "aurora-mysql",
+        "8.0.mysql_aurora.3.07.1",
+        "8.0",
+        "aurora-mysql8.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Engine,
+    ),
+    row(
+        "aurora-postgresql",
+        "15.8",
+        "15",
+        "aurora-postgresql15",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
+    ),
+    row(
+        "aurora-postgresql",
+        "16.4",
+        "16",
+        "aurora-postgresql16",
+        STATUS_AVAILABLE,
+        DefaultLevel::Engine,
+    ),
+    row(
+        "db2-ae",
+        "11.5.9.0",
+        "11.5",
+        "db2-ae-11.5",
+        STATUS_AVAILABLE,
+        DefaultLevel::Engine,
+    ),
+    row(
+        "db2-ce",
+        "11.5.9.0",
+        "11.5",
+        "db2-ce-11.5",
+        STATUS_AVAILABLE,
+        DefaultLevel::Engine,
+    ),
+    row(
+        "db2-se",
+        "11.5.9.0",
+        "11.5",
+        "db2-se-11.5",
+        STATUS_AVAILABLE,
+        DefaultLevel::Engine,
+    ),
+    row(
+        "mariadb",
+        "10.11.9",
+        "10.11",
+        "mariadb10.11",
+        STATUS_AVAILABLE,
+        DefaultLevel::Engine,
+    ),
+    row(
+        "mariadb",
+        "11.4.4",
+        "11.4",
+        "mariadb11.4",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
+    ),
+    row(
+        "mysql",
+        "5.7.44",
+        "5.7",
+        "mysql5.7",
+        STATUS_DEPRECATED,
+        DefaultLevel::Major,
+    ),
+    row(
+        "mysql",
+        "8.0.37",
+        "8.0",
+        "mysql8.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+    ),
+    row(
+        "mysql",
+        "8.0.39",
+        "8.0",
+        "mysql8.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Engine,
+    ),
+    row(
+        "mysql",
+        "8.4.3",
+        "8.4",
+        "mysql8.4",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
+    ),
+    row(
+        "oracle-ee",
+        "19.0.0.0.ru-2024-10.rur-2024-10.r1",
+        "19",
+        "oracle-ee-19",
+        STATUS_AVAILABLE,
+        DefaultLevel::Engine,
+    ),
+    row(
+        "oracle-ee-cdb",
+        "21.0.0.0.ru-2024-10.rur-2024-10.r1",
+        "21",
+        "oracle-ee-cdb-21",
+        STATUS_AVAILABLE,
+        DefaultLevel::Engine,
+    ),
+    row(
+        "oracle-se2",
+        "19.0.0.0.ru-2024-10.rur-2024-10.r1",
+        "19",
+        "oracle-se2-19",
+        STATUS_AVAILABLE,
+        DefaultLevel::Engine,
+    ),
+    row(
+        "oracle-se2-cdb",
+        "21.0.0.0.ru-2024-10.rur-2024-10.r1",
+        "21",
+        "oracle-se2-cdb-21",
+        STATUS_AVAILABLE,
+        DefaultLevel::Engine,
+    ),
+    row(
+        "postgres",
+        "15.8",
+        "15",
+        "postgres15",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
+    ),
+    row(
+        "postgres",
+        "16.3",
+        "16",
+        "postgres16",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+    ),
+    row(
+        "postgres",
+        "16.4",
+        "16",
+        "postgres16",
+        STATUS_AVAILABLE,
+        DefaultLevel::Engine,
+    ),
+    row(
+        "postgres",
+        "17.2",
+        "17",
+        "postgres17",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
+    ),
+    row(
+        "sqlserver-dev-ee",
+        "16.00.4165.4.v1",
+        "16.00",
+        "sqlserver-dev-ee-16.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Engine,
+    ),
+    row(
+        "sqlserver-ee",
+        "15.00.4385.2.v1",
+        "15.00",
+        "sqlserver-ee-15.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Engine,
+    ),
+    row(
+        "sqlserver-ee",
+        "16.00.4165.4.v1",
+        "16.00",
+        "sqlserver-ee-16.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
+    ),
+    row(
+        "sqlserver-ex",
+        "15.00.4385.2.v1",
+        "15.00",
+        "sqlserver-ex-15.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Engine,
+    ),
+    row(
+        "sqlserver-se",
+        "15.00.4385.2.v1",
+        "15.00",
+        "sqlserver-se-15.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Engine,
+    ),
+    row(
+        "sqlserver-web",
+        "15.00.4385.2.v1",
+        "15.00",
+        "sqlserver-web-15.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Engine,
+    ),
+];
+
+/// The engine facts of `engine`, or `None` for an engine this service reports no
+/// versions for (the `custom-oracle-*` engines, and any value that is not an engine).
+pub(crate) fn engine_facts(engine: &str) -> Option<&'static EngineFacts> {
+    ENGINES.iter().find(|facts| facts.engine == engine)
+}
+
+/// Every catalogue entry with its index and its engine's facts.
+///
+/// A row naming an engine absent from [`ENGINES`] could not be projected onto the wire
+/// shape — there would be nothing to report for `DBEngineDescription` and the support
+/// members — so it is skipped rather than half-reported. The two tables are written
+/// together and no row does this today, which makes the skip a guard rather than a
+/// behaviour.
+pub(crate) fn catalogue() -> impl Iterator<Item = (usize, &'static CatalogVersion, &'static EngineFacts)>
+{
+    CATALOG
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| engine_facts(entry.engine).map(|facts| (index, entry, facts)))
+}
+
+/// Whether `entry` is in the report this request asks for.
+fn matches_request(
+    entry: &CatalogVersion,
+    facts: &EngineFacts,
+    input: &DescribeDBEngineVersionsInput,
+    filters: &[Filter],
+) -> bool {
+    // `IncludeAll`: "Specifies whether to also list the engine versions that aren't
+    // available. The default is to list only available engine versions."
+    if input.include_all != Some(true) && entry.status != STATUS_AVAILABLE {
+        return false;
+    }
+    // `Engine`: "The database engine to return version details for."
+    if let Some(engine) = &input.engine {
+        if !entry.engine.eq_ignore_ascii_case(engine) {
+            return false;
+        }
+    }
+    // `EngineVersion`: "A specific database engine version to return details for" —
+    // matched either exactly or by the major version it belongs to, the "engine and
+    // major version combination" `DefaultOnly` names.
+    if let Some(version) = &input.engine_version {
+        if !entry.engine_version.eq_ignore_ascii_case(version)
+            && !entry.major_engine_version.eq_ignore_ascii_case(version)
+        {
+            return false;
+        }
+    }
+    // `DBParameterGroupFamily`: "The name of a specific DB parameter group family to
+    // return details for."
+    if let Some(family) = &input.db_parameter_group_family {
+        if !entry.parameter_group_family.eq_ignore_ascii_case(family) {
+            return false;
+        }
+    }
+    // `DefaultOnly`: "Specifies whether to return only the default version of the
+    // specified engine or the engine and major version combination." A request that
+    // narrows to one major version family — by `EngineVersion` or by
+    // `DBParameterGroupFamily` — asks for that family's default; otherwise the engine's.
+    if input.default_only == Some(true) {
+        let narrowed_to_a_major_version =
+            input.engine_version.is_some() || input.db_parameter_group_family.is_some();
+        let keep = if narrowed_to_a_major_version {
+            entry.default_level.is_major_default()
+        } else {
+            entry.default_level.is_engine_default()
+        };
+        if !keep {
+            return false;
+        }
+    }
+    filters
+        .iter()
+        .all(|filter| matches_filter(entry, facts, filter))
+}
+
+/// Whether `entry` matches one filter: true when any of the filter's values matches the
+/// member that filter names. Filter values are case-sensitive.
+fn matches_filter(entry: &CatalogVersion, facts: &EngineFacts, filter: &Filter) -> bool {
+    filter
+        .values
+        .iter()
+        .any(|wanted| match filter.name.as_str() {
+            "db-parameter-group-family" => wanted == entry.parameter_group_family,
+            "engine" => wanted == entry.engine,
+            "engine-mode" => facts.engine_modes.contains(&wanted.as_str()),
+            "engine-version" => wanted == entry.engine_version,
+            "status" => wanted == entry.status,
+            _ => false,
+        })
+}
+
+/// One `(name, description)` pair as the modelled `CharacterSet`.
+fn character_set((name, description): &(&str, &str)) -> CharacterSet {
+    CharacterSet {
+        character_set_name: Some((*name).to_string()),
+        character_set_description: Some((*description).to_string()),
+    }
+}
+
+/// The versions `entry` can be upgraded to: the LATER versions of the same engine, which
+/// are the catalogue rows after it (each engine's rows ascend by version).
+fn valid_upgrade_targets(
+    entry: &CatalogVersion,
+    facts: &EngineFacts,
+    index: usize,
+) -> Vec<UpgradeTarget> {
+    CATALOG
+        .iter()
+        .skip(index.saturating_add(1))
+        .filter(|target| target.engine == entry.engine)
+        .map(|target| {
+            let within_one_major = target.major_engine_version == entry.major_engine_version;
+            UpgradeTarget {
+                engine: Some(target.engine.to_string()),
+                engine_version: Some(target.engine_version.to_string()),
+                description: Some(format!("{} {}", facts.product, target.engine_version)),
+                // An automatic MINOR upgrade only ever moves within one major version,
+                // and only onto that major version's default.
+                auto_upgrade: Some(within_one_major && target.default_level.is_major_default()),
+                is_major_version_upgrade: Some(!within_one_major),
+                supported_engine_modes: Some(
+                    facts
+                        .engine_modes
+                        .iter()
+                        .map(|mode| (*mode).to_string())
+                        .collect(),
+                ),
+                supports_parallel_query: Some(facts.supports_parallel_query),
+                supports_global_databases: Some(facts.supports_global_databases),
+                supports_babelfish: Some(facts.supports_babelfish),
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
+/// Project one catalogue entry onto the modelled `DBEngineVersion` wire shape.
+///
+/// `SupportedCharacterSets` and `SupportedTimezones` are reported only when the request
+/// asks for them: "Specifies whether to list the supported character sets for each
+/// engine version" / "… the supported time zones for each engine version", and only for
+/// an engine that has them.
+fn to_wire(
+    entry: &CatalogVersion,
+    facts: &EngineFacts,
+    index: usize,
+    input: &DescribeDBEngineVersionsInput,
+) -> CreateCustomDBEngineVersionOutput {
+    let supported_character_sets = (input.list_supported_character_sets == Some(true)
+        && !facts.character_sets.is_empty())
+    .then(|| facts.character_sets.iter().map(character_set).collect());
+    let supported_timezones = (input.list_supported_timezones == Some(true)
+        && !facts.timezones.is_empty())
+    .then(|| {
+        facts
+            .timezones
+            .iter()
+            .map(|name| Timezone {
+                timezone_name: Some((*name).to_string()),
+            })
+            .collect()
+    });
+    CreateCustomDBEngineVersionOutput {
+        engine: Some(entry.engine.to_string()),
+        engine_version: Some(entry.engine_version.to_string()),
+        major_engine_version: Some(entry.major_engine_version.to_string()),
+        db_parameter_group_family: Some(entry.parameter_group_family.to_string()),
+        db_engine_description: Some(facts.description.to_string()),
+        db_engine_version_description: Some(format!(
+            "{} {}",
+            facts.product, entry.engine_version
+        )),
+        status: Some(entry.status.to_string()),
+        supported_engine_modes: Some(
+            facts
+                .engine_modes
+                .iter()
+                .map(|mode| (*mode).to_string())
+                .collect(),
+        ),
+        exportable_log_types: Some(
+            facts
+                .exportable_log_types
+                .iter()
+                .map(|log_type| (*log_type).to_string())
+                .collect(),
+        ),
+        supports_log_exports_to_cloudwatch_logs: Some(!facts.exportable_log_types.is_empty()),
+        supports_read_replica: Some(facts.supports_read_replica),
+        supports_global_databases: Some(facts.supports_global_databases),
+        supports_parallel_query: Some(facts.supports_parallel_query),
+        supports_babelfish: Some(facts.supports_babelfish),
+        default_character_set: facts.character_sets.first().map(character_set),
+        supported_character_sets,
+        supported_timezones,
+        valid_upgrade_target: Some(valid_upgrade_targets(entry, facts, index)),
+        // The members a CUSTOM engine version carries — `DBEngineVersionArn`,
+        // `CreateTime`, `KMSKeyId`, `Image`, the installation-file members and
+        // `CustomDBEngineVersionManifest` — belong to a record
+        // `CreateCustomDBEngineVersion` stores, and this service stores none yet, so no
+        // catalogue entry invents them.
+        ..Default::default()
     }
 }

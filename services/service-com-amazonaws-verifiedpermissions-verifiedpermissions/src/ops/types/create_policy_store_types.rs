@@ -31,7 +31,11 @@ pub struct CreatePolicyStoreInput {
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.verifiedpermissions#CreatePolicyStoreOutput")]
+/// `createdDate` and `lastUpdatedDate` target `TimestampFormat`, which carries
+/// `@timestampFormat("date-time")`, so this shape's schema comes from
+/// `vp_schema_and_codec!` rather than `#[smithy_macros::smithy(shape = ...)]`:
+/// see `types/date_time_wire.rs` for why. Member set, order and requiredness from
+/// `smithy_query(query="shape", shape="CreatePolicyStoreOutput")`.
 #[derive(Debug, Clone)]
 pub struct CreatePolicyStoreOutput {
     pub policy_store_id: String,
@@ -39,3 +43,15 @@ pub struct CreatePolicyStoreOutput {
     pub created_date: ::aws_smithy_types::DateTime,
     pub last_updated_date: ::aws_smithy_types::DateTime,
 }
+
+vp_schema_and_codec!(
+    CreatePolicyStoreOutput,
+    CREATE_POLICY_STORE_OUTPUT_SCHEMA,
+    "com.amazonaws.verifiedpermissions#CreatePolicyStoreOutput",
+    "com.amazonaws.verifiedpermissions",
+    "CreatePolicyStoreOutput",
+    (M_POLICY_STORE_ID, policy_store_id, "policyStoreId", 0, req, string),
+    (M_ARN, arn, "arn", 1, req, string),
+    (M_CREATED_DATE, created_date, "createdDate", 2, req, date_time),
+    (M_LAST_UPDATED_DATE, last_updated_date, "lastUpdatedDate", 3, req, date_time),
+);

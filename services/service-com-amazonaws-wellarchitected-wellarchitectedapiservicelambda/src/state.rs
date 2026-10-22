@@ -4,10 +4,10 @@
 //!
 //! The workload lifecycle (`CreateWorkload`, `GetWorkload`, `ListWorkloads`,
 //! `UpdateWorkload`, `DeleteWorkload`), the milestones recorded against a workload
-//! (`CreateMilestone`, `GetMilestone`) and the answers of a workload's lens reviews
-//! (`ListAnswers`) are backed entirely by the maps below, so a create is visible to the
-//! next request on the same engine. The custom lenses `ImportLens` imports and
-//! `ExportLens` reads back are backed the same way. The record types and their
+//! (`CreateMilestone`, `GetMilestone`, `ListMilestones`) and the answers of a workload's
+//! lens reviews (`ListAnswers`) are backed entirely by the maps below, so a create is
+//! visible to the next request on the same engine. The custom lenses `ImportLens` imports
+//! and `ExportLens` reads back are backed the same way. The record types and their
 //! projections live here rather than in a handler because several operations reach them.
 //!
 //! The one lens definition this emulator ships itself — the AWS-official Well-Architected
@@ -26,8 +26,9 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    ConflictException, Milestone, ResourceNotFoundException, Workload, WorkloadDiscoveryConfig,
-    WorkloadJiraConfigurationInput, WorkloadJiraConfigurationOutput, WorkloadSummary, RISK_VALUES,
+    ConflictException, Milestone, MilestoneSummary, ResourceNotFoundException, Workload,
+    WorkloadDiscoveryConfig, WorkloadJiraConfigurationInput, WorkloadJiraConfigurationOutput,
+    WorkloadSummary, RISK_VALUES,
 };
 
 /// `Workload$ImprovementStatus` before any lens review has been answered. The
@@ -272,6 +273,25 @@ pub const MAX_WORKLOADS_PER_ACCOUNT_REGION: usize = 10_000;
 /// `@range(min: 1, max: 100)`. Numbers are handed out from 1 upwards and never reused,
 /// so this is what bounds the milestone map per workload.
 pub const MAX_MILESTONES_PER_WORKLOAD: i32 = 100;
+
+/// The largest page any paginated operation of this service serves, and the page size a
+/// request that omits `MaxResults` gets.
+///
+/// Every paginated operation here targets the one modelled `MaxResults` shape, which is
+/// `@range(min: 1, max: 50)` (`smithy_query(query="shape", shape="MaxResults")`), so
+/// one ceiling covers them all: a request that omits the member asks for a full page.
+pub const MAX_RESULTS_CEILING: i32 = 50;
+
+/// [`MAX_RESULTS_CEILING`] applied to the `MaxResults` a request carried: the modelled
+/// range restated in the handler, so the page size is in `1..=MAX_RESULTS_CEILING`
+/// whatever reaches it.
+pub fn page_size(max_results: Option<i32>) -> usize {
+    let clamped = max_results
+        .unwrap_or(MAX_RESULTS_CEILING)
+        .clamp(1, MAX_RESULTS_CEILING);
+    usize::try_from(clamped)
+        .expect("MaxResults is clamped into 1..=MAX_RESULTS_CEILING, which always fits in a usize")
+}
 
 /// One stored answer to one question of one lens review, as the operations that answer
 /// a question record it.
@@ -580,6 +600,18 @@ impl MilestoneRecord {
             milestone_name: Some(self.milestone_name.clone()),
             recorded_at: Some(::aws_smithy_types::DateTime::from(self.recorded_at)),
             workload: Some(self.workload.to_workload()),
+        }
+    }
+
+    /// The `MilestoneSummary` projection `ListMilestones` pages over: the same milestone,
+    /// with the recorded workload projected to its `WorkloadSummary`
+    /// (`smithy_query(query="shape", shape="MilestoneSummary")`).
+    pub fn to_summary(&self) -> MilestoneSummary {
+        MilestoneSummary {
+            milestone_number: Some(self.milestone_number),
+            milestone_name: Some(self.milestone_name.clone()),
+            recorded_at: Some(::aws_smithy_types::DateTime::from(self.recorded_at)),
+            workload_summary: Some(self.workload.to_summary()),
         }
     }
 }
@@ -1333,6 +1365,29 @@ pub fn decode_next_token(token: &str) -> Option<(String, String)> {
     let id = cursor.get("i")?.as_str()?.to_string();
     Some((name, id))
 }
+
+/// Encode a `ListMilestones` cursor: the `MilestoneNumber` of the last milestone the
+/// page returned. A milestone keeps its number for life and numbers are never reused,
+/// so the number alone resumes the enumeration.
+pub fn encode_milestone_next_token(milestone_number: i32) -> String {
+    encode_cursor(&::serde_json::json!({ "m": milestone_number }))
+}
+
+/// The `MilestoneNumber` a `ListMilestones` `NextToken` points just past, or `None`
+/// when the token is not one this service issued.
+pub fn decode_milestone_next_token(token: &str) -> Option<i32> {
+    let cursor = decode_cursor(token)?;
+    i32::try_from(cursor.get("m")?.as_i64()?).ok()
+}
+
+/// What a `NextToken` this service did not issue is answered with. The token is this
+/// service's own opaque cursor, so the only thing a caller can do is start the
+/// pagination again — which is what `CANNOT_PARSE` tells it. Shared by every paginated
+/// operation, so none of them words that refusal differently.
+pub const INVALID_NEXT_TOKEN_MESSAGE: &str = "The next token that was passed in is invalid.";
+
+/// The member an undecodable-token finding names (`<Operation>Input$NextToken`).
+pub const NEXT_TOKEN_MEMBER: &str = "NextToken";
 
 /// Encode a cursor over a lens's questions: the `QuestionId` last served, in the same
 /// opaque scheme as [`encode_next_token`].

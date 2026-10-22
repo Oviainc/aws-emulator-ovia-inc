@@ -18,7 +18,13 @@ pub struct GetListenerInput {
     pub listener_identifier: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.vpclattice#GetListenerResponse")]
+/// `GetListenerResponse`, with its schema written out instead of derived because
+/// `createdAt` and `lastUpdatedAt` are `@timestampFormat("date-time")`; the note in
+/// `shared_types` says why that cannot be derived here. Member for member this is the
+/// model's shape: same ids, same order, same indices.
+///
+/// The derive's `DeserializableStruct` impl is deliberately not reproduced: this shape
+/// is an operation OUTPUT, which the server only ever serializes.
 #[derive(Debug, Clone, Default)]
 pub struct GetListenerOutput {
     pub arn: Option<String>,
@@ -33,3 +39,91 @@ pub struct GetListenerOutput {
     pub last_updated_at: Option<::aws_smithy_types::DateTime>,
 }
 
+#[allow(non_upper_case_globals)]
+impl GetListenerOutput {
+    const M_ARN: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetListenerResponse", "arn", String, 0);
+    const M_ID: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetListenerResponse", "id", String, 1);
+    const M_NAME: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetListenerResponse", "name", String, 2);
+    // `ListenerProtocol` is an enum shape, which the generator writes as
+    // `ShapeType::String`.
+    const M_PROTOCOL: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetListenerResponse", "protocol", String, 3);
+    const M_PORT: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetListenerResponse", "port", Integer, 4);
+    const M_SERVICE_ARN: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetListenerResponse", "serviceArn", String, 5);
+    const M_SERVICE_ID: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetListenerResponse", "serviceId", String, 6);
+    const M_DEFAULT_ACTION: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetListenerResponse", "defaultAction", Union, 7);
+    const M_CREATED_AT: ::aws_smithy_schema::Schema =
+        shared_types::date_time_member_of!("GetListenerResponse", "createdAt", 8);
+    const M_LAST_UPDATED_AT: ::aws_smithy_schema::Schema =
+        shared_types::date_time_member_of!("GetListenerResponse", "lastUpdatedAt", 9);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.vpclattice#GetListenerResponse",
+            shared_types::NAMESPACE,
+            "GetListenerResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ARN,
+            &Self::M_ID,
+            &Self::M_NAME,
+            &Self::M_PROTOCOL,
+            &Self::M_PORT,
+            &Self::M_SERVICE_ARN,
+            &Self::M_SERVICE_ID,
+            &Self::M_DEFAULT_ACTION,
+            &Self::M_CREATED_AT,
+            &Self::M_LAST_UPDATED_AT,
+        ],
+    );
+}
+
+pub static GET_LISTENER_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &GetListenerOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for GetListenerOutput {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(value) = self.arn.as_ref() {
+            serializer.write_string(&Self::M_ARN, value.as_str())?;
+        }
+        if let Some(value) = self.id.as_ref() {
+            serializer.write_string(&Self::M_ID, value.as_str())?;
+        }
+        if let Some(value) = self.name.as_ref() {
+            serializer.write_string(&Self::M_NAME, value.as_str())?;
+        }
+        if let Some(value) = self.protocol.as_ref() {
+            serializer.write_string(&Self::M_PROTOCOL, value.as_str())?;
+        }
+        if let Some(value) = self.port.as_ref() {
+            serializer.write_integer(&Self::M_PORT, *value)?;
+        }
+        if let Some(value) = self.service_arn.as_ref() {
+            serializer.write_string(&Self::M_SERVICE_ARN, value.as_str())?;
+        }
+        if let Some(value) = self.service_id.as_ref() {
+            serializer.write_string(&Self::M_SERVICE_ID, value.as_str())?;
+        }
+        if let Some(value) = self.default_action.as_ref() {
+            serializer.write_struct(&Self::M_DEFAULT_ACTION, value)?;
+        }
+        if let Some(value) = self.created_at.as_ref() {
+            serializer.write_timestamp(&Self::M_CREATED_AT, value)?;
+        }
+        if let Some(value) = self.last_updated_at.as_ref() {
+            serializer.write_timestamp(&Self::M_LAST_UPDATED_AT, value)?;
+        }
+        Ok(())
+    }
+}

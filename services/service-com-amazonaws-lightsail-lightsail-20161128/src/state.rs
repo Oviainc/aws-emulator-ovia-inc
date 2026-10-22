@@ -4,10 +4,12 @@
 //!
 //! The slice implemented so far is Lightsail's primary resource, the **instance**
 //! (a virtual private server), the **domain** (a DNS zone the account holds
-//! recordsets in), and the append-only **operation log** every mutating call
-//! writes. Everything in this module is reached through [`with_state`], so no
-//! handler can observe a store whose clock-owed instance transitions have not
-//! been applied yet.
+//! recordsets in), the append-only **operation log** every mutating call writes,
+//! and the service's static **Region catalog** — the Regions and Availability
+//! Zones `GetRegions` lists and every other operation validates a location
+//! against. Everything mutable in this module is reached through [`with_state`],
+//! so no handler can observe a store whose clock-owed instance transitions have
+//! not been applied yet.
 //!
 //! Two kinds of value live on a stored instance:
 //!
@@ -24,9 +26,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AddOn, AddOnRequest, Domain, DomainEntry, Instance, InstanceHardware, InstanceMetadataOptions,
-    InstanceNetworking, InstancePortInfo, InstanceState, MonthlyTransfer, Operation,
-    ResourceLocation, Tag, REGION_NAME_VALUES,
+    AddOn, AddOnRequest, AvailabilityZone, Domain, DomainEntry, Instance, InstanceHardware,
+    InstanceMetadataOptions, InstanceNetworking, InstancePortInfo, InstanceState, MonthlyTransfer,
+    Operation, Region, ResourceLocation, Tag, REGION_NAME_VALUES,
 };
 
 // ---------------------------------------------------------------------------
@@ -422,6 +424,232 @@ pub fn region_of_availability_zone(availability_zone: &str) -> Option<&'static s
 /// tell the caller what to send instead.
 pub fn region_names() -> String {
     REGION_NAME_VALUES.join(", ")
+}
+
+// ---------------------------------------------------------------------------
+// Region catalog
+// ---------------------------------------------------------------------------
+
+/// One Region Lightsail serves, as `GetRegions` reports it.
+///
+/// The catalog of Regions is the modelled `RegionName` enum
+/// (`smithy_query(query="shape",shape="RegionName")`, generated here as
+/// `REGION_NAME_VALUES`) — those are exactly the Regions this API accepts, so
+/// those are the Regions it lists. Each entry adds the two human-facing values
+/// the enum cannot carry: the place AWS names the Region after
+/// (`Region$displayName` — "The display name (`Ohio`)") and the area AWS
+/// recommends it for (`Region$description` — "This region is recommended to
+/// serve users in the eastern United States and eastern Canada"). The
+/// continent code is not stored, because it follows from the name: see
+/// [`continent_code_of_region`].
+#[derive(Debug, Clone, Copy)]
+pub struct RegionSpec {
+    /// The `RegionName` value, as `Region$name` reports it.
+    pub name: &'static str,
+    /// The place the Region is named after, as `Region$displayName` reports it.
+    pub display_name: &'static str,
+    /// The area the Region is recommended for: the clause `Region$description`
+    /// puts after "This region is recommended to serve users in".
+    pub serves: &'static str,
+}
+
+impl RegionSpec {
+    /// The sentence `Region$description` carries, in the form that member's own
+    /// documentation shows.
+    pub fn description(&self) -> String {
+        format!(
+            "This region is recommended to serve users in {}",
+            self.serves
+        )
+    }
+
+    /// This Region as the modelled `Region`.
+    ///
+    /// Each zone list is filled only when the caller asked for it: `GetRegions`
+    /// documents both as opt-in ("Use the include availability zones parameter
+    /// to ALSO return the Availability Zones in a region"), so a caller that did
+    /// not ask is told nothing about them rather than handed an empty list it
+    /// could read as "this Region has no zones".
+    pub fn view(&self, include_zones: bool, include_relational_database_zones: bool) -> Region {
+        Region {
+            continent_code: continent_code_of_region(self.name).map(str::to_string),
+            description: Some(self.description()),
+            display_name: Some(self.display_name.to_string()),
+            name: Some(self.name.to_string()),
+            availability_zones: include_zones.then(|| availability_zones_of_region(self.name)),
+            relational_database_availability_zones: include_relational_database_zones
+                .then(|| availability_zones_of_region(self.name)),
+        }
+    }
+}
+
+/// Every Region this service serves, one per `REGION_NAME_VALUES` entry and in
+/// that list's order, so `GetRegions` walks a stable total order.
+///
+/// `display_name` is the city, state or country AWS names each Region after;
+/// `serves` is the geography that Region is the closest one to.
+pub const REGION_SPECS: &[RegionSpec] = &[
+    RegionSpec {
+        name: "ap-east-1",
+        display_name: "Hong Kong",
+        serves: "Hong Kong and southern China",
+    },
+    RegionSpec {
+        name: "ap-northeast-1",
+        display_name: "Tokyo",
+        serves: "Japan",
+    },
+    RegionSpec {
+        name: "ap-northeast-2",
+        display_name: "Seoul",
+        serves: "South Korea",
+    },
+    RegionSpec {
+        name: "ap-south-1",
+        display_name: "Mumbai",
+        serves: "India",
+    },
+    RegionSpec {
+        name: "ap-southeast-1",
+        display_name: "Singapore",
+        serves: "Singapore and southeast Asia",
+    },
+    RegionSpec {
+        name: "ap-southeast-2",
+        display_name: "Sydney",
+        serves: "Australia and New Zealand",
+    },
+    RegionSpec {
+        name: "ap-southeast-3",
+        display_name: "Jakarta",
+        serves: "Indonesia",
+    },
+    RegionSpec {
+        name: "ap-southeast-5",
+        display_name: "Malaysia",
+        serves: "Malaysia",
+    },
+    RegionSpec {
+        name: "ca-central-1",
+        display_name: "Montreal",
+        serves: "Canada",
+    },
+    RegionSpec {
+        name: "eu-central-1",
+        display_name: "Frankfurt",
+        serves: "Germany and central Europe",
+    },
+    RegionSpec {
+        name: "eu-north-1",
+        display_name: "Stockholm",
+        serves: "the Nordic countries",
+    },
+    RegionSpec {
+        name: "eu-south-2",
+        display_name: "Spain",
+        serves: "Spain and Portugal",
+    },
+    RegionSpec {
+        name: "eu-west-1",
+        display_name: "Ireland",
+        serves: "Ireland and western Europe",
+    },
+    RegionSpec {
+        name: "eu-west-2",
+        display_name: "London",
+        serves: "the United Kingdom",
+    },
+    RegionSpec {
+        name: "eu-west-3",
+        display_name: "Paris",
+        serves: "France",
+    },
+    RegionSpec {
+        name: "sa-east-1",
+        display_name: "São Paulo",
+        serves: "Brazil and eastern South America",
+    },
+    RegionSpec {
+        name: "us-east-1",
+        display_name: "Virginia",
+        serves: "the eastern United States and eastern Canada",
+    },
+    RegionSpec {
+        name: "us-east-2",
+        display_name: "Ohio",
+        serves: "the midwestern United States",
+    },
+    RegionSpec {
+        name: "us-west-1",
+        display_name: "California",
+        serves: "California and the southwestern United States",
+    },
+    RegionSpec {
+        name: "us-west-2",
+        display_name: "Oregon",
+        serves: "the northwestern United States and western Canada",
+    },
+];
+
+/// The continent code of the Region `name`, or `None` when its geography prefix
+/// is not one this service serves.
+///
+/// An AWS Region name begins with the geography it sits in, so the continent
+/// code follows from the name rather than needing its own table: `us-`/`ca-` are
+/// North America, `sa-` South America, `eu-` Europe and `ap-` Asia Pacific —
+/// the pairing the modelled `Region$continentCode` documentation shows ("The
+/// continent code (`NA`, meaning North America)"). An unlisted prefix reports
+/// NO continent code: the member is optional, and guessing one would be worse
+/// than saying nothing.
+pub fn continent_code_of_region(name: &str) -> Option<&'static str> {
+    match name.split('-').next()? {
+        "us" | "ca" => Some("NA"),
+        "sa" => Some("SA"),
+        "eu" => Some("EU"),
+        "ap" => Some("AP"),
+        _ => None,
+    }
+}
+
+/// How many Availability Zones each Region advertises.
+///
+/// CHOSEN, not an AWS figure: the model declares no count, and AWS's own count
+/// differs per Region and even per account. Three is the fewest any Lightsail
+/// Region offers, so every zone this catalog names is one the real Region has
+/// too.
+pub const AVAILABILITY_ZONES_PER_REGION: usize = 3;
+
+/// The `state` a serving Availability Zone reports.
+///
+/// A Lightsail Availability Zone is an EC2 one, and `available` is EC2's state
+/// for a zone that is operating normally.
+pub const AVAILABILITY_ZONE_STATE_AVAILABLE: &str = "available";
+
+/// The Availability Zones of `region`.
+///
+/// A zone name is its Region's name followed by a lowercase letter, counted from
+/// `a`, which is the format the modelled `AvailabilityZone$zoneName` documents:
+/// "The format is `us-east-2a` (case-sensitive)".
+pub fn availability_zones_of_region(region: &str) -> Vec<AvailabilityZone> {
+    (0..AVAILABILITY_ZONES_PER_REGION)
+        .filter_map(availability_zone_letter)
+        .map(|letter| AvailabilityZone {
+            zone_name: Some(format!("{region}{letter}")),
+            state: Some(AVAILABILITY_ZONE_STATE_AVAILABLE.to_string()),
+        })
+        .collect()
+}
+
+/// The zone letter at `index`, counting from `a`. Indices past the alphabet
+/// would collide, so they are a programming error rather than a value to render:
+/// a debug build trips, and a release build reports no zone for them.
+fn availability_zone_letter(index: usize) -> Option<char> {
+    debug_assert!(
+        index < 26,
+        "an availability zone index past the alphabet has no letter: {index}"
+    );
+    let offset = u8::try_from(index).ok()?;
+    (offset < 26).then(|| char::from(b'a' + offset))
 }
 
 /// Where a stored record lives.

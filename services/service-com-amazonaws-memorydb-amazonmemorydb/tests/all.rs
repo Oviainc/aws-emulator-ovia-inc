@@ -19,5 +19,7 @@ mod engine_versions;
 mod parameter_groups;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/user_lifecycle.rs"]
+mod user_lifecycle;
 #[path = "all/users.rs"]
 mod users;

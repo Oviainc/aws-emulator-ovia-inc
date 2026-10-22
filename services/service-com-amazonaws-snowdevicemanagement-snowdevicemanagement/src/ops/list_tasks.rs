@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTasks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTasks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTasks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the tasks created in the signed Region as `TaskSummary`, in `taskId`
+//! order, narrowed to one `TaskState` when the request names one:
+//! `@paginated(items: tasks)`, so a page is cut at `maxResults` and `nextToken`
+//! carries the task id the next page resumes at. A Region this account has
+//! activated no device in is refused by the account-level device gate
+//! (`AccessDeniedException`) instead.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +147,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTasks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTasksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTasks"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTasksErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the snow-device-management task store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // The account-level device gate comes FIRST: a Region this account has
+        // activated no Snow device in has no device to have run a task, and the
+        // service refuses the call rather than answering an empty list — or than
+        // judging the request's `nextToken`, which is request-carried state like
+        // any id.
+        if !store.has_activated_device(&region) {
+            return Err(ListTasksErrorModeled::AccessDeniedException(
+                crate::state::no_devices_in_region(),
+            )
+            .into());
+        }
+        store.settle(now);
+
+        // The token carries the task id the next page resumes at; a value this
+        // service never issued is refused rather than silently serving page one.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_token(token) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(ListTasksErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!(
+                                "nextToken {token:?} is not a token returned by ListTasks"
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+        let page_size = crate::state::page_size(input.max_results);
+
+        let mut tasks = Vec::with_capacity(page_size);
+        let mut next_token = None;
+        for (task_id, task) in &store.tasks {
+            // A task belongs to the Region its targets are managed in.
+            if task.region != region {
+                continue;
+            }
+            // Resume at the first id at or after the token, so a page is still
+            // served when the task the token named is gone.
+            if resume_at.as_deref().is_some_and(|key| task_id.as_str() < key) {
+                continue;
+            }
+            // "A structure used to filter the list of tasks" by state. The value
+            // is one of `TaskState`'s: the boundary validator refused anything
+            // else before this handler ran.
+            if input
+                .state
+                .as_deref()
+                .is_some_and(|wanted| task.state != wanted)
+            {
+                continue;
+            }
+            if tasks.len() == page_size {
+                next_token = Some(crate::state::encode_token(task_id));
+                break;
+            }
+            tasks.push(task.to_summary());
+        }
+
+        Ok(ListTasksOutput {
+            tasks: Some(tasks),
+            next_token,
+        })
     }
 }

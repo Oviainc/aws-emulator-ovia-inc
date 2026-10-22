@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDomain
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDomain`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes the named search domain and reports its `DomainStatus` with `Deleted=true`.
+//! A MUTATION.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDomain::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The domain stops being usable at once — it disappears from `ListDomainNames`, its
+//! index fields are gone, and every per-domain operation answers
+//! `ResourceNotFoundException` — but its record lingers for `DescribeDomains` with
+//! `Deleted=true` while cleanup runs, per the modelled `DomainStatus$Deleted` doc: "The
+//! system must clean up resources dedicated to the search domain when DeleteDomain is
+//! called. Newly deleted search domains are returned from DescribeDomains with a true
+//! value for IsDeleted for several minutes until resource cleanup is complete."
+//!
+//! This operation models NO `ResourceNotFoundException`, so deleting a domain that does
+//! not exist is a success carrying no `DomainStatus` (the member is optional) rather
+//! than an error the model cannot express.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +145,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDomain` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDomainErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDomain"))
+        // Request metadata only; the store is reached through `self.engine`.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteDomainErrorModeled::InternalException(InternalException {
+                code: None,
+                message: Some(
+                    "CloudSearch domain state is unavailable on this engine.".to_string(),
+                ),
+            })
+        })?;
+        let mut state = state.lock();
+
+        let clock = ::std::time::Instant::now();
+        state.advance(clock);
+
+        let Some(domain) = state.domain_mut(&input.domain_name) else {
+            return Ok(DeleteDomainOutput {
+                domain_status: None,
+            });
+        };
+
+        // Deleting an already-deleted domain is not an error: it is the same answer,
+        // because the record is already in the state the caller asked for.
+        if domain.is_live() {
+            domain.start_delete(clock);
+        }
+
+        Ok(DeleteDomainOutput {
+            domain_status: Some(domain.status()),
+        })
     }
 }

@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSourceViewsForBillingView
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSourceViewsForBillingView`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the source-view ARNs persisted on the billing view the request names,
+//! in the order that view stores them, paginated with `maxResults` and an opaque
+//! `nextToken` that resumes at the entry after the last one the previous page
+//! returned. The operation is `@readonly`: it only reads
+//! [`crate::state::BillingView::source_views`], so a caller can poll it without
+//! changing what the next caller sees.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSourceViewsForBillingView::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A view holding no source views (the account's `PRIMARY` view, which draws on
+//! no other view) answers 200 with an empty list; an ARN no view is stored under
+//! is refused with the modeled `ResourceNotFoundException`, which is the answer
+//! that distinguishes "no such view" from "a view with no sources". The output
+//! member `sourceViews` is modeled `@length(min: 1)` because a `CUSTOM` view is
+//! created with 1..10 sources; reporting the empty list a `PRIMARY` view really
+//! holds is preferred over refusing the read or inventing an entry the store
+//! does not hold.
 //!
 //! ## Shape of an operation
 //!
@@ -130,6 +136,40 @@ pub struct ListSourceViewsForBillingView<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// The `nextToken` for a page that ended after `returned` entries of the view's
+/// source-view list.
+///
+/// The token is POSITIONAL rather than the last ARN returned, because
+/// `BillingViewSourceViewsList` is a list in which nothing collapses a repeated
+/// ARN, so an ARN does not identify a page boundary. Hex keeps the token inside
+/// the modeled `PageToken` pattern (`^[-a-zA-Z0-9+=/_]+$`) and length (1..4095).
+/// It is encoded, not unforgeable: a caller that hand-builds one resumes at that
+/// position of the view it already named, which is bounded by the slice below
+/// and reaches nothing the same caller could not list page by page.
+fn encode_page_token(returned: usize) -> String {
+    hex::encode(returned.to_string().as_bytes())
+}
+
+/// The number of entries a `nextToken` resumes after, or a `ValidationException`
+/// when the token is not one this service issued.
+fn decode_page_token(token: &str) -> Result<usize, ListSourceViewsForBillingViewError> {
+    hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| text.parse::<usize>().ok())
+        .ok_or_else(|| {
+            ListSourceViewsForBillingViewErrorModeled::ValidationException(ValidationException {
+                message: "nextToken is not a token this service issued".to_string(),
+                reason: "cannotParse".to_string(),
+                field_list: Some(vec![ValidationExceptionField {
+                    name: "nextToken".to_string(),
+                    message: "The pagination token is not valid.".to_string(),
+                }]),
+            })
+            .into()
+        })
+}
+
 impl<Eng> ListSourceViewsForBillingView<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -156,18 +196,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSourceViewsForBillingView` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSourceViewsForBillingViewErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSourceViewsForBillingView"))
+        // Every modeled constraint (the `arn` pattern, `maxResults` 1..100, the
+        // `nextToken` pattern and length) is refused by the boundary validator
+        // before this runs; what is left to decide is which view the ARN names
+        // and which slice of its source views the page carries.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListSourceViewsForBillingViewErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the billing view store is unavailable".to_string(),
+                },
+            )
+        })?;
+        let state = state.lock();
+
+        let view = state.billing_views.get(&input.arn).ok_or_else(|| {
+            ListSourceViewsForBillingViewErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Billing view {} does not exist", input.arn),
+                    resource_id: input.arn.clone(),
+                    resource_type: crate::state::BILLING_VIEW_RESOURCE_TYPE.to_string(),
+                },
+            )
+        })?;
+
+        // The page starts where the previous one stopped. An offset past the end
+        // of the list (the entries behind it were disassociated since the token
+        // was issued) leaves nothing to return, which is the last page.
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => decode_page_token(token)?,
+            None => 0,
+        };
+        let remaining = view.source_views.get(resume_after..).unwrap_or_default();
+
+        // `maxResults` is the page size; absent, the whole list is one page.
+        let (page, next_token) = match input.max_results.and_then(|max| usize::try_from(max).ok()) {
+            Some(limit) if remaining.len() > limit => (
+                &remaining[..limit],
+                Some(encode_page_token(resume_after + limit)),
+            ),
+            _ => (remaining, None),
+        };
+
+        Ok(ListSourceViewsForBillingViewOutput {
+            // Derived on every read from the one stored copy of the view, so a
+            // list cannot disagree with what `GetBillingView` reports as
+            // `sourceViewCount`.
+            source_views: page.to_vec(),
+            next_token,
+        })
     }
 }

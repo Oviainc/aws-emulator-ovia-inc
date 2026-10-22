@@ -15,6 +15,16 @@ use serde_json::{json, Value};
 // and is shared with every other suite in this crate.
 use super::harness::{call, error_code, ok, router, store_with_validation_off};
 
+/// The human-readable text an awsJson1_0 fault carries. The modeled member is
+/// `message`; some SDKs read the capitalized spelling, so both are accepted.
+fn error_message(body: &Value) -> String {
+    body["message"]
+        .as_str()
+        .or_else(|| body["Message"].as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// `{entityType, entityId}` pairs, sorted, for order-insensitive comparison.
 fn pairs(value: &Value, type_key: &str, id_key: &str) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = value
@@ -229,6 +239,354 @@ async fn deleting_a_policy_store_makes_it_unknown_unless_protection_refuses_it()
     assert_eq!(
         status, 200,
         "case \"repeat delete\": a delete of an absent store must succeed, got {status} {body}"
+    );
+}
+
+/// The deletion-protection refusal reports a CONSTANT message.
+///
+/// `com.amazonaws.verifiedpermissions#InvalidStateException` documents one fixed
+/// sentence pair for this refusal and its only member is `message`, so the text
+/// is byte-identical on every call and embeds no request-supplied or
+/// server-minted value. Rows differ along everything a templated message could
+/// have spliced in: the minted store id, the description, the validation mode,
+/// the tags, and how many policies the store holds.
+#[tokio::test]
+async fn the_deletion_protection_refusal_message_is_a_constant_without_identifiers() {
+    struct Case {
+        name: &'static str,
+        request: Value,
+        /// Static policies to put in the store before the refused delete. A
+        /// STRICT store refuses every static policy (no schema yet), so those
+        /// rows carry none.
+        policies: usize,
+    }
+    let cases = [
+        Case {
+            name: "minimal",
+            request: json!({
+                "validationSettings": { "mode": "OFF" },
+                "deletionProtection": "ENABLED",
+            }),
+            policies: 0,
+        },
+        Case {
+            name: "described",
+            request: json!({
+                "validationSettings": { "mode": "OFF" },
+                "deletionProtection": "ENABLED",
+                "description": "production authorization store",
+            }),
+            policies: 1,
+        },
+        Case {
+            name: "tagged-strict",
+            request: json!({
+                "validationSettings": { "mode": "STRICT" },
+                "deletionProtection": "ENABLED",
+                "description": "locked down",
+                "tags": { "team": "photos", "env": "prod" },
+            }),
+            policies: 0,
+        },
+        Case {
+            name: "many-policies",
+            request: json!({
+                "validationSettings": { "mode": "OFF" },
+                "deletionProtection": "ENABLED",
+            }),
+            policies: 3,
+        },
+    ];
+
+    let router = router();
+    let mut messages: Vec<(&str, String)> = Vec::new();
+    for case in &cases {
+        let name = case.name;
+        let created = ok(&router, "CreatePolicyStore", &case.request).await;
+        let id = created["policyStoreId"].as_str().unwrap_or_default();
+        let arn = created["arn"].as_str().unwrap_or_default();
+        for index in 0..case.policies {
+            ok(
+                &router,
+                "CreatePolicy",
+                &json!({
+                    "policyStoreId": id,
+                    "definition": { "static": {
+                        "statement": format!(
+                            "permit(principal, action, resource == Photo::\"p{index}\");"
+                        ),
+                    } },
+                }),
+            )
+            .await;
+        }
+
+        let (status, body) = call(&router, "DeletePolicyStore", &json!({ "policyStoreId": id }))
+            .await;
+        assert_eq!(
+            status, 406,
+            "case {name:?}: expected HTTP 406 for a protected store, got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidStateException",
+            "case {name:?}: unexpected error code, got {body}"
+        );
+
+        let message = error_message(&body);
+        assert!(
+            !message.is_empty(),
+            "case {name:?}: InvalidStateException must carry its required message, got {body}"
+        );
+        // The documented sentence pair is about deletion protection, and
+        // nothing else: no identifier and no echoed request value.
+        assert!(
+            message.to_lowercase().contains("deletion protection"),
+            "case {name:?}: expected the documented deletion-protection sentence, got {message:?}"
+        );
+        assert!(
+            !message.contains(id),
+            "case {name:?}: the message must not embed the policy store id {id:?}, got {message:?}"
+        );
+        assert!(
+            !message.contains(arn),
+            "case {name:?}: the message must not embed the store arn {arn:?}, got {message:?}"
+        );
+        for echoed in [
+            case.request["description"].as_str(),
+            case.request["validationSettings"]["mode"].as_str(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert!(
+                !message.contains(echoed),
+                "case {name:?}: the message must not echo the request value {echoed:?}, \
+                 got {message:?}"
+            );
+        }
+        for (key, value) in case.request["tags"]
+            .as_object()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+        {
+            let value = value.as_str().unwrap_or_default().to_string();
+            assert!(
+                !message.contains(key.as_str()) && !message.contains(&value),
+                "case {name:?}: the message must not echo the tag {key:?}={value:?}, \
+                 got {message:?}"
+            );
+        }
+
+        // The refusal is reporting-only: the store (and its policies) survive,
+        // and a second refused delete answers exactly the same text.
+        let fetched = ok(&router, "GetPolicyStore", &json!({ "policyStoreId": id })).await;
+        assert_eq!(
+            fetched["policyStoreId"].as_str().unwrap_or_default(),
+            id,
+            "case {name:?}: a refused delete must leave the store readable, got {fetched}"
+        );
+        let listed = ok(&router, "ListPolicies", &json!({ "policyStoreId": id })).await;
+        assert_eq!(
+            listed["policies"].as_array().map(Vec::len).unwrap_or(0),
+            case.policies,
+            "case {name:?}: a refused delete must leave the store's policies in place, \
+             got {listed}"
+        );
+        let (again_status, again_body) =
+            call(&router, "DeletePolicyStore", &json!({ "policyStoreId": id })).await;
+        assert_eq!(
+            again_status, 406,
+            "case {name:?}: a repeated protected delete must stay refused, \
+             got {again_status} {again_body}"
+        );
+        assert_eq!(
+            error_message(&again_body),
+            message,
+            "case {name:?}: the refusal message must not change between calls, got {again_body}"
+        );
+
+        messages.push((name, message));
+    }
+
+    // One constant for the whole class: every row reported the same text.
+    let (first_case, first_message) = messages
+        .first()
+        .cloned()
+        .expect("the case table is not empty");
+    for (name, message) in &messages {
+        assert_eq!(
+            message, &first_message,
+            "case {name:?}: the deletion-protection message must be the same constant as \
+             case {first_case:?} reported, got {message:?}"
+        );
+    }
+
+    // A store without protection is deleted, so the constant belongs to the
+    // refusal path alone.
+    let unprotected = ok(
+        &router,
+        "CreatePolicyStore",
+        &json!({ "validationSettings": { "mode": "OFF" }, "deletionProtection": "DISABLED" }),
+    )
+    .await;
+    let unprotected_id = unprotected["policyStoreId"].as_str().unwrap_or_default();
+    let (status, body) = call(
+        &router,
+        "DeletePolicyStore",
+        &json!({ "policyStoreId": unprotected_id }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case \"unprotected\": an unprotected store must delete, got {status} {body}"
+    );
+}
+
+/// `UpdatePolicyStore` writes through to the store every later read sees, and
+/// disabling deletion protection is what lets the refused delete through.
+///
+/// Rows differ along which members the call carries: `validationSettings` is
+/// required and replaces the mode, `description` follows the request (a call
+/// carrying none leaves the store without one), and `deletionProtection` is the
+/// one member the model documents as "unchanged unless explicitly included in
+/// the call".
+#[tokio::test]
+async fn update_policy_store_writes_through_and_only_touches_what_the_call_carries() {
+    // (case, update request members beyond policyStoreId, expected mode,
+    //  expected description, expected deletionProtection)
+    let cases: &[(&str, Value, &str, Option<&str>, &str)] = &[
+        (
+            "mode only, protection untouched",
+            json!({ "validationSettings": { "mode": "STRICT" } }),
+            "STRICT",
+            None,
+            "ENABLED",
+        ),
+        (
+            "description replaced",
+            json!({
+                "validationSettings": { "mode": "OFF" },
+                "description": "second description",
+            }),
+            "OFF",
+            Some("second description"),
+            "ENABLED",
+        ),
+        (
+            "protection disabled explicitly",
+            json!({
+                "validationSettings": { "mode": "OFF" },
+                "description": "still here",
+                "deletionProtection": "DISABLED",
+            }),
+            "OFF",
+            Some("still here"),
+            "DISABLED",
+        ),
+        (
+            "protection re-enabled",
+            json!({
+                "validationSettings": { "mode": "STRICT" },
+                "deletionProtection": "ENABLED",
+            }),
+            "STRICT",
+            None,
+            "ENABLED",
+        ),
+    ];
+
+    let router = router();
+    for (case, members, expected_mode, expected_description, expected_protection) in cases {
+        let created = ok(
+            &router,
+            "CreatePolicyStore",
+            &json!({
+                "validationSettings": { "mode": "OFF" },
+                "description": "first description",
+                "deletionProtection": "ENABLED",
+            }),
+        )
+        .await;
+        let id = created["policyStoreId"].as_str().unwrap_or_default();
+
+        let mut request = members.clone();
+        request["policyStoreId"] = json!(id);
+        let updated = ok(&router, "UpdatePolicyStore", &request).await;
+        assert_eq!(
+            updated["policyStoreId"].as_str().unwrap_or_default(),
+            id,
+            "case {case:?}: the update must report the store it changed, got {updated}"
+        );
+        assert_eq!(
+            updated["arn"], created["arn"],
+            "case {case:?}: an update must not re-mint the arn, got {updated}"
+        );
+        assert_eq!(
+            updated["createdDate"], created["createdDate"],
+            "case {case:?}: createdDate must survive an update, got {updated}"
+        );
+        assert!(
+            updated["lastUpdatedDate"].as_f64().unwrap_or_default()
+                >= created["createdDate"].as_f64().unwrap_or_default(),
+            "case {case:?}: lastUpdatedDate must not go backwards, got {updated}"
+        );
+
+        // Read it back: the update reached state, not just the response.
+        let fetched = ok(&router, "GetPolicyStore", &json!({ "policyStoreId": id })).await;
+        assert_eq!(
+            fetched["validationSettings"]["mode"].as_str().unwrap_or_default(),
+            *expected_mode,
+            "case {case:?}: validationSettings.mode was not persisted, got {fetched}"
+        );
+        assert_eq!(
+            fetched["description"].as_str(),
+            *expected_description,
+            "case {case:?}: unexpected description after the update, got {fetched}"
+        );
+        assert_eq!(
+            fetched["deletionProtection"].as_str().unwrap_or_default(),
+            *expected_protection,
+            "case {case:?}: unexpected deletionProtection after the update, got {fetched}"
+        );
+        assert_eq!(
+            fetched["lastUpdatedDate"], updated["lastUpdatedDate"],
+            "case {case:?}: the persisted lastUpdatedDate must match the response, got {fetched}"
+        );
+
+        // Deletion protection decides the delete, from state alone.
+        let (status, body) = call(&router, "DeletePolicyStore", &json!({ "policyStoreId": id })).await;
+        let expected_status = if *expected_protection == "ENABLED" {
+            406
+        } else {
+            200
+        };
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected HTTP {expected_status} from DeletePolicyStore after the \
+             update, got {status} {body}"
+        );
+    }
+
+    // An unknown store is the 404 the operation models.
+    let (status, body) = call(
+        &router,
+        "UpdatePolicyStore",
+        &json!({
+            "policyStoreId": "PSdoesnotexist",
+            "validationSettings": { "mode": "OFF" },
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 404,
+        "case \"unknown store\": expected 404 from UpdatePolicyStore, got {status} {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "ResourceNotFoundException",
+        "case \"unknown store\": unexpected error code, got {body}"
     );
 }
 

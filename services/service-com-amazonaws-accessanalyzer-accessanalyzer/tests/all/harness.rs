@@ -169,6 +169,43 @@ impl Emulator {
     }
 }
 
+/// Every `ValidationExceptionReason` this service's model declares, as the pair the model
+/// itself declares: the lowerCamel discriminator (`value`) and the SCREAMING_SNAKE name
+/// (`name`) a response spells it with.
+///
+/// Copied from the model's own enum — `smithy-model/…accessanalyzer.json`, shape
+/// `ValidationExceptionReason`, which declares
+/// `{"value":"unknownOperation","name":"UNKNOWN_OPERATION"}`,
+/// `{"value":"cannotParse","name":"CANNOT_PARSE"}`,
+/// `{"value":"fieldValidationFailed","name":"FIELD_VALIDATION_FAILED"}`,
+/// `{"value":"other","name":"OTHER"}` and
+/// `{"value":"notSupported","name":"NOT_SUPPORTED"}` (the `values` list
+/// `smithy_query(query="shape",shape="ValidationExceptionReason")` reports is the `value`
+/// half of those pairs). AWS serializes the `name`: a recorded refusal carries
+/// `"reason":"FIELD_VALIDATION_FAILED"`.
+pub const VALIDATION_REASONS: &[(&str, &str)] = &[
+    ("unknownOperation", "UNKNOWN_OPERATION"),
+    ("cannotParse", "CANNOT_PARSE"),
+    ("fieldValidationFailed", "FIELD_VALIDATION_FAILED"),
+    ("other", "OTHER"),
+    ("notSupported", "NOT_SUPPORTED"),
+];
+
+/// The spelling a response carries for the modelled `discriminator`, from
+/// [`VALIDATION_REASONS`].
+///
+/// Panics on a discriminator the model does not declare, so a test can never assert
+/// against a reason this service has no business raising.
+pub fn wire_reason(discriminator: &str) -> &'static str {
+    VALIDATION_REASONS
+        .iter()
+        .find(|(modelled, _)| *modelled == discriminator)
+        .map(|(_, wire)| *wire)
+        .unwrap_or_else(|| {
+            panic!("{discriminator:?} is not a modelled ValidationExceptionReason")
+        })
+}
+
 /// The ARN an analyzer of `name` must carry:
 /// `arn:aws:access-analyzer:<region>:<account>:analyzer/<name>`, with the account
 /// segment taken from the core's single source of truth.

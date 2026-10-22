@@ -17,5 +17,7 @@ mod billing_views;
 mod credits;
 #[path = "all/rejection_fidelity.rs"]
 mod rejection_fidelity;
+#[path = "all/source_views.rs"]
+mod source_views;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

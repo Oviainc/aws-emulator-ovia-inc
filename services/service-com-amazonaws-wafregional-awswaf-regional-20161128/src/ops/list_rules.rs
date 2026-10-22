@@ -157,34 +157,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A read: it walks the stored Rules and writes nothing.
         let state = state.lock();
 
-        // `Limit` carries the model's declared default of 0 when the client omitted
-        // it, and its `@range` of 0..100 is enforced at the boundary. 0 asks for the
-        // service's own page size, which that range's maximum states; a larger value
-        // cannot arrive, and is bounded here anyway.
-        let page_size = match usize::try_from(input.limit) {
-            Ok(0) => crate::state::MAX_PAGE_SIZE,
-            Ok(limit) => limit.min(crate::state::MAX_PAGE_SIZE),
-            Err(_) => crate::state::MAX_PAGE_SIZE,
-        };
-
-        // The marker a previous page handed back is the `RuleId` this page starts at.
-        // Borrowed bounds, so resuming copies no id.
-        let start = match input.next_marker.as_deref() {
-            Some(marker) => ::std::ops::Bound::Included(marker),
-            None => ::std::ops::Bound::Unbounded,
-        };
-        let mut remaining = state
-            .rules
-            .range::<str, _>((start, ::std::ops::Bound::Unbounded));
-
-        let rules: Vec<RuleSummary> = remaining
-            .by_ref()
-            .take(page_size)
-            .map(|(_, entry)| entry.summary())
-            .collect();
-        // The marker is the first Rule AFTER this page, so `NextMarker` is present
+        // The pagination rule every AWS WAF Classic `List*` operation follows, held
+        // once in `crate::state::page`: `Limit` bounds the page (0, the model's
+        // declared default, asks for the service's own page size), the marker a
+        // previous page handed back is the `RuleId` this page starts at, and the
+        // returned marker is the first Rule AFTER this page, so `NextMarker` is present
         // exactly when one remains.
-        let next_marker = remaining.next().map(|(rule_id, _)| rule_id.clone());
+        let (page, next_marker) =
+            crate::state::page(&state.rules, input.limit, input.next_marker.as_deref());
+        let rules: Vec<RuleSummary> = page
+            .into_iter()
+            .map(crate::state::RuleEntry::summary)
+            .collect();
 
         Ok(ListRulesOutput {
             rules: Some(rules),

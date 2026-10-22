@@ -15,5 +15,7 @@
 mod domain_zone;
 #[path = "all/instance_lifecycle.rs"]
 mod instance_lifecycle;
+#[path = "all/region_catalog.rs"]
+mod region_catalog;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

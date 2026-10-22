@@ -2,8 +2,18 @@
 
 //! @op CreateAddress
 //!
-//! Mints an `AddressId` and stores the submitted address under it, so
-//! `DescribeAddress` can rebuild that address from the store.
+//! Validates the submitted address, mints an `AddressId` and stores the address under
+//! it, so `DescribeAddress` can rebuild that address from the store.
+//!
+//! Two refusals come before the store is touched, because an address AWS validates at
+//! creation time must not be handed back an id it can never ship to:
+//!
+//! * a destination country the Region that took the order does not ship to is refused by
+//!   the service front-end with a 400 `ValidationException` (the recorded wire shape;
+//!   the Snowball-specific `UnsupportedAddressException` never reaches the client,
+//!   because the front-end rejects the Region/country pair first), and
+//! * an address missing a member the carrier needs to hand over the device is refused
+//!   with the modelled `InvalidAddressException`, naming that member.
 //!
 //! ## Shape of an operation
 //!
@@ -70,6 +80,241 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// Every spelling this emulator accepts for a country one of the shipping areas below
+/// covers, one row per country: its ISO 3166-1 alpha-2 code FIRST — the code the areas
+/// are written in — then the alpha-3 code, the English name and the common short forms.
+///
+/// Source: ISO 3166-1 (alpha-2, alpha-3, English short name). An area names its countries
+/// by alpha-2 code, and a code always matches itself, so a country missing a row here is
+/// still deliverable when written as its code — the rows only widen how an address may
+/// spell it.
+const KNOWN_COUNTRIES: &[&[&str]] = &[
+    // The Americas.
+    &["US", "USA", "United States", "United States of America"],
+    &["CA", "CAN", "Canada"],
+    &["MX", "MEX", "Mexico"],
+    &["BR", "BRA", "Brazil"],
+    // Europe.
+    &["AT", "AUT", "Austria"],
+    &["BE", "BEL", "Belgium"],
+    &["BG", "BGR", "Bulgaria"],
+    &["CH", "CHE", "Switzerland"],
+    &["CY", "CYP", "Cyprus"],
+    &["CZ", "CZE", "Czechia", "Czech Republic"],
+    &["DE", "DEU", "Germany"],
+    &["DK", "DNK", "Denmark"],
+    &["EE", "EST", "Estonia"],
+    &["ES", "ESP", "Spain"],
+    &["FI", "FIN", "Finland"],
+    &["FR", "FRA", "France"],
+    &["GB", "GBR", "United Kingdom", "UK", "Great Britain"],
+    &["GR", "GRC", "Greece"],
+    &["HR", "HRV", "Croatia"],
+    &["HU", "HUN", "Hungary"],
+    &["IE", "IRL", "Ireland"],
+    &["IS", "ISL", "Iceland"],
+    &["IT", "ITA", "Italy"],
+    &["LI", "LIE", "Liechtenstein"],
+    &["LT", "LTU", "Lithuania"],
+    &["LU", "LUX", "Luxembourg"],
+    &["LV", "LVA", "Latvia"],
+    &["MT", "MLT", "Malta"],
+    &["NL", "NLD", "Netherlands"],
+    &["NO", "NOR", "Norway"],
+    &["PL", "POL", "Poland"],
+    &["PT", "PRT", "Portugal"],
+    &["RO", "ROU", "Romania"],
+    &["SE", "SWE", "Sweden"],
+    &["SI", "SVN", "Slovenia"],
+    &["SK", "SVK", "Slovakia"],
+    // Asia and Oceania.
+    &["AU", "AUS", "Australia"],
+    &["CN", "CHN", "China"],
+    &["HK", "HKG", "Hong Kong"],
+    &["ID", "IDN", "Indonesia"],
+    &["IN", "IND", "India"],
+    &["JP", "JPN", "Japan"],
+    &["KR", "KOR", "South Korea", "Korea, Republic of"],
+    &["NZ", "NZL", "New Zealand"],
+    &["SG", "SGP", "Singapore"],
+    // The Middle East and Africa.
+    &["AE", "ARE", "United Arab Emirates"],
+    &["BH", "BHR", "Bahrain"],
+    &["IL", "ISR", "Israel"],
+    &["ZA", "ZAF", "South Africa"],
+];
+
+/// The `AddressType` an address carries when the create named none.
+///
+/// `CreateAddress` "creates an address for a Snow device to be shipped to", and
+/// `Address$Type` "differentiates between delivery address and pickup address in the
+/// customer account" (`smithy_query(query="shape", shape="Address")`) — so an address
+/// this operation creates is the delivery address it says it is unless the caller typed
+/// it otherwise, and every stored address carries one of `ADDRESS_TYPE_VALUES`.
+pub const DEFAULT_ADDRESS_TYPE: &str = "AWS_SHIP";
+
+/// The `Address` members a Snow device cannot be delivered without, each paired with the
+/// way the service names it when it is missing, in the order they are checked.
+///
+/// Source: the member documentation of `com.amazonaws.snowball#Address`
+/// (`smithy_query(query="shape", shape="Address")`). Every member here either names who
+/// the device is handed to ("The name of a person to receive a Snow device at an
+/// address", "The phone number associated with an address that a Snow device is to be
+/// delivered to") or where the carrier takes it ("The first line in a street address
+/// that a Snow device is to be delivered to", city, postal code, country). The members
+/// left out are the ones a delivery can do without: the two the model documents as "no
+/// longer used and the value is ignored" (`PrefectureOrDistrict`, `Landmark`), the
+/// refinements of a line that is already required (`Company`, `Street2`, `Street3`, and
+/// `StateOrProvince` — not every country has one), and the members the service owns
+/// rather than the caller (`AddressId` and `Type`, which this operation assigns, and
+/// `IsRestricted`, which marks a primary address rather than describing a destination).
+///
+/// The set is deliberately the whole delivery-critical group rather than only the member
+/// a recorded refusal happened to drop: the service's refusal is built from the member
+/// name ("You must specify … in the address."), so it is one rule over a set of members,
+/// and a device cannot be handed over without a recipient, a phone number to reach them
+/// on, or a street, city, postal code and country to take it to.
+pub const REQUIRED_DELIVERY_MEMBERS: &[(&str, &str)] = &[
+    ("Name", "a name"),
+    ("Street1", "Address 1"),
+    ("City", "a city"),
+    ("PostalCode", "a postal code"),
+    ("Country", "a country"),
+    ("PhoneNumber", "a phone number"),
+];
+
+/// The countries a Snow device ordered in a Region can be delivered to, as ISO 3166-1
+/// alpha-2 codes, keyed by the Regions that share one area.
+///
+/// A device is shipped by the carrier of the Region that took the order, so the
+/// destination must be a country that Region serves: AWS publishes Snow Family
+/// availability per Region, and a device ordered in a Region is delivered inside that
+/// Region's own country — the European Regions sharing a single area that covers the
+/// EU/EEA, the United Kingdom and Switzerland.
+///
+/// A Region this table does not name has no known area, and then nothing is refused:
+/// this emulator declines a destination it can show the Region does not serve, never one
+/// it merely has no record for.
+const SHIPPING_AREAS: &[(&[&str], &[&str])] = &[
+    (
+        &[
+            "us-east-1",
+            "us-east-2",
+            "us-west-1",
+            "us-west-2",
+            "us-gov-east-1",
+            "us-gov-west-1",
+        ],
+        &["US"],
+    ),
+    (&["ca-central-1", "ca-west-1"], &["CA"]),
+    (&["mx-central-1"], &["MX"]),
+    (&["sa-east-1"], &["BR"]),
+    (
+        &[
+            "eu-west-1",
+            "eu-west-2",
+            "eu-west-3",
+            "eu-central-1",
+            "eu-central-2",
+            "eu-north-1",
+            "eu-south-1",
+            "eu-south-2",
+        ],
+        &[
+            "AT", "BE", "BG", "CH", "CY", "CZ", "DE", "DK", "EE", "ES", "FI", "FR", "GB", "GR",
+            "HR", "HU", "IE", "IS", "IT", "LI", "LT", "LU", "LV", "MT", "NL", "NO", "PL", "PT",
+            "RO", "SE", "SI", "SK",
+        ],
+    ),
+    (&["ap-east-1"], &["HK"]),
+    (&["ap-south-1", "ap-south-2"], &["IN"]),
+    (&["ap-northeast-1", "ap-northeast-3"], &["JP"]),
+    (&["ap-northeast-2"], &["KR"]),
+    (&["ap-southeast-1"], &["SG"]),
+    (&["ap-southeast-2", "ap-southeast-4"], &["AU", "NZ"]),
+    (&["ap-southeast-3"], &["ID"]),
+    (&["me-south-1"], &["BH"]),
+    (&["me-central-1"], &["AE"]),
+    (&["il-central-1"], &["IL"]),
+    (&["af-south-1"], &["ZA"]),
+    (&["cn-north-1", "cn-northwest-1"], &["CN"]),
+];
+
+/// This address's value for the modelled member `member`, as the validator reads it: a
+/// member that is absent, empty or nothing but whitespace names no name, street or city,
+/// so it counts as unset.
+fn member_value<'a>(address: &'a Address, member: &str) -> Option<&'a str> {
+    let supplied: Option<&'a str> = match member {
+        "Name" => address.name.as_deref(),
+        "Street1" => address.street1.as_deref(),
+        "City" => address.city.as_deref(),
+        "PostalCode" => address.postal_code.as_deref(),
+        "Country" => address.country.as_deref(),
+        "PhoneNumber" => address.phone_number.as_deref(),
+        _ => None,
+    };
+    supplied.map(str::trim).filter(|value| !value.is_empty())
+}
+
+/// How the service names the first [`REQUIRED_DELIVERY_MEMBERS`] entry this address does
+/// not carry, or `None` when it carries them all.
+fn missing_delivery_member(address: &Address) -> Option<&'static str> {
+    REQUIRED_DELIVERY_MEMBERS
+        .iter()
+        .find(|(member, _)| member_value(address, member).is_none())
+        .map(|(_, named_as)| *named_as)
+}
+
+/// The countries the Region `region` ships a device to, or `None` when this emulator has
+/// no area recorded for it.
+fn shipping_area(region: &str) -> Option<&'static [&'static str]> {
+    SHIPPING_AREAS
+        .iter()
+        .find(|(regions, _)| regions.contains(&region))
+        .map(|(_, countries)| *countries)
+}
+
+/// What a create answers when this emulator's address store is at its ceiling.
+fn store_full_message() -> String {
+    format!(
+        "this emulator stores at most {} addresses, and that limit has been reached",
+        crate::state::MAX_STORED_ADDRESSES
+    )
+}
+
+/// Whether a device ordered in `region` can be delivered to `country`.
+///
+/// `None` — refuse nothing — only when the Region has no recorded shipping area. When it
+/// has one, the answer is whether the submitted value names one of that area's countries:
+/// the front-end that takes the order knows which countries its carrier serves, so a
+/// destination it cannot match to one of them is not one it can deliver to, whether that
+/// is a country served from elsewhere or a value that names no country at all.
+fn region_delivers_to(region: &str, country: &str) -> Option<bool> {
+    let area = shipping_area(region)?;
+    let needle = country.trim();
+    Some(area.iter().any(|code| names_country(needle, code)))
+}
+
+/// Whether `value` is one of the spellings of the country whose ISO 3166-1 alpha-2 code
+/// is `code`.
+///
+/// The code itself always counts, so an area entry is matchable even if
+/// [`KNOWN_COUNTRIES`] carries no row widening it.
+fn names_country(value: &str, code: &str) -> bool {
+    if value.eq_ignore_ascii_case(code) {
+        return true;
+    }
+    KNOWN_COUNTRIES
+        .iter()
+        .filter(|spellings| spellings[0].eq_ignore_ascii_case(code))
+        .any(|spellings| {
+            spellings
+                .iter()
+                .any(|spelling| value.eq_ignore_ascii_case(spelling))
+        })
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -140,19 +385,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::validation(
                 crate::state::STATE_UNAVAILABLE,
             ));
         };
 
+        let submitted = input.address;
+
+        // `Address$Type` targets the `AddressType` enum, so a value outside that catalog
+        // names no address type at all: refuse it the way the boundary validator refuses
+        // a value a modelled constraint rejects, rather than storing a type no client can
+        // interpret and reporting it back from `DescribeAddress`.
+        if let Some(address_type) = submitted.r#type.as_deref() {
+            if !ADDRESS_TYPE_VALUES.contains(&address_type) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Value '{address_type}' at 'address.type' failed to satisfy constraint: \
+                     Member must satisfy enum value set: [{}]",
+                    ADDRESS_TYPE_VALUES.join(", ")
+                )));
+            }
+        }
+
+        // "The address you provide must be located within the serviceable area of your
+        // region": a destination the Region that took the order does not ship to is
+        // refused before the address itself is validated, since no correction to the
+        // other lines can make that country deliverable from here.
+        let region = crate::state::request_region(ctx.parts());
+        if let Some(country) = member_value(&submitted, "Country") {
+            if region_delivers_to(&region, country) == Some(false) {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "Delivery of the device from this region to this country is not available.",
+                ));
+            }
+        }
+
+        // "Addresses are validated at the time of creation ... if the address is invalid
+        // or unsupported, then an exception is thrown": an address missing a member the
+        // carrier needs to hand over the device is refused here rather than accepted and
+        // found undeliverable at shipping time.
+        if let Some(named_as) = missing_delivery_member(&submitted) {
+            return Err(CreateAddressErrorModeled::InvalidAddressException(
+                InvalidAddressException {
+                    message: Some(format!("You must specify {named_as} in the address.")),
+                },
+            )
+            .into());
+        }
+
+        // This emulator holds a bounded number of addresses, and nothing in this API
+        // deletes one, so a store at its ceiling refuses the create rather than growing
+        // the process further. The model declares no quota error on this operation, so
+        // the refusal travels on the framework's channel, naming the limit reached. It is
+        // answered BEFORE an id is minted, so a refused create leaves the id sequence
+        // where it was.
+        let mut store = state.lock();
+        if !store.can_store_another_address() {
+            return Err(crate::scaffolded::Scaffolded::validation(store_full_message()));
+        }
+
         // The id is the service's own: a submitted `Address$AddressId` would name an
         // address that already exists, which is not what this operation creates, so the
         // record is keyed and reported by the minted id.
-        let mut store = state.lock();
         let address_id = store.mint_address_id();
-        let submitted = input.address;
         let record = crate::state::StoredAddress {
             address_id: address_id.clone(),
             name: submitted.name,
@@ -165,22 +460,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             country: submitted.country,
             postal_code: submitted.postal_code,
             phone_number: submitted.phone_number,
+            // The caller's own: the model documents `IsRestricted` as "If the address you
+            // are creating is a primary address, then set this option to true", so the
+            // submitted flag is what is stored and reported.
             is_restricted: submitted.is_restricted,
-            address_type: submitted.r#type,
+            // An address created for a device to be shipped to is a delivery address
+            // unless the caller typed it otherwise, so the record carries a type either
+            // way and `DescribeAddress` reports one for every address.
+            address_type: Some(
+                submitted
+                    .r#type
+                    .unwrap_or_else(|| DEFAULT_ADDRESS_TYPE.to_string()),
+            ),
             // `PrefectureOrDistrict` and `Landmark` are deliberately not carried over:
             // the model documents both as "This field is no longer used and the value is
             // ignored", so a submitted value is neither stored nor reported back.
         };
 
-        // This emulator holds a bounded number of addresses, and nothing in this API
-        // deletes one, so a store at its ceiling refuses the create rather than growing
-        // the process further. The model declares no quota error on this operation, so
-        // the refusal travels on the framework's channel, naming the limit reached.
+        // The ceiling is enforced again at the insertion point, which is the only place
+        // that can tell whether the record went in.
         if !store.insert_address(record) {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "this emulator stores at most {} addresses, and that limit has been reached",
-                crate::state::MAX_STORED_ADDRESSES
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(store_full_message()));
         }
 
         Ok(CreateAddressOutput {

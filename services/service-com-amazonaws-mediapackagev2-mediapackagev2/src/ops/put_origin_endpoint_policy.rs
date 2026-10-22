@@ -226,7 +226,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The policy replaces any policy the endpoint already carried, together with the
         // CDN authorization settings submitted with it: the pair is one record, so a
-        // request that omits `CdnAuthConfiguration` leaves none behind.
+        // request that omits `CdnAuthConfiguration` leaves none behind. One field on the
+        // endpoint, replaced rather than appended to, and every part of what it holds is
+        // bounded by the model and refused at the request boundary before this handler
+        // runs: `PolicyText` is `@length max 6144`, `CdnIdentifierSecretArns` is
+        // `@length 1..100`, and each ARN in it `@length 20..2048`.
         endpoint.policy = Some(crate::state::EndpointPolicy {
             policy: input.policy,
             cdn_auth_configuration: input.cdn_auth_configuration,
