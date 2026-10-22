@@ -415,6 +415,24 @@ impl Domain {
         templates
     }
 
+    /// Every field this domain still holds, in creation order and each paired
+    /// with the key [`order_key`] builds for it, with the deleted ones left out:
+    /// what a listing of fields reports. A deleted field is left out because the
+    /// model says so for that listing in particular — "Deleted fields are not
+    /// included in the `ListFields` response"
+    /// (`smithy_query(query="doc", shape="DeleteField")`) — and the same
+    /// tombstone is what [`Self::unknown_field_ids`] already treats as absent.
+    pub fn live_fields(&self) -> Vec<(String, &Field)> {
+        let mut fields: Vec<(String, &Field)> = self
+            .fields
+            .values()
+            .filter(|field| !field.deleted)
+            .map(|field| (order_key(field.created_time, &field.field_id), field))
+            .collect();
+        fields.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        fields
+    }
+
     /// Refuse a new field once the domain holds [`MAX_FIELDS_PER_DOMAIN`].
     pub fn field_capacity(&self) -> Result<(), ServiceQuotaExceededException> {
         capacity(

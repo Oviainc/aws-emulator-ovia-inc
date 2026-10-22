@@ -15,6 +15,8 @@
 mod case_event_configuration;
 #[path = "all/case_lifecycle.rs"]
 mod case_lifecycle;
+#[path = "all/field_listing.rs"]
+mod field_listing;
 #[path = "all/field_options.rs"]
 mod field_options;
 #[path = "all/layout_lifecycle.rs"]

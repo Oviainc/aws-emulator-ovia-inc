@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListFields
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListFields`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListFields::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the fields [`crate::state`] holds for the domain, one page at
+//! a time, and writes nothing. It is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -120,6 +113,22 @@ impl From<ListFieldsErrorModeled> for ListFieldsError {
     }
 }
 
+/// The condensed summary the listing reports for one stored field: the members
+/// `FieldSummary` declares, each read off the stored record rather than off the
+/// request that asked for it. `description` is not one of them, so a summary
+/// carries less than `BatchGetField`'s record of the same field
+/// (`smithy_query(query="shape", shape="FieldSummary")`).
+fn summary(field: &crate::state::Field) -> FieldSummary {
+    FieldSummary {
+        field_id: field.field_id.clone(),
+        field_arn: field.field_arn.clone(),
+        name: field.name.clone(),
+        r#type: field.field_type.clone(),
+        namespace: field.namespace.clone(),
+        attributes: field.attributes.clone(),
+    }
+}
+
 /// The `ListFields` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -156,18 +165,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListFields` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListFieldsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListFields"))
+        // A read (`@readonly` in the model): it reports the domain's stored field
+        // definitions and writes nothing, so a later caller sees exactly what it
+        // would have seen had this call never happened.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListFieldsErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        let domain = store
+            .domain(&input.domain_id)
+            .map_err(ListFieldsErrorModeled::ResourceNotFoundException)?;
+
+        // Every live field of the domain, in the creation order the store orders
+        // a listing by, each summarised from the stored record. The listing takes
+        // no filters, so its page scope narrows nothing beyond the domain.
+        let listed: Vec<(String, FieldSummary)> = domain
+            .live_fields()
+            .into_iter()
+            .map(|(key, field)| (key, summary(field)))
+            .collect();
+
+        // The cursor is scoped to this listing and this domain, so a token from
+        // another read is refused rather than resumed at a key it never ordered,
+        // and a `maxResults` outside the modelled range is refused rather than
+        // quietly clamped.
+        let page = crate::state::page(
+            &crate::state::page_scope(Self::NAME, &input.domain_id, &[]),
+            listed,
+            input.max_results,
+            input.next_token.as_deref(),
+        )
+        .map_err(|error| {
+            ListFieldsErrorModeled::ValidationException(crate::state::page_validation_exception(
+                &error,
+            ))
+        })?;
+
+        Ok(ListFieldsOutput {
+            fields: page.items,
+            next_token: page.next_token,
+        })
     }
 }
