@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddTagsToCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddTagsToCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddTagsToCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: merges the request's tags into the certificate record's tag map, so
+//! `ListTagsForCertificate` reports them back.
 //!
 //! ## Shape of an operation
 //!
@@ -189,18 +182,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddTagsToCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddTagsToCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddTagsToCertificate"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AddTagsToCertificateErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some("the acm certificate store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        if crate::state::certificate_id_from_arn(&input.certificate_arn).is_none() {
+            return Err(AddTagsToCertificateErrorModeled::InvalidArnException(
+                InvalidArnException {
+                    message: Some(format!(
+                        "{} is not an ACM certificate ARN",
+                        input.certificate_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let added = crate::state::tag_map(&input.tags).map_err(|message| {
+            AddTagsToCertificateErrorModeled::InvalidTagException(InvalidTagException {
+                message: Some(message),
+            })
+        })?;
+
+        let mut store = state.lock();
+        let Some(certificate) = store.certificates.get_mut(&input.certificate_arn) else {
+            return Err(AddTagsToCertificateErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Could not find certificate {}",
+                        input.certificate_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // Merged by key: a key the certificate already carries takes the new value.
+        let mut merged = certificate.tags.clone();
+        merged.extend(added);
+
+        // `TagList` tops out at 50 entries, which is the per-certificate tag quota
+        // `TooManyTagsException` reports. Refused before the record is touched, so a
+        // rejected request leaves the certificate's tags as they were.
+        if merged.len() > TAG_LIMIT {
+            let over = merged.len();
+            return Err(AddTagsToCertificateErrorModeled::TooManyTagsException(
+                TooManyTagsException {
+                    message: Some(format!(
+                        "a certificate may carry at most {TAG_LIMIT} tags; this request would leave {over}"
+                    )),
+                },
+            )
+            .into());
+        }
+        certificate.tags = merged;
+
+        Ok(AddTagsToCertificateOutput)
     }
 }
+
+/// The number of tags one certificate may carry, from the `TagList` length bound the
+/// model declares (`len 1..50`).
+const TAG_LIMIT: usize = 50;

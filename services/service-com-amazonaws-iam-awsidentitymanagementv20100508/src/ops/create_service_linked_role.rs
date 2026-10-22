@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateServiceLinkedRole
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateServiceLinkedRole`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateServiceLinkedRole::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -97,6 +88,93 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// What every service-linked role name starts with. AWS's "Using service-linked
+/// roles" guidance, echoed by `CreateServiceLinkedRole$CustomSuffix`'s
+/// documentation ("a string that you provide, which is combined with the
+/// service-provided prefix to form the complete role name"), is that the role a
+/// service links to itself is named for the service behind this prefix.
+const SERVICE_LINKED_ROLE_NAME_PREFIX: &str = "AWSServiceRoleFor";
+
+/// The character that joins a `CustomSuffix` to the service-provided prefix, as in
+/// `AWSServiceRoleForElasticBeanstalk_debug`. It is inside `roleNameType`'s
+/// `^[\w+=,.@-]+$`, so a name carrying a suffix is still a legal role name.
+const CUSTOM_SUFFIX_SEPARATOR: char = '_';
+
+/// The path every service-linked role lives under. AWS reserves the
+/// `/aws-service-role/` path for them and files each one under its own service
+/// principal, so the path identifies which service the role is linked to.
+const SERVICE_LINKED_ROLE_PATH_PREFIX: &str = "/aws-service-role/";
+
+/// The IAM policy language version a generated trust policy declares. It is the
+/// current version of the policy grammar IAM documents, and the one AWS emits in
+/// the trust policy of a role it creates.
+const POLICY_LANGUAGE_VERSION: &str = "2012-10-17";
+
+/// Whether `aws_service_name` is shaped like a service principal.
+///
+/// `CreateServiceLinkedRole$AWSServiceName`'s documentation describes it as "a
+/// string similar to a URL but without the http:// in front. For example:
+/// elasticbeanstalk.amazonaws.com" — a DNS-style name, so at least two non-empty
+/// dot-separated labels. The modelled `groupNameType` pattern `^[\w+=,.@-]+$`
+/// admits far more than that (a bare word, or one that is all separators), and
+/// those name no service.
+fn is_service_principal(aws_service_name: &str) -> bool {
+    let labels: Vec<&str> = aws_service_name.split('.').collect();
+    labels.len() >= 2 && labels.iter().all(|label| !label.is_empty())
+}
+
+/// The path a service-linked role for `service_principal` is filed under:
+/// [`SERVICE_LINKED_ROLE_PATH_PREFIX`] followed by the principal and a closing
+/// `/`, which is `pathType`'s required form
+/// (`^(\u002F)|(\u002F[\u0021-\u007E]+\u002F)$`).
+fn service_linked_role_path(service_principal: &str) -> String {
+    format!("{SERVICE_LINKED_ROLE_PATH_PREFIX}{service_principal}/")
+}
+
+/// The name of the service-linked role for `service_principal`, with
+/// `custom_suffix` appended when the request supplied one.
+///
+/// The service-provided prefix is [`SERVICE_LINKED_ROLE_NAME_PREFIX`] followed by
+/// the service's own label — the first label of its principal, capitalised. The
+/// EXACT spelling AWS gives that label is a per-service string no part of the API
+/// model carries, so it is derived from the principal the request named, which
+/// keeps the name a function of the request alone: the same principal and suffix
+/// always name the same role, and two different principals never do.
+fn service_linked_role_name(service_principal: &str, custom_suffix: Option<&str>) -> String {
+    let service_label = service_principal
+        .split('.')
+        .next()
+        .unwrap_or(service_principal);
+    let mut role_name = String::from(SERVICE_LINKED_ROLE_NAME_PREFIX);
+    let mut characters = service_label.chars();
+    if let Some(first) = characters.next() {
+        role_name.extend(first.to_uppercase());
+        role_name.push_str(characters.as_str());
+    }
+    if let Some(custom_suffix) = custom_suffix {
+        role_name.push(CUSTOM_SUFFIX_SEPARATOR);
+        role_name.push_str(custom_suffix);
+    }
+    role_name
+}
+
+/// The trust policy of a service-linked role: the one statement that lets the
+/// service principal the role is linked to assume it.
+///
+/// Computed from the request's principal, so the document a read returns says
+/// which service controls the role rather than being a fixed blob.
+fn service_linked_role_trust_policy(service_principal: &str) -> String {
+    ::serde_json::json!({
+        "Version": POLICY_LANGUAGE_VERSION,
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": { "Service": service_principal },
+            "Action": ["sts:AssumeRole"],
+        }],
+    })
+    .to_string()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -168,18 +246,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateServiceLinkedRole` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateServiceLinkedRoleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateServiceLinkedRole"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateServiceLinkedRoleErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A service-linked role is linked to a SERVICE, named by its principal, so
+        // a value that does not name one cannot be linked to anything.
+        if !is_service_principal(&input.aws_service_name) {
+            return Err(CreateServiceLinkedRoleErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "AWSServiceName must be a service principal, such as \
+                         elasticbeanstalk.amazonaws.com; got {}",
+                        input.aws_service_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let role_name =
+            service_linked_role_name(&input.aws_service_name, input.custom_suffix.as_deref());
+        // The derived name has to BE a role name: `roleNameType` bounds it at 64
+        // characters, which a long principal or a long suffix can carry it past.
+        if role_name.chars().count() > crate::state::MAX_ROLE_NAME_CHARACTERS {
+            return Err(CreateServiceLinkedRoleErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "The service-linked role name {role_name} is longer than the \
+                         maximum of {} characters",
+                        crate::state::MAX_ROLE_NAME_CHARACTERS
+                    )),
+                },
+            )
+            .into());
+        }
+        let path = service_linked_role_path(&input.aws_service_name);
+
+        let mut store = state.lock();
+
+        // IAM entity names are unique within the account and "are not
+        // distinguished by case", so the case-folded name is the identity. A second
+        // create for the same service therefore needs a different `CustomSuffix`,
+        // which is what that member's documentation says ("if you make multiple
+        // requests for the same service, then you must supply a different
+        // CustomSuffix for each request. Otherwise the request fails with a
+        // duplicate role name error"). This operation models no
+        // `EntityAlreadyExistsException`
+        // (`smithy_query(query="operation", operation="CreateServiceLinkedRole")`),
+        // so the duplicate is refused through `InvalidInputException`.
+        let key = crate::state::name_key(&role_name);
+        if store.roles.contains_key(&key) {
+            return Err(CreateServiceLinkedRoleErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Service role name {role_name} has been taken in this account, \
+                         please try a different suffix"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // An account holds a bounded number of roles, so a caller cannot grow the
+        // account without limit; past the quota IAM refuses the create.
+        if store.roles.len() >= crate::state::MAX_ROLES_PER_ACCOUNT {
+            return Err(CreateServiceLinkedRoleErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Cannot exceed quota for RoleLimit: {}",
+                        crate::state::MAX_ROLES_PER_ACCOUNT
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let role = Role {
+            arn: crate::state::role_arn(&path, &role_name),
+            path,
+            role_id: store.next_role_id(),
+            create_date: crate::state::now(),
+            // The service that controls the role is the one that can assume it.
+            assume_role_policy_document: Some(service_linked_role_trust_policy(
+                &input.aws_service_name,
+            )),
+            description: input.description,
+            max_session_duration: Some(crate::state::DEFAULT_MAX_SESSION_DURATION_SECONDS),
+            // The create carries neither a boundary nor tags, and a brand-new role
+            // has never been assumed, so there is no last-used activity to report.
+            permissions_boundary: None,
+            tags: None,
+            role_last_used: None,
+            // Only a role created from a role template carries one
+            // (`smithy_query(query="shape", shape="Role")`), which this is not.
+            source_role_template: None,
+            role_name,
+        };
+
+        store.roles.insert(key, role.clone());
+        Ok(CreateServiceLinkedRoleOutput { role: Some(role) })
     }
 }

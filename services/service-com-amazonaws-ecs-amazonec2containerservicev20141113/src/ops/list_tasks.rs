@@ -196,7 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the ECS store is unavailable".to_string()),
             })
         })?;
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
 
         // "This value can be between 1 and 100."
         if let Some(max_results) = input.max_results {
@@ -213,23 +213,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // Services and container instances cannot exist in this slice — nothing
-        // registers one — so a filter that names one names something absent, which is
-        // what each of these modelled errors reports.
+        // A service cannot exist in this slice — nothing creates one — so a filter that
+        // names one names something absent, which is what the modelled error reports.
         if let Some(service_name) = input.service_name.as_deref() {
             return Err(ListTasksErrorModeled::ServiceNotFoundException(
                 ServiceNotFoundException {
                     message: Some(format!("service {service_name:?} was not found")),
-                },
-            )
-            .into());
-        }
-        if let Some(container_instance) = input.container_instance.as_deref() {
-            return Err(ListTasksErrorModeled::InvalidParameterException(
-                InvalidParameterException {
-                    message: Some(format!(
-                        "container instance {container_instance:?} was not found"
-                    )),
                 },
             )
             .into());
@@ -253,6 +242,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+
+        // "Specifying a containerInstance limits the results to tasks that belong to
+        // that container instance." An id that names no REGISTERED instance names
+        // nothing in the cluster, which the modelled error reports.
+        if let Some(reference) = input.container_instance.as_deref() {
+            let arn = crate::state::container_instance_arn_from_reference(
+                &region,
+                &cluster_name,
+                reference,
+            );
+            if guard
+                .container_instances
+                .get(&arn)
+                .is_none_or(|instance| instance.cluster_name != cluster_name)
+            {
+                return Err(ListTasksErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "container instance {reference:?} is not registered in cluster \
+                             {cluster_name:?}"
+                        )),
+                    },
+                )
+                .into());
+            }
         }
 
         let mut matching: Vec<String> = guard
@@ -281,6 +296,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A daemon cannot exist in this slice, so no task belongs to one and a
             // `daemonName` filter selects nothing.
             .filter(|_| input.daemon_name.is_none())
+            // Nothing in this emulator places a task on a container instance (a stored
+            // task records none), so a `containerInstance` filter selects nothing.
+            .filter(|_| input.container_instance.is_none())
             .map(|task| task.task_arn.clone())
             .collect();
         // Task ARNs end in a zero-padded, monotonically minted id, so sorting them puts

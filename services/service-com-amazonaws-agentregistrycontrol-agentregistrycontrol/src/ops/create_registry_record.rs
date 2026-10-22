@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRegistryRecord
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRegistryRecord`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRegistryRecord::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a record id under the parent registry, persists the whole
+//! request in [`crate::state`] and answers the record ARN and status. Creation is
+//! asynchronous, so the record is stored `CREATING` with the clock owing it `DRAFT`.
 //!
 //! ## Shape of an operation
 //!
@@ -181,18 +175,161 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRegistryRecord` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRegistryRecordErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRegistryRecord"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateRegistryRecordErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the agent registry store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        state.materialise_due_transitions();
+
+        let registry_id = crate::state::identifier_to_id(&input.registry_id).to_string();
+        let token = input.client_token.clone().filter(|t| !t.is_empty());
+
+        let registry_arn = {
+            let Some(registry) = state.registries.get(&registry_id) else {
+                return Err(CreateRegistryRecordErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("registry {registry_id} was not found")),
+                    },
+                )
+                .into());
+            };
+
+            // `clientToken` is an @idempotencyToken: a replayed token answers with what
+            // the first call created and creates no second record. This is checked
+            // BEFORE any state refusal, so a replay stays idempotent even once the
+            // parent registry has left READY. The record it named is looked up, so once
+            // that record has been deleted the token names nothing and this call falls
+            // through to a fresh create.
+            if let Some(token) = token.as_deref() {
+                if let Some(arn) = state.idempotent_answer(Self::NAME, token) {
+                    if let Some(record) = registry
+                        .records
+                        .values()
+                        .find(|record| record.record_arn == arn)
+                    {
+                        return Ok(CreateRegistryRecordOutput {
+                            record_arn: record.record_arn.clone(),
+                            status: record.status.clone(),
+                        });
+                    }
+                }
+            }
+
+            // A registry "becomes usable once it reaches READY", so a record cannot be
+            // created in one that is still being created or is being deleted.
+            if registry.status != crate::state::REGISTRY_READY {
+                return Err(CreateRegistryRecordErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(format!(
+                            "registry {registry_id} is in status {}; records can be created \
+                             once it is {}",
+                            registry.status,
+                            crate::state::REGISTRY_READY
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            // The registry's record quota: a caller-driven store cannot grow for ever.
+            if registry.records.len() >= crate::state::MAX_RECORDS_PER_REGISTRY {
+                return Err(
+                    CreateRegistryRecordErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: Some(format!(
+                                "registry {registry_id} already holds the maximum of {} records",
+                                crate::state::MAX_RECORDS_PER_REGISTRY
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            // Record names are unique within a registry.
+            if registry
+                .records
+                .values()
+                .any(|record| record.name == input.name)
+            {
+                return Err(CreateRegistryRecordErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(format!(
+                            "a record named {} already exists in registry {registry_id}",
+                            input.name
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            registry.registry_arn.clone()
+        };
+
+        let record_id = state.mint_record_id(&registry_id);
+        let record_arn = crate::state::record_arn(&registry_arn, &record_id);
+        let created_at = crate::state::now();
+        // Creation is asynchronous: the model documents the record being returned with
+        // the CREATING status while it is processed, after which it is the DRAFT record
+        // `SubmitRegistryRecordForApproval` acts on.
+        let pending =
+            crate::state::DueTransition::after_async_span(crate::state::RecordTransition::Draft);
+        state.arm_transition(pending.due_at);
+        let record = crate::state::RegistryRecord {
+            record_id: record_id.clone(),
+            record_arn: record_arn.clone(),
+            registry_arn,
+            name: input.name,
+            display_name: input.display_name,
+            description: input.description,
+            record_type: input.record_type,
+            descriptors: Some(input.descriptors),
+            // CHOSEN, not modelled: `recordVersion` is optional on input but
+            // `RegistryRecordSummary` reports one, so a record created without a version
+            // carries the emulator's first version. The value is stored, so every later
+            // read reports what was persisted here.
+            record_version: input.record_version.unwrap_or_else(|| "1".to_string()),
+            status: crate::state::RECORD_CREATING.to_string(),
+            status_reason: None,
+            provenance: input.provenance.unwrap_or_default(),
+            custom_metadata: input.custom_metadata,
+            // Schema-compliance evaluation is not implemented, so nothing is claimed
+            // about it rather than claiming compliance.
+            custom_metadata_schema_compliance_status: None,
+            created_by: Some(::engine::emulator_account_id().to_string()),
+            // false: the record was created through a control-plane API call.
+            created_by_auto_detection: Some(false),
+            created_at,
+            updated_at: created_at,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            pending: Some(pending),
+        };
+        let status = record.status.clone();
+
+        // The registry was resolved above under this same lock, so it is still there.
+        // Answering 202 with an ARN for a record that was not stored would be absence
+        // dressed as success, so a lookup that somehow fails is a server error.
+        let Some(registry) = state.registries.get_mut(&registry_id) else {
+            return Err(CreateRegistryRecordErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(format!(
+                        "registry {registry_id} disappeared while the record was being created"
+                    )),
+                },
+            )
+            .into());
+        };
+        registry.records.insert(record_id, record);
+        if let Some(token) = token {
+            state.remember_idempotent_answer(Self::NAME, &token, &record_arn);
+        }
+
+        Ok(CreateRegistryRecordOutput { record_arn, status })
     }
 }
