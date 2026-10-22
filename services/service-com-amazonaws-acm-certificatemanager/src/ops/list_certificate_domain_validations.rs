@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCertificateDomainValidations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCertificateDomainValidations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCertificateDomainValidations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one `DomainValidationSummary` per name on a stored certificate, projected
+//! from that certificate's persisted per-domain validation records: the method in
+//! effect, the status that validation currently stands at, and the challenge the
+//! method publishes. Nothing here is echoed from the request beyond the certificate it
+//! names — `RequestCertificate` wrote those records, and this operation reads them.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +158,222 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCertificateDomainValidations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCertificateDomainValidationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCertificateDomainValidations"))
+        let _ = ctx;
+        // This operation models no error for an unreachable store, so the refusal goes
+        // through the wrapper's `ValidationException` rather than through a modelled
+        // shape that would claim something else about the request.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the acm certificate store is unavailable",
+            ));
+        };
+
+        // `CertificateArn` must name an ACM CERTIFICATE. The member's `@pattern` is a
+        // find, not an anchored match, so an ARN that merely begins with an ACM
+        // certificate ARN reaches this handler and is classified here. This operation
+        // models no `InvalidArnException`, so the refusal is `InvalidArgsException` —
+        // "One or more of request parameters specified is not valid" — with the same
+        // sentence every certificate-lookup path in this service renders.
+        if crate::state::certificate_id_from_arn(&input.certificate_arn).is_none() {
+            return Err(
+                ListCertificateDomainValidationsErrorModeled::InvalidArgsException(
+                    InvalidArgsException {
+                        message: Some(crate::state::invalid_arn_message(&input.certificate_arn)),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let resume_after = input
+            .next_token
+            .as_deref()
+            .map(|token| decode_next_token(token, &input.certificate_arn))
+            .transpose()?;
+
+        // A read of one certificate's validations, except for the outcome the clock
+        // already owes it: a validation whose outcome fell due before this call is
+        // reported as it stands now, so this reader and `DescribeCertificate` cannot
+        // report one store at two different instants.
+        let mut store = state.lock();
+        store.materialize_due(::std::time::SystemTime::now());
+        let Some(certificate) = store.certificates.get(&input.certificate_arn) else {
+            return Err(
+                ListCertificateDomainValidationsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::certificate_not_found_message(
+                            &input.certificate_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The stored order: the certificate's own domain name first, then its subject
+        // alternative names. A `NextToken` resumes against that same order, so the
+        // order a page is cut in and the order it is resumed in cannot drift apart.
+        let validations = certificate.domain_validations.as_slice();
+        let start = match resume_after.as_deref() {
+            None => 0,
+            // The token names the last domain the previous page emitted, so this page
+            // starts at the one after it. A token naming a domain this certificate does
+            // not cover resolves to no position at all and is refused rather than
+            // answered with a silently empty page.
+            Some(domain) => validations
+                .iter()
+                .position(|record| crate::state::same_domain(&record.domain_name, domain))
+                .map(|position| position + 1)
+                .ok_or_else(invalid_next_token)?,
+        };
+        let page = &validations[start.min(validations.len())..];
+
+        // Page size: the caller's `MaxItems`, else the documented default of 1000
+        // ("If you don't specify a value, the default is 1000",
+        // `ListCertificateDomainValidationsRequest$MaxItems` doc), which is also the
+        // maximum the member allows. The member's modelled `range 1..1000` is refused
+        // at the boundary before this handler runs; a `MaxItems` the caller DID name
+        // is therefore bounded into that range here rather than defaulted, so the
+        // unreachable path answers the smallest page rather than the largest.
+        let limit = match input.max_items {
+            None => MAX_PAGE_SIZE,
+            Some(max) => usize::try_from(max).unwrap_or(1).clamp(1, MAX_PAGE_SIZE),
+        };
+        let emitted = page.len().min(limit);
+
+        let summaries: Vec<DomainValidationSummary> = page[..emitted]
+            .iter()
+            .map(domain_validation_summary)
+            .collect();
+        // A token is issued only when this page stopped short of the certificate's
+        // remaining domains, and it names the last domain the page emitted.
+        let next_token = if emitted < page.len() {
+            page[..emitted]
+                .last()
+                .map(|record| encode_next_token(&certificate.arn, &record.domain_name))
+        } else {
+            None
+        };
+
+        Ok(ListCertificateDomainValidationsOutput {
+            // `DomainValidationSummaryList` is this operation's `@paginated` items
+            // member, so it is always present: a client walking the pages reads the
+            // list on every one, and an empty page is an empty list rather than an
+            // absent member.
+            domain_validation_summary_list: Some(summaries),
+            next_token,
+        })
     }
+}
+
+/// The most summaries one response carries, which is also the page size used when the
+/// caller names no `MaxItems`: the maximum the model allows for that member
+/// (`MaxItems`, `range 1..1000`), and the default its doc states.
+const MAX_PAGE_SIZE: usize = 1000;
+
+/// One stored validation as the modelled `DomainValidationSummary`.
+///
+/// `ActiveValidationConfiguration` is "the validation configuration currently in
+/// effect for this domain" (`DomainValidationSummary$ActiveValidationConfiguration`
+/// doc), which is exactly what the record holds: the method ACM is validating by, the
+/// status that validation stands at, and the challenge that method publishes.
+///
+/// `RequestedValidationConfiguration` is "present only when a migration is in
+/// progress" (`DomainValidationSummary$RequestedValidationConfiguration` doc) — a
+/// pending change of a domain's validation METHOD. No operation this service models
+/// starts one (`smithy_query(query="list_operations")`), so no stored certificate can
+/// be migrating and the member is absent rather than a copy of the active
+/// configuration.
+fn domain_validation_summary(
+    record: &crate::state::DomainValidationRecord,
+) -> DomainValidationSummary {
+    DomainValidationSummary {
+        domain_name: record.domain_name.clone(),
+        active_validation_configuration: Some(ValidationConfiguration {
+            validation_method: Some(record.validation_method.clone()),
+            validation_status: Some(record.validation_status.clone()),
+            validation_challenge: validation_challenge(record),
+        }),
+        requested_validation_configuration: None,
+    }
+}
+
+/// The challenge a domain's validation configuration carries: the evidence the method
+/// in effect asks for, read off the record `RequestCertificate` stored.
+///
+/// `ValidationChallenge` is a union with one member per method whose challenge the
+/// model describes — `EmailValidationChallenge` (the mailboxes ACM wrote to and the
+/// domain it wrote them at) and `DnsValidationChallenge` (the CNAME to publish), from
+/// `smithy_query(query="shape", shape="com.amazonaws.acm#ValidationChallenge")`.
+/// `ValidationMethod` has a third value, `HTTP`, that the union models no variant for,
+/// so an HTTP-validated domain carries no challenge here rather than one of the two
+/// shapes that would describe evidence it does not use.
+fn validation_challenge(
+    record: &crate::state::DomainValidationRecord,
+) -> Option<ValidationChallenge> {
+    match record.validation_method.as_str() {
+        crate::state::VALIDATION_METHOD_EMAIL => Some(
+            ValidationChallenge::EmailValidationChallenge(EmailValidationChallenge {
+                validation_emails: Some(record.validation_emails.clone()),
+                validation_domain: record.validation_domain.clone(),
+            }),
+        ),
+        // The CNAME to publish, which only a DNS-validated domain has one of.
+        crate::state::VALIDATION_METHOD_DNS => {
+            record.resource_record.clone().map(|resource_record| {
+                ValidationChallenge::DnsValidationChallenge(DnsValidationChallenge {
+                    resource_record: Some(resource_record),
+                })
+            })
+        }
+        // `HTTP`: the union models no member for it, so there is no challenge to
+        // report rather than one describing evidence the method does not use.
+        _ => None,
+    }
+}
+
+/// The byte that separates a token's two keys. Outside both the `CertificateArn`
+/// pattern and a domain name, so it cannot occur inside either value it joins.
+const CURSOR_SEPARATOR: char = '\u{1f}';
+
+/// The opaque `NextToken` for the last domain a page emitted.
+///
+/// It carries the certificate the page was cut from as well as that domain, so a token
+/// issued for one certificate cannot resume a list of another's domains. Hex-encoded
+/// so the token is opaque to the caller and satisfies the member's
+/// `^[\u0009\u000A\u000D\u0020-\u00FF]*$` pattern whatever the values contain.
+fn encode_next_token(certificate_arn: &str, domain_name: &str) -> String {
+    hex::encode(format!("{certificate_arn}{CURSOR_SEPARATOR}{domain_name}"))
+}
+
+/// The refusal for a `NextToken` this service did not issue for this certificate.
+///
+/// `InvalidArgsException` is the operation's modelled error for a request parameter
+/// that is not valid, and the token is one.
+fn invalid_next_token() -> ListCertificateDomainValidationsErrorModeled {
+    ListCertificateDomainValidationsErrorModeled::InvalidArgsException(InvalidArgsException {
+        message: Some(
+            "NextToken is not a token this service issued for this certificate".to_string(),
+        ),
+    })
+}
+
+/// The domain name a `NextToken` resumes after, or `InvalidArgsException` when the
+/// token did not come from [`encode_next_token`] for `certificate_arn`.
+///
+/// Every step is fallible on purpose: the token is caller-supplied, so no value read
+/// out of it may panic the handler or silently resume somebody else's list.
+fn decode_next_token(
+    token: &str,
+    certificate_arn: &str,
+) -> Result<String, ListCertificateDomainValidationsError> {
+    let bytes = hex::decode(token).map_err(|_| invalid_next_token())?;
+    let decoded = String::from_utf8(bytes).map_err(|_| invalid_next_token())?;
+    let (arn, domain_name) = decoded
+        .split_once(CURSOR_SEPARATOR)
+        .ok_or_else(invalid_next_token)?;
+    if arn != certificate_arn || domain_name.is_empty() {
+        return Err(invalid_next_token().into());
+    }
+    Ok(domain_name.to_string())
 }

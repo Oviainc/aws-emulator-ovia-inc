@@ -37,6 +37,11 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// and `RSA_2048` is the RSA size ACM issues.
 pub const DEFAULT_KEY_ALGORITHM: &str = "RSA_2048";
 
+/// `ValidationMethod=DNS`, the method whose evidence is a published DNS record: it is
+/// the only one for which `DomainValidation` carries a `ResourceRecord`, the CNAME
+/// "you add to your DNS database" (`ResourceRecord` doc).
+pub const VALIDATION_METHOD_DNS: &str = "DNS";
+
 /// `ValidationMethod=EMAIL`, the method whose evidence is a mailbox: it is the only
 /// one for which `DomainValidation` carries `ValidationEmails` and
 /// `ValidationDomain`, both documented as what "ACM used to send domain validation
