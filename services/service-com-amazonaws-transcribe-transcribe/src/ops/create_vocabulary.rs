@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateVocabulary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateVocabulary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateVocabulary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a custom vocabulary from the terms the request lists, or refuses a request
+//! whose terms it would have to read from a file (see [`CreateVocabulary::handle`]).
 //!
 //! ## Shape of an operation
 //!
@@ -211,18 +204,149 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateVocabulary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateVocabularyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateVocabulary"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateVocabularyErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some(
+                        "this service is mounted on an engine that holds no Transcribe state"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // "When creating a new custom vocabulary, you can either upload a text file
+        // that contains your new entries, phrases, and terms into an Amazon S3 bucket
+        // and include the URI in your request, or you can include a list of terms
+        // directly in your request using the Phrases flag" — one of the two, and the
+        // model can express neither requirement, so the handler is where they are
+        // refused.
+        let phrases = match crate::state::content_source(
+            input.phrases.as_deref(),
+            input.vocabulary_file_uri.as_deref(),
+        ) {
+            crate::state::ContentSource::Inline(phrases) => phrases.to_vec(),
+            crate::state::ContentSource::Neither => {
+                return Err(bad_request(
+                    "Your request must include either Phrases or VocabularyFileUri. Add the \
+                     terms of your custom vocabulary and try your request again.",
+                ))
+            }
+            crate::state::ContentSource::Both => {
+                return Err(bad_request(
+                    "Your request includes both Phrases and VocabularyFileUri. Specify the \
+                     terms of your custom vocabulary one way or the other and try your \
+                     request again.",
+                ))
+            }
+            // Building this vocabulary would mean READING the object at that URI.
+            // This emulator reads no object store and makes no outbound request, so
+            // the file is unreachable to it and the request is refused with the error
+            // this operation models for a file it cannot access — rather than
+            // recording a vocabulary whose terms nothing ever loaded.
+            crate::state::ContentSource::File(uri) => {
+                return Err(bad_request(&format!(
+                    "The VocabularyFileUri {uri} can't be read by this emulator: it \
+                     builds a custom vocabulary only from the terms a request lists in \
+                     Phrases. Send the terms in Phrases and try your request again."
+                )))
+            }
+        };
+
+        // Amazon Transcribe publishes a 50 KB ceiling on a custom vocabulary's size, so
+        // a longer list of terms is refused rather than stored — which is also what
+        // keeps the terms this emulator holds bounded.
+        let content_bytes = crate::state::content_bytes(&phrases);
+        if content_bytes > crate::state::MAX_VOCABULARY_CONTENT_BYTES {
+            return Err(bad_request(&format!(
+                "The Phrases in your request are {content_bytes} bytes, more than the {max} \
+                 bytes a custom vocabulary may hold. Remove terms and try your request \
+                 again.",
+                max = crate::state::MAX_VOCABULARY_CONTENT_BYTES,
+            )));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // "must be unique within an Amazon Web Services account. If you try to create a
+        // new custom vocabulary with the same name as an existing one, you get a
+        // ConflictException error." Checked and inserted under one lock, so N
+        // concurrent creates of one name have exactly one winner.
+        if store.vocabularies.contains_key(&input.vocabulary_name) {
+            return Err(CreateVocabularyErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "The requested vocabulary name {} already exists. Use a different \
+                         name and try your request again.",
+                        input.vocabulary_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        if store.vocabularies.len() >= crate::state::MAX_VOCABULARIES {
+            return Err(CreateVocabularyErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "You have reached the limit of {} custom vocabularies for this \
+                         account. Delete a custom vocabulary you no longer need and try \
+                         your request again.",
+                        crate::state::MAX_VOCABULARIES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let sequence = store.next_sequence();
+        let record = crate::state::VocabularyRecord {
+            name: input.vocabulary_name.clone(),
+            sequence,
+            language_code: input.language_code,
+            phrases,
+            // "If the state is READY, you can use the custom vocabulary in a
+            // StartTranscriptionJob request": a new custom vocabulary is PENDING
+            // until the service has finished processing it.
+            state: crate::state::VOCABULARY_STATE_PENDING.to_string(),
+            failure_reason: None,
+            ready_due: Some(now + crate::state::VOCABULARY_TRANSITION_DELAY),
+            last_modified_time: now,
+            region,
+            data_access_role_arn: input.data_access_role_arn,
+            encryption_configuration: input.encryption_configuration,
+            tags: input.tags.unwrap_or_default(),
+        };
+
+        // The response is the record just stored, never the request echoed back.
+        let output = CreateVocabularyOutput {
+            vocabulary_name: Some(record.name.clone()),
+            language_code: Some(record.language_code.clone()),
+            vocabulary_state: Some(record.state.clone()),
+            last_modified_time: Some(crate::state::to_date_time(record.last_modified_time)),
+            failure_reason: record.failure_reason.clone(),
+        };
+        ::tracing::info!(
+            operation = "CreateVocabulary",
+            vocabulary = %record.name,
+            state = %record.state,
+            terms = record.phrases.len(),
+            "custom vocabulary created"
+        );
+        store.vocabularies.insert(record.name.clone(), record);
+
+        Ok(output)
     }
+}
+
+/// A `BadRequestException` (HTTP 400) refusing a request the model's own constraint
+/// traits cannot express.
+fn bad_request(message: &str) -> CreateVocabularyError {
+    CreateVocabularyErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

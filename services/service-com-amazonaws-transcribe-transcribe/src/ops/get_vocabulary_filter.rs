@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetVocabularyFilter
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetVocabularyFilter`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetVocabularyFilter::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored custom vocabulary filter (see
+//! [`GetVocabularyFilter::handle`]).
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +161,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetVocabularyFilter` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetVocabularyFilterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetVocabularyFilter"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetVocabularyFilterErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some(
+                        "this service is mounted on an engine that holds no Transcribe state"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        let Some(record) = store.vocabulary_filters.get(&input.vocabulary_filter_name) else {
+            return Err(GetVocabularyFilterErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!(
+                        "The requested vocabulary filter {} couldn't be found. Check the \
+                         vocabulary filter name and try your request again.",
+                        input.vocabulary_filter_name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetVocabularyFilterOutput {
+            vocabulary_filter_name: Some(record.name.clone()),
+            language_code: Some(record.language_code.clone()),
+            last_modified_time: Some(crate::state::to_date_time(record.last_modified_time)),
+            // Where the filter's file is reported to live. Nothing is served there —
+            // see the `crate::state` header. This answer carries no words:
+            // `GetVocabularyFilterResponse` has no member for them, so the filter's
+            // content is not reported by this operation at all.
+            download_uri: Some(record.download_uri()),
+            data_access_role_arn: record.data_access_role_arn.clone(),
+            encryption_configuration: record.encryption_configuration.clone(),
+        })
     }
 }

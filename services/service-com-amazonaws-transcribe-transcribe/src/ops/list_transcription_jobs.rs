@@ -179,9 +179,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A page cursor: the creation sequence of the last job of the previous page,
-        // so the next page resumes strictly past it even if that job was deleted
-        // meanwhile. The job's name travels with it, which is what makes the token
-        // readable in a trace; only the sequence is interpreted.
+        // read through this service's own token codec (`state::page_cursor` /
+        // `parse_page_cursor`), so every listing pages the same way.
         let resume_below = match input.next_token.as_deref() {
             None => None,
             Some(token) => Some(parse_next_token(token)?),
@@ -234,7 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // A further match exists, so the caller gets a cursor to it.
                 next_token = last_on_page
                     .as_ref()
-                    .map(|(sequence, name)| format!("{sequence}|{name}"));
+                    .map(|(sequence, name)| crate::state::page_cursor(*sequence, name));
                 break;
             }
             summaries.push(record.to_summary());
@@ -251,27 +250,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The creation sequence a `NextToken` resumes after.
+/// The creation sequence a `NextToken` resumes after, or this operation's own
+/// modelled refusal for a token this service never handed out.
 ///
-/// The token is opaque to clients: this service writes `{sequence}|{job name}` and
-/// reads back the sequence. A token it did not write is refused rather than silently
-/// restarting the listing from the top.
+/// The token format and what counts as one of this service's own is
+/// `state::parse_page_cursor`; this lifts its `None` into the error channel
+/// `ListTranscriptionJobs` models.
 fn parse_next_token(token: &str) -> Result<u64, ListTranscriptionJobsError> {
-    token
-        .split('|')
-        .next()
-        .and_then(|sequence| sequence.parse::<u64>().ok())
-        // Creation sequences start at 1, so a cursor of 0 is one this service never
-        // handed out: refuse it rather than answer an empty page.
-        .filter(|sequence| *sequence > 0)
-        .ok_or_else(|| {
-            ListTranscriptionJobsErrorModeled::BadRequestException(BadRequestException {
-                message: Some(
-                    "The NextToken in your request is not valid. Use the NextToken returned \
-                     by your previous ListTranscriptionJobs request."
-                        .to_string(),
-                ),
-            })
-            .into()
+    crate::state::parse_page_cursor(token).ok_or_else(|| {
+        ListTranscriptionJobsErrorModeled::BadRequestException(BadRequestException {
+            message: Some(
+                "The NextToken in your request is not valid. Use the NextToken returned \
+                 by your previous ListTranscriptionJobs request."
+                    .to_string(),
+            ),
         })
+        .into()
+    })
 }

@@ -176,12 +176,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        if store
+        // The clock-owed transitions are materialised FIRST, so a job whose completion
+        // was already due is deleted rather than refused for a status it had left.
+        let Some(record) = store
             .transcription_jobs
-            .remove(&input.transcription_job_name)
-            .is_none()
-        {
+            .get_mut(&input.transcription_job_name)
+        else {
             return Err(DeleteTranscriptionJobErrorModeled::BadRequestException(
                 BadRequestException {
                     message: Some(format!(
@@ -192,8 +194,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        };
+        record.advance_clock(now);
+
+        // "Your request didn't pass one or more validation tests. This can occur when
+        // the entity you're trying to delete doesn't exist or if it's in a non-terminal
+        // state (such as IN PROGRESS)" (`BadRequestException`'s own documentation): a
+        // job the service is still working on is not deletable.
+        if !crate::state::is_terminal_job_status(&record.status) {
+            let (name, status) = (record.name.clone(), record.status.clone());
+            return Err(DeleteTranscriptionJobErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(format!(
+                        "The transcription job {name} is in the {status} state and can't be \
+                         deleted. Wait until it is no longer being processed and try your \
+                         request again."
+                    )),
+                },
+            )
+            .into());
         }
 
+        store
+            .transcription_jobs
+            .remove(&input.transcription_job_name);
         ::tracing::info!(
             operation = "DeleteTranscriptionJob",
             job = %input.transcription_job_name,

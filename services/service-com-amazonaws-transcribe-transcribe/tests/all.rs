@@ -17,3 +17,5 @@ mod service_claim;
 mod state_roundtrip;
 #[path = "all/transcription_jobs.rs"]
 mod transcription_jobs;
+#[path = "all/vocabularies.rs"]
+mod vocabularies;

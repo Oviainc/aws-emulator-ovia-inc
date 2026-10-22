@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateVocabularyFilter
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateVocabularyFilter`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateVocabularyFilter::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces a stored custom vocabulary filter's words (see
+//! [`UpdateVocabularyFilter::handle`]).
 //!
 //! ## Shape of an operation
 //!
@@ -191,18 +184,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateVocabularyFilter` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateVocabularyFilterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateVocabularyFilter"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateVocabularyFilterErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some(
+                        "this service is mounted on an engine that holds no Transcribe state"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // Same pair of alternatives as the create, and the same refusals: "You can use
+        // Words or VocabularyFilterFileUri, but you can't use both."
+        let words = match crate::state::content_source(
+            input.words.as_deref(),
+            input.vocabulary_filter_file_uri.as_deref(),
+        ) {
+            crate::state::ContentSource::Inline(words) => words.to_vec(),
+            crate::state::ContentSource::Neither => {
+                return Err(bad_request(
+                    "Your request must include either Words or VocabularyFilterFileUri. Add \
+                     the words of your custom vocabulary filter and try your request again.",
+                ))
+            }
+            crate::state::ContentSource::Both => {
+                return Err(bad_request(
+                    "Your request includes both Words and VocabularyFilterFileUri. Specify \
+                     the words of your custom vocabulary filter one way or the other and \
+                     try your request again.",
+                ))
+            }
+            // Unreachable to this emulator, exactly as on the create: it reads no
+            // object store and makes no outbound request, so it would have nothing to
+            // rebuild the filter from.
+            crate::state::ContentSource::File(uri) => {
+                return Err(bad_request(&format!(
+                    "The VocabularyFilterFileUri {uri} can't be read by this emulator: \
+                     it rebuilds a custom vocabulary filter only from the words a request \
+                     lists in Words. Send the words in Words and try your request again."
+                )))
+            }
+        };
+
+        // The same published 50 KB ceiling as the create.
+        let content_bytes = crate::state::content_bytes(&words);
+        if content_bytes > crate::state::MAX_VOCABULARY_CONTENT_BYTES {
+            return Err(bad_request(&format!(
+                "The Words in your request are {content_bytes} bytes, more than the {max} \
+                 bytes a custom vocabulary filter may hold. Remove words and try your \
+                 request again.",
+                max = crate::state::MAX_VOCABULARY_CONTENT_BYTES,
+            )));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        let Some(record) = store
+            .vocabulary_filters
+            .get_mut(&input.vocabulary_filter_name)
+        else {
+            return Err(UpdateVocabularyFilterErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!(
+                        "The requested vocabulary filter {} couldn't be found. Check the \
+                         vocabulary filter name and try your request again.",
+                        input.vocabulary_filter_name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "The new list you provide overwrites all previous entries; you cannot append
+        // new terms onto an existing custom vocabulary filter." The language code is
+        // not an input of this operation, so the stored one is kept.
+        record.words = words;
+        record.last_modified_time = now;
+        record.region = region;
+        record.data_access_role_arn = input.data_access_role_arn;
+        record.encryption_configuration = input.encryption_configuration;
+
+        ::tracing::info!(
+            operation = "UpdateVocabularyFilter",
+            filter = %record.name,
+            words = record.words.len(),
+            "custom vocabulary filter updated"
+        );
+
+        Ok(UpdateVocabularyFilterOutput {
+            vocabulary_filter_name: Some(record.name.clone()),
+            language_code: Some(record.language_code.clone()),
+            last_modified_time: Some(crate::state::to_date_time(record.last_modified_time)),
+        })
     }
+}
+
+/// A `BadRequestException` (HTTP 400) refusing a request the model's own constraint
+/// traits cannot express.
+fn bad_request(message: &str) -> UpdateVocabularyFilterError {
+    UpdateVocabularyFilterErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

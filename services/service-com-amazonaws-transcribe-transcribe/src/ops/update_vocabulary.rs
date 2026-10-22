@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateVocabulary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateVocabulary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateVocabulary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces a stored custom vocabulary's terms, which puts it back into `PENDING`
+//! (see [`UpdateVocabulary::handle`]).
 //!
 //! ## Shape of an operation
 //!
@@ -204,18 +197,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateVocabulary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateVocabularyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateVocabulary"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateVocabularyErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some(
+                        "this service is mounted on an engine that holds no Transcribe state"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // Same pair of alternatives as the create, and the same refusals: "you can
+        // either upload a text file … or you can include a list of terms directly in
+        // your request using the Phrases flag".
+        let phrases = match crate::state::content_source(
+            input.phrases.as_deref(),
+            input.vocabulary_file_uri.as_deref(),
+        ) {
+            crate::state::ContentSource::Inline(phrases) => phrases.to_vec(),
+            crate::state::ContentSource::Neither => {
+                return Err(bad_request(
+                    "Your request must include either Phrases or VocabularyFileUri. Add the \
+                     terms of your custom vocabulary and try your request again.",
+                ))
+            }
+            crate::state::ContentSource::Both => {
+                return Err(bad_request(
+                    "Your request includes both Phrases and VocabularyFileUri. Specify the \
+                     terms of your custom vocabulary one way or the other and try your \
+                     request again.",
+                ))
+            }
+            // Unreachable to this emulator, exactly as on the create: it reads no
+            // object store and makes no outbound request, so it would have nothing to
+            // rebuild the vocabulary from.
+            crate::state::ContentSource::File(uri) => {
+                return Err(bad_request(&format!(
+                    "The VocabularyFileUri {uri} can't be read by this emulator: it \
+                     rebuilds a custom vocabulary only from the terms a request lists in \
+                     Phrases. Send the terms in Phrases and try your request again."
+                )))
+            }
+        };
+
+        // The same published 50 KB ceiling as the create.
+        let content_bytes = crate::state::content_bytes(&phrases);
+        if content_bytes > crate::state::MAX_VOCABULARY_CONTENT_BYTES {
+            return Err(bad_request(&format!(
+                "The Phrases in your request are {content_bytes} bytes, more than the {max} \
+                 bytes a custom vocabulary may hold. Remove terms and try your request \
+                 again.",
+                max = crate::state::MAX_VOCABULARY_CONTENT_BYTES,
+            )));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        let Some(record) = store.vocabularies.get_mut(&input.vocabulary_name) else {
+            return Err(UpdateVocabularyErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!(
+                    "The requested vocabulary {} couldn't be found. Check the vocabulary \
+                     name and try your request again.",
+                    input.vocabulary_name
+                )),
+            })
+            .into());
+        };
+
+        // "This operation overwrites all existing information with your new values; you
+        // cannot append new terms onto an existing custom vocabulary." The rebuilt
+        // vocabulary is PENDING again until the service has finished processing it —
+        // the same transition a create owes, from the instant of this call.
+        record.language_code = input.language_code;
+        record.phrases = phrases;
+        record.state = crate::state::VOCABULARY_STATE_PENDING.to_string();
+        record.failure_reason = None;
+        record.ready_due = Some(now + crate::state::VOCABULARY_TRANSITION_DELAY);
+        record.last_modified_time = now;
+        record.region = region;
+        record.data_access_role_arn = input.data_access_role_arn;
+        record.encryption_configuration = input.encryption_configuration;
+
+        ::tracing::info!(
+            operation = "UpdateVocabulary",
+            vocabulary = %record.name,
+            state = %record.state,
+            terms = record.phrases.len(),
+            "custom vocabulary updated"
+        );
+
+        Ok(UpdateVocabularyOutput {
+            vocabulary_name: Some(record.name.clone()),
+            language_code: Some(record.language_code.clone()),
+            last_modified_time: Some(crate::state::to_date_time(record.last_modified_time)),
+            vocabulary_state: Some(record.state.clone()),
+        })
     }
+}
+
+/// A `BadRequestException` (HTTP 400) refusing a request the model's own constraint
+/// traits cannot express.
+fn bad_request(message: &str) -> UpdateVocabularyError {
+    UpdateVocabularyErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

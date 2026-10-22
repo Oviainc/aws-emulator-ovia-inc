@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateVocabularyFilter
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateVocabularyFilter`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateVocabularyFilter::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a custom vocabulary filter from the words the request lists, or refuses a
+//! request whose words it would have to read from a file (see
+//! [`CreateVocabularyFilter::handle`]).
 //!
 //! ## Shape of an operation
 //!
@@ -206,18 +200,142 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateVocabularyFilter` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateVocabularyFilterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateVocabularyFilter"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateVocabularyFilterErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some(
+                        "this service is mounted on an engine that holds no Transcribe state"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // "You can use Words or VocabularyFilterFileUri, but you can't use both." The
+        // model can express neither requirement, so the handler is where they are
+        // refused.
+        let words = match crate::state::content_source(
+            input.words.as_deref(),
+            input.vocabulary_filter_file_uri.as_deref(),
+        ) {
+            crate::state::ContentSource::Inline(words) => words.to_vec(),
+            crate::state::ContentSource::Neither => {
+                return Err(bad_request(
+                    "Your request must include either Words or VocabularyFilterFileUri. Add \
+                     the words of your custom vocabulary filter and try your request again.",
+                ))
+            }
+            crate::state::ContentSource::Both => {
+                return Err(bad_request(
+                    "Your request includes both Words and VocabularyFilterFileUri. Specify \
+                     the words of your custom vocabulary filter one way or the other and \
+                     try your request again.",
+                ))
+            }
+            // Building this filter would mean READING the object at that URI. This
+            // emulator reads no object store and makes no outbound request, so the file
+            // is unreachable to it and the request is refused with the error this
+            // operation models for a file it cannot access — rather than recording a
+            // filter whose words nothing ever loaded.
+            crate::state::ContentSource::File(uri) => {
+                return Err(bad_request(&format!(
+                    "The VocabularyFilterFileUri {uri} can't be read by this emulator: \
+                     it builds a custom vocabulary filter only from the words a request \
+                     lists in Words. Send the words in Words and try your request again."
+                )))
+            }
+        };
+
+        // Amazon Transcribe publishes a 50 KB ceiling on a custom vocabulary filter's
+        // size, so a longer list of words is refused rather than stored — which is also
+        // what keeps the words this emulator holds bounded.
+        let content_bytes = crate::state::content_bytes(&words);
+        if content_bytes > crate::state::MAX_VOCABULARY_CONTENT_BYTES {
+            return Err(bad_request(&format!(
+                "The Words in your request are {content_bytes} bytes, more than the {max} \
+                 bytes a custom vocabulary filter may hold. Remove words and try your \
+                 request again.",
+                max = crate::state::MAX_VOCABULARY_CONTENT_BYTES,
+            )));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // "must be unique within an Amazon Web Services account. If you try to create a
+        // new custom vocabulary filter with the same name as an existing one, you get a
+        // ConflictException error." Checked and inserted under one lock, so N
+        // concurrent creates of one name have exactly one winner.
+        if store
+            .vocabulary_filters
+            .contains_key(&input.vocabulary_filter_name)
+        {
+            return Err(CreateVocabularyFilterErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "The requested vocabulary filter name {} already exists. Use a \
+                         different name and try your request again.",
+                        input.vocabulary_filter_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        if store.vocabulary_filters.len() >= crate::state::MAX_VOCABULARIES {
+            return Err(CreateVocabularyFilterErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "You have reached the limit of {} custom vocabulary filters for this \
+                         account. Delete a custom vocabulary filter you no longer need and \
+                         try your request again.",
+                        crate::state::MAX_VOCABULARIES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let sequence = store.next_sequence();
+        let record = crate::state::VocabularyFilterRecord {
+            name: input.vocabulary_filter_name.clone(),
+            sequence,
+            language_code: input.language_code,
+            words,
+            last_modified_time: now,
+            region,
+            data_access_role_arn: input.data_access_role_arn,
+            encryption_configuration: input.encryption_configuration,
+            tags: input.tags.unwrap_or_default(),
+        };
+
+        // The response is the record just stored, never the request echoed back.
+        let output = CreateVocabularyFilterOutput {
+            vocabulary_filter_name: Some(record.name.clone()),
+            language_code: Some(record.language_code.clone()),
+            last_modified_time: Some(crate::state::to_date_time(record.last_modified_time)),
+        };
+        ::tracing::info!(
+            operation = "CreateVocabularyFilter",
+            filter = %record.name,
+            words = record.words.len(),
+            "custom vocabulary filter created"
+        );
+        store
+            .vocabulary_filters
+            .insert(record.name.clone(), record);
+
+        Ok(output)
     }
+}
+
+/// A `BadRequestException` (HTTP 400) refusing a request the model's own constraint
+/// traits cannot express.
+fn bad_request(message: &str) -> CreateVocabularyFilterError {
+    CreateVocabularyFilterErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }
