@@ -3,9 +3,16 @@
 //! @op GetAccountPlanState
 //!
 //! Reports the stored [`crate::state::AccountPlan`] singleton for the caller's
-//! account. The only write it performs is the expiry the clock has already made
-//! due ([`crate::state::AccountPlan::settle`]), which is owed at that instant
-//! whether or not anybody calls.
+//! account, or the modelled `ResourceNotFoundException` when the account holds
+//! no account-plan data at all — every member of the output the model marks
+//! `@required` comes from that record, so there is no well-formed success
+//! representation of "no plan data".
+//!
+//! The only write it performs is the expiry the clock has already made due
+//! ([`crate::state::AccountPlan::settle`]), which is owed at that instant
+//! whether or not anybody calls; it never brings a plan into being, which is
+//! what [`crate::state::ComAmazonawsFreetierAwsfreetierserviceState::settled_plan`]
+//! (as opposed to `plan_mut`) buys.
 //!
 //! ## Shape of an operation
 //!
@@ -163,11 +170,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let account_id = crate::state::caller_account_id();
         let plan = {
             let mut store = state.lock();
-            let plan = store.plan_mut(account_id);
-            // Expiry is the one change a reporting operation may materialise:
-            // the plan was already due to expire at that instant.
-            plan.settle(crate::state::now());
-            plan.clone()
+            // The account's own record, with the expiry the clock already made
+            // due materialised. Never a record this read brought into being: an
+            // account with no plan data is reported as absent, not invented.
+            match store.settled_plan(account_id, crate::state::now()) {
+                Some(plan) => plan,
+                None => return Err(missing_plan_data(account_id)),
+            }
         };
 
         Ok(GetAccountPlanStateOutput {
@@ -178,4 +187,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             account_plan_expiration_date: plan.expiration_date,
         })
     }
+}
+
+/// The HTTP status this service answers `ResourceNotFoundException` with.
+///
+/// The model annotates the shape `@httpError 404`, but every recorded response
+/// of this condition is an HTTP 400 carrying `__type`
+/// `ResourceNotFoundException`; the status a client reads is the recorded one, so
+/// that is what [`crate::scaffolded::Scaffolded::restated`] answers with while
+/// the shape, the body and the wire error code stay the modelled ones.
+const RESOURCE_NOT_FOUND_STATUS: u16 = 400;
+
+/// The modelled `ResourceNotFoundException` for an account the store holds no
+/// account-plan record for, naming the account whose data is missing.
+fn missing_plan_data(account_id: &str) -> GetAccountPlanStateError {
+    crate::scaffolded::Scaffolded::restated(
+        GetAccountPlanStateErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+            message: format!("Missing data for account: {account_id}"),
+        }),
+        RESOURCE_NOT_FOUND_STATUS,
+    )
 }
