@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSecurityPolicies
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSecurityPolicies`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSecurityPolicies::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages the names of this service's security policy catalog
+//! ([`crate::state::SECURITY_POLICIES`]).
+//!
+//! The catalog is service-owned reference data: the model has no operation that
+//! creates, updates or deletes a security policy, so the answer does not depend on
+//! what any caller stored, and two calls with the same `NextToken` answer the same
+//! page. The paging itself is the shared `List*` codec
+//! ([`crate::state::page_bounds`] over an ordered key list, with a hex
+//! [`crate::state::encode_page_token`] token): a token this codec cannot have issued
+//! is refused with the modelled `InvalidNextTokenException` rather than silently
+//! restarting the listing, and a token it could have issued is a POSITION in the
+//! ordered names, so one naming a position past the last policy resumes after it —
+//! an empty final page — rather than starting over.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +161,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSecurityPolicies` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSecurityPoliciesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSecurityPolicies"))
+        use crate::state as st;
+
+        // A published catalog is the same for every caller in every region, so this
+        // read needs neither request metadata nor the per-account store — the same
+        // reason `DescribeSecurityPolicy` reads neither.
+        let _ = (ctx, &self.engine);
+
+        let after = match input.next_token.as_deref() {
+            Some(token) => Some(st::decode_page_token(token).ok_or_else(|| {
+                ListSecurityPoliciesErrorModeled::InvalidNextTokenException(
+                    InvalidNextTokenException {
+                        message: "The NextToken is not valid".to_string(),
+                    },
+                )
+            })?),
+            None => None,
+        };
+
+        // The catalog's names in catalog order, which is ascending by name — what
+        // `page_bounds` needs to resume a listing from the previous page's last key.
+        let names: Vec<&'static str> = st::security_policy_names().collect();
+        let (page, next_key) =
+            st::page_bounds(&names, after.as_deref(), st::page_limit(input.max_results));
+
+        Ok(ListSecurityPoliciesOutput {
+            // A token only when a further page remains.
+            next_token: next_key.as_deref().map(st::encode_page_token),
+            security_policy_names: names
+                .get(page)
+                .unwrap_or_default()
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+        })
     }
 }

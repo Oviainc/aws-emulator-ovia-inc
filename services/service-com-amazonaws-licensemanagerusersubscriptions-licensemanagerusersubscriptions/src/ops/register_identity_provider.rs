@@ -182,6 +182,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The in-memory store is bounded, and AWS bounds registrations per account too:
+        // the modelled quota error is what a caller at the limit is told. It also bounds
+        // the per-request work every operation that reads the registrations does.
+        if crate::state::ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::at_resource_limit(
+            state.identity_providers.len(),
+        ) {
+            return Err(
+                RegisterIdentityProviderErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "the account already has {} identity provider registrations, the \
+                             most this service holds",
+                            state.identity_providers.len()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let id = state.mint_id("ip");
         let arn = crate::state::resource_arn(&signing_name, &region, "identity-provider", &id);
         let record = crate::state::IdentityProviderRecord {
@@ -204,6 +224,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state
             .identity_provider_index
             .insert((key, input.product.clone()), arn);
+        // The `REGISTERING` -> `REGISTERED` transition the clock now owes, so a later
+        // read materialises it without every request sweeping the whole store.
+        state.schedule_transition(record.registered_due_at);
 
         Ok(RegisterIdentityProviderOutput {
             identity_provider_summary: crate::state::identity_provider_summary(&record),

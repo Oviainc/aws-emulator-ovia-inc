@@ -14,17 +14,21 @@
 //! paging primitives both list operations share, so the per-operation files cannot
 //! drift from each other in how they render the same stored record.
 //!
-//! Room is deliberately left for the operations later issues own: an
-//! `Application` grows a `policy_statements` list for
-//! PutApplicationPolicy/GetApplicationPolicy, and the state struct grows a template
-//! map for the CloudFormation template/changeset operations. Neither is declared yet —
-//! the operations that would read them still answer 501.
+//! An application also carries its permission policy — the `policy_statements` list
+//! `PutApplicationPolicy` replaces and `GetApplicationPolicy` reports — so a policy is
+//! part of the application record and goes away with it. Room is still deliberately left
+//! for the operations later issues own: the state struct grows a template map for the
+//! CloudFormation template/changeset operations, which is not declared yet — the
+//! operations that would read it still answer 501.
 
+use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 use crate::ops::types::{
-    ApplicationSummary, BadRequestException, ConflictException, InternalServerErrorException,
-    NotFoundException, ParameterDefinition, Version, VersionSummary,
+    ApplicationPolicyStatement, ApplicationSummary, BadRequestException, ConflictException,
+    InternalServerErrorException, NotFoundException, ParameterDefinition, Version, VersionSummary,
 };
 
 /// The region an ARN carries when the request names none.
@@ -116,6 +120,11 @@ pub struct Application {
     /// The semantic version with the highest precedence of those stored, which
     /// `GetApplication` reports when the caller names none.
     pub latest_version: Option<String>,
+    /// This application's permission policy, in the order the last
+    /// `PutApplicationPolicy` listed its statements. Empty for an application whose
+    /// policy was never set, or whose last put carried no statements: a policy is
+    /// REPLACED by each put, never merged into.
+    pub policy_statements: Vec<PolicyStatement>,
 }
 
 impl Application {
@@ -146,6 +155,16 @@ impl Application {
             self.latest_version = Some(semantic_version.clone());
         }
         self.versions.insert(semantic_version, version);
+    }
+
+    /// This application's policy projected into the modelled statements both
+    /// `PutApplicationPolicy` and `GetApplicationPolicy` answer with, in the stored
+    /// order — so the two operations cannot render one stored policy differently.
+    pub fn policy(&self) -> Vec<ApplicationPolicyStatement> {
+        self.policy_statements
+            .iter()
+            .map(PolicyStatement::statement)
+            .collect()
     }
 
     /// This record projected into the modelled `ApplicationSummary` that both
@@ -218,6 +237,45 @@ impl AppVersion {
             creation_time: self.creation_time.clone(),
             semantic_version: self.semantic_version.clone(),
             source_code_url: self.source_code_url.clone(),
+        }
+    }
+}
+
+/// One statement of an application's permission policy: the record
+/// `PutApplicationPolicy` writes and `GetApplicationPolicy` reads back.
+///
+/// Stored rather than kept as the modelled shape because a statement always HAS a
+/// `StatementId` once it is stored — the model documents it as "A unique ID for the
+/// statement" — while the request's member is optional, so the id is resolved once, on
+/// the way in ([`validate_policy_statements`]), and every read answers with it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PolicyStatement {
+    /// The statement's unique id: the caller's own `StatementId`, or the one minted for
+    /// a statement that named none.
+    pub statement_id: String,
+    /// The application permissions this statement grants; see [`APPLICATION_PERMISSIONS`].
+    pub actions: Vec<String>,
+    /// The AWS account ids this statement grants them to, or `*`.
+    pub principals: Vec<String>,
+    /// The AWS organization ids this statement is conditioned on, empty when it names
+    /// none.
+    pub principal_org_ids: Vec<String>,
+}
+
+impl PolicyStatement {
+    /// This record projected into the modelled `ApplicationPolicyStatement`.
+    ///
+    /// `PrincipalOrgIDs` is rendered as the empty LIST for a statement that names no
+    /// organization, the same way [`Application::summary`] renders a label-less
+    /// application's `Labels`: an empty list is the member's value, not its absence, so a
+    /// client reading `statement["principalOrgIDs"]` never has to guard for the member
+    /// being missing.
+    pub fn statement(&self) -> ApplicationPolicyStatement {
+        ApplicationPolicyStatement {
+            actions: self.actions.clone(),
+            principal_org_i_ds: Some(self.principal_org_ids.clone()),
+            principals: self.principals.clone(),
+            statement_id: Some(self.statement_id.clone()),
         }
     }
 }
@@ -528,6 +586,245 @@ pub fn bounded_bytes(member: &str, value: Option<&String>, max: usize) -> Result
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The application PERMISSION POLICY, validated and stored in ONE place.
+//
+// `PutApplicationPolicy` is the only operation that writes a policy and
+// `GetApplicationPolicy` the only one that reads it, so the rule each statement must
+// satisfy, and the record a statement is kept as, live here once rather than in two
+// handlers that can drift.
+// ---------------------------------------------------------------------------
+
+/// The application permissions a policy statement may grant, as the API spells them.
+///
+/// The catalogue is the "Application permissions" list the `Actions` member's own
+/// documentation points at
+/// (`smithy_query(query="doc", shape="ApplicationPolicyStatement", member="Actions")` →
+/// `https://docs.aws.amazon.com/serverlessrepo/latest/devguide/access-control-resource-based.html#application-permissions`):
+/// the per-application actions a publisher grants to another account or an organization,
+/// plus `Deploy`, the grant that covers the set a deployment needs.
+///
+/// An action outside the catalogue is not a permission this service can grant, so a put
+/// naming one is refused rather than stored — a stored statement a client reads back must
+/// mean something.
+pub const APPLICATION_PERMISSIONS: &[&str] = &[
+    "CreateCloudFormationChangeSet",
+    "CreateCloudFormationTemplate",
+    "Deploy",
+    "GetApplication",
+    "ListApplicationDependencies",
+    "ListApplicationVersions",
+    "SearchApplications",
+    "UnshareApplication",
+];
+
+/// The prefix an action carries when it is spelled as the IAM action it is.
+///
+/// The same permission is written bare in this API's own examples (`Actions=Deploy`) and
+/// `serverlessrepo:Deploy` in an IAM policy document, so both spellings name the same
+/// entry of [`APPLICATION_PERMISSIONS`] and both are accepted; the statement is stored as
+/// the caller spelled it.
+const ACTION_PREFIX: &str = "serverlessrepo:";
+
+/// How many statements one application's policy retains, and how many entries one of a
+/// statement's lists retains.
+///
+/// A policy is caller-supplied content the store holds for the life of the application,
+/// so without a ceiling one call can drive the emulator's heap until the host is out of
+/// memory. AWS publishes no quota for either, so these are the emulator's own bounds:
+/// far above any real sharing policy, finite so the growth is not caller-controlled. A
+/// put past a ceiling is refused with the modelled `BadRequestException` and leaves the
+/// stored policy exactly as it was.
+pub const MAX_POLICY_STATEMENTS: usize = 100;
+
+/// See [`MAX_POLICY_STATEMENTS`].
+pub const MAX_POLICY_LIST_ENTRIES: usize = 100;
+
+/// See [`MAX_POLICY_STATEMENTS`]; the bound on a caller-supplied `StatementId`.
+pub const MAX_STATEMENT_ID_LENGTH: usize = 128;
+
+/// The statements of `statements` as the records a policy is stored as, or the refusal
+/// wording the calling operation renders as its modelled invalid-parameter error.
+///
+/// What is enforced, and why each rule is a rule:
+///
+/// * `Actions` and `Principals` are `@required` members of the statement
+///   (`smithy_query(query="operation", operation="PutApplicationPolicy")`), so a
+///   statement granting no action, or granting to nobody, is not a statement;
+/// * an action must be an application permission ([`APPLICATION_PERMISSIONS`]);
+/// * a principal is "an array of AWS account IDs, or * to make the application public"
+///   (`smithy_query(query="doc", shape="ApplicationPolicyStatement", member="Principals")`),
+///   so it is a 12-digit account id or `*`;
+/// * a `PrincipalOrgIDs` entry "corresponds to AWS IAM aws:PrincipalOrgID" (the same
+///   query on that member), whose value is an organization id, `o-` and 10 to 32
+///   lowercase alphanumerics;
+/// * a `StatementId` is "A unique ID for the statement", so two statements of one policy
+///   cannot carry the same one, and a statement that names none is minted one.
+///
+/// Nothing is written until every statement passes, so a refused put leaves the stored
+/// policy untouched.
+pub fn validate_policy_statements(
+    statements: &[ApplicationPolicyStatement],
+) -> Result<Vec<PolicyStatement>, String> {
+    if statements.len() > MAX_POLICY_STATEMENTS {
+        return Err(format!(
+            "Statements must have at most {MAX_POLICY_STATEMENTS} entries, got {}",
+            statements.len()
+        ));
+    }
+
+    let mut stored: Vec<PolicyStatement> = Vec::with_capacity(statements.len());
+    for statement in statements {
+        bounded_entries("Actions", statement.actions.len())?;
+        for action in &statement.actions {
+            let permission = action.strip_prefix(ACTION_PREFIX).unwrap_or(action);
+            if !APPLICATION_PERMISSIONS.contains(&permission) {
+                return Err(format!(
+                    "Actions must each be one of the application permissions [{}], got {action}",
+                    APPLICATION_PERMISSIONS.join(", ")
+                ));
+            }
+        }
+
+        bounded_entries("Principals", statement.principals.len())?;
+        for principal in &statement.principals {
+            if !is_principal(principal) {
+                return Err(format!(
+                    "Principals must each be a 12-digit AWS account ID or *, got {principal}"
+                ));
+            }
+        }
+
+        let principal_org_ids = statement.principal_org_i_ds.clone().unwrap_or_default();
+        if !principal_org_ids.is_empty() {
+            bounded_entries("PrincipalOrgIDs", principal_org_ids.len())?;
+            for organization_id in &principal_org_ids {
+                if !is_organization_id(organization_id) {
+                    return Err(format!(
+                        "PrincipalOrgIDs must each be an AWS organization ID matching \
+                         ^o-[a-z0-9]{{10,32}}$, got {organization_id}"
+                    ));
+                }
+            }
+        }
+
+        let statement_id = match statement.statement_id.as_deref() {
+            Some(statement_id) => {
+                bounded_length("StatementId", statement_id, 1, MAX_STATEMENT_ID_LENGTH)?;
+                statement_id.to_string()
+            }
+            None => new_statement_id(),
+        };
+        if stored.iter().any(|kept| kept.statement_id == statement_id) {
+            return Err(format!(
+                "StatementId must be unique within the policy, got {statement_id} on two \
+                 statements"
+            ));
+        }
+
+        stored.push(PolicyStatement {
+            statement_id,
+            actions: statement.actions.clone(),
+            principals: statement.principals.clone(),
+            principal_org_ids,
+        });
+    }
+
+    Ok(stored)
+}
+
+/// A list member of a policy statement carries at least one entry and at most
+/// [`MAX_POLICY_LIST_ENTRIES`].
+fn bounded_entries(member: &str, entries: usize) -> Result<(), String> {
+    if entries == 0 {
+        return Err(format!("{member} must have at least one entry"));
+    }
+    if entries > MAX_POLICY_LIST_ENTRIES {
+        return Err(format!(
+            "{member} must have at most {MAX_POLICY_LIST_ENTRIES} entries, got {entries}"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `principal` is "an AWS account ID, or * to make the application public"
+/// (`smithy_query(query="doc", shape="ApplicationPolicyStatement", member="Principals")`):
+/// an AWS account id is twelve digits.
+fn is_principal(principal: &str) -> bool {
+    principal == "*"
+        || (principal.len() == 12 && principal.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// Whether `organization_id` is an AWS organization id, the value of the
+/// `aws:PrincipalOrgID` condition key `PrincipalOrgIDs` corresponds to: `o-` followed by
+/// 10 to 32 lowercase letters or digits.
+fn is_organization_id(organization_id: &str) -> bool {
+    let Some(suffix) = organization_id.strip_prefix("o-") else {
+        return false;
+    };
+    (10..=32).contains(&suffix.len())
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+
+/// How many statement ids this process has minted: the part of an id that makes it
+/// UNIQUE.
+///
+/// A counter cannot repeat within a process, so no two ids this service hands out can
+/// collide however fast they are minted — which a clock reading alone cannot promise.
+static STATEMENT_IDS_MINTED: AtomicU64 = AtomicU64::new(0);
+
+/// A per-process random value, the part of a minted id that makes it UNGUESSABLE.
+///
+/// `RandomState` seeds each of its hashers with keys the standard library draws from the
+/// OS once per process, so hashing a fixed value through one yields a value that differs
+/// between runs and is not derivable from the request.
+fn process_seed() -> u64 {
+    static SEED: OnceLock<u64> = OnceLock::new();
+    *SEED.get_or_init(|| {
+        let mut hasher = ::std::hash::BuildHasher::build_hasher(&RandomState::new());
+        ::std::hash::Hash::hash(&"com.amazonaws.serverlessapplicationrepository", &mut hasher);
+        ::std::hash::Hasher::finish(&hasher)
+    })
+}
+
+/// The `StatementId` a statement that named none is stored under: a fresh lowercase,
+/// hyphenated uuid in the version-4 layout (version nibble `4`, variant bits `10`).
+///
+/// The 16 bytes are a SHA-256 digest — from the maintained `sha2` crate, not written here
+/// — of this process's random seed, the number of ids minted before this one and the
+/// current clock reading, rendered by `hex`. The counter is what makes the id unique and
+/// the seed is what makes it unguessable; digesting them is what spreads both across all
+/// 16 bytes, so an id reveals neither. It is deliberately NOT derived from the request:
+/// two identical puts mint two different ids.
+pub fn new_statement_id() -> String {
+    use ::sha2::Digest as _;
+
+    let minted = STATEMENT_IDS_MINTED.fetch_add(1, Ordering::Relaxed);
+    let nanos = ::std::time::SystemTime::now()
+        .duration_since(::std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+
+    let mut digest = ::sha2::Sha256::new();
+    digest.update(process_seed().to_be_bytes());
+    digest.update(minted.to_be_bytes());
+    digest.update(nanos.to_be_bytes());
+    let mut bytes = <[u8; 16]>::try_from(&digest.finalize()[..16]).expect("16 of 32 digest bytes");
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+    let hex = ::hex::encode(bytes);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 /// Whether `semantic_version` is a semantic version, which is what the model says the

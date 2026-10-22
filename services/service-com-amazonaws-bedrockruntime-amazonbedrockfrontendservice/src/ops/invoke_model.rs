@@ -2,9 +2,10 @@
 
 //! @op InvokeModel
 //! Serves one synchronous inference call: it resolves `modelId` against the
-//! registry in [`crate::state`], applies the request rules the model documents
+//! inventory in [`crate::state`], applies the request rules the model documents
 //! (`application/json` bodies, and the three guardrail combinations that are an
-//! error), counts the prompt tokens the body carries, honours the generation cap
+//! error), checks the body against the invoked family's own request schema,
+//! counts the prompt tokens the body carries, honours the generation cap
 //! the body carries for the model's family, and answers in the response envelope
 //! of that family so a client can parse it.
 //!
@@ -261,22 +262,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // `modelId` resolution: an identifier the service cannot interpret is a
+        // 400, an identifier naming a model or resource that is not available
+        // here is a 404. See `crate::state::resolve_model_for_inference`.
         let model = {
             let guard = state.lock();
-            match guard.resolve_model(&input.model_id) {
-                Some(entry) => entry.clone(),
-                None => {
+            match guard.resolve_model_for_inference(&input.model_id) {
+                Ok(entry) => entry.clone(),
+                Err(crate::state::ModelRejection::Invalid(message)) => {
+                    return Err(validation(message))
+                }
+                Err(crate::state::ModelRejection::NotFound(message)) => {
                     return Err(InvokeModelErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
-                            message: Some(format!(
-                                "The provided model identifier is invalid: {}",
-                                input.model_id
-                            )),
+                            message: Some(message),
                         },
                     )
                     .into())
                 }
             }
+        };
+
+        // A model whose modality this emulator computes nothing for. Nothing
+        // ran, so the answer is the modelled model-processing error rather than
+        // a fabricated embedding, image or video payload.
+        let Some(family) = model.family else {
+            return Err(InvokeModelErrorModeled::ModelErrorException(
+                ModelErrorException {
+                    message: Some(format!(
+                        "No model runs in this Amazon Bedrock Runtime emulator, so it serves no \
+                         {} inference for {}.",
+                        model.modality.label(),
+                        model.model_id
+                    )),
+                    original_status_code: None,
+                    resource_name: Some(model.model_id.clone()),
+                },
+            )
+            .into());
         };
 
         // "You must provide the body in JSON format", and the response is in the
@@ -335,12 +358,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // The body is model-specific, so the model's own family is what says
+        // whether it can be read: a body that is not a JSON object, or that
+        // omits a member the family's documented request schema requires, is
+        // refused naming the violation.
+        if let Some(message) = crate::state::invoke_body_violation(family, body) {
+            return Err(validation(message));
+        }
+
         // The generation cap the body carries for this family, bounded by the
         // model's own ceiling; reaching it is what makes the family's response
         // report its length stop reason instead of a completed one.
         let max_output_tokens = parsed_body
             .as_ref()
-            .and_then(|value| crate::state::body_max_tokens(model.family, value))
+            .and_then(|value| crate::state::body_max_tokens(family, value))
             .unwrap_or(model.max_output_tokens)
             .min(model.max_output_tokens);
 
@@ -366,7 +397,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let response = crate::state::invoke_model_response_body(
-            model.family,
+            family,
             &model.model_id,
             &completion_id,
             &text,
