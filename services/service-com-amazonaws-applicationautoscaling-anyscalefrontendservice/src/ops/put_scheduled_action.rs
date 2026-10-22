@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutScheduledAction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutScheduledAction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutScheduledAction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -213,18 +204,283 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutScheduledAction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutScheduledActionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutScheduledAction"))
+        use crate::state::{
+            check_dimension_namespace, check_enum, scheduled_action_arn, timestamp_of,
+            ScheduledActionKey, TargetKey,
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutScheduledActionErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some(
+                        "this service is mounted on an engine that holds no state".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // The two identifying enums arrive as plain strings, so the permitted set is
+        // checked here against the model-derived value lists, and the pair against the
+        // namespace the dimension names.
+        check_enum(
+            "serviceNamespace",
+            &input.service_namespace,
+            SERVICE_NAMESPACE_VALUES,
+        )
+        .map_err(validation)?;
+        check_enum(
+            "scalableDimension",
+            &input.scalable_dimension,
+            SCALABLE_DIMENSION_VALUES,
+        )
+        .map_err(validation)?;
+        check_dimension_namespace(&input.service_namespace, &input.scalable_dimension)
+            .map_err(validation)?;
+
+        if let Some(schedule) = input.schedule.as_deref() {
+            check_schedule(schedule).map_err(validation)?;
+        }
+        if let Some(action) = input.scalable_target_action.as_ref() {
+            check_scalable_target_action(action).map_err(validation)?;
+        }
+        // "When you specify start and end times […] they form the boundaries for when the
+        // recurring action starts and stops": a pair of boundaries in the wrong order is
+        // not a window the action could ever run in.
+        if let (Some(start), Some(end)) = (input.start_time, input.end_time) {
+            if end < start {
+                return Err(validation(
+                    "EndTime must be at or after StartTime for a scheduled action",
+                ));
+            }
+        }
+
+        let key = ScheduledActionKey {
+            target: TargetKey {
+                service_namespace: input.service_namespace.clone(),
+                resource_id: input.resource_id.clone(),
+                scalable_dimension: input.scalable_dimension.clone(),
+            },
+            scheduled_action_name: input.scheduled_action_name.clone(),
+        };
+
+        let mut state = state.lock();
+
+        // A scheduled action only exists against a registered scalable target: "You
+        // cannot create a scheduled action until you have registered the resource as a
+        // scalable target."
+        if !state.targets.contains_key(&key.target) {
+            return Err(PutScheduledActionErrorModeled::ObjectNotFoundException(
+                ObjectNotFoundException {
+                    message: Some(format!(
+                        "No scalable target found for service namespace: {}, resource ID: {}, \
+                         scalable dimension: {}",
+                        key.target.service_namespace,
+                        key.target.resource_id,
+                        key.target.scalable_dimension
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The action's name is scoped to its target, so the SAME name on another resource
+        // or dimension is another action, not this one.
+        let stored = state.scheduled_actions.get(&key).cloned();
+
+        // "To update a scheduled action, specify the parameters that you want to change":
+        // an absent member keeps what was persisted, so `Schedule` is only required when
+        // the action is being created.
+        let schedule = match (input.schedule.clone(), stored.as_ref()) {
+            (Some(schedule), _) => schedule,
+            (None, Some(existing)) => existing.schedule.clone(),
+            (None, None) => {
+                return Err(validation(
+                    "Schedule is required when creating a scheduled action",
+                ))
+            }
+        };
+
+        // The ARN and the creation time are minted once per scheduled-action identity and
+        // survive every later Put for the same (namespace, resource, dimension, name).
+        let (scheduled_action_arn, creation_time) = match stored.as_ref() {
+            Some(existing) => (
+                existing.scheduled_action_arn.clone(),
+                existing.creation_time,
+            ),
+            None => {
+                // The emulator's own store bound, checked only on the create path so an
+                // update of an existing action still succeeds at the ceiling.
+                if state.scheduled_actions.len() >= crate::state::MAX_SCHEDULED_ACTIONS {
+                    return Err(PutScheduledActionErrorModeled::LimitExceededException(
+                        LimitExceededException {
+                            message: Some(format!(
+                                "This emulator holds at most {} scheduled actions; delete one \
+                                 before creating another",
+                                crate::state::MAX_SCHEDULED_ACTIONS
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                (
+                    scheduled_action_arn(&crate::state::request_region(ctx.parts()), &key),
+                    timestamp_of(::std::time::SystemTime::now()),
+                )
+            }
+        };
+
+        let action = ScheduledAction {
+            scheduled_action_name: key.scheduled_action_name.clone(),
+            scheduled_action_arn,
+            service_namespace: key.target.service_namespace.clone(),
+            schedule,
+            // `Timezone` qualifies the schedule it was stored with, so it follows the
+            // same keep-what-you-did-not-name rule.
+            timezone: input.timezone.clone().or_else(|| {
+                stored
+                    .as_ref()
+                    .and_then(|existing| existing.timezone.clone())
+            }),
+            resource_id: key.target.resource_id.clone(),
+            scalable_dimension: Some(key.target.scalable_dimension.clone()),
+            // The one documented exception to that rule: "If you don't specify start and
+            // end times, the old values are deleted."
+            start_time: input.start_time,
+            end_time: input.end_time,
+            // A `ScalableTargetAction` the request carries REPLACES the stored one rather
+            // than merging into it: "You can set both values or just one", so a side it
+            // leaves out is this action's choice not to bound that side.
+            scalable_target_action: input.scalable_target_action.clone().or_else(|| {
+                stored
+                    .as_ref()
+                    .and_then(|existing| existing.scalable_target_action.clone())
+            }),
+            creation_time,
+        };
+        state.scheduled_actions.insert(key, action);
+
+        Ok(PutScheduledActionOutput {})
     }
+}
+
+/// This operation's modelled `ValidationException`, carrying `message`.
+fn validation(message: impl Into<String>) -> PutScheduledActionError {
+    PutScheduledActionErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The units a `rate(value unit)` schedule accepts, from the model's own documentation
+/// for `Schedule`: "For rate expressions, value is a positive integer and unit is
+/// `minute` | `minutes` | `hour` | `hours` | `day` | `days`."
+pub const SCHEDULE_RATE_UNITS: &[&str] = &["minute", "minutes", "hour", "hours", "day", "days"];
+
+/// How many whitespace-separated fields a `cron(…)` schedule carries: "The cron format
+/// consists of six fields separated by white spaces: [Minutes] [Hours] [Day_of_Month]
+/// [Month] [Day_of_Week] [Year]."
+pub const SCHEDULE_CRON_FIELDS: usize = 6;
+
+/// The character count of an `at` expression's body — `yyyy-mm-ddThh:mm:ss`, the format
+/// the model documents, with no zone designator and no fractional seconds.
+const AT_EXPRESSION_LEN: usize = "yyyy-mm-ddThh:mm:ss".len();
+
+/// `Ok` when `schedule` is one of the three expression forms the model documents, else
+/// the `ValidationException` message naming the member and what it must be.
+///
+/// Only the expression's SYNTAX is checked here. Nothing in this emulator dispatches a
+/// scheduled action yet, so a cron expression's fields are stored as written rather than
+/// resolved to fire times.
+fn check_schedule(schedule: &str) -> Result<(), String> {
+    let refuse = |detail: &str| {
+        format!(
+            "Value '{schedule}' at 'schedule' failed to satisfy constraint: \
+             Member must be an at, rate or cron expression ({detail})"
+        )
+    };
+
+    let Some((kind, rest)) = schedule.split_once('(') else {
+        return Err(refuse("expected at(…), rate(…) or cron(…)"));
+    };
+    let Some(body) = rest.strip_suffix(')') else {
+        return Err(refuse("the expression is not closed by ')'"));
+    };
+
+    match kind {
+        "at" => {
+            // `at(yyyy-mm-ddThh:mm:ss)` is a civil time — UTC unless `Timezone` says
+            // otherwise — so it parses as RFC 3339 once a zone is appended.
+            if body.len() != AT_EXPRESSION_LEN
+                || ::aws_smithy_types::DateTime::from_str(
+                    &format!("{body}Z"),
+                    ::aws_smithy_types::date_time::Format::DateTime,
+                )
+                .is_err()
+            {
+                return Err(refuse("an at expression reads at(yyyy-mm-ddThh:mm:ss)"));
+            }
+            Ok(())
+        }
+        "rate" => {
+            let fields: Vec<&str> = body.split_whitespace().collect();
+            let [value, unit] = fields[..] else {
+                return Err(refuse("a rate expression reads rate(value unit)"));
+            };
+            // "value is a positive integer": zero is not an interval, and a sign or a
+            // fraction is not an integer.
+            if !value.bytes().all(|byte| byte.is_ascii_digit())
+                || value.parse::<u64>().unwrap_or_default() == 0
+            {
+                return Err(refuse("a rate expression's value is a positive integer"));
+            }
+            if !SCHEDULE_RATE_UNITS.contains(&unit) {
+                return Err(refuse(&format!(
+                    "a rate expression's unit is one of [{}]",
+                    SCHEDULE_RATE_UNITS.join(", ")
+                )));
+            }
+            Ok(())
+        }
+        "cron" => {
+            let fields = body.split_whitespace().count();
+            if fields != SCHEDULE_CRON_FIELDS {
+                return Err(refuse(&format!(
+                    "a cron expression carries {SCHEDULE_CRON_FIELDS} fields, not {fields}"
+                )));
+            }
+            Ok(())
+        }
+        _ => Err(refuse("expected at(…), rate(…) or cron(…)")),
+    }
+}
+
+/// `Ok` when the scheduled capacity window is a window at all.
+///
+/// The two bounds are checked against each other only. A window OUTSIDE the target's
+/// registered range is accepted on purpose: the registered range is what the action is
+/// measured against when it RUNS, not when it is stored.
+fn check_scalable_target_action(action: &ScalableTargetAction) -> Result<(), String> {
+    for (member, capacity) in [
+        ("scalableTargetAction.minCapacity", action.min_capacity),
+        ("scalableTargetAction.maxCapacity", action.max_capacity),
+    ] {
+        if let Some(value) = capacity {
+            if value < 0 {
+                return Err(format!(
+                    "Value '{value}' at '{member}' failed to satisfy constraint: \
+                     Member must have value greater than or equal to 0"
+                ));
+            }
+        }
+    }
+    if let (Some(min_capacity), Some(max_capacity)) = (action.min_capacity, action.max_capacity) {
+        if min_capacity > max_capacity {
+            return Err(format!(
+                "MinCapacity ({min_capacity}) must be less than or equal to MaxCapacity \
+                 ({max_capacity})"
+            ));
+        }
+    }
+    Ok(())
 }

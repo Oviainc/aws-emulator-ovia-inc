@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetOriginEndpointPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetOriginEndpointPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetOriginEndpointPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the resource policy attached to an origin endpoint. A `@readonly` operation:
+//! it reads the store and writes nothing. Four distinct absences all answer
+//! `ResourceNotFoundException` (404) with the fixed sentence of the resource that is
+//! missing: the channel group, the channel, the origin endpoint, or the policy on an
+//! endpoint that has never had one attached.
 //!
 //! ## Shape of an operation
 //!
@@ -137,6 +134,28 @@ impl From<GetOriginEndpointPolicyErrorModeled> for GetOriginEndpointPolicyError 
     }
 }
 
+/// The sentence MediaPackage answers with when a channel group cannot be resolved —
+/// fixed per resource type, echoing none of the caller's identifiers. Worded exactly as
+/// the channel-scope policy handlers word it (`get_channel_policy`).
+const CHANNEL_GROUP_NOT_FOUND: &str = "MediaPackage can't process your request because \
+    we can't find your channel group. Verify your channel group name or add a channel \
+    group and then try again";
+
+/// The same fixed sentence at channel scope.
+const CHANNEL_NOT_FOUND: &str = "MediaPackage can't process your request because we \
+    can't find your channel. Verify your channel name or add a channel and then try \
+    again";
+
+/// The same fixed sentence at origin-endpoint scope.
+const ORIGIN_ENDPOINT_NOT_FOUND: &str = "MediaPackage can't process your request because \
+    we can't find your origin endpoint. Verify your origin endpoint name or add an origin \
+    endpoint and then try again";
+
+/// The not-found text for an endpoint that exists with no policy attached: the endpoint
+/// resolves, so what is missing is the policy sub-resource.
+const POLICY_NOT_FOUND: &str = "MediaPackage can't process your request because we can't \
+    find your policy. Attach a policy to your resource and then try again";
+
 /// The `GetOriginEndpointPolicy` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -173,18 +192,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetOriginEndpointPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetOriginEndpointPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetOriginEndpointPolicy"))
+        // A read needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetOriginEndpointPolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the MediaPackageV2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let store = state.lock();
+
+        // Each level of the address is resolved on its own, because the service words a
+        // not-found by the resource type that is missing.
+        let Some(group) = store.channel_groups.get(&input.channel_group_name) else {
+            return Err(
+                GetOriginEndpointPolicyErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(CHANNEL_GROUP_NOT_FOUND.to_string()),
+                        resource_type_not_found: Some("CHANNEL_GROUP".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let Some(channel) = group.channels.get(&input.channel_name) else {
+            return Err(
+                GetOriginEndpointPolicyErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(CHANNEL_NOT_FOUND.to_string()),
+                        resource_type_not_found: Some("CHANNEL".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let Some(endpoint) = channel.origin_endpoints.get(&input.origin_endpoint_name) else {
+            return Err(
+                GetOriginEndpointPolicyErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(ORIGIN_ENDPOINT_NOT_FOUND.to_string()),
+                        resource_type_not_found: Some("ORIGIN_ENDPOINT".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        // The endpoint is there; the policy is what is missing. `ResourceTypeNotFound`
+        // enumerates only the four addressable resources (channel group, channel, origin
+        // endpoint, harvest job), so naming one of them here would claim the ENDPOINT is
+        // gone when it is not: the member is left unset instead.
+        let Some(attached) = endpoint.policy.as_ref() else {
+            return Err(
+                GetOriginEndpointPolicyErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(POLICY_NOT_FOUND.to_string()),
+                        resource_type_not_found: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetOriginEndpointPolicyOutput {
+            channel_group_name: input.channel_group_name,
+            channel_name: input.channel_name,
+            origin_endpoint_name: input.origin_endpoint_name,
+            policy: attached.policy.clone(),
+            cdn_auth_configuration: attached.cdn_auth_configuration.clone(),
+        })
     }
 }

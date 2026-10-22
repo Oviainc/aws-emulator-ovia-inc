@@ -24,8 +24,8 @@
 //!   correctly. The default returns `None`, so every request resolves through the
 //!   generated routing table. Return `Some(op)` to route one yourself.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   before any handler ran. This service answers a failed input validation with
+//!   Control Tower's front-door bad-request refusal; see that method.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -44,6 +44,29 @@ use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+/// The error code AWS Control Tower answers a request that failed input validation
+/// with.
+///
+/// Every Control Tower operation is a restJson1 REST call, and a request whose
+/// members do not satisfy the model's constraints is refused by the REST front door
+/// before the modeled service error is reached: the answer is a generic bad-request
+/// refusal, not the per-member `ValidationException` the operations declare. The
+/// distinction is client-visible — an SDK unmarshals `ValidationException` into a
+/// typed, modeled error and this code into a generic service error — so the code a
+/// client branches on has to be this one. `ValidationException` remains what a
+/// HANDLER returns when a request that satisfied every modeled constraint is still
+/// not acceptable to the service; only the pre-handler refusal is reworded here.
+const BAD_REQUEST_EXCEPTION: &str = "BadRequestException";
+
+/// The message that front-door refusal carries.
+///
+/// It is constant: the front door refuses the request before it is dispatched to an
+/// operation, so it names neither the member nor the constraint that failed. No model
+/// trait or AWS document states this text, so it is this emulator's rendering of that
+/// one refusal rather than a value a client may rely on — the status (400) and
+/// [`BAD_REQUEST_EXCEPTION`] are the contract.
+const INVALID_REQUEST_BODY_MESSAGE: &str = "Invalid request body";
 
 /// The `com-amazonaws-controltower-awscontroltowerapis` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -98,15 +121,30 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // Control Tower refuses such a request at its REST front door, so the
+        // answer is the generic bad-request code and message above rather than the
+        // framework's per-member `ValidationException` envelope: the front door has
+        // not dispatched the request to an operation, so it states neither the
+        // member nor the constraint. One decision for every operation and every
+        // constraint kind — a request refused before a handler ran is refused the
+        // same way whichever member failed.
+        //
+        // The status stays with the protocol (400), and both the code and the
+        // message are replaced together: a message without its matching code is
+        // worse than leaving both alone.
+        //
+        // An authentication refusal is NOT an input-validation failure, so it keeps
+        // the framework's 403 wording; `Refusal` is `#[non_exhaustive]`, and a
+        // refusal class this crate has not seen keeps the default wording too.
+        match refusal {
+            Refusal::Invalid(_) => Some(Refused {
+                code: BAD_REQUEST_EXCEPTION.to_string(),
+                message: INVALID_REQUEST_BODY_MESSAGE.to_string(),
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

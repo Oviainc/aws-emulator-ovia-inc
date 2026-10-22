@@ -17,6 +17,11 @@
 //! `NumberOfRecoveryPoints` are derived from it, so the two can never disagree.
 //! [`VaultView`] is likewise the ONLY vault read projection: `DescribeBackupVault`
 //! and `ListBackupVaults` both answer from it.
+//!
+//! [`ComAmazonawsBackupCryocontrollerusermanagerState::visible_vault`] is the
+//! resolution step every vault-scoped READ shares: it applies the access decision
+//! before the existence lookup, so no read can disclose a vault the caller cannot
+//! see.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -654,6 +659,32 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
         self.recovery_points_by_vault
             .get(vault_name)
             .map_or(0, |arns| i64::try_from(arns.len()).unwrap_or(i64::MAX))
+    }
+
+    /// Resolve a vault for a vault-scoped READ, deciding access before existence.
+    ///
+    /// AWS Backup authorizes a vault-scoped read against the named vault as the
+    /// resource, so a caller that may not see that vault is refused for lack of
+    /// privileges and told nothing about whether it exists. A vault is outside the
+    /// caller's visibility when the account the request is scoped to does not hold it
+    /// — it was never created, or it has been deleted — or when the request addresses
+    /// another account's vault with `BackupVaultAccountId`; this emulator holds
+    /// exactly one account's vaults ([`engine::emulator_account_id`]), so any other
+    /// account id is another account's.
+    ///
+    /// Reporting only `Err(AccessDeniedException)` is the point: a caller cannot ask
+    /// this step whether an invisible vault exists, so no read can leak it.
+    pub fn visible_vault(
+        &self,
+        vault_name: &str,
+        vault_account_id: Option<&str>,
+    ) -> Result<&BackupVault, crate::scaffolded::AccessDeniedException> {
+        let own_account =
+            vault_account_id.is_none_or(|account| account == ::engine::emulator_account_id());
+        self.vaults
+            .get(vault_name)
+            .filter(|_| own_account)
+            .ok_or_else(crate::scaffolded::AccessDeniedException::insufficient_privileges)
     }
 
     /// Materialise the transition the clock has already made due, for ONE job.

@@ -16,7 +16,7 @@
 
 use serde_json::{json, Value};
 
-use crate::wire::{call, emulator, ok, REGISTRY_ID};
+use crate::wire::{call, emulator, ok, refused, REGISTRY_ID};
 
 /// The documented ceiling on a registry policy document: `RegistryPolicyText` is
 /// modelled `@length(min: 0, max: 10240)` — `smithy_query(query="operation",
@@ -189,28 +189,6 @@ fn refused_documents() -> Vec<(&'static str, &'static str)> {
 /// The `policyText` a call reported, or `Value::Null` when it reported none.
 fn policy_text(body: &Value) -> Value {
     body["policyText"].clone()
-}
-
-/// Assert `operation` refused the call with HTTP `status` and the wire code `code`.
-async fn refused(
-    router: &smithy_server_runtime::MultiServiceRouter,
-    case: &str,
-    operation: &str,
-    request: &Value,
-    code: &str,
-) {
-    let answer = call(router, operation, request).await;
-    assert_eq!(
-        answer.status, 400,
-        "case {case:?}: expected HTTP 400 from {operation}, got {} with {:?}",
-        answer.status, answer.body
-    );
-    assert_eq!(
-        answer.error_code(),
-        code,
-        "case {case:?}: expected {code} from {operation}, got {:?}",
-        answer.body
-    );
 }
 
 /// A document the registry accepts is stored verbatim, read back unchanged however many

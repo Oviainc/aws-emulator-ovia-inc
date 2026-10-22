@@ -5,6 +5,14 @@
 //! asserts NOTHING about `ListPolicyGenerations`'s real behaviour. Implement it here — this is
 //! the ONLY file to touch for this operation.
 //!
+//! The one thing it DOES assert is its refusal: a `principalArn` outside the model's
+//! `@pattern`, or a `maxResults` below the model's `@range` minimum, is answered with this
+//! service's MODELLED `ValidationException` (400) — `message` plus the `@required`
+//! `reason` and a `fieldList` naming the member — because the framework's pre-handler
+//! refusal is worded as a bare code and message and cannot carry a modelled member. A
+//! well-formed request keeps the 501: nothing in this service records a policy generation
+//! yet, so there is no state to list.
+//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`ListPolicyGenerations::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -76,6 +84,110 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// `PrincipalArn`'s `@pattern`, verbatim from the model
+/// (`smithy_query(query="shape",shape="PrincipalArn")`).
+///
+/// It is enforced HERE rather than at the request boundary because the boundary's refusal
+/// cannot carry `ValidationException$reason`, which this service's model marks
+/// `@required`; `ListPolicyGenerationsInput` carries `skip_validation` for this member for
+/// exactly that reason (see `ops::types::list_policy_generations_types`).
+const PRINCIPAL_ARN_PATTERN: &str = "^arn:[^:]*:iam::[^:]*:(role|user)/.{1,576}$";
+
+/// `maxResults`' `@range` minimum, from the model
+/// (`smithy_query(query="shape",shape="ListPolicyGenerationsRequest")`): a page size of at
+/// least one.
+const MAX_RESULTS_MIN: f64 = 1.0;
+
+/// The constraint traits of this operation's `principalArn`, as the macro would have
+/// attached them to the boundary schema.
+static PRINCIPAL_ARN_TRAITS: ::std::sync::LazyLock<::aws_smithy_schema::TraitMap> =
+    ::std::sync::LazyLock::new(|| {
+        let mut traits = ::aws_smithy_schema::TraitMap::new();
+        traits.insert(::std::boxed::Box::new(
+            ::aws_smithy_schema_server::constraints::PatternTrait::new(PRINCIPAL_ARN_PATTERN),
+        ));
+        traits
+    });
+
+/// The constraint traits of this operation's `maxResults`.
+static MAX_RESULTS_TRAITS: ::std::sync::LazyLock<::aws_smithy_schema::TraitMap> =
+    ::std::sync::LazyLock::new(|| {
+        let mut traits = ::aws_smithy_schema::TraitMap::new();
+        traits.insert(::std::boxed::Box::new(
+            ::aws_smithy_schema_server::constraints::RangeTrait::new(
+                ::std::option::Option::Some(MAX_RESULTS_MIN),
+                ::std::option::Option::None,
+            ),
+        ));
+        traits
+    });
+
+/// The modelled constraints of this operation's input, re-declared so this handler can run
+/// the SAME validating walk the request boundary runs
+/// (`aws_smithy_schema_server::constraints::validate`) and answer what it finds with the
+/// MODELLED `ValidationException` — `message` and the `@required` `reason` — instead of the
+/// framework's message-only envelope.
+///
+/// Only the members the input shape marks `skip_validation` appear here; every other member
+/// is still validated at the boundary, so no constraint is checked twice.
+struct ConstrainedInput<'a> {
+    principal_arn: Option<&'a str>,
+    max_results: Option<i32>,
+}
+
+impl ConstrainedInput<'_> {
+    const NAMESPACE: &'static str = "com.amazonaws.accessanalyzer";
+
+    const M_PRINCIPAL_ARN: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.accessanalyzer#ListPolicyGenerationsRequest$principalArn",
+            Self::NAMESPACE,
+            "principalArn",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "principalArn",
+        0,
+    )
+    .with_traits(&PRINCIPAL_ARN_TRAITS);
+
+    const M_MAX_RESULTS: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.accessanalyzer#ListPolicyGenerationsRequest$maxResults",
+            Self::NAMESPACE,
+            "maxResults",
+        ),
+        ::aws_smithy_schema::ShapeType::Integer,
+        "maxResults",
+        1,
+    )
+    .with_traits(&MAX_RESULTS_TRAITS);
+
+    const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.accessanalyzer#ListPolicyGenerationsRequest",
+            Self::NAMESPACE,
+            "ListPolicyGenerationsRequest",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[&Self::M_PRINCIPAL_ARN, &Self::M_MAX_RESULTS],
+    );
+}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for ConstrainedInput<'_> {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(value) = self.principal_arn {
+            s.write_string(&Self::M_PRINCIPAL_ARN, value)?;
+        }
+        if let Some(value) = self.max_results {
+            s.write_integer(&Self::M_MAX_RESULTS, value)?;
+        }
+        Ok(())
+    }
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -150,16 +262,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
         // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPolicyGenerations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPolicyGenerationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
+        let _ = (ctx, &self.engine);
+
+        // The modelled constraints this operation owns (see `ConstrainedInput`): a value
+        // outside one is refused with the MODELLED `ValidationException`, which carries
+        // the `@required` `reason` a client branches on, rather than with the framework's
+        // message-only refusal.
+        let violations = ::aws_smithy_schema_server::constraints::validate(
+            &ConstrainedInput {
+                principal_arn: input.principal_arn.as_deref(),
+                max_results: input.max_results,
+            },
+            &ConstrainedInput::SCHEMA,
+        );
+        if !violations.is_empty() {
+            return Err(ListPolicyGenerationsErrorModeled::ValidationException(
+                crate::state::constraint_validation_exception(&violations),
+            )
+            .into());
+        }
+
+        // The listing itself is NOT implemented: no operation in this service records a
+        // policy generation yet (`StartPolicyGeneration` is still scaffolded), so there is
+        // no state to project and an empty page would assert something this emulator does
+        // not know. A well-formed request therefore keeps the scaffold's 501 — "nobody has
+        // written this yet" — while a malformed one gets the modelled 400 above.
         Err(crate::scaffolded::Scaffolded::not_implemented("ListPolicyGenerations"))
     }
 }

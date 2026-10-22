@@ -9,6 +9,10 @@
 //! recorded request: the rows differ along whatever the rule generalises over
 //! (enum value, optional member present or absent, list size, page size, signing
 //! region, resource kind).
+//!
+//! The wire harness below (`b2bi_router`, `call`, `error_code`, `text`,
+//! `is_generated_id`) is `pub(crate)` so the other suites in this test target reuse it
+//! rather than growing a second copy.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -25,7 +29,7 @@ pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// How many hex digits follow the prefix of a generated b2bi resource id, per the
 /// `p-<17 hex>` ids in this service's own Smithy model examples.
-const ID_HEX_DIGITS: usize = 17;
+pub(crate) const ID_HEX_DIGITS: usize = 17;
 
 /// A router with one b2bi service on one shared engine — what `build_router` assembles,
 /// narrowed to the service under test.
@@ -87,7 +91,7 @@ pub(crate) fn text(body: &Value, member: &str) -> String {
 
 /// Is `id` a `<prefix>-<17 hex>` id that also satisfies the modelled
 /// `len 1..64` / `^[a-zA-Z0-9_-]+$` constraint every b2bi resource id carries?
-fn is_generated_id(id: &str, prefix: &str) -> bool {
+pub(crate) fn is_generated_id(id: &str, prefix: &str) -> bool {
     let modelled = !id.is_empty()
         && id.len() <= 64
         && id
@@ -1194,8 +1198,8 @@ async fn operations_outside_this_slice_still_answer_501() {
     let cases: &[(&str, &str, Value)] = &[
         ("list transformers", "ListTransformers", json!({})),
         (
-            "get transformer",
-            "GetTransformer",
+            "delete transformer",
+            "DeleteTransformer",
             json!({ "transformerId": "t-0123456789abcdef0" }),
         ),
     ];

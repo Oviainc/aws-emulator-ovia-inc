@@ -5,7 +5,10 @@
 //! Reports the stored vault, through the ONE vault projection
 //! ([`crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::vault_view`])
 //! `ListBackupVaults` reports from too. `NumberOfRecoveryPoints` is derived from
-//! the per-vault recovery-point index, never stored twice.
+//! the per-vault recovery-point index, never stored twice. The vault is resolved
+//! through [`crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::visible_vault`],
+//! so a vault outside the caller's visibility is refused with 403
+//! `AccessDeniedException` before any existence lookup.
 //!
 //! ## Shape of an operation
 //!
@@ -233,26 +236,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        // A vault is scoped to one account, and this emulator holds exactly one
-        // (`engine::emulator_account_id`), so a request naming another account's
-        // vault finds nothing.
-        let wrong_account = input
-            .backup_vault_account_id
-            .as_deref()
-            .is_some_and(|account| account != ::engine::emulator_account_id());
-        let vault = store.vaults.get(&input.backup_vault_name).filter(|_| !wrong_account);
-        let Some(vault) = vault else {
-            return Err(DescribeBackupVaultErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Backup vault {} not found",
-                        input.backup_vault_name
-                    )),
-                    ..Default::default()
-                },
-            )
-            .into());
-        };
+        // A vault-scoped read decides access before existence: a vault outside the
+        // caller's visibility (absent from this account, or addressed with another
+        // account's `BackupVaultAccountId`) is refused with 403
+        // `AccessDeniedException` rather than reported as missing, so the answer
+        // discloses nothing about whether the vault exists. The decision lives in
+        // `state::visible_vault`, shared with every other vault-scoped read.
+        let vault = store.visible_vault(
+            &input.backup_vault_name,
+            input.backup_vault_account_id.as_deref(),
+        )?;
 
         // ONE projection, shared with `ListBackupVaults`, so the two views of a
         // vault can never disagree.

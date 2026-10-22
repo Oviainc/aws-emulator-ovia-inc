@@ -2,15 +2,14 @@
 
 //! Engine state for the com-amazonaws-wafregional-awswaf-regional-20161128 service.
 //!
-//! AWS WAF Classic's `IPSet`, `Rule` and `SqlInjectionMatchSet` records and the change
-//! tokens every mutating call consumes live here, so `GetChangeToken`,
-//! `GetChangeTokenStatus`, `CreateIPSet`, `UpdateIPSet`, `GetIPSet`, `ListIPSets`,
-//! `DeleteIPSet`, `CreateRule`, `GetRule`, `CreateSqlInjectionMatchSet` and
-//! `GetSqlInjectionMatchSet` all read and write ONE copy of each resource. The helpers
-//! below (id minting, the change-token protocol, CIDR parsing, metric-name validation,
-//! the `IPSet`/`IPSetSummary`, `Rule` and `SqlInjectionMatchSet` projections) are
-//! shared by those handlers rather than
-//! duplicated per operation.
+//! AWS WAF Classic's `IPSet`, `Rule`, `SqlInjectionMatchSet` and `XssMatchSet` records
+//! and the change tokens every mutating call consumes live here, so `GetChangeToken`,
+//! `GetChangeTokenStatus` and the `Create*`, `Update*`, `Get*`, `List*` and `Delete*`
+//! handlers of every resource kind all read and write ONE copy of each resource. The
+//! helpers below (id minting, the change-token protocol, CIDR parsing, metric-name
+//! validation, filter identity, the `IPSet`/`IPSetSummary`, `Rule`,
+//! `SqlInjectionMatchSet` and `XssMatchSet`/`XssMatchSetSummary` projections) are shared
+//! by those handlers rather than duplicated per operation.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
@@ -18,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use crate::ops::types::{
     IPSet, IPSetDescriptor, IPSetSummary, Predicate, Rule, SqlInjectionMatchSet,
-    SqlInjectionMatchTuple,
+    SqlInjectionMatchTuple, XssMatchSet, XssMatchSetSummary, XssMatchTuple,
 };
 
 /// `ChangeTokenStatus` wire values, from the model's `CHANGE_TOKEN_STATUS_VALUES`
@@ -174,6 +173,56 @@ pub const MESSAGE_LIMITS_EXCEEDED: &str = "The operation exceeds a resource limi
 pub const MESSAGE_INTERNAL_ERROR: &str =
     "The operation failed because of a system problem, even though the request was \
      valid. Retry your request.";
+/// The fixed sentence for `WAFNonexistentContainerException`, the refusal of an update
+/// whose container resource does not exist — see [`MESSAGE_DISALLOWED_NAME`].
+pub const MESSAGE_NONEXISTENT_CONTAINER: &str = "The referenced item does not exist.";
+/// The fixed sentence for `WAFNonEmptyEntityException`, the refusal of a delete of a
+/// resource that still holds filters or addresses — see [`MESSAGE_DISALLOWED_NAME`].
+pub const MESSAGE_NON_EMPTY_ENTITY: &str = "The referenced entity is not empty.";
+/// The fixed sentence for `WAFInvalidOperationException`, the refusal of an update that
+/// would leave the resource as it was — see [`MESSAGE_DISALLOWED_NAME`].
+pub const MESSAGE_INVALID_OPERATION: &str = "The operation is not valid.";
+
+/// The `MatchFieldType` whose `FieldToMatch.Data` names a request header.
+pub const MATCH_FIELD_TYPE_HEADER: &str = "HEADER";
+/// The `MatchFieldType` whose `FieldToMatch.Data` names a query-string parameter.
+pub const MATCH_FIELD_TYPE_SINGLE_QUERY_ARG: &str = "SINGLE_QUERY_ARG";
+
+/// Whether `FieldToMatch.Data` carries a name for match-field type `field_type`.
+///
+/// Source: `FieldToMatch`'s own `Data` documentation — "When the value of `Type` is
+/// `HEADER`, enter the name of the header that you want AWS WAF to search
+/// \[…\] When the value of `Type` is `SINGLE_QUERY_ARG`, enter the name of the parameter
+/// that you want AWS WAF to search \[…\] If the value of `Type` is any other value, omit
+/// `Data`."
+pub fn match_field_takes_data(field_type: &str) -> bool {
+    field_type == MATCH_FIELD_TYPE_HEADER || field_type == MATCH_FIELD_TYPE_SINGLE_QUERY_ARG
+}
+
+/// The most `XssMatchSet`s this emulator stores for the account before
+/// `CreateXssMatchSet` answers its modelled `WAFLimitsExceededException`.
+///
+/// The model states no quota, so this bound is the one AWS WAF Classic publishes for an
+/// account (100 cross-site scripting match conditions); with
+/// [`MAX_XSS_MATCH_TUPLES`] bounding each one's contents it keeps the XssMatchSet state a
+/// caller can grow bounded.
+pub const MAX_XSS_MATCH_SETS: usize = 100;
+
+/// The most `XssMatchTuple`s one `XssMatchSet` may hold.
+///
+/// The model states no quota, so this bound is the one AWS WAF Classic publishes per
+/// cross-site scripting match condition (10 filters).
+pub const MAX_XSS_MATCH_TUPLES: usize = 10;
+
+/// The most `XssMatchSetUpdate`s one `UpdateXssMatchSet` request may carry.
+///
+/// The model states no per-request quota for this operation, so this bound is CHOSEN,
+/// not cited: a request can at most empty a set ([`MAX_XSS_MATCH_TUPLES`] deletes) and
+/// then fill it again ([`MAX_XSS_MATCH_TUPLES`] inserts), since a delete must name a
+/// filter the set holds and an insert one it does not, so no larger request can leave the
+/// set in a state a request of this size cannot. It caps the work one caller can ask for
+/// before the handler takes the shared store's lock.
+pub const MAX_XSS_MATCH_SET_UPDATES_PER_REQUEST: usize = 2 * MAX_XSS_MATCH_TUPLES;
 
 /// A descriptor's identity: the parsed IP address and the prefix length.
 ///
@@ -293,6 +342,103 @@ impl IPSetEntry {
             return false;
         }
         self.descriptors.retain(|stored| &stored.cidr != cidr);
+        true
+    }
+}
+
+/// One `XssMatchTuple`'s identity: the part of the request it inspects and the text
+/// transformation applied before inspecting it.
+///
+/// `FieldToMatch`'s `Data` documentation states that the header name and the
+/// query-parameter name are "not case sensitive", so two spellings of one name are one
+/// filter; and that `Data` is omitted for every other `Type`, so a type that takes no
+/// `Data` has none in its identity.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct XssMatchTupleKey {
+    pub field_type: String,
+    pub data: Option<String>,
+    pub text_transformation: String,
+}
+
+/// The identity of `tuple` — see [`XssMatchTupleKey`].
+pub fn xss_match_tuple_key(tuple: &XssMatchTuple) -> XssMatchTupleKey {
+    let field_type = tuple.field_to_match.r#type.clone();
+    let data = tuple
+        .field_to_match
+        .data
+        .as_deref()
+        .filter(|_| match_field_takes_data(&field_type))
+        .map(str::to_lowercase);
+    XssMatchTupleKey {
+        field_type,
+        data,
+        text_transformation: tuple.text_transformation.clone(),
+    }
+}
+
+/// One stored `XssMatchSet`.
+#[derive(Debug, Clone)]
+pub struct XssMatchSetEntry {
+    pub xss_match_set_id: String,
+    pub name: String,
+    /// The filters in insertion order, deduplicated by [`XssMatchTupleKey`]. The
+    /// modelled shape is stored as it was accepted, so a read reports the stored record
+    /// rather than a re-rendering of it.
+    pub tuples: Vec<XssMatchTuple>,
+    /// Membership index over the [`XssMatchTupleKey`]s of `tuples`, kept in step with it
+    /// by [`XssMatchSetEntry::insert_tuple`] and [`XssMatchSetEntry::remove_tuple`], so
+    /// deduplicating one update costs a lookup rather than a scan of the whole set.
+    keys: BTreeSet<XssMatchTupleKey>,
+}
+
+impl XssMatchSetEntry {
+    /// A new, empty XssMatchSet record.
+    pub fn new(xss_match_set_id: String, name: String) -> Self {
+        Self {
+            xss_match_set_id,
+            name,
+            tuples: Vec::new(),
+            keys: BTreeSet::new(),
+        }
+    }
+
+    /// This record projected onto the modelled `XssMatchSet` shape the Get and Create
+    /// responses carry: the stored record's own fields, never request input.
+    pub fn to_modelled(&self) -> XssMatchSet {
+        XssMatchSet {
+            xss_match_set_id: self.xss_match_set_id.clone(),
+            name: Some(self.name.clone()),
+            xss_match_tuples: self.tuples.clone(),
+        }
+    }
+
+    /// This record projected onto the `XssMatchSetSummary` shape `ListXssMatchSets`
+    /// returns.
+    pub fn summary(&self) -> XssMatchSetSummary {
+        XssMatchSetSummary {
+            xss_match_set_id: self.xss_match_set_id.clone(),
+            name: self.name.clone(),
+        }
+    }
+
+    /// Add a filter, unless one with the same identity is already stored. Answers
+    /// whether the set changed.
+    pub fn insert_tuple(&mut self, tuple: &XssMatchTuple) -> bool {
+        if !self.keys.insert(xss_match_tuple_key(tuple)) {
+            return false;
+        }
+        self.tuples.push(tuple.clone());
+        true
+    }
+
+    /// Remove the filter whose identity equals `tuple`'s, if the set holds one. Answers
+    /// whether the set changed.
+    pub fn remove_tuple(&mut self, tuple: &XssMatchTuple) -> bool {
+        let key = xss_match_tuple_key(tuple);
+        if !self.keys.remove(&key) {
+            return false;
+        }
+        self.tuples.retain(|stored| xss_match_tuple_key(stored) != key);
         true
     }
 }
@@ -423,6 +569,10 @@ pub struct ComAmazonawsWafregionalAwswafRegional20161128State {
     /// `BTreeMap` for the same reason as `ip_sets`: one stable walk order for the
     /// paginated list.
     pub sql_injection_match_sets: BTreeMap<String, SqlInjectionMatchSetEntry>,
+    /// Every stored `XssMatchSet`, keyed by its `XssMatchSetId`. A `BTreeMap` so
+    /// `ListXssMatchSets` walks them in one stable order and a `NextMarker` taken on one
+    /// page resumes at the right place on the next.
+    pub xss_match_sets: BTreeMap<String, XssMatchSetEntry>,
     /// Every change token this service minted and has not yet dropped, keyed by the
     /// token value, so `GetChangeTokenStatus` can report one and a mutating call can
     /// tell a fresh token from a used one.

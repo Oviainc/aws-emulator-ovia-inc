@@ -305,6 +305,12 @@ pub struct Repo {
     pub image_scanning_config: Option<ImageScanningConfiguration>,
     pub encryption_config: EncryptionConfiguration,
     pub tags: Vec<Tag>,
+    /// The repository policy, as the last `SetRepositoryPolicy` stored it: `None`
+    /// until a policy is set and again once `DeleteRepositoryPolicy` removes it, which
+    /// is what `GetRepositoryPolicy` reports `RepositoryPolicyNotFoundException` for.
+    /// It lives on the repository record, so deleting the repository drops its policy
+    /// with it.
+    pub policy_text: Option<String>,
     pub images: BTreeMap<String, ImageRecord>,
     pub tag_index: BTreeMap<String, String>,
 }
@@ -667,6 +673,17 @@ pub fn repository_not_found_message(name: &str) -> String {
     )
 }
 
+/// The wording ECR uses when a repository carries no policy: the error's own
+/// documentation is "the specified repository and registry combination does not have an
+/// associated repository policy".
+pub fn repository_policy_not_found_message(name: &str) -> String {
+    format!(
+        "Repository policy does not exist for the repository with name '{name}' in the \
+         registry with id '{}'",
+        registry_id()
+    )
+}
+
 /// The wording ECR uses when the registry carries no signing configuration — the state
 /// `SigningConfigurationNotFoundException` documents: "attempting to retrieve or delete a
 /// signing configuration that does not exist".
@@ -748,16 +765,17 @@ fn bad_policy(member: &str, detail: impl std::fmt::Display) -> Fault {
 /// (`Action` or `NotAction`) and — because this is a RESOURCE-based policy, which
 /// states who the permission is granted to — a `Principal`.
 ///
-/// `check_principal` is called with each statement's `Principal` element, so a service
-/// that adds its own rule about who a policy may name (see
-/// [`validate_registry_policy`]) does not have to parse the document a second time;
-/// a service with no such rule passes `|_| Ok(())`.
+/// `check_statement` is called with each statement object once it satisfies that
+/// grammar, so a service that adds its own rule about what a policy may say (see
+/// [`validate_registry_policy`], and the repository-policy lock-out rule in
+/// `ops::set_repository_policy`) does not have to parse the document a second time; a
+/// service with no such rule passes `|_| Ok(())`.
 ///
 /// Parsing is `serde_json`'s; only the policy grammar on top of it is ours.
 pub fn validate_resource_policy(
     member: &str,
     text: &str,
-    mut check_principal: impl FnMut(&serde_json::Value) -> Result<(), Fault>,
+    mut check_statement: impl FnMut(&serde_json::Map<String, serde_json::Value>) -> Result<(), Fault>,
 ) -> Result<(), Fault> {
     let document: serde_json::Value = serde_json::from_str(text)
         .map_err(|error| bad_policy(member, format!("the policy is not valid JSON: {error}")))?;
@@ -822,13 +840,13 @@ pub fn validate_resource_policy(
                 "every policy statement must carry at least one Action or NotAction",
             ));
         }
-        let principal = entry.get("Principal").filter(|p| names_values(p)).ok_or_else(|| {
+        entry.get("Principal").filter(|p| names_values(p)).ok_or_else(|| {
             bad_policy(
                 member,
                 "every statement of a resource-based policy must carry a Principal",
             )
         })?;
-        check_principal(principal)?;
+        check_statement(entry)?;
     }
     Ok(())
 }
@@ -847,13 +865,14 @@ fn names_values(element: &serde_json::Value) -> bool {
     }
 }
 
-/// Every principal a statement's `Principal` element names, flattened out of the string,
-/// the array or the `{"AWS": …}`-style object it may be written as.
-fn principals(element: &serde_json::Value) -> Vec<&str> {
+/// Every value a policy element names, flattened out of the string, the array or the
+/// `{"AWS": …}`-style object it may be written as. `Principal`, `Action` and `NotAction`
+/// are all written in those three forms, so one flattener reads them all.
+pub fn policy_values(element: &serde_json::Value) -> Vec<&str> {
     match element {
         serde_json::Value::String(value) => vec![value.as_str()],
-        serde_json::Value::Array(entries) => entries.iter().flat_map(principals).collect(),
-        serde_json::Value::Object(members) => members.values().flat_map(principals).collect(),
+        serde_json::Value::Array(entries) => entries.iter().flat_map(policy_values).collect(),
+        serde_json::Value::Object(members) => members.values().flat_map(policy_values).collect(),
         _ => Vec::new(),
     }
 }
@@ -863,8 +882,12 @@ fn principals(element: &serde_json::Value) -> Vec<&str> {
 /// other accounts, so every statement must name the identities it grants to and may not
 /// open the registry to every principal with the `*` wildcard.
 pub fn validate_registry_policy(member: &str, text: &str) -> Result<(), Fault> {
-    validate_resource_policy(member, text, |principal| {
-        if principals(principal).contains(&"*") {
+    validate_resource_policy(member, text, |statement| {
+        // The grammar above guarantees the statement carries a `Principal`.
+        let grants_to_everyone = statement
+            .get("Principal")
+            .is_some_and(|principal| policy_values(principal).contains(&"*"));
+        if grants_to_everyone {
             return Err(bad_policy(
                 member,
                 "a registry policy statement cannot grant to every principal ('*'); \
@@ -1066,11 +1089,18 @@ pub fn is_layer_digest(digest: &str) -> bool {
         && encoded.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// Match `tag` against an exclusion filter. `*` is the only metacharacter a filter can
-/// carry: the model constrains `ImageTagMutabilityExclusionFilterValue` to
-/// `^[0-9a-zA-Z._*-]{1,128}$`, so there is no other wildcard to honour — a general glob
-/// crate would match more than ECR does. (The guardduty service carries its own private
-/// matcher for its own filter alphabet; neither is reachable from the other today.)
+/// Match `tag` against a `*`-glob pattern, where `*` stands for any run of characters.
+///
+/// Two callers share it. An image-tag exclusion filter: the model constrains
+/// `ImageTagMutabilityExclusionFilterValue` to `^[0-9a-zA-Z._*-]{1,128}$`, so `*` is the
+/// only metacharacter there is to honour — a general glob crate would match more than
+/// ECR does. And an IAM policy's `Action`/`NotAction` pattern (see
+/// `ops::set_repository_policy`), where `*` means the same thing; IAM's single-character
+/// `?` is deliberately NOT honoured, which leaves that caller's lock-out check
+/// conservative — a pattern written with `?` reads as not covering the action, so the
+/// policy is accepted rather than refused. (The guardduty service carries its own
+/// private matcher for its own filter alphabet; neither is reachable from the other
+/// today.)
 pub fn wildcard_matches(filter: &str, tag: &str) -> bool {
     let segments: Vec<&str> = filter.split('*').collect();
     let (Some(first), Some(last)) = (segments.first(), segments.last()) else {

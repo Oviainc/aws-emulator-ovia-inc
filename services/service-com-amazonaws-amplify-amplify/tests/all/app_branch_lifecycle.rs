@@ -620,7 +620,8 @@ struct BranchCase {
 /// (`BETA | DEVELOPMENT | EXPERIMENTAL | PRODUCTION | PULL_REQUEST`, from
 /// `smithy_query(query="shape",shape="Stage")`) — the issue cited only
 /// `PRODUCTION` — and varies `ttl`, `displayName`, `framework`, `enableAutoBuild`
-/// and the environment-variable map between absent and present.
+/// (absent, explicitly true, explicitly false) and the environment-variable map
+/// between absent and present.
 fn branch_cases() -> Vec<BranchCase> {
     vec![
         BranchCase {
