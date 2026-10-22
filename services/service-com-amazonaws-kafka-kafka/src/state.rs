@@ -22,6 +22,11 @@
 //! The replicator registry sits beside them on the same principle: a [`Replicator`]
 //! holds the whole replication setup, and [`Replicator::to_replicator_summary`] is
 //! the one rendering `ListReplicators` reports it through.
+//!
+//! The service's Apache Kafka version catalog lives here too
+//! ([`KAFKA_VERSION_CATALOG`], with [`compatible_target_versions`] and
+//! [`kafka_version_order`]), for the same reason: it is the single list every
+//! version-aware operation answers from.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
@@ -141,6 +146,125 @@ pub const DEFAULT_STORAGE_MODE: &str = "LOCAL";
 /// The default for `ConnectivityInfo$NetworkType`, per the `NetworkType` model
 /// documentation ("By default, a cluster uses the IPv4 network type").
 pub const DEFAULT_NETWORK_TYPE: &str = "IPV4";
+
+/// A `KafkaVersionStatus` value: a version Amazon MSK still offers for new
+/// clusters and for upgrades.
+pub const KAFKA_VERSION_ACTIVE: &str = "ACTIVE";
+/// A `KafkaVersionStatus` value: a version Amazon MSK has deprecated. Existing
+/// clusters keep running it, but it is not an upgrade target.
+pub const KAFKA_VERSION_DEPRECATED: &str = "DEPRECATED";
+
+/// One Apache Kafka version Amazon MSK knows about, with the lifecycle status it
+/// publishes for that version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KafkaVersionEntry {
+    /// The version string as MSK names it, e.g. a three-component release, a
+    /// `.x` name (MSK patches the trailing component for you) or the
+    /// `2.8.2.tiered` variant.
+    pub version: &'static str,
+    /// [`KAFKA_VERSION_ACTIVE`] or [`KAFKA_VERSION_DEPRECATED`] — one of the
+    /// model's `KafkaVersionStatus` values
+    /// ([`crate::ops::types::KAFKA_VERSION_STATUS_VALUES`]).
+    pub status: &'static str,
+}
+
+/// Every Apache Kafka version this emulator's MSK knows, OLDEST FIRST, so the
+/// catalog order is the upgrade ladder itself.
+///
+/// Source: the Amazon MSK Developer Guide, "Supported Apache Kafka versions"
+/// (<https://docs.aws.amazon.com/msk/latest/developerguide/supported-kafka-versions.html>),
+/// which lists the versions MSK offers and the ones it has deprecated. MSK
+/// deprecated every version older than 2.8.1, which is the ACTIVE/DEPRECATED
+/// boundary below; a deprecated version is still a valid SOURCE version (a
+/// cluster already running it can be upgraded away from it) but never a target.
+///
+/// This is the one catalog: `GetCompatibleKafkaVersions` derives its matrix from
+/// it, so nothing has to keep a second copy of the version list in step.
+pub const KAFKA_VERSION_CATALOG: &[KafkaVersionEntry] = &[
+    KafkaVersionEntry { version: "1.1.1", status: KAFKA_VERSION_DEPRECATED },
+    KafkaVersionEntry { version: "2.1.0", status: KAFKA_VERSION_DEPRECATED },
+    KafkaVersionEntry { version: "2.2.1", status: KAFKA_VERSION_DEPRECATED },
+    KafkaVersionEntry { version: "2.3.1", status: KAFKA_VERSION_DEPRECATED },
+    KafkaVersionEntry { version: "2.4.1", status: KAFKA_VERSION_DEPRECATED },
+    KafkaVersionEntry { version: "2.4.1.1", status: KAFKA_VERSION_DEPRECATED },
+    KafkaVersionEntry { version: "2.5.1", status: KAFKA_VERSION_DEPRECATED },
+    KafkaVersionEntry { version: "2.6.0", status: KAFKA_VERSION_DEPRECATED },
+    KafkaVersionEntry { version: "2.6.1", status: KAFKA_VERSION_DEPRECATED },
+    KafkaVersionEntry { version: "2.6.2", status: KAFKA_VERSION_DEPRECATED },
+    KafkaVersionEntry { version: "2.6.3", status: KAFKA_VERSION_DEPRECATED },
+    KafkaVersionEntry { version: "2.7.0", status: KAFKA_VERSION_DEPRECATED },
+    KafkaVersionEntry { version: "2.7.1", status: KAFKA_VERSION_DEPRECATED },
+    KafkaVersionEntry { version: "2.7.2", status: KAFKA_VERSION_DEPRECATED },
+    KafkaVersionEntry { version: "2.8.0", status: KAFKA_VERSION_DEPRECATED },
+    KafkaVersionEntry { version: "2.8.1", status: KAFKA_VERSION_ACTIVE },
+    KafkaVersionEntry { version: "2.8.2.tiered", status: KAFKA_VERSION_ACTIVE },
+    KafkaVersionEntry { version: "3.1.1", status: KAFKA_VERSION_ACTIVE },
+    KafkaVersionEntry { version: "3.2.0", status: KAFKA_VERSION_ACTIVE },
+    KafkaVersionEntry { version: "3.3.1", status: KAFKA_VERSION_ACTIVE },
+    KafkaVersionEntry { version: "3.3.2", status: KAFKA_VERSION_ACTIVE },
+    KafkaVersionEntry { version: "3.4.0", status: KAFKA_VERSION_ACTIVE },
+    KafkaVersionEntry { version: "3.5.1", status: KAFKA_VERSION_ACTIVE },
+    KafkaVersionEntry { version: "3.6.0", status: KAFKA_VERSION_ACTIVE },
+    KafkaVersionEntry { version: "3.7.x", status: KAFKA_VERSION_ACTIVE },
+    KafkaVersionEntry { version: "3.8.x", status: KAFKA_VERSION_ACTIVE },
+    KafkaVersionEntry { version: "3.9.x", status: KAFKA_VERSION_ACTIVE },
+];
+
+/// The versions a cluster running `source` can be upgraded to: every catalogued
+/// version that is still [`KAFKA_VERSION_ACTIVE`] and strictly NEWER than
+/// `source`, oldest first.
+///
+/// Amazon MSK upgrades a cluster's Apache Kafka version in place and does not
+/// support downgrading, and a deprecated version cannot be upgraded to — so a
+/// version at or below the source, and every deprecated version, is excluded.
+/// `source` need not be catalogued: a cluster running a version this catalog
+/// does not list is still ordered against it by [`kafka_version_order`].
+pub fn compatible_target_versions(source: &str) -> Vec<String> {
+    KAFKA_VERSION_CATALOG
+        .iter()
+        .filter(|entry| {
+            entry.status == KAFKA_VERSION_ACTIVE
+                && kafka_version_order(entry.version, source) == std::cmp::Ordering::Greater
+        })
+        .map(|entry| entry.version.to_string())
+        .collect()
+}
+
+/// Order two Apache Kafka version strings the way the upgrade ladder runs:
+/// component by component numerically, so `2.8.1` precedes `2.8.2.tiered` and
+/// `3.6.0` precedes `3.7.x`.
+///
+/// A `.x` component is MSK's name for "the newest patch of this minor", so it
+/// orders ABOVE every numbered patch of the same minor. Any other
+/// non-numeric component (the `tiered` of `2.8.2.tiered`) is a qualifier, which
+/// orders after the bare numeric version it qualifies and otherwise
+/// lexicographically — enough to give the catalog one total order without
+/// inventing semantics for it.
+pub fn kafka_version_order(left: &str, right: &str) -> std::cmp::Ordering {
+    kafka_version_key(left).cmp(&kafka_version_key(right))
+}
+
+/// `(numeric components, qualifier)` for a version string — the sort key
+/// [`kafka_version_order`] compares. `Vec<u32>` compares lexicographically, so a
+/// version that is a prefix of another (`2.4.1` of `2.4.1.1`) orders below it.
+fn kafka_version_key(version: &str) -> (Vec<u32>, String) {
+    let mut numbers: Vec<u32> = Vec::new();
+    let mut qualifier = String::new();
+    for component in version.split('.') {
+        if !qualifier.is_empty() {
+            qualifier.push('.');
+            qualifier.push_str(component);
+        } else if let Ok(number) = component.parse::<u32>() {
+            numbers.push(number);
+        } else if component == "x" {
+            // "the latest patch of this minor": above every numbered patch.
+            numbers.push(u32::MAX);
+        } else {
+            qualifier.push_str(component);
+        }
+    }
+    (numbers, qualifier)
+}
 
 /// The message Amazon MSK answers a request naming a resource it does not hold.
 ///
