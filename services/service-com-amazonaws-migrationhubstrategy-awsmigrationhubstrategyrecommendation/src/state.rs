@@ -333,27 +333,53 @@ impl ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState 
     }
 }
 
+/// This service's message for a request refused because a value it carries does not
+/// satisfy a rule the model declares.
+///
+/// Strategy Recommendations states that refusal as ONE service-wide sentence — the
+/// `ValidationException` the model documents as "The request body isn't valid." — and
+/// names neither the member that failed nor the value it rejected. It is a constant of
+/// the service, not a rendering of the request, so it is stated once here and used for
+/// every operation and every constraint kind (see
+/// `EmulatedService::override_refusal`).
+pub const INVALID_REQUEST_BODY: &str = "Invalid request body";
+
+/// This service's message for a request whose parameters it cannot resolve: an id that
+/// names no resource of this account.
+///
+/// Like [`INVALID_REQUEST_BODY`] it is a constant of the service and carries nothing
+/// from the request — in particular not the id that failed to resolve, which a caller
+/// already holds.
+pub const INVALID_OR_MISSING_PARAMETERS: &str =
+    "Looks like you provided invalid or missing parameters.";
+
 /// The `ResourceNotFoundException` payload for an import file task id that names no
 /// task.
-pub fn import_task_not_found(id: &str) -> ResourceNotFoundException {
+///
+/// Takes no id: the message is this service's constant for an unresolvable parameter,
+/// so there is nothing from the request to put in it.
+pub fn import_task_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!("Import file task {id} not found")),
+        message: Some(INVALID_OR_MISSING_PARAMETERS.to_string()),
     }
 }
 
 /// The `ResourceNotFoundException` payload for an assessment id that names no
-/// assessment.
-pub fn assessment_not_found(id: &str) -> ResourceNotFoundException {
+/// assessment. The same constant, for the same reason.
+pub fn assessment_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!("Assessment {id} not found")),
+        message: Some(INVALID_OR_MISSING_PARAMETERS.to_string()),
     }
 }
 
 /// The `ValidationException` payload for an assessment id that names no assessment, on
 /// an operation whose model declares no `ResourceNotFoundException`.
-pub fn invalid_assessment_id(id: &str) -> ValidationException {
+///
+/// Same family, same constant: an id that resolves to nothing is an unresolvable
+/// parameter whichever error shape the operation declares for it.
+pub fn invalid_assessment_id() -> ValidationException {
     ValidationException {
-        message: Some(format!("assessmentId {id} does not name an assessment")),
+        message: Some(INVALID_OR_MISSING_PARAMETERS.to_string()),
     }
 }
 
