@@ -16,7 +16,11 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+# The emulator's own request-handling runtime; `time` is what holds a caller to the
+# policy checks' deadline while they run on the blocking pool (see
+# `ops::validate_policy`), and the generated crates use the rest for
+# `#[tokio::main]` / `#[tokio::test]`.
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
@@ -24,6 +28,11 @@ tracing = { workspace = true }
 # Encodes a listing's continuation key as the opaque `nextToken` the pagination
 # handlers hand out (and decodes it on resume).
 hex = { workspace = true }
+# Span-preserving JSON parser: `ValidatePolicy` reports every finding with the
+# `Location` (JSON path + byte/line/column span) of the element it is about, which
+# `serde_json` discards, so the policy document is parsed into an AST that keeps the
+# source range of every value and object property.
+jsonc-parser = "0.26"
 # Mints an `accessPreviewId`: the 128 unguessable bits a version-4 UUID carries are
 # taken from a digest over the process's entropy, a counter and the clock.
 sha2 = { workspace = true }

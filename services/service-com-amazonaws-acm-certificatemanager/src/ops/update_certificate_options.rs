@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCertificateOptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCertificateOptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCertificateOptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation does here
+//!
+//! It reconfigures a certificate the service already holds: each `Options` member the
+//! request names replaces the stored one, and a member it omits is left as it was.
+//! Changing `Options.ValidationMethod` also rebuilds every per-domain validation
+//! record for the new method, so `DescribeCertificate` reports the evidence that
+//! method asks for (a CNAME for `DNS`, the mailboxes for `EMAIL`, the fetched URL for
+//! `HTTP`) — the records are minted by the shared
+//! [`crate::state::domain_validation_record`], the one `RequestCertificate` uses, so
+//! both paths store the same record for the same certificate, domain and method.
+//!
+//! Two refusals are the operation's own:
+//!
+//! * a certificate ACM has not issued — one whose validation is still running, or
+//!   whose request failed — has no issued certificate to reconfigure, so it answers
+//!   `InvalidStateException`;
+//! * `Export` "cannot [be updated] after the the certificate is created"
+//!   (`CertificateOptions$Export` doc), so a request naming a different value than the
+//!   certificate carries is refused with `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +184,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCertificateOptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCertificateOptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCertificateOptions"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateCertificateOptionsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some("the acm certificate store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // The ARN must name an ACM certificate at all before there is anything to look
+        // up; the model's `@pattern` has already refused everything that is not an
+        // `acm` ARN, so what is left to check is the resource type.
+        let Some(certificate_id) = crate::state::certificate_id_from_arn(&input.certificate_arn)
+        else {
+            return Err(UpdateCertificateOptionsErrorModeled::InvalidArnException(
+                InvalidArnException {
+                    message: Some(crate::state::invalid_arn_message(&input.certificate_arn)),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // Every handler materialises what the clock already owes first, so this call
+        // decides on the status a reader would see at this instant rather than on a
+        // validation outcome that had fallen due with nobody to apply it.
+        store.materialize_due(::std::time::SystemTime::now());
+        let Some(certificate) = store.certificates.get_mut(&input.certificate_arn) else {
+            return Err(
+                UpdateCertificateOptionsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::certificate_not_found_message(
+                            &input.certificate_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The options this operation updates are those of an ISSUED certificate: a
+        // request ACM is still validating has not produced one yet, and a request that
+        // failed never will, so in either case processing has not reached a state in
+        // which the certificate can be reconfigured. ACM answers the one sentence it
+        // reports for that whole class ([`crate::state::NOT_ISSUED_MESSAGE`]).
+        if certificate.status != crate::state::STATUS_ISSUED {
+            return Err(UpdateCertificateOptionsErrorModeled::InvalidStateException(
+                InvalidStateException {
+                    message: Some(crate::state::NOT_ISSUED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // "You cannot update the value of Export after the the certificate is created"
+        // (`CertificateOptions$Export` doc). Naming the value the certificate already
+        // carries asks for no change and is accepted, so a client that reads the
+        // options and writes them back unchanged is not refused.
+        let current_export = crate::state::export_option(certificate);
+        if let Some(requested) = input.options.export.as_deref() {
+            if requested != current_export {
+                return Err(UpdateCertificateOptionsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "Options.Export cannot be updated after the certificate is created: \
+                             this certificate was created with Export {current_export}, and the \
+                             request asks for {requested}"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Each member the request names replaces the stored one; one it omits is not
+        // part of this update and keeps the value the certificate carries.
+        let stored = certificate.options.clone().unwrap_or_default();
+        let updated = CertificateOptions {
+            // Deprecated ("Certificate transparency logging opt-out is no longer
+            // available"), and carried exactly as `RequestCertificate` carries it:
+            // this emulator models no transparency log, so the member is stored and
+            // reported rather than acted on.
+            certificate_transparency_logging_preference: input
+                .options
+                .certificate_transparency_logging_preference
+                .clone()
+                .or(stored.certificate_transparency_logging_preference),
+            export: input.options.export.clone().or(stored.export),
+            validation_method: input
+                .options
+                .validation_method
+                .clone()
+                .or(stored.validation_method),
+        };
+
+        // A new validation method is how ACM will validate this certificate's domains
+        // from now on, so the evidence each domain needs is re-minted for it. The
+        // per-domain validation STATUS is left alone: the certificate stays issued and
+        // its domains stay as proven as they already were — the new method applies to
+        // the validation still to come.
+        if let Some(method) = input.options.validation_method.clone() {
+            if certificate.validation_method.as_deref() != Some(method.as_str()) {
+                for record in &mut certificate.domain_validations {
+                    // The validation domain the certificate was requested with, which
+                    // the record keeps whatever method is in force — so a migration
+                    // back to `EMAIL` mails the domain the request named.
+                    let rebuilt = crate::state::domain_validation_record(
+                        certificate_id,
+                        &record.domain_name,
+                        &method,
+                        record.requested_validation_domain.as_deref(),
+                    );
+                    *record = crate::state::DomainValidationRecord {
+                        validation_status: record.validation_status.clone(),
+                        ..rebuilt
+                    };
+                }
+                certificate.validation_method = Some(method);
+            }
+        }
+        // A request whose `Options` names nothing, over a certificate that carries
+        // none, asks for no change: the record keeps its absent options rather than
+        // gaining an empty structure.
+        if updated.certificate_transparency_logging_preference.is_some()
+            || updated.export.is_some()
+            || updated.validation_method.is_some()
+        {
+            certificate.options = Some(updated);
+        }
+
+        Ok(UpdateCertificateOptionsOutput)
     }
 }

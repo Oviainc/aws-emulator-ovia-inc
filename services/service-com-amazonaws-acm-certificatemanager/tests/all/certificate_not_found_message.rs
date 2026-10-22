@@ -25,7 +25,7 @@ use crate::certificate_lifecycle::{
 
 /// The implemented operations that resolve `CertificateArn` and model
 /// `ResourceNotFoundException`
-/// (`smithy_query(query="operation", operation="DescribeCertificate,DeleteCertificate,AddTagsToCertificate,ListTagsForCertificate,ResendValidationEmail,RevokeCertificate")`).
+/// (`smithy_query(query="operation", operation="DescribeCertificate,DeleteCertificate,AddTagsToCertificate,ListTagsForCertificate,ResendValidationEmail,RevokeCertificate,UpdateCertificateOptions")`).
 const CERTIFICATE_LOOKUPS: &[&str] = &[
     "AddTagsToCertificate",
     "DeleteCertificate",
@@ -33,6 +33,7 @@ const CERTIFICATE_LOOKUPS: &[&str] = &[
     "ListTagsForCertificate",
     "ResendValidationEmail",
     "RevokeCertificate",
+    "UpdateCertificateOptions",
 ];
 
 /// The `ResourceNotFoundException` sentence the rule requires for `arn`.
@@ -53,6 +54,11 @@ fn request_body(operation: &str, arn: &str) -> Value {
         // `Tags` is required and `TagList` has a minimum length of 1, so the request
         // has to carry one to reach the certificate lookup at all.
         body["Tags"] = json!([{ "Key": "env", "Value": "test" }]);
+    }
+    if operation == "UpdateCertificateOptions" {
+        // `Options` is required and declares no required member of its own, so an
+        // empty structure is the smallest body that reaches the certificate lookup.
+        body["Options"] = json!({});
     }
     if operation == "ResendValidationEmail" {
         // `Domain` and `ValidationDomain` are both required, and the pair has to

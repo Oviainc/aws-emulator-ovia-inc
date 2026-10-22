@@ -3,10 +3,12 @@
 //! Engine state for the com-amazonaws-mediaconnect-mediaconnect service.
 //!
 //! The store is keyed by the flow's own ARN, which is what every flow operation
-//! addresses a flow by (`@httpLabel FlowArn`). A second index by name backs the
-//! uniqueness rule MediaConnect enforces on flow names: the flow name is the last
-//! segment of the ARN the service mints, so two flows with one name would share one
-//! ARN.
+//! addresses a flow by (`@httpLabel FlowArn`) and which is the flow's identity: the ARN
+//! the service mints carries a per-flow generated id as well as the name
+//! ([`flow_resource_fragment`]), so two flows that share a name are still distinct
+//! resources with distinct ARNs. There is no index by name beside it, because no
+//! operation addresses a flow by name and the model puts no uniqueness rule on
+//! `Flow.Name`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
@@ -501,7 +503,10 @@ pub fn materialise_media_stream(request: &AddMediaStreamRequest, fmt: i32) -> St
 pub struct StoredFlow {
     pub flow_arn: String,
     pub name: String,
-    pub description: Option<String>,
+    /// The flow's service-derived description — see [`derived_flow_description`], which
+    /// is where it is computed. Always non-empty, because `ListedFlow.Description` is a
+    /// required member and `Flow.Description` is reported for every owned flow.
+    pub description: String,
     pub availability_zone: String,
     pub status: String,
     /// The status change the clock owes, if any. See [`TRANSITION_SPAN`].
@@ -591,7 +596,9 @@ impl StoredFlow {
         Flow {
             flow_arn: self.flow_arn.clone(),
             name: self.name.clone(),
-            description: self.description.clone(),
+            // `Flow.Description` is optional on the shape but the service always has one
+            // for a flow it owns, so it is reported rather than omitted.
+            description: Some(self.description.clone()),
             availability_zone: self.availability_zone.clone(),
             status: self.status.clone(),
             egress_ip: self.egress_ip.clone(),
@@ -628,7 +635,9 @@ impl StoredFlow {
         ListedFlow {
             flow_arn: self.flow_arn.clone(),
             name: self.name.clone(),
-            description: self.description.clone().unwrap_or_default(),
+            // `ListedFlow.Description` is REQUIRED, and it is the same value
+            // `Flow.Description` reports for the flow.
+            description: self.description.clone(),
             availability_zone: self.availability_zone.clone(),
             source_type: self.source_type().to_string(),
             status: self.status.clone(),
@@ -694,13 +703,15 @@ impl StoredGateway {
 #[derive(Debug, Default)]
 pub struct ComAmazonawsMediaconnectMediaconnectState {
     /// Every live flow, keyed by its ARN. Ordered, so ListFlows pages stably.
+    ///
+    /// There is no index by name beside it: the model puts no uniqueness rule on a flow
+    /// name, and the flow id in the ARN is what keeps two same-named flows apart — the
+    /// same reasoning as for [`Self::gateways`].
     pub flows: BTreeMap<String, StoredFlow>,
-    /// Flow name -> flow ARN, the index behind the name-uniqueness rule.
-    pub flow_arns_by_name: BTreeMap<String, String>,
     /// Every live gateway, keyed by its ARN. Ordered, so ListGateways pages stably.
     ///
-    /// There is no index by name beside it: unlike a flow name, a gateway name is under
-    /// no uniqueness rule in the model, and the gateway id in the ARN is what keeps two
+    /// There is no index by name beside it: like a flow name, a gateway name is under no
+    /// uniqueness rule in the model, and the gateway id in the ARN is what keeps two
     /// same-named gateways apart.
     pub gateways: BTreeMap<String, StoredGateway>,
     /// Monotonic counter minting the unique fragment of every flow / source / output /
@@ -752,6 +763,33 @@ impl ComAmazonawsMediaconnectMediaconnectState {
 /// and is unique per flow.
 pub fn flow_resource_fragment(suffix: u64, name: &str) -> String {
     format!("flow:1-{suffix:08x}:{name}")
+}
+
+/// The description the service DERIVES for a flow as it is created.
+///
+/// `CreateFlow` models no `Description` member, yet `Flow.Description` is reported for
+/// every flow and `ListedFlow.Description` is a REQUIRED member, so the value is
+/// service-derived rather than client-supplied: it is the description given for the
+/// flow's own source when the request supplies a non-blank one — the source description
+/// "is not used or seen outside of the current MediaConnect account"
+/// (`smithy_query(query="doc",shape="SetSourceRequest",member="Description")`), exactly
+/// like the flow description — and otherwise the sentence naming the flow and that
+/// source.
+///
+/// Derived ONCE, when the flow is created, and then stored: it is part of the flow
+/// record, so every later read reports the same value.
+pub fn derived_flow_description(
+    flow_name: &str,
+    source_name: &str,
+    source_description: Option<&str>,
+) -> String {
+    match source_description
+        .map(str::trim)
+        .filter(|description| !description.is_empty())
+    {
+        Some(description) => description.to_string(),
+        None => format!("{flow_name} using source {source_name}"),
+    }
 }
 
 /// The resource fragment of a gateway ARN: `gateway:<gateway id>:<name>`.

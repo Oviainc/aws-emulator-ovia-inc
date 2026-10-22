@@ -23,3 +23,5 @@ mod resource_tags;
 mod state_roundtrip;
 #[path = "all/stream_lifecycle.rs"]
 mod stream_lifecycle;
+#[path = "all/vpc_endpoint_service_name.rs"]
+mod vpc_endpoint_service_name;

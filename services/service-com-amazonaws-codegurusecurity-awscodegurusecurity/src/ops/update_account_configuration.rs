@@ -2,10 +2,12 @@
 
 //! @op UpdateAccountConfiguration
 //!
-//! WRITES the account's encryption configuration into the store
-//! ([`crate::state::Store::encryption_kms_key_arn`]) — the single copy
+//! WRITES the encryption configuration of the account's EXISTING configuration record
+//! ([`crate::state::Store::account_configuration`]) — the single copy
 //! `GetAccountConfiguration` reports and `CreateUploadUrl` derives an upload's
-//! server-side-encryption headers from.
+//! server-side-encryption headers from. An account with no configuration record has
+//! nothing to update, so the call is refused with the modelled
+//! `ResourceNotFoundException` (HTTP 404) rather than creating one.
 //!
 //! ## Shape of an operation
 //!
@@ -179,7 +181,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reports is the one it committed rather than a value a concurrent update
         // replaced in between.
         let mut store = state.lock();
-        store.encryption_kms_key_arn = requested;
+
+        // This operation UPDATES the account's existing configuration; it does not bring
+        // one into existence. An account CodeGuru Security holds no configuration record
+        // for therefore has nothing to update, and the call is refused with the modelled
+        // `ResourceNotFoundException` (HTTP 404, "The resource specified in the request
+        // was not found") rather than reported as a configuration that was applied. The
+        // record appears when the account is onboarded to the service, which this
+        // emulator materialises on its first resource-creating call (see
+        // `crate::state::Store::onboard_account`).
+        let Some(config) = store.account_configuration.as_mut() else {
+            return Err(
+                UpdateAccountConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        error_code: "ResourceNotFoundException".to_string(),
+                        message: format!(
+                            "no existing account configuration found for account {account}: \
+                             CodeGuru Security holds no configuration for this account, so \
+                             there is none to update",
+                            account = ::engine::emulator_account_id(),
+                        ),
+                        resource_id: ::engine::emulator_account_id().to_string(),
+                        resource_type: "accountConfiguration".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        config.encryption_kms_key_arn = requested;
 
         // "An EncryptionConfig object that contains the KMS key ARN that is used for
         // encryption. If you did not specify a customer-managed KMS key in the request,
@@ -188,7 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // are the same value by construction.
         Ok(UpdateAccountConfigurationOutput {
             encryption_config: EncryptionConfig {
-                kms_key_arn: store.encryption_kms_key_arn.clone(),
+                kms_key_arn: store.encryption_kms_key_arn(),
             },
         })
     }

@@ -1,0 +1,796 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! `UpdateCertificateOptions` end to end over the wire (`POST /`,
+//! `X-Amz-Target: CertificateManager.<Op>`, awsJson1_1).
+//!
+//! RULE under test: `UpdateCertificateOptions` reconfigures a certificate the service
+//! already holds — every `Options` member the request names replaces the stored one
+//! and a member it omits keeps the value the certificate carries, and a new
+//! `Options.ValidationMethod` re-mints each covered domain's validation evidence for
+//! that method while leaving the certificate's own status and each domain's validation
+//! status alone. It applies only to a certificate ACM has ISSUED: while the request is
+//! still being validated, or once it has failed, there is no issued certificate to
+//! reconfigure and ACM answers `InvalidStateException`. `Export` is fixed at creation
+//! ("You cannot update the value of `Export` after the the certificate is created",
+//! `CertificateOptions$Export` doc), so asking for a different value is refused with
+//! `ValidationException` while asking for the one in force is accepted.
+//!
+//! The tables span what the rule generalises over: every `ValidationMethod` the model
+//! declares as a source and as a target of the change (including the no-op of the
+//! method already in force), one covered name as against several and a wildcard name,
+//! the statuses a stored certificate can be in, and the `Export` values with and
+//! without an `Options` structure at creation. Every row writes with
+//! `UpdateCertificateOptions` and reads back with `DescribeCertificate`, so nothing
+//! here can pass on a response that was not computed from the persisted record.
+
+use serde_json::{json, Value};
+
+use crate::certificate_lifecycle::{
+    call, describe, error_code, error_message, hold_pending_validations, request_certificate,
+    router_with_engine,
+};
+use crate::certificate_revocation::mark_exported;
+use crate::certificate_validation_state_machine::{make_validation_due_now, PRIVATE_CA_ARN};
+
+/// Every `ValidationMethod` the model declares
+/// (`smithy_query(query="shape", shape="com.amazonaws.acm#ValidationMethod")`).
+const VALIDATION_METHODS: &[&str] = &["DNS", "EMAIL", "HTTP"];
+
+/// The mailbox local parts ACM writes domain-validation mail to, as
+/// `ResendValidationEmailRequest$ValidationDomain`'s doc lists them
+/// (`admin@`, `administrator@`, `hostmaster@`, `postmaster@`, `webmaster@` at the
+/// validation domain). Compared as a set, so mailbox order is not asserted.
+const VALIDATION_MAILBOXES: &[&str] = &[
+    "admin",
+    "administrator",
+    "hostmaster",
+    "postmaster",
+    "webmaster",
+];
+
+/// The zone ACM publishes DNS-validation CNAME targets under, as the
+/// `ResourceRecord$Value` doc shows (`_3639ac533e.acm-validations.aws.`).
+const ACM_VALIDATIONS_ZONE: &str = "acm-validations.aws";
+
+/// The path a CA fetches an HTTP validation token from, as `HttpRedirect$RedirectFrom`
+/// shows (`http://example.com/.well-known/pki-validation/abc.txt`).
+const HTTP_VALIDATION_PATH: &str = "/.well-known/pki-validation/";
+
+/// The one sentence ACM reports with `InvalidStateException` when an operation needs
+/// an issued, valid certificate and the request names one that is neither — taken from
+/// ACM's recorded behaviour, which names neither the certificate nor its status, so
+/// the refusal reads the same whatever status drew it.
+const NOT_ISSUED_MESSAGE: &str = "The selected certificate is not Issued and/or Valid.";
+
+/// One certificate to migrate: what it is, the `RequestCertificate` body (always a
+/// private certificate authority, the request ACM needs no out-of-band proof for and
+/// so the one that reaches `ISSUED`), and the `ValidationMethod` its domains start on.
+type CertificateCase<'a> = (&'a str, Value, &'a str);
+
+/// The certificates the migration table runs over.
+fn migration_certificates() -> Vec<CertificateCase<'static>> {
+    vec![
+        (
+            "one name, DNS validation",
+            json!({
+                "DomainName": "one.example.com",
+                "ValidationMethod": "DNS",
+                "CertificateAuthorityArn": PRIVATE_CA_ARN,
+            }),
+            "DNS",
+        ),
+        (
+            "two names, EMAIL validation",
+            json!({
+                "DomainName": "mail.example.org",
+                "SubjectAlternativeNames": ["alt.mail.example.org"],
+                "ValidationMethod": "EMAIL",
+                "CertificateAuthorityArn": PRIVATE_CA_ARN,
+            }),
+            "EMAIL",
+        ),
+        (
+            "wildcard and plain name, HTTP validation",
+            json!({
+                "DomainName": "*.wild.example.net",
+                "SubjectAlternativeNames": ["wild.example.net", "deep.wild.example.net"],
+                "ValidationMethod": "HTTP",
+                "CertificateAuthorityArn": PRIVATE_CA_ARN,
+            }),
+            "HTTP",
+        ),
+        (
+            "no validation method named, so the EMAIL default",
+            json!({
+                "DomainName": "defaulted.example.io",
+                "CertificateAuthorityArn": PRIVATE_CA_ARN,
+            }),
+            "EMAIL",
+        ),
+        (
+            "the method named through Options rather than the top-level member",
+            json!({
+                "DomainName": "options.example.com",
+                "Options": { "ValidationMethod": "DNS" },
+                "CertificateAuthorityArn": PRIVATE_CA_ARN,
+            }),
+            "DNS",
+        ),
+    ]
+}
+
+/// The domain a validation proves control of: ACM validates `*.example.com` by
+/// proving control of `example.com`.
+fn validation_target(domain_name: &str) -> &str {
+    domain_name.strip_prefix("*.").unwrap_or(domain_name)
+}
+
+/// The `DomainValidationOptions` of a described certificate, in the order it reports
+/// them.
+fn validations(case: &str, detail: &Value) -> Vec<Value> {
+    detail["DomainValidationOptions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case}: no DomainValidationOptions in {detail}"))
+        .clone()
+}
+
+/// Call `UpdateCertificateOptions` and return `(status, body)`.
+async fn update_options(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    arn: &str,
+    options: &Value,
+) -> (u16, Value) {
+    call(
+        router,
+        "UpdateCertificateOptions",
+        &json!({ "CertificateArn": arn, "Options": options }),
+    )
+    .await
+}
+
+/// Assert the validation evidence of one domain is the evidence `method` asks for, and
+/// carries none of the evidence the other methods ask for.
+fn assert_evidence(case: &str, validation: &Value, method: &str) {
+    let domain = validation["DomainName"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case}: a validation carried no DomainName: {validation}"));
+    let proven = validation_target(domain);
+    assert_eq!(
+        validation["ValidationMethod"].as_str(),
+        Some(method),
+        "case {case}: expected ValidationMethod {method} on {domain}, got {validation}"
+    );
+
+    match method {
+        "DNS" => {
+            let record = &validation["ResourceRecord"];
+            assert_eq!(
+                record["Type"].as_str(),
+                Some("CNAME"),
+                "case {case}: DNS validation publishes a CNAME, got {validation}"
+            );
+            let name = record["Name"].as_str().unwrap_or_default();
+            assert!(
+                name.starts_with('_') && name.ends_with(&format!(".{proven}.")),
+                "case {case}: expected a validation label under {proven}, got {name:?}"
+            );
+            let value = record["Value"].as_str().unwrap_or_default();
+            assert!(
+                value.starts_with('_') && value.ends_with(&format!(".{ACM_VALIDATIONS_ZONE}.")),
+                "case {case}: expected a CNAME target in {ACM_VALIDATIONS_ZONE}, got {value:?}"
+            );
+            assert!(
+                validation["ValidationEmails"].is_null()
+                    && validation["ValidationDomain"].is_null(),
+                "case {case}: DNS validation sends no mail, got {validation}"
+            );
+            assert!(
+                validation["HttpRedirect"].is_null(),
+                "case {case}: DNS validation fetches no URL, got {validation}"
+            );
+        }
+        "EMAIL" => {
+            assert_eq!(
+                validation["ValidationDomain"].as_str(),
+                Some(proven),
+                "case {case}: expected the mailed domain {proven}, got {validation}"
+            );
+            let mut mailboxes: Vec<String> = validation["ValidationEmails"]
+                .as_array()
+                .unwrap_or_else(|| {
+                    panic!("case {case}: email validation reports its mailboxes, got {validation}")
+                })
+                .iter()
+                .map(|address| address.as_str().unwrap_or_default().to_string())
+                .collect();
+            mailboxes.sort();
+            let mut expected: Vec<String> = VALIDATION_MAILBOXES
+                .iter()
+                .map(|local_part| format!("{local_part}@{proven}"))
+                .collect();
+            expected.sort();
+            assert_eq!(
+                mailboxes, expected,
+                "case {case}: expected the validation mailboxes {expected:?}, got {mailboxes:?}"
+            );
+            assert!(
+                validation["ResourceRecord"].is_null() && validation["HttpRedirect"].is_null(),
+                "case {case}: email validation publishes no record and fetches no URL, \
+                 got {validation}"
+            );
+        }
+        "HTTP" => {
+            let redirect = &validation["HttpRedirect"];
+            let from = redirect["RedirectFrom"].as_str().unwrap_or_default();
+            assert!(
+                from.starts_with(&format!("http://{proven}{HTTP_VALIDATION_PATH}"))
+                    && from.ends_with(".txt"),
+                "case {case}: expected a token fetched from {proven}{HTTP_VALIDATION_PATH}, \
+                 got {from:?}"
+            );
+            let to = redirect["RedirectTo"].as_str().unwrap_or_default();
+            assert!(
+                to.contains(ACM_VALIDATIONS_ZONE) && to.ends_with(".txt"),
+                "case {case}: expected the redirect target in {ACM_VALIDATIONS_ZONE}, got {to:?}"
+            );
+            assert!(
+                validation["ResourceRecord"].is_null(),
+                "case {case}: HTTP validation publishes no DNS record, got {validation}"
+            );
+            assert!(
+                validation["ValidationEmails"].is_null()
+                    && validation["ValidationDomain"].is_null(),
+                "case {case}: HTTP validation sends no mail, got {validation}"
+            );
+        }
+        other => panic!("case {case}: the table named an unmodelled validation method {other}"),
+    }
+}
+
+/// Request one private-CA certificate, let the validation outcome the clock owes it
+/// fall due, and return its ARN once it reads `ISSUED`.
+async fn issued_certificate(case: &str, body: &Value) -> (smithy_server_runtime::MultiServiceRouter, String) {
+    let (router, engine) = router_with_engine();
+    let arn = request_certificate(&router, body).await;
+    make_validation_due_now(&engine);
+    let detail = describe(&router, &arn).await;
+    assert_eq!(
+        detail["Status"].as_str(),
+        Some("ISSUED"),
+        "case {case}: the fixture certificate must reach ISSUED, got {detail}"
+    );
+    (router, arn)
+}
+
+/// RULE: a new `Options.ValidationMethod` becomes the method the certificate's domains
+/// are validated by, and each covered domain's evidence is re-minted for it — for
+/// every modelled method, from every modelled method, on one covered name as on
+/// several and on a wildcard name. The certificate stays issued and its domains stay
+/// proven: the new method applies to the validation still to come.
+#[tokio::test]
+async fn an_options_update_rewrites_the_validation_method_of_every_domain() {
+    for (case, body, from) in migration_certificates() {
+        for target in VALIDATION_METHODS {
+            let case = format!("{case} -> {target}");
+            let (router, arn) = issued_certificate(&case, &body).await;
+
+            let before = describe(&router, &arn).await;
+            for validation in validations(&case, &before) {
+                assert_evidence(&format!("{case} (before)"), &validation, from);
+            }
+
+            let (status, response) =
+                update_options(&router, &arn, &json!({ "ValidationMethod": target })).await;
+            assert_eq!(
+                (status, &response),
+                (200, &json!({})),
+                "case {case}: UpdateCertificateOptions must succeed with an empty body, \
+                 got {status} {response}"
+            );
+
+            let after = describe(&router, &arn).await;
+            assert_eq!(
+                after["Options"]["ValidationMethod"].as_str(),
+                Some(*target),
+                "case {case}: expected the stored Options.ValidationMethod to be {target}, \
+                 got {after}"
+            );
+            assert_eq!(
+                after["Status"].as_str(),
+                Some("ISSUED"),
+                "case {case}: an options update does not move the certificate's status, \
+                 got {after}"
+            );
+            let names: Vec<String> = validations(&case, &after)
+                .iter()
+                .map(|validation| {
+                    validation["DomainName"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect();
+            assert!(
+                !names.is_empty(),
+                "case {case}: the certificate must still cover its domains, got {after}"
+            );
+            for validation in validations(&case, &after) {
+                assert_evidence(&case, &validation, target);
+                assert_eq!(
+                    validation["ValidationStatus"].as_str(),
+                    Some("SUCCESS"),
+                    "case {case}: an issued certificate's domains stay proven, got {validation}"
+                );
+            }
+
+            // Reading twice reports the same record: the update wrote once, and a read
+            // changes nothing.
+            let again = describe(&router, &arn).await;
+            assert_eq!(
+                again, after,
+                "case {case}: describing again must report the same record, got {again}"
+            );
+        }
+    }
+}
+
+/// RULE: the evidence is derived from the certificate and the method alone, so asking
+/// for the method already in force changes nothing and a method migrated away from and
+/// back is reported exactly as it was.
+#[tokio::test]
+async fn an_options_update_is_idempotent_and_reversible() {
+    for (case, body, from) in migration_certificates() {
+        let (router, arn) = issued_certificate(case, &body).await;
+        let original = describe(&router, &arn).await;
+
+        // The method already in force: accepted, and nothing moves.
+        let (status, response) = update_options(&router, &arn, &json!({ "ValidationMethod": from })).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: re-asking for {from} must succeed, got {status} {response}"
+        );
+        let unchanged = describe(&router, &arn).await;
+        assert_eq!(
+            unchanged["DomainValidationOptions"], original["DomainValidationOptions"],
+            "case {case}: re-asking for {from} must leave the validations as they were, \
+             got {unchanged}"
+        );
+
+        // Away to every other method and back: the record returns to what it was.
+        for target in VALIDATION_METHODS.iter().filter(|method| **method != from) {
+            let (status, response) =
+                update_options(&router, &arn, &json!({ "ValidationMethod": target })).await;
+            assert_eq!(
+                status, 200,
+                "case {case}: migrating to {target} must succeed, got {status} {response}"
+            );
+            let migrated = describe(&router, &arn).await;
+            assert_ne!(
+                migrated["DomainValidationOptions"], original["DomainValidationOptions"],
+                "case {case}: migrating to {target} must change the validations, got {migrated}"
+            );
+
+            let (status, response) =
+                update_options(&router, &arn, &json!({ "ValidationMethod": from })).await;
+            assert_eq!(
+                status, 200,
+                "case {case}: migrating back to {from} must succeed, got {status} {response}"
+            );
+            let back = describe(&router, &arn).await;
+            assert_eq!(
+                back["DomainValidationOptions"], original["DomainValidationOptions"],
+                "case {case}: {from} -> {target} -> {from} must restore the validations, \
+                 got {back}"
+            );
+        }
+    }
+}
+
+/// RULE: the validation domain a certificate was requested with for one of its names
+/// (`DomainValidationOption$ValidationDomain` — "the base validation domain that will
+/// act as the suffix of the email addresses") is configuration of the certificate, not
+/// of the method in force, so it survives a migration away from `EMAIL` and is mailed
+/// again on the way back.
+#[tokio::test]
+async fn a_requested_validation_domain_survives_a_migration() {
+    // The certificate's three names are validated through three different suffixes:
+    // the registrable domain, the parent and the name itself — so the row cannot pass
+    // on one shared default.
+    let (router, arn) = issued_certificate(
+        "three names with three validation domains",
+        &json!({
+            "DomainName": "a.deep.example.io",
+            "SubjectAlternativeNames": ["b.deep.example.io", "c.deep.example.io"],
+            "ValidationMethod": "EMAIL",
+            "DomainValidationOptions": [
+                { "DomainName": "a.deep.example.io", "ValidationDomain": "example.io" },
+                { "DomainName": "b.deep.example.io", "ValidationDomain": "deep.example.io" },
+                { "DomainName": "c.deep.example.io", "ValidationDomain": "c.deep.example.io" },
+            ],
+            "CertificateAuthorityArn": PRIVATE_CA_ARN,
+        }),
+    )
+    .await;
+
+    // What the certificate was requested with: name -> the suffix ACM mails.
+    let mailed: &[(&str, &str)] = &[
+        ("a.deep.example.io", "example.io"),
+        ("b.deep.example.io", "deep.example.io"),
+        ("c.deep.example.io", "c.deep.example.io"),
+    ];
+    let assert_mailed = |case: &str, detail: &Value| {
+        for (name, suffix) in mailed {
+            let validation = validations(case, detail)
+                .into_iter()
+                .find(|validation| validation["DomainName"].as_str() == Some(*name))
+                .unwrap_or_else(|| panic!("case {case}: no validation for {name} in {detail}"));
+            assert_eq!(
+                validation["ValidationDomain"].as_str(),
+                Some(*suffix),
+                "case {case}: expected {name} to be mailed at {suffix}, got {validation}"
+            );
+            let mut mailboxes: Vec<String> = validation["ValidationEmails"]
+                .as_array()
+                .unwrap_or_else(|| panic!("case {case}: no ValidationEmails in {validation}"))
+                .iter()
+                .map(|address| address.as_str().unwrap_or_default().to_string())
+                .collect();
+            mailboxes.sort();
+            let mut expected: Vec<String> = VALIDATION_MAILBOXES
+                .iter()
+                .map(|local_part| format!("{local_part}@{suffix}"))
+                .collect();
+            expected.sort();
+            assert_eq!(
+                mailboxes, expected,
+                "case {case}: expected {name} mailed at {expected:?}, got {mailboxes:?}"
+            );
+        }
+    };
+
+    let original = describe(&router, &arn).await;
+    assert_mailed("as requested", &original);
+
+    // Away from email validation: the mailing suffixes stop being reported, because
+    // ACM sends no mail for DNS or HTTP validation.
+    for target in ["DNS", "HTTP"] {
+        let (status, response) =
+            update_options(&router, &arn, &json!({ "ValidationMethod": target })).await;
+        assert_eq!(
+            status, 200,
+            "case {target}: migrating to {target} must succeed, got {status} {response}"
+        );
+        let migrated = describe(&router, &arn).await;
+        for validation in validations(target, &migrated) {
+            assert_evidence(target, &validation, target);
+        }
+    }
+
+    // And back: every name is mailed at the suffix it was requested with, and the
+    // whole set of validations is the one the certificate started with.
+    let (status, response) =
+        update_options(&router, &arn, &json!({ "ValidationMethod": "EMAIL" })).await;
+    assert_eq!(
+        status, 200,
+        "case back to EMAIL: the migration must succeed, got {status} {response}"
+    );
+    let back = describe(&router, &arn).await;
+    assert_mailed("back to EMAIL", &back);
+    assert_eq!(
+        back["DomainValidationOptions"], original["DomainValidationOptions"],
+        "case back to EMAIL: EMAIL -> DNS -> HTTP -> EMAIL must restore the validations, \
+         got {back}"
+    );
+}
+
+/// RULE: an `Options` member the request does not name is not part of the update and
+/// keeps the value the certificate carries.
+#[tokio::test]
+async fn an_options_update_leaves_unnamed_members_alone() {
+    let (router, arn) = issued_certificate(
+        "every option set at creation",
+        &json!({
+            "DomainName": "merge.example.com",
+            "ValidationMethod": "EMAIL",
+            "Options": {
+                "Export": "ENABLED",
+                "CertificateTransparencyLoggingPreference": "ENABLED",
+                "ValidationMethod": "EMAIL",
+            },
+            "CertificateAuthorityArn": PRIVATE_CA_ARN,
+        }),
+    )
+    .await;
+
+    // Rows: each names ONE member, so the other two must survive the call.
+    let cases: &[(&str, Value, &str, &str, &str)] = &[
+        (
+            "only the validation method",
+            json!({ "ValidationMethod": "DNS" }),
+            "DNS",
+            "ENABLED",
+            "ENABLED",
+        ),
+        (
+            "only the transparency logging preference",
+            json!({ "CertificateTransparencyLoggingPreference": "DISABLED" }),
+            "DNS",
+            "ENABLED",
+            "DISABLED",
+        ),
+        (
+            "only the export option, at the value in force",
+            json!({ "Export": "ENABLED" }),
+            "DNS",
+            "ENABLED",
+            "DISABLED",
+        ),
+        (
+            "the validation method again, beside the export in force",
+            json!({ "ValidationMethod": "HTTP", "Export": "ENABLED" }),
+            "HTTP",
+            "ENABLED",
+            "DISABLED",
+        ),
+    ];
+
+    for (case, options, method, export, transparency) in cases {
+        let (status, response) = update_options(&router, &arn, options).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: UpdateCertificateOptions must succeed, got {status} {response}"
+        );
+        let detail = describe(&router, &arn).await;
+        assert_eq!(
+            (
+                detail["Options"]["ValidationMethod"].as_str(),
+                detail["Options"]["Export"].as_str(),
+                detail["Options"]["CertificateTransparencyLoggingPreference"].as_str(),
+            ),
+            (Some(*method), Some(*export), Some(*transparency)),
+            "case {case}: expected Options {method}/{export}/{transparency}, got {detail}"
+        );
+    }
+}
+
+/// RULE: `Export` is fixed when the certificate is created ("You cannot update the
+/// value of `Export` after the the certificate is created",
+/// `CertificateOptions$Export` doc), so a request naming a different value is refused
+/// with `ValidationException` and the stored option is left as it was; naming the
+/// value in force asks for no change and is accepted.
+#[tokio::test]
+async fn export_cannot_be_updated_after_creation() {
+    // Rows: the `Options` the certificate was created with (including none at all,
+    // where the export option is the DISABLED default), the `Export` value in force,
+    // and the other modelled value, which must be refused.
+    let cases: &[(&str, Value, &str, &str)] = &[
+        (
+            "created with Export ENABLED",
+            json!({ "Export": "ENABLED" }),
+            "ENABLED",
+            "DISABLED",
+        ),
+        (
+            "created with Export DISABLED",
+            json!({ "Export": "DISABLED" }),
+            "DISABLED",
+            "ENABLED",
+        ),
+        (
+            "created with an Options structure naming no Export",
+            json!({ "CertificateTransparencyLoggingPreference": "ENABLED" }),
+            "DISABLED",
+            "ENABLED",
+        ),
+        ("created with no Options at all", Value::Null, "DISABLED", "ENABLED"),
+    ];
+
+    for (case, created_with, in_force, refused) in cases {
+        let mut body = json!({
+            "DomainName": "export.example.com",
+            "ValidationMethod": "DNS",
+            "CertificateAuthorityArn": PRIVATE_CA_ARN,
+        });
+        if !created_with.is_null() {
+            body["Options"] = created_with.clone();
+        }
+        let (router, arn) = issued_certificate(case, &body).await;
+        let before = describe(&router, &arn).await;
+
+        let (status, response) = update_options(&router, &arn, &json!({ "Export": refused })).await;
+        assert_eq!(
+            (status, error_code(&response).as_str()),
+            (400, "ValidationException"),
+            "case {case}: expected 400 ValidationException for Export {refused}, \
+             got {status} {response}"
+        );
+        let message = error_message(&response);
+        assert!(
+            message.contains("Export"),
+            "case {case}: the refusal must name the member it refuses, got {message:?}"
+        );
+
+        // The refusal wrote nothing: the export option in force is still reported, and
+        // the record is byte-for-byte the one the refused call found.
+        let detail = describe(&router, &arn).await;
+        assert_eq!(
+            detail["Options"]["Export"]
+                .as_str()
+                .unwrap_or(/* absent means the DISABLED default */ "DISABLED"),
+            *in_force,
+            "case {case}: a refused update must leave Export as it was, got {detail}"
+        );
+        assert_eq!(
+            detail, before,
+            "case {case}: a refused update must leave the whole record alone, got {detail}"
+        );
+
+        // The value in force asks for no change and is accepted.
+        let (status, response) =
+            update_options(&router, &arn, &json!({ "Export": in_force })).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: Export {in_force} asks for no change and must succeed, \
+             got {status} {response}"
+        );
+    }
+}
+
+/// RULE: only a certificate ACM has ISSUED can be reconfigured — a request still being
+/// validated has produced no certificate yet and a failed one never will, so either is
+/// refused with HTTP 400 `InvalidStateException` and nothing is written.
+#[tokio::test]
+async fn options_cannot_be_updated_unless_the_certificate_is_issued() {
+    // Rows: the request, whether its validation outcome is held off (leaving the
+    // certificate in the transient PENDING_VALIDATION status) or materialised (leaving
+    // a public request FAILED), the status the row asserts, and the options it asks
+    // for — the first row is the recorded case, a validation-method change while the
+    // certificate is pending.
+    let cases: &[(&str, Value, bool, &str, Value)] = &[
+        (
+            "a public certificate still being validated",
+            json!({ "DomainName": "pending.example.com", "ValidationMethod": "EMAIL" }),
+            true,
+            "PENDING_VALIDATION",
+            json!({ "ValidationMethod": "DNS" }),
+        ),
+        (
+            "a private certificate still being validated",
+            json!({
+                "DomainName": "pending.example.org",
+                "ValidationMethod": "DNS",
+                "CertificateAuthorityArn": PRIVATE_CA_ARN,
+            }),
+            true,
+            "PENDING_VALIDATION",
+            json!({ "ValidationMethod": "EMAIL" }),
+        ),
+        (
+            "a public certificate whose validation failed",
+            json!({ "DomainName": "failed.example.net", "ValidationMethod": "DNS" }),
+            false,
+            "FAILED",
+            json!({ "ValidationMethod": "HTTP" }),
+        ),
+        (
+            "a failed certificate, asked for the export option it already has",
+            json!({ "DomainName": "failed.example.io", "ValidationMethod": "EMAIL" }),
+            false,
+            "FAILED",
+            json!({ "Export": "DISABLED" }),
+        ),
+        (
+            "a failed certificate, asked for the transparency logging preference",
+            json!({ "DomainName": "failed.example.com", "ValidationMethod": "HTTP" }),
+            false,
+            "FAILED",
+            json!({ "CertificateTransparencyLoggingPreference": "ENABLED" }),
+        ),
+    ];
+
+    for (case, body, hold, expected_status, options) in cases {
+        let (router, engine) = router_with_engine();
+        let arn = request_certificate(&router, body).await;
+        if *hold {
+            hold_pending_validations(&engine);
+        } else {
+            make_validation_due_now(&engine);
+        }
+
+        let before = describe(&router, &arn).await;
+        assert_eq!(
+            before["Status"].as_str(),
+            Some(*expected_status),
+            "case {case}: the fixture must be {expected_status}, got {before}"
+        );
+
+        let (status, response) = update_options(&router, &arn, options).await;
+        assert_eq!(
+            (status, error_code(&response).as_str()),
+            (400, "InvalidStateException"),
+            "case {case}: expected 400 InvalidStateException for a {expected_status} \
+             certificate, got {status} {response}"
+        );
+        let message = error_message(&response);
+        assert_eq!(
+            message, NOT_ISSUED_MESSAGE,
+            "case {case}: expected the refusal sentence {NOT_ISSUED_MESSAGE:?}, got {message:?}"
+        );
+
+        // The refusal persisted nothing: the record reads exactly as it did before.
+        let after = describe(&router, &arn).await;
+        assert_eq!(
+            after, before,
+            "case {case}: a refused update must leave the record untouched, got {after}"
+        );
+    }
+}
+
+/// RULE: the ISSUED requirement holds for every status a stored certificate can reach,
+/// not only the ones a request lands in — a certificate whose revocation has been
+/// recorded is no longer issued, so the same update that succeeded while it was issued
+/// is refused once it is revoked.
+#[tokio::test]
+async fn options_cannot_be_updated_once_the_certificate_is_revoked() {
+    let (router, engine) = router_with_engine();
+    // A certificate that can be carried all the way to a revocation: a private-CA
+    // request (nothing to prove, so it reaches `ISSUED`) that opted in to export,
+    // which is what `RevokeCertificate` requires of it.
+    let arn = request_certificate(
+        &router,
+        &json!({
+            "DomainName": "revoked.example.com",
+            "ValidationMethod": "DNS",
+            "Options": { "Export": "ENABLED" },
+            "CertificateAuthorityArn": PRIVATE_CA_ARN,
+        }),
+    )
+    .await;
+    make_validation_due_now(&engine);
+
+    // While it is issued, the update is accepted.
+    let (status, response) =
+        update_options(&router, &arn, &json!({ "ValidationMethod": "EMAIL" })).await;
+    assert_eq!(
+        status, 200,
+        "case while issued: the update must succeed, got {status} {response}"
+    );
+
+    mark_exported(&engine, &arn);
+    let (status, response) = call(
+        &router,
+        "RevokeCertificate",
+        &json!({ "CertificateArn": &arn, "RevocationReason": "KEY_COMPROMISE" }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case revoke: RevokeCertificate must succeed, got {status} {response}"
+    );
+    let revoked = describe(&router, &arn).await;
+    assert_eq!(
+        revoked["Status"].as_str(),
+        Some("REVOKED"),
+        "case revoke: the fixture must be REVOKED, got {revoked}"
+    );
+
+    // Once revoked, the very same update is refused and nothing is written.
+    let (status, response) =
+        update_options(&router, &arn, &json!({ "ValidationMethod": "HTTP" })).await;
+    assert_eq!(
+        (status, error_code(&response).as_str()),
+        (400, "InvalidStateException"),
+        "case once revoked: expected 400 InvalidStateException, got {status} {response}"
+    );
+    let message = error_message(&response);
+    assert_eq!(
+        message, NOT_ISSUED_MESSAGE,
+        "case once revoked: expected the refusal sentence {NOT_ISSUED_MESSAGE:?}, \
+         got {message:?}"
+    );
+    let after = describe(&router, &arn).await;
+    assert_eq!(
+        after, revoked,
+        "case once revoked: a refused update must leave the record untouched, got {after}"
+    );
+}

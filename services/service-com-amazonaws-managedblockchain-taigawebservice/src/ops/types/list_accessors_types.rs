@@ -26,7 +26,14 @@ pub struct ListAccessorsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.managedblockchain#AccessorSummary")]
+// `AccessorSummary`'s schema is written out by hand for the same single reason as
+// `Accessor`'s — `@timestampFormat("date-time")` on `CreationDate`'s target shape
+// (`com.amazonaws.managedblockchain#Timestamp`), which the vendored codegen does not
+// emit, so a macro-built member schema reports no format and the restJson1 codec falls
+// back to its protocol default of epoch seconds: a NUMBER where the model requires an
+// ISO-8601 string. It mirrors the macro's output in every other respect. See the note
+// above `Accessor` in `get_accessor_types.rs`, and `MemberSummary` in
+// `list_members_types.rs`.
 #[derive(Debug, Clone, Default)]
 pub struct AccessorSummary {
     pub id: Option<String>,
@@ -35,5 +42,144 @@ pub struct AccessorSummary {
     pub creation_date: Option<::aws_smithy_types::DateTime>,
     pub arn: Option<String>,
     pub network_type: Option<String>,
+}
+
+#[allow(non_upper_case_globals)]
+impl AccessorSummary {
+    const SHAPE_ID: &'static str = "com.amazonaws.managedblockchain#AccessorSummary";
+    const NAMESPACE: &'static str = "com.amazonaws.managedblockchain";
+
+    pub const M_ID: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.managedblockchain#AccessorSummary$Id",
+            Self::NAMESPACE,
+            "Id",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "Id",
+        0,
+    );
+    pub const M_TYPE: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.managedblockchain#AccessorSummary$Type",
+            Self::NAMESPACE,
+            "Type",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "Type",
+        1,
+    );
+    pub const M_STATUS: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.managedblockchain#AccessorSummary$Status",
+            Self::NAMESPACE,
+            "Status",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "Status",
+        2,
+    );
+    /// `@timestampFormat("date-time")` from `Timestamp` — the chain the macro cannot
+    /// emit.
+    pub const M_CREATION_DATE: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.managedblockchain#AccessorSummary$CreationDate",
+                Self::NAMESPACE,
+                "CreationDate",
+            ),
+            ::aws_smithy_schema::ShapeType::Timestamp,
+            "CreationDate",
+            3,
+        )
+        .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    pub const M_ARN: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.managedblockchain#AccessorSummary$Arn",
+            Self::NAMESPACE,
+            "Arn",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "Arn",
+        4,
+    );
+    pub const M_NETWORK_TYPE: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.managedblockchain#AccessorSummary$NetworkType",
+                Self::NAMESPACE,
+                "NetworkType",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "NetworkType",
+            5,
+        );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            Self::SHAPE_ID,
+            Self::NAMESPACE,
+            "AccessorSummary",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ID,
+            &Self::M_TYPE,
+            &Self::M_STATUS,
+            &Self::M_CREATION_DATE,
+            &Self::M_ARN,
+            &Self::M_NETWORK_TYPE,
+        ],
+    );
+}
+
+pub static ACCESSOR_SUMMARY_SCHEMA: &::aws_smithy_schema::Schema = &AccessorSummary::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for AccessorSummary {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(v) = self.id.as_ref() {
+            s.write_string(&Self::M_ID, v.as_str())?;
+        }
+        if let Some(v) = self.r#type.as_ref() {
+            s.write_string(&Self::M_TYPE, v.as_str())?;
+        }
+        if let Some(v) = self.status.as_ref() {
+            s.write_string(&Self::M_STATUS, v.as_str())?;
+        }
+        if let Some(v) = self.creation_date.as_ref() {
+            s.write_timestamp(&Self::M_CREATION_DATE, v)?;
+        }
+        if let Some(v) = self.arn.as_ref() {
+            s.write_string(&Self::M_ARN, v.as_str())?;
+        }
+        if let Some(v) = self.network_type.as_ref() {
+            s.write_string(&Self::M_NETWORK_TYPE, v.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for AccessorSummary {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => out.id = Some(d.read_string(&Self::M_ID)?),
+                Some(1) => out.r#type = Some(d.read_string(&Self::M_TYPE)?),
+                Some(2) => out.status = Some(d.read_string(&Self::M_STATUS)?),
+                Some(3) => out.creation_date = Some(d.read_timestamp(&Self::M_CREATION_DATE)?),
+                Some(4) => out.arn = Some(d.read_string(&Self::M_ARN)?),
+                Some(5) => out.network_type = Some(d.read_string(&Self::M_NETWORK_TYPE)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
 }
 

@@ -198,7 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "Content-Type".to_string(),
             "application/zip".to_string(),
         )]);
-        if let Some(kms_key_arn) = store.encryption_kms_key_arn.clone() {
+        if let Some(kms_key_arn) = store.encryption_kms_key_arn() {
             request_headers.insert(
                 "x-amz-server-side-encryption".to_string(),
                 "aws:kms".to_string(),
@@ -237,6 +237,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
             store.record_artifact(artifact.clone());
+            // The account's first CodeGuru Security resource is what brings its
+            // configuration record into existence (see
+            // `crate::state::Store::onboard_account`), so from the first artifact this
+            // account holds on, UpdateAccountConfiguration has a configuration to update.
+            // Only a call that actually recorded a resource onboards the account: a
+            // refused one changes nothing.
+            store.onboard_account(now);
         }
 
         Ok(CreateUploadUrlOutput {

@@ -3,8 +3,10 @@
 //! @op GetAccountConfiguration
 //!
 //! REPORTS the account's encryption configuration from the store
-//! ([`crate::state::Store::encryption_kms_key_arn`]), which `UpdateAccountConfiguration`
-//! writes. The model marks this operation `@readonly`, so it only reads: nothing a later
+//! ([`crate::state::Store::account_configuration`]), which `UpdateAccountConfiguration`
+//! writes. An account with no configuration record reports the documented default (the
+//! AWS-managed key, i.e. an empty `encryptionConfig`), since this operation models no
+//! not-found error at all (`smithy_query(query="operation",operation="GetAccountConfiguration")`). The model marks this operation `@readonly`, so it only reads: nothing a later
 //! caller sees changes because the configuration was read.
 //!
 //! ## Shape of an operation
@@ -161,7 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // was configured, and an `EncryptionConfig` with no `kmsKeyArn` when none was.
         // Read under the same guard every other handler of this service uses, so the
         // value reported is the one the last UpdateAccountConfiguration committed.
-        let kms_key_arn = state.lock().encryption_kms_key_arn.clone();
+        let kms_key_arn = state.lock().encryption_kms_key_arn();
 
         Ok(GetAccountConfigurationOutput {
             encryption_config: EncryptionConfig { kms_key_arn },

@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/domain_repository_lifecycle.rs"]
 mod domain_repository_lifecycle;
+#[path = "all/external_connection.rs"]
+mod external_connection;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

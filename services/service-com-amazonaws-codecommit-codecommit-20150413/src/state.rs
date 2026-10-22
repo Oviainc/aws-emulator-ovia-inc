@@ -90,6 +90,10 @@ pub struct Repository {
     pub repository_id: String,
     pub account_id: String,
     pub name: String,
+    /// The region this repository lives in, as the request that created it was
+    /// scoped for. Held because the ARN and both clone URLs are built from the
+    /// region AND the name, so a rename has to rebuild them for the SAME region.
+    pub region: String,
     pub description: Option<String>,
     pub default_branch: Option<String>,
     pub arn: String,
@@ -153,6 +157,7 @@ impl Repository {
             repository_id: repository_id(name, created),
             account_id: ::engine::emulator_account_id().to_string(),
             name: name.to_string(),
+            region: region.to_string(),
             description,
             default_branch: None,
             arn: ::engine::emulator_arn("codecommit", region, name),
@@ -186,6 +191,23 @@ impl Repository {
             arn: Some(self.arn.clone()),
             kms_key_id: self.kms_key_id.clone(),
         }
+    }
+
+    /// Rename this repository, recomputing every field CodeCommit derives from the
+    /// repository name — the ARN and both clone URLs address a repository BY name —
+    /// and moving the last-modified instant to the rename.
+    ///
+    /// Everything that belongs to the resource rather than to its name (the
+    /// repository id, the creation date, the description, the KMS key, the tags, the
+    /// branches, the commits and the blobs) carries over untouched, so a renamed
+    /// repository is the same repository under a new name. The caller re-keys the
+    /// store, which is keyed by `repositoryName`.
+    pub fn rename(&mut self, new_name: &str, renamed: SystemTime) {
+        self.name = new_name.to_string();
+        self.arn = ::engine::emulator_arn("codecommit", &self.region, new_name);
+        self.clone_url_http = clone_url_http(&self.region, new_name);
+        self.clone_url_ssh = clone_url_ssh(&self.region, new_name);
+        self.last_modified_date = renamed;
     }
 
     /// The commit a `commitSpecifier` names: a branch name, or the id of a commit
@@ -264,6 +286,19 @@ fn repository_id(name: &str, created: SystemTime) -> String {
         &hex[16..20],
         &hex[20..32]
     )
+}
+
+/// Does this repository name carry the prohibited `.git` suffix?
+///
+/// CodeCommit documents it on every operation that takes a name for a repository
+/// it is about to hold (`CreateRepository`, `UpdateRepositoryName`): "The suffix
+/// .git is prohibited." Every other restriction on `RepositoryName` is the
+/// modelled length and pattern, which the boundary validator refuses before a
+/// handler runs, so this is the one name rule a handler is left to apply. Git
+/// repository names are compared case-insensitively on this suffix, so `.GIT` is
+/// prohibited too.
+pub fn has_prohibited_git_suffix(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(".git")
 }
 
 /// The HTTPS clone URL CodeCommit publishes for a repository in a region.

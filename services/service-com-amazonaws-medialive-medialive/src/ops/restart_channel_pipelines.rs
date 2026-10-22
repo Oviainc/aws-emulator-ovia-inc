@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RestartChannelPipelines
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RestartChannelPipelines`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RestartChannelPipelines::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: restart pipelines in one channel that is currently running. The
+//! pipelines the request names (all of the channel's, when it names none) go down,
+//! the channel reports `RECOVERING` while they come back up, and the clock settles
+//! it to `RUNNING` with every pipeline healthy again. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -193,18 +189,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RestartChannelPipelines` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RestartChannelPipelinesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RestartChannelPipelines"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        state.settle(now);
+
+        let channel = state.channels.get_mut(&input.channel_id).ok_or_else(|| {
+            RestartChannelPipelinesErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message("Channel", &input.channel_id)),
+            })
+        })?;
+
+        // "Restart pipelines in one channel that is currently running": a channel
+        // that is not running has no pipelines to restart, so every other state is
+        // a conflict rather than a no-op.
+        if channel.state != crate::state::channel_state::RUNNING {
+            return Err(RestartChannelPipelinesErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "Channel {} is in state {} and its pipelines can only be restarted from RUNNING",
+                        channel.id, channel.state
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `PipelineIds` is "an array of pipelines to restart in this channel", so a
+        // request that names none restarts all of the channel's pipelines.
+        let pipelines = match input.pipeline_ids.as_deref().unwrap_or_default() {
+            [] => (0..channel.pipeline_count()).collect(),
+            named => {
+                let mut pipelines: Vec<i32> = Vec::with_capacity(named.len());
+                for id in named {
+                    let pipeline = pipeline_index(id)
+                        .filter(|pipeline| channel.has_pipeline(*pipeline))
+                        .ok_or_else(|| bad_pipeline(channel, id))?;
+                    // Naming one pipeline twice restarts it once.
+                    if !pipelines.contains(&pipeline) {
+                        pipelines.push(pipeline);
+                    }
+                }
+                pipelines
+            }
+        };
+        crate::state::begin_pipeline_restart(channel, pipelines, now);
+
+        let channel = state
+            .channel_description(&input.channel_id)
+            .ok_or_else(unavailable)?;
+
+        Ok(crate::state::channel_description_output!(
+            RestartChannelPipelinesOutput,
+            channel,
+            // ABSENT, not invented: `MaintenanceStatus` is "the time in
+            // milliseconds by when the PVRE restart must occur", a deadline the
+            // real service's maintenance scheduler sets on a pipeline-VM
+            // recreation event. This emulator schedules no such event, so it
+            // reports no deadline for one.
+            maintenance_status: None,
+        ))
     }
+}
+
+/// The pipeline a `ChannelPipelineIdToRestart` value names, as
+/// `PipelineDetail$PipelineId` numbers it.
+///
+/// The enum's only values are `PIPELINE_0` and `PIPELINE_1`
+/// (`smithy_query(query="shape", shape="ChannelPipelineIdToRestart")`, and the
+/// `PipelineIds` member's own doc: "Format PIPELINE_0 or PIPELINE_1"), so they
+/// are matched exactly rather than by parsing the suffix: a spelling the enum
+/// does not declare names no pipeline. `None` for anything else, which the caller
+/// refuses.
+fn pipeline_index(id: &str) -> Option<i32> {
+    match id {
+        "PIPELINE_0" => Some(0),
+        "PIPELINE_1" => Some(1),
+        _ => None,
+    }
+}
+
+/// A `PipelineIds` entry that does not name a pipeline this channel has.
+///
+/// The channel's class fixes how many pipelines it has (the `ChannelClass` doc:
+/// "A standard channel has two encoding pipelines and a single pipeline channel
+/// only has one"), so `PIPELINE_1` on a single-pipeline channel names nothing
+/// that could restart. Refused with the operation's own `BadRequestException`,
+/// naming the member and the value the request carried.
+fn bad_pipeline(channel: &crate::state::ChannelRecord, id: &str) -> RestartChannelPipelinesError {
+    RestartChannelPipelinesErrorModeled::BadRequestException(BadRequestException {
+        message: Some(format!(
+            "PipelineIds names {id}, which channel {} does not have: a {} channel has {} pipeline(s)",
+            channel.id,
+            channel.channel_class,
+            channel.pipeline_count()
+        )),
+    })
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no channel store whose pipelines could restart. A modelled server
+/// error, never a fresh engine (which would drop the transition on return).
+fn unavailable() -> RestartChannelPipelinesError {
+    RestartChannelPipelinesErrorModeled::InternalServerErrorException(
+        InternalServerErrorException {
+            message: Some(crate::state::NO_STORE.to_string()),
+        },
+    )
+    .into()
 }

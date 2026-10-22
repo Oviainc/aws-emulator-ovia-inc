@@ -15,3 +15,5 @@
 mod service_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/test_template_catalog.rs"]
+mod test_template_catalog;

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateExternalConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateExternalConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateExternalConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds one of CodeArtifact's supported public registries to an existing repository as
+//! its external connection, and answers with the stored repository's
+//! `RepositoryDescription`. A repository holds at most ONE external connection (the
+//! operation's own documentation: "One external connection is allowed per repository"),
+//! so a second one is a `ServiceQuotaExceededException` (402) and re-associating the one
+//! already held is a `ConflictException` (409); an unknown domain or repository is a
+//! `ResourceNotFoundException` (404) and a connection name that is not a registry
+//! CodeArtifact supports is a `ValidationException` (400).
 //!
 //! ## Shape of an operation
 //!
@@ -169,20 +168,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateExternalConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateExternalConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateExternalConnection"))
+        // `externalConnection` is modelled as a free string, so the boundary validator has
+        // only checked its length and pattern: whether it NAMES a registry CodeArtifact
+        // can connect to is this handler's check, and its package format comes from the
+        // same catalog rather than from the request.
+        let Some(package_format) =
+            crate::state::external_connection_package_format(&input.external_connection)
+        else {
+            return Err(AssociateExternalConnectionErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "Invalid external connection '{}'.",
+                        input.external_connection
+                    ),
+                    reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                AssociateExternalConnectionErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the CodeArtifact store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        let Some(domain) = store.domain_mut(&input.domain, input.domain_owner.as_deref()) else {
+            return Err(
+                AssociateExternalConnectionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("Domain {} not found.", input.domain),
+                        resource_id: Some(input.domain.clone()),
+                        resource_type: Some("domain".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let domain_name = domain.name.clone();
+        let Some(repository) = domain.repositories.get_mut(&input.repository) else {
+            return Err(
+                AssociateExternalConnectionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "Repository {} not found in domain {}.",
+                            input.repository, domain_name
+                        ),
+                        resource_id: Some(input.repository.clone()),
+                        resource_type: Some("repository".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The connection already held is the same one: it exists, so this is a conflict,
+        // not a quota — and nothing is written, so the repository keeps the record (and
+        // the status) it already had.
+        if repository
+            .external_connections
+            .iter()
+            .any(|connection| {
+                connection.external_connection_name.as_deref()
+                    == Some(input.external_connection.as_str())
+            })
+        {
+            return Err(AssociateExternalConnectionErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "The external connection '{}' is already associated with repository '{}'.",
+                        input.external_connection, input.repository
+                    ),
+                    resource_id: Some(input.external_connection.clone()),
+                    resource_type: Some("repository".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // One external connection per repository: a request for a SECOND one would take
+        // the repository past that limit, which is what this operation's
+        // `ServiceQuotaExceededException` is for.
+        if repository.external_connections.len()
+            >= crate::state::MAX_EXTERNAL_CONNECTIONS_PER_REPOSITORY
+        {
+            return Err(
+                AssociateExternalConnectionErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "Cannot associate external connection '{}' with repository '{}': only {} external connection is allowed per repository.",
+                            input.external_connection,
+                            input.repository,
+                            crate::state::MAX_EXTERNAL_CONNECTIONS_PER_REPOSITORY
+                        ),
+                        resource_id: Some(input.external_connection.clone()),
+                        resource_type: Some("repository".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        repository
+            .external_connections
+            .push(RepositoryExternalConnectionInfo {
+                external_connection_name: Some(input.external_connection.clone()),
+                package_format: Some(package_format.to_string()),
+                status: Some(crate::state::EXTERNAL_CONNECTION_STATUS_AVAILABLE.to_string()),
+            });
+
+        // The response is the projection of the record as it now STANDS, so a later
+        // `DescribeRepository` answers with the very same description.
+        Ok(AssociateExternalConnectionOutput {
+            repository: Some(repository.description()),
+        })
     }
 }

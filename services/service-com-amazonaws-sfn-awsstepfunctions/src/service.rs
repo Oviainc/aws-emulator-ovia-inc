@@ -50,6 +50,12 @@ use std::sync::Arc;
 /// Private: it is reached through `override_refusal` below, not by a caller.
 mod validation;
 
+/// How this service serializes a response body's NESTED structures — the SWF
+/// type discriminator every awsJson recording of this API shows on them.
+/// Public: its catalog of discriminated shapes is checked against the Smithy
+/// model by this crate's tests.
+pub mod wire;
+
 /// The `com-amazonaws-sfn-awsstepfunctions` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -57,6 +63,10 @@ mod validation;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// This service's wire protocol, built ONCE here because
+    /// `override_protocol` hands out a borrow of it rather than a new one per
+    /// request.
+    protocol: wire::SwfJsonProtocol,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -66,6 +76,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            protocol: wire::SwfJsonProtocol::new(),
         }
     }
 }
@@ -132,6 +143,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // word that routing failure in your own envelope instead.
         let _ = req;
         None
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // The model-derived protocol is `awsJson1_0`, and so is this one: it
+        // delegates routing, request deserialization and the error envelope to
+        // the framework's own `awsJson1_0`, and differs only in the success
+        // body, where a nested structure of AWS's SWF base model carries the
+        // `__type` discriminator the recordings of this API show on it. See
+        // [`wire`] for the rule and the shapes it covers.
+        Some(&self.protocol)
     }
 
     fn override_framework_error(

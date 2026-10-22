@@ -111,14 +111,44 @@ pub const MODEL_CARD_QUOTA: usize = 1_000;
 /// reports this one.
 pub const DEFAULT_LINEAGE_GROUP: &str = "sagemaker-default-lineage-group";
 
-/// The most models `ListModels` returns in one page, including when `MaxResults` is
-/// absent or larger.
+/// The most records each of this service's paginated listings returns in one page,
+/// including when `MaxResults` is absent or larger.
 ///
-/// `MaxResults` is modelled `range 1..100` but has no documented default, so this is the
-/// service's own server-side ceiling: one call can never serialise the whole store, and
-/// a caller that wants the rest follows `NextToken`. Matches the ceiling the other
-/// paginated services in this workspace apply.
+/// `MaxResults` is modelled `range 1..100` on these operations, so this is the service's
+/// own server-side ceiling: one call can never serialise the whole store, and a caller
+/// that wants the rest follows `NextToken`. Matches the ceiling the other paginated
+/// services in this workspace apply.
 pub const MAX_PAGE_SIZE: i32 = 50;
+
+/// `SortBy`'s documented default on this service's listings ("Sorts the list of results.
+/// The default is `CreationTime`." — the member doc on both `ListModels` and
+/// `ListEndpoints`).
+pub const DEFAULT_SORT_BY: &str = "CreationTime";
+
+/// `SortOrder`'s documented default ("The sort order for results. The default is
+/// `Descending`.").
+pub const DEFAULT_SORT_ORDER: &str = ORDER_DESCENDING;
+
+/// `OrderKey`'s descending member, named once here so no handler decides a sort
+/// direction by comparing a bare string literal, nor by assuming the documented default
+/// is the descending one.
+pub const ORDER_DESCENDING: &str = "Descending";
+
+/// A page boundary as an opaque `NextToken`: the hex of the resource name the page
+/// stopped at.
+///
+/// The token names the item the page stopped at rather than an offset, so resuming lands
+/// exactly after it even though the token is opaque to the caller. Stated once here so
+/// every paginated listing in this service mints and reads one token format.
+pub fn encode_page_token(resource_name: &str) -> String {
+    hex::encode(resource_name.as_bytes())
+}
+
+/// The resource name a `NextToken` names, or `None` when the token was not minted by
+/// [`encode_page_token`].
+pub fn decode_page_token(token: &str) -> Option<String> {
+    String::from_utf8(hex::decode(token).ok()?).ok()
+}
 
 /// `MlflowAppStatus`'s members this emulator moves an MLflow app through (the modelled
 /// enum also carries the update, delete and failure states, which creating one does not

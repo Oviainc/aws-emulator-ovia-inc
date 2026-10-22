@@ -13,6 +13,16 @@
 //! `src/ops/<operation>.rs` file; only the data model and the primitives several
 //! operations share live here.
 //!
+//! Every resource is stored as the MODELLED shape the describe operations return,
+//! beside the few facts those shapes carry no member for, keyed by the same resource
+//! id ([`ComAmazonawsEc2Amazonec2State::vpc_available_at`] is when a `pending` VPC's
+//! `available` transition falls due, on the same monotonic clock and the same
+//! [`TRANSITION_DELAY`] as an instance's [`PendingTransition`]). This module also holds what several operations
+//! share: the resource-id mint, the CIDR canonicalisation the `CidrBlock` members
+//! document, the Availability Zone facts, the EC2 filter-value matcher, the page-token
+//! codec, and the EC2 error channel (EC2's model declares no error shapes at all, so
+//! every documented error code is returned through [`crate::scaffolded`]).
+//!
 //! ## Availability Zones are facts of a Region, not stored resources
 //!
 //! Nothing in the EC2 API creates, renames or deletes an Availability Zone: AWS
@@ -64,6 +74,7 @@
 //! stores names the Region its own request was signed for.
 
 use std::collections::{BTreeMap, HashMap};
+use std::net::Ipv6Addr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
@@ -73,6 +84,7 @@ use crate::ops::types::{
     RequestLaunchTemplateData, RunInstancesOutput, StateReason, Subnet, Tag, Vpc,
     VpcCidrBlockAssociation, VpcCidrBlockState,
 };
+use crate::scaffolded::Scaffolded;
 
 /// The `Reservation` shape, under the name the scaffold generated for it.
 ///
@@ -445,6 +457,12 @@ pub const OPT_IN_NOT_REQUIRED: &str = "opt-in-not-required";
 /// [`crate::scaffolded::Scaffolded::service_error`].
 pub const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
 
+/// EC2's error code for a request that leaves out a member the action requires.
+pub const MISSING_PARAMETER: &str = "MissingParameter";
+
+/// EC2's error code for members that are each valid but cannot be used together.
+pub const INVALID_PARAMETER_COMBINATION: &str = "InvalidParameterCombination";
+
 /// EC2's error code for a `DryRun` request whose caller holds the permissions the
 /// action needs: "If you have the required permissions, the error response is
 /// `DryRunOperation`" (the `DryRun` member's own doc).
@@ -622,6 +640,16 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// module docs). Further caller-created resources go beside this field as they
     /// land.
     pub vpcs: BTreeMap<String, Vpc>,
+    /// When each VPC's `pending` -> `available` transition falls due, for the VPCs that
+    /// have one.
+    ///
+    /// `CreateVpc` answers a VPC in the non-terminal `pending` state, so the clock owes it
+    /// `available` (and its IPv6 association `associated`) [`TRANSITION_DELAY`] later — the
+    /// same span, read off the same monotonic clock, as an instance's
+    /// [`PendingTransition`]. The due instant is recorded rather than slept for, and
+    /// [`Self::materialize_due_transitions`] applies it once the clock has passed it; a VPC
+    /// AWS returns ready (the account's default VPC) never has an entry here.
+    pub vpc_available_at: BTreeMap<String, Instant>,
     /// Every subnet the account holds, by `SubnetId`, as the modelled [`Subnet`] shape
     /// itself — so a member a writer sets round-trips through `DescribeSubnets` without a
     /// field-by-field copy. Ordered by id, which is the order the describe reports and
@@ -654,6 +682,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             next_reservation: 0,
             next_private_ip: 0,
             vpcs: BTreeMap::new(),
+            vpc_available_at: BTreeMap::new(),
             subnets: BTreeMap::new(),
             launch_templates: BTreeMap::new(),
             launch_template_client_tokens: HashMap::new(),
@@ -682,12 +711,52 @@ impl ComAmazonawsEc2Amazonec2State {
         format!("{prefix}-{:017x}", self.id_counter)
     }
 
+    /// Mint an Amazon-provided IPv6 CIDR block with the `/56` prefix length
+    /// `CreateVpcRequest$AmazonProvidedIpv6CidrBlock` documents ("an Amazon-provided IPv6
+    /// CIDR block with a /56 prefix length for the VPC"), out of the `2600:1f00::/24`
+    /// space Amazon advertises them from.
+    ///
+    /// The address comes from the store's own id counter, never from the request — the
+    /// caller "cannot specify the range of IP addresses, or the size of the CIDR block".
+    pub fn mint_amazon_ipv6_cidr(&mut self) -> String {
+        self.id_counter = self.id_counter.saturating_add(1);
+        let counter = self.id_counter;
+        let second = u16::try_from((counter >> 24) & 0xff).unwrap_or_default();
+        let third = u16::try_from((counter >> 8) & 0xffff).unwrap_or_default();
+        let fourth = u16::try_from((counter & 0xff) << 8).unwrap_or_default();
+        let address = Ipv6Addr::new(0x2600, 0x1f00 | second, third, fourth, 0, 0, 0, 0);
+        format!("{address}/56")
+    }
+
+    /// Whether another VPC fits inside the store's ceiling ([`MAX_VPCS`]).
+    ///
+    /// A create must ask this BEFORE inserting and refuse with [`vpc_limit_exceeded`]
+    /// when it answers `false`, the way [`Self::would_exceed_stored_bytes`] gates the
+    /// caller-chosen bytes: without a count ceiling repeated creates would grow memory
+    /// without bound.
+    pub fn has_vpc_capacity(&self) -> bool {
+        self.vpcs.len() < MAX_VPCS
+    }
+
+    /// Whether another subnet fits inside the store's ceiling ([`MAX_SUBNETS`]).
+    ///
+    /// The same contract as [`Self::has_vpc_capacity`]: a create asks first and refuses
+    /// with EC2's `SubnetLimitExceeded` when it answers `false`.
+    pub fn has_subnet_capacity(&self) -> bool {
+        self.subnets.len() < MAX_SUBNETS
+    }
+
     /// Insert a VPC with `cidr_block` as its primary IPv4 CIDR block, in `vpc_state`, and
     /// answer the `VpcId` it was given.
     ///
     /// Every id the record carries — the VPC's own, its primary CIDR association's, and
     /// the DHCP options set associated with it — is minted here, so a VPC never shares an
     /// id with another resource of this store.
+    ///
+    /// The caller-chosen bytes of `tags` are charged against the store's byte budget HERE
+    /// rather than by each writer, so no writer can store them uncharged; a create still
+    /// asks [`Self::has_vpc_capacity`] and [`Self::would_exceed_stored_bytes`] first so it
+    /// can refuse instead of overshooting.
     pub fn insert_vpc(
         &mut self,
         cidr_block: &str,
@@ -726,6 +795,7 @@ impl ComAmazonawsEc2Amazonec2State {
             cidr_block: Some(cidr_block.to_string()),
             dhcp_options_id: Some(dhcp_options_id),
         };
+        self.add_stored_bytes(tag_list_bytes(vpc.tags.as_deref().unwrap_or_default()));
         self.vpcs.insert(vpc_id.clone(), vpc);
         vpc_id
     }
@@ -736,6 +806,9 @@ impl ComAmazonawsEc2Amazonec2State {
     /// caller: the id, the ARN built from it, the owning account, and
     /// `AvailableIpAddressCount` computed from the CIDR block — so two writers cannot
     /// report the same subnet differently.
+    ///
+    /// Like [`Self::insert_vpc`], the caller-chosen bytes of `spec.tags` are charged
+    /// against the store's byte budget here, so a writer cannot store them uncharged.
     pub fn insert_subnet(&mut self, spec: SubnetSpec) -> String {
         let subnet_id = self.next_id("subnet");
         let subnet = Subnet {
@@ -781,6 +854,7 @@ impl ComAmazonawsEc2Amazonec2State {
             default_for_az: Some(spec.default_for_az),
             map_public_ip_on_launch: Some(spec.map_public_ip_on_launch),
         };
+        self.add_stored_bytes(tag_list_bytes(subnet.tags.as_deref().unwrap_or_default()));
         self.subnets.insert(subnet_id.clone(), subnet);
         subnet_id
     }
@@ -794,7 +868,8 @@ impl ComAmazonawsEc2Amazonec2State {
     /// VPCs"), so each zone's subnet is the n-th [`DEFAULT_SUBNET_PREFIX_LENGTH`] block of
     /// the VPC's own CIDR block, `DefaultForAz`, and public-IP-on-launch. A zone whose
     /// block does not fit inside `vpc_cidr_block` gets no subnet, rather than one with a
-    /// block outside its VPC.
+    /// block outside its VPC, and a store already at [`MAX_SUBNETS`] gets none at all
+    /// rather than growing past its ceiling.
     pub fn insert_default_subnets(
         &mut self,
         vpc_id: &str,
@@ -803,6 +878,9 @@ impl ComAmazonawsEc2Amazonec2State {
     ) -> Vec<String> {
         let mut inserted = Vec::new();
         for (index, zone) in availability_zones_in_region(region).into_iter().enumerate() {
+            if !self.has_subnet_capacity() {
+                break;
+            }
             let Ok(offset) = u32::try_from(index) else {
                 break;
             };
@@ -1302,7 +1380,9 @@ impl ComAmazonawsEc2Amazonec2State {
     ///
     /// A reporting operation may call this: each move was already owed at this
     /// instant whether or not anybody asked, so materialising it changes nothing
-    /// a later caller would otherwise have seen.
+    /// a later caller would otherwise have seen. It covers both resource kinds that
+    /// have one — an instance's next state, and a `pending` VPC becoming `available`
+    /// with its IPv6 association moving `associating` -> `associated`.
     pub fn materialize_due_transitions(&mut self) {
         let now = Instant::now();
         for instance in self.instances.values_mut() {
@@ -1316,6 +1396,26 @@ impl ComAmazonawsEc2Amazonec2State {
                 instance.pending_transition = None;
             }
         }
+        let vpcs = &mut self.vpcs;
+        self.vpc_available_at.retain(|vpc_id, due_at| {
+            if now < *due_at {
+                return true;
+            }
+            if let Some(vpc) = vpcs.get_mut(vpc_id) {
+                if vpc.state.as_deref() == Some(VPC_STATE_PENDING) {
+                    vpc.state = Some(VPC_STATE_AVAILABLE.to_string());
+                }
+                for association in vpc.ipv6_cidr_block_association_set.iter_mut().flatten() {
+                    if let Some(state) = association.ipv6_cidr_block_state.as_mut() {
+                        if state.state.as_deref() == Some(CIDR_BLOCK_STATE_ASSOCIATING) {
+                            state.state = Some(CIDR_BLOCK_STATE_ASSOCIATED.to_string());
+                        }
+                    }
+                }
+            }
+            // The transition is applied once; nothing is owed on this VPC any more.
+            false
+        });
     }
 
     /// The modelled `Instance` for one stored instance.
@@ -2192,6 +2292,174 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsEc2Amazonec2State>)
 }
+
+// ---------------------------------------------------------------------------
+// Modelled values and bounds the VPC create path uses
+// ---------------------------------------------------------------------------
+
+/// A VPC AWS is still creating: the `VpcState` enum's `pending` member, which is what
+/// `CreateVpc` answers with until [`TRANSITION_DELAY`] has passed.
+pub const VPC_STATE_PENDING: &str = "pending";
+
+/// An IPv6 CIDR block still being associated with its VPC: the `VpcCidrBlockStateCode`
+/// enum's `associating` member.
+pub const CIDR_BLOCK_STATE_ASSOCIATING: &str = "associating";
+
+/// The tenancy a VPC may be created with beside [`DEFAULT_INSTANCE_TENANCY`]: the
+/// `Tenancy` enum's `dedicated` member. Its third member, `host`, is excluded by
+/// `CreateVpcRequest$InstanceTenancy`'s own documentation.
+pub const TENANCY_DEDICATED: &str = "dedicated";
+
+/// The `ResourceType` a `CreateVpc` tag specification may name: the VPC it creates.
+pub const RESOURCE_TYPE_VPC: &str = "vpc";
+
+/// `Ipv6AddressAttribute` of a block advertised on the internet from AWS.
+pub const IPV6_ADDRESS_PUBLIC: &str = "public";
+
+/// `IpSource` of an IPv6 block Amazon allocated.
+pub const IP_SOURCE_AMAZON: &str = "amazon";
+
+/// `IpSource` of an IPv6 block the customer brought to AWS.
+pub const IP_SOURCE_BYOIP: &str = "byoip";
+
+/// The largest number of VPCs this in-memory store holds.
+///
+/// A capacity bound, not an AWS quota (AWS's VPCs-per-Region quota is adjustable): the
+/// store lives in this process's memory, so the number of VPCs a caller can create has to
+/// be finite. `CreateVpc` answers [`VPC_LIMIT_EXCEEDED`] rather than growing without
+/// limit.
+pub const MAX_VPCS: usize = 1_000;
+
+/// EC2's error code for a `CreateVpc` that would take the account past its VPC quota.
+pub const VPC_LIMIT_EXCEEDED: &str = "VpcLimitExceeded";
+
+/// The largest number of subnets this in-memory store holds.
+///
+/// A capacity bound in the same style as [`MAX_VPCS`] and [`MAX_STORED_INSTANCES`], not an
+/// AWS quota: each subnet is a record in this process's memory, and a default VPC alone
+/// seeds one per Availability Zone, so the total has to be finite.
+/// [`ComAmazonawsEc2Amazonec2State::has_subnet_capacity`] is the predicate a writer asks
+/// before inserting; a create past it refuses with [`SUBNET_LIMIT_EXCEEDED`].
+pub const MAX_SUBNETS: usize = 4_096;
+
+/// EC2's error code for a create that would take the account past its subnet quota —
+/// "You've reached the limit on the number of subnets that you can create" (EC2 API error
+/// codes).
+pub const SUBNET_LIMIT_EXCEEDED: &str = "SubnetLimitExceeded";
+
+// ---------------------------------------------------------------------------
+// CIDR blocks
+// ---------------------------------------------------------------------------
+
+/// The smallest IPv4 prefix length a VPC CIDR block may have.
+///
+/// Amazon VPC User Guide, VPC CIDR blocks: "The allowed block size is between a /16
+/// netmask (65,536 IP addresses) and /28 netmask (16 IP addresses)."
+pub const MIN_VPC_IPV4_PREFIX: u8 = 16;
+
+/// The largest IPv4 prefix length a VPC CIDR block may have (see
+/// [`MIN_VPC_IPV4_PREFIX`]).
+pub const MAX_VPC_IPV4_PREFIX: u8 = 28;
+
+/// Why a requested CIDR block cannot be used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CidrProblem {
+    /// The value is not a CIDR block of the expected address family at all.
+    Malformed,
+    /// The value parses, but its prefix length is outside the allowed block size.
+    PrefixLength,
+}
+
+/// A requested IPv4 VPC CIDR block in the canonical form AWS stores it in.
+///
+/// `CreateVpcRequest$CidrBlock`: "We modify the specified CIDR block to its canonical
+/// form; for example, if you specify 100.68.0.18/18, we modify it to 100.68.0.0/18" — so
+/// the host bits are cleared rather than the value being refused. The prefix length is
+/// held to the published block size ([`MIN_VPC_IPV4_PREFIX`]..=[`MAX_VPC_IPV4_PREFIX`]).
+///
+/// The address itself is parsed by the standard library's `Ipv4Addr`, the same parser
+/// [`parse_ipv4_cidr_block`] uses, so this crate keeps ONE rule for what an IPv4 address
+/// is; the only difference between the two readers is that this one CLEARS the host bits
+/// where that one requires them already clear.
+pub fn canonical_vpc_ipv4_cidr(value: &str) -> Result<String, CidrProblem> {
+    let (address, prefix_length) = value.split_once('/').ok_or(CidrProblem::Malformed)?;
+    let base = u32::from(
+        address
+            .parse::<::std::net::Ipv4Addr>()
+            .map_err(|_| CidrProblem::Malformed)?,
+    );
+    let prefix_length: u8 = prefix_length.parse().map_err(|_| CidrProblem::Malformed)?;
+    if prefix_length > 32 {
+        // No IPv4 block has a prefix longer than its address, so the value is malformed
+        // rather than a block of a disallowed size.
+        return Err(CidrProblem::Malformed);
+    }
+    if !(MIN_VPC_IPV4_PREFIX..=MAX_VPC_IPV4_PREFIX).contains(&prefix_length) {
+        return Err(CidrProblem::PrefixLength);
+    }
+    let mask = u32::MAX
+        .checked_shl(u32::from(32 - prefix_length))
+        .unwrap_or_default();
+    Ok(format!(
+        "{}/{prefix_length}",
+        ::std::net::Ipv4Addr::from(base & mask)
+    ))
+}
+
+/// A requested IPv6 CIDR block in canonical form: the host bits cleared, the address
+/// rendered the one way `Ipv6Addr` renders it.
+///
+/// Deliberately NO prefix-length rule, unlike the IPv4 path: the model states a size only
+/// for the block AWS itself picks ("an Amazon-provided IPv6 CIDR block with a /56 prefix
+/// length"), which this service mints at that size, while the size a caller may bring from
+/// its own pool is a property of that pool and is documented nowhere the model or the
+/// request carries. A bound invented here would refuse blocks AWS accepts.
+pub fn canonical_ipv6_cidr(value: &str) -> Result<String, CidrProblem> {
+    let (address, prefix_length) = value.split_once('/').ok_or(CidrProblem::Malformed)?;
+    let base = u128::from(
+        address
+            .parse::<Ipv6Addr>()
+            .map_err(|_| CidrProblem::Malformed)?,
+    );
+    let prefix_length: u8 = prefix_length.parse().map_err(|_| CidrProblem::Malformed)?;
+    if prefix_length > 128 {
+        return Err(CidrProblem::Malformed);
+    }
+    let mask = u128::MAX
+        .checked_shl(u32::from(128 - prefix_length))
+        .unwrap_or_default();
+    Ok(format!("{}/{prefix_length}", Ipv6Addr::from(base & mask)))
+}
+
+// ---------------------------------------------------------------------------
+// The rest of the EC2 error channel (the codes above live with the describes)
+// ---------------------------------------------------------------------------
+
+/// Refuse a request that leaves out a member the action requires, the way EC2 does: HTTP
+/// 400 `MissingParameter`.
+pub fn missing_parameter<E>(message: impl Into<String>) -> Scaffolded<E> {
+    Scaffolded::service_error(MISSING_PARAMETER, 400, message)
+}
+
+/// Refuse members that are each valid but cannot be used together, the way EC2 does: HTTP
+/// 400 `InvalidParameterCombination`.
+pub fn invalid_parameter_combination<E>(message: impl Into<String>) -> Scaffolded<E> {
+    Scaffolded::service_error(INVALID_PARAMETER_COMBINATION, 400, message)
+}
+
+/// Refuse a create that would take the store past [`MAX_VPCS`]: HTTP 400
+/// `VpcLimitExceeded`.
+pub fn vpc_limit_exceeded<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        VPC_LIMIT_EXCEEDED,
+        400,
+        format!("The maximum number of VPCs has been reached ({MAX_VPCS})"),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Pagination
+// ---------------------------------------------------------------------------
 
 /// [`service_state`], with the "mounted on an engine that holds no state" case
 /// already turned into the server error every handler answers it with.
