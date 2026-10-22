@@ -222,7 +222,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.live_domain(&input.domain_identifier).is_none() {
             return Err(UpdateProjectErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("Domain {} was not found", input.domain_identifier),
+                    message: crate::state::ResourceKind::Domain.not_found_message(),
                 },
             )
             .into());
@@ -233,7 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|domain| domain.projects.get_mut(&input.identifier))
             .ok_or_else(|| {
                 UpdateProjectErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: format!("Project {} was not found", input.identifier),
+                    message: crate::state::ResourceKind::Project.not_found_message(),
                 })
             })?;
 
