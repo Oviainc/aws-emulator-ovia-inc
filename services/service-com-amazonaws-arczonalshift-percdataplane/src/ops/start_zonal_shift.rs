@@ -222,17 +222,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // called, so the conflict check below sees the resource as it really is.
         store.expire_due_shifts(now);
 
-        let Some(resource) = store.managed_resources.get(&input.resource_identifier) else {
-            return Err(StartZonalShiftErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!(
-                        "no managed resource is registered with ARC for resourceIdentifier {}",
-                        input.resource_identifier
-                    ),
-                },
-            )
-            .into());
-        };
+        // The caller's authorization on the named target is decided BEFORE the
+        // target is resolved: a resourceIdentifier ARC holds nothing for is refused
+        // 403 AccessDeniedException, disclosing nothing about what exists. One
+        // helper takes this branch for every operation that acts on a target.
+        let resource = store
+            .authorized_resource(&input.resource_identifier)
+            .map_err(StartZonalShiftErrorModeled::AccessDeniedException)?;
 
         // Traffic can only be moved away from a zone the resource is deployed in.
         if !resource.availability_zones.contains(&input.away_from) {

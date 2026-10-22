@@ -187,17 +187,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.expire_due_shifts(SystemTime::now());
 
-        let Some(shift) = store.zonal_shifts.get_mut(&input.zonal_shift_id) else {
-            return Err(CancelZonalShiftErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!(
-                        "no zonal shift found for zonalShiftId {}",
-                        input.zonal_shift_id
-                    ),
-                },
-            )
-            .into());
-        };
+        // The caller's authorization on the named target is decided BEFORE the
+        // target is resolved: a zonalShiftId ARC holds no shift for is refused 403
+        // AccessDeniedException, disclosing nothing about what exists. One helper
+        // takes this branch for every operation that acts on a target.
+        let shift = store
+            .authorized_shift_mut(&input.zonal_shift_id)
+            .map_err(CancelZonalShiftErrorModeled::AccessDeniedException)?;
 
         // Cancelling is only meaningful while the shift is running: one already
         // canceled, or that has expired, has nothing left to cancel.

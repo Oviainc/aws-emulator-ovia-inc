@@ -16,7 +16,10 @@
 //! * `expiresIn` is a whole number of minutes or hours, converted to an expiry time,
 //!   and is refused past the documented three-day maximum;
 //! * a shift whose expiry time the clock has passed reads back as `EXPIRED`;
-//! * a shift that is no longer `ACTIVE` can be neither updated nor canceled.
+//! * a shift that is no longer `ACTIVE` can be neither updated nor canceled;
+//! * a mutation whose target ARC holds nothing for is refused 403
+//!   `AccessDeniedException` (the table spanning that rule lives in
+//!   `access_denied_precedence.rs`).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -40,7 +43,7 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The engine is handed back as well as the router, because the clock-driven case has
 /// to move a stored shift's expiry time into the past, which no modeled operation can
 /// do.
-fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signatures are the emulator core's business, not this service's; off here so a
@@ -68,7 +71,7 @@ fn request(method: &str, uri: &str, body: &str) -> http::Request<bytes::Bytes> {
 }
 
 /// Dispatch a call and read back its status and JSON body.
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -95,7 +98,7 @@ async fn call(
 /// two sub-delimiters (RFC 3986 section 2.2 reserved characters). Written out rather
 /// than pulled from an escaping crate so this test crate adds no dependency, and
 /// matching the convention of the sibling suites that bind an ARN to a URI label.
-fn encoded(value: &str) -> String {
+pub(crate) fn encoded(value: &str) -> String {
     value
         .replace('%', "%25")
         .replace(':', "%3A")
@@ -107,7 +110,7 @@ fn encoded(value: &str) -> String {
 /// The seeded managed resources, as `(resourceIdentifier, availabilityZones)` in the
 /// order the store holds them. Read from the engine the router serves, so a case names
 /// no ARN of its own.
-fn seeded(engine: &engine::InMemoryEngine) -> Vec<(String, Vec<String>)> {
+pub(crate) fn seeded(engine: &engine::InMemoryEngine) -> Vec<(String, Vec<String>)> {
     engine
         .state::<ZonalShiftStore>()
         .lock()
@@ -124,7 +127,7 @@ fn seeded(engine: &engine::InMemoryEngine) -> Vec<(String, Vec<String>)> {
 
 /// `__type` as the restJson1 error envelope carries it, with any `shapeId#` prefix
 /// dropped.
-fn error_code(body: &serde_json::Value) -> String {
+pub(crate) fn error_code(body: &serde_json::Value) -> String {
     body["__type"]
         .as_str()
         .unwrap_or_default()
@@ -134,7 +137,12 @@ fn error_code(body: &serde_json::Value) -> String {
         .to_string()
 }
 
-fn start_body(resource: &str, away_from: &str, expires_in: &str, comment: &str) -> String {
+pub(crate) fn start_body(
+    resource: &str,
+    away_from: &str,
+    expires_in: &str,
+    comment: &str,
+) -> String {
     serde_json::json!({
         "resourceIdentifier": resource,
         "awayFrom": away_from,
@@ -532,12 +540,14 @@ async fn expires_in_is_converted_to_an_expiry_time_and_bounded_at_three_days() {
 }
 
 #[tokio::test]
-async fn unknown_identifiers_are_not_found_and_a_shift_that_is_over_is_a_conflict() {
+async fn unknown_identifiers_are_refused_and_a_shift_that_is_over_is_a_conflict() {
     let (router, engine) = emulator();
     let resources = seeded(&engine);
     let (resource, zones) = resources[0].clone();
 
-    // An identifier no resource carries is not found, whatever shape it has.
+    // An identifier no managed resource carries is a target the caller is not
+    // authorized for, whatever shape it has: the shift-starting mutation is refused
+    // before existence is reported.
     for unknown in [
         "arn:aws:elasticloadbalancing:us-east-1:111111111111:loadbalancer/app/absent/0",
         "arn:aws:autoscaling:us-west-2:000000000000:autoScalingGroupName/absent",
@@ -550,13 +560,13 @@ async fn unknown_identifiers_are_not_found_and_a_shift_that_is_over_is_a_conflic
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {unknown}: an unregistered resource is not found, got {status} {body}"
+            status, 403,
+            "case {unknown}: an unregistered resource is refused, got {status} {body}"
         );
         assert_eq!(
             error_code(&body),
-            "ResourceNotFoundException",
-            "case {unknown}: expected ResourceNotFoundException, got {body}"
+            "AccessDeniedException",
+            "case {unknown}: expected AccessDeniedException, got {body}"
         );
 
         let (status, body) = call(
@@ -591,17 +601,17 @@ async fn unknown_identifiers_are_not_found_and_a_shift_that_is_over_is_a_conflic
         );
     }
 
-    // An id no shift carries is not found, for both operations keyed by one.
+    // An id no shift carries is refused, for both operations keyed by one.
     for (method, name) in [("PATCH", "UpdateZonalShift"), ("DELETE", "CancelZonalShift")] {
         let (status, body) = call(&router, method, "/zonalshifts/zs-0000009999", "{}").await;
         assert_eq!(
-            status, 404,
-            "case {name}: an unknown zonalShiftId is not found, got {status} {body}"
+            status, 403,
+            "case {name}: an unknown zonalShiftId is refused, got {status} {body}"
         );
         assert_eq!(
             error_code(&body),
-            "ResourceNotFoundException",
-            "case {name}: expected ResourceNotFoundException, got {body}"
+            "AccessDeniedException",
+            "case {name}: expected AccessDeniedException, got {body}"
         );
     }
 
@@ -860,8 +870,9 @@ async fn the_store_keeps_a_bounded_number_of_completed_shifts() {
     let newest = ids.last().expect("at least one shift was started");
     let (status, body) = call(&router, "DELETE", &format!("/zonalshifts/{oldest}"), "").await;
     assert_eq!(
-        status, 404,
-        "the oldest completed shift was dropped first, got {status} {body}"
+        status, 403,
+        "the oldest completed shift was dropped first, so its id names no target the \
+         caller is authorized for: got {status} {body}"
     );
     let (status, body) = call(&router, "DELETE", &format!("/zonalshifts/{newest}"), "").await;
     assert_eq!(

@@ -14,7 +14,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::ops::types::{AutoshiftInResource, PracticeRunConfiguration, ZonalShiftInResource};
+use crate::ops::types::{
+    AccessDeniedException, AutoshiftInResource, PracticeRunConfiguration, ZonalShiftInResource,
+};
 
 /// The Amazon Web Services Region the seeded managed resources live in. The
 /// Availability Zone IDs they are deployed in (`use1-az*`) are this Region's, so
@@ -43,6 +45,30 @@ pub const DEFAULT_PAGE_SIZE: usize = 100;
 /// back, and the oldest are dropped first, so what a caller can still observe is
 /// what it keeps.
 pub const MAX_COMPLETED_SHIFTS_RETAINED: usize = 1_000;
+
+/// The message ARC answers with when the target of a zonal-shift call is not one
+/// it holds for the caller.
+///
+/// It names no identifier, which is the point: the refusal discloses nothing about
+/// what does or does not exist.
+pub const TARGET_UNAVAILABLE_MESSAGE: &str = "Requested resource is not available.";
+
+/// The ONE refusal every resource-scoped zonal-shift mutation answers when the
+/// target it names is not a target this account's ARC holds for the caller.
+///
+/// ARC decides the caller's authorization ON THE TARGET before the target is
+/// resolved, so an identifier it cannot attribute to the caller is answered
+/// `AccessDeniedException` — "You do not have sufficient access to perform this
+/// action.", `@error client` with `@httpError 403` and a service-common error of
+/// `PercDataPlane` — and never `ResourceNotFoundException` (404), which would
+/// disclose that the identifier names nothing. Built here, once, so the handlers
+/// cannot drift apart on which branch they take.
+#[must_use]
+pub fn target_unavailable() -> AccessDeniedException {
+    AccessDeniedException {
+        message: Some(TARGET_UNAVAILABLE_MESSAGE.to_string()),
+    }
+}
 
 /// A zonal shift's lifecycle status.
 ///
@@ -238,6 +264,34 @@ impl ComAmazonawsArczonalshiftPercdataplaneState {
                 shift.status = ZonalShiftStatus::Expired;
             }
         }
+    }
+
+    /// The managed resource a zonal-shift mutation may act on, or the refusal it
+    /// answers instead.
+    ///
+    /// This is the ordering every such operation shares: the authorization
+    /// decision on the named target is taken FIRST, so a `resourceIdentifier`
+    /// this store holds no resource for is refused with [`target_unavailable`]
+    /// rather than reported as not found.
+    pub fn authorized_resource(
+        &self,
+        resource_identifier: &str,
+    ) -> Result<&ManagedResource, AccessDeniedException> {
+        self.managed_resources
+            .get(resource_identifier)
+            .ok_or_else(target_unavailable)
+    }
+
+    /// The stored zonal shift a mutation keyed by `zonalShiftId` may act on, or
+    /// the refusal it answers instead — the same ordering as
+    /// [`Self::authorized_resource`], for the operations whose target is a shift.
+    pub fn authorized_shift_mut(
+        &mut self,
+        zonal_shift_id: &str,
+    ) -> Result<&mut ZonalShift, AccessDeniedException> {
+        self.zonal_shifts
+            .get_mut(zonal_shift_id)
+            .ok_or_else(target_unavailable)
     }
 
     /// Bound the store: drop the oldest completed shifts once it holds more than
