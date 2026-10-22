@@ -20,6 +20,10 @@ tokio = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
+# JSONPath: the query language every Amazon States Language `*Path` member is
+# written in, evaluated by this maintained RFC 9535 implementation rather than a
+# hand-written subset.
+serde_json_path = "0.7"
 tracing = { workspace = true }
 
 [build-dependencies]

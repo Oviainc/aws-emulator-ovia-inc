@@ -102,6 +102,16 @@ pub const LABELED_ARN_MESSAGE: &str = "Labeled State Machine ARNs are not suppor
 /// through the one non-modelled channel the crate has.
 pub const STORE_UNAVAILABLE: &str = "the Step Functions store is unavailable on this engine";
 
+/// Returned when the blocking thread the definition is INTERPRETED on did not
+/// answer — a cancelled runtime, or a panic the interpreter itself raised.
+///
+/// The model declares no server-fault error for `StartExecution` or
+/// `RedriveExecution`, so this refusal goes out through the one non-modelled channel
+/// the crate has rather than being reported as a started execution that was never
+/// planned.
+pub const INTERPRETER_UNAVAILABLE: &str =
+    "the state machine definition could not be interpreted on this engine";
+
 // ---------------------------------------------------------------------------
 // Wire values, from the model's own enums (`crate::ops::types::*_VALUES`).
 // ---------------------------------------------------------------------------
@@ -154,6 +164,10 @@ pub const EXECUTION_STATUS_FAILED: &str = "FAILED";
 
 /// An execution `StopExecution` stopped.
 pub const EXECUTION_STATUS_ABORTED: &str = "ABORTED";
+
+/// An execution that ran for longer than the `TimeoutSeconds` its definition
+/// declares.
+pub const EXECUTION_STATUS_TIMED_OUT: &str = "TIMED_OUT";
 
 /// `IncludedData`'s metadata-only member: see [`reported_definition`].
 pub const INCLUDED_DATA_METADATA_ONLY: &str = "METADATA_ONLY";
@@ -2429,6 +2443,32 @@ pub fn epoch_millis(time: SystemTime) -> i64 {
         .map_or(0, |since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
 }
 
+/// `offset` after `time`, without the panic `SystemTime`'s `Add` carries.
+///
+/// The offsets this service adds to an instant are accumulated from the `Wait` states
+/// of a caller's definition, which the model bounds only in BYTES, so an offset no
+/// instant can represent holds at the furthest instant this clock carries instead of
+/// panicking: the execution then simply never comes due, which is what an unreachable
+/// instant means.
+pub fn after(time: SystemTime, offset: Duration) -> SystemTime {
+    time.checked_add(offset).unwrap_or_else(|| {
+        // The furthest instant reachable by halving the offset until it fits: a few
+        // steps at most, and it needs no platform-specific maximum.
+        let mut offset = offset;
+        let mut furthest = time;
+        while !offset.is_zero() {
+            match time.checked_add(offset) {
+                Some(instant) => {
+                    furthest = instant;
+                    break;
+                }
+                None => offset /= 2,
+            }
+        }
+        furthest
+    })
+}
+
 /// Now, in nanoseconds since the Unix epoch — only an id-generator seed.
 fn now_nanos() -> u64 {
     SystemTime::now()
@@ -2476,14 +2516,19 @@ fn uuid_v4(high: u64, low: u64) -> String {
 /// `StartExecution`, [`EVENT_EXECUTION_REDRIVEN`] for a `RedriveExecution` — and
 /// `previous_event_id` the last id the execution's history already holds, so a
 /// redrive's events CONTINUE the existing numbering instead of restarting it.
+///
+/// `context` is what the definition reads through the context object (`$$`): the
+/// execution's and the state machine's own identity, which the caller's request
+/// already fixed.
 pub fn plan_run(
     definition: &str,
     input: &str,
     start: SystemTime,
+    context: &asl::Context,
     opening: &str,
     previous_event_id: i64,
 ) -> (Vec<HistoryEvent>, PendingOutcome) {
-    let run = asl::run(definition, input, start);
+    let run = asl::run(definition, input, start, context);
     let started = HistoryEvent {
         id: previous_event_id + 1,
         previous_event_id,
@@ -2491,7 +2536,11 @@ pub fn plan_run(
         timestamp: start,
         state_name: None,
     };
-    let due_at = start + EXECUTION_SETTLE_DELAY + run.elapsed;
+    // The offsets below are accumulated from the `Wait` states of a CALLER'S
+    // definition, so every instant is computed with checked arithmetic: an
+    // offset no instant can represent is held at the furthest instant this clock
+    // carries, rather than reached through the panicking `Add`.
+    let due_at = after(start, EXECUTION_SETTLE_DELAY.saturating_add(run.elapsed));
     let events: Vec<HistoryEvent> = run
         .steps
         .into_iter()
@@ -2505,7 +2554,7 @@ pub fn plan_run(
             timestamp: if step.terminal {
                 due_at
             } else {
-                start + step.after
+                after(start, step.after)
             },
             state_name: step.state_name,
         })
@@ -2523,751 +2572,7 @@ pub fn plan_run(
     )
 }
 
-pub mod asl {
-    //! The Amazon States Language subset this emulator EXECUTES.
-    //!
-    //! ASL is Step Functions' own definition language; no crates.io crate parses or
-    //! runs it, so the walk below is written here, over `serde_json` — the
-    //! maintained parser for the JSON the language is written in.
-    //!
-    //! Only states this emulator can run without reaching outside the process are
-    //! executed: `Pass`, `Succeed`, `Fail` and `Wait`. Everything else is NOT run
-    //! and NOT faked — neither a `Task`'s integration nor the JSONPath members
-    //! (`InputPath`, `OutputPath`, `Parameters`, `ResultPath`) are interpreted.
-    //! An execution that reaches one ends in the service's own failure state:
-    //! `FAILED`, with the ASL-documented [`RUNTIME_ERROR`] error name and a cause
-    //! that says exactly what was not run.
-    //!
-    //! ## The document the walk carries
-    //!
-    //! A state's input and output is a JSON DOCUMENT, and a document no state
-    //! TRANSFORMED is carried on in its own BYTES rather than re-encoded from a
-    //! parsed copy: the caller's `input` text reaches `output` byte for byte when the
-    //! walk only passed it through. JSON is parsed to check that the document IS
-    //! JSON, and a `Pass` state's `Result` is a value of the parsed definition, so
-    //! that one state puts out that value's own encoding.
-
-    use std::collections::{BTreeMap, BTreeSet};
-    use std::time::{Duration, SystemTime};
-
-    use serde_json::{Map, Value};
-
-    /// The ASL predefined error name for a failure the interpreter itself raises
-    /// ("States.Runtime — an execution failed due to some exception that could not
-    /// be processed").
-    pub const RUNTIME_ERROR: &str = "States.Runtime";
-
-    /// The ASL predefined error name for a payload that outgrew what a state may
-    /// carry ("States.DataLimitExceeded").
-    pub const DATA_LIMIT_ERROR: &str = "States.DataLimitExceeded";
-
-    /// The most state transitions one execution makes before the interpreter stops
-    /// it.
-    ///
-    /// Emulator step budget, NOT an AWS quota: it is what bounds a definition whose
-    /// `Next` chain forms a cycle. An execution that exceeds it ends `FAILED` with
-    /// [`RUNTIME_ERROR`].
-    pub const MAX_STATE_TRANSITIONS: usize = 1_000;
-
-    /// The most characters a state name may carry.
-    ///
-    /// From the Amazon States Language: a state's name "must be unique within the
-    /// scope of the whole state machine and has a maximum length of 80 characters".
-    /// A longer one is refused at create time, which is also what keeps an
-    /// execution's history bounded in BYTES: every history event carries the name of
-    /// the state it happened in.
-    pub const MAX_STATE_NAME_CHARS: usize = 80;
-
-    /// The most bytes a state's output may carry: the maximum the modelled
-    /// `SensitiveData` shape that `input`/`output` target accepts (0..262144).
-    ///
-    /// A run whose value grows past it ends `FAILED` with ASL's own
-    /// [`DATA_LIMIT_ERROR`], rather than storing a payload no response could carry.
-    pub const MAX_PAYLOAD_BYTES: usize = 262_144;
-
-    /// The most bytes a `Fail` state's `Error` and `Cause` may carry: the maxima of
-    /// the modelled `SensitiveError` (0..256) and `SensitiveCause` (0..32768) shapes
-    /// `DescribeExecution` reports them through. A longer one is refused at create
-    /// time.
-    pub const MAX_ERROR_BYTES: usize = 256;
-
-    /// See [`MAX_ERROR_BYTES`].
-    pub const MAX_CAUSE_BYTES: usize = 32_768;
-
-    /// The longest a `Wait` state waits: Step Functions' published maximum `Wait`
-    /// duration of one year, in seconds. A definition asking for more is out of
-    /// range, and ends the execution with [`RUNTIME_ERROR`] rather than being
-    /// silently shortened to this.
-    pub const MAX_WAIT_SECONDS: u64 = 31_622_400;
-
-    /// The state types this emulator executes.
-    pub const EXECUTED_STATE_TYPES: &[&str] = &["Fail", "Pass", "Succeed", "Wait"];
-
-    /// State types that end an execution, so they must NOT carry `Next`.
-    const TERMINAL_STATE_TYPES: &[&str] = &["Fail", "Succeed"];
-
-    /// State types that continue an execution, so each must carry `Next` or
-    /// `"End": true`. `Choice` is absent because it branches through its own
-    /// `Choices`/`Default` members instead.
-    const CONTINUING_STATE_TYPES: &[&str] = &["Map", "Parallel", "Pass", "Task", "Wait"];
-
-    /// The members each executed state type may carry. A state that carries any
-    /// other member is not executed: the member changes what the state does, and
-    /// running the state while ignoring it would report an outcome the definition
-    /// does not describe.
-    fn executable_members(state_type: &str) -> &'static [&'static str] {
-        match state_type {
-            "Pass" => &["Type", "Comment", "Result", "Next", "End"],
-            "Wait" => &["Type", "Comment", "Seconds", "Timestamp", "Next", "End"],
-            "Succeed" => &["Type", "Comment"],
-            "Fail" => &["Type", "Comment", "Error", "Cause"],
-            _ => &[],
-        }
-    }
-
-    /// The first member of `state` this emulator does not execute, if any.
-    fn unexecutable_member(state_type: &str, state: &Map<String, Value>) -> Option<String> {
-        let allowed = executable_members(state_type);
-        state
-            .keys()
-            .find(|member| !allowed.contains(&member.as_str()))
-            .cloned()
-    }
-
-    /// One history event the walk produced.
-    #[derive(Debug, Clone)]
-    pub struct Step {
-        pub event_type: &'static str,
-        pub state_name: Option<String>,
-        /// How far into the run this event happened.
-        pub after: Duration,
-        /// Whether this is the event the execution ends on.
-        pub terminal: bool,
-    }
-
-    /// What one walk of a definition produced.
-    #[derive(Debug, Clone)]
-    pub struct Run {
-        /// `SUCCEEDED` or `FAILED`.
-        pub status: &'static str,
-        /// The document the run ended with, in the bytes it was written with.
-        pub output: Option<String>,
-        pub error: Option<String>,
-        pub cause: Option<String>,
-        pub steps: Vec<Step>,
-        /// The total of every `Wait` the walk passed.
-        pub elapsed: Duration,
-    }
-
-    /// The diagnostic code `INVALID_JSON_DESCRIPTION`: "JSON syntax problem
-    /// found".
-    ///
-    /// The four codes below are the ones this emulator's validation can reach, out
-    /// of the error-code list the model documents on
-    /// `ValidateStateMachineDefinitionDiagnostic`
-    /// (`smithy_query(query="doc",shape="ValidateStateMachineDefinitionDiagnostic")`).
-    /// That same documentation is why the code is the stable part of an
-    /// `InvalidDefinition` message and the detail after it is not: "might add new
-    /// diagnostics in the future, adjust diagnostic codes, or change the message
-    /// wording. […] Do not rely on the exact order, count, or wording of
-    /// diagnostic messages."
-    pub const INVALID_JSON_DESCRIPTION: &str = "INVALID_JSON_DESCRIPTION";
-
-    /// `SCHEMA_VALIDATION_FAILED`: "Schema validation reported errors" — the
-    /// definition is JSON, but not the shape the Amazon States Language declares.
-    pub const SCHEMA_VALIDATION_FAILED: &str = "SCHEMA_VALIDATION_FAILED";
-
-    /// `MISSING_TRANSITION_TARGET`: "The value of \"Next\" field doesn't match a
-    /// known state name" — reported for every transition target that names no
-    /// declared state, `StartAt`'s included.
-    pub const MISSING_TRANSITION_TARGET: &str = "MISSING_TRANSITION_TARGET";
-
-    /// `INVALID_STATE_NAME`: "The state name does not follow the naming
-    /// convention".
-    pub const INVALID_STATE_NAME: &str = "INVALID_STATE_NAME";
-
-    /// One diagnostic as an `InvalidDefinition` message carries it: the code that
-    /// classifies the problem, then the detail describing it.
-    fn diagnostic(code: &str, detail: impl ::std::fmt::Display) -> String {
-        format!("{code}: {detail}")
-    }
-
-    /// Why `definition` is not a definition this service accepts, or `Ok` when it
-    /// is.
-    ///
-    /// These are the Amazon States Language's own structural rules, so the refusal
-    /// is `CreateStateMachine`'s modelled `InvalidDefinition`: the definition is a
-    /// JSON object carrying `StartAt` and a non-empty `States` map, `StartAt` names
-    /// a declared state, every state is an object with a string `Type`, every `Next`
-    /// names a declared state, a terminal state carries no `Next`, and a continuing
-    /// state carries `Next` or `"End": true`.
-    ///
-    /// The `Err` is the SUBJECT of that error's message — one diagnostic, `<code>:
-    /// <detail>` — which the operation states through
-    /// [`crate::state::resource_error_message`] with
-    /// [`crate::state::INVALID_STATE_MACHINE_DEFINITION`].
-    ///
-    /// A definition may use states this emulator does not EXECUTE and still be
-    /// valid, because it is valid ASL: what cannot be run surfaces at execution
-    /// time, as a `FAILED` execution, not as a rejected create.
-    pub fn validate(definition: &str) -> Result<(), String> {
-        let document: Value = serde_json::from_str(definition).map_err(|error| {
-            diagnostic(
-                INVALID_JSON_DESCRIPTION,
-                format!("the definition is not valid JSON: {error}"),
-            )
-        })?;
-        let document = document.as_object().ok_or_else(|| {
-            diagnostic(SCHEMA_VALIDATION_FAILED, "the definition must be a JSON object")
-        })?;
-        let start_at = document
-            .get("StartAt")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                diagnostic(
-                    SCHEMA_VALIDATION_FAILED,
-                    "the definition must carry a string 'StartAt' member",
-                )
-            })?;
-        let states = document
-            .get("States")
-            .and_then(Value::as_object)
-            .ok_or_else(|| {
-                diagnostic(
-                    SCHEMA_VALIDATION_FAILED,
-                    "the definition must carry an object 'States' member",
-                )
-            })?;
-        if states.is_empty() {
-            return Err(diagnostic(
-                SCHEMA_VALIDATION_FAILED,
-                "'States' must declare at least one state",
-            ));
-        }
-        if !states.contains_key(start_at) {
-            return Err(diagnostic(
-                MISSING_TRANSITION_TARGET,
-                format!("'StartAt' names '{start_at}', which 'States' does not declare"),
-            ));
-        }
-        for (name, state) in states {
-            // A state name is a caller-chosen JSON object key and lands in every
-            // history event of that state, so its LENGTH is bounded here, not only
-            // the number of events: this is what keeps a history's bytes bounded.
-            if name.chars().count() > MAX_STATE_NAME_CHARS {
-                return Err(diagnostic(
-                    INVALID_STATE_NAME,
-                    format!(
-                        "a state name may carry at most {MAX_STATE_NAME_CHARS} characters, and \
-                         this definition declares one of {}",
-                        name.chars().count()
-                    ),
-                ));
-            }
-            let state = state.as_object().ok_or_else(|| {
-                diagnostic(
-                    SCHEMA_VALIDATION_FAILED,
-                    format!("state '{name}' must be a JSON object"),
-                )
-            })?;
-            let state_type = state
-                .get("Type")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    diagnostic(
-                        SCHEMA_VALIDATION_FAILED,
-                        format!("state '{name}' must carry a string 'Type' member"),
-                    )
-                })?;
-            // A `Fail` state's `Error` and `Cause` are reported verbatim by
-            // `DescribeExecution`, through shapes with their own maxima, so a
-            // definition carrying a longer one could never be reported.
-            for (member, cap) in [("Error", MAX_ERROR_BYTES), ("Cause", MAX_CAUSE_BYTES)] {
-                if let Some(value) = state.get(member).and_then(Value::as_str) {
-                    if value.len() > cap {
-                        return Err(diagnostic(
-                            SCHEMA_VALIDATION_FAILED,
-                            format!(
-                                "state '{name}' carries a '{member}' of {} bytes, more than the \
-                                 {cap} this service reports",
-                                value.len()
-                            ),
-                        ));
-                    }
-                }
-            }
-            match state.get("Next") {
-                Some(next) => {
-                    let next = next.as_str().ok_or_else(|| {
-                        diagnostic(
-                            SCHEMA_VALIDATION_FAILED,
-                            format!("state '{name}' has a non-string 'Next' member"),
-                        )
-                    })?;
-                    if !states.contains_key(next) {
-                        return Err(diagnostic(
-                            MISSING_TRANSITION_TARGET,
-                            format!(
-                                "state '{name}' transitions to '{next}', which 'States' does not \
-                                 declare"
-                            ),
-                        ));
-                    }
-                    if TERMINAL_STATE_TYPES.contains(&state_type) {
-                        return Err(diagnostic(
-                            SCHEMA_VALIDATION_FAILED,
-                            format!(
-                                "state '{name}' is a '{state_type}' state, which ends an execution \
-                                 and must not carry 'Next'"
-                            ),
-                        ));
-                    }
-                }
-                None => {
-                    if CONTINUING_STATE_TYPES.contains(&state_type)
-                        && state.get("End").and_then(Value::as_bool) != Some(true)
-                    {
-                        return Err(diagnostic(
-                            SCHEMA_VALIDATION_FAILED,
-                            format!(
-                                "state '{name}' is a '{state_type}' state, so it must carry either \
-                                 'Next' or \"End\": true"
-                            ),
-                        ));
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    // -----------------------------------------------------------------------
-    // What a state REFERENCES
-    // -----------------------------------------------------------------------
-
-    /// `$` terms that are not variables.
-    ///
-    /// `$states` is the reserved context object Step Functions exposes to an
-    /// expression (`$states.input`, `$states.context`, `$states.result`), not a
-    /// variable a state assigned.
-    const RESERVED_TERMS: &[&str] = &["states"];
-
-    /// The variables each state of `definition` references, keyed by state name.
-    ///
-    /// `DescribeStateMachine`'s `variableReferences` is "a map of state name to a
-    /// list of variables referenced by that state. States that do not use variable
-    /// references will not be shown in the response" — so a state that references
-    /// none is absent, and a definition whose states reference none answers an empty
-    /// map, which the caller sees as no member at all.
-    ///
-    /// A variable reference is a `$name` term of one of the state's own
-    /// EXPRESSIONS, which is where both of the service's query languages read one:
-    ///
-    /// * a JSONata expression, which the language delimits with `{%` and `%}` (the
-    ///   `Assign`, `Output`, `Arguments`, `Condition`, … members of a state whose
-    ///   `QueryLanguage` is JSONata);
-    /// * a JSONPath reference field, which the Amazon States Language spells as a
-    ///   member whose name ends in `.$` and whose value is a path or a reference.
-    ///
-    /// Nothing else in the state is scanned, so a literal `Result` that happens to
-    /// carry a `$` is not mistaken for a reference. A nested `States` map — a
-    /// `Parallel` branch or a `Map` processor — is walked as the states it declares,
-    /// so each state's references are reported under ITS own name and never folded
-    /// into its parent's.
-    ///
-    /// The definition is parsed with `serde_json`, whose own recursion limit bounds
-    /// how deep the walk below can go; the extraction of the `$name` terms from one
-    /// expression is lexical, which is why it needs no expression parser (and there
-    /// is no maintained Rust crate that parses JSONata).
-    pub fn variable_references(definition: &str) -> BTreeMap<String, Vec<String>> {
-        let mut references = BTreeMap::new();
-        let Ok(document) = serde_json::from_str::<Value>(definition) else {
-            return references;
-        };
-        if let Some(states) = document.get("States").and_then(Value::as_object) {
-            collect_state_references(states, &mut references);
-        }
-        references
-    }
-
-    /// Report the references of every state `states` declares, and of every state
-    /// nested inside one of them.
-    ///
-    /// The Amazon States Language scopes a state name to the machine it is declared
-    /// in, so a `Parallel` branch may declare a name a top-level state also uses.
-    /// The map is flat, as the wire shape is, so two states of one name are MERGED
-    /// rather than one silently replacing the other.
-    fn collect_state_references(
-        states: &Map<String, Value>,
-        into: &mut BTreeMap<String, Vec<String>>,
-    ) {
-        for (name, state) in states {
-            let mut own = BTreeSet::new();
-            scan_state(state, false, &mut own, into);
-            if own.is_empty() {
-                continue;
-            }
-            let entry = into.entry(name.clone()).or_default();
-            own.extend(entry.drain(..));
-            entry.extend(own);
-        }
-    }
-
-    /// Walk one state, collecting ITS references into `own` and the references of
-    /// any state nested inside it into `nested`.
-    ///
-    /// `reference_field` is whether the value being walked is the value of a `.$`
-    /// member, which is what makes a JSONPath string a reference rather than a
-    /// literal.
-    fn scan_state(
-        value: &Value,
-        reference_field: bool,
-        own: &mut BTreeSet<String>,
-        nested: &mut BTreeMap<String, Vec<String>>,
-    ) {
-        match value {
-            Value::String(text) => {
-                for expression in jsonata_expressions(text) {
-                    scan_expression(expression, own);
-                }
-                if reference_field {
-                    scan_expression(text, own);
-                }
-            }
-            Value::Array(items) => {
-                for item in items {
-                    scan_state(item, reference_field, own, nested);
-                }
-            }
-            Value::Object(members) => {
-                // A nested state machine — a `Parallel` branch, a `Map`'s
-                // `ItemProcessor`/`Iterator` — is an object carrying BOTH a string
-                // `StartAt` and an object `States`, exactly as the top-level
-                // definition does. Requiring the pair is what keeps a literal
-                // payload member that happens to be called `States` from being
-                // walked as states and injecting names of its own.
-                let sub_machine = members
-                    .get("StartAt")
-                    .and_then(Value::as_str)
-                    .is_some_and(|start_at| !start_at.is_empty());
-                for (member, child) in members {
-                    match child.as_object() {
-                        Some(states) if member == "States" && sub_machine => {
-                            collect_state_references(states, nested);
-                        }
-                        _ => scan_state(child, member.ends_with(".$"), own, nested),
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Every JSONata expression `text` carries: the language embeds one between
-    /// `{%` and `%}`.
-    fn jsonata_expressions(text: &str) -> Vec<&str> {
-        let mut expressions = Vec::new();
-        let mut rest = text;
-        while let Some(open) = rest.find("{%") {
-            let after = &rest[open + 2..];
-            let Some(close) = after.find("%}") else {
-                break;
-            };
-            expressions.push(&after[..close]);
-            rest = &after[close + 2..];
-        }
-        expressions
-    }
-
-    /// Every variable one expression references.
-    ///
-    /// A term is `$` followed by an identifier. `$$` names the context, `$` alone
-    /// the state's input, `$name(` is a function call and [`RESERVED_TERMS`] names
-    /// the context object — none of them is a variable.
-    fn scan_expression(expression: &str, into: &mut BTreeSet<String>) {
-        let bytes = expression.as_bytes();
-        let mut index = 0;
-        while let Some(offset) = expression[index..].find('$') {
-            let start = index + offset;
-            let mut end = start + 1;
-            while bytes
-                .get(end)
-                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-            {
-                end += 1;
-            }
-            index = end.max(start + 1);
-            let name = &expression[start + 1..end];
-            let identifier = name
-                .as_bytes()
-                .first()
-                .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_');
-            if !identifier
-                || (start > 0 && bytes[start - 1] == b'$')
-                || bytes.get(end) == Some(&b'(')
-                || RESERVED_TERMS.contains(&name)
-            {
-                continue;
-            }
-            into.insert(name.to_string());
-        }
-    }
-
-    /// Walk `definition` from its `StartAt` state with `input` as the first state's
-    /// input, and report what happened.
-    pub fn run(definition: &str, input: &str, start: SystemTime) -> Run {
-        let mut steps: Vec<Step> = Vec::new();
-        let mut elapsed = Duration::ZERO;
-
-        let document: Value = match serde_json::from_str(definition) {
-            Ok(document) => document,
-            Err(error) => {
-                return runtime_failure(
-                    steps,
-                    elapsed,
-                    format!("the state machine definition is not valid JSON: {error}"),
-                );
-            }
-        };
-        let (Some(start_at), Some(states)) = (
-            document.get("StartAt").and_then(Value::as_str),
-            document.get("States").and_then(Value::as_object),
-        ) else {
-            return runtime_failure(
-                steps,
-                elapsed,
-                "the state machine definition carries no 'StartAt' and 'States' pair".to_string(),
-            );
-        };
-        // The execution input is the FIRST state's input document. It is parsed only
-        // to check that it is JSON: what the walk carries on is the caller's own
-        // bytes.
-        if let Err(error) = serde_json::from_str::<Value>(input) {
-            return runtime_failure(
-                steps,
-                elapsed,
-                format!("the execution input is not valid JSON: {error}"),
-            );
-        }
-        let mut current: String = input.to_string();
-
-        let mut name = start_at.to_string();
-        for _ in 0..MAX_STATE_TRANSITIONS {
-            let Some(state) = states.get(&name).and_then(Value::as_object) else {
-                return runtime_failure(
-                    steps,
-                    elapsed,
-                    format!("state '{name}' is not declared by the state machine"),
-                );
-            };
-            let state_type = state.get("Type").and_then(Value::as_str).unwrap_or_default();
-            if !EXECUTED_STATE_TYPES.contains(&state_type) {
-                return runtime_failure(
-                    steps,
-                    elapsed,
-                    format!(
-                        "state '{name}' is of type '{state_type}', which this emulator does not \
-                         execute, so nothing was run for it"
-                    ),
-                );
-            }
-            if let Some(member) = unexecutable_member(state_type, state) {
-                return runtime_failure(
-                    steps,
-                    elapsed,
-                    format!(
-                        "state '{name}' carries the member '{member}', which this emulator does \
-                         not interpret, so nothing was run for it"
-                    ),
-                );
-            }
-            match state_type {
-                "Pass" => {
-                    steps.push(step("PassStateEntered", &name, elapsed));
-                    // A `Pass` state's output is its `Result` when it declares one,
-                    // and its input unchanged otherwise. A `Result` is a value of the
-                    // PARSED definition, so what the state puts out is that value's
-                    // own encoding; the pass-through case carries the input
-                    // document's bytes on, because the state did not transform it.
-                    if let Some(result) = state.get("Result") {
-                        current = result.to_string();
-                    }
-                    steps.push(step("PassStateExited", &name, elapsed));
-                }
-                "Wait" => {
-                    steps.push(step("WaitStateEntered", &name, elapsed));
-                    match wait_duration(state, start, elapsed) {
-                        Ok(duration) => elapsed += duration,
-                        Err(why) => {
-                            return runtime_failure(steps, elapsed, format!("state '{name}': {why}"));
-                        }
-                    }
-                    steps.push(step("WaitStateExited", &name, elapsed));
-                }
-                "Succeed" => {
-                    steps.push(step("SucceedStateEntered", &name, elapsed));
-                    steps.push(step("SucceedStateExited", &name, elapsed));
-                    return success(steps, elapsed, &current);
-                }
-                // A `Fail` state ends the execution with the error and cause it
-                // declares, both of which ASL leaves optional.
-                _ => {
-                    steps.push(step("FailStateEntered", &name, elapsed));
-                    return failure(
-                        steps,
-                        elapsed,
-                        state.get("Error").and_then(Value::as_str).map(str::to_string),
-                        state.get("Cause").and_then(Value::as_str).map(str::to_string),
-                    );
-                }
-            }
-            if state.get("End").and_then(Value::as_bool) == Some(true) {
-                return success(steps, elapsed, &current);
-            }
-            match state.get("Next").and_then(Value::as_str) {
-                Some(next) => name = next.to_string(),
-                None => {
-                    return runtime_failure(
-                        steps,
-                        elapsed,
-                        format!("state '{name}' carries neither 'Next' nor \"End\": true"),
-                    );
-                }
-            }
-        }
-        runtime_failure(
-            steps,
-            elapsed,
-            format!(
-                "the execution made more than the {MAX_STATE_TRANSITIONS} state transitions this \
-                 emulator runs, so it was stopped"
-            ),
-        )
-    }
-
-    /// How long a `Wait` state waits.
-    ///
-    /// `Seconds` is the caller's own figure and keeps its value; `Timestamp` is an
-    /// instant, so the wait is however much of it is still ahead of the run.
-    fn wait_duration(
-        state: &Map<String, Value>,
-        start: SystemTime,
-        elapsed: Duration,
-    ) -> Result<Duration, String> {
-        if let Some(seconds) = state.get("Seconds") {
-            let seconds = seconds
-                .as_u64()
-                .ok_or_else(|| "'Seconds' must be a non-negative whole number".to_string())?;
-            if seconds > MAX_WAIT_SECONDS {
-                return Err(format!(
-                    "'Seconds' is {seconds}, more than the {MAX_WAIT_SECONDS} seconds a 'Wait' \
-                     state may wait for"
-                ));
-            }
-            return Ok(Duration::from_secs(seconds));
-        }
-        if let Some(timestamp) = state.get("Timestamp") {
-            let text = timestamp
-                .as_str()
-                .ok_or_else(|| "'Timestamp' must be an ISO 8601 string".to_string())?;
-            let due = ::aws_smithy_types::DateTime::from_str(
-                text,
-                ::aws_smithy_types::date_time::Format::DateTime,
-            )
-            .map_err(|error| format!("'Timestamp' is not an ISO 8601 instant: {error}"))?;
-            let due_millis = due
-                .to_millis()
-                .map_err(|error| format!("'Timestamp' is out of range: {error}"))?;
-            let reached = super::epoch_millis(start)
-                .saturating_add(i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX));
-            // A `Timestamp` already behind the run is no wait at all; one further
-            // ahead than a `Wait` may wait for is out of range, like an over-maximum
-            // `Seconds`, and is NOT silently shortened to the maximum.
-            let remaining = u64::try_from(due_millis.saturating_sub(reached)).unwrap_or(0);
-            if remaining > MAX_WAIT_SECONDS.saturating_mul(1_000) {
-                return Err(format!(
-                    "'Timestamp' is {text}, further ahead than the {MAX_WAIT_SECONDS} seconds a \
-                     'Wait' state may wait for"
-                ));
-            }
-            return Ok(Duration::from_millis(remaining));
-        }
-        Err("a 'Wait' state must carry 'Seconds' or 'Timestamp'".to_string())
-    }
-
-    fn step(event_type: &'static str, state_name: &str, after: Duration) -> Step {
-        Step {
-            event_type,
-            state_name: Some(state_name.to_string()),
-            after,
-            terminal: false,
-        }
-    }
-
-    fn success(mut steps: Vec<Step>, elapsed: Duration, document: &str) -> Run {
-        // The document the walk carried, in the bytes it was written with: the
-        // execution's reported `output` is what the caller or the definition wrote,
-        // not a re-encoding of it.
-        let output = document.to_string();
-        // A state's output is bounded by what the service can report it through, so
-        // a run whose value outgrew that ends with ASL's own data-limit error rather
-        // than storing a payload no response could carry.
-        if output.len() > MAX_PAYLOAD_BYTES {
-            return failure(
-                steps,
-                elapsed,
-                Some(DATA_LIMIT_ERROR.to_string()),
-                Some(format!(
-                    "the execution output is {} bytes, more than the {MAX_PAYLOAD_BYTES} a state's \
-                     output may carry",
-                    output.len()
-                )),
-            );
-        }
-        steps.push(Step {
-            event_type: "ExecutionSucceeded",
-            state_name: None,
-            after: elapsed,
-            terminal: true,
-        });
-        Run {
-            status: super::EXECUTION_STATUS_SUCCEEDED,
-            output: Some(output),
-            error: None,
-            cause: None,
-            steps,
-            elapsed,
-        }
-    }
-
-    fn failure(
-        mut steps: Vec<Step>,
-        elapsed: Duration,
-        error: Option<String>,
-        cause: Option<String>,
-    ) -> Run {
-        steps.push(Step {
-            event_type: "ExecutionFailed",
-            state_name: None,
-            after: elapsed,
-            terminal: true,
-        });
-        Run {
-            status: super::EXECUTION_STATUS_FAILED,
-            output: None,
-            error,
-            cause,
-            steps,
-            elapsed,
-        }
-    }
-
-    /// A failure the interpreter itself raised, carrying ASL's own
-    /// [`RUNTIME_ERROR`] name and a cause that says what was not run.
-    fn runtime_failure(steps: Vec<Step>, elapsed: Duration, cause: String) -> Run {
-        failure(steps, elapsed, Some(RUNTIME_ERROR.to_string()), Some(cause))
-    }
-}
+pub mod asl;
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

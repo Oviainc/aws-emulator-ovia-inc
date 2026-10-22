@@ -204,7 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Phase 1, under the lock: resolve the execution, refuse what cannot be
         // redriven, and read what the re-run needs. The lock is released before the
         // walk, so no other request waits on an interpretation.
-        let (definition, execution_input, previous_event_id) = {
+        let (definition, execution_input, previous_event_id, context) = {
             let mut store = state.lock();
             // Settle first: an execution whose terminal status the clock already owed
             // is terminal when this call decides whether it can be redriven.
@@ -283,10 +283,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             };
+            // The context object (`$$`) the re-run reads is the SAME execution's
+            // identity: a redrive continues this execution rather than starting a
+            // new one, so `$$.Execution.Id` and `$$.Execution.Name` do not change.
+            let context = crate::state::asl::Context {
+                execution_arn: execution.arn.clone(),
+                execution_name: execution.name.clone(),
+                state_machine_arn: machine.arn.clone(),
+                state_machine_name: machine.name.clone(),
+                role_arn: machine.role_arn.clone(),
+            };
             (
                 machine.definition.clone(),
                 execution.input.clone(),
                 execution.last_event_id(),
+                context,
             )
         };
 
@@ -298,13 +309,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // successful steps produced the first time and then runs on; nothing about the
         // outcome is assumed. That outcome is owed to the clock, so the execution
         // reports `RUNNING` until then.
-        let (opening, pending) = crate::state::plan_run(
-            &definition,
-            &execution_input,
-            now,
-            crate::state::EVENT_EXECUTION_REDRIVEN,
-            previous_event_id,
-        );
+        let interpreted = {
+            let definition = definition.clone();
+            let execution_input = execution_input.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::state::plan_run(
+                    &definition,
+                    &execution_input,
+                    now,
+                    &context,
+                    crate::state::EVENT_EXECUTION_REDRIVEN,
+                    previous_event_id,
+                )
+            })
+            .await
+        };
+        let Ok((opening, pending)) = interpreted else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::INTERPRETER_UNAVAILABLE,
+            ));
+        };
 
         // Phase 3, under the lock again: record it. Every check is re-made, because
         // the execution could have been redriven or its state machine deleted while

@@ -284,7 +284,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Phase 1, under the lock: resolve the state machine and read what the run
         // needs. The lock is released before the walk, so no other request waits on
         // an interpretation.
-        let (machine_arn, machine_name, machine_type, definition, execution_name) = {
+        let (machine_arn, machine_name, machine_type, definition, role_arn, execution_name) = {
             let mut store = state.lock();
             store.settle(started);
             let Some(machine) = store.state_machines.get(&input.state_machine_arn) else {
@@ -309,11 +309,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            let (arn, name, sm_type, definition) = (
+            let (arn, name, sm_type, definition, role_arn) = (
                 machine.arn.clone(),
                 machine.name.clone(),
                 machine.sm_type.clone(),
                 machine.definition.clone(),
+                machine.role_arn.clone(),
             );
             // "If you don't provide a name for the execution, Step Functions
             // automatically generates a universally unique identifier (UUID) as the
@@ -323,7 +324,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(name) => name,
                 None => store.fresh_execution_name(),
             };
-            (arn, name, sm_type, definition, execution_name)
+            (arn, name, sm_type, definition, role_arn, execution_name)
         };
 
         // The execution ARN is built in the state machine's OWN region, so the two
@@ -335,13 +336,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // bounded by its own step budget, but it is the expensive part of this call,
         // so it does not hold the shared store. The outcome it computes is owed to
         // the clock, so the execution reports RUNNING until then.
-        let (history, pending) = crate::state::plan_run(
-            &definition,
-            &execution_input,
-            started,
-            crate::state::EVENT_EXECUTION_STARTED,
-            0,
-        );
+        //
+        // The context object (`$$`) a definition reads is this execution's own
+        // identity, which is already fixed by here: the ARN just minted, the name
+        // the caller gave or the store minted, and the state machine it runs.
+        let context = crate::state::asl::Context {
+            execution_arn: arn.clone(),
+            execution_name: execution_name.clone(),
+            state_machine_arn: machine_arn.clone(),
+            state_machine_name: machine_name.clone(),
+            role_arn: role_arn.clone(),
+        };
+        // The walk is CPU work a caller's definition sizes, so it runs on a blocking
+        // thread rather than on an async worker: an interpretation that reaches its
+        // own deadline (`asl::MAX_INTERPRET_DURATION`) then ends there instead of
+        // holding a worker the runtime needs for health, timeouts and shutdown.
+        let interpreted = {
+            let definition = definition.clone();
+            let execution_input = execution_input.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::state::plan_run(
+                    &definition,
+                    &execution_input,
+                    started,
+                    &context,
+                    crate::state::EVENT_EXECUTION_STARTED,
+                    0,
+                )
+            })
+            .await
+        };
+        let Ok((history, pending)) = interpreted else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::INTERPRETER_UNAVAILABLE,
+            ));
+        };
         let candidate = crate::state::Execution {
             arn: arn.clone(),
             state_machine_arn: machine_arn.clone(),
