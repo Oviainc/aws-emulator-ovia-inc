@@ -126,10 +126,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListApplicationsErrorModeled::InternalServerErrorException(
-                InternalServerErrorException {
-                    error_code: Some("500".to_string()),
-                    message: Some("the service state is unavailable".to_string()),
-                },
+                crate::state::internal_server_error("the service state is unavailable"),
             )
             .into());
         };
@@ -142,10 +139,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(|error| {
             ListApplicationsError::from(ListApplicationsErrorModeled::BadRequestException(
-                BadRequestException {
-                    error_code: Some("400".to_string()),
-                    message: Some(error.message().to_string()),
-                },
+                crate::state::bad_request(error.message()),
             ))
         })?;
 

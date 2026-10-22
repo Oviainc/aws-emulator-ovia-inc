@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateUserPoolClient
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateUserPoolClient`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints a `ClientId` (and a `ClientSecret` when asked for one), stores the app
+//! client on its user pool, and answers with the STORED client.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateUserPoolClient::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -327,20 +321,128 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateUserPoolClient` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateUserPoolClientErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateUserPoolClient"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        // "You cannot specify both GenerateSecret as true and provide a
+        // ClientSecret value" (`CreateUserPoolClient.ClientSecret`).
+        if input.generate_secret && input.client_secret.is_some() {
+            return Err(invalid_parameter(
+                "You cannot specify both GenerateSecret as true and provide a ClientSecret value"
+                    .to_string(),
+            ));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+        let pool = guard
+            .pool_mut(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+
+        // This emulator holds a pool's app clients in memory, so the store is
+        // bounded.
+        if pool.clients.len() >= crate::state::MAX_CLIENTS_PER_POOL {
+            return Err(limit_exceeded(format!(
+                "User pool {} holds at most {} app clients.",
+                input.user_pool_id,
+                crate::state::MAX_CLIENTS_PER_POOL
+            )));
+        }
+
+        let mut client_id = crate::state::new_client_id();
+        // A minted client id must name exactly one app client in this pool.
+        while pool.clients.contains_key(&client_id) {
+            client_id = crate::state::new_client_id();
+        }
+        let client_secret = input
+            .client_secret
+            .clone()
+            .or_else(|| input.generate_secret.then(crate::state::new_client_secret));
+        let client = crate::state::UserPoolClient {
+            client_id: client_id.clone(),
+            client_secret,
+            user_pool_id: pool.id.clone(),
+            client_name: input.client_name.clone(),
+            creation_date: now,
+            last_modified_date: now,
+            refresh_token_validity: input.refresh_token_validity,
+            access_token_validity: input.access_token_validity,
+            id_token_validity: input.id_token_validity,
+            token_validity_units: input.token_validity_units,
+            read_attributes: input.read_attributes,
+            write_attributes: input.write_attributes,
+            explicit_auth_flows: input.explicit_auth_flows.unwrap_or_else(|| {
+                crate::state::DEFAULT_EXPLICIT_AUTH_FLOWS
+                    .iter()
+                    .map(|flow| (*flow).to_string())
+                    .collect()
+            }),
+            supported_identity_providers: input.supported_identity_providers,
+            callback_urls: input.callback_ur_ls,
+            logout_urls: input.logout_ur_ls,
+            default_redirect_uri: input.default_redirect_uri,
+            allowed_oauth_flows: input.allowed_o_auth_flows,
+            allowed_oauth_scopes: input.allowed_o_auth_scopes,
+            allowed_oauth_flows_user_pool_client: input.allowed_o_auth_flows_user_pool_client,
+            analytics_configuration: input.analytics_configuration,
+            prevent_user_existence_errors: crate::state::effective_prevent_user_existence_errors(
+                input.prevent_user_existence_errors,
+            ),
+            // "If you don't include this parameter, token revocation is
+            // automatically activated for the new user pool client."
+            enable_token_revocation: input.enable_token_revocation.unwrap_or(true),
+            enable_propagate_additional_user_context_data: input
+                .enable_propagate_additional_user_context_data
+                .unwrap_or(false),
+            auth_session_validity: input.auth_session_validity,
+            refresh_token_rotation: input.refresh_token_rotation,
+        };
+        pool.clients.insert(client_id.clone(), client);
+
+        // Rendered from the STORED client, so the response is what a later read sees.
+        let stored = pool
+            .clients
+            .get(&client_id)
+            .ok_or_else(internal_error)?
+            .to_user_pool_client_type();
+        Ok(CreateUserPoolClientOutput {
+            user_pool_client: Some(stored),
+        })
     }
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> CreateUserPoolClientError {
+    CreateUserPoolClientErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException`, carrying `message`.
+fn invalid_parameter(message: String) -> CreateUserPoolClientError {
+    CreateUserPoolClientErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        reason_code: None,
+    })
+    .into()
+}
+
+/// This operation's `LimitExceededException` for a store at its bound.
+fn limit_exceeded(message: String) -> CreateUserPoolClientError {
+    CreateUserPoolClientErrorModeled::LimitExceededException(LimitExceededException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> CreateUserPoolClientError {
+    CreateUserPoolClientErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

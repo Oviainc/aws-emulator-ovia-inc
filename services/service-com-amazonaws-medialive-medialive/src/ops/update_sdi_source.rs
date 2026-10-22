@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateSdiSource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateSdiSource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateSdiSource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -96,7 +87,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-medialive-medialive.jso
 // here — hence the `UpdateSdiSourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.medialive#UpdateSdiSource")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.medialive#UpdateSdiSource",
+    // `NotFoundException` is a shape the SERVICE models, and one
+    // `DescribeSdiSource` and `DeleteSdiSource` declare, which this operation's
+    // error list omits: the real service answers an `SdiSourceId` that names no
+    // live source with it, so this operation needs it to say the same.
+    extra_errors = ["NotFoundException"]
+)]
 #[derive(Debug)]
 pub enum UpdateSdiSourceErrorModeled {
     BadGatewayException(BadGatewayException),
@@ -105,6 +103,7 @@ pub enum UpdateSdiSourceErrorModeled {
     ForbiddenException(ForbiddenException),
     GatewayTimeoutException(GatewayTimeoutException),
     InternalServerErrorException(InternalServerErrorException),
+    NotFoundException(NotFoundException),
     TooManyRequestsException(TooManyRequestsException),
 }
 
@@ -159,18 +158,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateSdiSource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSdiSourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateSdiSource"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        let mut state = state.lock();
+        // One lookup, two refusals told apart by what it finds: a source that was
+        // deleted is reported as already deleted, naming the id the request asked
+        // for, while an id no source ever had is simply not found. Both are
+        // `NotFoundException`, because neither leaves a source to change.
+        let source = match state.sdi_sources.get_mut(&input.sdi_source_id) {
+            Some(source) if !source.is_deleted() => source,
+            found => {
+                let message = if found.is_some() {
+                    format!("SdiSource {} already deleted", input.sdi_source_id)
+                } else {
+                    format!("SdiSource not found: {}", input.sdi_source_id)
+                };
+                return Err(UpdateSdiSourceErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(message),
+                })
+                .into());
+            }
+        };
+
+        // "Change some of the settings in an SdiSource": a member the request
+        // carries replaces the stored one, and a member it omits leaves that
+        // setting as it was.
+        if let Some(name) = input.name {
+            source.name = Some(name);
+        }
+        if let Some(mode) = input.mode {
+            source.mode = Some(mode);
+        }
+        if let Some(r#type) = input.r#type {
+            source.r#type = Some(r#type);
+        }
+
+        // Read back out of the store, so the response reports what was written
+        // rather than what the request asked for.
+        let sdi_source = state
+            .sdi_source_description(&input.sdi_source_id)
+            .ok_or_else(unavailable)?;
+        Ok(UpdateSdiSourceOutput {
+            sdi_source: Some(sdi_source),
+        })
     }
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to update the SdiSource in. A modelled server error,
+/// never a fresh engine (which would drop the write when this request returns).
+fn unavailable() -> UpdateSdiSourceError {
+    UpdateSdiSourceErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

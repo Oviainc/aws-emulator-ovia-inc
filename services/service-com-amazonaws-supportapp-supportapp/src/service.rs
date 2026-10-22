@@ -40,10 +40,55 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+use aws_smithy_schema_server::constraints;
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The error code this service names for a request it refused as invalid: the
+/// modelled `ValidationException`, which every Support App operation declares with
+/// `@httpError 400` ("Your request input doesn't meet the constraints that the Amazon
+/// Web Services Support App specifies"). It is also what the framework's default
+/// renderer answers, restated here because `override_refusal` replaces the code and
+/// the message together.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// A violation as this service states it: the framework's own clause, with a
+/// `@pattern` named WITHOUT the anchors the model brackets it with.
+///
+/// The Support App states the pattern a refused member must satisfy as the
+/// expression alone — `[\w\- ]+` for `awsAccountAlias`'s `^[\w\- ]+$` — because the
+/// clause already says the whole member must satisfy it, so the anchors would only
+/// restate the sentence. Every other clause, and the value the clause echoes, is the
+/// framework's unchanged.
+fn as_stated(violation: &Violation) -> Violation {
+    match &violation.kind {
+        ViolationKind::Pattern(pattern) => Violation {
+            kind: ViolationKind::Pattern(unanchored(pattern).to_string()),
+            ..violation.clone()
+        },
+        _ => violation.clone(),
+    }
+}
+
+/// `pattern` without a leading `^` or a trailing `$`. A trailing `$` escaped by a
+/// backslash is a literal dollar sign in the expression, not the end anchor, so it
+/// stays — and so does a `$` whose backslash is itself escaped.
+fn unanchored(pattern: &str) -> &str {
+    let body = pattern.strip_prefix('^').unwrap_or(pattern);
+    match body.strip_suffix('$') {
+        Some(stripped) => {
+            let backslashes = stripped.len() - stripped.trim_end_matches('\\').len();
+            if backslashes % 2 == 0 {
+                stripped
+            } else {
+                body
+            }
+        }
+        None => body,
+    }
+}
 
 /// The `com-amazonaws-supportapp-supportapp` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -97,16 +142,32 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it.
+        //
+        // The Support App answers a constraint violation in the standard validation
+        // envelope the framework already builds — `N validation error(s) detected: `
+        // over one clause per violation, each naming the rejected value and the
+        // member path — and names a `@pattern` without the anchors the model spells
+        // it with. The clauses therefore come from the framework's own renderer, so a
+        // constraint class added upstream cannot arrive with a sentence this file
+        // forgot to write; `as_stated` changes nothing but the pattern.
+        //
+        // The code stays the modelled `ValidationException` (HTTP 400), which is what
+        // the framework would have answered: only the wording changes. An
+        // authentication refusal keeps the framework's wording — it is not an
+        // input-constraint failure, and this service models `AccessDeniedException`
+        // for it only once a handler runs.
+        match refusal {
+            Refusal::Invalid(violations) => {
+                let stated: Vec<Violation> = violations.iter().map(as_stated).collect();
+                Some(Refused {
+                    code: VALIDATION_EXCEPTION.to_string(),
+                    message: constraints::envelope(&stated)?,
+                })
+            }
+            _ => None,
+        }
     }
 
     fn override_routing_error(

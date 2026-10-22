@@ -1,0 +1,550 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! How the Support App WORDS the failures it answers with.
+//!
+//! Three rules are under test, and each is service-wide rather than tied to one
+//! operation or one recorded request:
+//!
+//! 1. A request refused for the rule the model cannot express — the
+//!    `notifyOnCaseSeverity` / notification-flag combination documented on
+//!    `CreateSlackChannelConfigurationRequest$notifyOnCaseSeverity` — is answered 400
+//!    `ValidationException` whose message is service prose naming the OPERATION that
+//!    was called, restating the documented rule with the parameters spelled the way
+//!    the API spells them, and closing with "Try your request again.".
+//! 2. A request refused for a constraint the model DOES declare is answered in the
+//!    standard validation envelope (`N validation error(s) detected: ` over one
+//!    clause per violation, each naming the rejected value and the member path), with
+//!    a `@pattern` requirement stated WITHOUT the `^` / `$` anchors the model
+//!    brackets it with.
+//! 3. A Slack channel configuration this account does not hold is reported 404
+//!    `ResourceNotFoundException` with one template, built from the request's
+//!    identifying members in the order the request carries them (`teamId`, then
+//!    `channelId`), shared by every operation that looks one up.
+//!
+//! So the tests are TABLES spanning each class: both operations that enforce the
+//! severity rule, every severity level and flag combination on each side of it, both
+//! operations that look a configuration up, id pairs at both published `@length`
+//! bounds and in several forms, and a `@pattern` row for every patterned member this
+//! service declares — not only the `accountAlias` the issue cited. Each row's
+//! expected message is written out in full AND checked against the invariants of its
+//! rule, so a message that drifts back to an internal paraphrase fails twice.
+//!
+//! Every constraint quoted here comes from the model, via
+//! `smithy_query(query="operation", operation="CreateSlackChannelConfiguration,UpdateSlackChannelConfiguration,DeleteSlackChannelConfiguration,PutAccountAlias",
+//! model_path="services/service-com-amazonaws-supportapp-supportapp/smithy-model/com-amazonaws-supportapp-supportapp.json")`.
+
+use serde_json::{json, Value};
+
+use crate::slack_channel_configurations::{role_arn, Emulator, Reply};
+
+/// The clause stating the documented `all`/`high` rule: "If you specify high or all,
+/// you must specify true for at least one of the following parameters:
+/// notifyOnAddCorrespondenceToCase notifyOnCreateOrReopenCase notifyOnResolveCase"
+/// (`smithy_query(query="doc", shape="CreateSlackChannelConfigurationRequest", member="notifyOnCaseSeverity")`),
+/// in the service's own prose.
+const ALL_OR_HIGH_RULE: &str = "If NotifyOnCaseSeverity is all or high, you must enter true for at \
+                                least one of the following parameters: \
+                                NotifyOnCreateOrReopenCase, NotifyOnAddCorrespondenceToCase or \
+                                NotifyOnResolveCase.";
+
+/// The clause stating the other half of the same documented rule: "If you specify
+/// none, the following parameters must be null or false".
+const NONE_RULE: &str = "If NotifyOnCaseSeverity is none, the following parameters must be null or \
+                         false: NotifyOnCreateOrReopenCase, NotifyOnAddCorrespondenceToCase or \
+                         NotifyOnResolveCase.";
+
+/// `awsAccountAlias`'s `@pattern`, with the anchors the model spells it with stripped
+/// — which is what a clause reporting it must state. Model value: `^[\w\- ]+$`.
+const ACCOUNT_ALIAS_PATTERN: &str = r"[\w\- ]+";
+
+/// `teamId`'s and `channelId`'s `@pattern`, unanchored. Model value: `^\S+$`.
+const SLACK_ID_PATTERN: &str = r"\S+";
+
+/// `channelName`'s `@pattern`, unanchored. Model value: `^.+$`.
+const CHANNEL_NAME_PATTERN: &str = r".+";
+
+/// `roleArn`'s `@pattern`, unanchored. Model value:
+/// `^arn:aws:iam::[0-9]{12}:role/(.+)$`.
+const ROLE_ARN_PATTERN: &str = r"arn:aws:iam::[0-9]{12}:role/(.+)";
+
+/// `teamId` / `channelId` are `@length min 1 max 256`, so a 256-character id is the
+/// published upper bound rather than a value past it.
+const SLACK_ID_MAX_LEN: usize = 256;
+
+/// The envelope a Support App request-validation message is stated in.
+fn invalid_request(operation: &str, rule: &str) -> String {
+    format!("Your {operation} request isn't valid. {rule} Try your request again.")
+}
+
+/// The template a miss on a Slack channel configuration is reported with.
+fn not_found(team_id: &str, channel_id: &str) -> String {
+    format!("Slack channel configuration for team {team_id} and channel {channel_id} not found")
+}
+
+/// The single-violation validation envelope for a `@pattern` violation.
+fn pattern_refusal(value: &str, member: &str, pattern: &str) -> String {
+    format!(
+        "1 validation error detected: Value '{value}' at '{member}' failed to satisfy constraint: \
+         Member must satisfy regular expression pattern: {pattern}"
+    )
+}
+
+/// The `message` the reply carried, or a panic naming the whole reply: a refusal that
+/// says nothing is as bad as one that says the wrong thing.
+fn message_of(case: &str, reply: &Reply) -> String {
+    reply
+        .string("message")
+        .unwrap_or_else(|| panic!("case {case:?}: the refusal carries no message: {}", reply.body))
+}
+
+/// Require `reply` to be `status` / `error_type` and return the message it carried.
+fn refusal(case: &str, reply: &Reply, status: u16, error_type: &str) -> String {
+    assert_eq!(
+        reply.status, status,
+        "case {case:?}: expected HTTP {status}, got {} / {}",
+        reply.status, reply.body
+    );
+    assert_eq!(
+        reply.error_type, error_type,
+        "case {case:?}: expected {error_type}, got {:?}",
+        reply.error_type
+    );
+    message_of(case, reply)
+}
+
+/// The invariants of rule 1, checked on every row: the operation-named prose
+/// envelope, and no lowerCamel wire spelling of a parameter, which is what an
+/// internal paraphrase reads like.
+fn assert_service_prose(case: &str, operation: &str, message: &str) {
+    let prefix = format!("Your {operation} request isn't valid. ");
+    assert!(
+        message.starts_with(&prefix),
+        "case {case:?}: expected the message to open with {prefix:?}, got {message:?}"
+    );
+    assert!(
+        message.ends_with("Try your request again."),
+        "case {case:?}: expected the message to close with the retry sentence, got {message:?}"
+    );
+    for wire_spelling in [
+        "notifyOnCaseSeverity",
+        "notifyOnCreateOrReopenCase",
+        "notifyOnAddCorrespondenceToCase",
+        "notifyOnResolveCase",
+    ] {
+        assert!(
+            !message.contains(wire_spelling),
+            "case {case:?}: a parameter must be named as the API names it, not {wire_spelling:?}: \
+             got {message:?}"
+        );
+    }
+}
+
+/// The invariants of rule 2, checked on every refusal of a declared constraint: the
+/// standard envelope, and no anchor on any reported pattern.
+fn assert_validation_envelope(case: &str, message: &str) {
+    assert!(
+        message.starts_with("1 validation error detected: ")
+            || message
+                .split_once(" validation errors detected: ")
+                .is_some_and(|(count, _)| count.parse::<u32>().is_ok_and(|n| n > 1)),
+        "case {case:?}: expected the AWS validation envelope, got {message:?}"
+    );
+    for clause in message
+        .split_once(": ")
+        .map(|(_, clauses)| clauses)
+        .unwrap_or_default()
+        .split("; ")
+    {
+        if let Some((_, pattern)) =
+            clause.split_once("Member must satisfy regular expression pattern: ")
+        {
+            assert!(
+                !pattern.starts_with('^') && !pattern.ends_with('$'),
+                "case {case:?}: a reported pattern must carry no anchors, got {pattern:?}"
+            );
+        }
+    }
+}
+
+/// A create body every row starts from: valid in every member, so only what a row
+/// changes is refused.
+fn valid_create() -> Value {
+    json!({
+        "teamId": "T012ABCDEFG",
+        "channelId": "C01234A5BCD",
+        "notifyOnCaseSeverity": "high",
+        "notifyOnCreateOrReopenCase": true,
+        "channelRoleArn": role_arn("SupportAppRole"),
+    })
+}
+
+/// A create body carrying `severity` and the three notification flags as `flags`
+/// gives them, an absent flag being left out of the request entirely.
+fn create_with(severity: &str, flags: [Option<bool>; 3]) -> Value {
+    let mut body = json!({
+        "teamId": "T012ABCDEFG",
+        "channelId": "C01234A5BCD",
+        "notifyOnCaseSeverity": severity,
+        "channelRoleArn": role_arn("SupportAppRole"),
+    });
+    for (member, flag) in [
+        "notifyOnCreateOrReopenCase",
+        "notifyOnAddCorrespondenceToCase",
+        "notifyOnResolveCase",
+    ]
+    .into_iter()
+    .zip(flags)
+    {
+        if let Some(value) = flag {
+            body[member] = json!(value);
+        }
+    }
+    body
+}
+
+#[tokio::test]
+async fn the_all_or_high_severity_rule_is_stated_as_service_prose_naming_the_operation() {
+    // Rows differ in the severity that needs a flag and in HOW no flag is true:
+    // every flag omitted, every flag explicitly false, and mixtures of the two.
+    let create_rows: [(&str, &str, [Option<bool>; 3]); 6] = [
+        ("high, every flag omitted", "high", [None, None, None]),
+        (
+            "high, every flag false",
+            "high",
+            [Some(false), Some(false), Some(false)],
+        ),
+        (
+            "high, one flag false and two omitted",
+            "high",
+            [None, Some(false), None],
+        ),
+        ("all, every flag omitted", "all", [None, None, None]),
+        (
+            "all, every flag false",
+            "all",
+            [Some(false), Some(false), Some(false)],
+        ),
+        (
+            "all, two flags false and one omitted",
+            "all",
+            [Some(false), None, Some(false)],
+        ),
+    ];
+    let expected = invalid_request("CreateSlackChannelConfiguration", ALL_OR_HIGH_RULE);
+    for (label, severity, flags) in create_rows {
+        let emulator = Emulator::new();
+        let reply = emulator.create(create_with(severity, flags)).await;
+        let message = refusal(label, &reply, 400, "ValidationException");
+        assert_eq!(
+            message, expected,
+            "case {label:?}: expected {expected:?}, got {message:?}"
+        );
+        assert_service_prose(label, "CreateSlackChannelConfiguration", &message);
+        assert!(
+            emulator.listed("T012ABCDEFG", "C01234A5BCD").await.is_none(),
+            "case {label:?}: a refused create must store nothing"
+        );
+    }
+
+    // The same rule, the same prose, on the other operation that enforces it — which
+    // names ITSELF, because the message states which request was not valid.
+    let update_rows: [(&str, Value); 3] = [
+        (
+            "severity stays high, the stored flag turned off",
+            json!({ "notifyOnCaseSeverity": "high", "notifyOnCreateOrReopenCase": false }),
+        ),
+        (
+            "severity to all, the stored flag turned off",
+            json!({ "notifyOnCaseSeverity": "all", "notifyOnCreateOrReopenCase": false }),
+        ),
+        (
+            "only the stored flag turned off, severity left alone",
+            json!({ "notifyOnCreateOrReopenCase": false }),
+        ),
+    ];
+    let expected = invalid_request("UpdateSlackChannelConfiguration", ALL_OR_HIGH_RULE);
+    for (label, patch) in update_rows {
+        let emulator = Emulator::new();
+        assert_eq!(
+            emulator.create(valid_create()).await.status,
+            200,
+            "case {label:?}: the fixture configuration must be created"
+        );
+        let mut body = patch;
+        body["teamId"] = json!("T012ABCDEFG");
+        body["channelId"] = json!("C01234A5BCD");
+        let reply = emulator.update(body).await;
+        let message = refusal(label, &reply, 400, "ValidationException");
+        assert_eq!(
+            message, expected,
+            "case {label:?}: expected {expected:?}, got {message:?}"
+        );
+        assert_service_prose(label, "UpdateSlackChannelConfiguration", &message);
+    }
+}
+
+#[tokio::test]
+async fn the_none_severity_rule_is_stated_in_the_same_service_prose() {
+    // The other side of the documented rule, over which flag is the true one.
+    let create_rows: [(&str, [Option<bool>; 3]); 4] = [
+        ("none with create-or-reopen true", [Some(true), None, None]),
+        ("none with add-correspondence true", [None, Some(true), None]),
+        ("none with resolve true", [None, None, Some(true)]),
+        (
+            "none with every flag true",
+            [Some(true), Some(true), Some(true)],
+        ),
+    ];
+    let expected = invalid_request("CreateSlackChannelConfiguration", NONE_RULE);
+    for (label, flags) in create_rows {
+        let emulator = Emulator::new();
+        let reply = emulator.create(create_with("none", flags)).await;
+        let message = refusal(label, &reply, 400, "ValidationException");
+        assert_eq!(
+            message, expected,
+            "case {label:?}: expected {expected:?}, got {message:?}"
+        );
+        assert_service_prose(label, "CreateSlackChannelConfiguration", &message);
+    }
+
+    // And on update, where the offending flag is the one the record already HOLDS.
+    let label = "severity to none while a stored flag is true";
+    let emulator = Emulator::new();
+    assert_eq!(
+        emulator.create(valid_create()).await.status,
+        200,
+        "case {label:?}: the fixture configuration must be created"
+    );
+    let reply = emulator
+        .update(json!({
+            "teamId": "T012ABCDEFG",
+            "channelId": "C01234A5BCD",
+            "notifyOnCaseSeverity": "none",
+        }))
+        .await;
+    let message = refusal(label, &reply, 400, "ValidationException");
+    let expected = invalid_request("UpdateSlackChannelConfiguration", NONE_RULE);
+    assert_eq!(
+        message, expected,
+        "case {label:?}: expected {expected:?}, got {message:?}"
+    );
+    assert_service_prose(label, "UpdateSlackChannelConfiguration", &message);
+}
+
+#[tokio::test]
+async fn a_configuration_this_account_does_not_hold_is_reported_with_one_template() {
+    let emulator = Emulator::new();
+    // A stored neighbour, so each 404 is about the named pair and not an empty store.
+    assert_eq!(
+        emulator.create(valid_create()).await.status,
+        200,
+        "the stored neighbour must be created"
+    );
+
+    let longest_id = "T".repeat(SLACK_ID_MAX_LEN);
+    // Rows differ in the FORM and LENGTH of the ids the template interpolates: the
+    // recorded Slack shapes, both published `@length` bounds, punctuation, and a pair
+    // that reuses the stored team with an unconfigured channel.
+    let rows: [(&str, &str, &str); 5] = [
+        ("Slack-shaped ids", "T999ZZZZZZZ", "C999ZZZZZZZ"),
+        ("single-character ids", "t", "c"),
+        ("ids at the length maximum", &longest_id, &longest_id),
+        ("punctuated ids", "T-0_1.2", "C#9/x"),
+        ("the stored team, another channel", "T012ABCDEFG", "C-other"),
+    ];
+    for (label, team_id, channel_id) in rows {
+        let expected = not_found(team_id, channel_id);
+
+        let case = format!("{label} / delete");
+        let reply = emulator.delete(team_id, channel_id).await;
+        let message = refusal(&case, &reply, 404, "ResourceNotFoundException");
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
+        );
+
+        let case = format!("{label} / update");
+        let reply = emulator
+            .update(json!({ "teamId": team_id, "channelId": channel_id }))
+            .await;
+        let message = refusal(&case, &reply, 404, "ResourceNotFoundException");
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
+        );
+    }
+
+    // None of those refusals touched the stored neighbour.
+    assert!(
+        emulator.listed("T012ABCDEFG", "C01234A5BCD").await.is_some(),
+        "a refused lookup must leave the stored configuration alone"
+    );
+}
+
+#[tokio::test]
+async fn a_pattern_violation_states_the_model_pattern_without_its_anchors() {
+    let emulator = Emulator::new();
+
+    // One row per patterned member this service declares, each with a value that
+    // violates its `@pattern` and nothing else: the cited `accountAlias` is one row.
+    let mut team_space = valid_create();
+    team_space["teamId"] = json!("T012 ABCDEFG");
+    let mut channel_space = valid_create();
+    channel_space["channelId"] = json!("C0123 45");
+    let mut newline_name = valid_create();
+    newline_name["channelName"] = json!("first\nsecond");
+    let mut bad_role = valid_create();
+    bad_role["channelRoleArn"] = json!("arn:aws:iam::ABCDEFGHIJKL:role/SupportAppRole");
+
+    let rows: [(&str, &str, Value, &str, &str, &str); 6] = [
+        (
+            "accountAlias outside its charset",
+            "put-account-alias",
+            json!({ "accountAlias": "bad alias!" }),
+            "bad alias!",
+            "accountAlias",
+            ACCOUNT_ALIAS_PATTERN,
+        ),
+        (
+            "teamId with a space",
+            "create-slack-channel-configuration",
+            team_space,
+            "T012 ABCDEFG",
+            "teamId",
+            SLACK_ID_PATTERN,
+        ),
+        (
+            "channelId with a space",
+            "create-slack-channel-configuration",
+            channel_space,
+            "C0123 45",
+            "channelId",
+            SLACK_ID_PATTERN,
+        ),
+        (
+            "channelName spanning a line break",
+            "create-slack-channel-configuration",
+            newline_name,
+            "first\nsecond",
+            "channelName",
+            CHANNEL_NAME_PATTERN,
+        ),
+        (
+            "channelRoleArn without a twelve-digit account",
+            "create-slack-channel-configuration",
+            bad_role,
+            "arn:aws:iam::ABCDEFGHIJKL:role/SupportAppRole",
+            "channelRoleArn",
+            ROLE_ARN_PATTERN,
+        ),
+        (
+            "channelId with a space on a delete",
+            "delete-slack-channel-configuration",
+            json!({ "teamId": "T012ABCDEFG", "channelId": "C0123 45" }),
+            "C0123 45",
+            "channelId",
+            SLACK_ID_PATTERN,
+        ),
+    ];
+
+    for (label, path, body, value, member, pattern) in rows {
+        let reply = emulator.call(path, body).await;
+        let message = refusal(label, &reply, 400, "ValidationException");
+        let expected = pattern_refusal(value, member, pattern);
+        assert_eq!(
+            message, expected,
+            "case {label:?}: expected {expected:?}, got {message:?}"
+        );
+        assert_validation_envelope(label, &message);
+    }
+}
+
+#[tokio::test]
+async fn every_other_constraint_class_keeps_the_standard_clause() {
+    let emulator = Emulator::new();
+
+    // Only the pattern clause changes: a length bound, an absent required member and
+    // an enumerated value set are reported exactly as the standard envelope states
+    // them. `accountAlias` is `@length min 1 max 30`, so 31 characters is one past
+    // the published maximum.
+    let too_long = "a".repeat(31);
+    let reply = emulator.put_alias(&too_long).await;
+    let message = refusal("alias one past the length maximum", &reply, 400, "ValidationException");
+    let expected = format!(
+        "1 validation error detected: Value '{too_long}' at 'accountAlias' failed to satisfy \
+         constraint: Member must have length less than or equal to 30"
+    );
+    assert_eq!(
+        message, expected,
+        "case \"alias one past the length maximum\": expected {expected:?}, got {message:?}"
+    );
+    assert_validation_envelope("alias one past the length maximum", &message);
+
+    // The published minimum, from the other side: an empty alias is short AND outside
+    // the charset, so both clauses are reported, in one counted envelope.
+    let reply = emulator.put_alias("").await;
+    let message = refusal("empty alias", &reply, 400, "ValidationException");
+    let expected = format!(
+        "2 validation errors detected: Value '' at 'accountAlias' failed to satisfy constraint: \
+         Member must have length greater than or equal to 1; Value '' at 'accountAlias' failed to \
+         satisfy constraint: Member must satisfy regular expression pattern: \
+         {ACCOUNT_ALIAS_PATTERN}"
+    );
+    assert_eq!(
+        message, expected,
+        "case \"empty alias\": expected {expected:?}, got {message:?}"
+    );
+    assert_validation_envelope("empty alias", &message);
+
+    // An absent `@required` member names the null it was.
+    let mut without_team = valid_create();
+    without_team
+        .as_object_mut()
+        .expect("object")
+        .remove("teamId");
+    let reply = emulator.create(without_team).await;
+    let message = refusal("teamId absent", &reply, 400, "ValidationException");
+    assert_eq!(
+        message,
+        "1 validation error detected: Value null at 'teamId' failed to satisfy constraint: \
+         Member must not be null",
+        "case \"teamId absent\": got {message:?}"
+    );
+    assert_validation_envelope("teamId absent", &message);
+
+    // A severity outside `NotificationSeverityLevel`'s value set.
+    let mut bad_severity = valid_create();
+    bad_severity["notifyOnCaseSeverity"] = json!("critical");
+    let reply = emulator.create(bad_severity).await;
+    let message = refusal("severity outside the value set", &reply, 400, "ValidationException");
+    assert!(
+        message.contains("at 'notifyOnCaseSeverity' failed to satisfy constraint: Member must \
+                          satisfy enum value set: ["),
+        "case \"severity outside the value set\": expected the enum clause, got {message:?}"
+    );
+    assert_validation_envelope("severity outside the value set", &message);
+
+    // Two violations in one request still render one envelope, counted.
+    let reply = emulator
+        .call(
+            "delete-slack-channel-configuration",
+            json!({ "teamId": "T012 ABCDEFG", "channelId": "C0123 45" }),
+        )
+        .await;
+    let message = refusal("two patterned members at once", &reply, 400, "ValidationException");
+    assert!(
+        message.starts_with("2 validation errors detected: "),
+        "case \"two patterned members at once\": expected a counted envelope, got {message:?}"
+    );
+    for member in ["teamId", "channelId"] {
+        assert!(
+            message.contains(&format!(
+                "at '{member}' failed to satisfy constraint: Member must satisfy regular \
+                 expression pattern: {SLACK_ID_PATTERN}"
+            )),
+            "case \"two patterned members at once\": expected a clause for {member:?}, got \
+             {message:?}"
+        );
+    }
+    assert_validation_envelope("two patterned members at once", &message);
+}

@@ -32,99 +32,11 @@
 //!   reports the feed unchanged;
 //! * an id no live feed has is `ResourceNotFoundException` (HTTP 404) on both.
 
+use crate::harness::{call, output_config, past_the_transition_span, router, REGION, SIGNING_NAME};
 use serde_json::{json, Value};
-use service_com_amazonaws_elementalinference_elementalinference::state::{
-    MAX_OUTPUTS_PER_FEED, TRANSITION_SPAN,
-};
-use service_com_amazonaws_elementalinference_elementalinference::EmulatedService;
+use service_com_amazonaws_elementalinference_elementalinference::state::MAX_OUTPUTS_PER_FEED;
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
-
-/// The region every request below is signed for.
-const REGION: &str = "us-west-2";
-
-/// This service's SigV4 signing name (`OPERATIONS.md`, "Wire protocol"): the router
-/// resolves the claiming service from it.
-const SIGNING_NAME: &str = "elemental-inference";
-
-/// Long enough for a clock-owed feed transition to have fallen due.
-fn past_the_transition_span() {
-    // A plain blocking sleep: the test's runtime has nothing else to run, and the
-    // service never sleeps for a transition — it stores the due instant.
-    std::thread::sleep(TRANSITION_SPAN + std::time::Duration::from_millis(250));
-}
-
-/// A router serving this service alone over one shared engine.
-fn router() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    // These requests carry an unsigned placeholder Authorization header, which is
-    // there only so the router can resolve the signing name.
-    router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
-}
-
-/// Send one request and return its status and parsed body (`Value::Null` when empty).
-async fn call(
-    router: &MultiServiceRouter,
-    method: &str,
-    uri: &str,
-    body: Option<Value>,
-) -> (u16, Value) {
-    let payload = body.map_or_else(Vec::new, |body| serde_json::to_vec(&body).unwrap());
-    let request = http::Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("content-type", "application/json")
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{REGION}/{SIGNING_NAME}/aws4_request, \
-                 SignedHeaders=host, Signature=deadbeef"
-            ),
-        )
-        .body(bytes::Bytes::from(payload))
-        .unwrap();
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let parsed = if response.body().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(response.body()).unwrap_or_else(|e| {
-            panic!(
-                "{method} {uri}: body is not JSON ({e}): {}",
-                String::from_utf8_lossy(response.body())
-            )
-        })
-    };
-    (status, parsed)
-}
-
-/// One `outputConfig` of each kind the `OutputConfig` union models
-/// (`smithy_query(query="shape",shape="OutputConfig")`: cropping, clipping,
-/// subtitling, contextualMetadata).
-fn output_config(kind: &str) -> Value {
-    match kind {
-        "cropping" => json!({"cropping": {"templateGroups": [
-            {"name": "group1", "templateUris": ["s3://templates/wide.psd"]}
-        ]}}),
-        "clipping" => json!({"clipping": {
-            "callbackMetadata": "season opener",
-            "dataSourceConfiguration": {"fixtureId": "fixture-1"}
-        }}),
-        "subtitling" => json!({"subtitling": {
-            "language": "eng-gb",
-            "aspectRatio": {"width": 16, "height": 9},
-            "profanityFilter": "CENSOR"
-        }}),
-        "contextualMetadata" => json!({"contextualMetadata": {
-            "summaryGeneration": "ENABLED",
-            "extendedAnalysis": "DISABLED"
-        }}),
-        other => panic!("no such OutputConfig member: {other}"),
-    }
-}
 
 /// One output, named `name`, carrying the `kind` config and `status`.
 fn output(name: &str, kind: &str, status: &str) -> Value {
@@ -859,6 +771,65 @@ async fn disassociate_releases_the_resource_and_archives_the_feed_irreversibly()
             error["__type"],
             json!("ValidationException"),
             "case {label:?}: that 400 is a ValidationException, got {error}"
+        );
+    }
+}
+
+/// A feed whose deletion has been accepted refuses both association calls, and the
+/// removal the clock already owes still completes.
+#[tokio::test]
+async fn a_feed_that_is_being_deleted_refuses_both_association_calls() {
+    let router = router();
+    let feed_outputs = json!([output("crop1", "cropping", "ENABLED")]);
+
+    // Whether the feed holds an association when the deletion is accepted.
+    for associated in [false, true] {
+        let id = available_feed(&router, "deleting-feed", feed_outputs.clone()).await;
+        if associated {
+            let (status, _) = associate(&router, &id, "source-media", json!([])).await;
+            assert_eq!(
+                status, 200,
+                "case associated={associated}: the claim is accepted"
+            );
+        }
+        let (status, _) = call(&router, "DELETE", &format!("/v1/feed/{id}"), None).await;
+        assert_eq!(
+            status, 202,
+            "case associated={associated}: DeleteFeed answers 202"
+        );
+
+        for (operation, answer) in [
+            (
+                "associate",
+                associate(&router, &id, "too-late", json!([])).await,
+            ),
+            (
+                "disassociate",
+                disassociate(&router, &id, "source-media").await,
+            ),
+        ] {
+            let label = format!("{operation} on a DELETING feed (associated={associated})");
+            let (status, error) = answer;
+            assert_eq!(
+                status, 400,
+                "case {label:?}: a feed being deleted takes neither call, got {status} \
+                 with {error}"
+            );
+            assert_eq!(
+                error["__type"],
+                json!("ValidationException"),
+                "case {label:?}: that 400 is a ValidationException, got {error}"
+            );
+        }
+
+        // And the removal the clock was owed still happens: neither refused call
+        // cancelled the accepted deletion.
+        past_the_transition_span();
+        let (status, gone) = call(&router, "GET", &format!("/v1/feed/{id}"), None).await;
+        assert_eq!(
+            status, 404,
+            "case associated={associated}: the accepted deletion still completed, got \
+             {status} with {gone}"
         );
     }
 }

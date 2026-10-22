@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDBInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDBInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDBInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: answers from the persisted instance records, honouring
+//! `DBInstanceIdentifier`, the documented filters, `MaxRecords` and `Marker`.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +149,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDBInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDBInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDBInstances"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state as st;
+
+        let _ = ctx;
+        let max_records =
+            st::resolve_max_records(input.max_records).map_err(Scaffolded::validation)?;
+        let filters = input.filters.unwrap_or_default();
+        for filter in &filters {
+            if !st::SUPPORTED_DESCRIBE_FILTERS.contains(&filter.name.as_str()) {
+                return Err(Scaffolded::validation(st::unsupported_filter_message(
+                    &filter.name,
+                )));
+            }
+        }
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(Scaffolded::not_implemented("DescribeDBInstances"));
+        };
+        let mut state = state.lock();
+        // The only write a read makes: statuses the clock already owed.
+        state.settle();
+
+        let candidates: Vec<String> = match input.db_instance_identifier.as_deref() {
+            Some(reference) => match state.resolve_instance_key(reference) {
+                Some(key) => vec![key],
+                None => {
+                    return Err(DescribeDBInstancesErrorModeled::DBInstanceNotFoundFault(
+                        DBInstanceNotFoundFault {
+                            message: Some(format!("DBInstance {reference} not found.")),
+                        },
+                    )
+                    .into())
+                }
+            },
+            None => state.instances.keys().cloned().collect(),
+        };
+
+        let selected: Vec<String> = candidates
+            .into_iter()
+            .filter(|key| {
+                state.instances.get(key).is_some_and(|instance| {
+                    let cluster = state.clusters.get(&instance.cluster_identifier);
+                    filters.iter().all(|filter| {
+                        st::filter_matches(
+                            &filter.name,
+                            &filter.values,
+                            &instance.engine,
+                            cluster,
+                        )
+                    })
+                })
+            })
+            .collect();
+
+        let (page_keys, marker) = st::page(&selected, input.marker.as_deref(), max_records);
+        let db_instances = page_keys
+            .iter()
+            .filter_map(|key| state.instances.get(key))
+            .map(|instance| {
+                st::instance_view(
+                    instance,
+                    state.clusters.get(&instance.cluster_identifier),
+                    &instance.status,
+                )
+            })
+            .collect();
+
+        Ok(DescribeDBInstancesOutput {
+            marker,
+            db_instances: Some(db_instances),
+        })
     }
 }
