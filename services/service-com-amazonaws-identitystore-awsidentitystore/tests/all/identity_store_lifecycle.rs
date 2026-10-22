@@ -313,7 +313,7 @@ pub(crate) async fn create_group(
 
 /// The `MembershipId`s `ListGroupMemberships` reports for `group`, walking every page
 /// with `max_results` and asserting no page exceeds it and nothing repeats.
-async fn walk_memberships(
+pub(crate) async fn walk_memberships(
     router: &MultiServiceRouter,
     store: &str,
     group: &str,
