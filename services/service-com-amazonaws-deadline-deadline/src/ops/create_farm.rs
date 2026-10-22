@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFarm
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFarm`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFarm::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a farm and persists it in this service's store under the `farmId` it mints.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +160,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFarm` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFarmErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFarm"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateFarmErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // `clientToken` is `@idempotencyToken`: a retry of the same create must answer
+        // with the resource the first call made, not make a second one.
+        let token = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::idempotency_key(Self::NAME, "", token));
+        if let Some(key) = token.as_deref() {
+            if let Some(farm_id) = store.remembered_resource(key) {
+                if store.farms.contains_key(farm_id) {
+                    return Ok(CreateFarmOutput {
+                        farm_id: farm_id.to_string(),
+                    });
+                }
+            }
+        }
+
+        // Every farm stored is one caller-driven insert that only a DeleteFarm releases,
+        // so the store carries a maximum and the create past it is refused with the
+        // operation's own modeled quota error rather than growing without bound.
+        if store.farms.len() >= crate::state::MAX_FARMS {
+            return Err(CreateFarmErrorModeled::ServiceQuotaExceededException(
+                crate::state::quota_exceeded(
+                    crate::state::RESOURCE_TYPE_FARM,
+                    "You exceeded the number of farms this emulator stores. Delete a farm \
+                     and try again.",
+                ),
+            )
+            .into());
+        }
+
+        let farm_id = store.mint_id("farm");
+        let farm = crate::state::Farm {
+            farm_id: farm_id.clone(),
+            display_name: input.display_name,
+            description: input.description,
+            kms_key_arn: input.kms_key_arn,
+            cost_scale_factor: input.cost_scale_factor,
+            tags: input.tags.unwrap_or_default(),
+            created_at: ::std::time::SystemTime::now(),
+            created_by: crate::state::caller_principal(ctx),
+            updated_at: None,
+            updated_by: None,
+            queues: ::std::collections::HashMap::new(),
+        };
+        store.farms.insert(farm_id.clone(), farm);
+        if let Some(key) = token {
+            store.remember_resource(key, &farm_id);
+        }
+
+        Ok(CreateFarmOutput { farm_id })
     }
 }

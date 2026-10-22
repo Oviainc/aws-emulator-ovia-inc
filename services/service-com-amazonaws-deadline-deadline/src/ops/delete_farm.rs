@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteFarm
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteFarm`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes a farm from this service's store, with everything held under it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteFarm::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The cascade is deliberate: `DeleteFarm`'s modeled error set
+//! (`smithy_query(query="operation", operation="DeleteFarm")`: AccessDenied,
+//! InternalServerError, ResourceNotFound, Throttling, Validation) carries no
+//! `ConflictException`, so "this farm still holds queues" is not a refusal this operation
+//! can express — and leaving the queues and jobs behind would leave resources no path can
+//! name, since the model reaches them only through their farm.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +140,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteFarm` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteFarmErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteFarm"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteFarmErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // The queues and jobs held under the farm go with it: the model reaches them only
+        // through the farm's path, so leaving them would leave resources nothing can name.
+        let Some(removed_farm) = store.farms.remove(&input.farm_id) else {
+            return Err(DeleteFarmErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+            )
+            .into());
+        };
+
+        // A client token outlives nothing: the tokens of every resource this delete
+        // removed are released with it, so the idempotency record cannot grow past the
+        // resources it describes. The template bytes those jobs held go back to the
+        // store's budget for the same reason.
+        let mut removed = vec![removed_farm.farm_id.clone()];
+        let mut released_template_bytes = 0;
+        for queue in removed_farm.queues.values() {
+            removed.push(queue.queue_id.clone());
+            for job in queue.jobs.values() {
+                removed.push(job.job_id.clone());
+                released_template_bytes += job.template.as_deref().map_or(0, str::len);
+            }
+        }
+        store.forget_resources(&removed);
+        store.release_template_bytes(released_template_bytes);
+
+        Ok(DeleteFarmOutput {})
     }
 }
