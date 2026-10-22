@@ -19,6 +19,8 @@ mod code_binding_lifecycle;
 mod code_bindings;
 #[path = "all/discovered_schema_inference.rs"]
 mod discovered_schema_inference;
+#[path = "all/error_body_codes.rs"]
+mod error_body_codes;
 #[path = "all/iso8601_timestamps.rs"]
 mod iso8601_timestamps;
 #[path = "all/registry_schema_lifecycle.rs"]

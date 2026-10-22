@@ -187,7 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the schema. DeleteSchemaVersion is what removes one of them.
         if registry.schemas.remove(&input.schema_name).is_none() {
             return Err(DeleteSchemaErrorModeled::NotFoundException(
-                crate::state::schema_not_found(&input.registry_name, &input.schema_name),
+                crate::state::schema_not_found(&input.schema_name),
             )
             .into());
         }

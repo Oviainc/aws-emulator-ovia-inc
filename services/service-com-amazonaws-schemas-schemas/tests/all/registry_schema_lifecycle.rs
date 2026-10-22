@@ -70,6 +70,14 @@ impl Emulator {
             .expect("a well-formed test request");
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
+        // The exception SHAPE name travels in this header; the error body's own `Code`
+        // member carries the service's code for the condition. A suite that asserts
+        // one against the other needs both, so the harness keeps the header.
+        let error_type = response
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         let raw = response.body().clone();
         let body = if raw.is_empty() {
             Value::Null
@@ -81,7 +89,11 @@ impl Emulator {
                 )
             })
         };
-        Answer { status, body }
+        Answer {
+            status,
+            body,
+            error_type,
+        }
     }
 }
 
@@ -90,6 +102,8 @@ impl Emulator {
 pub(crate) struct Answer {
     pub(crate) status: u16,
     pub(crate) body: Value,
+    /// The `x-amzn-errortype` header, where the exception shape name travels.
+    pub(crate) error_type: Option<String>,
 }
 
 impl Answer {
@@ -100,6 +114,21 @@ impl Answer {
             .and_then(Value::as_str)
             .unwrap_or("<no __type>")
             .rsplit('#')
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// The exception shape name the `x-amzn-errortype` header carries, with any
+    /// `#`-qualified namespace and any `:`-suffixed URI dropped, as a client reads it.
+    pub(crate) fn error_type(&self) -> String {
+        self.error_type
+            .as_deref()
+            .unwrap_or("<no x-amzn-errortype>")
+            .rsplit('#')
+            .next()
+            .unwrap_or_default()
+            .split(':')
             .next()
             .unwrap_or_default()
             .to_string()
