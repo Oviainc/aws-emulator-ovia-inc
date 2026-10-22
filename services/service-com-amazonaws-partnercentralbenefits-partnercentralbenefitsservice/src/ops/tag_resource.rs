@@ -22,9 +22,10 @@
 //! tagging call whose resource does not exist.
 //!
 //! The service's partner-entitlement gate ([`crate::state::entitlement_refusal`]), which
-//! fronts every benefit operation, does NOT front the tagging path: the recorded
-//! `TagResource` call is answered by the resource lookup from the same account whose
-//! benefit calls record the gate's 403 (see the citation in [`TagResource::handle`]).
+//! fronts every other operation of this service — the tag-READING one included — does NOT
+//! front the two tag-MUTATING operations: the recorded `TagResource` call is answered by
+//! the resource lookup from the same account whose benefit calls record the gate's
+//! refusal (see the citation in [`TagResource::handle`]).
 //!
 //! ## Shape of an operation
 //!
@@ -174,13 +175,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ARN, not by region).
         //
         // The partner-entitlement gate (`crate::state::entitlement_refusal`, applied by
-        // every benefit operation) is NOT applied here: the tagging path is not behind
-        // it. Recorded behaviour, corpus `simparity-behavioral-aws-v1`, unit
+        // every other operation of this service, the tag-READING one included) is NOT
+        // applied here: the tag-MUTATING path is not behind it. Recorded behaviour,
+        // corpus `simparity-behavioral-aws-v1`, unit
         // `partnercentral-benefits.tag-resource-malformed-arn-rejected`: a well-formed
         // `TagResource` naming a resource that does not exist is answered
         // ``("ResourceNotFoundException", "Catalog `null` not found")`` — the resource
         // lookup's own answer — from the same account whose `ListBenefits` and
-        // `CreateBenefitApplication` calls record the 403 entitlement refusal.
+        // `CreateBenefitApplication` calls record the entitlement refusal; the same
+        // asymmetry is recorded on the wire (corpus `simparity-wire-aws-v1`, fixture
+        // `partnercentral-benefits-list-and-tag-validation-error-paths`), where that
+        // fixture's `TagResource` step is answered `ResourceNotFoundException` and its
+        // `ListTagsForResource` step `AccessDeniedException`.
         let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(TagResourceErrorModeled::InternalServerException(

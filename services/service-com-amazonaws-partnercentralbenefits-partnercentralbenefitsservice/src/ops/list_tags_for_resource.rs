@@ -9,6 +9,19 @@
 //! `TagResource` put there — in tag-key order, and writes nothing. A resource carrying
 //! no tags reports an empty list.
 //!
+//! The service's partner-entitlement gate ([`crate::state::entitlement_refusal`]) fronts
+//! this read: a caller whose account holds no active AWS partner benefit is refused with
+//! the modelled `AccessDeniedException` BEFORE any resource is looked up, so the answer
+//! never says whether the resource exists. Recorded behaviour, corpus
+//! `simparity-wire-aws-v1`, fixture
+//! `partnercentral-benefits-list-and-tag-validation-error-paths` step `task#4`: the
+//! recorded `ListTagsForResource` answer for an un-entitled caller is
+//! `AccessDeniedException` with the entitlement sentence, exactly as `ListBenefits`'
+//! (step `task#1`). The status it carries is [`crate::state::ACCESS_DENIED_STATUS`].
+//!
+//! The two tag-MUTATING operations are the exception, and they are recorded that way:
+//! see `crate::ops::tag_resource`.
+//!
 //! A `resourceArn` that names no resource this service holds is refused with the modelled
 //! `ResourceNotFoundException` (HTTP 404), with the same message as the other tagging
 //! operations: see `crate::ops::tag_resource`.
@@ -154,11 +167,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `resourceArn`'s pattern and length are modelled, so the centralized walk has
         // already refused anything outside them; this read needs nothing from `ctx`.
-        //
-        // The partner-entitlement gate is not applied here, for the reason given in
-        // `crate::ops::tag_resource`: the recorded tagging calls are answered by the
-        // resource lookup, not by the gate.
         let _ = ctx;
+
+        // The entitlement gate, ahead of everything else this handler does — the
+        // authorization stage is not a lookup, so it cannot depend on resolving the
+        // resource first. See [`crate::state::entitlement_refusal`] and the citation in
+        // this module's header.
+        if let Some(denied) = crate::state::entitlement_refusal(&*self.engine) {
+            return Err(ListTagsForResourceErrorModeled::AccessDeniedException(denied).into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListTagsForResourceErrorModeled::InternalServerException(
                 InternalServerException {
@@ -173,7 +191,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     // This operation binds no `Catalog` member, so the lookup reports
-                    // the catalog the request named: none.
+                    // the catalog the request named: none. That absent catalog is what
+                    // the service itself reports on this path — see
+                    // [`crate::state::catalog_not_found_message`] for the recorded
+                    // tagging answers it is built from — so the tagging operations word
+                    // a failed lookup identically.
                     message: crate::state::catalog_not_found_message(None),
                 },
             )

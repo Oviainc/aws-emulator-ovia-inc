@@ -176,10 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // exist — and nothing was removed.
             return Err(
                 DeleteTargetAccountConfigurationErrorModeled::ResourceNotFoundException(
-                    crate::state::target_account_configuration_not_found(
-                        &input.experiment_template_id,
-                        &input.account_id,
-                    ),
+                    crate::state::target_account_configuration_not_found(),
                 )
                 .into(),
             );

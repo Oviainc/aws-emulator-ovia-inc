@@ -164,6 +164,26 @@ pub const TARGET_ACCOUNT_ID_FLOOR: usize = 12;
 /// `@length`.
 pub const TARGET_ACCOUNT_ID_CEILING: usize = 48;
 
+/// How many digits an AWS account number has — the account segment of an ARN.
+///
+/// Named here because [`is_iam_role_arn`] checks it on the account segment of a
+/// `roleArn`, which the model types as a plain `RoleArn` string.
+pub const ACCOUNT_ID_DIGITS: usize = 12;
+
+/// The message FIS answers for a target account configuration the named experiment
+/// TEMPLATE does not hold.
+///
+/// A constant rather than a request-derived string: the identical text is recorded for
+/// different template/account pairs, so neither half of the resource's name appears in
+/// it.
+pub const TARGET_ACCOUNT_CONFIGURATION_NOT_FOUND: &str = "TargetAccountConfiguration not found.";
+
+/// The message FIS answers for a `nextToken` no call of the list issued.
+///
+/// Also a constant: the text varies neither with the token nor with the collection being
+/// paginated, so every paginated list of this service refuses an unissued token with it.
+pub const INVALID_NEXT_TOKEN: &str = "The provided nextToken is invalid.";
+
 /// The marker every `nextToken` a list of target account configurations issues starts
 /// with — `ListTargetAccountConfigurations` over a template's configurations and
 /// `ListExperimentTargetAccountConfigurations` over an experiment's snapshot of them.
@@ -1170,11 +1190,88 @@ pub fn resolve_actions_mode(requested: Option<&str>) -> Result<String, Validatio
     Ok(requested.unwrap_or(DEFAULT_ACTIONS_MODE).to_string())
 }
 
+/// `None` when `role_arn` is absent or is a well-formed IAM role ARN; otherwise the
+/// `ValidationException` that refuses the member `member` carries.
+///
+/// `RoleArn` is modelled only as a string within `@length(20..2048)`, `pattern ^[\S]+$`,
+/// so the ARN SYNTAX of a role reference is a server-side rule: FIS refuses a value that
+/// satisfies those bounds but is not an IAM role ARN with a 400 `ValidationException`,
+/// before anything is persisted. Every member of this service that names an IAM role
+/// (`CreateExperimentTemplate.roleArn`, `CreateTargetAccountConfiguration.roleArn`,
+/// `UpdateTargetAccountConfiguration.roleArn`) goes through here.
+pub fn role_arn_refusal(member: &str, role_arn: Option<&str>) -> Option<ValidationException> {
+    let role_arn = role_arn?;
+    if is_iam_role_arn(role_arn) {
+        return None;
+    }
+    Some(invalid_input(format!(
+        "Value for {member} is not a valid ARN."
+    )))
+}
+
+/// True when `value` is a well-formed IAM role ARN:
+/// `arn:<partition>:iam::<12-digit account id>:role/<path segments>/<role name>`.
+///
+/// IAM is a global service, so the region segment of one of its ARNs is EMPTY and the
+/// account segment is an AWS account number (twelve digits). The resource is a role
+/// (`role/` followed by an optional path and the role name), and no segment of that path
+/// may be empty. The characters of the role name itself are NOT constrained here beyond
+/// what the modelled `pattern ^[\S]+$` already refuses: the rule this checks is the ARN's
+/// STRUCTURE.
+pub fn is_iam_role_arn(value: &str) -> bool {
+    // `splitn(6, ':')` keeps any further colon inside the resource segment, which
+    // [`is_iam_role_resource`] then refuses: an IAM role resource carries none.
+    let segments: Vec<&str> = value.splitn(6, ':').collect();
+    let ["arn", partition, "iam", "", account_id, resource] = segments.as_slice() else {
+        return false;
+    };
+    is_partition(partition) && is_account_id(account_id) && is_iam_role_resource(resource)
+}
+
+/// True when `value` has an AWS partition's shape (`aws`, `aws-cn`, `aws-us-gov`, …):
+/// non-empty lowercase alphanumeric segments joined by `-`.
+fn is_partition(value: &str) -> bool {
+    !value.is_empty()
+        && value.split('-').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        })
+}
+
+/// True when `value` is an AWS account number: exactly twelve decimal digits.
+fn is_account_id(value: &str) -> bool {
+    value.len() == ACCOUNT_ID_DIGITS && value.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// True when `value` is the resource segment of an IAM ROLE ARN: `role/`, then an
+/// optional path and the role name, with no empty segment and no colon.
+fn is_iam_role_resource(value: &str) -> bool {
+    let Some(path_and_name) = value.strip_prefix("role/") else {
+        return false;
+    };
+    // An empty value splits into one EMPTY segment, which the segment rule below already
+    // refuses: `role/` on its own names no role. The characters of a segment are not
+    // constrained here — `RoleArn`'s modelled `pattern ^[\S]+$` already refused
+    // whitespace at the boundary — so what this checks is the resource's STRUCTURE.
+    !path_and_name.contains(':') && path_and_name.split('/').all(|segment| !segment.is_empty())
+}
+
 /// The `ValidationException` payload for a request this service refuses.
 pub fn invalid_input(message: impl Into<String>) -> ValidationException {
     ValidationException {
         message: Some(message.into()),
     }
+}
+
+/// The `ValidationException` payload for a `nextToken` this service never issued.
+///
+/// FIS answers one constant for every paginated list of this service — the text does not
+/// vary with the token, the operation or the resource it paginates — so the message is
+/// built here rather than by each list handler.
+pub fn invalid_next_token() -> ValidationException {
+    invalid_input(INVALID_NEXT_TOKEN)
 }
 
 /// The `ResourceNotFoundException` payload for an experiment template id that names no
@@ -1202,29 +1299,30 @@ pub fn experiment_not_found(id: &str) -> ResourceNotFoundException {
 
 /// The `ResourceNotFoundException` payload for a (template, account) pair that names no
 /// target account configuration — "the specified resource cannot be found".
-pub fn target_account_configuration_not_found(
-    experiment_template_id: &str,
-    account_id: &str,
-) -> ResourceNotFoundException {
+///
+/// FIS answers the CONSTANT [`TARGET_ACCOUNT_CONFIGURATION_NOT_FOUND`] here: the text
+/// names neither the template nor the account, so it takes no argument.
+pub fn target_account_configuration_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!(
-            "No target account configuration found for account {account_id} \
-             in experiment template {experiment_template_id}"
-        )),
+        message: Some(TARGET_ACCOUNT_CONFIGURATION_NOT_FOUND.to_string()),
     }
 }
 
 /// The `ResourceNotFoundException` payload for an (experiment, account) pair that names
 /// no target account configuration on that experiment's snapshot — "the specified
 /// resource cannot be found".
+///
+/// Unlike the template-scoped miss ([`target_account_configuration_not_found`], a
+/// constant), FIS builds this message FROM THE REQUEST: it names the experiment first and
+/// then the target account.
 pub fn experiment_target_account_configuration_not_found(
     experiment_id: &str,
     account_id: &str,
 ) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(format!(
-            "No target account configuration found for account {account_id} \
-             in experiment {experiment_id}"
+            "TargetAccountConfiguration for experiment {experiment_id} \
+             and target account {account_id} not found"
         )),
     }
 }

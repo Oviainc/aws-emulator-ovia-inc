@@ -29,5 +29,7 @@ mod list_groups;
 mod list_users;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_group.rs"]
+mod update_group;
 #[path = "all/update_user_attributes.rs"]
 mod update_user_attributes;

@@ -79,7 +79,7 @@ impl Synthetics {
         }
     }
 
-    async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Answer {
+    pub(crate) async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Answer {
         let payload = body
             .map(|value| serde_json::to_vec(&value).expect("the test body serialises"))
             .unwrap_or_default();

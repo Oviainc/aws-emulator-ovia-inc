@@ -167,6 +167,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+
+        // The same documented prefix rule as `StartAssessment`, on this operation's own
+        // bucket members: `S3Bucket` is where the import file is read from and
+        // `s3bucketForReportData` where the import results would be uploaded. Both are
+        // only held to the prefix — the model marks `S3Bucket` `@required`, so the
+        // boundary validator has already refused its absence, and the report bucket is
+        // optional. Both run before the task is minted.
+        crate::state::check_bucket_usable(Some(input.s3_bucket.as_str()))
+            .map_err(StartImportFileTaskErrorModeled::ValidationException)?;
+        crate::state::check_bucket_usable(input.s3bucket_for_report_data.as_deref())
+            .map_err(StartImportFileTaskErrorModeled::ValidationException)?;
+
         let mut store = state.lock();
 
         // The store is bounded: past its quota an import is refused rather than adding

@@ -3,14 +3,19 @@
 #![forbid(unsafe_code)]
 //! Code more than one emulated service needs, as a path dependency.
 //!
-//! Today that is four things: [`claims_request`], the request-claim rule a
-//! service whose SigV4 signing name is SHARED with other services uses for its
-//! `Service::can_handle`; [`nth_path_segment`], for the rarer case of two such
-//! services publishing the SAME path space; [`stable_hex_id`], the one
-//! deterministic mixing function a service derives a wire-visible id with; and
-//! [`network`], the contract the account's EC2 network — which subnets a Region
-//! has — is modelled against, so no two services answer "does this subnet exist"
-//! differently.
+//! Today that is five things:
+//!
+//! * [`claims_request`], the request-claim rule a service whose SigV4 signing name is
+//!   SHARED with other services uses for its `Service::can_handle`;
+//! * [`nth_path_segment`], for the rarer case of two such services publishing the SAME
+//!   path space;
+//! * [`front_door`], the body-rejection layer an AWS REST service puts in front of its
+//!   application code, as a wrapper a service serves its operations behind;
+//! * [`stable_hex_id`], the one deterministic mixing function a service derives a
+//!   wire-visible id with;
+//! * [`network`], the contract the account's EC2 network — which subnets a Region has —
+//!   is modelled against, so no two services answer "does this subnet exist"
+//!   differently.
 //!
 //! # Why a shared rule
 //!
@@ -68,6 +73,7 @@
 //! each is covered by its own routing suite under `core/router/tests/all/`. Nothing new
 //! should inline the rule again — call this crate.
 
+pub mod front_door;
 pub mod network;
 
 use emulator_server::{resolve_route_key, service_from_target, ROOT_PATH_SEGMENT};

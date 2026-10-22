@@ -40,6 +40,18 @@
 //! place it can return an error its own model does not declare — `validation` above,
 //! for a service whose model carries no client-input error. Delete the wrapper and the
 //! handler has no way to refuse a bad request at all.
+//!
+//! ## Errors S3 documents but its model omits
+//!
+//! S3's REST API documents failures its Smithy model declares no error shape for
+//! (`BucketNotEmpty` 409, `InvalidArgument` 400, `EntityTooLarge` 400, `BadDigest` 400,
+//! `ServiceUnavailable` 503, `InternalError` 500, and the bucket-subresource
+//! `NoSuchBucketPolicy`/`NoSuchTagSet`/`MalformedPolicy`). A client branches on the HTTP
+//! status and the `<Code>`, so those cannot be answered as `ValidationException`;
+//! [`Scaffolded::unmodeled`] carries the documented code and status for exactly that
+//! case. Anything the model DOES model goes through the modeled channel — widen an
+//! operation that omits a shape the service declares with
+//! `#[operation_error(.., extra_errors = [".."])]` instead.
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
@@ -208,11 +220,15 @@ pub static UNMODELED_SCHEMA: Schema = Schema::new_struct(
 
 /// A rejection whose wire error code this service's model does not declare.
 ///
-/// S3's bucket subresource operations are the case this exists for: `PutBucketPolicy`,
+/// S3's model omits failures its REST API documents, and they are answered through this
+/// one channel so the code and status on the wire are the ones S3 sends. The bucket
+/// subresource operations are the case it was added for: `PutBucketPolicy`,
 /// `GetBucketPolicy`, `PutBucketTagging` and `GetBucketTagging` declare NO errors in the
 /// model, yet S3 answers `NoSuchBucket` (404), `NoSuchBucketPolicy` (404),
-/// `NoSuchTagSet` (404) and `MalformedPolicy` (400) on them. A client branches on the
-/// code, so the code has to be the one S3 sends.
+/// `NoSuchTagSet` (404) and `MalformedPolicy` (400) on them; the object-storage loop
+/// uses it for `BucketNotEmpty` (409), `InvalidArgument` (400), `EntityTooLarge` (400),
+/// `BadDigest` (400), `ServiceUnavailable` (503) and `InternalError` (500). A client
+/// branches on the code, so the code has to be the one S3 sends.
 #[derive(Debug, Clone)]
 pub struct Unmodeled {
     /// The wire error code (`<Code>` on restXml).
@@ -290,8 +306,10 @@ impl<E> Scaffolded<E> {
     ///
     /// Only for a code the emulated service demonstrably sends where the model names
     /// none — S3's bucket subresource operations model no errors at all, yet answer
-    /// `NoSuchBucket`, `NoSuchBucketPolicy`, `NoSuchTagSet` and `MalformedPolicy`.
-    /// Prefer a modeled variant whenever the model has one for the failure.
+    /// `NoSuchBucket`, `NoSuchBucketPolicy`, `NoSuchTagSet` and `MalformedPolicy`, and
+    /// the object-storage loop answers `BucketNotEmpty`, `InvalidArgument`,
+    /// `EntityTooLarge`, `BadDigest`, `ServiceUnavailable` and `InternalError` the same
+    /// way. Prefer a modeled variant whenever the model has one for the failure.
     pub fn unmodeled(code: &'static str, status: u16, message: impl Into<String>) -> Self {
         Self::Unmodeled(Unmodeled {
             code,
@@ -357,6 +375,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
+            // The documented wire code this failure carries, not a Rust variant name.
             Self::Unmodeled(e) => e.code,
         }
     }
@@ -381,7 +400,6 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // envelope carries the signal on the query protocols too.
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
-            // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
             // Same reason: the synthetic shapes carry no `awsQueryError` trait.
             Self::Unmodeled(_) => None,

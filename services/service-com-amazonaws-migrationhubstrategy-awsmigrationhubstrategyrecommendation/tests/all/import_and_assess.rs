@@ -69,8 +69,8 @@ fn matches_async_task_id(value: &str) -> bool {
 
 /// One emulator: a router carrying only this service, over one shared engine.
 ///
-/// `pub(crate)` so the refusal-wording suite beside this one drives the same emulator
-/// through the same harness rather than standing up a second copy of it.
+/// `pub(crate)` so the suites beside this one drive the same emulator through the same
+/// harness rather than standing up a second copy of it.
 pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -99,7 +99,7 @@ impl Answer {
     }
 }
 
-fn at(value: &Value, pointer: &str) -> Value {
+pub(crate) fn at(value: &Value, pointer: &str) -> Value {
     value.pointer(pointer).cloned().unwrap_or(Value::Null)
 }
 
@@ -138,27 +138,27 @@ pub(crate) async fn call(
     Answer { status, body }
 }
 
-async fn start_import(router: &MultiServiceRouter, request: Value) -> Answer {
+pub(crate) async fn start_import(router: &MultiServiceRouter, request: Value) -> Answer {
     call(router, "POST", "/start-import-file-task", Some(request)).await
 }
 
-async fn get_import(router: &MultiServiceRouter, id: &str) -> Answer {
+pub(crate) async fn get_import(router: &MultiServiceRouter, id: &str) -> Answer {
     call(router, "GET", &format!("/get-import-file-task/{id}"), None).await
 }
 
-async fn start_assessment(router: &MultiServiceRouter, request: Value) -> Answer {
+pub(crate) async fn start_assessment(router: &MultiServiceRouter, request: Value) -> Answer {
     call(router, "POST", "/start-assessment", Some(request)).await
 }
 
-async fn get_assessment(router: &MultiServiceRouter, id: &str) -> Answer {
+pub(crate) async fn get_assessment(router: &MultiServiceRouter, id: &str) -> Answer {
     call(router, "GET", &format!("/get-assessment/{id}"), None).await
 }
 
-async fn get_latest_assessment_id(router: &MultiServiceRouter) -> Answer {
+pub(crate) async fn get_latest_assessment_id(router: &MultiServiceRouter) -> Answer {
     call(router, "GET", "/get-latest-assessment-id", None).await
 }
 
-async fn stop_assessment(router: &MultiServiceRouter, id: &str) -> Answer {
+pub(crate) async fn stop_assessment(router: &MultiServiceRouter, id: &str) -> Answer {
     call(
         router,
         "POST",
@@ -191,7 +191,11 @@ fn reported_as(member: &str) -> Option<&'static str> {
 }
 
 /// A start request carrying only the three required members.
-fn minimal_import(name: &str) -> Value {
+///
+/// Every bucket name here begins with `migrationhub-strategy-`, the prefix each bucket
+/// member's documentation requires; the refusal of a name that does not is a table of
+/// its own in `assessment_error_paths.rs`.
+pub(crate) fn minimal_import(name: &str) -> Value {
     json!({"name": name, "S3Bucket": "migrationhub-strategy-import", "s3key": "servers.csv"})
 }
 
@@ -205,7 +209,7 @@ fn import_cases() -> Vec<(&'static str, Value)> {
             "a report bucket and a nested key",
             json!({
                 "name": "import_2",
-                "S3Bucket": "my-bucket",
+                "S3Bucket": "migrationhub-strategy-my-bucket",
                 "s3key": "inventory/2026/01/servers.csv",
                 "s3bucketForReportData": "migrationhub-strategy-reports",
             }),
@@ -215,7 +219,7 @@ fn import_cases() -> Vec<(&'static str, Value)> {
             "a data source type and one import group",
             json!({
                 "name": "a",
-                "S3Bucket": "bucket.with.dots",
+                "S3Bucket": "migrationhub-strategy-bucket.with.dots",
                 "s3key": "x",
                 "dataSourceType": DATA_SOURCE_TYPES[2],
                 "groupId": [{"name": "ExternalId", "value": "wave-1"}],
@@ -225,9 +229,9 @@ fn import_cases() -> Vec<(&'static str, Value)> {
             "every optional member, with two import groups",
             json!({
                 "name": "IMPORT-4_mixed-case_and-underscores",
-                "S3Bucket": "ab",
+                "S3Bucket": "migrationhub-strategy-ab",
                 "s3key": "a/".repeat(400) + "servers.csv",
-                "s3bucketForReportData": "my-bucket",
+                "s3bucketForReportData": "migrationhub-strategy-r",
                 "dataSourceType": DATA_SOURCE_TYPES[1],
                 "groupId": [
                     {"name": "ExternalId", "value": "wave-2"},
@@ -430,21 +434,34 @@ async fn an_unknown_import_file_task_id_is_refused_with_resource_not_found() {
     );
 }
 
+/// The smallest `StartAssessment` request the service accepts: the analysis-data bucket
+/// it cannot start without, named with the prefix its documentation requires.
+pub(crate) fn minimal_assessment() -> Value {
+    json!({"s3bucketForAnalysisData": "migrationhub-strategy-analysis"})
+}
+
 /// The `StartAssessment` requests every assessment case runs, differing along what the
 /// rule generalises over: how many targets, which condition, how many values per target,
-/// which data source type, and whether the buckets are named at all.
+/// which data source type, and whether the optional report bucket is named at all.
 fn assessment_cases() -> Vec<(&'static str, Value)> {
     vec![
-        ("no members at all", json!({})),
+        ("only the bucket the service requires", minimal_assessment()),
         (
             "the issue's single EQUALS target",
-            json!({"assessmentTargets": [
-                {"condition": "EQUALS", "name": "OS_NAME", "values": ["Linux"]},
-            ]}),
+            json!({
+                "s3bucketForAnalysisData": "migrationhub-strategy-analysis",
+                "assessmentTargets": [
+                    {"condition": "EQUALS", "name": "OS_NAME", "values": ["Linux"]},
+                ],
+            }),
         ),
         (
             "an empty target list",
-            json!({"assessmentTargets": [], "assessmentDataSourceType": ASSESSMENT_DATA_SOURCE_TYPES[1]}),
+            json!({
+                "s3bucketForAnalysisData": "migrationhub-strategy-a",
+                "assessmentTargets": [],
+                "assessmentDataSourceType": ASSESSMENT_DATA_SOURCE_TYPES[1],
+            }),
         ),
         (
             // A condition the issue did not cite, from the `Condition` catalog above.
@@ -469,7 +486,7 @@ fn assessment_cases() -> Vec<(&'static str, Value)> {
                     }))
                     .collect::<Vec<Value>>(),
                 "assessmentDataSourceType": ASSESSMENT_DATA_SOURCE_TYPES[2],
-                "s3bucketForAnalysisData": "my-bucket",
+                "s3bucketForAnalysisData": "migrationhub-strategy-analysis-data.1",
                 "s3bucketForReportData": "migrationhub-strategy-reports",
             }),
         ),
@@ -626,7 +643,7 @@ async fn an_assessments_server_count_comes_from_the_imports_in_state() {
                 });
         }
 
-        let id = start_assessment(&router, json!({}))
+        let id = start_assessment(&router, minimal_assessment())
             .await
             .string("/assessmentId");
         let reported = get_assessment(&router, &id).await;
@@ -727,9 +744,12 @@ async fn an_assessment_completes_when_the_clock_owes_it() {
     let router = emulator();
     let id = start_assessment(
         &router,
-        json!({"assessmentTargets": [
-            {"condition": "EQUALS", "name": "OS_NAME", "values": ["Linux"]},
-        ]}),
+        json!({
+            "s3bucketForAnalysisData": "migrationhub-strategy-analysis",
+            "assessmentTargets": [
+                {"condition": "EQUALS", "name": "OS_NAME", "values": ["Linux"]},
+            ],
+        }),
     )
     .await
     .string("/assessmentId");
@@ -757,82 +777,28 @@ async fn an_assessment_completes_when_the_clock_owes_it() {
     );
 }
 
-/// An assessment id that names no assessment is refused with each operation's own
-/// modelled error: `GetAssessment` models `ResourceNotFoundException` (404) and
-/// `StopAssessment`, which models none, answers `ValidationException` (400). Every row
-/// satisfies `AsyncTaskId`'s pattern, so the refusal comes from the handler and not from
-/// the boundary validator.
-#[tokio::test]
-async fn an_unknown_assessment_id_is_refused_by_each_operation() {
-    let router = emulator();
-    let known = start_assessment(&router, json!({}))
-        .await
-        .string("/assessmentId");
-
-    let cases = vec![
-        ("an unknown word", "nope".to_string()),
-        ("a single digit", "0".to_string()),
-        (
-            "an id of the minted shape that was never minted",
-            "assessment-ffffffffffff".to_string(),
-        ),
-        ("a colon-separated id", "task:0:does-not-exist".to_string()),
-        ("a known id with a suffix", format!("{known}-1")),
-    ];
-
-    for (case, id) in cases {
-        let got = get_assessment(&router, &id).await;
-        assert_eq!(
-            got.status, 404,
-            "case {case:?}: GetAssessment on {id:?} must answer HTTP 404, got {} with {:?}",
-            got.status, got.body
-        );
-        assert_eq!(
-            got.error_code(),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException for {id:?}, got {:?}",
-            got.body
-        );
-
-        let stopped = stop_assessment(&router, &id).await;
-        assert_eq!(
-            stopped.status, 400,
-            "case {case:?}: StopAssessment on {id:?} must answer HTTP 400, got {} with {:?}",
-            stopped.status, stopped.body
-        );
-        assert_eq!(
-            stopped.error_code(),
-            "ValidationException",
-            "case {case:?}: expected ValidationException for {id:?}, got {:?}",
-            stopped.body
-        );
-    }
-
-    // None of the refusals touched the assessment that does exist.
-    assert_eq!(
-        get_assessment(&router, &known).await.status,
-        200,
-        "the assessment that was started is still reported after the refusals"
-    );
-}
+// The refusals an assessment id that names no assessment earns are tabled in
+// `assessment_error_paths.rs`, over both operations that take one.
 
 /// `GetLatestAssessmentId` reports the most recently started assessment, and before any
-/// assessment exists it answers its modelled client error rather than an id nothing
-/// minted.
+/// assessment exists it reports the absent resource rather than an id nothing minted.
+/// Which status and error code each error path answers is tabled in
+/// `assessment_error_paths.rs`; this case only pins that the empty state is an error and
+/// that the happy path follows the last start.
 #[tokio::test]
 async fn the_latest_assessment_id_follows_the_most_recent_start() {
     let router = emulator();
 
     let empty = get_latest_assessment_id(&router).await;
     assert_eq!(
-        empty.status, 400,
+        empty.status, 404,
         "with no assessment started there is no latest id to report, got {} with {:?}",
         empty.status, empty.body
     );
     assert_eq!(
         empty.error_code(),
-        "ValidationException",
-        "expected ValidationException before any assessment exists, got {:?}",
+        "ResourceNotFoundException",
+        "expected ResourceNotFoundException before any assessment exists, got {:?}",
         empty.body
     );
 

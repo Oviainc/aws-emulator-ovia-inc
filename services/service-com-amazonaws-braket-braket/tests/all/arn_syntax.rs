@@ -15,6 +15,11 @@
 //! ARNs that differ in partition, region, account and id form. The recorded request
 //! (`not-a-valid-quantum-task-arn`) is one row of the first table.
 //!
+//! The one exception is the last suite, on a member the model DOES give a `@pattern`
+//! and that travels in the request BODY: that refusal belongs to Braket's front door,
+//! which answers a body outside the modelled input with 400 `BadRequestException` (see
+//! `request_body_rejection.rs`), so it is asserted as such here.
+//!
 //! Everything goes over HTTP through the production router, reusing the harness in
 //! `quantum_task_loop.rs`.
 
@@ -346,9 +351,18 @@ async fn create_quantum_task_refuses_a_device_arn_that_is_not_an_arn() {
 
 /// The validator is reached through the wire for a member the model gives a
 /// `@pattern`, too: `Association$arn` carries
-/// `^arn:aws[a-z\-]*:braket:[a-z0-9\-]*:[0-9]{12}:.*$`, which the framework's boundary
-/// validator enforces — so a malformed association ARN is already a 400 and needs no
-/// handler check. This row is what keeps that claim honest.
+/// `^arn:aws[a-z\-]*:braket:[a-z0-9\-]*:[0-9]{12}:.*$`, which the boundary enforces —
+/// so a malformed association ARN is already a 400 and needs no handler check. This row
+/// is what keeps that claim honest.
+///
+/// It is answered by Braket's FRONT DOOR rather than by the service's own
+/// `ValidationException`, because the member travels in the request BODY: a body that
+/// breaks a modelled constraint is rejected ahead of the service as 400
+/// `BadRequestException` / "Invalid request body"
+/// (`request_body_rejection.rs`, and the recorded `CreateSpendingLimit` / `CreateJob`
+/// `@pattern` refusals it pins). What this suite's other rows refuse — a value that is
+/// not an ARN on a shape the model gives NO `@pattern` — is the handler's own check and
+/// stays the modelled `ValidationException` naming the member.
 #[tokio::test]
 async fn a_modelled_pattern_on_an_arn_member_is_enforced_at_the_boundary() {
     let braket = Braket::new();
@@ -367,8 +381,9 @@ async fn a_modelled_pattern_on_an_arn_member_is_enforced_at_the_boundary() {
     );
     assert_eq!(
         reply.error.as_deref(),
-        Some("ValidationException"),
-        "case a malformed association ARN: expected ValidationException, got {:?} ({})",
+        Some("BadRequestException"),
+        "case a malformed association ARN: expected the front door's BadRequestException \
+         for a body member outside its modelled @pattern, got {:?} ({})",
         reply.error,
         reply.body
     );

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies a request's `AttributeOperation`s to a group this identity store already
+//! holds: each one sets the group attribute its `AttributePath` names to the value it
+//! carries, or removes that attribute when it carries none. The operations are applied
+//! in request order and only after every one of them has been accepted, so a refused
+//! request leaves the group exactly as it was; a successful one bumps the group's
+//! revision and its `UpdatedAt`, so a later `DescribeGroup` reports what was applied.
 //!
 //! ## Shape of an operation
 //!
@@ -107,6 +105,15 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use ::std::sync::LazyLock;
+
+use ::aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
+use ::aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
+use ::aws_smithy_schema_server::constraints::{
+    envelope, validate, LengthTrait, PatternTrait, Violation,
+};
+use ::aws_smithy_types::Document;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -118,13 +125,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-identitystore-awsidenti
 // here — hence the `UpdateGroupError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.identitystore#UpdateGroup")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.identitystore#UpdateGroup",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum UpdateGroupErrorModeled {
     ConflictException(ConflictException),
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     ValidationException(ValidationException),
+    /// The service-common server error, widened in because the model declares it on
+    /// the service rather than on this operation. Answered when the store is
+    /// unreachable.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -140,6 +154,238 @@ impl From<UpdateGroupErrorModeled> for UpdateGroupError {
     fn from(modeled: UpdateGroupErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// This service's Smithy namespace, for the shadow member schemas below.
+const NAMESPACE: &str = "com.amazonaws.identitystore";
+
+/// The `@pattern` the group's two text attributes carry: `DisplayName` (targeting
+/// `GroupDisplayName`) and `Description` (targeting `SensitiveStringType`) declare the
+/// SAME character class (`smithy_query(query="shape",shape="Group")`) — letters, marks,
+/// symbols, numbers, punctuation, tab, newline, carriage return, and the three space
+/// characters the model spells out literally: U+0020, U+00A0 (no-break space) and
+/// U+3000 (ideographic space), which are the only space characters the model's own text
+/// contains. They are written here as `\x{A0}` / `\x{3000}` so the class is the
+/// model's exactly while this source stays ASCII.
+const GROUP_TEXT_PATTERN: &str = r"^[\p{L}\p{M}\p{S}\p{N}\p{P}\t\n\r \x{A0}\x{3000}]+$";
+
+/// The `@length` both group text attributes carry: 1..1024 characters.
+const GROUP_TEXT_LENGTH: (Option<i64>, Option<i64>) = (Some(1), Some(1024));
+
+/// What a `@sensitive` attribute's offending value is reported as.
+///
+/// Both group text attributes are `@sensitive` in the model, so a refusal names the
+/// attribute and the constraint it failed but never echoes what was sent — which is
+/// what the framework's own clause would otherwise interpolate.
+const REDACTED: &str = "***";
+
+/// `GroupDisplayName` / `SensitiveStringType`: `@length(1..1024)` plus
+/// [`GROUP_TEXT_PATTERN`].
+static GROUP_TEXT_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(LengthTrait::new(
+        GROUP_TEXT_LENGTH.0,
+        GROUP_TEXT_LENGTH.1,
+    )));
+    traits.insert(Box::new(PatternTrait::new(GROUP_TEXT_PATTERN)));
+    traits
+});
+
+/// The `DisplayName` attribute, as the constraint walk reads it.
+static M_DISPLAY_NAME: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.identitystore#UpdatedGroupAttributes$DisplayName",
+        NAMESPACE,
+        "DisplayName",
+    ),
+    ShapeType::String,
+    "DisplayName",
+    0,
+)
+.with_traits(&GROUP_TEXT_TRAITS);
+
+/// The `Description` attribute, as the constraint walk reads it.
+static M_DESCRIPTION: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.identitystore#UpdatedGroupAttributes$Description",
+        NAMESPACE,
+        "Description",
+    ),
+    ShapeType::String,
+    "Description",
+    1,
+)
+.with_traits(&GROUP_TEXT_TRAITS);
+
+/// The root of the shadow structure the constraint walk is driven over. Its member
+/// list is empty on purpose: the walk visits what [`AttributeText`] WRITES, and a root
+/// struct schema carries no member name so it contributes no path segment.
+static UPDATED_GROUP_ATTRIBUTES_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "com.amazonaws.identitystore#UpdatedGroupAttributes",
+        NAMESPACE,
+        "UpdatedGroupAttributes",
+    ),
+    ShapeType::Structure,
+    &[],
+);
+
+/// One attribute value handed to the framework's constraint walk, written the way a
+/// codec writes a string member so the walk builds the same path and runs the same
+/// checks the request boundary does for a modelled string.
+struct AttributeText<'a> {
+    schema: &'static Schema,
+    text: &'a str,
+}
+
+impl SerializableStruct for AttributeText<'_> {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(self.schema, self.text)
+    }
+}
+
+/// A group attribute an `AttributeOperation` can add, replace or remove.
+///
+/// `AttributeOperation`'s own documentation says "for more information on the
+/// attributes that can be added, replaced, or removed, see Group", so the catalog is
+/// the `Group` shape's members (`smithy_query(query="shape",shape="Group")`) minus the
+/// ones a caller does not own: `IdentityStoreId`, `GroupId` and `GroupArn` are the
+/// group's identity, `Revision` is maintained by the service (and is this request's
+/// precondition, not its target), and `ExternalIds` holds the identifiers an external
+/// identity provider issues, which no operation of this API sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupAttribute {
+    DisplayName,
+    Description,
+}
+
+impl GroupAttribute {
+    /// Every attribute an `AttributePath` may name, in the order a refusal lists them.
+    const ALL: [Self; 2] = [Self::DisplayName, Self::Description];
+
+    /// The attribute name an `AttributePath` carries for this attribute: the `Group`
+    /// member's name in the lower-camel spelling the API's attribute paths use.
+    fn path(self) -> &'static str {
+        match self {
+            Self::DisplayName => "displayName",
+            Self::Description => "description",
+        }
+    }
+
+    /// The member schema whose modelled constraints this attribute's value must
+    /// satisfy.
+    fn member_schema(self) -> &'static Schema {
+        match self {
+            Self::DisplayName => &M_DISPLAY_NAME,
+            Self::Description => &M_DESCRIPTION,
+        }
+    }
+
+    /// The attribute `path` names, or `None` when it names none of them.
+    ///
+    /// The comparison ignores case. An `AttributePath` names an attribute of the
+    /// `Group` shape, whose member name (`DisplayName`) and documented path spelling
+    /// (`displayName`) differ only in case, and these are SCIM attribute names, which
+    /// RFC 7643 § 2.1 defines as case-insensitive — so the handler is not keyed to one
+    /// spelling of the recorded request.
+    fn from_path(path: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|attribute| attribute.path().eq_ignore_ascii_case(path))
+    }
+}
+
+/// The attribute paths a refusal names as the accepted ones: the `path()` of every
+/// [`GroupAttribute::ALL`] entry. A literal rather than a joined `Vec`, so a refusal
+/// allocates nothing; the two spellings are the ones [`GroupAttribute::path`] returns.
+const SUPPORTED_PATHS: &str = "displayName, description";
+
+/// The `target` the audit record this operation emits carries, so a consumer can
+/// select the access trail without reading the rest of the emulator's traces.
+const AUDIT_TARGET: &str = "emulator::audit";
+
+/// The modelled `ValidationException` (HTTP 400) for a request this operation cannot
+/// apply.
+///
+/// `reason` stays absent: `ValidationExceptionReason` models only the four KMS reasons
+/// (`VALIDATION_EXCEPTION_REASON_VALUES`), none of which describes an attribute
+/// operation.
+fn invalid(message: String) -> UpdateGroupErrorModeled {
+    UpdateGroupErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+        request_id: None,
+        reason: None,
+    })
+}
+
+/// The value `operation` sets `attribute` to: `None` when the operation carries no
+/// value, which REMOVES the attribute.
+///
+/// `AttributeValue` is a `Document`, so no modelled constraint was enforced at the
+/// request boundary: the type the attribute is modelled with, and its `@length` and
+/// `@pattern`, are checked here instead, through the framework's OWN constraint walk
+/// over the member schemas above, so the clause, the bound and the violation cap are
+/// the framework's rather than this file's.
+fn attribute_value(
+    attribute: GroupAttribute,
+    value: Option<&Document>,
+) -> Result<Option<String>, UpdateGroupErrorModeled> {
+    let text = match value {
+        // "These operations might add, replace, or remove an attribute": an operation
+        // that carries no value is the remove. An explicit JSON null is the same
+        // request written the other way.
+        None | Some(Document::Null) => return Ok(None),
+        Some(Document::String(text)) => text,
+        Some(_) => {
+            return Err(invalid(format!(
+                "AttributeValue for the group attribute {} must be a string",
+                attribute.path()
+            )))
+        }
+    };
+    let violations: Vec<Violation> = validate(
+        &AttributeText {
+            schema: attribute.member_schema(),
+            text,
+        },
+        &UPDATED_GROUP_ATTRIBUTES_SCHEMA,
+    )
+    .into_iter()
+    .map(|violation| Violation {
+        value: Some(REDACTED.to_string()),
+        ..violation
+    })
+    .collect();
+    if let Some(message) = envelope(&violations) {
+        return Err(invalid(message));
+    }
+    Ok(Some(text.clone()))
+}
+
+/// Every change `operations` asks for, in request order, with each one's path resolved
+/// to the attribute it names and each one's value accepted.
+///
+/// The whole list is resolved BEFORE anything is written, so an operation this service
+/// cannot apply refuses the request instead of leaving the group half-updated.
+fn planned_changes(
+    operations: &[AttributeOperation],
+) -> Result<Vec<(GroupAttribute, Option<String>)>, UpdateGroupErrorModeled> {
+    operations
+        .iter()
+        .map(|operation| {
+            let attribute = GroupAttribute::from_path(&operation.attribute_path).ok_or_else(
+                || {
+                    invalid(format!(
+                        "AttributePath {:?} names no group attribute this operation can add, \
+                         replace or remove; it accepts {SUPPORTED_PATHS}",
+                        operation.attribute_path,
+                    ))
+                },
+            )?;
+            let value = attribute_value(attribute, operation.attribute_value.as_ref())?;
+            Ok((attribute, value))
+        })
+        .collect()
 }
 
 /// The `UpdateGroup` operation.
@@ -178,18 +424,151 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateGroup"))
+        // Resolved first, from the request alone: an operation this service cannot
+        // apply refuses the whole request, so nothing below it is ever half-written.
+        // The list itself is never empty — `AttributeOperations` is modelled
+        // `@length(1..100)`, so the request boundary refuses one that is.
+        let changes = planned_changes(&input.operations)?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateGroupErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the identity store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+        let mut state = state.lock();
+        let group_not_found = || {
+            UpdateGroupErrorModeled::ResourceNotFoundException(crate::state::not_found(
+                crate::state::ResourceKind::Group,
+                &input.group_id,
+            ))
+        };
+        // An update changes a group that already exists, so the store is looked up with
+        // `store_mut` rather than vivified: an identity store nothing was ever created
+        // in holds no group to update, and it is THAT resource the refusal names.
+        // Both identifiers go through the crate's own key normalisation, so the ARN
+        // form and either letter case of each name the same resource the create used.
+        let store = state.store_mut(&input.identity_store_id).ok_or_else(|| {
+            UpdateGroupErrorModeled::ResourceNotFoundException(
+                crate::state::identity_store_not_found(&input.identity_store_id),
+            )
+        })?;
+        let group_key = crate::state::resource_key(&input.group_id);
+        let stored = store.groups.get(&group_key).ok_or_else(group_not_found)?;
+
+        // `Revision` is "the expected current revision of the group … the update is
+        // applied only if it matches", so a request carrying one that is not the
+        // group's current revision is refused and changes nothing. A request without
+        // one is applied unconditionally.
+        if input
+            .revision
+            .as_deref()
+            .is_some_and(|expected| expected != stored.revision())
+        {
+            return Err(UpdateGroupErrorModeled::ConflictException(
+                crate::state::concurrent_modification(
+                    "the group has been modified since the revision this request expects: \
+                     read it again and retry with its current revision"
+                        .to_string(),
+                ),
+            )
+            .into());
+        }
+
+        // Applied to a copy, in request order, so two operations naming one attribute
+        // leave the later one's value and a refusal below leaves the stored group
+        // untouched.
+        let mut updated = stored.clone();
+        let previous_display_name = stored.display_name.clone();
+        let mut changed_attributes: Vec<&'static str> = Vec::new();
+        for (attribute, value) in changes {
+            match attribute {
+                // `Group$DisplayName` is not `@required` in the model
+                // (`smithy_query(query="shape",shape="Group")` marks only
+                // `IdentityStoreId`, `GroupId`, `GroupArn` and `Revision`), and
+                // `CreateGroup` already stores a group without one, so removing it is
+                // a request this service can apply.
+                GroupAttribute::DisplayName => updated.display_name = value,
+                GroupAttribute::Description => updated.description = value,
+            }
+            if !changed_attributes.contains(&attribute.path()) {
+                changed_attributes.push(attribute.path());
+            }
+        }
+
+        // `DisplayName` is a uniqueness claim within the identity store, which an
+        // update makes exactly as a create does: a name another group of this store
+        // already holds conflicts, while the group's own current name is already its
+        // claim and so does not. The name is `@sensitive` and stays out of the message.
+        if let Some(display_name) = &updated.display_name {
+            if store
+                .group_display_name_index
+                .get(display_name)
+                .is_some_and(|owner| *owner != updated.group_id)
+            {
+                return Err(UpdateGroupErrorModeled::ConflictException(
+                    crate::state::uniqueness_conflict(format!(
+                        "another group in identity store {} already has this DisplayName",
+                        store.identity_store_id
+                    )),
+                )
+                .into());
+            }
+        }
+
+        // The group was modified, so its revision moves and its `UpdatedAt` is now.
+        updated.revision = updated.revision.saturating_add(1);
+        updated.updated_at = ::std::time::SystemTime::now();
+
+        if previous_display_name != updated.display_name {
+            // Released only when the index still records THIS group as the name's
+            // owner, mirroring the ownership test the claim above makes: a request
+            // must never drop another group's uniqueness claim.
+            if let Some(released) = previous_display_name {
+                if store
+                    .group_display_name_index
+                    .get(&released)
+                    .is_some_and(|owner| *owner == updated.group_id)
+                {
+                    store.group_display_name_index.remove(&released);
+                }
+            }
+            if let Some(claimed) = updated.display_name.clone() {
+                store
+                    .group_display_name_index
+                    .insert(claimed, updated.group_id.clone());
+            }
+        }
+
+        let output = UpdateGroupOutput {
+            identity_store_id: store.identity_store_id.clone(),
+            group_id: updated.group_id.clone(),
+            group_arn: updated.group_arn.clone(),
+            revision: updated.revision(),
+        };
+        // Written back under the key it was READ with, so the lookup an operation does
+        // through `resource_key` and the record it stores cannot end up under two keys.
+        store.groups.insert(group_key, updated);
+        // Everything below is owned, so the state lock is released before the record is
+        // formatted: the critical section covers the state change only.
+        drop(state);
+        // The access record for a state-changing operation: who, what, which resource
+        // and the outcome. Metadata only — `DisplayName` and `Description` are
+        // `@sensitive`, so which attributes changed is recorded and their values are
+        // not, and request-derived values are `Debug`-escaped so none can split a
+        // record. The access key id NAMES the caller and is not a secret; no signature
+        // or secret key is read.
+        ::tracing::info!(
+            target: AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?::emulator_server::extract_akid(&ctx.parts().headers),
+            identity_store = ?output.identity_store_id,
+            group = ?output.group_id,
+            attributes = ?changed_attributes,
+            revision = ?output.revision,
+            outcome = "updated",
+            "identity store group updated",
+        );
+        Ok(output)
     }
 }

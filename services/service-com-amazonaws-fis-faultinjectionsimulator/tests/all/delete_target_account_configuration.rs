@@ -42,10 +42,17 @@ const ACCOUNT_ID_FLOOR: usize = 12;
 /// See [`ACCOUNT_ID_FLOOR`].
 const ACCOUNT_ID_CEILING: usize = 48;
 
-/// `RoleArn`'s published bounds (`@length(min: 20, max: 2048)`).
-const ROLE_ARN_FLOOR: usize = 20;
-/// See [`ROLE_ARN_FLOOR`].
+/// `RoleArn`'s published ceiling (`@length(min: 20, max: 2048)`).
 const ROLE_ARN_CEILING: usize = 2048;
+
+/// The length of the SHORTEST well-formed IAM role ARN:
+/// `arn:aws:iam::<12 digits>:role/<one character>` — `"arn:aws:iam::"` (13) plus the
+/// twelve-digit account id, `":role/"` (6) and a one-character role name. It is above
+/// `RoleArn`'s modelled floor of 20, which is why a configuration is created with this
+/// length rather than with that floor: a `roleArn` at the floor is inside the shape's
+/// bounds and still not an ARN, so the service refuses it (see
+/// `target_account_configuration_errors.rs`).
+const SHORTEST_ROLE_ARN: usize = 32;
 
 /// `TargetAccountConfigurationDescription`'s published ceiling
 /// (`@length(min: 0, max: 512)`).
@@ -294,7 +301,8 @@ fn account_id_of(len: usize) -> String {
     }
 }
 
-/// An IAM role ARN of exactly `len` characters, padded in the role name.
+/// A well-formed IAM role ARN of exactly `len` characters, padded in the role name.
+/// `len` has to be at least [`SHORTEST_ROLE_ARN`].
 fn role_arn_of(len: usize) -> String {
     let prefix = "arn:aws:iam::000000000000:role/";
     if len <= prefix.len() {
@@ -317,8 +325,9 @@ struct Row {
 ///
 /// They differ along everything that rule generalises over: the length and shape of the
 /// `accountId` naming the configuration being removed (both published bounds of
-/// `TargetAccountId`), the length and shape of the stored `roleArn` (the published floor,
-/// a role with a path, a role at the published ceiling), whether the stored `description`
+/// `TargetAccountId`), the length and shape of the stored `roleArn` (the shortest
+/// well-formed ARN, a role with a path, a role at the published ceiling), whether the
+/// stored `description`
 /// is absent, empty, non-ASCII or at `TargetAccountConfigurationDescription`'s published
 /// ceiling, and whether the configuration was created with a `clientToken` at all.
 fn rows() -> Vec<Row> {
@@ -326,7 +335,7 @@ fn rows() -> Vec<Row> {
         Row {
             case: "account id at the published floor, no description, no token",
             account_id: account_id_of(ACCOUNT_ID_FLOOR),
-            role_arn: role_arn_of(ROLE_ARN_FLOOR),
+            role_arn: role_arn_of(SHORTEST_ROLE_ARN),
             description: None,
             client_token: None,
         },

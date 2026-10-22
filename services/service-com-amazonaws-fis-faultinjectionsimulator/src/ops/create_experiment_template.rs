@@ -174,8 +174,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every modelled constraint on this input — the required members, the lengths
         // and patterns on `clientToken`, `description` and `roleArn`, the 50-entry tag
         // map — was already refused at the boundary. What the model cannot express is
-        // what FIS documents for a stop condition's `source`/`value` pair, and which
-        // values the two `experimentOptions` enums admit.
+        // that `roleArn` names an IAM ROLE, what FIS documents for a stop condition's
+        // `source`/`value` pair, and which values the two `experimentOptions` enums
+        // admit.
+        if let Some(refusal) =
+            crate::state::role_arn_refusal("roleArn", Some(input.role_arn.as_str()))
+        {
+            return Err(CreateExperimentTemplateErrorModeled::ValidationException(refusal).into());
+        }
         if let Some(refusal) = crate::state::stop_conditions_refusal(&input.stop_conditions) {
             return Err(CreateExperimentTemplateErrorModeled::ValidationException(refusal).into());
         }

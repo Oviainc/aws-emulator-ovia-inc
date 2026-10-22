@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetAssetPropertyAggregates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetAssetPropertyAggregates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetAssetPropertyAggregates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation derives each entry's aggregates from the per-(asset,
+//! property) time series in the shared engine store (`crate::state`) — it writes
+//! nothing — and pages the batch with an opaque `nextToken`; this is the ONLY file to
+//! touch for it. The bucketing and reduction of a series live at the bottom of this
+//! file; when `GetAssetPropertyAggregates` is implemented, hoist them into
+//! `crate::state` so the two operations cannot disagree about what a window covers.
 //!
 //! ## Shape of an operation
 //!
@@ -166,20 +163,629 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetAssetPropertyAggregates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetAssetPropertyAggregatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetAssetPropertyAggregates"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchGetAssetPropertyAggregatesError::Modeled(
+                BatchGetAssetPropertyAggregatesErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+
+        // "You can specify up to 16 entries per request" — and a batch that names
+        // no entry at all asks for nothing, so both ends of the range are refused.
+        // The model carries no `@length` for `entries`, so the bound is enforced
+        // here; it is a bound on the input shape, hence the 400 the runtime's own
+        // constraint checks answer with rather than a quota error.
+        if input.entries.is_empty() || input.entries.len() > MAX_ENTRIES {
+            return Err(invalid_request(format!(
+                "A request carries 1 to {MAX_ENTRIES} entries, but this one carries {}.",
+                input.entries.len()
+            )));
+        }
+        // "The number of data points in the result set is equal to the value of
+        // maxResults. The maximum value of maxResults is 4000." The modelled range
+        // is 1.., which the runtime checks before this handler runs, so only the
+        // documented ceiling is left to enforce. With no `maxResults` the result set
+        // is bounded only by that ceiling.
+        let max_results = match input.max_results {
+            Some(requested) if requested > MAX_RESULTS => {
+                return Err(invalid_request(format!(
+                    "maxResults is at most {MAX_RESULTS}, but this request asks for {requested}."
+                )))
+            }
+            Some(requested) => requested as usize,
+            None => MAX_RESULTS as usize,
+        };
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => decode_token(token)?,
+            None => Cursor::START,
+        };
+        if cursor.entry >= input.entries.len() {
+            return Err(invalid_token());
+        }
+
+        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        let mut error_entries = Vec::new();
+        let mut success_entries = Vec::new();
+        let mut skipped_entries = Vec::new();
+        let mut next_token = None;
+        // The budget this response has left, in data points. An entry that fails to
+        // resolve spends none of it: it reports an error rather than a result.
+        let mut remaining = max_results;
+
+        for (at, entry) in input.entries.iter().enumerate() {
+            // The same entry resolves the same way on every page, so an entry a
+            // previous page already finished is recognised without storing anything
+            // about that page beyond the cursor.
+            let resolved = resolve_entry(&store, entry);
+
+            if at < cursor.entry {
+                // "entries that were not processed by this batch request, because
+                // these entries had been completely processed by previous paginated
+                // requests."
+                skipped_entries.push(BatchGetAssetPropertyAggregatesSkippedEntry {
+                    entry_id: entry.entry_id.clone(),
+                    completion_status: if resolved.is_ok() { "SUCCESS" } else { "ERROR" }
+                        .to_string(),
+                    error_info: resolved.as_ref().err().map(|(code, _)| {
+                        BatchGetAssetPropertyAggregatesErrorInfo {
+                            error_code: (*code).to_string(),
+                            error_timestamp: crate::state::to_date_time(now),
+                        }
+                    }),
+                });
+                continue;
+            }
+
+            let (asset_id, property_id, query) = match resolved {
+                Ok(resolved) => resolved,
+                Err((code, message)) => {
+                    error_entries.push(BatchGetAssetPropertyAggregatesErrorEntry {
+                        error_code: code.to_string(),
+                        error_message: message,
+                        entry_id: entry.entry_id.clone(),
+                    });
+                    continue;
+                }
+            };
+
+            let aggregated = aggregated_values(&store, &asset_id, &property_id, &query);
+            // The first entry of a resumed page starts where the previous one
+            // stopped; every later entry starts at its first data point.
+            let from = if at == cursor.entry {
+                // A resume point past the end of this entry's answer is a token
+                // this request's entries cannot have produced, so it is refused
+                // rather than clamped: a clamped offset would silently repeat or
+                // drop data points. A series trimmed at
+                // `MAX_SAMPLES_PER_SERIES` between two pages can also land here,
+                // and refusing is the right answer for that too — the enumeration
+                // the token named no longer exists.
+                if cursor.value > aggregated.len() {
+                    return Err(invalid_token());
+                }
+                cursor.value
+            } else {
+                0
+            };
+            let available = aggregated.len() - from;
+
+            if available > remaining {
+                // This entry still has data points the budget cannot carry, so the
+                // page ends inside it and `nextToken` names where to resume.
+                if remaining > 0 {
+                    success_entries.push(BatchGetAssetPropertyAggregatesSuccessEntry {
+                        entry_id: entry.entry_id.clone(),
+                        aggregated_values: aggregated[from..from + remaining].to_vec(),
+                    });
+                }
+                next_token = Some(Cursor {
+                    entry: at,
+                    value: from + remaining,
+                }
+                .encode());
+                break;
+            }
+
+            remaining -= available;
+            // An entry whose series feeds no window still gets a success entry, with
+            // an empty `aggregatedValues`: the entry WAS processed, and reporting it
+            // as an error would claim a failure that did not happen.
+            success_entries.push(BatchGetAssetPropertyAggregatesSuccessEntry {
+                entry_id: entry.entry_id.clone(),
+                aggregated_values: aggregated[from..].to_vec(),
+            });
+        }
+
+        Ok(BatchGetAssetPropertyAggregatesOutput {
+            error_entries,
+            success_entries,
+            skipped_entries,
+            next_token,
+        })
     }
+}
+
+/// How many entries one request carries, from the model doc on
+/// `BatchGetAssetPropertyAggregatesRequest$entries`: "You can specify up to 16
+/// entries per request."
+const MAX_ENTRIES: usize = 16;
+
+/// The ceiling on `maxResults`, from the model doc on
+/// `BatchGetAssetPropertyAggregatesRequest$maxResults`: "The maximum value of
+/// maxResults is 4000."
+const MAX_RESULTS: i32 = 4_000;
+
+/// Where a page of this batch resumes: the entry still being answered and how many
+/// of its data points earlier pages already carried.
+#[derive(Debug, Clone, Copy)]
+struct Cursor {
+    /// Index into the request's `entries` of the first entry not yet finished.
+    entry: usize,
+    /// How many of THAT entry's aggregated values previous pages already reported.
+    value: usize,
+}
+
+impl Cursor {
+    /// The cursor of a request that carries no `nextToken`.
+    const START: Self = Self { entry: 0, value: 0 };
+
+    /// This cursor as a `nextToken`: hex, so the token matches the modelled
+    /// `^[A-Za-z0-9+/=]+$` and stays opaque to the caller, the same encoding
+    /// `ListAssets` uses for its own resume point.
+    fn encode(self) -> String {
+        ::hex::encode(format!("{}:{}", self.entry, self.value))
+    }
+}
+
+/// Decode a `nextToken` back into the cursor it names.
+fn decode_token(token: &str) -> Result<Cursor, BatchGetAssetPropertyAggregatesError> {
+    let decoded = ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(invalid_token)?;
+    let (entry, value) = decoded.split_once(':').ok_or_else(invalid_token)?;
+    Ok(Cursor {
+        entry: entry.parse().map_err(|_| invalid_token())?,
+        value: value.parse().map_err(|_| invalid_token())?,
+    })
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued
+/// for these entries.
+fn invalid_token() -> BatchGetAssetPropertyAggregatesError {
+    invalid_request("The nextToken is not a token this operation issued.".to_string())
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> BatchGetAssetPropertyAggregatesError {
+    BatchGetAssetPropertyAggregatesError::Modeled(
+        BatchGetAssetPropertyAggregatesErrorModeled::InvalidRequestException(
+            InvalidRequestException { message },
+        ),
+    )
+}
+
+/// Resolve one entry to the stored property it names and the query it asks of that
+/// property's series, or to the `BatchGetAssetPropertyAggregatesErrorCode` the entry
+/// should report.
+///
+/// Every check lives here, so an entry is judged identically whether this page
+/// answers it (an error entry) or a previous page already did (a skipped entry
+/// carrying the same code).
+fn resolve_entry<'a>(
+    store: &crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
+    entry: &'a BatchGetAssetPropertyAggregatesEntry,
+) -> Result<(String, String, AggregateQuery<'a>), (&'static str, String)> {
+    // A property is named either by its asset and property ids or by its alias;
+    // exactly one of the two forms identifies it.
+    let (asset_id, property_id) = match (
+        entry.asset_id.as_deref(),
+        entry.property_id.as_deref(),
+        entry.property_alias.as_deref(),
+    ) {
+        (Some(asset_label), Some(property_id), None) => {
+            // The shared resolver every other handler uses, so one asset is named
+            // one way across the service.
+            let asset_id = store.resolve_asset_id(asset_label).ok_or_else(|| {
+                (
+                    "ResourceNotFoundException",
+                    format!("The asset {asset_label} could not be found."),
+                )
+            })?;
+            let has_property = store.assets.get(&asset_id).is_some_and(|asset| {
+                asset
+                    .properties
+                    .iter()
+                    .any(|property| property.id == property_id)
+            });
+            if !has_property {
+                return Err((
+                    "ResourceNotFoundException",
+                    format!("The asset {asset_label} has no property {property_id}."),
+                ));
+            }
+            (asset_id, property_id.to_string())
+        }
+        (None, None, Some(alias)) => store
+            .property_alias_index
+            .get(alias)
+            .cloned()
+            .ok_or_else(|| {
+                (
+                    "ResourceNotFoundException",
+                    format!("The property alias {alias} could not be found."),
+                )
+            })?,
+        _ => {
+            return Err((
+                "InvalidRequestException",
+                "Each entry must specify either assetId and propertyId, or propertyAlias."
+                    .to_string(),
+            ))
+        }
+    };
+
+    // Every catalogue below the resolution's is the GENERATED one from the model
+    // (`super::types`), so a hand-kept copy cannot drift from the enum the model
+    // declares.
+    if let Some(unknown) = entry
+        .aggregate_types
+        .iter()
+        .find(|asked| !AGGREGATE_TYPE_VALUES.contains(&asked.as_str()))
+    {
+        return Err((
+            "InvalidRequestException",
+            format!(
+                "The aggregate type {unknown} is none of {}.",
+                names(AGGREGATE_TYPE_VALUES.iter().copied())
+            ),
+        ));
+    }
+
+    // `Qualities` is modelled with length 1..1, so the runtime already refuses a
+    // list of any other length; an entry that names none filters on the default
+    // quality.
+    let quality = match entry.qualities.as_deref() {
+        None => DEFAULT_QUALITY,
+        Some([only]) => {
+            if !QUALITY_VALUES.contains(&only.as_str()) {
+                return Err((
+                    "InvalidRequestException",
+                    format!(
+                        "The quality {only} is none of {}.",
+                        names(QUALITY_VALUES.iter().copied())
+                    ),
+                ));
+            }
+            only.as_str()
+        }
+        Some(many) => {
+            return Err((
+                "InvalidRequestException",
+                format!(
+                    "An entry filters on exactly one quality, but this one names {}.",
+                    many.len()
+                ),
+            ))
+        }
+    };
+
+    // ASCENDING is the documented default for the member; anything the generated
+    // `TimeOrdering` catalogue does not name is refused.
+    let descending = match entry.time_ordering.as_deref() {
+        None => false,
+        Some(asked) if TIME_ORDERING_VALUES.contains(&asked) => asked == "DESCENDING",
+        Some(other) => {
+            return Err((
+                "InvalidRequestException",
+                format!(
+                    "The timeOrdering {other} is none of {}.",
+                    names(TIME_ORDERING_VALUES.iter().copied())
+                ),
+            ))
+        }
+    };
+
+    let start_exclusive_nanos = date_time_nanos(&entry.start_date);
+    let end_inclusive_nanos = date_time_nanos(&entry.end_date);
+    if start_exclusive_nanos > end_inclusive_nanos {
+        return Err((
+            "InvalidRequestException",
+            "startDate must not be after endDate.".to_string(),
+        ));
+    }
+
+    // The resolution is checked by the one constructor that can build a query, so
+    // a window length this crate has no definition for cannot reach the series.
+    let query = AggregateQuery::new(
+        &entry.resolution,
+        start_exclusive_nanos,
+        end_inclusive_nanos,
+        quality,
+        &entry.aggregate_types,
+        descending,
+    )
+    .ok_or_else(|| {
+        (
+            "InvalidRequestException",
+            format!(
+                "The resolution {} is none of {}.",
+                entry.resolution,
+                names(RESOLUTIONS.iter().map(|(name, _)| *name))
+            ),
+        )
+    })?;
+
+    Ok((asset_id, property_id, query))
+}
+
+/// `a, b, c` — the accepted values a refusal names, so the message states the rule
+/// that refused the request rather than only that it was refused.
+fn names<'a>(values: impl Iterator<Item = &'a str>) -> String {
+    values.collect::<Vec<&str>>().join(", ")
+}
+
+// ---------------------------------------------------------------------------
+// Deriving one series' aggregates.
+//
+// Everything below reads a stored series and reduces it; it touches no state this
+// operation does not read. It lives in this file because the layout gives one
+// operation one file, and `GetAssetPropertyAggregates` — the only other caller it
+// would have — is still a 501 scaffold with its own issue: the fixer that
+// implements it should hoist this block into `crate::state` and call it from both.
+// ---------------------------------------------------------------------------
+
+/// Every `Resolution` an aggregate query may name, with the length in seconds of
+/// the window it names.
+///
+/// Source: the `Resolution` shape — `smithy_query(query="shape",
+/// shape="Resolution")` reports length 2..3 and pattern `^1m|15m|1h|1d$`, i.e.
+/// the four names below ("1m" one minute, "15m" fifteen minutes, "1h" one hour,
+/// "1d" one day). The window LENGTHS are what the generated `Resolution` string
+/// does not carry, which is why this table exists at all.
+const RESOLUTIONS: [(&str, i64); 4] = [("1m", 60), ("15m", 900), ("1h", 3_600), ("1d", 86_400)];
+
+/// The quality an aggregate query filters on when the request names no
+/// `qualities`.
+///
+/// It is `crate::state::DEFAULT_QUALITY`, the same value a stored TQV that names
+/// no quality counts as (`crate::state::quality_of`), so a sample written without
+/// a quality is counted by a query that names none. A history read is a different
+/// question — it reports the samples themselves, so an absent `qualities` there
+/// filters nothing out — and `GetAssetPropertyValueHistory` is right to read the
+/// same member its own way.
+const DEFAULT_QUALITY: &str = crate::state::DEFAULT_QUALITY;
+
+/// The window length, in seconds, that `resolution` names — `None` when it is not
+/// one of [`RESOLUTIONS`].
+fn resolution_seconds(resolution: &str) -> Option<i64> {
+    RESOLUTIONS
+        .iter()
+        .find(|(name, _)| *name == resolution)
+        .map(|(_, seconds)| *seconds)
+}
+
+/// A `TimeInNanos` as whole nanoseconds since the Unix epoch, so a sample and a
+/// modelled `Timestamp` bound compare at the precision the sample carries.
+fn timestamp_nanos(timestamp: &TimeInNanos) -> i128 {
+    i128::from(timestamp.time_in_seconds) * 1_000_000_000
+        + i128::from(timestamp.offset_in_nanos.unwrap_or(0))
+}
+
+/// A modelled `Timestamp` as whole nanoseconds since the Unix epoch; see
+/// [`timestamp_nanos`].
+fn date_time_nanos(at: &::aws_smithy_types::DateTime) -> i128 {
+    i128::from(at.secs()) * 1_000_000_000 + i128::from(at.subsec_nanos())
+}
+
+/// What one aggregate query asks of one stored series: the window grid to bucket
+/// its samples into, the range to read, the quality to count and which aggregates
+/// to compute.
+///
+/// Built only by [`AggregateQuery::new`], so `window_seconds` can only ever be a
+/// length [`resolution_seconds`] returned — the invariant the bucketing arithmetic
+/// relies on is therefore unforgeable rather than merely documented.
+#[derive(Debug, Clone, Copy)]
+struct AggregateQuery<'a> {
+    /// The window length in seconds. Windows are aligned to the Unix epoch, so
+    /// one window covers the same instants whoever asks. Always positive.
+    window_seconds: i64,
+    /// The EXCLUSIVE start of the queried range, in nanoseconds of Unix epoch
+    /// time: "The exclusive start of the range from which to query historical
+    /// data" (`BatchGetAssetPropertyAggregatesEntry$startDate`).
+    start_exclusive_nanos: i128,
+    /// The INCLUSIVE end of the queried range: "The inclusive end of the range
+    /// from which to query historical data"
+    /// (`BatchGetAssetPropertyAggregatesEntry$endDate`).
+    end_inclusive_nanos: i128,
+    /// The one `Quality` a sample must carry to be counted; see
+    /// [`DEFAULT_QUALITY`].
+    quality: &'a str,
+    /// The `AggregateType`s to compute. Every other member of `Aggregates` is
+    /// left unset, because the caller did not ask for it.
+    aggregate_types: &'a [String],
+    /// `true` for `TimeOrdering` DESCENDING; ASCENDING is the modelled default.
+    descending: bool,
+}
+
+impl<'a> AggregateQuery<'a> {
+    /// The query a request's `resolution` names, or `None` when `resolution` is
+    /// not one of [`RESOLUTIONS`] — which is the caller's cue to refuse the entry
+    /// with the modelled `InvalidRequestException` rather than answer it.
+    fn new(
+        resolution: &str,
+        start_exclusive_nanos: i128,
+        end_inclusive_nanos: i128,
+        quality: &'a str,
+        aggregate_types: &'a [String],
+        descending: bool,
+    ) -> Option<Self> {
+        Some(Self {
+            window_seconds: resolution_seconds(resolution)?,
+            start_exclusive_nanos,
+            end_inclusive_nanos,
+            quality,
+            aggregate_types,
+            descending,
+        })
+    }
+}
+
+/// The aggregated values of the `(asset_id, property_id)` series under `query` —
+/// the answer one entry reports.
+///
+/// DERIVED, never stored: the samples `BatchPutAssetPropertyValue` wrote are
+/// bucketed into the epoch-aligned windows `query` names and each bucket is
+/// reduced to the aggregates the caller asked for. A window that no in-range
+/// sample of the asked-for quality falls in is not reported at all, so the length
+/// of the answer is a function of the stored data and not of the width of the
+/// queried range.
+///
+/// The pass is over the SAMPLES, not over the windows the range spans: a series is
+/// bounded at `crate::state::MAX_SAMPLES_PER_SERIES`, so the work one entry can
+/// ask for is bounded however wide a range it names.
+fn aggregated_values(
+    store: &crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
+    asset_id: &str,
+    property_id: &str,
+    query: &AggregateQuery<'_>,
+) -> Vec<AggregatedValue> {
+    let Some(series) = store
+        .property_values
+        .get(asset_id)
+        .and_then(|properties| properties.get(property_id))
+    else {
+        return Vec::new();
+    };
+
+    // The series is kept sorted ascending, so one window's samples are contiguous
+    // and a single `last_mut()` bucket is all the grouping needs.
+    let mut windows: Vec<(i64, Bucket)> = Vec::new();
+    for sample in series {
+        let at = timestamp_nanos(&sample.timestamp);
+        if at <= query.start_exclusive_nanos || at > query.end_inclusive_nanos {
+            continue;
+        }
+        if crate::state::quality_of(sample) != query.quality {
+            continue;
+        }
+        // A `nullValue` reports a reading that is absent, so it is not a data
+        // point of the window it falls in.
+        if sample.value.null_value.is_some() {
+            continue;
+        }
+        let seconds = sample.timestamp.time_in_seconds;
+        // `window_seconds` is positive by construction (see
+        // [`AggregateQuery::new`]), so this is total.
+        let start = seconds.saturating_sub(seconds.rem_euclid(query.window_seconds));
+        if windows.last().map(|(at, _)| *at) != Some(start) {
+            windows.push((start, Bucket::default()));
+        }
+        if let Some((_, bucket)) = windows.last_mut() {
+            bucket.count = bucket.count.saturating_add(1);
+            if let Some(numeric) = numeric_value(&sample.value) {
+                bucket.numeric.push(numeric);
+            }
+        }
+    }
+
+    let mut values: Vec<AggregatedValue> = windows
+        .iter()
+        .filter_map(|(start, bucket)| {
+            let value = bucket.reduce(query.aggregate_types);
+            reports_an_aggregate(&value).then(|| AggregatedValue {
+                // A window is reported at the instant it starts.
+                timestamp: ::aws_smithy_types::DateTime::from_secs(*start),
+                quality: Some(query.quality.to_string()),
+                value,
+            })
+        })
+        .collect();
+    // ASCENDING is the modelled default; DESCENDING is the same windows read the
+    // other way.
+    if query.descending {
+        values.reverse();
+    }
+    values
+}
+
+/// One window's contributing samples, accumulated in a single pass over the
+/// series.
+#[derive(Debug, Default)]
+struct Bucket {
+    /// How many data points fell in the window, whatever their type: `count` is
+    /// the count of the data points the window's aggregates were computed from.
+    count: u64,
+    /// The numeric value of each sample that has one. A `STRING` or `BOOLEAN`
+    /// sample has none, so it is counted but cannot be summed or averaged.
+    numeric: Vec<f64>,
+}
+
+impl Bucket {
+    /// This window reduced to the requested aggregates. An aggregate the caller
+    /// did not ask for is left unset, and so is a numeric aggregate that no sample
+    /// in the window can feed.
+    ///
+    /// The arms name the `AggregateType` members the model declares, generated as
+    /// `AGGREGATE_TYPE_VALUES` in `super::types` — which is what `resolve_entry`
+    /// checks a request against before a series is read.
+    fn reduce(&self, aggregate_types: &[String]) -> Aggregates {
+        let samples = self.numeric.len();
+        let sum: f64 = self.numeric.iter().sum();
+        let mean = (samples > 0).then(|| sum / samples as f64);
+        let mut aggregates = Aggregates::default();
+        for aggregate_type in aggregate_types {
+            match aggregate_type.as_str() {
+                "COUNT" => aggregates.count = Some(self.count as f64),
+                "SUM" => aggregates.sum = (samples > 0).then_some(sum),
+                "AVERAGE" => aggregates.average = mean,
+                "MAXIMUM" => aggregates.maximum = self.numeric.iter().copied().reduce(f64::max),
+                "MINIMUM" => aggregates.minimum = self.numeric.iter().copied().reduce(f64::min),
+                // The POPULATION standard deviation: a window's data points are
+                // all of that window's data, so nothing is being sampled from a
+                // wider set and there is no degree of freedom to lose.
+                "STANDARD_DEVIATION" => {
+                    aggregates.standard_deviation = mean.map(|mean| {
+                        (self
+                            .numeric
+                            .iter()
+                            .map(|value| (value - mean) * (value - mean))
+                            .sum::<f64>()
+                            / samples as f64)
+                            .sqrt()
+                    });
+                }
+                // Unreachable: `resolve_entry` checks a request's aggregate types
+                // against the generated catalogue before the series is read.
+                _ => {}
+            }
+        }
+        aggregates
+    }
+}
+
+/// Whether `aggregates` reports any value at all. A window that can feed none of
+/// the requested aggregates is not reported, rather than reported as an empty
+/// `Aggregates`.
+fn reports_an_aggregate(aggregates: &Aggregates) -> bool {
+    aggregates.average.is_some()
+        || aggregates.count.is_some()
+        || aggregates.maximum.is_some()
+        || aggregates.minimum.is_some()
+        || aggregates.sum.is_some()
+        || aggregates.standard_deviation.is_some()
+}
+
+/// The numeric value a `Variant` holds, or `None` when it holds none. A `Variant`
+/// sets exactly one member, and only `integerValue` and `doubleValue` are numbers.
+fn numeric_value(value: &Variant) -> Option<f64> {
+    value
+        .double_value
+        .or_else(|| value.integer_value.map(f64::from))
 }

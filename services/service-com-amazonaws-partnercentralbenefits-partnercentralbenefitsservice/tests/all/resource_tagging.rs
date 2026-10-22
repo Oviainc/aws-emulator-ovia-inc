@@ -46,6 +46,11 @@ pub(crate) const REGION: &str = "us-west-2";
 /// The account id every emulated ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
 pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
+/// The status this service serves its `AccessDeniedException` with (recorded; the model
+/// declares the shape `@httpError(403)`) — the rule's own table is
+/// `tests/all/entitlement_denial.rs`.
+const DENIED_STATUS: u16 = 400;
+
 /// Call one operation that must answer 200, and return its body.
 pub(crate) async fn ok(harness: &Harness, case: &str, operation: &str, body: &Value) -> Value {
     let (status, out) = harness.call(operation, body).await;
@@ -410,9 +415,13 @@ async fn tagging_an_arn_that_names_no_resource_is_404() {
     );
 }
 
-/// The recorded shape of the issue's own call: the tagging path is NOT behind the
+/// The recorded shape of the issue's own call: the tag-MUTATING path is NOT behind the
 /// partner-entitlement gate, so an account with no active partner benefit — every caller
-/// from the wire — is answered by the resource lookup, not with 403.
+/// from the wire — is answered by the resource lookup. The tag-READING operation IS
+/// behind it (corpus `simparity-wire-aws-v1`, fixture
+/// `partnercentral-benefits-list-and-tag-validation-error-paths` step `task#4`), so the
+/// same ARN is refused as denied there and never says whether the resource exists; the
+/// denial's own table is `tests/all/entitlement_denial.rs`.
 #[tokio::test]
 async fn an_unentitled_caller_is_answered_by_the_resource_lookup() {
     let harness = Harness::unentitled();
@@ -422,23 +431,43 @@ async fn an_unentitled_caller_is_answered_by_the_resource_lookup() {
         "ben-00000000000000",
     );
 
-    for (operation, body) in tagging_calls(&resource_arn) {
-        let (status, out) = harness.call(operation, &body).await;
-        assert_eq!(
-            status, 404,
-            "case {operation:?}: expected the lookup's 404, got {status} {out:?}"
-        );
-        assert_eq!(
-            error_code(&out),
-            "ResourceNotFoundException",
-            "case {operation:?}: expected ResourceNotFoundException, got {out:?}"
-        );
-        assert_eq!(
-            error_message(&out),
-            catalog_not_found_message(None),
-            "case {operation:?}: unexpected not-found message in {out:?}"
-        );
-    }
+    let (status, out) = harness
+        .call(
+            "TagResource",
+            &json!({
+                "resourceArn": resource_arn,
+                "tags": tag_payload(&[("env", "test")]),
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 404,
+        "case \"TagResource, unentitled\": expected the lookup's 404, got {status} {out:?}"
+    );
+    assert_eq!(
+        error_code(&out),
+        "ResourceNotFoundException",
+        "case \"TagResource, unentitled\": expected ResourceNotFoundException, got {out:?}"
+    );
+    assert_eq!(
+        error_message(&out),
+        catalog_not_found_message(None),
+        "case \"TagResource, unentitled\": unexpected not-found message in {out:?}"
+    );
+
+    let (status, out) = harness
+        .call("ListTagsForResource", &json!({ "resourceArn": resource_arn }))
+        .await;
+    assert_eq!(
+        status, DENIED_STATUS,
+        "case \"ListTagsForResource, unentitled\": expected the gate's refusal, \
+         got {status} {out:?}"
+    );
+    assert_eq!(
+        error_code(&out),
+        "AccessDeniedException",
+        "case \"ListTagsForResource, unentitled\": expected AccessDeniedException, got {out:?}"
+    );
 }
 
 /// A `resourceArn` outside the modelled `TaggableResourceArn` pattern or length is a 400

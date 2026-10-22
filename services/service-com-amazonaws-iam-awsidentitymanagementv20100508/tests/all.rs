@@ -21,6 +21,8 @@ mod role_attached_policies;
 mod role_deletion;
 #[path = "all/role_inline_policies.rs"]
 mod role_inline_policies;
+#[path = "all/role_inline_policy_rotation.rs"]
+mod role_inline_policy_rotation;
 #[path = "all/role_lifecycle.rs"]
 mod role_lifecycle;
 #[path = "all/role_policy_removal.rs"]

@@ -177,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The entitlement gate, ahead of everything else this handler does: a caller
         // whose account holds no active AWS partner benefit is refused before any
-        // resource is looked up, so a 403 never leaks whether a resource exists. The
+        // resource is looked up, so the denial never leaks whether a resource exists. The
         // modelled constraints were refused earlier still, by the centralized walk.
         if let Some(denied) = crate::state::entitlement_refusal(&*self.engine) {
             return Err(

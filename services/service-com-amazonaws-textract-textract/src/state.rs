@@ -111,6 +111,14 @@ pub const ADAPTER_FEATURE_TYPE: &str = "QUERIES";
 /// Characters in a minted `AdapterId`, inside `AdapterId`'s modelled `12..1011` length.
 const ADAPTER_ID_LEN: usize = 32;
 
+/// The `ResourceNotFoundException` message every adapter operation answers for an
+/// `AdapterId` that names no adapter — one never created, or one already deleted.
+///
+/// ONE sentence for the one failure, whichever operation looked the adapter up, and it
+/// carries nothing from the request: the id the caller sent is already in its own request.
+/// This is the sentence Amazon Textract itself answers for an unknown `AdapterId`.
+pub const ADAPTER_NOT_FOUND_MESSAGE: &str = "Adapter Id not found.";
+
 /// The `Confidence` every block reports.
 ///
 /// This emulator READS a document's text rather than recognising it, so there is no
@@ -285,6 +293,20 @@ impl ComAmazonawsTextractTextractState {
         self.adapters.insert(adapter.adapter_id.clone(), adapter);
     }
 
+    /// Remove the adapter `adapter_id` names, with every `ClientRequestToken` entry that
+    /// resolved to it, and hand the removed record back.
+    ///
+    /// `None` when no adapter carries that id — which is how a delete answers the
+    /// modelled `ResourceNotFoundException`. Dropping the token entries keeps
+    /// [`adapter_idempotency`](Self::adapter_idempotency) from growing past the live
+    /// adapters, and matches [`adapter_for_token`](Self::adapter_for_token): a token whose
+    /// adapter is gone names nothing.
+    pub fn remove_adapter(&mut self, adapter_id: &str) -> Option<AdapterRecord> {
+        let removed = self.adapters.remove(adapter_id)?;
+        self.adapter_idempotency.retain(|_, id| id != adapter_id);
+        Some(removed)
+    }
+
     /// Mint a `JobId`: 64 hex characters, within `JobId`'s `1..64` length and its
     /// `^[a-zA-Z0-9-_]+$` pattern.
     pub fn mint_job_id(&mut self, document_key: &str) -> String {
@@ -299,35 +321,102 @@ impl ComAmazonawsTextractTextractState {
     }
 }
 
+/// The members of an adapter's configuration a mutation can change.
+///
+/// AWS, on `UpdateAdapter`: "Update the configuration for an adapter. FeatureTypes
+/// configurations cannot be updated." — so this is exactly `AdapterName`, `Description`
+/// and `AutoUpdate`, and neither `FeatureTypes` nor `Tags` belongs here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdapterConfiguration {
+    pub adapter_name: String,
+    pub description: Option<String>,
+    /// `ENABLED` or `DISABLED`; [`DEFAULT_AUTO_UPDATE`] when the request named none.
+    pub auto_update: String,
+}
+
 /// An adapter created by `CreateAdapter`, as `GetAdapter` reports it back.
 #[derive(Debug, Clone)]
 pub struct AdapterRecord {
     /// The id this service minted for the adapter. Its identity.
     pub adapter_id: String,
+    /// The adapter's LIVE name: the create request's, with every later mutation applied.
     pub adapter_name: String,
+    /// The adapter's LIVE description, or `None` while nothing has set one.
     pub description: Option<String>,
     /// The feature types the adapter is trained on, as the create request listed them.
+    /// Immutable: `UpdateAdapter` cannot change a `FeatureTypes` configuration.
     pub feature_types: Vec<String>,
-    /// `ENABLED` or `DISABLED`; [`DEFAULT_AUTO_UPDATE`] when the request named none.
+    /// The adapter's LIVE `AutoUpdate`: `ENABLED` or `DISABLED`.
     pub auto_update: String,
     pub tags: HashMap<String, String>,
-    /// When this service created the adapter, reported as `CreationTime`.
+    /// When this service created the adapter, reported as `CreationTime`. A mutation does
+    /// not move it: the adapter is still the one that was created then.
     pub created_at: SystemTime,
     /// The `ClientRequestToken` the create carried, if any.
     pub client_request_token: Option<String>,
+    /// The configuration the CREATE request asked for, kept as it was asked for even
+    /// after a mutation changed the live one: `ClientRequestToken` idempotency compares
+    /// create REQUESTS, so an adapter that was updated since must still answer a replay
+    /// of its own create token with itself rather than with a parameter mismatch.
+    pub created_with: AdapterConfiguration,
 }
 
 impl AdapterRecord {
+    /// The record for a create request: its live configuration IS what the request asked
+    /// for, and that same configuration is remembered as [`Self::created_with`].
+    pub fn created(
+        adapter_id: String,
+        configuration: AdapterConfiguration,
+        feature_types: Vec<String>,
+        tags: HashMap<String, String>,
+        created_at: SystemTime,
+        client_request_token: Option<String>,
+    ) -> Self {
+        Self {
+            adapter_id,
+            adapter_name: configuration.adapter_name.clone(),
+            description: configuration.description.clone(),
+            feature_types,
+            auto_update: configuration.auto_update.clone(),
+            tags,
+            created_at,
+            client_request_token,
+            created_with: configuration,
+        }
+    }
+
+    /// Apply a mutation to this adapter: every member the request NAMED replaces the
+    /// stored one, and every member it left out keeps its stored value.
+    ///
+    /// This is what makes a read after a write report the written values: the stored
+    /// record is the one source every read derives its answer from.
+    pub fn apply_update(
+        &mut self,
+        adapter_name: Option<String>,
+        description: Option<String>,
+        auto_update: Option<String>,
+    ) {
+        if let Some(adapter_name) = adapter_name {
+            self.adapter_name = adapter_name;
+        }
+        if let Some(description) = description {
+            self.description = Some(description);
+        }
+        if let Some(auto_update) = auto_update {
+            self.auto_update = auto_update;
+        }
+    }
+
     /// Whether `other` describes the SAME create request as this adapter was made from.
     ///
     /// This is the comparison `IdempotentParameterMismatchException` is about: a reused
     /// token is idempotent only when every member that shapes the adapter agrees.
     /// `FeatureTypes` is compared as a SET, because the list is which features the
-    /// adapter is trained on and not an ordering the resource keeps.
+    /// adapter is trained on and not an ordering the resource keeps. The comparison is
+    /// against the configuration each record was CREATED with, never the live one, so a
+    /// mutation does not retroactively turn a replay into a mismatch.
     pub fn same_request_as(&self, other: &AdapterRecord) -> bool {
-        self.adapter_name == other.adapter_name
-            && self.description == other.description
-            && self.auto_update == other.auto_update
+        self.created_with == other.created_with
             && self.tags == other.tags
             && feature_type_set(&self.feature_types) == feature_type_set(&other.feature_types)
     }
@@ -611,6 +700,32 @@ pub fn validate_adapter_features(feature_types: &[String]) -> Result<(), String>
                  supported feature type is {ADAPTER_FEATURE_TYPE}"
             ));
         }
+    }
+    Ok(())
+}
+
+/// Read a mutation's members as the configuration change it asks for.
+///
+/// AWS, on `UpdateAdapter`: "Update the configuration for an adapter. FeatureTypes
+/// configurations cannot be updated. At least one new parameter must be specified as an
+/// argument." So a request naming none of the three updatable members asks for no change
+/// at all and is refused; `Err` carries the reason, which the caller answers with the
+/// modelled `InvalidParameterException`. The members' own length, pattern and enum
+/// constraints were already enforced at the boundary.
+pub fn validate_adapter_update(
+    adapter_name: Option<&str>,
+    description: Option<&str>,
+    auto_update: Option<&str>,
+) -> Result<(), String> {
+    if adapter_name.is_none() && description.is_none() && auto_update.is_none() {
+        return Err(
+            "at least one of AdapterName, Description or AutoUpdate must be specified to \
+             update an adapter"
+                .to_string(),
+        );
+    }
+    if let Some(auto_update) = auto_update {
+        adapter_auto_update(Some(auto_update))?;
     }
     Ok(())
 }

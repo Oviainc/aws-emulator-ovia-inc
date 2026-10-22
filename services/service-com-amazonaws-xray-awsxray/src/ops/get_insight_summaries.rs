@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetInsightSummaries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetInsightSummaries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetInsightSummaries::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the STORED insights — the map `GetInsight` answers from
+//! ([`crate::state::ComAmazonawsXrayAwsxrayState::insights`]) — that the
+//! request selects: the ones belonging to the group its selector names, whose
+//! own interval overlaps the requested window, and whose `State` it asked for.
+//! Every member of every `InsightSummary` is the stored insight's, so an id
+//! this operation lists is an id `GetInsight` resolves, and one it does not
+//! hold is listed by neither.
+//!
+//! Nothing in the X-Ray API creates an insight — "when fault rates go outside
+//! of the expected range, X-Ray creates an insight" — and this emulator does not
+//! run that anomaly detection, so the map holds an insight only once something
+//! writes one into it. Until then this operation answers an empty
+//! `InsightSummaries` list, which is what a fresh account answers; it never
+//! invents one, and being a reader it writes nothing.
+//!
+//! The window itself goes through the crate's one check
+//! ([`crate::state::validate_window`]), so this operation refuses the same
+//! windows, with the same wording, as every other operation taking a required
+//! `[StartTime, EndTime]`.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +165,204 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetInsightSummaries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetInsightSummariesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetInsightSummaries"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetInsightSummariesErrorModeled::ThrottledException(
+                ThrottledException {
+                    message: Some(
+                        "the X-Ray insight store is unavailable on this emulator engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // `InsightStateList` is bounded to one entry by the model and its member
+        // is the `InsightState` enum, so the request layer already refused a
+        // longer list and a value outside the published set; this is the
+        // handler's backstop, which refuses rather than ignoring a state it
+        // cannot select on — ignoring it would answer every state under 200.
+        let wanted_state = match input.states.as_deref().unwrap_or_default() {
+            [] => None,
+            [state] if INSIGHT_STATES.contains(&state.as_str()) => Some(state.as_str()),
+            [state] => {
+                return Err(refuse(format!(
+                    "States entry `{state}` is not an InsightState; expected one of {}",
+                    INSIGHT_STATES.join(", ")
+                )))
+            }
+            states => {
+                return Err(refuse(format!(
+                    "States carries {} entries; at most one InsightState may be requested",
+                    states.len()
+                )))
+            }
+        };
+
+        // `MaxResults` is "the maximum number of results to display", bounded
+        // 1..100 by the model and so already checked; absent, one page is
+        // [`INSIGHT_SUMMARIES_PAGE_SIZE`].
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(INSIGHT_SUMMARIES_PAGE_SIZE);
+
+        let window_start = crate::state::epoch_seconds(&input.start_time);
+        let window_end = crate::state::epoch_seconds(&input.end_time);
+        // The crate's ONE window check, so every operation taking a required
+        // `[StartTime, EndTime]` refuses the same windows with the same wording.
+        if let Err(window) = crate::state::validate_window(
+            window_start,
+            window_end,
+            crate::state::now_epoch_seconds(),
+        ) {
+            return Err(refuse(window.message(window_start, window_end)));
+        }
+
+        let store = state.lock();
+
+        // "Required if the GroupName isn't provided" and the other way about:
+        // a selector narrows the listing to that group, so one naming no group
+        // is an invalid request rather than an empty list, and `find_group`
+        // refuses a pair that names two identities. No selector lists every
+        // group's insights, which is how X-Ray reports an account's. A group's
+        // `FilterExpression` does not enter it: an insight carries the group it
+        // belongs to, so nothing here has to evaluate one.
+        let selected = if input.group_name.is_some() || input.group_arn.is_some() {
+            let region = crate::state::request_region(ctx.parts());
+            let group = store
+                .find_group(
+                    &region,
+                    input.group_name.as_deref(),
+                    input.group_arn.as_deref(),
+                )
+                .map_err(|failure| refuse(failure.message().to_string()))?;
+            Some(group)
+        } else {
+            None
+        };
+
+        // A token this service issued names the insight the next page starts
+        // at. One still inside the keyspace being walked is honoured even if
+        // that exact insight has since gone, so a change between pages does not
+        // fail an in-flight paginator; one beyond it never came from here.
+        if let Some(token) = input.next_token.as_deref() {
+            let within_keyspace = store
+                .insights
+                .keys()
+                .next_back()
+                .is_some_and(|last| token <= last.as_str());
+            if !within_keyspace {
+                return Err(refuse(format!(
+                    "NextToken `{token}` was not issued by this service"
+                )));
+            }
+        }
+
+        // `insights` is a `BTreeMap`, so the listing is in `InsightId` order and
+        // a token naming the next id resumes exactly where the last page
+        // stopped, in O(log n).
+        let scan: Box<dyn Iterator<Item = (&String, &Insight)>> = match input.next_token.as_deref() {
+            Some(token) => Box::new(store.insights.range(token.to_string()..)),
+            None => Box::new(store.insights.iter()),
+        };
+
+        let mut insight_summaries = Vec::new();
+        let mut next_token = None;
+        for (insight_id, insight) in scan {
+            if !belongs_to(insight, selected.as_ref())
+                || !in_window(insight, window_start, window_end)
+                || !has_state(insight, wanted_state)
+            {
+                continue;
+            }
+            // A token only when the listing was truncated; it names the insight
+            // the next page resumes at.
+            if insight_summaries.len() >= page_size {
+                next_token = Some(insight_id.clone());
+                break;
+            }
+            insight_summaries.push(summary_of(insight));
+        }
+
+        Ok(GetInsightSummariesOutput {
+            insight_summaries: Some(insight_summaries),
+            next_token,
+        })
+    }
+}
+
+/// How many `InsightSummary` values one page carries when the request names no
+/// `MaxResults`. The model bounds `MaxResults` to 1..100 but declares no
+/// default, so this is the emulator's: a `NextToken` is emitted only when the
+/// listing exceeded the page, and resuming from it returns the remainder.
+pub const INSIGHT_SUMMARIES_PAGE_SIZE: usize = 5;
+
+/// The values `InsightState` publishes, which are the ones `States` may carry
+/// (`smithy_query(query="shape",shape="InsightState")`).
+pub const INSIGHT_STATES: [&str; 2] = ["ACTIVE", "CLOSED"];
+
+/// Refuse the request with the error this operation models for an invalid one.
+fn refuse(message: String) -> GetInsightSummariesError {
+    GetInsightSummariesErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Whether a stored insight belongs to the group a selector resolved, which it
+/// does when the insight carries that group's name or its ARN. No selector
+/// selects every insight.
+fn belongs_to(insight: &Insight, group: Option<&crate::state::GroupRecord>) -> bool {
+    let Some(group) = group else {
+        return true;
+    };
+    insight.group_name.as_deref() == Some(group.group_name.as_str())
+        || insight.group_arn.as_deref() == Some(group.group_arn.as_str())
+}
+
+/// Whether a stored insight was in progress during the half-open window
+/// [`start`, `end`): it began before the window ended and had not ended before
+/// the window began.
+///
+/// `StartTime` is "the beginning of the time frame in which the insights
+/// started" and `EndTime` "the end of the time frame in which the insights
+/// ended", so an insight is selected by the OVERLAP rather than by containment:
+/// an `ACTIVE` insight has not ended and so carries no `EndTime`, and a bound
+/// the stored insight does not report bounds nothing.
+fn in_window(insight: &Insight, start: f64, end: f64) -> bool {
+    let insight_start = insight.start_time.as_ref().map(crate::state::epoch_seconds);
+    let insight_end = insight.end_time.as_ref().map(crate::state::epoch_seconds);
+    insight_start.is_none_or(|began| began < end) && insight_end.is_none_or(|ended| ended >= start)
+}
+
+/// Whether a stored insight is in the state the request asked for. An insight
+/// that reports no `State` matches no requested one.
+fn has_state(insight: &Insight, wanted: Option<&str>) -> bool {
+    wanted.is_none_or(|wanted| insight.state.as_deref() == Some(wanted))
+}
+
+/// One stored insight as the `InsightSummary` this operation reports.
+///
+/// Every member comes from the stored insight; `InsightSummary$LastUpdateTime`
+/// has no counterpart on `Insight` (`smithy_query(query="shape",shape="Insight")`
+/// publishes no `LastUpdateTime`), so it is reported only when the store knows
+/// it, which is never — rather than invented from a clock.
+fn summary_of(insight: &Insight) -> InsightSummary {
+    InsightSummary {
+        insight_id: insight.insight_id.clone(),
+        group_arn: insight.group_arn.clone(),
+        group_name: insight.group_name.clone(),
+        root_cause_service_id: insight.root_cause_service_id.clone(),
+        categories: insight.categories.clone(),
+        state: insight.state.clone(),
+        start_time: insight.start_time,
+        end_time: insight.end_time,
+        summary: insight.summary.clone(),
+        client_request_impact_statistics: insight.client_request_impact_statistics.clone(),
+        root_cause_service_request_impact_statistics: insight
+            .root_cause_service_request_impact_statistics
+            .clone(),
+        top_anomalous_services: insight.top_anomalous_services.clone(),
+        last_update_time: None,
     }
 }

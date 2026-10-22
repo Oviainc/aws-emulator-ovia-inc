@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListObjectsV2
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListObjectsV2`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: enumerates the keys actually stored in the bucket, in ascending UTF-8
+//! byte order, honouring Prefix, StartAfter, Delimiter, MaxKeys and ContinuationToken.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListObjectsV2::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A read: it reports the stored objects and changes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -228,6 +223,36 @@ impl From<ListObjectsV2ErrorModeled> for ListObjectsV2Error {
     }
 }
 
+/// The most keys one page may carry: "By default, the action returns up to 1,000 key
+/// names. The response might contain fewer keys but will never contain more"
+/// (`MaxKeys`, `com.amazonaws.s3#ListObjectsV2Request`). A larger `max-keys` is
+/// answered with this many.
+const MAX_KEYS_PER_PAGE: i32 = 1000;
+
+/// The marker a continuation token this service issued carries, so a token it did not
+/// issue is refused rather than silently read as a cursor.
+const CONTINUATION_TOKEN_MARKER: &str = "s3v1 ";
+
+/// Encode the resume point of a truncated page as the `NextContinuationToken`.
+///
+/// "NextContinuationToken is obfuscated and is not a real key" — hex of a marker plus
+/// the first key NOT returned, so the token a page hands back resumes exactly where it
+/// stopped without storing per-caller cursor state. Obfuscated, NOT confidential: hex is
+/// trivially reversible, and the token is only opaque in the sense that a client must not
+/// read a key out of it or mint one of its own.
+fn encode_continuation_token(first_key_not_returned: &str) -> String {
+    hex::encode(format!("{CONTINUATION_TOKEN_MARKER}{first_key_not_returned}").as_bytes())
+}
+
+/// The key a `ContinuationToken` resumes at (inclusive), or `None` when the token is
+/// not one this service issued.
+fn decode_continuation_token(token: &str) -> Option<String> {
+    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    decoded
+        .strip_prefix(CONTINUATION_TOKEN_MARKER)
+        .map(str::to_string)
+}
+
 /// The `ListObjectsV2` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -262,20 +287,171 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListObjectsV2` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListObjectsV2ErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListObjectsV2"))
+        // `encoding-type=url` changes how Delimiter, Prefix, Key and StartAfter are
+        // written in the response, `fetch-owner` adds an Owner to every entry, and
+        // `OptionalObjectAttributes` adds restore state: none of the three is served
+        // yet, and answering as if they had been asked for would be a different
+        // response than the one requested.
+        if input.encoding_type.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListObjectsV2 with encoding-type",
+            ));
+        }
+        if input.fetch_owner == Some(true) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListObjectsV2 with fetch-owner=true",
+            ));
+        }
+        if input
+            .optional_object_attributes
+            .as_ref()
+            .is_some_and(|attrs| !attrs.is_empty())
+        {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListObjectsV2 with x-amz-optional-object-attributes",
+            ));
+        }
+
+        let max_keys = match input.max_keys {
+            Some(requested) if requested < 0 => {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    "InvalidArgument",
+                    400,
+                    format!("Argument max-keys must be an integer between 0 and 2147483647: {requested}"),
+                ))
+            }
+            Some(requested) => requested.min(MAX_KEYS_PER_PAGE),
+            None => MAX_KEYS_PER_PAGE,
+        };
+        let page_limit = max_keys as usize;
+
+        // A continuation token wins over StartAfter: it already encodes where the
+        // previous page stopped, which is at or after StartAfter.
+        let resume_at = match input.continuation_token.as_deref() {
+            Some(token) => Some(decode_continuation_token(token).ok_or_else(|| {
+                crate::scaffolded::Scaffolded::unmodeled(
+                    "InvalidArgument",
+                    400,
+                    "The continuation token provided is incorrect",
+                )
+            })?),
+            None => None,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::unmodeled(
+                "InternalError",
+                500,
+                "the shared S3 store is unreachable from this engine",
+            )
+        })?;
+        let store = state.lock();
+
+        let bucket = store
+            .bucket(&input.bucket)
+            .ok_or(ListObjectsV2ErrorModeled::NoSuchBucket(NoSuchBucket {}))?;
+
+        let prefix = input.prefix.clone().unwrap_or_default();
+        let delimiter = input.delimiter.clone().unwrap_or_default();
+
+        let mut contents: Vec<Object> = Vec::new();
+        let mut common_prefixes: Vec<String> = Vec::new();
+        let mut next_continuation_token: Option<String> = None;
+
+        // `max-keys=0` asks for no entries at all, which is an empty page and NOT a
+        // truncated one — reporting it as truncated would hand a paginating client a
+        // token that makes no progress — so the walk below is skipped entirely.
+        if page_limit > 0 {
+            // The store keys objects in a `BTreeMap<String, _>`, so this walk is
+            // already in ascending UTF-8 byte order and every key rolling into one
+            // common prefix is contiguous within it.
+            for (key, object) in bucket.objects() {
+                if !key.starts_with(&prefix) {
+                    continue;
+                }
+                match (&resume_at, &input.start_after) {
+                    // The token's key is the first one this page owes, inclusive.
+                    (Some(from), _) if key < from => continue,
+                    // "Amazon S3 starts listing AFTER this specified key".
+                    (None, Some(start_after)) if key <= start_after => continue,
+                    _ => {}
+                }
+
+                // With a delimiter, a key whose remainder after the prefix contains
+                // one is reported as the prefix up to and including that delimiter,
+                // not as an entry of its own.
+                let rolled_up = if delimiter.is_empty() {
+                    None
+                } else {
+                    key[prefix.len()..]
+                        .find(delimiter.as_str())
+                        .map(|at| key[..prefix.len() + at + delimiter.len()].to_string())
+                };
+
+                // "All of the keys that roll up into a common prefix count as a
+                // single return": a key under a prefix already on this page consumes
+                // no slot.
+                if let Some(rolled_up) = &rolled_up {
+                    if common_prefixes.last() == Some(rolled_up) {
+                        continue;
+                    }
+                }
+
+                // One slot per entry, shared by Contents and CommonPrefixes. Out of
+                // slots means this key starts the NEXT page.
+                if contents.len() + common_prefixes.len() >= page_limit {
+                    next_continuation_token = Some(encode_continuation_token(key));
+                    break;
+                }
+
+                match rolled_up {
+                    Some(rolled_up) => common_prefixes.push(rolled_up),
+                    None => contents.push(Object {
+                        key: Some(key.clone()),
+                        // The instant the store recorded for the write, rendered the way
+                        // `GetObject` and `HeadObject` render it.
+                        last_modified: Some(::aws_smithy_types::DateTime::from(
+                            object.last_modified,
+                        )),
+                        e_tag: Some(object.etag.clone()),
+                        size: Some(object.body.len() as i64),
+                        storage_class: Some(object.storage_class.clone()),
+                        ..Object::default()
+                    }),
+                }
+            }
+        }
+
+        let key_count = (contents.len() + common_prefixes.len()) as i32;
+
+        Ok(ListObjectsV2Output {
+            name: Some(input.bucket.clone()),
+            prefix: input.prefix.clone(),
+            delimiter: input.delimiter.clone(),
+            max_keys: Some(max_keys),
+            // "KeyCount is the number of keys returned with this request" — the
+            // entries on this page, each rolled-up prefix counting as one.
+            key_count: Some(key_count),
+            // Truncated exactly when a key was left for the next page.
+            is_truncated: Some(next_continuation_token.is_some()),
+            next_continuation_token,
+            // "If ContinuationToken was sent with the request, it is included in the
+            // response" — same for StartAfter.
+            continuation_token: input.continuation_token.clone(),
+            start_after: input.start_after.clone(),
+            contents: (!contents.is_empty()).then_some(contents),
+            common_prefixes: (!common_prefixes.is_empty()).then(|| {
+                common_prefixes
+                    .into_iter()
+                    .map(|prefix| CommonPrefix {
+                        prefix: Some(prefix),
+                    })
+                    .collect()
+            }),
+            encoding_type: None,
+            request_charged: None,
+        })
     }
 }
