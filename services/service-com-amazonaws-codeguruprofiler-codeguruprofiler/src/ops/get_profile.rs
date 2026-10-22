@@ -262,15 +262,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let guard = state.lock();
         let group = guard.groups.get(&input.profiling_group_name).ok_or_else(|| {
             GetProfileErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!("no profiling group named {}", input.profiling_group_name),
+                message: crate::state::group_not_found_message(&input.profiling_group_name),
             })
         })?;
+        // The group IS there; what is missing is profile data covering the requested
+        // range. That is a different refusal from a missing group, and the service
+        // states it with its own fixed text — the only thing distinguishing the two,
+        // since both are 404 `ResourceNotFoundException`.
         let profile = group.latest_profile_in(start, end).ok_or_else(|| {
             GetProfileErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!(
-                    "no profile has been posted to profiling group {} in the requested time range",
-                    input.profiling_group_name
-                ),
+                message: crate::state::NO_PROFILES_IN_TIME_RANGE.to_string(),
             })
         })?;
 

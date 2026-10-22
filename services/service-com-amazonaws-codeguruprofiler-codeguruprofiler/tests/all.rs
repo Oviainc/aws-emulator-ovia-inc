@@ -19,6 +19,8 @@ mod profile_times;
 mod profiling_group_lifecycle;
 #[path = "all/recommendations_analysis.rs"]
 mod recommendations_analysis;
+#[path = "all/refusal_message_formats.rs"]
+mod refusal_message_formats;
 #[path = "all/resource_policy.rs"]
 mod resource_policy;
 #[path = "all/state_roundtrip.rs"]

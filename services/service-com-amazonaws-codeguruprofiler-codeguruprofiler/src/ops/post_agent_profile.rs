@@ -172,9 +172,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::PostedProfile::UnknownGroup => Err(
                 PostAgentProfileErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!(
-                            "no profiling group named {}",
-                            input.profiling_group_name
+                        message: crate::state::group_not_found_message(
+                            &input.profiling_group_name,
                         ),
                     },
                 )

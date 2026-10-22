@@ -255,7 +255,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let guard = state.lock();
         let group = guard.groups.get(&input.profiling_group_name).ok_or_else(|| {
             GetRecommendationsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!("no profiling group named {}", input.profiling_group_name),
+                message: crate::state::group_not_found_message(&input.profiling_group_name),
             })
         })?;
 

@@ -628,6 +628,53 @@ impl ComAmazonawsCodeguruprofilerCodeguruprofilerState {
     }
 }
 
+/// The message a 404 about missing profile DATA carries — a FIXED service text, with no
+/// substitution from the request at all. Both "no such group" and "the group holds no
+/// profile in this range" are `ResourceNotFoundException` (404), so the message is the
+/// only thing a caller can tell them apart by: the group-missing refusals name the group
+/// ([`group_not_found_message`], [`profiling_group_record_not_found_message`]) and the
+/// no-data refusal states this constant instead.
+pub const NO_PROFILES_IN_TIME_RANGE: &str = "No profiles found for the requested time range!";
+
+/// How CodeGuru Profiler words a refusal about the profiling-group RECORD ITSELF — the
+/// collision a create hits and the absence a delete hits: the group is named together
+/// with the account it would live in, because a profiling-group name identifies a group
+/// only WITHIN one account, so the account is part of saying which group collided or was
+/// missing. `outcome` completes the sentence ("already exists.", "not found.").
+///
+/// The account is this emulator's own ([`::engine::emulator_account_id`]), which is the
+/// account every resource it mints lives in — the same one the group's ARN carries.
+fn profiling_group_record_message(name: &str, outcome: &str) -> String {
+    format!(
+        "ProfilingGroup (name: {name}, accountId: {}) {outcome}",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// The `ConflictException` message for a create whose `profilingGroupName` is already
+/// taken: the record-level form of [`profiling_group_record_message`].
+pub fn profiling_group_already_exists_message(name: &str) -> String {
+    profiling_group_record_message(name, "already exists.")
+}
+
+/// The `ResourceNotFoundException` message for a delete of a group that is not there:
+/// the record-level form of [`profiling_group_record_message`].
+pub fn profiling_group_record_not_found_message(name: &str) -> String {
+    profiling_group_record_message(name, "not found.")
+}
+
+/// The `ResourceNotFoundException` message every OTHER group-scoped operation answers a
+/// name it cannot resolve with: the service states that it cannot carry out the operation
+/// asked of it, naming the group that was not there. The apostrophe is the typographic
+/// one (U+2019) the service's own text uses, not an ASCII `'`.
+///
+/// This is the refusal of an operation ON a group, as distinct from a refusal about the
+/// group RECORD (create's conflict, delete's absence), which names the account too —
+/// see [`profiling_group_record_not_found_message`].
+pub fn group_not_found_message(name: &str) -> String {
+    format!("CodeGuru Profiler can\u{2019}t complete the operation because {name} was not found.")
+}
+
 /// The resource-type prefix a profiling-group ARN carries in its resource field, as
 /// [`profiling_group_arn`] mints it: `profilingGroup/<name>`.
 pub const PROFILING_GROUP_RESOURCE_PREFIX: &str = "profilingGroup/";

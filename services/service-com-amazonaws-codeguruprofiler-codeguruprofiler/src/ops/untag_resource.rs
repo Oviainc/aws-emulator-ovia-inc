@@ -168,7 +168,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .group_by_arn_mut(&input.resource_arn)
             .ok_or_else(|| {
                 UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: format!("no resource with the arn {}", input.resource_arn),
+                    // The only taggable resource of this service is a profiling group, so
+                    // this is the group-scoped not-found refusal, stated in the service's
+                    // own wording and naming the group the ARN names (the ARN parsed
+                    // above, so it has one).
+                    message: crate::state::group_not_found_message(
+                        crate::state::profiling_group_name_from_arn(&input.resource_arn)
+                            .unwrap_or(&input.resource_arn),
+                    ),
                 })
             })?;
 

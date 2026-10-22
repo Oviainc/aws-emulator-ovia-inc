@@ -148,9 +148,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if guard.groups.remove(&input.profiling_group_name).is_none() {
             return Err(DeleteProfilingGroupErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "no profiling group named {}",
-                        input.profiling_group_name
+                    // Deleting is an operation on the group RECORD, so the refusal names
+                    // the group together with the account it was looked for in.
+                    message: crate::state::profiling_group_record_not_found_message(
+                        &input.profiling_group_name,
                     ),
                 },
             )

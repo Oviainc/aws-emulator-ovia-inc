@@ -196,9 +196,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if guard.groups.contains_key(&input.profiling_group_name) {
             return Err(CreateProfilingGroupErrorModeled::ConflictException(
                 ConflictException {
-                    message: format!(
-                        "a profiling group named {} already exists",
-                        input.profiling_group_name
+                    // The conflict is about the group RECORD: it names the group and the
+                    // account it already exists in, because the name identifies a group
+                    // only within one account.
+                    message: crate::state::profiling_group_already_exists_message(
+                        &input.profiling_group_name,
                     ),
                 },
             )
