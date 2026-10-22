@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAccountAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAccountAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reads the linked accounts and the billing group each one is associated with out
+//! of state. A pure read: it writes nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAccountAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! LIMITATION: `BillingPeriod` selects the month to report for. This emulator keeps
+//! no per-billing-period history of the associations, so every period reports the
+//! CURRENT ones. The operation models no `MaxResults`, so a page is bounded by
+//! `crate::state::DEFAULT_PAGE_SIZE` and continued through the modelled `NextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -124,6 +122,13 @@ impl From<ListAccountAssociationsErrorModeled> for ListAccountAssociationsError 
     }
 }
 
+/// The two `Association` filter values that are not a billing group ARN, as the
+/// `ListAccountAssociationsFilter.Association` pattern and doc enumerate them:
+/// "MONITORED: linked accounts that are associated to billing groups. UNMONITORED:
+/// linked accounts that are not associated to billing groups."
+const MONITORED: &str = "MONITORED";
+const UNMONITORED: &str = "UNMONITORED";
+
 /// The `ListAccountAssociations` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -160,18 +165,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAccountAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAccountAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAccountAssociations"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListAccountAssociationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the billingconductor store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // `BillingPeriod` selects the month to report for; this emulator keeps no
+        // per-period history, so every period reports the current associations.
+        let filters = input.filters.unwrap_or_default();
+
+        // An `Association` that is neither MONITORED nor UNMONITORED is a billing
+        // group ARN (or bare id) to restrict the listing to. One that names no stored
+        // group is a reference to a resource that doesn't exist.
+        let association_group = match filters.association.as_deref() {
+            None | Some(MONITORED | UNMONITORED) => None,
+            Some(value) => {
+                let arn = crate::state::normalize_billing_group_arn(value);
+                if !state.billing_groups.contains_key(&arn) {
+                    return Err(ListAccountAssociationsErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: "the billing group does not exist".to_string(),
+                            resource_id: arn,
+                            resource_type: "billinggroup".to_string(),
+                        },
+                    )
+                    .into());
+                }
+                Some(arn)
+            }
+        };
+
+        let mut selected: Vec<(String, AccountAssociationsListElement)> = Vec::new();
+        for (account_id, group_arn) in state.linked_accounts() {
+            let association_matches = match filters.association.as_deref() {
+                None => true,
+                Some(MONITORED) => group_arn.is_some(),
+                Some(UNMONITORED) => group_arn.is_none(),
+                Some(_) => group_arn == association_group,
+            };
+            if !association_matches {
+                continue;
+            }
+            if filters
+                .account_id
+                .as_ref()
+                .is_some_and(|wanted| *wanted != account_id)
+            {
+                continue;
+            }
+            if filters
+                .account_ids
+                .as_ref()
+                .is_some_and(|wanted| !wanted.contains(&account_id))
+            {
+                continue;
+            }
+            selected.push((
+                account_id.clone(),
+                AccountAssociationsListElement {
+                    account_id: Some(account_id),
+                    billing_group_arn: group_arn,
+                    // The account's name and email live in Organizations, which this
+                    // emulator has not been told; absent rather than invented.
+                    account_name: None,
+                    account_email: None,
+                },
+            ));
+        }
+
+        // This operation models no `MaxResults`, so the server chooses the page
+        // size: `paginate` applies `crate::state::DEFAULT_PAGE_SIZE` and hands back
+        // the modelled `NextToken` to continue from.
+        let (linked_accounts, next_token) =
+            crate::state::paginate(selected, input.next_token.as_deref(), None);
+
+        Ok(ListAccountAssociationsOutput {
+            linked_accounts: Some(linked_accounts),
+            next_token,
+        })
     }
 }
