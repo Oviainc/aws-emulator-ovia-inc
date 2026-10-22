@@ -19,6 +19,8 @@ mod cluster_policy;
 mod error_contract;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/policy_document_class.rs"]
+mod policy_document_class;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

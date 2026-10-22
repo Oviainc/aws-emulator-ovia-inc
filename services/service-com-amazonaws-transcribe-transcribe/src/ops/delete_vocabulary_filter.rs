@@ -157,7 +157,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "DeleteVocabularyFilter";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_VOCABULARY_FILTER_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = DELETE_VOCABULARY_FILTER_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 204u16;
+    // 200, not the model's `@http` `code: 204`: this service speaks awsJson1_1, an RPC
+    // protocol, so its `@http` traits are inert on the wire (`smithy_query` reports
+    // `httpBindingsInert: true` for every operation) and a success answers that
+    // protocol's own status, 200. The error side of the same rule is
+    // [`crate::scaffolded::wire_status`].
+    const SUCCESS_STATUS: u16 = 200u16;
 
     async fn handle(
         &self,
@@ -185,12 +190,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .remove(&input.vocabulary_filter_name)
             .is_none()
         {
-            return Err(DeleteVocabularyFilterErrorModeled::NotFoundException(
-                NotFoundException {
-                    message: Some(format!(
-                        "The requested vocabulary filter {} couldn't be found. Check the \
-                         vocabulary filter name and try your request again.",
-                        input.vocabulary_filter_name
+            return Err(DeleteVocabularyFilterErrorModeled::BadRequestException(
+                BadRequestException {
+                    // "This can occur when the entity you're trying to delete doesn't
+                    // exist" (`BadRequestException`'s own documentation), which is the
+                    // error this service reports a resource it does not hold with.
+                    message: Some(crate::state::not_found_message(
+                        crate::state::KIND_VOCABULARY_FILTER,
                     )),
                 },
             )

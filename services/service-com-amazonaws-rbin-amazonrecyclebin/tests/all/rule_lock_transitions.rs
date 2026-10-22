@@ -14,10 +14,15 @@
 //! Each case drives the service through the real router, exactly as a signed SDK
 //! request would, and every row states its own case so a failure names the input.
 
+use std::time::Instant;
+
 use serde_json::json;
 
 use crate::retention_rule_lifecycle::{
     call, create_rule, delete_rule, get_rule, lock_configuration, retention, router, update_rule,
+};
+use service_com_amazonaws_rbin_amazonrecyclebin::state::{
+    RULE_STATUS_AVAILABLE, RULE_STATUS_PENDING, STATUS_TRANSITION,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -121,6 +126,7 @@ async fn lock_rule_locks_every_region_level_rule_and_persists_its_configuration(
         if let Some(text) = description {
             body["Description"] = json!(text);
         }
+        let minted_at = Instant::now();
         let (status, created) = create_rule(&router, body).await;
         assert_eq!(
             status, 201,
@@ -158,13 +164,28 @@ async fn lock_rule_locks_every_region_level_rule_and_persists_its_configuration(
             locked["LockConfiguration"]
         );
         // Locking changes the lock, and nothing else about the rule.
-        for member in ["Identifier", "ResourceType", "RetentionPeriod", "RuleArn", "Status"] {
+        for member in ["Identifier", "ResourceType", "RetentionPeriod", "RuleArn"] {
             assert_eq!(
                 locked[member], created[member],
                 "case {case:?}: LockRule changed {member}: {:?} -> {:?}",
                 created[member], locked[member]
             );
         }
+        // `Status` is the CLOCK's to move, not this call's: locking neither advances
+        // nor reverts it, so inside the transition span the locked rule still reports
+        // the `pending` the create left, and past it the `available` the clock made
+        // due. `tests/all/rule_status_transitions.rs` pins the transition itself.
+        let status = locked["Status"].as_str();
+        let expected = if minted_at.elapsed() < STATUS_TRANSITION {
+            RULE_STATUS_PENDING
+        } else {
+            RULE_STATUS_AVAILABLE
+        };
+        assert_eq!(
+            status,
+            Some(expected),
+            "case {case:?}: expected LockRule to report Status={expected}, got {status:?}"
+        );
         assert_eq!(
             locked["Description"], created["Description"],
             "case {case:?}: LockRule changed Description: {:?} -> {:?}",

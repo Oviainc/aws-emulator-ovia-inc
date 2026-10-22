@@ -29,15 +29,16 @@ const REGION: &str = "us-east-1";
 /// The canonical emulator account id every emulated ARN carries.
 const ACCOUNT: &str = "000000000000";
 
-/// One HTTP answer, reduced to what these tests assert on.
-struct Answer {
-    status: u16,
+/// One HTTP answer, reduced to what these tests assert on. `pub(crate)` so the other
+/// suites in this test target drive the same harness instead of forking it.
+pub(crate) struct Answer {
+    pub(crate) status: u16,
     content_type: Option<String>,
-    body: Vec<u8>,
+    pub(crate) body: Vec<u8>,
 }
 
 impl Answer {
-    fn json(&self) -> serde_json::Value {
+    pub(crate) fn json(&self) -> serde_json::Value {
         serde_json::from_slice(&self.body).unwrap_or_else(|error| {
             panic!(
                 "expected a JSON body, got {error}: {}",
@@ -47,7 +48,7 @@ impl Answer {
     }
 
     /// The modelled error code, which restJson1 carries in `__type`.
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         self.json()
             .get("__type")
             .and_then(|value| value.as_str())
@@ -62,13 +63,13 @@ impl Answer {
 /// The emulator, assembled exactly as the router assembles it: one shared engine
 /// behind one mounted service. The engine is kept so a test can assert on the stored
 /// state itself, which is the only way to observe a retention bound.
-struct Harness {
+pub(crate) struct Harness {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Harness {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -106,7 +107,7 @@ impl Harness {
             .retained_profile_bytes()
     }
 
-    async fn send(
+    pub(crate) async fn send(
         &self,
         method: &str,
         uri: &str,
@@ -135,7 +136,7 @@ impl Harness {
         }
     }
 
-    async fn create(&self, case: &GroupCase, client_token: &str) -> Answer {
+    pub(crate) async fn create(&self, case: &GroupCase, client_token: &str) -> Answer {
         self.send(
             "POST",
             &format!("/profilingGroups?clientToken={client_token}"),
@@ -145,7 +146,7 @@ impl Harness {
         .await
     }
 
-    async fn describe(&self, name: &str) -> Answer {
+    pub(crate) async fn describe(&self, name: &str) -> Answer {
         self.send(
             "GET",
             &format!("/profilingGroups/{name}"),
@@ -165,7 +166,7 @@ impl Harness {
         .await
     }
 
-    async fn configure_agent(&self, name: &str) -> Answer {
+    pub(crate) async fn configure_agent(&self, name: &str) -> Answer {
         self.send(
             "POST",
             &format!("/profilingGroups/{name}/configureAgent"),
@@ -246,13 +247,13 @@ impl Harness {
 
 /// One `CreateProfilingGroup` input, plus what the stored group must then report.
 #[derive(Debug)]
-struct GroupCase {
-    name: String,
+pub(crate) struct GroupCase {
+    pub(crate) name: String,
     /// `computePlatform` as sent; `None` exercises the model's documented default.
     compute_platform: Option<&'static str>,
     /// `agentOrchestrationConfig.profilingEnabled` as sent; `None` omits the config.
     profiling_enabled: Option<bool>,
-    tags: BTreeMap<&'static str, &'static str>,
+    pub(crate) tags: BTreeMap<&'static str, &'static str>,
 }
 
 impl GroupCase {
@@ -290,17 +291,17 @@ impl GroupCase {
 
     /// `computePlatform` the group must report: the model's doc for that member says
     /// "If not specified, Default is used."
-    fn expected_compute_platform(&self) -> &str {
+    pub(crate) fn expected_compute_platform(&self) -> &str {
         self.compute_platform.unwrap_or("Default")
     }
 
     /// `profilingEnabled` the group must report: an absent `agentOrchestrationConfig`
     /// leaves the agents orchestrated, i.e. profiling enabled.
-    fn expected_profiling_enabled(&self) -> bool {
+    pub(crate) fn expected_profiling_enabled(&self) -> bool {
         self.profiling_enabled.unwrap_or(true)
     }
 
-    fn expected_arn(&self) -> String {
+    pub(crate) fn expected_arn(&self) -> String {
         format!(
             "arn:aws:codeguru-profiler:{REGION}:{ACCOUNT}:profilingGroup/{}",
             self.name
@@ -310,7 +311,7 @@ impl GroupCase {
 
 /// The table: rows differ in compute platform, orchestration flag, tag count and name
 /// length (1 and 255 are the `ProfilingGroupName` length bounds the model declares).
-fn group_cases() -> Vec<GroupCase> {
+pub(crate) fn group_cases() -> Vec<GroupCase> {
     vec![
         GroupCase {
             name: "demo-app".to_string(),

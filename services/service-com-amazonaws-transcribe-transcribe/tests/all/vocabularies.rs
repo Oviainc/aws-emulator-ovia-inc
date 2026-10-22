@@ -304,7 +304,7 @@ async fn a_create_without_usable_inline_terms_is_a_bad_request() {
             )
         };
         let read = transcribe.call(reader, json!({key: name})).await;
-        read.refused(case, 404, "NotFoundException");
+        read.refused(case, 400, "BadRequestException");
     }
 }
 
@@ -325,7 +325,7 @@ async fn a_vocabulary_name_is_claimed_by_exactly_one_create() {
         .await
         .ok("the first create of a free name");
     let again = transcribe.call("CreateVocabulary", request.clone()).await;
-    again.refused("a second create of the same name", 409, "ConflictException");
+    again.refused("a second create of the same name", 400, "ConflictException");
 
     // Rows differ in how many racers contend for one fresh name; the invariant is
     // the same for each: one winner, every other racer the modelled conflict.
@@ -351,7 +351,7 @@ async fn a_vocabulary_name_is_claimed_by_exactly_one_create() {
         let winners = outcomes.iter().filter(|(status, _)| *status == 200).count();
         let conflicts = outcomes
             .iter()
-            .filter(|(status, code)| *status == 409 && code == "ConflictException")
+            .filter(|(status, code)| *status == 400 && code == "ConflictException")
             .count();
         assert_eq!(
             winners, 1,
@@ -398,20 +398,24 @@ async fn a_vocabulary_being_processed_cannot_be_deleted() {
     transcribe
         .call("DeleteVocabulary", json!({"VocabularyName": "pending-delete"}))
         .await
-        .ok_status("delete once READY", 204);
+        .ok_status("delete once READY", 200);
     transcribe
         .call("GetVocabulary", json!({"VocabularyName": "pending-delete"}))
         .await
-        .refused("read a deleted vocabulary", 404, "NotFoundException");
+        .refused("read a deleted vocabulary", 400, "BadRequestException");
     transcribe
         .call("DeleteVocabulary", json!({"VocabularyName": "never-created"}))
         .await
-        .refused("delete a vocabulary that does not exist", 404, "NotFoundException");
+        .refused(
+            "delete a vocabulary that does not exist",
+            400,
+            "BadRequestException",
+        );
 }
 
 /// `UpdateVocabulary` replaces the stored terms and puts the vocabulary back into
 /// `PENDING`, for several replacement term lists; an update of a name that does not
-/// exist is the modelled not-found.
+/// exist is this service's `BadRequestException`.
 #[tokio::test]
 async fn updating_a_vocabulary_resets_its_state() {
     let transcribe = Transcribe::new();
@@ -505,7 +509,11 @@ async fn updating_a_vocabulary_resets_its_state() {
             }),
         )
         .await
-        .refused("update a vocabulary that does not exist", 404, "NotFoundException");
+        .refused(
+            "update a vocabulary that does not exist",
+            400,
+            "BadRequestException",
+        );
 }
 
 /// `ListVocabularies` reports the stored vocabularies newest first, filters them by
@@ -707,8 +715,9 @@ async fn the_vocabulary_filter_family_round_trips() {
         let created = transcribe
             .call("CreateVocabularyFilter", request.clone())
             .await;
-        // `CreateVocabularyFilter` models `201` as its success status.
-        created.ok_status(case, 201);
+        // Every success of this awsJson1_1 service is 200: the model's `@http`
+        // `code: 201` is inert on an RPC protocol.
+        created.ok_status(case, 200);
         assert_eq!(
             created.member(case, "VocabularyFilterName"),
             name,
@@ -783,17 +792,17 @@ async fn the_vocabulary_filter_family_round_trips() {
         transcribe
             .call("DeleteVocabularyFilter", json!({"VocabularyFilterName": name}))
             .await
-            .ok_status(case, 204);
+            .ok_status(case, 200);
         transcribe
             .call("GetVocabularyFilter", json!({"VocabularyFilterName": name}))
             .await
-            .refused(case, 404, "NotFoundException");
+            .refused(case, 400, "BadRequestException");
     }
 }
 
 /// Tags round trip on every resource type an Amazon Transcribe ARN this emulator
-/// stores can name, and an ARN that names no stored resource is the modelled
-/// not-found.
+/// stores can name, and an ARN that names no stored resource is this service's
+/// `BadRequestException`.
 #[tokio::test]
 async fn tags_round_trip_on_each_taggable_resource() {
     let transcribe = Transcribe::new();
@@ -819,7 +828,7 @@ async fn tags_round_trip_on_each_taggable_resource() {
             }),
         )
         .await
-        .ok_status("create the filter to tag", 201);
+        .ok_status("create the filter to tag", 200);
     transcribe
         .call(
             "StartTranscriptionJob",
@@ -905,7 +914,7 @@ async fn tags_round_trip_on_each_taggable_resource() {
                 json!({"ResourceArn": resource_arn, "TagKeys": ["env", "not-a-tag-key"]}),
             )
             .await
-            .ok_status(case, 204);
+            .ok_status(case, 200);
         let after = transcribe
             .call("ListTagsForResource", json!({"ResourceArn": resource_arn}))
             .await;
@@ -929,20 +938,20 @@ async fn tags_round_trip_on_each_taggable_resource() {
         transcribe
             .call("ListTagsForResource", json!({"ResourceArn": resource_arn}))
             .await
-            .refused(case, 404, "NotFoundException");
+            .refused(case, 400, "BadRequestException");
         transcribe
             .call(
                 "TagResource",
                 json!({"ResourceArn": resource_arn, "Tags": [{"Key": "team", "Value": "speech"}]}),
             )
             .await
-            .refused(case, 404, "NotFoundException");
+            .refused(case, 400, "BadRequestException");
         transcribe
             .call(
                 "UntagResource",
                 json!({"ResourceArn": resource_arn, "TagKeys": ["team"]}),
             )
             .await
-            .refused(case, 404, "NotFoundException");
+            .refused(case, 400, "BadRequestException");
     }
 }

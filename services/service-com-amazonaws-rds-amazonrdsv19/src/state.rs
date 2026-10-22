@@ -2,15 +2,17 @@
 
 //! Engine state for the com-amazonaws-rds-amazonrdsv19 service.
 //!
-//! The DB instance, DB snapshot, option group and DB subnet group records the
-//! implemented handlers read and write, plus the projection of a stored record onto
-//! the modelled `DBInstance` / `DBSnapshot` / `OptionGroup` / `DBSubnetGroup` wire
-//! shapes. These live here rather than in one operation file because every implemented
-//! operation shares them: `CreateDBInstance`, `DescribeDBInstances`,
+//! The DB instance, DB snapshot, option group, DB subnet group, event subscription and
+//! global cluster records the implemented handlers read and write, plus the projection of
+//! a stored record onto the modelled `DBInstance` / `DBSnapshot` / `OptionGroup` /
+//! `DBSubnetGroup` / `EventSubscription` / `GlobalCluster` wire shapes. These live here
+//! rather than in one operation file because every implemented operation shares them:
+//! `CreateDBInstance`, `DescribeDBInstances`,
 //! `ModifyDBInstance`, `CreateDBSnapshot`, `DescribeDBSnapshots`, `DeleteDBInstance`,
 //! `CreateOptionGroup`, `ModifyOptionGroup`, `DescribeOptionGroups`,
-//! `DeleteOptionGroup`, `CreateDBSubnetGroup` and `DescribeDBSubnetGroups` all project
-//! the same records.
+//! `DeleteOptionGroup`, `CreateDBSubnetGroup`, `DescribeDBSubnetGroups`,
+//! `CreateEventSubscription`, `DescribeEventSubscriptions`, `CreateGlobalCluster` and
+//! `DescribeGlobalClusters` all project the same records.
 //!
 //! RDS is a REGIONAL service, so every map is keyed by `(region, identifier)`: the
 //! region a request is signed for scopes what it can see and create, one identifier
@@ -92,6 +94,125 @@ pub const DB_SUBNET_GROUP_QUOTA_PER_REGION: usize = 50;
 /// `DBSubnetQuotaExceededFault` — "The request would result in the user exceeding the
 /// allowed number of subnets in a DB subnet groups".
 pub const MAX_SUBNETS_PER_DB_SUBNET_GROUP: usize = 20;
+
+/// How many event notification subscriptions one region may hold: Amazon RDS's published
+/// default quota ("Event subscriptions": 20 per Region). Reaching it is the modelled
+/// `EventSubscriptionQuotaExceededFault`, which `CreateEventSubscription` declares ("You
+/// have reached the maximum number of event subscriptions").
+pub const EVENT_SUBSCRIPTION_QUOTA_PER_REGION: usize = 20;
+
+/// How many Aurora global database clusters this account may hold: the allowance Amazon
+/// Aurora publishes for global databases (5). Reaching it is the modelled
+/// `GlobalClusterQuotaExceededFault` — "The number of global database clusters for this
+/// account is already at the maximum allowed" — which is worded per ACCOUNT, as is the
+/// map this bounds: a global cluster is account-scoped and carries no region.
+pub const GLOBAL_CLUSTER_QUOTA_PER_ACCOUNT: usize = 5;
+
+/// The status an event notification subscription reports once it is set up and
+/// delivering, from `EventSubscription$Status`'s published list ("creating | modifying |
+/// deleting | active | no-permission | topic-not-exist").
+///
+/// It is the status a subscription has from its create onwards: RDS answers
+/// `CreateEventSubscription` with the subscription already active — creating one writes a
+/// notification rule and provisions no resource — so no transient status is owed for it
+/// and the clock owes it no transition.
+pub const EVENT_SUBSCRIPTION_STATUS_ACTIVE: &str = "active";
+
+/// The status an Aurora global database cluster reports once it is usable, as
+/// `GlobalCluster$Status` carries it. A global database created EMPTY provisions no DB
+/// cluster — "You can create a global database that is initially empty, and then create
+/// the primary and secondary DB clusters in the global database"
+/// (`CreateGlobalCluster`) — so there is nothing to wait for and no transient status is
+/// owed for it.
+pub const GLOBAL_CLUSTER_STATUS_AVAILABLE: &str = "available";
+
+/// The status a global database cluster reports in the answer to the delete that was
+/// accepted for it, as `GlobalCluster$Status` carries it — the same `deleting` status the
+/// other delete paths of this service report.
+pub const GLOBAL_CLUSTER_STATUS_DELETING: &str = "deleting";
+
+/// The status an event notification subscription reports in the answer to the delete that
+/// was accepted for it, from `EventSubscription$Status`'s published list.
+pub const EVENT_SUBSCRIPTION_STATUS_DELETING: &str = "deleting";
+
+/// `GlobalCluster$StorageEncryptionType` for one encrypted under the key the service
+/// applies itself: "`sse-rds` - The global database cluster is encrypted using an Amazon
+/// Web Services owned KMS key."
+pub const STORAGE_ENCRYPTION_TYPE_SSE_RDS: &str = "sse-rds";
+
+/// `GlobalCluster$StorageEncryptionType` for one encrypted under a managed key:
+/// "`sse-kms` - The global database cluster is encrypted using a customer managed KMS key
+/// or Amazon Web Services managed KMS key."
+pub const STORAGE_ENCRYPTION_TYPE_SSE_KMS: &str = "sse-kms";
+
+/// The lifecycle types a global database cluster may be enrolled in, as
+/// `CreateGlobalClusterMessage$EngineLifecycleSupport` publishes them ("Valid Values:
+/// open-source-rds-extended-support | open-source-rds-extended-support-disabled").
+pub const ENGINE_LIFECYCLE_SUPPORT_VALUES: [&str; 2] = [
+    DEFAULT_ENGINE_LIFECYCLE_SUPPORT,
+    "open-source-rds-extended-support-disabled",
+];
+
+/// Refuse an `EngineLifecycleSupport` outside the two values the member publishes,
+/// naming the member, the value rejected and the set it is not in.
+pub fn check_engine_lifecycle_support(value: &str) -> Result<(), String> {
+    if ENGINE_LIFECYCLE_SUPPORT_VALUES.contains(&value) {
+        return Ok(());
+    }
+    Err(format!(
+        "invalid value {value} for EngineLifecycleSupport: must be one of {}",
+        ENGINE_LIFECYCLE_SUPPORT_VALUES.join(", ")
+    ))
+}
+
+/// The engines an Aurora global database cluster may run, as
+/// `CreateGlobalClusterMessage$Engine` publishes them ("Valid Values: aurora-mysql |
+/// aurora-postgresql"). A global database is an Aurora resource — "This operation applies
+/// only to Aurora DB clusters" — so the list is narrower than the DB instance engines in
+/// [`DB_INSTANCE_ENGINES`].
+pub const GLOBAL_CLUSTER_ENGINES: [&str; 2] = ["aurora-mysql", "aurora-postgresql"];
+
+/// The longest `EngineVersion` this service accepts as a version string at all. AWS's
+/// longest published version strings are the SQL Server ones (`15.00.4382.1.v1`) and the
+/// Aurora MySQL ones (`8.0.mysql_aurora.3.08.0`); 64 leaves room for any form AWS adds.
+pub const MAX_ENGINE_VERSION_LEN: usize = 64;
+
+/// Refuse a value that is not an engine version at all: AWS writes every published
+/// engine version as a dotted number, optionally carrying a lettered qualifier
+/// (`16.6`, `15.00.4382.1.v1`, `8.0.mysql_aurora.3.08.0`, `16.4-limitless`), so a
+/// version starts with a digit and is drawn from that alphabet.
+///
+/// This is a check on the FORM, for a member whose value this service cannot resolve
+/// against a catalogue of its own. It is deliberately not a claim that the version
+/// exists: the engine-version catalogue this emulator publishes is explicitly not the
+/// real service's live list, so a version it does not carry is not a version AWS refuses.
+pub fn check_engine_version_form(value: &str) -> Result<(), String> {
+    let length = value.chars().count();
+    let shaped = value.starts_with(|c: char| c.is_ascii_digit())
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if !shaped || length > MAX_ENGINE_VERSION_LEN {
+        return Err(format!(
+            "invalid value {value} for EngineVersion: an engine version starts with a digit \
+             and is written as a dotted number, optionally with a qualifier (16.6, \
+             8.0.mysql_aurora.3.08.0), of at most {MAX_ENGINE_VERSION_LEN} characters"
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse an `Engine` a global database cluster cannot run, naming the member, the value
+/// rejected and the set it is not in.
+pub fn check_global_cluster_engine(engine: &str) -> Result<(), String> {
+    if GLOBAL_CLUSTER_ENGINES.contains(&engine) {
+        return Ok(());
+    }
+    Err(format!(
+        "invalid value {engine} for Engine: a global database cluster runs one of {}",
+        GLOBAL_CLUSTER_ENGINES.join(", ")
+    ))
+}
 
 /// The engines an option group may be associated with, as
 /// `CreateOptionGroupMessage$EngineName` lists them — the identical list
@@ -310,11 +431,9 @@ pub struct ComAmazonawsRdsAmazonrdsv19State {
     /// Event notification subscriptions by `(region, SubscriptionName)`. Ordered, so
     /// `DescribeEventSubscriptions` pages deterministically within a region.
     ///
-    /// Nothing in this crate INSERTS here yet: the only operations that mint or remove a
-    /// subscription (`CreateEventSubscription`, `DeleteEventSubscription`) are still
-    /// scaffolded, so they also own the quota that bounds this map when they are written.
-    /// `DescribeEventSubscriptions` reports what is here, which is how a subscription
-    /// becomes visible the moment its writer lands.
+    /// `CreateEventSubscription` inserts here — bounded by
+    /// [`EVENT_SUBSCRIPTION_QUOTA_PER_REGION`] per region, and by [`MAX_REGIONS`] regions
+    /// — and `DescribeEventSubscriptions` reports what is here.
     pub event_subscriptions: BTreeMap<RegionalKey, EventSubscriptionRecord>,
     /// Aurora global database clusters by `GlobalClusterIdentifier`.
     ///
@@ -322,8 +441,8 @@ pub struct ComAmazonawsRdsAmazonrdsv19State {
     /// global cluster is an ACCOUNT-scoped resource whose ARN carries no region
     /// (`arn:aws:rds::<account>:global-cluster:<id>`) and spans the regions of its member
     /// clusters, so `DescribeGlobalClusters` reports it whatever region the request is
-    /// signed for. As with the subscriptions above, its writers (`CreateGlobalCluster`,
-    /// `DeleteGlobalCluster`) are still scaffolded and own the bound on this map.
+    /// signed for. `CreateGlobalCluster` inserts here, bounded by
+    /// [`GLOBAL_CLUSTER_QUOTA_PER_ACCOUNT`] — the account scope the map itself has.
     pub global_clusters: BTreeMap<String, GlobalClusterRecord>,
     /// Option groups by `(region, OptionGroupName)`. Ordered, so
     /// `DescribeOptionGroups` pages deterministically within a region.
@@ -500,6 +619,7 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             .chain(self.db_snapshots.keys())
             .chain(self.option_groups.keys())
             .chain(self.db_subnet_groups.keys())
+            .chain(self.event_subscriptions.keys())
             .map(|(stored, _)| stored.as_str())
             .chain(self.certificate_overrides.keys().map(String::as_str))
             .collect();
@@ -975,9 +1095,54 @@ pub struct EventSubscriptionRecord {
     pub event_categories: Vec<String>,
     /// `Enabled`.
     pub enabled: bool,
+    /// The tags `CreateEventSubscription$Tags` assigned to the subscription. The modelled
+    /// `EventSubscription` shape carries no tag member, so nothing reports them yet —
+    /// `ListTagsForResource`, which does, is still scaffolded — but the caller's input is
+    /// kept rather than dropped, so it is here when that operation lands.
+    pub tags: Vec<Tag>,
 }
 
 impl EventSubscriptionRecord {
+    /// A subscription as `CreateEventSubscription` mints it: RDS answers the create with
+    /// the subscription already [`EVENT_SUBSCRIPTION_STATUS_ACTIVE`], so there is no
+    /// transient status to owe and nothing for the clock to settle later.
+    #[allow(clippy::too_many_arguments)]
+    pub fn active(
+        subscription_name: String,
+        region: String,
+        sns_topic_arn: String,
+        subscription_creation_time: String,
+        source_type: Option<String>,
+        source_ids: Vec<String>,
+        event_categories: Vec<String>,
+        enabled: bool,
+        tags: Vec<Tag>,
+    ) -> Self {
+        Self {
+            subscription_name,
+            region,
+            sns_topic_arn,
+            status: EVENT_SUBSCRIPTION_STATUS_ACTIVE.to_string(),
+            subscription_creation_time,
+            source_type,
+            source_ids,
+            event_categories,
+            enabled,
+            tags,
+        }
+    }
+
+    /// Accept a delete: the subscription's own answer reports the `deleting` status that
+    /// says the delete was accepted. A notification rule has nothing provisioned to tear
+    /// down, so the record leaves the store with that call rather than a span later — see
+    /// `DeleteEventSubscription`.
+    pub fn deleting(&self) -> Self {
+        Self {
+            status: EVENT_SUBSCRIPTION_STATUS_DELETING.to_string(),
+            ..self.clone()
+        }
+    }
+
     /// `arn:aws:rds:<region>:<account>:es:<subscription name>` — the `es` resource type
     /// RDS gives an event subscription.
     pub fn arn(&self) -> String {
@@ -1169,6 +1334,9 @@ pub struct GlobalClusterRecord {
     pub engine: Option<String>,
     /// `EngineVersion`.
     pub engine_version: Option<String>,
+    /// `EngineLifecycleSupport`: the lifecycle type the global cluster is enrolled in —
+    /// the value the request named, or [`DEFAULT_ENGINE_LIFECYCLE_SUPPORT`].
+    pub engine_lifecycle_support: String,
     /// `DatabaseName`.
     pub database_name: Option<String>,
     /// `StorageEncrypted`.
@@ -1180,6 +1348,12 @@ pub struct GlobalClusterRecord {
     /// these ARNs are what the documented `region` filter of `DescribeGlobalClusters`
     /// matches on.
     pub member_cluster_arns: Vec<String>,
+    /// The DNS label AWS assigns the global database's own writer endpoint between the
+    /// identifier and the `global` suffix: a server-minted token, unique per global
+    /// cluster — see [`Self::endpoint`].
+    pub endpoint_host: String,
+    /// `TagList`: the tags `CreateGlobalCluster$Tags` assigned to the global cluster.
+    pub tags: Vec<Tag>,
 }
 
 impl GlobalClusterRecord {
@@ -1203,6 +1377,55 @@ impl GlobalClusterRecord {
             .any(|arn| arn_region(arn) == Some(region))
     }
 
+    /// The global database's own writer endpoint, `<identifier>.global-<minted
+    /// host>.global.rds.amazonaws.com`.
+    ///
+    /// `GlobalCluster$Endpoint` is "the writer endpoint for the new global database
+    /// cluster. This endpoint always points to the writer DB instance in the current
+    /// primary cluster" — the Aurora global database writer endpoint, whose published form
+    /// is the global cluster's identifier, a server-assigned label and the
+    /// `global.rds.amazonaws.com` suffix (Amazon Aurora User Guide, "Using the writer
+    /// endpoint of an Amazon Aurora global database"). It is a function of the stored
+    /// identifier and minted host rather than stored text, so it cannot drift from the
+    /// record; the label itself is server-assigned, as the DB instance endpoint's is.
+    pub fn endpoint(&self) -> String {
+        format!(
+            "{}.global-{}.global.rds.amazonaws.com",
+            self.identifier, self.endpoint_host
+        )
+    }
+
+    /// `StorageEncryptionType`: "the type of encryption used to protect data at rest IN
+    /// the global database cluster".
+    ///
+    /// Aurora storage is encrypted at rest either way, so the member reports WHICH key
+    /// class protects it rather than whether anything does: `sse-kms` — "encrypted using a
+    /// customer managed KMS key or Amazon Web Services managed KMS key" — when
+    /// `StorageEncrypted` asked for KMS encryption (`CreateGlobalCluster` names no key of
+    /// its own, so the key is the Amazon Web Services managed one RDS encrypts with by
+    /// default), and otherwise `sse-rds`, "encrypted using an Amazon Web Services owned
+    /// KMS key", the key the service applies itself. The third published value, `none`, is
+    /// for a global database whose data is not encrypted at all, which this service
+    /// creates none of.
+    pub fn storage_encryption_type(&self) -> &'static str {
+        if self.storage_encrypted {
+            STORAGE_ENCRYPTION_TYPE_SSE_KMS
+        } else {
+            STORAGE_ENCRYPTION_TYPE_SSE_RDS
+        }
+    }
+
+    /// Accept a delete: the global cluster's own answer reports the `deleting` status that
+    /// says the delete was accepted. Nothing is provisioned for a global database that
+    /// holds no member cluster, so the record leaves the store with this call rather than
+    /// a span later — see `DeleteGlobalCluster`.
+    pub fn deleting(&self) -> Self {
+        Self {
+            status: GLOBAL_CLUSTER_STATUS_DELETING.to_string(),
+            ..self.clone()
+        }
+    }
+
     /// Project the stored record onto the modelled `GlobalCluster` output shape.
     pub fn to_wire(&self) -> GlobalCluster {
         GlobalCluster {
@@ -1212,8 +1435,14 @@ impl GlobalClusterRecord {
             status: Some(self.status.clone()),
             engine: self.engine.clone(),
             engine_version: self.engine_version.clone(),
+            engine_lifecycle_support: Some(self.engine_lifecycle_support.clone()),
             database_name: self.database_name.clone(),
             storage_encrypted: Some(self.storage_encrypted),
+            // "The type of encryption used to protect data at rest in the global database
+            // cluster" — see [`Self::storage_encryption_type`].
+            storage_encryption_type: Some(self.storage_encryption_type().to_string()),
+            // The global database's own writer endpoint — see [`Self::endpoint`].
+            endpoint: Some(self.endpoint()),
             deletion_protection: Some(self.deletion_protection),
             global_cluster_members: Some(
                 self.member_cluster_arns
@@ -1228,6 +1457,7 @@ impl GlobalClusterRecord {
                     })
                     .collect(),
             ),
+            tag_list: Some(self.tags.clone()),
             // `FailoverState` "is empty unless the SwitchoverGlobalCluster or
             // FailoverGlobalCluster operation was called on this global cluster", and
             // neither is implemented in this crate, so nothing can have set one.
@@ -1547,6 +1777,14 @@ pub fn mint_dbi_resource_id(mint: u64) -> String {
 /// region: a server-minted, 12-character token, unique per instance.
 pub fn mint_endpoint_host(mint: u64) -> String {
     base36(mint, 12).to_ascii_lowercase()
+}
+
+/// The immutable resource id RDS reports as `GlobalClusterResourceId`: the
+/// "partition-unique, immutable identifier for the global database cluster", written
+/// `cluster-` plus 26 characters of the same server-minted alphabet
+/// [`mint_dbi_resource_id`] draws on, and never reused.
+pub fn mint_global_cluster_resource_id(mint: u64) -> String {
+    format!("cluster-{}", base36(mint, 26))
 }
 
 /// The Route 53 hosted zone id RDS reports for the endpoints in one region, when it
@@ -2270,5 +2508,190 @@ pub fn event_categories_to_wire(source_type: &str, categories: &[&str]) -> Event
                 .collect(),
         ),
     }
+}
+
+/// The source types an event notification SUBSCRIPTION may name, as
+/// `CreateEventSubscriptionMessage$SourceType` publishes them ("Valid Values: db-instance
+/// | db-cluster | db-parameter-group | db-security-group | db-snapshot |
+/// db-cluster-snapshot | db-proxy | zero-etl | custom-engine-version |
+/// blue-green-deployment").
+///
+/// Wider than the source types [`EVENT_CATEGORIES`] carries a category map for, which is
+/// the narrower list `DescribeEventCategories`'s own member documents: a subscription may
+/// be created for a source type whose published categories this emulator does not have,
+/// and [`check_event_categories`] says what that means for the categories such a
+/// subscription may name.
+pub const EVENT_SUBSCRIPTION_SOURCE_TYPES: [&str; 10] = [
+    "db-instance",
+    "db-cluster",
+    "db-parameter-group",
+    "db-security-group",
+    "db-snapshot",
+    "db-cluster-snapshot",
+    "db-proxy",
+    "zero-etl",
+    "custom-engine-version",
+    "blue-green-deployment",
+];
+
+/// Refuse a `SourceType` a subscription cannot be created for, naming the member, the
+/// value rejected and the set it is not in.
+pub fn check_event_subscription_source_type(source_type: &str) -> Result<(), String> {
+    if EVENT_SUBSCRIPTION_SOURCE_TYPES.contains(&source_type) {
+        return Ok(());
+    }
+    Err(format!(
+        "invalid value {source_type} for SourceType: must be one of {}",
+        EVENT_SUBSCRIPTION_SOURCE_TYPES.join(", ")
+    ))
+}
+
+/// The categories of `source_type` a subscription may subscribe to, with the one that
+/// is not among them, if any: `EventCategories` is "a list of event categories for a
+/// particular source type (SourceType) that you want to subscribe to", so a category
+/// that source type does not publish names no events at all.
+///
+/// A source type [`EVENT_CATEGORIES`] carries no published map for is not checked —
+/// there is nothing to check it against, and refusing every category for it would refuse
+/// the ones AWS accepts. Matching is exact: the published categories are all lowercase.
+pub fn check_event_categories(source_type: &str, categories: &[String]) -> Result<(), String> {
+    let Some(published) = event_categories_of(source_type) else {
+        return Ok(());
+    };
+    for category in categories {
+        if !published.contains(&category.as_str()) {
+            return Err(format!(
+                "{category} is not a published event category of {source_type} \
+                 (its categories are {})",
+                published.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The longest `SubscriptionName` this service accepts: "Constraints: The name must be
+/// less than 255 characters" (`CreateEventSubscriptionMessage$SubscriptionName`), which
+/// the model itself does not express.
+pub const MAX_SUBSCRIPTION_NAME_LEN: usize = 254;
+
+/// How many `EventCategories` entries one request may carry.
+///
+/// The member publishes no bound and every entry is STORED, so it is capped for the same
+/// reason as [`MAX_FILTER_TERMS`]: request data that enters the store has to be bounded.
+/// Generous next to the fourteen categories the largest published source type has.
+pub const MAX_EVENT_CATEGORIES_PER_REQUEST: usize = 32;
+
+/// The longest `EventCategories` entry this service stores. The published categories are
+/// short phrases — the longest, `security patching`, is 17 characters — and a source type
+/// this emulator publishes no category map for cannot have its entries resolved, so their
+/// length is what bounds them.
+pub const MAX_EVENT_CATEGORY_LEN: usize = 64;
+
+/// How many `SourceIds` entries one request may carry.
+///
+/// Each entry is resolved against the stored resources of its source type, so the scan is
+/// the PRODUCT of this count and the per-region record quota, under this service's one
+/// state lock: this caps the factor the caller chooses, exactly as [`check_filter_terms`]
+/// does for a describe. Generous next to the forty DB instances a region may hold.
+pub const MAX_SOURCE_IDS_PER_REQUEST: usize = 64;
+
+/// How many tags one resource may carry: Amazon RDS's published tag quota ("Tags per
+/// resource": 50). Tags are stored request data, so the bound is enforced rather than
+/// documented.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The longest tag key AWS accepts: "Tag keys ... maximum length: 128 Unicode characters"
+/// (Tagging AWS resources).
+pub const MAX_TAG_KEY_LEN: usize = 128;
+
+/// The longest tag value AWS accepts: "maximum length: 256 Unicode characters".
+pub const MAX_TAG_VALUE_LEN: usize = 256;
+
+/// Refuse a request list longer than `max`, naming the member, the count and the bound it
+/// broke — for the members that publish no bound of their own and whose entries are
+/// stored or scanned.
+pub fn check_request_list_len(member: &str, len: usize, max: usize) -> Result<(), String> {
+    if len > max {
+        return Err(format!(
+            "{member} carries {len} entries: this emulator serves at most {max}"
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse stored request text longer than `max`, naming the member and the bound it broke.
+pub fn check_stored_text(member: &str, value: &str, max: usize) -> Result<(), String> {
+    let length = value.chars().count();
+    if length > max {
+        return Err(format!(
+            "{member} carries {length} characters: this emulator stores at most {max}"
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a `Tags` list this service will not store: more tags than one resource may
+/// carry, or a key or value past AWS's published tag lengths. Every tag a create stores is
+/// request data, so all three bounds are checked before the store is touched.
+pub fn check_tags(tags: &[Tag]) -> Result<(), String> {
+    check_request_list_len("Tags", tags.len(), MAX_TAGS_PER_RESOURCE)?;
+    for tag in tags {
+        if let Some(key) = &tag.key {
+            check_stored_text("Tags.Key", key, MAX_TAG_KEY_LEN)?;
+        }
+        if let Some(value) = &tag.value {
+            check_stored_text("Tags.Value", value, MAX_TAG_VALUE_LEN)?;
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a `SubscriptionName` outside the constraint its member documents, naming the
+/// member and the bound it broke.
+pub fn check_subscription_name(name: &str) -> Result<(), String> {
+    let length = name.chars().count();
+    if length == 0 || length > MAX_SUBSCRIPTION_NAME_LEN {
+        return Err(format!(
+            "SubscriptionName must be less than {} characters; got {length}",
+            MAX_SUBSCRIPTION_NAME_LEN + 1
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse an `SnsTopicArn` that is not an Amazon SNS topic ARN:
+/// `arn:<partition>:sns:<region>:<account>:<topic name>`, the form
+/// "`SnsTopicArn` — The Amazon Resource Name (ARN) of the SNS topic created for event
+/// notification" takes.
+///
+/// Only the FORM is checked. Whether a topic of that ARN exists is Amazon SNS's state,
+/// which this service does not hold, so a well-formed ARN is accepted rather than
+/// answered with the modelled `SNSTopicArnNotFoundFault` — this service cannot tell an
+/// existing topic from a missing one, and claiming either would be a fabrication. A value
+/// that is not an SNS topic ARN names no topic whatever SNS holds, which is what the
+/// modelled `SNSInvalidTopicFault` says.
+pub fn check_sns_topic_arn(arn: &str) -> Result<(), String> {
+    let malformed = || {
+        format!(
+            "invalid value {arn} for SnsTopicArn: expected an Amazon SNS topic ARN of the \
+             form arn:aws:sns:<region>:<account>:<topic name>"
+        )
+    };
+    let fields: Vec<&str> = arn.split(':').collect();
+    let [prefix, partition, service, region, account, topic] = fields[..] else {
+        return Err(malformed());
+    };
+    if prefix != "arn"
+        || partition.is_empty()
+        || service != "sns"
+        || account.is_empty()
+        || !account.bytes().all(|b| b.is_ascii_digit())
+        || topic.is_empty()
+    {
+        return Err(malformed());
+    }
+    check_region(region).map_err(|_| malformed())?;
+    Ok(())
 }
 

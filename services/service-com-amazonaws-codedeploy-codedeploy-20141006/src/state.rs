@@ -265,6 +265,18 @@ pub struct ComAmazonawsCodedeployCodedeploy20141006State {
     pending_deployments: Vec<String>,
     /// Deployment configurations by `deploymentConfigName`.
     pub deployment_configs: HashMap<String, DeploymentConfig>,
+    /// The names of this account's stored connections to GitHub accounts, in the
+    /// order they were linked, so `ListGitHubAccountTokenNames` is deterministic
+    /// and pages stably.
+    ///
+    /// EMPTY on a fresh store, and that is the faithful answer: CodeDeploy's API
+    /// models no operation that CREATES a GitHub account connection — the
+    /// connection is made by the GitHub OAuth handshake the CodeDeploy console
+    /// drives, which this emulator cannot perform — so an account that has run no
+    /// console handshake has no stored connection names. The two modelled
+    /// operations over this store only READ it (`ListGitHubAccountTokenNames`) and
+    /// REMOVE from it (`DeleteGitHubAccountToken`).
+    pub git_hub_account_token_names: Vec<String>,
     /// On-premises instances by `instanceName`, registered and deregistered
     /// alike — a deregistered instance keeps its record.
     pub on_premises_instances: HashMap<String, OnPremisesInstance>,

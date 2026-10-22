@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCrossAccountAuthorization
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCrossAccountAuthorization`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCrossAccountAuthorization::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records a cross-account readiness authorization, so `ListCrossAccountAuthorizations`
+//! reports it until `DeleteCrossAccountAuthorization` withdraws it. The authorization
+//! value is the resource's whole identity (the API carries no other member for it), so
+//! the store is a set and re-authorizing a value already held reports that same value
+//! back rather than storing a second copy.
+//!
+//! Implemented alongside `DeleteCrossAccountAuthorization`: a delete needs an
+//! authorization to remove for its effect to be observable at all.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +149,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCrossAccountAuthorization` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCrossAccountAuthorizationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCrossAccountAuthorization"))
+        let _ = ctx;
+        crate::state::validate_cross_account_authorization(&input.cross_account_authorization)
+            .map_err(|message| {
+                CreateCrossAccountAuthorizationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message),
+                    },
+                )
+            })?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateCrossAccountAuthorizationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+                },
+            )
+        })?;
+        let mut state = state.lock();
+
+        // CC-02 growth bound: the store must not grow per request without a ceiling.
+        // Checked only for a value the store does not already hold, so re-authorizing
+        // one it does hold stays a no-op even at the ceiling.
+        if !state
+            .cross_account_authorizations
+            .contains(&input.cross_account_authorization)
+            && state.cross_account_authorizations.len() >= crate::state::MAX_RECORDS_PER_STORE
+        {
+            return Err(CreateCrossAccountAuthorizationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::store_full_message(
+                        "cross-account authorizations",
+                    )),
+                },
+            )
+            .into());
+        }
+
+        state
+            .cross_account_authorizations
+            .insert(input.cross_account_authorization.clone());
+
+        // Read the response back out of the store, so what the caller sees is what a
+        // later `ListCrossAccountAuthorizations` will report.
+        let stored = state
+            .cross_account_authorizations
+            .get(&input.cross_account_authorization)
+            .ok_or_else(|| {
+                CreateCrossAccountAuthorizationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+            })?;
+        Ok(CreateCrossAccountAuthorizationOutput {
+            cross_account_authorization: Some(stored.clone()),
+        })
     }
 }

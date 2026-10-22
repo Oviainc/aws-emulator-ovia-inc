@@ -217,7 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         "refused a compliance inquiry export"
                     );
                     return Err(ExportComplianceInquiryErrorModeled::ValidationException(
-                        crate::state::unknown_query_identifiers(),
+                        crate::state::unknown_query_identifiers("queryIdentifiers"),
                     )
                     .into());
                 }

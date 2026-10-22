@@ -15,6 +15,8 @@
 mod account_settings;
 #[path = "all/compliance_inquiry_export.rs"]
 mod compliance_inquiry_export;
+#[path = "all/compliance_inquiry_feedback.rs"]
+mod compliance_inquiry_feedback;
 #[path = "all/compliance_inquiry_lifecycle.rs"]
 mod compliance_inquiry_lifecycle;
 #[path = "all/compliance_inquiry_listing.rs"]

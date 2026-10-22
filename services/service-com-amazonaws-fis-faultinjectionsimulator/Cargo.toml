@@ -21,6 +21,14 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# `iam_trust_policy`: the one reading of an IAM trust policy, shared with every other
+# service that resolves a caller-supplied execution role before it writes.
+service-common = { path = "../common" }
+# Parses the ISO 8601 duration an `aws:fis:wait` action's `duration` parameter carries.
+iso8601-duration = "0.2"
+# The IAM store StartExperiment resolves an experiment template's `roleArn` against, to
+# check the role's trust policy grants fis.amazonaws.com before an experiment is created.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

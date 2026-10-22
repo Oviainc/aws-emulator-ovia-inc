@@ -147,6 +147,43 @@ pub const PROPOSAL_IN_PROGRESS: &str = "IN_PROGRESS";
 /// `ProposalActions` aren't carried out" (`Proposal$Status`).
 pub const PROPOSAL_EXPIRED: &str = "EXPIRED";
 
+/// The `ProposalStatus` of a proposal the members approved: "`APPROVED` - The proposal
+/// was approved with sufficient `YES` votes among members according to the `VotingPolicy`
+/// specified for the `Network`. The specified proposal actions are carried out."
+/// (`Proposal$Status`).
+pub const PROPOSAL_APPROVED: &str = "APPROVED";
+
+/// The `ProposalStatus` of a proposal the members turned down: "`REJECTED` - The proposal
+/// was rejected with insufficient `YES` votes among members according to the
+/// `VotingPolicy` specified for the `Network`. The specified `ProposalActions` aren't
+/// carried out." (`Proposal$Status`).
+pub const PROPOSAL_REJECTED: &str = "REJECTED";
+
+/// The `ProposalStatus` of an approved proposal whose actions could not be carried out:
+/// "`ACTION_FAILED` - One or more of the specified `ProposalActions` in a proposal that
+/// was approved couldn't be completed because of an error. The `ACTION_FAILED` status
+/// occurs even if only one ProposalAction fails and other actions are successful."
+/// (`Proposal$Status`).
+pub const PROPOSAL_ACTION_FAILED: &str = "ACTION_FAILED";
+
+/// The `ThresholdComparator` under which the `YES` percentage "must be greater than the
+/// `ThresholdPercentage` … to be approved".
+pub const THRESHOLD_GREATER_THAN: &str = "GREATER_THAN";
+
+/// The `ThresholdComparator` under which the `YES` percentage "must be greater than or
+/// equal to the `ThresholdPercentage` to be approved".
+pub const THRESHOLD_GREATER_THAN_OR_EQUAL_TO: &str = "GREATER_THAN_OR_EQUAL_TO";
+
+/// The comparison applied when an `ApprovalThresholdPolicy` names no
+/// `ThresholdComparator`.
+///
+/// `ThresholdComparator` is optional and the model fixes no default, so THIS choice is
+/// the emulator's own: it is the comparison the documented worked example uses ("a
+/// `ThresholdPercentage` value of `50` … along with a `ThresholdComparator` value of
+/// `GREATER_THAN`, this indicates that 6 `YES` votes are required"), and it is a member of
+/// `ThresholdComparator`, so the rule applied is always a modelled one.
+pub const DEFAULT_THRESHOLD_COMPARATOR: &str = THRESHOLD_GREATER_THAN;
+
 /// A `YES` vote on a proposal (`VoteValue` = `YES` | `NO`), counted into
 /// `Proposal$YesVoteCount`.
 pub const VOTE_YES: &str = "YES";
@@ -717,6 +754,14 @@ impl StoredProposal {
     /// How many members cast `vote` on this proposal.
     pub fn vote_count(&self, vote: &str) -> i32 {
         i32::try_from(self.votes.values().filter(|cast| *cast == vote).count()).unwrap_or(i32::MAX)
+    }
+
+    /// Whether this proposal is still "active and open for member voting"
+    /// (`Proposal$Status`'s `IN_PROGRESS`) — the only status under which a vote can be
+    /// cast on it. Every other status is terminal: approved, rejected, expired, or
+    /// approved with actions that failed.
+    pub fn is_open(&self) -> bool {
+        self.status == PROPOSAL_IN_PROGRESS
     }
 
     /// The modelled `Proposal` for this record, as `GetProposal` returns it.
@@ -1293,6 +1338,70 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
         self.invitations.insert(id.clone(), invitation);
         Some(id)
     }
+
+    /// Carry out the actions of a proposal that has just been approved: "The specified
+    /// proposal actions are carried out" (`Proposal$Status`'s `APPROVED`).
+    ///
+    /// Every `InviteAction` records the invitation it owes its principal, and every
+    /// `RemoveAction` deletes the member it names together with that member's resources.
+    ///
+    /// Answers whether EVERY action was carried out: `false` when any one of them could
+    /// not be, which is what `ACTION_FAILED` reports — "one or more of the specified
+    /// `ProposalActions` … couldn't be completed because of an error. The `ACTION_FAILED`
+    /// status occurs even if only one ProposalAction fails and other actions are
+    /// successful", so the remaining actions are still attempted.
+    pub fn carry_out_proposal_actions(
+        &mut self,
+        network_id: &str,
+        actions: &ProposalActions,
+        region: &str,
+        now: SystemTime,
+    ) -> bool {
+        let mut carried_out = true;
+        for invite in actions.invitations.iter().flatten() {
+            if self
+                .record_invitation(network_id, &invite.principal, region, now)
+                .is_none()
+            {
+                carried_out = false;
+            }
+        }
+        for removal in actions.removals.iter().flatten() {
+            if !self.remove_member(network_id, &removal.member_id) {
+                carried_out = false;
+            }
+        }
+        carried_out
+    }
+
+    /// Remove `member_id` from `network_id`: "The member and all associated resources are
+    /// deleted from the network" (`RemoveAction`), so the member's nodes go with it, and
+    /// the idempotency record of each node's create goes with the node (the same reason
+    /// [`Self::forget_node_token`] is called when a node is deleted outright).
+    ///
+    /// Answers whether the member was there to remove: `false` when the network or the
+    /// member names nothing stored, which is an action that could not be carried out.
+    pub fn remove_member(&mut self, network_id: &str, member_id: &str) -> bool {
+        let Some(network) = self.networks.get_mut(network_id) else {
+            return false;
+        };
+        if network.members.remove(member_id).is_none() {
+            return false;
+        }
+        let orphaned: Vec<String> = network
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.member_id.as_deref() == Some(member_id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for node_id in &orphaned {
+            network.nodes.remove(node_id);
+        }
+        for node_id in &orphaned {
+            self.forget_node_token(node_id);
+        }
+        true
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -1368,6 +1477,95 @@ pub fn proposal_duration(policy: &VotingPolicy) -> Option<Duration> {
     u64::try_from(hours)
         .ok()
         .map(|hours| Duration::from_secs(hours * 60 * 60))
+}
+
+/// How many `YES` votes approve a proposal on a network with this voting policy, when the
+/// network holds `members` members.
+///
+/// `ApprovalThresholdPolicy$ThresholdPercentage` is "the percentage of votes among all
+/// members that must be `YES` for a proposal to be approved", and
+/// `$ThresholdComparator` "determines whether the vote percentage must be greater than
+/// the `ThresholdPercentage` or must be greater than or equal to the
+/// `ThresholdPercentage` to be approved" — so the count is the smallest number of `YES`
+/// votes whose share of the membership satisfies that comparison. This reproduces the
+/// documented worked example exactly: 50% `GREATER_THAN` on a network with 10 members
+/// requires 6 `YES` votes.
+///
+/// `None` when the policy names no threshold (either no `ApprovalThresholdPolicy` at all
+/// or no `ThresholdPercentage` in it): nothing then fixes how many `YES` votes approve a
+/// proposal, so no number of votes decides it.
+///
+/// Never below one: the percentage is of the votes "that must be `YES`", so approval
+/// takes a `YES` vote however low the threshold is set (`ThresholdPercentageInt` is
+/// `@range(0, 100)`, so a policy may name 0%).
+pub fn required_yes_votes(policy: Option<&VotingPolicy>, members: usize) -> Option<i64> {
+    let threshold = policy?.approval_threshold_policy.as_ref()?;
+    // `ThresholdPercentageInt` is `@range(0, 100)`, which the boundary validator already
+    // enforced on the create; the clamp keeps the arithmetic sound whatever a stored
+    // record holds.
+    let percentage = i64::from(threshold.threshold_percentage?.clamp(0, 100));
+    let members = i64::try_from(members).unwrap_or(i64::MAX);
+    let comparator = threshold
+        .threshold_comparator
+        .as_deref()
+        .unwrap_or(DEFAULT_THRESHOLD_COMPARATOR);
+    // `votes * 100` against `percentage * members` keeps the comparison in integers, so
+    // no rounding of a percentage can approve a proposal a point short of the threshold.
+    // The membership is bounded by `MAX_MEMBERS_PER_NETWORK`, which
+    // `StoredNetwork::insert_member` enforces, but the product is saturated here as well
+    // so this public helper's arithmetic does not rest on its callers' bounds.
+    let share = percentage.saturating_mul(members);
+    let required = if comparator == THRESHOLD_GREATER_THAN_OR_EQUAL_TO {
+        // The smallest `votes` with `votes * 100 >= share`.
+        share.div_euclid(100) + i64::from(share.rem_euclid(100) != 0)
+    } else {
+        // `GREATER_THAN` (and the default): the smallest `votes` with `votes * 100 >
+        // share`.
+        share.div_euclid(100) + 1
+    };
+    Some(required.max(1))
+}
+
+/// The `ProposalStatus` the votes cast so far decide for a proposal on a network with
+/// this voting policy, or `None` while they decide nothing and the proposal stays
+/// "active and open for member voting".
+///
+/// The rule has two halves, both from `ApprovalThresholdPolicy$ProposalDurationInHours`:
+/// "if members cast neither the required number of `YES` votes to approve the proposal
+/// nor the number of `NO` votes required to reject it before the duration expires, the
+/// proposal is `EXPIRED`".
+///
+/// * approved once the `YES` votes reach [`required_yes_votes`];
+/// * rejected once `NO` votes have been cast and leave too few members un-voted for that
+///   count to be reached — "rejected with insufficient `YES` votes among members according
+///   to the `VotingPolicy`" (`Proposal$Status`). Rejection is what the `NO` votes do, so a
+///   threshold no number of votes could reach (100% under `GREATER_THAN`, say) is not
+///   rejected by a `YES` vote: with no `NO` vote cast it stays open, and the clock expires
+///   it on its `ExpirationDate`, which is exactly the case
+///   `ProposalDurationInHours` describes.
+/// * otherwise undecided, which is what leaves the proposal open to its `ExpirationDate`.
+pub fn proposal_outcome(
+    policy: Option<&VotingPolicy>,
+    members: usize,
+    yes_votes: i32,
+    no_votes: i32,
+) -> Option<&'static str> {
+    let required = required_yes_votes(policy, members)?;
+    let members = i64::try_from(members).unwrap_or(i64::MAX);
+    let yes = i64::from(yes_votes);
+    let no = i64::from(no_votes);
+    if yes >= required {
+        return Some(PROPOSAL_APPROVED);
+    }
+    // Every member that voted `NO` is a member that cannot vote `YES`, so the most `YES`
+    // votes this proposal can still gather is the membership minus the `NO` votes. It is
+    // the `NO` votes that reject a proposal ("the number of `NO` votes required to reject
+    // it"), so a threshold that was out of reach before anybody voted `NO` leaves the
+    // proposal open to its `ExpirationDate` instead.
+    if no > 0 && members - no < required {
+        return Some(PROPOSAL_REJECTED);
+    }
+    None
 }
 
 /// The ARN of an invitation

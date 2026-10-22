@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMarketplaceRevenueShareAllocation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMarketplaceRevenueShareAllocation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMarketplaceRevenueShareAllocation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints an allocation under a stored revenue share, bumps that
+//! share's revision, and answers with the version it wrote.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +174,188 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMarketplaceRevenueShareAllocation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMarketplaceRevenueShareAllocationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMarketplaceRevenueShareAllocation"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateMarketplaceRevenueShareAllocationErrorModeled::InternalServerException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        let catalog = crate::state::parse_catalog(&input.catalog).map_err(validation)?;
+        crate::state::validate_effective_from("EffectiveFrom", &input.effective_from)
+            .map_err(validation)?;
+        if let Some(until) = input.effective_until.as_deref() {
+            crate::state::validate_effective_until("EffectiveUntil", until).map_err(validation)?;
+            crate::state::validate_interval(&input.effective_from, until).map_err(validation)?;
+        }
+        crate::state::validate_percent("RevenueSharePercent", &input.revenue_share_percent)
+            .map_err(validation)?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+
+        // The `@idempotent` replay: the same `ClientToken` answers with the
+        // allocation it already minted, and only when this request asks for the
+        // same allocation under the same parent.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some((minted_catalog, minted_product, minted_allocation)) =
+                state.allocation_idempotency.get(token).cloned()
+            {
+                if let Some(share) = state.share(minted_catalog, &minted_product) {
+                    if let Some(allocation) = share.allocations.get(&minted_allocation) {
+                        let created = allocation.created();
+                        let same = minted_catalog == catalog
+                            && minted_product == input.product_id
+                            && created.effective_from == input.effective_from
+                            && created.effective_until == input.effective_until
+                            && created.revenue_share_percent == input.revenue_share_percent;
+                        if same {
+                            let view = crate::state::allocation_view(
+                                share,
+                                allocation,
+                                allocation.current(),
+                            );
+                            crate::state::audit(
+                                ctx.parts(),
+                                Self::NAME,
+                                &view.arn,
+                                "replayed: no change",
+                            );
+                            return Ok(output(view));
+                        }
+                        return Err(
+                            CreateMarketplaceRevenueShareAllocationErrorModeled::ConflictException(
+                                crate::state::client_token_conflict(),
+                            )
+                            .into(),
+                        );
+                    }
+                }
+            }
+        }
+
+        // An allocation only exists under a revenue share, so an unknown parent
+        // is a 404.
+        let Some((held, revision)) = state
+            .share(catalog, &input.product_id)
+            .map(|share| (share.allocations.len(), share.revision))
+        else {
+            return Err(
+                CreateMarketplaceRevenueShareAllocationErrorModeled::ResourceNotFoundException(
+                    crate::state::share_not_found(catalog, &input.product_id),
+                )
+                .into(),
+            );
+        };
+        if held >= crate::state::MAX_ALLOCATIONS_PER_SHARE {
+            // A whole-store condition, not a bad member: no `fieldList`.
+            return Err(validation(crate::state::request_validation(format!(
+                "this emulator holds at most {} allocations per marketplace revenue share",
+                crate::state::MAX_ALLOCATIONS_PER_SHARE
+            ))));
+        }
+        if revision >= crate::state::MAX_SHARE_REVISION {
+            return Err(validation(crate::state::request_validation(format!(
+                "this emulator holds at most {} revisions of a marketplace revenue share",
+                crate::state::MAX_SHARE_REVISION
+            ))));
+        }
+
+        let sequence = state.next_sequence();
+        let allocation_id = crate::state::allocation_id(sequence);
+        let arn = crate::state::allocation_arn(&region, catalog, &input.product_id, &allocation_id);
+
+        let Some(share) = state.share_mut(catalog, &input.product_id) else {
+            return Err(
+                CreateMarketplaceRevenueShareAllocationErrorModeled::InternalServerException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+        // Writing an allocation is what moves the parent share to a new revision,
+        // and that revision is the one this allocation's first version carries.
+        let new_revision = share.bump_revision(now);
+        share.allocations.insert(
+            allocation_id.clone(),
+            crate::state::MarketplaceRevenueShareAllocation {
+                allocation_id: allocation_id.clone(),
+                arn,
+                product_id: input.product_id.clone(),
+                created_date: now,
+                created_version: crate::state::AllocationVersion {
+                    revision: new_revision,
+                    effective_from: input.effective_from.clone(),
+                    effective_until: input.effective_until.clone(),
+                    revenue_share_percent: input.revenue_share_percent.clone(),
+                    // A newly created allocation is in force; `INACTIVE` is
+                    // reached only through the update's soft delete.
+                    status: crate::state::AllocationStatus::Active,
+                    modified_date: now,
+                },
+                later_versions: Vec::new(),
+            },
+        );
+        // Only a token the CALLER sent is recorded: an absent
+        // `@idempotencyToken` member means this create has no idempotency key,
+        // so there is nothing a later request could replay.
+        if let Some(token) = input.client_token.clone() {
+            state.allocation_idempotency.insert(
+                token,
+                (catalog, input.product_id.clone(), allocation_id.clone()),
+            );
+        }
+
+        // Read the stored record back, so the response is the state rather than
+        // the values that went into it.
+        let stored = state
+            .share(catalog, &input.product_id)
+            .and_then(|share| {
+                share
+                    .allocations
+                    .get(&allocation_id)
+                    .map(|allocation| {
+                        crate::state::allocation_view(share, allocation, allocation.current())
+                    })
+            })
+            .ok_or_else(|| {
+                CreateMarketplaceRevenueShareAllocationError::from(
+                    CreateMarketplaceRevenueShareAllocationErrorModeled::InternalServerException(
+                        crate::state::state_unavailable(),
+                    ),
+                )
+            })?;
+        crate::state::audit(ctx.parts(), Self::NAME, &stored.arn, "created");
+        Ok(output(stored))
+    }
+}
+
+/// Lift a modelled `ValidationException` into this operation's error channel.
+fn validation(error: ValidationException) -> CreateMarketplaceRevenueShareAllocationError {
+    CreateMarketplaceRevenueShareAllocationErrorModeled::ValidationException(error).into()
+}
+
+/// This operation's output for a stored allocation.
+fn output(
+    view: crate::state::AllocationView,
+) -> CreateMarketplaceRevenueShareAllocationOutput {
+    CreateMarketplaceRevenueShareAllocationOutput {
+        marketplace_revenue_share_allocation_id: view.allocation_id,
+        product_id: view.product_id,
+        // Absent: see the note on `ProductName` in `crate::state`.
+        product_name: None,
+        arn: view.arn,
+        effective_from: view.effective_from,
+        effective_until: view.effective_until,
+        revenue_share_percent: view.revenue_share_percent,
+        status: view.status,
+        created_date: Some(crate::state::wire_timestamp(view.created_date)),
+        last_modified_date: Some(crate::state::wire_timestamp(view.last_modified_date)),
+        latest_marketplace_revenue_share_revision: Some(
+            view.latest_marketplace_revenue_share_revision,
+        ),
     }
 }

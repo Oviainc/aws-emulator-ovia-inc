@@ -29,6 +29,9 @@ mod export_components;
 #[path = "all/form_lifecycle.rs"]
 mod form_lifecycle;
 
+#[path = "all/form_update.rs"]
+mod form_update;
+
 #[path = "all/metadata_flags.rs"]
 mod metadata_flags;
 

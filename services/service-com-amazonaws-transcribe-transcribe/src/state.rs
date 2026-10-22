@@ -149,6 +149,61 @@ pub const RESOURCE_TYPE_VOCABULARY: &str = "vocabulary";
 /// [`RESOURCE_TYPE_TRANSCRIPTION_JOB`].
 pub const RESOURCE_TYPE_VOCABULARY_FILTER: &str = "vocabulary-filter";
 
+/// The word this service's own client-error messages use for the kind of resource an
+/// ARN's `<type>` segment names, for each type this emulator stores records of.
+///
+/// The kinds are the ones the service's recorded messages name ("vocabulary",
+/// "vocabulary filter", "job"), so one template plus a kind words a refusal for every
+/// family rather than each handler spelling its own. An ARN whose type names nothing
+/// this emulator holds gets the neutral `KIND_RESOURCE`.
+pub const KIND_JOB: &str = "job";
+/// See [`KIND_JOB`].
+pub const KIND_VOCABULARY: &str = "vocabulary";
+/// See [`KIND_JOB`].
+pub const KIND_VOCABULARY_FILTER: &str = "vocabulary filter";
+/// See [`KIND_JOB`].
+pub const KIND_RESOURCE: &str = "resource";
+
+/// The resource kind the ARN resource type `resource_type` denotes — the word a
+/// refusal about that resource names it by.
+///
+/// The three mapped types are the ones [`ComAmazonawsTranscribeTranscribeState::tags`]
+/// and [`ComAmazonawsTranscribeTranscribeState::tags_mut`] can find a record for, so
+/// the two agree about which ARN names which family.
+pub fn resource_kind(resource_type: &str) -> &'static str {
+    match resource_type {
+        RESOURCE_TYPE_TRANSCRIPTION_JOB => KIND_JOB,
+        RESOURCE_TYPE_VOCABULARY => KIND_VOCABULARY,
+        RESOURCE_TYPE_VOCABULARY_FILTER => KIND_VOCABULARY_FILTER,
+        _ => KIND_RESOURCE,
+    }
+}
+
+/// How this service words "there is no such resource", for a resource of `kind`.
+///
+/// The service's own texts name the resource KIND and do NOT echo the name the
+/// caller asked about (the recorded responses read "The requested job couldn't be
+/// found. Check the job name and try your request again."), so the message carries
+/// no request value. Single-homed here because every family's not-found refusal uses
+/// it; which error SHAPE carries it is the handler's own modelled choice
+/// (`BadRequestException` — see [`crate::scaffolded::wire_status`] for the status
+/// side of the same error channel).
+pub fn not_found_message(kind: &str) -> String {
+    format!(
+        "The requested {kind} couldn't be found. Check the {kind} name and try your \
+         request again."
+    )
+}
+
+/// How this service words "that name is already taken", for a resource of `kind`.
+///
+/// Same shape of text as [`not_found_message`], and the same reason for naming only
+/// the kind: "The requested vocabulary filter name already exists. Use a different
+/// vocabulary filter name."
+pub fn name_already_exists_message(kind: &str) -> String {
+    format!("The requested {kind} name already exists. Use a different {kind} name.")
+}
+
 /// The most tags one Amazon Transcribe resource may carry.
 ///
 /// A CHOSEN ceiling, not a modelled one: `TagList` is modelled

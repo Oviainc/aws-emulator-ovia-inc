@@ -47,6 +47,7 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 const FAMILY_ROWS: &[FamilyRow] = &[
     FamilyRow {
         model_id: "anthropic.claude-3-haiku-20240307-v1:0",
+        family: state::ModelFamily::AnthropicMessages,
         request: r#"{"anthropic_version":"bedrock-2023-05-31","max_tokens":256,"messages":[{"role":"user","content":[{"type":"text","text":"Summarize the Mars mission in one line."}]}]}"#,
         capped_request: r#"{"anthropic_version":"bedrock-2023-05-31","max_tokens":3,"messages":[{"role":"user","content":[{"type":"text","text":"Summarize the Mars mission in one line."}]}]}"#,
         text_pointer: "/content/0/text",
@@ -58,6 +59,7 @@ const FAMILY_ROWS: &[FamilyRow] = &[
     },
     FamilyRow {
         model_id: "amazon.titan-text-express-v1",
+        family: state::ModelFamily::TitanText,
         request: r#"{"inputText":"Write a haiku about persistent state.","textGenerationConfig":{"maxTokenCount":512}}"#,
         capped_request: r#"{"inputText":"Write a haiku about persistent state.","textGenerationConfig":{"maxTokenCount":3}}"#,
         text_pointer: "/results/0/outputText",
@@ -69,6 +71,7 @@ const FAMILY_ROWS: &[FamilyRow] = &[
     },
     FamilyRow {
         model_id: "amazon.nova-pro-v1:0",
+        family: state::ModelFamily::Nova,
         request: r#"{"system":[{"text":"You are terse."}],"messages":[{"role":"user","content":[{"text":"Name two planets."}]}]}"#,
         capped_request: r#"{"inferenceConfig":{"max_new_tokens":3},"system":[{"text":"You are terse."}],"messages":[{"role":"user","content":[{"text":"Name two planets."}]}]}"#,
         text_pointer: "/output/message/content/0/text",
@@ -80,6 +83,7 @@ const FAMILY_ROWS: &[FamilyRow] = &[
     },
     FamilyRow {
         model_id: "meta.llama3-8b-instruct-v1:0",
+        family: state::ModelFamily::Llama,
         request: r#"{"prompt":"Explain idempotency to a cat.","max_gen_len":128}"#,
         capped_request: r#"{"prompt":"Explain idempotency to a cat.","max_gen_len":3}"#,
         text_pointer: "/generation",
@@ -91,6 +95,7 @@ const FAMILY_ROWS: &[FamilyRow] = &[
     },
     FamilyRow {
         model_id: "mistral.mistral-7b-instruct-v0:2",
+        family: state::ModelFamily::Mistral,
         request: r#"{"prompt":"<s>[INST] List three primes. [/INST]","max_tokens":64}"#,
         capped_request: r#"{"prompt":"<s>[INST] List three primes. [/INST]","max_tokens":3}"#,
         text_pointer: "/outputs/0/text",
@@ -102,6 +107,7 @@ const FAMILY_ROWS: &[FamilyRow] = &[
     },
     FamilyRow {
         model_id: "cohere.command-text-v14",
+        family: state::ModelFamily::CohereCommand,
         request: r#"{"prompt":"Describe a page token.","max_tokens":64}"#,
         capped_request: r#"{"prompt":"Describe a page token.","max_tokens":3}"#,
         text_pointer: "/generations/0/text",
@@ -116,6 +122,8 @@ const FAMILY_ROWS: &[FamilyRow] = &[
 /// A row of [`FAMILY_ROWS`].
 struct FamilyRow {
     model_id: &'static str,
+    /// The response family the model above belongs to.
+    family: state::ModelFamily,
     /// A request whose generation cap is far above what the emulator returns.
     request: &'static str,
     /// The same request with the family's generation-cap field set to 3 tokens.
@@ -700,66 +708,229 @@ async fn every_served_inference_call_is_recorded_in_the_inference_log() {
     );
 }
 
-/// RULE: an operation that takes a `modelId` resolves it against the registry of
-/// recognised models — accepting the bare id, a `foundation-model` ARN and a
-/// cross-region inference profile id — and answers `ResourceNotFoundException`
-/// (404) for a model that is not in it.
+/// One `modelId` as a client may spell it, and what the service owes for it.
+///
+/// The rows differ along the class of identifier — a served base model in each
+/// spelling the `modelId` pattern allows, an identifier that names no model the
+/// service offers, an ARN naming an account-scoped resource, and a model past
+/// its end of life — which is what the resolution rule generalises over.
+struct IdentifierRow {
+    case: &'static str,
+    model_id: &'static str,
+    status: u16,
+    /// The modelled error code, empty for a row that must be served.
+    code: &'static str,
+    /// The message, where the service's message for the class is a fixed one.
+    message: Option<&'static str>,
+    /// An `InvokeModel` body the named model's family accepts. A row that is
+    /// refused on its identifier never reaches the body.
+    body: &'static str,
+}
+
+/// A body the Amazon Nova family accepts, and one the Meta Llama family does.
+const NOVA_BODY: &str = r#"{"messages":[{"role":"user","content":[{"text":"hi"}]}]}"#;
+const LLAMA_BODY: &str = r#"{"prompt":"hi"}"#;
+/// A body the Anthropic Claude Messages API accepts: it binds the three members
+/// that API documents as required.
+const CLAUDE_BODY: &str = r#"{"anthropic_version":"bedrock-2023-05-31","max_tokens":64,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}"#;
+
+fn identifier_rows() -> Vec<IdentifierRow> {
+    let invalid = Some(state::INVALID_MODEL_IDENTIFIER_MESSAGE);
+    let retired = Some(state::END_OF_LIFE_MESSAGE);
+    vec![
+        // Spellings of a base model the inventory carries, all served.
+        IdentifierRow {
+            case: "bare base model id",
+            model_id: "amazon.nova-micro-v1:0",
+            status: 200,
+            code: "",
+            message: None,
+            body: NOVA_BODY,
+        },
+        IdentifierRow {
+            case: "cross-region inference profile id",
+            model_id: "us.amazon.nova-micro-v1:0",
+            status: 200,
+            code: "",
+            message: None,
+            body: NOVA_BODY,
+        },
+        IdentifierRow {
+            case: "foundation-model ARN without an account",
+            model_id: "arn:aws:bedrock:us-east-1::foundation-model/meta.llama3-70b-instruct-v1:0",
+            status: 200,
+            code: "",
+            message: None,
+            body: LLAMA_BODY,
+        },
+        IdentifierRow {
+            case: "inference-profile ARN of a system-defined profile",
+            model_id:
+                "arn:aws:bedrock:us-east-1:000000000000:inference-profile/eu.amazon.nova-lite-v1:0",
+            status: 200,
+            code: "",
+            message: None,
+            body: NOVA_BODY,
+        },
+        // Identifiers that name no model the service offers: a client input
+        // fault, so 400 with the service's fixed message.
+        IdentifierRow {
+            case: "bare id of no model",
+            model_id: "nobody.such-model-v1",
+            status: 400,
+            code: "ValidationException",
+            message: invalid,
+            body: LLAMA_BODY,
+        },
+        IdentifierRow {
+            case: "an id with no provider at all",
+            model_id: "claude",
+            status: 400,
+            code: "ValidationException",
+            message: invalid,
+            body: LLAMA_BODY,
+        },
+        IdentifierRow {
+            case: "geography prefix on no model",
+            model_id: "apac.nobody.such-model-v1",
+            status: 400,
+            code: "ValidationException",
+            message: invalid,
+            body: LLAMA_BODY,
+        },
+        IdentifierRow {
+            case: "a text provider whose envelope this emulator does not render",
+            model_id: "ai21.jamba-1-5-mini-v1:0",
+            status: 400,
+            code: "ValidationException",
+            message: invalid,
+            body: LLAMA_BODY,
+        },
+        // ARNs: well-formed references to a resource, so an absent one is 404.
+        IdentifierRow {
+            case: "foundation-model ARN of no model",
+            model_id: "arn:aws:bedrock:us-east-1::foundation-model/nobody.nope-v1",
+            status: 404,
+            code: "ResourceNotFoundException",
+            message: None,
+            body: LLAMA_BODY,
+        },
+        IdentifierRow {
+            case: "provisioned throughput ARN",
+            model_id: "arn:aws:bedrock:us-east-1:000000000000:provisioned-model/abc123def456",
+            status: 404,
+            code: "ResourceNotFoundException",
+            message: None,
+            body: LLAMA_BODY,
+        },
+        IdentifierRow {
+            case: "custom model ARN",
+            model_id:
+                "arn:aws:bedrock:us-east-1:000000000000:custom-model/amazon.titan-text-express-v1/abc123def456",
+            status: 404,
+            code: "ResourceNotFoundException",
+            message: None,
+            body: LLAMA_BODY,
+        },
+        IdentifierRow {
+            case: "imported model ARN",
+            model_id: "arn:aws:bedrock:us-east-1:000000000000:imported-model/abc123def456",
+            status: 404,
+            code: "ResourceNotFoundException",
+            message: None,
+            body: LLAMA_BODY,
+        },
+        IdentifierRow {
+            case: "custom model deployment ARN",
+            model_id:
+                "arn:aws:bedrock:us-east-1:000000000000:custom-model-deployment/abc123def456",
+            status: 404,
+            code: "ResourceNotFoundException",
+            message: None,
+            body: LLAMA_BODY,
+        },
+        IdentifierRow {
+            case: "application inference profile ARN",
+            model_id:
+                "arn:aws:bedrock:us-east-1:000000000000:application-inference-profile/zz9plural",
+            status: 404,
+            code: "ResourceNotFoundException",
+            message: None,
+            body: LLAMA_BODY,
+        },
+        IdentifierRow {
+            case: "prompt router ARN",
+            model_id: "arn:aws:bedrock:us-east-1:000000000000:prompt-router/my-router",
+            status: 404,
+            code: "ResourceNotFoundException",
+            message: None,
+            body: LLAMA_BODY,
+        },
+        IdentifierRow {
+            case: "SageMaker endpoint ARN",
+            model_id: "arn:aws:sagemaker:us-east-1:000000000000:endpoint/my-endpoint",
+            status: 404,
+            code: "ResourceNotFoundException",
+            message: None,
+            body: LLAMA_BODY,
+        },
+        // A model past its end of life: the identifier resolves, the model is
+        // gone, so it is the resource that is not found.
+        IdentifierRow {
+            case: "retired Anthropic model",
+            model_id: "anthropic.claude-v2",
+            status: 404,
+            code: "ResourceNotFoundException",
+            message: retired,
+            body: LLAMA_BODY,
+        },
+        IdentifierRow {
+            case: "retired AI21 model",
+            model_id: "ai21.j2-ultra-v1",
+            status: 404,
+            code: "ResourceNotFoundException",
+            message: retired,
+            body: LLAMA_BODY,
+        },
+        IdentifierRow {
+            case: "retired model named by ARN",
+            model_id: "arn:aws:bedrock:us-east-1::foundation-model/meta.llama2-70b-chat-v1",
+            status: 404,
+            code: "ResourceNotFoundException",
+            message: retired,
+            body: LLAMA_BODY,
+        },
+    ]
+}
+
+/// RULE: every operation that takes a `modelId` resolves it before it serves
+/// anything, and the refusal it owes depends on the CLASS of identifier, not on
+/// the operation: an identifier the service cannot interpret as naming a model
+/// it offers is a client input fault — `ValidationException` (400) with the
+/// service's fixed message — while an identifier that does name a resource (an
+/// ARN, or a base model the inventory carries as past its end of life) whose
+/// resource is not available is `ResourceNotFoundException` (404). A base model
+/// the inventory carries is served under every spelling the `modelId` pattern
+/// allows: the bare id, a cross-region inference profile id, a
+/// `foundation-model` ARN and an `inference-profile` ARN.
 #[tokio::test]
-async fn an_unrecognised_model_is_not_found_on_every_inference_operation() {
+async fn a_model_identifier_is_refused_by_the_class_of_identifier_it_is() {
     let router = emulator();
-    let invoke_body = br#"{"prompt":"hi"}"#.to_vec();
 
-    // Spellings of ONE registered model the resolver must accept.
-    let known = "meta.llama3-70b-instruct-v1:0";
-    for spelling in [
-        known.to_string(),
-        format!("us.{known}"),
-        format!("arn:aws:bedrock:us-east-1:000000000000:foundation-model/{known}"),
-    ] {
-        let encoded = spelling.replace(':', "%3A").replace('/', "%2F");
-        let call = send(
-            &router,
-            "POST",
-            &format!("/model/{encoded}/invoke"),
-            &[("content-type", "application/json")],
-            invoke_body.clone(),
-        )
-        .await;
-        assert_eq!(
-            call.status,
-            200,
-            "case {spelling:?}: expected a recognised model to be served, got {} / {}",
-            call.status,
-            String::from_utf8_lossy(&call.body)
-        );
-    }
+    for row in identifier_rows() {
+        let encoded = encode_path(row.model_id);
+        let case = row.case;
 
-    // Unrecognised spellings, across all three inference operations.
-    for model_id in [
-        "anthropic.claude-9-imaginary-v1%3A0",
-        "nobody.such-model-v1",
-        "arn%3Aaws%3Abedrock%3Aus-east-1%3A000000000000%3Afoundation-model%2Fnobody.nope-v1",
-    ] {
-        let calls = vec![
+        // Every operation that resolves a modelId must answer the same way.
+        let mut calls = vec![
             (
                 "InvokeModel",
                 send(
                     &router,
                     "POST",
-                    &format!("/model/{model_id}/invoke"),
+                    &format!("/model/{encoded}/invoke"),
                     &[("content-type", "application/json")],
-                    invoke_body.clone(),
-                )
-                .await,
-            ),
-            (
-                "Converse",
-                post_json(
-                    &router,
-                    &format!("/model/{model_id}/converse"),
-                    &serde_json::json!({
-                        "messages": [{"role": "user", "content": [{"text": "hi"}]}],
-                    }),
+                    row.body.as_bytes().to_vec(),
                 )
                 .await,
             ),
@@ -767,7 +938,7 @@ async fn an_unrecognised_model_is_not_found_on_every_inference_operation() {
                 "CountTokens",
                 post_json(
                     &router,
-                    &format!("/model/{model_id}/count-tokens"),
+                    &format!("/model/{encoded}/count-tokens"),
                     &serde_json::json!({
                         "input": { "invokeModel": { "body": base64(b"{\"prompt\":\"hi\"}") } },
                     }),
@@ -775,21 +946,224 @@ async fn an_unrecognised_model_is_not_found_on_every_inference_operation() {
                 .await,
             ),
         ];
+        if row.status != 200 {
+            // A served row is not asserted against Converse: Converse has its
+            // own rule about which models it serves, pinned separately.
+            calls.push((
+                "Converse",
+                post_json(
+                    &router,
+                    &format!("/model/{encoded}/converse"),
+                    &serde_json::json!({
+                        "messages": [{"role": "user", "content": [{"text": "hi"}]}],
+                    }),
+                )
+                .await,
+            ));
+        }
+
         for (operation, call) in calls {
             assert_eq!(
                 call.status,
-                404,
-                "case {operation} {model_id:?}: expected 404, got {} / {}",
+                row.status,
+                "case {case:?} {operation} {:?}: expected {}, got {} / {}",
+                row.model_id,
+                row.status,
                 call.status,
                 String::from_utf8_lossy(&call.body)
             );
+            if !row.code.is_empty() {
+                assert_eq!(
+                    call.error_code(),
+                    row.code,
+                    "case {case:?} {operation} {:?}: expected {}, got {:?}",
+                    row.model_id,
+                    row.code,
+                    call.error_code()
+                );
+            }
+            if let Some(expected) = row.message {
+                assert_eq!(
+                    call.json()["message"].as_str(),
+                    Some(expected),
+                    "case {case:?} {operation} {:?}: expected message {expected:?}, got {:?}",
+                    row.model_id,
+                    call.json()["message"]
+                );
+            }
+        }
+    }
+}
+
+/// RULE: the model inventory is what `modelId` resolution answers from, so every
+/// active text model it carries is served by `InvokeModel` in its family's own
+/// response envelope — no model id is served or refused as a special case.
+#[tokio::test]
+async fn every_active_text_model_in_the_inventory_is_served_in_its_family_envelope() {
+    let (engine, router) = emulator_with_engine();
+    let inventory: Vec<(String, Option<state::ModelFamily>, state::ModelModality)> = engine
+        .state::<ServiceState>()
+        .lock()
+        .models
+        .values()
+        .filter(|entry| entry.lifecycle == state::ModelLifecycle::Active)
+        .map(|entry| (entry.model_id.clone(), entry.family, entry.modality))
+        .collect();
+    assert!(
+        inventory.len() >= FAMILY_ROWS.len(),
+        "case \"inventory\": expected at least one model per response family, got {}",
+        inventory.len()
+    );
+
+    let mut served = 0usize;
+    for (model_id, family, modality) in inventory {
+        let Some(family) = family else { continue };
+        assert_eq!(
+            modality,
+            state::ModelModality::Text,
+            "case {model_id:?}: only a text model has a response envelope"
+        );
+        served += 1;
+        // The family's own request body, from the family table above.
+        let request = FAMILY_ROWS
+            .iter()
+            .find(|row| row.family == family)
+            .map(|row| row.request)
+            .unwrap_or_else(|| panic!("case {model_id:?}: no request body for family {family:?}"));
+        let call = send(
+            &router,
+            "POST",
+            &format!("/model/{}/invoke", encode_path(&model_id)),
+            &[("content-type", "application/json")],
+            request.as_bytes().to_vec(),
+        )
+        .await;
+        assert_eq!(
+            call.status,
+            200,
+            "case {model_id:?}: expected the inventory's model to be served, got {} / {}",
+            call.status,
+            String::from_utf8_lossy(&call.body)
+        );
+        let body = call.json();
+        // The family's own envelope: its generated-text member must be there.
+        // Pointers as in [`FAMILY_ROWS`], one per documented envelope.
+        let text_pointer = match family {
+            state::ModelFamily::AnthropicMessages => "/content/0/text",
+            state::ModelFamily::TitanText => "/results/0/outputText",
+            state::ModelFamily::Nova => "/output/message/content/0/text",
+            state::ModelFamily::Llama => "/generation",
+            state::ModelFamily::Mistral => "/outputs/0/text",
+            state::ModelFamily::CohereCommand => "/generations/0/text",
+        };
+        assert!(
+            body.pointer(text_pointer)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| !text.is_empty()),
+            "case {model_id:?}: expected generated text at {text_pointer}, got {body}"
+        );
+        if family == state::ModelFamily::Nova {
+            // Nova answers the Converse-shaped envelope, whose usage carries the
+            // prompt-cache counters as well as the three token counts.
+            let usage = &body["usage"];
+            for member in [
+                "inputTokens",
+                "outputTokens",
+                "totalTokens",
+                "cacheReadInputTokenCount",
+                "cacheWriteInputTokenCount",
+            ] {
+                assert!(
+                    usage[member].is_i64(),
+                    "case {model_id:?}: expected usage.{member} to be an integer, got {usage}"
+                );
+            }
             assert_eq!(
-                call.error_code(),
-                "ResourceNotFoundException",
-                "case {operation} {model_id:?}: expected ResourceNotFoundException, got {:?}",
-                call.error_code()
+                usage["totalTokens"].as_i64(),
+                Some(
+                    usage["inputTokens"].as_i64().unwrap_or_default()
+                        + usage["outputTokens"].as_i64().unwrap_or_default()
+                ),
+                "case {model_id:?}: totalTokens must be the sum of the two counts, got {usage}"
+            );
+            assert!(
+                body["output"]["message"]["content"][0]["text"]
+                    .as_str()
+                    .is_some_and(|text| !text.is_empty()),
+                "case {model_id:?}: expected output.message.content[0].text, got {body}"
+            );
+            assert_eq!(
+                body["stopReason"].as_str(),
+                Some("end_turn"),
+                "case {model_id:?}: expected stopReason end_turn, got {body}"
             );
         }
+    }
+    assert!(
+        served >= FAMILY_ROWS.len(),
+        "case \"served models\": expected every family to be represented, served {served}"
+    );
+}
+
+/// RULE: a model id the inventory carries for a modality this emulator computes
+/// nothing for is a RECOGNISED identifier — so it is never reported as an
+/// invalid one — and an invocation of it is refused with the modelled
+/// `ModelErrorException` (424) rather than answered with a fabricated payload;
+/// an operation that needs no model output (counting the input's tokens) still
+/// succeeds for it.
+#[tokio::test]
+async fn a_model_this_emulator_runs_no_inference_for_is_refused_not_invented() {
+    let router = emulator();
+    for (case, model_id) in [
+        ("embedding model", "amazon.titan-embed-text-v2:0"),
+        ("embedding model, other provider", "cohere.embed-english-v3"),
+        ("image model", "amazon.nova-canvas-v1:0"),
+        ("video model", "amazon.nova-reel-v1:0"),
+    ] {
+        let encoded = encode_path(model_id);
+        let call = send(
+            &router,
+            "POST",
+            &format!("/model/{encoded}/invoke"),
+            &[("content-type", "application/json")],
+            br#"{"inputText":"a cat"}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(
+            call.status,
+            424,
+            "case {case:?} {model_id:?}: expected 424, got {} / {}",
+            call.status,
+            String::from_utf8_lossy(&call.body)
+        );
+        assert_eq!(
+            call.error_code(),
+            "ModelErrorException",
+            "case {case:?} {model_id:?}: expected ModelErrorException, got {:?}",
+            call.error_code()
+        );
+        assert_eq!(
+            call.json()["resourceName"].as_str(),
+            Some(model_id),
+            "case {case:?} {model_id:?}: expected the refusal to name the model, got {}",
+            call.json()
+        );
+
+        let counted = post_json(
+            &router,
+            &format!("/model/{encoded}/count-tokens"),
+            &serde_json::json!({
+                "input": { "invokeModel": { "body": base64(b"{\"inputText\":\"a cat\"}") } },
+            }),
+        )
+        .await;
+        assert_eq!(
+            counted.status,
+            200,
+            "case {case:?} {model_id:?}: counting tokens needs no model output, got {} / {}",
+            counted.status,
+            String::from_utf8_lossy(&counted.body)
+        );
     }
 }
 
@@ -932,7 +1306,7 @@ async fn a_request_that_breaks_a_stated_rule_is_refused_with_validation_exceptio
             ("x-amzn-bedrock-guardrailidentifier", "abc123"),
             ("x-amzn-bedrock-guardrailversion", "1"),
         ],
-        br#"{"prompt":"hi"}"#.to_vec(),
+        CLAUDE_BODY.as_bytes().to_vec(),
     )
     .await;
     assert_eq!(
@@ -944,10 +1318,176 @@ async fn a_request_that_breaks_a_stated_rule_is_refused_with_validation_exceptio
     );
 }
 
+/// One family's `InvokeModel` body rules: a body the family accepts, and a body
+/// that omits a member its documented request schema requires together with the
+/// key name the refusal must report.
+///
+/// Required members per family from "Inference request parameters and response
+/// fields for foundation models" in the Amazon Bedrock User Guide. The rows
+/// differ along the family, which is what the body schema generalises over, and
+/// along which member is missing.
+struct BodySchemaRow {
+    case: &'static str,
+    model_id: &'static str,
+    accepted: &'static str,
+    rejected: &'static str,
+    missing_key: &'static str,
+}
+
+fn body_schema_rows() -> Vec<BodySchemaRow> {
+    vec![
+        BodySchemaRow {
+            case: "Anthropic Claude without messages",
+            model_id: "anthropic.claude-3-haiku-20240307-v1:0",
+            accepted: CLAUDE_BODY,
+            rejected: r#"{"anthropic_version":"bedrock-2023-05-31","max_tokens":64}"#,
+            missing_key: "messages",
+        },
+        BodySchemaRow {
+            case: "Anthropic Claude without max_tokens",
+            model_id: "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            accepted: CLAUDE_BODY,
+            rejected: r#"{"anthropic_version":"bedrock-2023-05-31","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}"#,
+            missing_key: "max_tokens",
+        },
+        BodySchemaRow {
+            case: "Amazon Nova without messages",
+            model_id: "amazon.nova-micro-v1:0",
+            accepted: NOVA_BODY,
+            rejected: r#"{"inferenceConfig":{"max_new_tokens":16}}"#,
+            missing_key: "messages",
+        },
+        BodySchemaRow {
+            case: "Amazon Titan Text without inputText",
+            model_id: "amazon.titan-text-lite-v1",
+            accepted: r#"{"inputText":"hi"}"#,
+            rejected: r#"{"textGenerationConfig":{"maxTokenCount":16}}"#,
+            missing_key: "inputText",
+        },
+        BodySchemaRow {
+            case: "Meta Llama without prompt",
+            model_id: "meta.llama3-2-3b-instruct-v1:0",
+            accepted: LLAMA_BODY,
+            rejected: r#"{"max_gen_len":16}"#,
+            missing_key: "prompt",
+        },
+        BodySchemaRow {
+            // Mistral takes either a raw prompt or a chat transcript, so a body
+            // that binds the alternative member satisfies the same slot.
+            case: "Mistral with neither prompt nor messages",
+            model_id: "mistral.mistral-large-2407-v1:0",
+            accepted: r#"{"messages":[{"role":"user","content":"hi"}]}"#,
+            rejected: r#"{"max_tokens":16}"#,
+            missing_key: "prompt",
+        },
+        BodySchemaRow {
+            case: "Cohere Command with neither prompt nor message",
+            model_id: "cohere.command-r-plus-v1:0",
+            accepted: r#"{"message":"hi"}"#,
+            rejected: r#"{"max_tokens":16}"#,
+            missing_key: "prompt",
+        },
+    ]
+}
+
+/// RULE: `InvokeModel`'s body is model-specific, so it is checked against the
+/// invoked family's own documented request schema: a body that binds every
+/// member the family requires is served, one that omits a required member is
+/// refused with `ValidationException` (400) naming that member as the missing
+/// key, and a body that is not a JSON object at all is refused as unreadable.
+#[tokio::test]
+async fn an_invoke_body_is_checked_against_the_invoked_family_request_schema() {
+    let router = emulator();
+
+    for row in body_schema_rows() {
+        let case = row.case;
+        let path = format!("/model/{}/invoke", encode_path(row.model_id));
+
+        let served = send(
+            &router,
+            "POST",
+            &path,
+            &[("content-type", "application/json")],
+            row.accepted.as_bytes().to_vec(),
+        )
+        .await;
+        assert_eq!(
+            served.status,
+            200,
+            "case {case:?}: expected the family's own body to be served, got {} / {}",
+            served.status,
+            String::from_utf8_lossy(&served.body)
+        );
+
+        let refused = send(
+            &router,
+            "POST",
+            &path,
+            &[("content-type", "application/json")],
+            row.rejected.as_bytes().to_vec(),
+        )
+        .await;
+        assert_eq!(
+            refused.status,
+            400,
+            "case {case:?}: expected 400, got {} / {}",
+            refused.status,
+            String::from_utf8_lossy(&refused.body)
+        );
+        assert_eq!(
+            refused.error_code(),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {:?}",
+            refused.error_code()
+        );
+        let expected = format!(
+            "Malformed input request: #: required key [{}] not found, please reformat your input \
+             and try again.",
+            row.missing_key
+        );
+        assert_eq!(
+            refused.json()["message"].as_str(),
+            Some(expected.as_str()),
+            "case {case:?}: expected message {expected:?}, got {:?}",
+            refused.json()["message"]
+        );
+    }
+
+    // A body that is not a JSON object cannot be read as a request at all,
+    // whatever the family.
+    for (case, body) in [
+        ("plain text", "not json at all"),
+        ("a JSON array", "[1,2,3]"),
+        ("a bare JSON string", "\"hi\""),
+        ("a truncated object", "{\"prompt\":"),
+    ] {
+        let call = send(
+            &router,
+            "POST",
+            "/model/meta.llama3-8b-instruct-v1%3A0/invoke",
+            &[("content-type", "application/json")],
+            body.as_bytes().to_vec(),
+        )
+        .await;
+        assert_eq!(
+            call.status,
+            400,
+            "case {case:?}: expected 400, got {} / {}",
+            call.status,
+            String::from_utf8_lossy(&call.body)
+        );
+        assert_eq!(
+            call.json()["message"].as_str(),
+            Some(state::MALFORMED_BODY_MESSAGE),
+            "case {case:?}: expected the malformed-body refusal, got {:?}",
+            call.json()["message"]
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The async-invoke lifecycle
 // ---------------------------------------------------------------------------
-
 /// RULE: `StartAsyncInvoke` persists one invocation record and `GetAsyncInvoke`
 /// reports exactly that record; the operation is idempotent, so the same
 /// `clientRequestToken` with the same payload names the invocation already
@@ -1135,7 +1675,8 @@ async fn start_async_invoke_persists_a_record_that_get_async_invoke_reports_back
         );
     }
 
-    // An unrecognised model cannot be invoked asynchronously either.
+    // An unrecognised model cannot be invoked asynchronously either: the
+    // identifier is not one the service can interpret, so it is a 400.
     let unknown = post_json(
         &router,
         "/async-invoke",
@@ -1147,10 +1688,16 @@ async fn start_async_invoke_persists_a_record_that_get_async_invoke_reports_back
     )
     .await;
     assert_eq!(
-        unknown.status, 404,
-        "case \"unrecognised model\": expected 404, got {} / {}",
+        unknown.status, 400,
+        "case \"unrecognised model\": expected 400, got {} / {}",
         unknown.status,
         String::from_utf8_lossy(&unknown.body)
+    );
+    assert_eq!(
+        unknown.error_code(),
+        "ValidationException",
+        "case \"unrecognised model\": expected ValidationException, got {:?}",
+        unknown.error_code()
     );
 }
 

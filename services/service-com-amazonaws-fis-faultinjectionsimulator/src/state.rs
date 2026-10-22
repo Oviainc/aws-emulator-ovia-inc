@@ -28,9 +28,13 @@
 //!
 //! Both records are the one copy every handler reads and writes, so a value a create
 //! call returns is the value a later read reports. An experiment also owes the clock a
-//! transition (`initiating` -> `running`, `stopping` -> `stopped`): the instant it falls
-//! due is stored on the record and materialised by [`ExperimentRecord::settle`], so no
-//! handler ever sleeps and a read never invents a status the clock did not already owe.
+//! transition (`initiating` -> `running`, `running` -> `completed`/`failed`, `stopping`
+//! -> `stopped`): the instant it falls due is stored on the record and materialised by
+//! [`ExperimentRecord::settle`], so no handler ever sleeps and a read never invents a
+//! status the clock did not already owe.
+//!
+//! A template may also carry TARGET ACCOUNT CONFIGURATIONS, one per account id, which
+//! `UpdateTargetAccountConfiguration` changes in place.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, SystemTime};
@@ -61,11 +65,18 @@ use crate::ops::types::{
     ExperimentTemplateSummary, ExperimentTemplateTarget, ExperimentTemplateTargetFilter,
     ExperimentTemplateTargetInputFilter, ReportConfigurationCloudWatchDashboardInput,
     ReportConfigurationS3Output, ReportConfigurationS3OutputInput, ResolvedTarget,
-    ResourceNotFoundException,
-    ServiceQuotaExceededException, TargetAccountConfiguration, TargetAccountConfigurationSummary,
-    ValidationException,
+    ResourceNotFoundException, ServiceQuotaExceededException, StartExperimentInput,
+    TargetAccountConfiguration, TargetAccountConfigurationSummary, ValidationException,
     ACCOUNT_TARGETING_VALUES, ACTIONS_MODE_VALUES, EMPTY_TARGET_RESOLUTION_MODE_VALUES,
 };
+
+/// The IAM store this service resolves an execution role against.
+///
+/// It is the IAM service's OWN state struct, reached through the SAME shared engine this
+/// service's store lives in, so FIS reads the very records `CreateRole` wrote rather
+/// than a second copy of them.
+pub type IamState =
+    ::service_com_amazonaws_iam_awsidentitymanagementv20100508::ComAmazonawsIamAwsidentitymanagementv20100508State;
 
 /// What a handler reports when the engine it was built on carries no store for this
 /// service — a server fault, never a bad request.
@@ -126,6 +137,14 @@ pub const MAX_EXPERIMENT_TEMPLATES: usize = 1_000;
 /// `ServiceQuotaExceededException`. See [`MAX_EXPERIMENT_TEMPLATES`].
 pub const MAX_EXPERIMENTS: usize = 1_000;
 
+/// How many experiments may be ACTIVE at once before `StartExperiment` refuses with
+/// `ServiceQuotaExceededException`.
+///
+/// Unlike [`MAX_EXPERIMENTS`] this is a quota AWS publishes: the FIS user guide's quotas
+/// page lists "Active experiments" as 5 per account per Region, non-adjustable. The store
+/// is not partitioned by region, so the count is taken over every experiment it holds.
+pub const MAX_ACTIVE_EXPERIMENTS: usize = 5;
+
 /// How many target account configurations ONE experiment template holds before
 /// `CreateTargetAccountConfiguration` refuses with `ServiceQuotaExceededException`.
 ///
@@ -133,6 +152,34 @@ pub const MAX_EXPERIMENTS: usize = 1_000;
 /// rather than a claim about a quota AWS publishes, and it is checked only when a
 /// request would ADD a configuration.
 pub const MAX_TARGET_ACCOUNT_CONFIGURATIONS: usize = 1_000;
+
+/// How many actions ONE experiment template may carry.
+///
+/// A quota AWS publishes: the FIS user guide's quotas page lists "Actions per experiment
+/// template" as 20. It is also what BOUNDS the work [`run_plan`] does for a request — the
+/// action graph is walked once per action, so a stated cap on the actions keeps that walk
+/// linear in the size of the request instead of growing with it.
+pub const MAX_ACTIONS_PER_TEMPLATE: usize = 20;
+
+/// The built-in FIS action that waits: "aws:fis:wait — Run a wait action for a specified
+/// duration". It is the one action whose effect is pure elapsed time, so it is the one
+/// this emulator can carry out.
+pub const WAIT_ACTION_ID: &str = "aws:fis:wait";
+
+/// The parameter `aws:fis:wait` takes: "duration — The duration of the wait", required,
+/// in ISO 8601 format.
+pub const WAIT_DURATION_PARAMETER: &str = "duration";
+
+/// The smallest wait `aws:fis:wait` accepts: the documented range of its `duration` is
+/// 1 to 720 minutes (12 hours).
+pub const WAIT_DURATION_MIN_MINUTES: u64 = 1;
+
+/// The largest wait `aws:fis:wait` accepts. See [`WAIT_DURATION_MIN_MINUTES`].
+pub const WAIT_DURATION_MAX_MINUTES: u64 = 720;
+
+/// The service principal a template's execution role must let assume it, so FIS can run
+/// the experiment under that role.
+pub const FIS_SERVICE_PRINCIPAL: &str = "fis.amazonaws.com";
 
 /// `ResourceArnList`'s published ceiling (`@length(min: 0, max: 5)`) — the most resources
 /// ONE target of an experiment template may name.
@@ -286,15 +333,20 @@ pub const TRANSITION_DELAY: Duration = Duration::from_millis(500);
 /// this is an explanatory string rather than a reproduction of the service's own text.
 pub const STOPPED_BY_REQUEST: &str = "Stopped by a StopExperiment request";
 
+/// The `state.reason` an experiment carries once its actions have run to the end. Chosen
+/// here for the same reason [`STOPPED_BY_REQUEST`] is.
+pub const COMPLETED_REASON: &str = "Experiment completed";
+
 /// The status an experiment this emulator persists can be in.
 ///
 /// `ExperimentStatus` is modelled
 /// `pending | initiating | running | completed | stopping | stopped | failed | cancelled`.
-/// Only the four below are reachable here: an experiment is minted `initiating`, becomes
-/// `running` when the clock says so, and goes `stopping` -> `stopped` when
-/// `StopExperiment` is called. `completed`, `failed` and `cancelled` report the outcome
-/// of RUNNING an experiment's actions — injecting faults into other services — which this
-/// emulator does not perform, so it never claims one of them.
+/// Six of the eight are reachable here: an experiment is minted `initiating`, becomes
+/// `running` when the clock says so, and then either `completed` (its wait actions
+/// elapsed) or `failed` (it carries an action this emulator cannot inject); a
+/// `StopExperiment` moves it `stopping` -> `stopped` instead. `pending` is the status FIS
+/// reports before it has accepted the run, and `cancelled` reports a run cancelled by
+/// something other than a stop request, neither of which this emulator produces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExperimentStatus {
     /// The experiment has been accepted and is starting up.
@@ -303,8 +355,12 @@ pub enum ExperimentStatus {
     Running,
     /// A stop has been requested and is being carried out.
     Stopping,
-    /// The experiment is over. Terminal.
+    /// The experiment was stopped. Terminal.
     Stopped,
+    /// The experiment's actions ran to the end. Terminal.
+    Completed,
+    /// The experiment's actions could not be carried out. Terminal.
+    Failed,
 }
 
 impl ExperimentStatus {
@@ -315,13 +371,35 @@ impl ExperimentStatus {
             Self::Running => "running",
             Self::Stopping => "stopping",
             Self::Stopped => "stopped",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
         }
     }
 
     /// True when no further transition can leave this status.
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Stopped)
+        matches!(self, Self::Stopped | Self::Completed | Self::Failed)
     }
+
+    /// True while the experiment still occupies one of the account's active-experiment
+    /// slots — every status that is not terminal. This is the count
+    /// [`MAX_ACTIVE_EXPERIMENTS`] is taken against.
+    pub fn is_active(self) -> bool {
+        !self.is_terminal()
+    }
+}
+
+/// What the end of an experiment's run is: the terminal status its actions earn once the
+/// run span elapses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExperimentOutcome {
+    /// Every action is `aws:fis:wait`, so the run is elapsed time and nothing else: it
+    /// ends `completed`.
+    Completed,
+    /// The experiment carries an action that injects a fault into another service, which
+    /// this emulator does not do. The run ends in the modelled `failed` state carrying
+    /// this reason, rather than reporting a success nothing performed.
+    Failed(String),
 }
 
 /// One target account configuration of an experiment template, exactly as
@@ -620,6 +698,11 @@ pub struct ExperimentRecord {
     /// When the transition this experiment owes the clock falls due, or `None` when it
     /// owes none. [`ExperimentRecord::settle`] is what spends it.
     pub transition_due: Option<SystemTime>,
+    /// How long this experiment's actions take once it is `running` — the longest path
+    /// through its action graph, as [`run_plan`] computes it.
+    pub run_span: Duration,
+    /// The terminal status the run earns once [`run_span`](Self::run_span) elapses.
+    pub outcome: ExperimentOutcome,
 }
 
 impl ExperimentRecord {
@@ -632,6 +715,7 @@ impl ExperimentRecord {
         tags: Option<HashMap<String, String>>,
         now: SystemTime,
     ) -> Self {
+        let (run_span, outcome) = run_plan(&template.actions);
         let targets: HashMap<String, ExperimentTarget> = template
             .targets
             .iter()
@@ -682,6 +766,8 @@ impl ExperimentRecord {
             start_time: now,
             end_time: None,
             transition_due: Some(now + TRANSITION_DELAY),
+            run_span,
+            outcome,
         }
     }
 
@@ -695,38 +781,61 @@ impl ExperimentRecord {
     ///
     /// This is the one write a REPORTING operation performs, and it only makes a change
     /// that was owed at `now` whether or not anybody called: an experiment that was
-    /// `initiating` when [`TRANSITION_DELAY`] elapsed is `running` from that instant, and
-    /// one that was `stopping` is `stopped` from it. Nothing here depends on the call
-    /// being made, so two reads at the same instant report the same status.
+    /// `initiating` when [`TRANSITION_DELAY`] elapsed is `running` from that instant, one
+    /// that was `running` when its [`run_span`](Self::run_span) elapsed carries its
+    /// [`outcome`](Self::outcome) from that instant, and one that was `stopping` is
+    /// `stopped`. Nothing here depends on the call being made, so two reads at the same
+    /// instant report the same status.
+    ///
+    /// The loop is what makes a single read materialise a CHAIN of transitions that all
+    /// fell due before `now` — an experiment nobody polled for longer than its whole run
+    /// reports the terminal status, not the `running` it passed through.
     pub fn settle(&mut self, now: SystemTime) {
-        let Some(due) = self.transition_due else {
-            return;
-        };
-        if now < due {
-            return;
-        }
-        self.transition_due = None;
-        match self.status {
-            ExperimentStatus::Initiating => self.status = ExperimentStatus::Running,
-            ExperimentStatus::Stopping => {
-                self.status = ExperimentStatus::Stopped;
-                // The experiment ended when the transition fell due, not when somebody
-                // happened to look.
-                self.end_time = Some(due);
+        while let Some(due) = self.transition_due {
+            if now < due {
+                return;
             }
-            ExperimentStatus::Running | ExperimentStatus::Stopped => {}
+            match self.status {
+                ExperimentStatus::Initiating => {
+                    self.status = ExperimentStatus::Running;
+                    // The run started when the transition fell due, so what is left of it
+                    // is measured from there and not from this call.
+                    self.transition_due = Some(due + self.run_span);
+                }
+                ExperimentStatus::Running => {
+                    match &self.outcome {
+                        ExperimentOutcome::Completed => {
+                            self.status = ExperimentStatus::Completed;
+                            self.reason = Some(COMPLETED_REASON.to_string());
+                        }
+                        ExperimentOutcome::Failed(reason) => {
+                            self.status = ExperimentStatus::Failed;
+                            self.reason = Some(reason.clone());
+                        }
+                    }
+                    // The experiment ended when the transition fell due, not when somebody
+                    // happened to look.
+                    self.end_time = Some(due);
+                    self.transition_due = None;
+                }
+                ExperimentStatus::Stopping => {
+                    self.status = ExperimentStatus::Stopped;
+                    self.end_time = Some(due);
+                    self.transition_due = None;
+                }
+                ExperimentStatus::Stopped
+                | ExperimentStatus::Completed
+                | ExperimentStatus::Failed => self.transition_due = None,
+            }
         }
     }
 
     /// Start the move to `stopped`, due [`TRANSITION_DELAY`] from `now`.
     ///
-    /// A no-op on an experiment that is already stopping or stopped, so a repeated
-    /// `StopExperiment` neither restarts the span nor moves `endTime`.
+    /// A no-op on an experiment that is already stopping or in a final state, so a stop
+    /// this service refuses neither restarts the span nor moves `endTime`.
     pub fn request_stop(&mut self, now: SystemTime) {
-        if matches!(
-            self.status,
-            ExperimentStatus::Stopping | ExperimentStatus::Stopped
-        ) {
+        if self.status == ExperimentStatus::Stopping || self.status.is_terminal() {
             return;
         }
         self.status = ExperimentStatus::Stopping;
@@ -740,7 +849,9 @@ impl ExperimentRecord {
             status: Some(self.status.as_wire().to_string()),
             reason: self.reason.clone(),
             // `ExperimentError` carries "the error information of the experiment when the
-            // action has failed"; no status this emulator reaches is a failure.
+            // action has failed": an `accountId`, an error `code` and the `location` in
+            // the template. A run this emulator declines to perform produced no such
+            // error, so the reason says what happened and no code is invented for it.
             error: None,
         }
     }
@@ -793,6 +904,33 @@ pub enum IdempotentResource {
     Experiment,
 }
 
+/// What one `@idempotencyToken` created, and the request it created it from.
+///
+/// The request is kept BESIDE the id because a token identifies a request and not just a
+/// resource: replaying it with the same request reports that resource, while reusing it
+/// for a different request is a parameter mismatch rather than a retry.
+#[derive(Debug, Clone)]
+pub struct IdempotencyRecord {
+    /// The id of the resource the first call created.
+    pub id: String,
+    /// The canonical rendering of that first request — see [`template_fingerprint`] and
+    /// [`start_experiment_fingerprint`].
+    pub request: String,
+}
+
+/// What a token the store has already seen says about the request now carrying it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenReplay {
+    /// No live resource was created with this token: carry on and create one.
+    Fresh,
+    /// The token created this resource from an identical request: report that resource
+    /// rather than creating a second one.
+    Replay(String),
+    /// The token created a resource from a DIFFERENT request. The request is refused with
+    /// `ConflictException`; see [`token_conflict`].
+    Mismatch,
+}
+
 /// Per-service state for com-amazonaws-fis-faultinjectionsimulator. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsFisFaultinjectionsimulatorState {
@@ -802,12 +940,13 @@ pub struct ComAmazonawsFisFaultinjectionsimulatorState {
     pub experiment_templates: BTreeMap<String, ExperimentTemplateRecord>,
     /// Every experiment, keyed by its id — ordered for the same reason.
     pub experiments: BTreeMap<String, ExperimentRecord>,
-    /// The resource each `@idempotencyToken` has already created, so replaying a token
-    /// returns the first resource instead of minting a second one.
+    /// What each `@idempotencyToken` has already created, so replaying a token returns
+    /// the first resource instead of minting a second one, and reusing it for another
+    /// request is refused.
     ///
     /// An entry is dropped when the resource it names leaves the store, which is what
     /// keeps this map bounded by the live records.
-    pub idempotency: BTreeMap<(IdempotentResource, String), String>,
+    pub idempotency: BTreeMap<(IdempotentResource, String), IdempotencyRecord>,
     /// The counter template ids are minted from, so two calls never share an id.
     pub template_seq: u64,
     /// The counter experiment ids are minted from.
@@ -827,27 +966,67 @@ impl ComAmazonawsFisFaultinjectionsimulatorState {
         format_id(EXPERIMENT_ID_PREFIX, self.experiment_seq)
     }
 
-    /// The resource `token` already created for `resource`, when it is still in the store.
-    pub fn replayed(&self, resource: IdempotentResource, token: &str) -> Option<&String> {
-        let id = self.idempotency.get(&(resource, token.to_string()))?;
-        let live = match resource {
-            IdempotentResource::ExperimentTemplate => self.experiment_templates.contains_key(id),
-            IdempotentResource::Experiment => self.experiments.contains_key(id),
+    /// What `token` says about a request whose canonical rendering is `request`.
+    ///
+    /// A token whose resource has since left the store is [`TokenReplay::Fresh`]: there
+    /// is nothing left to report, so the token may create again.
+    pub fn replayed(
+        &self,
+        resource: IdempotentResource,
+        token: &str,
+        request: &str,
+    ) -> TokenReplay {
+        let Some(record) = self.idempotency.get(&(resource, token.to_string())) else {
+            return TokenReplay::Fresh;
         };
-        live.then_some(id)
+        let live = match resource {
+            IdempotentResource::ExperimentTemplate => {
+                self.experiment_templates.contains_key(&record.id)
+            }
+            IdempotentResource::Experiment => self.experiments.contains_key(&record.id),
+        };
+        if !live {
+            return TokenReplay::Fresh;
+        }
+        if record.request != request {
+            return TokenReplay::Mismatch;
+        }
+        TokenReplay::Replay(record.id.clone())
     }
 
-    /// Record that `token` created `id`.
-    pub fn remember_token(&mut self, resource: IdempotentResource, token: &str, id: &str) {
-        self.idempotency
-            .insert((resource, token.to_string()), id.to_string());
+    /// Record that `token`, carrying the request `request`, created `id`.
+    pub fn remember_token(
+        &mut self,
+        resource: IdempotentResource,
+        token: &str,
+        id: &str,
+        request: &str,
+    ) {
+        self.idempotency.insert(
+            (resource, token.to_string()),
+            IdempotencyRecord {
+                id: id.to_string(),
+                request: request.to_string(),
+            },
+        );
     }
 
     /// Drop every idempotency entry that names `id`, so the map does not outlive the
     /// records it points at.
     pub fn forget_tokens_for(&mut self, resource: IdempotentResource, id: &str) {
         self.idempotency
-            .retain(|(kind, _), created| *kind != resource || created != id);
+            .retain(|(kind, _), created| *kind != resource || created.id != id);
+    }
+
+    /// How many experiments still occupy an active slot at `now`.
+    ///
+    /// Call it on a SETTLED store ([`settle_experiments`](Self::settle_experiments)), so
+    /// an experiment whose run has already elapsed does not hold a slot nobody is using.
+    pub fn active_experiments(&self) -> usize {
+        self.experiments
+            .values()
+            .filter(|record| record.status.is_active())
+            .count()
     }
 
     /// The experiment `id` names, with every transition the clock already owes at `now`
@@ -1311,9 +1490,39 @@ pub fn action_not_found(id: &str) -> ResourceNotFoundException {
 }
 
 /// The `ResourceNotFoundException` payload for an experiment id that names no record.
+///
+/// This one FIS builds from the request: the message names the id that was looked up.
 pub fn experiment_not_found(id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!("No experiment found with id {id}")),
+        message: Some(format!("Experiment with ID {id} not found.")),
+    }
+}
+
+/// The `ConflictException` payload for an `@idempotencyToken` replayed with a request that
+/// is not the one it created its resource from.
+pub fn token_conflict(token: &str) -> ConflictException {
+    ConflictException {
+        message: Some(format!(
+            "clientToken {token} is not assigned to this resource."
+        )),
+    }
+}
+
+/// The `ValidationException` payload for a call that would move an experiment already in
+/// a final state. Built from the request: the message names the experiment.
+pub fn final_state_refusal(id: &str) -> ValidationException {
+    invalid_input(format!(
+        "Cannot modify the state of an experiment in final state: {id}."
+    ))
+}
+
+/// The `ServiceQuotaExceededException` payload for a `StartExperiment` that would push the
+/// account past the published active-experiments quota.
+pub fn active_quota_exceeded() -> ServiceQuotaExceededException {
+    ServiceQuotaExceededException {
+        message: Some(format!(
+            "The number of active experiments cannot exceed {MAX_ACTIVE_EXPERIMENTS}."
+        )),
     }
 }
 
@@ -1370,6 +1579,406 @@ pub fn store_full(resource: &str, limit: usize) -> ServiceQuotaExceededException
             "this emulator already holds the maximum of {limit} {resource} records"
         )),
     }
+}
+
+/// Why a `duration` an `aws:fis:wait` action carries is not one FIS would accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitDurationProblem {
+    /// The value is not an ISO 8601 duration, or names a span whose length is not fixed
+    /// (a year or a month).
+    NotADuration,
+    /// The value is a duration, but outside the documented 1..720 minutes.
+    OutOfRange,
+}
+
+/// The wait an `aws:fis:wait` action's `duration` parameter names.
+///
+/// "duration — The duration of the wait" is given in ISO 8601 format and its documented
+/// range is [`WAIT_DURATION_MIN_MINUTES`]..=[`WAIT_DURATION_MAX_MINUTES`] minutes, so a
+/// value outside that bound is not a wait this service accepts. A duration whose length
+/// depends on the calendar (a year or a month designator) names no fixed span and is
+/// refused as malformed rather than guessed at.
+pub fn wait_duration(value: &str) -> Result<Duration, WaitDurationProblem> {
+    let parsed = ::iso8601_duration::Duration::parse(value)
+        .map_err(|_| WaitDurationProblem::NotADuration)?;
+    if parsed.year != 0.0 || parsed.month != 0.0 {
+        return Err(WaitDurationProblem::NotADuration);
+    }
+    let seconds = f64::from(parsed.day) * 86_400.0
+        + f64::from(parsed.hour) * 3_600.0
+        + f64::from(parsed.minute) * 60.0
+        + f64::from(parsed.second);
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err(WaitDurationProblem::NotADuration);
+    }
+    let minutes = seconds / 60.0;
+    #[allow(clippy::cast_precision_loss)]
+    if minutes < WAIT_DURATION_MIN_MINUTES as f64 || minutes > WAIT_DURATION_MAX_MINUTES as f64 {
+        return Err(WaitDurationProblem::OutOfRange);
+    }
+    Ok(Duration::from_secs_f64(seconds))
+}
+
+/// `None` when every action a `CreateExperimentTemplate` request carries satisfies what
+/// FIS documents for it; otherwise the `ValidationException` that refuses the request.
+///
+/// The rule this enforces is the built-in `aws:fis:wait` action's: it takes a required
+/// `duration` parameter, an ISO 8601 duration within the documented 1 to 720 minutes. An
+/// action id FIS defines elsewhere carries its own parameter catalog, which this service
+/// does not hold, so its parameters are stored as sent. The other rule here is on the
+/// graph: `startAfter` is "the name of the action that must be completed before the
+/// current action starts", so it names an action the same template declares.
+pub fn actions_refusal(
+    actions: &HashMap<String, CreateExperimentTemplateActionInput>,
+) -> Option<ValidationException> {
+    // The map's iteration order is not stable, so the refusal is taken over the action
+    // names in order: one request always earns the same message. The entries are sorted
+    // as PAIRS, so no path through this function can turn a lookup miss into an
+    // acceptance.
+    let mut entries: Vec<(&String, &CreateExperimentTemplateActionInput)> =
+        actions.iter().collect();
+    entries.sort_by_key(|(name, _)| *name);
+    for (name, action) in entries {
+        if action
+            .start_after
+            .iter()
+            .flatten()
+            .any(|earlier| !actions.contains_key(earlier))
+        {
+            return Some(invalid_input(format!(
+                "actions.{name}.startAfter must name actions the template declares."
+            )));
+        }
+        if action.action_id != WAIT_ACTION_ID {
+            continue;
+        }
+        let duration = action
+            .parameters
+            .as_ref()
+            .and_then(|parameters| parameters.get(WAIT_DURATION_PARAMETER));
+        let Some(duration) = duration else {
+            return Some(invalid_input(format!(
+                "actions.{name}.parameters must carry '{WAIT_DURATION_PARAMETER}' \
+                 for action {WAIT_ACTION_ID}."
+            )));
+        };
+        match wait_duration(duration) {
+            Ok(_) => {}
+            Err(WaitDurationProblem::OutOfRange) => {
+                return Some(invalid_input(format!(
+                    "'{WAIT_DURATION_PARAMETER}' must be within a range of \
+                     {WAIT_DURATION_MIN_MINUTES} to {WAIT_DURATION_MAX_MINUTES} minutes."
+                )))
+            }
+            Err(WaitDurationProblem::NotADuration) => {
+                return Some(invalid_input(format!(
+                    "actions.{name}.parameters.'{WAIT_DURATION_PARAMETER}' must be a \
+                     duration in ISO 8601 format."
+                )))
+            }
+        }
+    }
+    None
+}
+
+/// `None` when a request carries no more actions than one template may hold; otherwise the
+/// `ServiceQuotaExceededException` that refuses it.
+///
+/// See [`MAX_ACTIONS_PER_TEMPLATE`]: the cap is a published quota, and it is also what
+/// keeps the per-request cost of [`run_plan`] proportional to the request rather than to
+/// its square.
+pub fn actions_quota_refusal(
+    actions: &HashMap<String, CreateExperimentTemplateActionInput>,
+) -> Option<ServiceQuotaExceededException> {
+    if actions.len() <= MAX_ACTIONS_PER_TEMPLATE {
+        return None;
+    }
+    Some(ServiceQuotaExceededException {
+        message: Some(format!(
+            "The number of actions in an experiment template cannot exceed \
+             {MAX_ACTIONS_PER_TEMPLATE}."
+        )),
+    })
+}
+
+/// How long an experiment's actions take once it is `running`, and what the run ends as.
+///
+/// FIS starts an action as soon as every action its `startAfter` names has finished, so a
+/// run lasts as long as the longest path through that graph. The only action this emulator
+/// can carry out is [`WAIT_ACTION_ID`], whose whole effect is elapsed time: an experiment
+/// built from waits runs for that path and then completes. Any other action injects a
+/// fault into another service, which this emulator does not do — the experiment it belongs
+/// to ends in the modelled `failed` state with a reason naming those actions, and claims
+/// no duration for work nothing performed.
+///
+/// The span is never zero: a caller polling straight after `StartExperiment` observes
+/// `initiating` and then `running`, exactly as it would against the real service.
+pub fn run_plan(actions: &HashMap<String, ExperimentTemplateAction>) -> (Duration, ExperimentOutcome) {
+    let mut unperformable: Vec<&str> = actions
+        .values()
+        .filter_map(|action| action.action_id.as_deref())
+        .filter(|action_id| *action_id != WAIT_ACTION_ID)
+        .collect();
+    unperformable.sort_unstable();
+    unperformable.dedup();
+
+    if unperformable.is_empty() {
+        (
+            critical_path(actions).max(TRANSITION_DELAY),
+            ExperimentOutcome::Completed,
+        )
+    } else {
+        (
+            TRANSITION_DELAY,
+            ExperimentOutcome::Failed(format!(
+                "This emulator does not inject faults, so the experiment's \
+                 {} action could not be run",
+                unperformable.join(", ")
+            )),
+        )
+    }
+}
+
+/// The longest path through `actions`, where each action's own length is the wait it
+/// performs and every other action is instantaneous.
+///
+/// Walked ONCE per action, with each action's finish offset memoised and its own span
+/// parsed exactly once up front, so the whole computation costs O(actions + `startAfter`
+/// entries) — linear in the request, never in its square. The number of actions is capped
+/// at [`MAX_ACTIONS_PER_TEMPLATE`] when the template is created, which also bounds the
+/// recursion depth here; a `startAfter` cycle, which FIS refuses but which a record could
+/// still carry, is broken at the back edge rather than recursing forever.
+fn critical_path(actions: &HashMap<String, ExperimentTemplateAction>) -> Duration {
+    // Parsed once per action, outside the walk.
+    let spans: HashMap<&str, Duration> = actions
+        .iter()
+        .map(|(name, action)| (name.as_str(), action_span(action)))
+        .collect();
+    let mut finish: HashMap<&str, Duration> = HashMap::with_capacity(actions.len());
+    let mut longest = Duration::ZERO;
+    for name in actions.keys() {
+        let mut walking: Vec<&str> = Vec::new();
+        let offset = finish_offset(name.as_str(), actions, &spans, &mut finish, &mut walking);
+        longest = longest.max(offset);
+    }
+    longest
+}
+
+/// When `name` finishes, measured from the start of the run: the latest finish of the
+/// actions its `startAfter` names, plus its own span.
+///
+/// `finish` memoises the answer for every action already resolved, and `walking` holds the
+/// chain currently being resolved so a cycle is answered as "no dependency" instead of
+/// recursing. See [`critical_path`] for the cost this keeps.
+fn finish_offset<'a>(
+    name: &'a str,
+    actions: &'a HashMap<String, ExperimentTemplateAction>,
+    spans: &HashMap<&'a str, Duration>,
+    finish: &mut HashMap<&'a str, Duration>,
+    walking: &mut Vec<&'a str>,
+) -> Duration {
+    if let Some(known) = finish.get(name) {
+        return *known;
+    }
+    if walking.contains(&name) {
+        return Duration::ZERO;
+    }
+    walking.push(name);
+    let mut start = Duration::ZERO;
+    if let Some(action) = actions.get(name) {
+        for earlier in action.start_after.iter().flatten() {
+            // `startAfter` names an action the template declares (`actions_refusal`); a
+            // name the map does not hold contributes nothing rather than a guess.
+            if let Some((key, _)) = actions.get_key_value(earlier.as_str()) {
+                start = start.max(finish_offset(key.as_str(), actions, spans, finish, walking));
+            }
+        }
+    }
+    walking.pop();
+    let total = start + spans.get(name).copied().unwrap_or(Duration::ZERO);
+    finish.insert(name, total);
+    total
+}
+
+/// How long one action takes: the wait it was asked for, or nothing at all for an action
+/// this emulator does not perform.
+///
+/// A stored wait went through [`actions_refusal`] at create time, so its duration parses;
+/// one that somehow does not contributes nothing rather than a made-up span.
+fn action_span(action: &ExperimentTemplateAction) -> Duration {
+    if action.action_id.as_deref() != Some(WAIT_ACTION_ID) {
+        return Duration::ZERO;
+    }
+    action
+        .parameters
+        .as_ref()
+        .and_then(|parameters| parameters.get(WAIT_DURATION_PARAMETER))
+        .and_then(|duration| wait_duration(duration).ok())
+        .unwrap_or(Duration::ZERO)
+}
+
+/// `None` when this emulator has no reason to think FIS could not assume `role_arn`;
+/// otherwise the `ValidationException` that refuses the call.
+///
+/// FIS runs an experiment under the template's execution role, so it checks up front that
+/// the role's trust policy lets `fis.amazonaws.com` assume it and refuses the start when
+/// it does not. The role is resolved against the account's IAM records — the same records
+/// `CreateRole` wrote — by its ARN. An ARN the IAM store holds no role for is NOT evidence
+/// of a missing trust (the role may belong to another account, or to a client that never
+/// told this emulator about it), so the start goes ahead; only a role this emulator holds
+/// and whose trust policy withholds the grant is refused.
+pub fn role_trust_refusal(role_arn: &str, iam: &IamState) -> Option<ValidationException> {
+    let role = iam.roles.values().find(|role| role.arn == role_arn)?;
+    let document = role.assume_role_policy_document.as_deref()?;
+    match policy_grants_service(document, FIS_SERVICE_PRINCIPAL) {
+        // A document this emulator cannot read as a policy is no evidence either way.
+        None | Some(true) => None,
+        Some(false) => Some(invalid_input(format!(
+            "Unable to assume role {role_arn}. Check the trust policy grants access to \
+             '{FIS_SERVICE_PRINCIPAL}'"
+        ))),
+    }
+}
+
+/// Whether `document` — an IAM trust policy — lets the service principal `principal`
+/// assume the role, or `None` when it is not a policy this can be read out of.
+///
+/// The rule itself is IAM's, not this service's, so it is read through the ONE evaluator
+/// every service that resolves a caller-supplied execution role shares
+/// (`service_common::iam_trust_policy`): the statement must name the principal and the
+/// assume-role action, an explicit `Deny` wins over any `Allow`, and the document is
+/// percent-decoded before it is parsed. What to do when it cannot be read as a policy is
+/// this service's own choice, which [`role_trust_refusal`] makes.
+fn policy_grants_service(document: &str, principal: &str) -> Option<bool> {
+    ::service_common::iam_trust_policy::admits_service_principal(document, principal)
+}
+
+/// `map` as an ordered rendering of its entries, or `null` when it is absent.
+///
+/// Every map that goes into a fingerprint goes through here. A `HashMap`'s iteration order
+/// is NOT stable — two maps holding the same entries can walk them in different orders —
+/// and `serde_json`'s object type preserves insertion order verbatim in any build that
+/// resolves the crate's `preserve_order` feature, so an unsorted map would render one
+/// request two ways and make a retry look like a different request. Sorting the entries
+/// here is what makes the rendering canonical under EITHER object type.
+fn ordered_entries(map: Option<&HashMap<String, String>>) -> ::serde_json::Value {
+    match map {
+        Some(map) => {
+            let ordered: BTreeMap<&str, &str> = map
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect();
+            ::serde_json::json!(ordered)
+        }
+        None => ::serde_json::Value::Null,
+    }
+}
+
+/// The canonical rendering of the `StartExperiment` request a `clientToken` belongs to.
+///
+/// Every member of the request that chooses what gets started, and nothing else: two
+/// requests with the same rendering start the same experiment, so one is a retry of the
+/// other. Every map is rendered in key order (see [`ordered_entries`]), so a map's
+/// iteration order cannot make one request look like two.
+pub fn start_experiment_fingerprint(input: &StartExperimentInput) -> String {
+    ::serde_json::json!({
+        "experimentTemplateId": input.experiment_template_id,
+        "actionsMode": input
+            .experiment_options
+            .as_ref()
+            .and_then(|options| options.actions_mode.clone()),
+        "tags": ordered_entries(input.tags.as_ref()),
+    })
+    .to_string()
+}
+
+/// The canonical rendering of the `CreateExperimentTemplate` request a `clientToken`
+/// belongs to, taken from the record that request builds.
+///
+/// Rendered from the RECORD rather than the request so every member the service persists
+/// is covered, including the defaults it filled in; the minted id, the ARN and the
+/// timestamps are left out because they are what the call produces rather than what it
+/// asked for. See [`start_experiment_fingerprint`] for why the rendering is JSON.
+pub fn template_fingerprint(record: &ExperimentTemplateRecord) -> String {
+    ::serde_json::json!({
+        "description": record.description,
+        "roleArn": record.role_arn,
+        "tags": ordered_entries(Some(&record.tags)),
+        "stopConditions": record
+            .stop_conditions
+            .iter()
+            .map(|condition| ::serde_json::json!({
+                "source": condition.source,
+                "value": condition.value,
+            }))
+            .collect::<Vec<_>>(),
+        "targets": record
+            .targets
+            .iter()
+            .map(|(name, target)| (name.as_str(), ::serde_json::json!({
+                "resourceType": target.resource_type,
+                "resourceArns": target.resource_arns,
+                "resourceTags": ordered_entries(target.resource_tags.as_ref()),
+                "selectionMode": target.selection_mode,
+                "parameters": ordered_entries(target.parameters.as_ref()),
+                "filters": target.filters.as_ref().map(|filters| filters
+                    .iter()
+                    .map(|filter| ::serde_json::json!({
+                        "path": filter.path,
+                        "values": filter.values,
+                    }))
+                    .collect::<Vec<_>>()),
+            })))
+            .collect::<BTreeMap<&str, ::serde_json::Value>>(),
+        "actions": record
+            .actions
+            .iter()
+            .map(|(name, action)| (name.as_str(), ::serde_json::json!({
+                "actionId": action.action_id,
+                "description": action.description,
+                "parameters": ordered_entries(action.parameters.as_ref()),
+                "targets": ordered_entries(action.targets.as_ref()),
+                "startAfter": action.start_after,
+            })))
+            .collect::<BTreeMap<&str, ::serde_json::Value>>(),
+        "logConfiguration": record.log_configuration.as_ref().map(|logs| ::serde_json::json!({
+            "logSchemaVersion": logs.log_schema_version,
+            "cloudWatchLogsConfiguration": logs
+                .cloud_watch_logs_configuration
+                .as_ref()
+                .map(|configuration| configuration.log_group_arn.clone()),
+            "s3Configuration": logs.s3_configuration.as_ref().map(|s3| ::serde_json::json!({
+                "bucketName": s3.bucket_name,
+                "prefix": s3.prefix,
+            })),
+        })),
+        "experimentOptions": {
+            "accountTargeting": record.experiment_options.account_targeting,
+            "emptyTargetResolutionMode": record.experiment_options.empty_target_resolution_mode,
+        },
+        "experimentReportConfiguration": record
+            .experiment_report_configuration
+            .as_ref()
+            .map(|report| ::serde_json::json!({
+                "preExperimentDuration": report.pre_experiment_duration,
+                "postExperimentDuration": report.post_experiment_duration,
+                "outputs": report.outputs.as_ref().and_then(|outputs| outputs
+                    .s3_configuration
+                    .as_ref()
+                    .map(|s3| ::serde_json::json!({
+                        "bucketName": s3.bucket_name,
+                        "prefix": s3.prefix,
+                    }))),
+                "dataSources": report.data_sources.as_ref().and_then(|sources| sources
+                    .cloud_watch_dashboards
+                    .as_ref()
+                    .map(|dashboards| dashboards
+                        .iter()
+                        .map(|dashboard| dashboard.dashboard_identifier.clone())
+                        .collect::<Vec<_>>())),
+            })),
+    })
+    .to_string()
 }
 
 /// The experiment options a template carries: what the request named, with FIS's
@@ -2106,4 +2715,16 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsFisFaultinjectionsimulatorState>)
+}
+
+/// The IAM store in the SAME shared engine, which is where the account's roles live.
+///
+/// This is the IAM service's OWN accessor, called rather than copied, so FIS reads the
+/// very store that service's handlers write. `None` has the same meaning as for
+/// [`service_state`]: the engine carries no such store, which a handler reports as a
+/// server fault.
+pub fn iam_state<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<IamState>> {
+    ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::service_state(engine)
 }

@@ -42,7 +42,8 @@
 //!   filter terms per record, and stores only the one page of ids it selected; no later
 //!   call re-runs that match, so no request's cost grows with the number of stored
 //!   queries. `ListJobTemplates` orders the job templates the same way and pages them the
-//!   same way.
+//!   same way, and `ListQueues` orders and pages the queues through [`page_of_queues`],
+//!   over at most [`MAX_QUEUES`] records.
 //!
 //! # No panic on caller-supplied input
 //!
@@ -206,6 +207,19 @@ pub const DEFAULT_CONCURRENT_JOBS: i32 = 200;
 /// bottom of the member's range, and zero is what the recorded corpus shows for a queue
 /// whose request omitted it.
 pub const DEFAULT_MAXIMUM_CONCURRENT_FEEDS: i32 = 0;
+
+/// The region-wide ceiling `ListQueues$TotalConcurrentJobs` reports: "The maximum number
+/// of jobs that MediaConvert can process at one time, across all of your on-demand queues
+/// in the current AWS Region."
+///
+/// A CHOSEN account quota, as [`MAX_QUEUES`] is: the model declares no value for it, and
+/// it is a DIFFERENT quota from the per-queue one [`DEFAULT_CONCURRENT_JOBS`] comes from
+/// (`CreateQueue$ConcurrentJobs`: "constrained by your service quotas for Maximum
+/// concurrent jobs, per on-demand queue"). It is deliberately above that per-queue value
+/// so the built-in `Default` queue's allocation leaves the account headroom to allocate,
+/// which is what `UnallocatedConcurrentJobs` reports (see
+/// [`ComAmazonawsMediaconvertMediaconvertState::concurrency_allocation`]).
+pub const TOTAL_CONCURRENT_JOBS: i32 = 1_000;
 
 /// `ReservationPlanStatus` values (`smithy_query(query="shape",shape="ReservationPlanStatus")`).
 pub const RESERVATION_PLAN_STATUS_ACTIVE: &str = "ACTIVE";
@@ -709,6 +723,18 @@ impl QueueRecord {
             r#type: Some(self.queue_type.clone()),
         }
     }
+
+    /// The pair a paged listing orders this queue on: its creation instant and its name,
+    /// which is unique within the account ("Each name must be unique within your
+    /// account"), so the pair is a total order.
+    pub fn ordering_key(&self) -> (u128, &str) {
+        (epoch_nanos(self.created_at), self.name.as_str())
+    }
+
+    /// This queue's [`encode_cursor`] token.
+    pub fn cursor(&self) -> String {
+        encode_cursor(self.created_at, &self.name)
+    }
 }
 
 /// One output preset, exactly as `CreatePreset` persisted it.
@@ -1200,6 +1226,115 @@ pub fn page_of_jobs<'a>(
         .flatten();
     JobPage {
         jobs: page.to_vec(),
+        next_token,
+    }
+}
+
+/// Which key a queue listing is ordered on, as `listBy` chooses it. `QueueListBy`'s doc:
+/// "you can choose to list them alphabetically by NAME or chronologically by
+/// CREATION_DATE. If you don't specify, the service will list them by creation date."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueSortKey {
+    /// Alphabetically by `Name`. Names are unique within the account, so this key alone
+    /// is a total order.
+    Name,
+    /// Chronologically by `CreatedAt`, with the name breaking ties.
+    CreationDate,
+}
+
+impl QueueSortKey {
+    /// The key the `listBy` a request carried names, or the documented default
+    /// ([`LIST_BY_CREATION_DATE`]) when it carried none. `QueueListBy` declares only the
+    /// two values, and the boundary validator has already refused anything else, so a
+    /// value that is not [`LIST_BY_NAME`] is the creation-date key.
+    pub fn from_list_by(list_by: Option<&str>) -> Self {
+        if list_by.unwrap_or(LIST_BY_CREATION_DATE) == LIST_BY_NAME {
+            Self::Name
+        } else {
+            Self::CreationDate
+        }
+    }
+
+    /// Where one queue's [`QueueRecord::ordering_key`] falls against another's on this
+    /// key.
+    fn compare(self, left: (u128, &str), right: (u128, &str)) -> ::std::cmp::Ordering {
+        match self {
+            Self::Name => left.1.cmp(right.1),
+            Self::CreationDate => left.0.cmp(&right.0).then_with(|| left.1.cmp(right.1)),
+        }
+    }
+}
+
+/// One page of queues and the cursor that resumes after it.
+#[derive(Debug)]
+pub struct QueuePage<'a> {
+    pub queues: Vec<&'a QueueRecord>,
+    /// The [`encode_cursor`] token of the last queue of the page, and only when a further
+    /// page exists.
+    pub next_token: Option<String>,
+}
+
+/// The page of `queues` `ListQueues` reports, ordered on the key `list_by` names in the
+/// direction `order` names.
+///
+/// The queue listing's own [`page_of_jobs`]: ONE place that owns the ordering, the cursor
+/// and the page size, so a later paged queue reader cannot drift from this one. A queue
+/// listing runs UP its key — alphabetically from the start of the alphabet,
+/// chronologically from the oldest, which is the account's built-in `Default` queue —
+/// unless the caller asks for [`ORDER_DESCENDING`]; `Order`'s doc says only "Default
+/// varies by resource".
+///
+/// `resume_from` is the ordering key a caller's `nextToken` decoded to; a token that
+/// decodes to nothing is refused by the handler that read it, with its modelled
+/// `BadRequestException`, so there is no failure left to answer here.
+pub fn page_of_queues<'a>(
+    queues: impl Iterator<Item = &'a QueueRecord>,
+    list_by: Option<&str>,
+    order: Option<&str>,
+    resume_from: Option<&(u128, String)>,
+    max_results: Option<i32>,
+) -> QueuePage<'a> {
+    let sort_key = QueueSortKey::from_list_by(list_by);
+    let mut matching: Vec<&QueueRecord> = queues.collect();
+    matching.sort_by(|left, right| sort_key.compare(left.ordering_key(), right.ordering_key()));
+    let ascending = order.unwrap_or(ORDER_ASCENDING) != ORDER_DESCENDING;
+    if !ascending {
+        matching.reverse();
+    }
+
+    let start = match resume_from {
+        None => 0,
+        Some((nanos, name)) => {
+            let anchor = (*nanos, name.as_str());
+            // Resume at the first queue strictly past the anchor key in this direction.
+            // The anchor itself need not still be stored, so a queue deleted between two
+            // pages is skipped rather than failing the token.
+            matching
+                .iter()
+                .position(|queue| {
+                    let side = sort_key.compare(queue.ordering_key(), anchor);
+                    if ascending {
+                        side == ::std::cmp::Ordering::Greater
+                    } else {
+                        side == ::std::cmp::Ordering::Less
+                    }
+                })
+                .unwrap_or(matching.len())
+        }
+    };
+
+    // `maxResults` carries the model's own 1..20 range, so the framework has already
+    // refused anything outside it; the fallback only covers the absent case.
+    let page_size = usize::try_from(max_results.unwrap_or(DEFAULT_PAGE_SIZE))
+        .unwrap_or(DEFAULT_PAGE_SIZE as usize);
+    let page = &matching[start.min(matching.len())..];
+    let page = &page[..page_size.min(page.len())];
+    // A token only when there is a further page to fetch.
+    let next_token = (start + page.len() < matching.len())
+        .then(|| page.last().map(|queue| queue.cursor()))
+        .flatten();
+    QueuePage {
+        queues: page.to_vec(),
         next_token,
     }
 }
@@ -1856,6 +1991,33 @@ impl ComAmazonawsMediaconvertMediaconvertState {
             }
         }
         (submitted, progressing)
+    }
+
+    /// `(TotalConcurrentJobs, UnallocatedConcurrentJobs)` as `ListQueues` reports them:
+    /// the region-wide ceiling [`TOTAL_CONCURRENT_JOBS`], and how much of it no queue
+    /// holds.
+    ///
+    /// `UnallocatedConcurrentJobs`: "The remaining number of concurrent jobs that are not
+    /// associated with a queue and are available to allocate to a queue" — so it is the
+    /// ceiling less what the stored queues have allocated, derived on every read rather
+    /// than stored so it cannot drift from `queues`. Only `ON_DEMAND` queues count,
+    /// because the ceiling itself is "across all of your on-demand queues": a `RESERVED`
+    /// queue's slots are bought by its reservation plan, not taken from this pool. Summed
+    /// in `i64` and clamped into the ceiling, so an account whose queues have allocated
+    /// more than the pool reports nothing left to allocate rather than a negative count.
+    pub fn concurrency_allocation(&self) -> (i32, i32) {
+        let allocated: i64 = self
+            .queues
+            .values()
+            .filter(|queue| queue.pricing_plan == PRICING_PLAN_ON_DEMAND)
+            .map(|queue| i64::from(queue.concurrent_jobs))
+            .sum();
+        let ceiling = i64::from(TOTAL_CONCURRENT_JOBS);
+        let unallocated = (ceiling - allocated).clamp(0, ceiling);
+        (
+            TOTAL_CONCURRENT_JOBS,
+            i32::try_from(unallocated).unwrap_or(0),
+        )
     }
 }
 

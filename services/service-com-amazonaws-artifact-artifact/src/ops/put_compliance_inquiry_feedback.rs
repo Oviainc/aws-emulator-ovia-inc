@@ -1,15 +1,37 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutComplianceInquiryFeedback
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutComplianceInquiryFeedback`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Records the caller's rating of a compliance inquiry's response and answers the instant
+//! the feedback was submitted.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutComplianceInquiryFeedback::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Three rules shape the handler:
+//!
+//! * it writes onto a PERSISTED inquiry: an id the store does not hold names no inquiry
+//!   this account may give feedback on, which the front door answers with its 401 — the
+//!   same refusal `GetComplianceInquiryMetadata` and `ExportComplianceInquiry` give for
+//!   that id, rather than a 404 confirming the resource's absence;
+//! * `queryIdentifier` names WHICH of the inquiry's queries the feedback is on, so an
+//!   identifier that names no query of that inquiry is refused with the modelled
+//!   `ValidationException` naming the member and the requirement it failed — the same
+//!   refusal `ExportComplianceInquiry` gives its own `queryIdentifiers`; naming none
+//!   records the feedback on the inquiry's response as a whole. A `Put` REPLACES the
+//!   feedback the inquiry already held for that key, which is what makes the stored record
+//!   the caller's current rating rather than an append-only log;
+//! * `clientToken` is this operation's `@idempotencyToken`: "If this token matches a
+//!   previous request, the service ignores the request, but does not return an error" — so
+//!   a repeat of one request records nothing further and answers the `submittedAt` the
+//!   first call answered, while the same token on a DIFFERENT request is refused with the
+//!   modelled `ConflictException`, exactly as `CreateComplianceInquiry` refuses it.
+//!
+//! `responseRevisionId` ("use this value to prevent submitting feedback on a stale
+//!  response") is persisted with the feedback and absorbed into what the token identifies,
+//! but nothing is refused on it: no response and no edit to one is ever generated here (see
+//! [`crate::state::InquiryQuery::response`]), so there is no stored revision a request's
+//! value could be stale against, and a staleness refusal would be a comparison against a
+//! revision nothing produced.
+//!
+//! What the call records is observable: the document `ExportComplianceInquiry` renders
+//! reports the feedback held for the queries it covers.
 //!
 //! ## Shape of an operation
 //!
@@ -162,20 +184,166 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutComplianceInquiryFeedback` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutComplianceInquiryFeedbackErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutComplianceInquiryFeedback"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                PutComplianceInquiryFeedbackErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the artifact compliance inquiry store is unavailable".to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+
+        // "The reason codes that describe why you rated the response": ascending and
+        // without repeats, because which reasons were given is a SET — neither the order
+        // the request listed them in nor a repeat is part of it. The same treatment
+        // `ExportComplianceInquiry` gives its `queryIdentifiers`.
+        let mut reason_codes = input.reason_codes.clone().unwrap_or_default();
+        reason_codes.sort_unstable();
+        reason_codes.dedup();
+
+        // What this request's `clientToken` identifies: every member that shapes the
+        // feedback recorded, so a token replayed on a different request can be told from a
+        // retry of the same one.
+        let fingerprint = request_fingerprint(&input, &reason_codes);
+
+        let mut store = state.lock();
+
+        // Read before the inquiry is borrowed for the write; WHICH refusal the caller sees
+        // is decided below, in the order the service decides it: the target first, then the
+        // token.
+        let remembered = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.inquiry_feedback_tokens.get(token).cloned());
+
+        let Some(inquiry) = store.inquiries.get_mut(&input.compliance_inquiry_id) else {
+            // Authorization of the targeted inquiry precedes the state lookup as far as a
+            // caller can tell: a well-formed id this account holds no inquiry for names no
+            // inquiry it may rate, so the front door's refusal is what it sees — not the
+            // modelled 404, which would confirm the resource's absence.
+            return Err(crate::scaffolded::Scaffolded::unauthorized());
+        };
+
+        // The only clock-owed write: the transition this inquiry was already due.
+        inquiry.materialise(now);
+
+        if let Some(record) = remembered {
+            if record.fingerprint != fingerprint {
+                ::tracing::info!(
+                    operation = "PutComplianceInquiryFeedback",
+                    compliance_inquiry_id = %input.compliance_inquiry_id,
+                    outcome = "refused",
+                    reason = "the clientToken was replayed on a different request",
+                    "refused a compliance inquiry feedback submission"
+                );
+                return Err(PutComplianceInquiryFeedbackErrorModeled::ConflictException(
+                    crate::state::feedback_token_mismatch(&record.inquiry_id),
+                )
+                .into());
+            }
+            // "If this token matches a previous request, the service ignores the request,
+            // but does not return an error": nothing further is recorded and the answer is
+            // the one the first call gave, read off the remembered record.
+            return Ok(PutComplianceInquiryFeedbackOutput {
+                submitted_at: ::aws_smithy_types::DateTime::from(record.submitted_at),
+            });
+        }
+
+        // "The sequential identifier of the query to provide feedback on": a query of THIS
+        // inquiry, so an identifier it does not own is refused with the modelled
+        // `ValidationException` naming the member.
+        if let Some(identifier) = input.query_identifier {
+            if !inquiry
+                .queries
+                .iter()
+                .any(|query| query.identifier == identifier)
+            {
+                ::tracing::info!(
+                    operation = "PutComplianceInquiryFeedback",
+                    compliance_inquiry_id = %input.compliance_inquiry_id,
+                    outcome = "refused",
+                    reason = "queryIdentifier names a query the inquiry does not own",
+                    "refused a compliance inquiry feedback submission"
+                );
+                return Err(PutComplianceInquiryFeedbackErrorModeled::ValidationException(
+                    crate::state::unknown_query_identifiers("queryIdentifier"),
+                )
+                .into());
+            }
+        }
+
+        // A `Put`: the feedback held for this query — or for the inquiry as a whole, when
+        // the request named no query — is REPLACED, so the record is the caller's current
+        // rating of that response.
+        let reason_code_count = reason_codes.len();
+        inquiry.feedback.insert(
+            input.query_identifier,
+            crate::state::InquiryFeedback {
+                query_identifier: input.query_identifier,
+                rating: input.rating.clone(),
+                reason_codes,
+                comment: input.comment.clone(),
+                response_revision_id: input.response_revision_id,
+                submitted_at: now,
+            },
+        );
+
+        if let Some(token) = input.client_token {
+            store.record_inquiry_feedback_token(
+                token,
+                &input.compliance_inquiry_id,
+                &fingerprint,
+                now,
+            );
+        }
+
+        // Attributable: the inquiry rated, which query, and how. NEVER the `comment` —
+        // `@sensitive` in the model — nor the inquiry's name, content or queries.
+        ::tracing::info!(
+            operation = "PutComplianceInquiryFeedback",
+            compliance_inquiry_id = %input.compliance_inquiry_id,
+            query_identifier = input.query_identifier,
+            rating = %input.rating,
+            reason_code_count,
+            outcome = "recorded",
+            "recorded feedback on a compliance inquiry"
+        );
+
+        Ok(PutComplianceInquiryFeedbackOutput {
+            // "The timestamp when the feedback was submitted" — the instant the record
+            // above carries, so the answer and the stored feedback cannot disagree.
+            submitted_at: ::aws_smithy_types::DateTime::from(now),
+        })
     }
+}
+
+/// A fingerprint of the feedback submission this request carries, so a replayed
+/// `clientToken` can be told from a token reused on a different submission.
+///
+/// Every member that shapes the recorded feedback is absorbed into the shared
+/// [`crate::state::RequestFingerprint`], which labels and length-prefixes each one so no
+/// two different requests can produce the same digest by splitting their fields
+/// differently. The reason codes are absorbed in the normalised order the record stores
+/// them in, because their wire order is not part of the request.
+fn request_fingerprint(
+    input: &PutComplianceInquiryFeedbackInput,
+    reason_codes: &[String],
+) -> String {
+    let mut fingerprint = crate::state::RequestFingerprint::new();
+    fingerprint.absorb_str("complianceInquiryId", &input.compliance_inquiry_id);
+    fingerprint.absorb_optional_i32("queryIdentifier", input.query_identifier);
+    fingerprint.absorb_str("rating", &input.rating);
+    fingerprint.absorb_optional_i32("responseRevisionId", input.response_revision_id);
+    for code in reason_codes {
+        fingerprint.absorb_str("reasonCode", code);
+    }
+    fingerprint.absorb_optional_str("comment", input.comment.as_deref());
+    fingerprint.finish()
 }

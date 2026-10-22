@@ -278,10 +278,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.vocabularies.contains_key(&input.vocabulary_name) {
             return Err(CreateVocabularyErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(format!(
-                        "The requested vocabulary name {} already exists. Use a different \
-                         name and try your request again.",
-                        input.vocabulary_name
+                    // As `CreateVocabularyFilter`: the kind, not the caller's name.
+                    message: Some(crate::state::name_already_exists_message(
+                        crate::state::KIND_VOCABULARY,
                     )),
                 },
             )

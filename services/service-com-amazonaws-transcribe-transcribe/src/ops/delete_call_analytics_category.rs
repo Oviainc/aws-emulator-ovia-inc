@@ -139,7 +139,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "DeleteCallAnalyticsCategory";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_CALL_ANALYTICS_CATEGORY_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_CALL_ANALYTICS_CATEGORY_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 204u16;
+    // 200, not the model's `@http` `code: 204`: this service speaks awsJson1_1, an RPC
+    // protocol, so its `@http` traits are inert on the wire (`smithy_query` reports
+    // `httpBindingsInert: true` for every operation) and a success answers that
+    // protocol's own status, 200. The error side of the same rule is
+    // [`crate::scaffolded::wire_status`].
+    const SUCCESS_STATUS: u16 = 200u16;
 
     async fn handle(
         &self,

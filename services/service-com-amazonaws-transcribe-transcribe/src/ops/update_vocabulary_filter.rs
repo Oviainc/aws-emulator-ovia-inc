@@ -246,16 +246,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .vocabulary_filters
             .get_mut(&input.vocabulary_filter_name)
         else {
-            return Err(UpdateVocabularyFilterErrorModeled::NotFoundException(
-                NotFoundException {
-                    message: Some(format!(
-                        "The requested vocabulary filter {} couldn't be found. Check the \
-                         vocabulary filter name and try your request again.",
-                        input.vocabulary_filter_name
-                    )),
-                },
-            )
-            .into());
+            // As `UpdateVocabulary`: a resource that does not exist is this service's
+            // `BadRequestException`, whose documentation covers an entity that
+            // "doesn't exist", and not the modelled `NotFoundException`.
+            return Err(bad_request(&crate::state::not_found_message(
+                crate::state::KIND_VOCABULARY_FILTER,
+            )));
         };
 
         // "The new list you provide overwrites all previous entries; you cannot append

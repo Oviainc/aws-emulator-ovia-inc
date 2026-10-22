@@ -23,6 +23,8 @@ mod error_messages;
 mod harness;
 #[path = "all/identity_sources.rs"]
 mod identity_sources;
+#[path = "all/list_identity_sources.rs"]
+mod list_identity_sources;
 #[path = "all/policy_store_alias.rs"]
 mod policy_store_alias;
 #[path = "all/policy_store_authorization.rs"]

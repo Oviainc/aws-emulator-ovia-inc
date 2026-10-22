@@ -176,12 +176,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let Some(record) = store.vocabulary_filters.get(&input.vocabulary_filter_name) else {
-            return Err(GetVocabularyFilterErrorModeled::NotFoundException(
-                NotFoundException {
-                    message: Some(format!(
-                        "The requested vocabulary filter {} couldn't be found. Check the \
-                         vocabulary filter name and try your request again.",
-                        input.vocabulary_filter_name
+            // As `GetVocabulary`: this service reports a resource it does not hold
+            // with `BadRequestException`, not the modelled `NotFoundException`.
+            return Err(GetVocabularyFilterErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::not_found_message(
+                        crate::state::KIND_VOCABULARY_FILTER,
                     )),
                 },
             )

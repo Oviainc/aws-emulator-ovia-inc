@@ -35,3 +35,5 @@ mod resource_tags;
 mod state_roundtrip;
 #[path = "all/update_node_log_publishing.rs"]
 mod update_node_log_publishing;
+#[path = "all/vote_on_proposal.rs"]
+mod vote_on_proposal;
