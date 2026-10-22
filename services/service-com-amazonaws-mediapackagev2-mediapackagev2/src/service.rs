@@ -52,16 +52,27 @@
 //! to reach THIS service rather than the control-plane resolver, which cannot name a
 //! service from an opaque label and answers `404 UnknownService`.
 //!
-//! Two seams carry it, and nothing else changes:
+//! Three seams carry it, and nothing else changes:
 //!
 //! - [`Service::can_handle`] also claims a request whose `Host` is one of those
 //!   published hostnames ([`crate::state::data_plane_of_host`]), which is what routes it
 //!   here at all.
-//! - [`Service::override_routing_error`] serves it. A data-plane request names no
-//!   modelled operation by construction (`/out/v1/…`, `/in/v1/…` are not in the model),
-//!   so the router reaches exactly this seam for it — past the input-validation gate
-//!   below, which only fronts the modelled operations — and reaches it BEFORE
-//!   authentication, which is what lets an anonymous player be answered at all.
+//! - [`Service::override_routing_error`] serves the request that presents NO credential.
+//!   A data-plane request names no modelled operation by construction (`/out/v1/…`,
+//!   `/in/v1/…` are not in the model), so the router reaches exactly this seam for it —
+//!   past the input-validation gate below, which only fronts the modelled operations —
+//!   and reaches it BEFORE authentication, which is what lets an anonymous player be
+//!   answered at all.
+//! - [`Service::override_operation`] serves the request that DOES present a SigV4
+//!   credential, through [`CredentialedDataPlane`]. The router authenticates whatever it
+//!   names an operation for and skips authentication for everything it answers from the
+//!   routing-error seam, so naming an operation here is what puts the emulator's own
+//!   signature verification in front of a credentialed push or fetch to a published URL —
+//!   the same verification a control-plane request gets, rather than a second signature
+//!   check written into this service. A credential the emulator cannot verify is therefore
+//!   refused by the router (`403`, with its signature-mismatch wording), which is a
+//!   DIFFERENT refusal from the access-denied `403` a request carrying no credential at
+//!   all gets below.
 //!
 //! What the data plane enforces:
 //!
@@ -80,7 +91,10 @@
 //!   is `403` with an access-denied body. Whether a credential that IS present carries a
 //!   valid signature is the emulator's own business — the emulator verifies every request
 //!   signature and a service never checks signatures itself — so this handler does not
-//!   re-verify it; a credentialed push is recorded against the channel, within the three
+//!   re-verify it; the credentialed push is routed as an operation instead
+//!   ([`CredentialedDataPlane`]) so the router's authenticator judges that signature
+//!   first, and a push that reaches this handler is one the emulator accepted. It is then
+//!   recorded against the channel, within the three
 //!   bounds the store declares: the per-object size, the per-channel object count, and the
 //!   store-wide retained bytes (`state::MAX_INGESTED_BYTES`), since the channel count is
 //!   itself caller-driven.
@@ -156,6 +170,9 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// which is not an operation and so has no `self.engine` of its own; it must read and
     /// write the one store the control-plane operations use, not a second copy.
     engine: Arc<Eng>,
+    /// The data-plane handler the router names as an OPERATION for a request that presents
+    /// a SigV4 credential, so the emulator authenticates it before anything is served.
+    credentialed_data_plane: CredentialedDataPlane<Eng>,
     /// The input-validation gate for each modelled operation, keyed by the routing key
     /// the protocol resolves for it (the operation's own `NAME`). Built once, in `new`.
     input_validation: HashMap<&'static str, Box<dyn ErasedOperation>>,
@@ -168,9 +185,58 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            credentialed_data_plane: CredentialedDataPlane {
+                engine: Arc::clone(&engine),
+            },
             engine,
             input_validation: input_validation_gates::<Eng>(),
         }
+    }
+}
+
+/// The auth schemes a credentialed data-plane request is verified under.
+///
+/// SigV4 is the only scheme this service's model declares (`awsService.sigv4Name`
+/// `mediapackagev2`), and MediaPackage hands out no data-plane credential of another kind,
+/// so a published URL is reached either anonymously — which the routing-error seam answers
+/// without the router authenticating anything — or with a SigV4 credential, which this
+/// names so the router's SigV4 authenticator verifies it.
+const DATA_PLANE_AUTH_SCHEMES: &[&str] = &[::emulator_server::aws_credentials::SIGV4_SCHEME];
+
+/// The data plane of a request that PRESENTS a SigV4 credential, as an [`ErasedOperation`]
+/// so the router authenticates it.
+///
+/// It holds the SAME shared engine the generated entry threads into every operation, and
+/// serves the request through exactly the functions the routing-error seam uses, so the
+/// credentialed and the anonymous path cannot diverge in what they serve — only in whether
+/// a signature was verified on the way in.
+struct CredentialedDataPlane<Eng> {
+    engine: Arc<Eng>,
+}
+
+impl<Eng: Send + Sync + 'static> ErasedOperation for CredentialedDataPlane<Eng> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        _ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            match data_plane_of_request(req) {
+                Some(crate::state::DataPlane::Egress) => serve_egress(&*self.engine, req),
+                Some(crate::state::DataPlane::Ingest) => serve_ingest(&*self.engine, req),
+                // Unreachable: `override_operation` names this only for a request whose
+                // `Host` is one of the data-plane hostnames this service publishes.
+                None => svc.definition().routing_error_response(req),
+            }
+        })
+    }
+
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        // This is NOT a modelled operation, so there is no modelled operation for the
+        // router to read schemes off: without this the router would find no scheme for a
+        // data-plane request and could not verify the credential it carries.
+        Some(DATA_PLANE_AUTH_SCHEMES)
     }
 }
 
@@ -384,6 +450,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
+        // A request to a published data-plane URL that PRESENTS a SigV4 credential is named
+        // as an operation, so the router verifies that credential's signature before
+        // anything is served — the router authenticates only what it names an operation
+        // for. A data-plane request carrying NO credential is left unnamed on purpose: it
+        // is answered by `override_routing_error` below, which the router reaches before
+        // authentication, so an anonymous player and an unauthenticated encoder still get
+        // this service's own answer rather than the emulator's "sign this request".
+        if carries_sigv4_credential(req) && data_plane_of_request(req).is_some() {
+            return Some(&self.credentialed_data_plane);
+        }
         // Put this service's input-validation gate in front of the modelled operation
         // the request names, so a value outside a constraint the model declares is
         // refused with the MODELLED `ValidationException` (both members set) instead of
@@ -428,13 +504,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this when a request reached this service but named no
-        // modeled operation. A data-plane request is exactly that case by
-        // construction, so this is where the published ingest and egress URLs are
+        // modeled operation. A data-plane request that carries no SigV4 credential is
+        // exactly that case by construction (`override_operation` names an operation
+        // only for the credentialed ones), so this is where an anonymous fetch of a
+        // published egress URL and an unauthenticated push to a published ingest URL are
         // served. Anything else keeps the framework's protocol-correct default.
-        let host = req.headers().get("host").or_else(|| authority_of(req.uri()))?;
-        match crate::state::data_plane_of_host(host)? {
-            crate::state::DataPlane::Egress => Some(self.serve_egress(req)),
-            crate::state::DataPlane::Ingest => Some(self.serve_ingest(req)),
+        match data_plane_of_request(req)? {
+            crate::state::DataPlane::Egress => Some(serve_egress(&*self.engine, req)),
+            crate::state::DataPlane::Ingest => Some(serve_ingest(&*self.engine, req)),
         }
     }
 
@@ -453,137 +530,157 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 }
 
-impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
-    /// Serve one request to a published EGRESS URL.
-    ///
-    /// The origin endpoint's resource policy decides, against the action the request's
-    /// method needs ([`egress_action`]): without a grant to the `*` principal the fetch is
-    /// refused `403`, and the refusal is the same whether the endpoint is absent or merely
-    /// ungranted, so a caller cannot probe for endpoints it may not read. With the grant
-    /// the fetch is authorized and the object is resolved, which is `404` while nothing
-    /// has been packaged for it.
-    fn serve_egress(&self, req: &RtRequest) -> RtResponse {
-        if !matches!(req.method(), "GET" | "HEAD") {
-            return error_response(
-                405,
-                "MethodNotAllowed",
-                "The egress data plane serves GET and HEAD",
-            );
-        }
-        let Some(target) = crate::state::parse_egress_path(request_path(req.uri())) else {
-            return error_response(
-                404,
-                "NotFound",
-                "The requested path is not an egress path this service publishes",
-            );
-        };
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return error_response(
-                500,
-                "InternalServerException",
-                "the MediaPackageV2 store is unavailable",
-            );
-        };
-        let store = state.lock();
-        let granted = store.endpoint_at(&target).is_some_and(|endpoint| {
-            endpoint.policy.as_ref().is_some_and(|attached| {
-                crate::state::policy_allows_anonymous(
-                    &attached.policy,
-                    egress_action(req.method()),
-                    // The resource the request addresses, which a statement's `Resource`
-                    // is matched against: the endpoint the published URL names.
-                    &endpoint.arn,
-                )
-            })
-        });
-        if !granted {
-            return error_response(403, "AccessDenied", ACCESS_DENIED_MESSAGE);
-        }
-        // Authorized, and there is nothing to serve: this emulator runs no packager, so
-        // no egress object exists for an endpoint however much has been ingested. The
-        // answer is the honest one for a data plane — no such object — not a synthesised
-        // manifest.
-        error_response(
+/// Serve one request to a published EGRESS URL.
+///
+/// The origin endpoint's resource policy decides, against the action the request's
+/// method needs ([`egress_action`]): without a grant to the `*` principal the fetch is
+/// refused `403`, and the refusal is the same whether the endpoint is absent or merely
+/// ungranted, so a caller cannot probe for endpoints it may not read. With the grant
+/// the fetch is authorized and the object is resolved, which is `404` while nothing
+/// has been packaged for it.
+///
+/// Free-standing, and reached with the ONE shared engine, so the two seams that serve the
+/// data plane — [`Service::override_routing_error`] for an anonymous request and
+/// [`CredentialedDataPlane`] for a credentialed one — serve it identically. Identically
+/// includes the grant that is read: the decision is always the one made for the `*`
+/// principal, because this emulator models no caller IDENTITY to match a statement's
+/// `Principal` against (see the module docs) — a credentialed fetch is verified, then
+/// authorized by the same `*` grant an anonymous one is. A statement naming one principal
+/// is therefore not a grant this emulator can honour, for either seam.
+fn serve_egress<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtResponse {
+    if !matches!(req.method(), "GET" | "HEAD") {
+        return error_response(
+            405,
+            "MethodNotAllowed",
+            "The egress data plane serves GET and HEAD",
+        );
+    }
+    let Some(target) = crate::state::parse_egress_path(request_path(req.uri())) else {
+        return error_response(
             404,
             "NotFound",
-            "No content is available at this origin endpoint yet",
-        )
+            "The requested path is not an egress path this service publishes",
+        );
+    };
+    let Some(state) = crate::state::service_state(engine) else {
+        return error_response(
+            500,
+            "InternalServerException",
+            "the MediaPackageV2 store is unavailable",
+        );
+    };
+    let store = state.lock();
+    let granted = store.endpoint_at(&target).is_some_and(|endpoint| {
+        endpoint.policy.as_ref().is_some_and(|attached| {
+            crate::state::policy_allows_anonymous(
+                &attached.policy,
+                egress_action(req.method()),
+                // The resource the request addresses, which a statement's `Resource`
+                // is matched against: the endpoint the published URL names.
+                &endpoint.arn,
+            )
+        })
+    });
+    if !granted {
+        return error_response(403, "AccessDenied", ACCESS_DENIED_MESSAGE);
     }
+    // Authorized, and there is nothing to serve: this emulator runs no packager, so
+    // no egress object exists for an endpoint however much has been ingested. The
+    // answer is the honest one for a data plane — no such object — not a synthesised
+    // manifest.
+    error_response(
+        404,
+        "NotFound",
+        "No content is available at this origin endpoint yet",
+    )
+}
 
-    /// Serve one request to a published INGEST URL.
-    ///
-    /// MediaPackage returns no credential for ingest, so an unauthenticated push is
-    /// refused `403`. A push that DOES carry a SigV4 credential is recorded against the
-    /// channel, bounded by [`crate::state::MAX_INGESTED_OBJECTS_PER_CHANNEL`] and
-    /// [`crate::state::MAX_INGESTED_OBJECT_BYTES`].
-    fn serve_ingest(&self, req: &RtRequest) -> RtResponse {
-        if !matches!(req.method(), "PUT" | "POST") {
-            return error_response(
-                405,
-                "MethodNotAllowed",
-                "The ingest data plane serves PUT and POST",
-            );
-        }
-        if !carries_sigv4_credential(req) {
-            return error_response(403, "AccessDenied", ACCESS_DENIED_MESSAGE);
-        }
-        let Some(target) = crate::state::parse_ingest_path(request_path(req.uri())) else {
+/// Serve one request to a published INGEST URL.
+///
+/// MediaPackage returns no credential for ingest, so an unauthenticated push is
+/// refused `403` here — it carries no signature for the emulator to judge, and the router
+/// hands this seam the request before it authenticates anything. A push that DOES carry a
+/// SigV4 credential reaches this function only through [`CredentialedDataPlane`], i.e.
+/// only once the emulator's authenticator accepted that credential, and is recorded
+/// against the channel, bounded by [`crate::state::MAX_INGESTED_OBJECTS_PER_CHANNEL`] and
+/// [`crate::state::MAX_INGESTED_OBJECT_BYTES`].
+fn serve_ingest<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtResponse {
+    if !matches!(req.method(), "PUT" | "POST") {
+        return error_response(
+            405,
+            "MethodNotAllowed",
+            "The ingest data plane serves PUT and POST",
+        );
+    }
+    if !carries_sigv4_credential(req) {
+        return error_response(403, "AccessDenied", ACCESS_DENIED_MESSAGE);
+    }
+    let Some(target) = crate::state::parse_ingest_path(request_path(req.uri())) else {
+        return error_response(
+            404,
+            "NotFound",
+            "The requested path is not an ingest path this service publishes",
+        );
+    };
+    let Some(state) = crate::state::service_state(engine) else {
+        return error_response(
+            500,
+            "InternalServerException",
+            "the MediaPackageV2 store is unavailable",
+        );
+    };
+    let body = req.body().bytes().unwrap_or_default();
+    if body.len() > crate::state::MAX_INGESTED_OBJECT_BYTES {
+        return error_response(
+            413,
+            "RequestEntityTooLarge",
+            "The ingested object is larger than this emulator retains",
+        );
+    }
+    let mut store = state.lock();
+    // Both store bounds are judged under this one hold of the lock, so two concurrent
+    // pushes cannot both see room that only one of them has.
+    match store.record_ingested_object(&target, body.to_vec()) {
+        crate::state::IngestOutcome::Recorded => {}
+        crate::state::IngestOutcome::NoSuchChannel => {
             return error_response(
                 404,
                 "NotFound",
                 "The requested path is not an ingest path this service publishes",
             );
-        };
-        let Some(state) = crate::state::service_state(&*self.engine) else {
+        }
+        crate::state::IngestOutcome::ObjectCountReached => {
             return error_response(
-                500,
-                "InternalServerException",
-                "the MediaPackageV2 store is unavailable",
-            );
-        };
-        let body = req.body().bytes().unwrap_or_default();
-        if body.len() > crate::state::MAX_INGESTED_OBJECT_BYTES {
-            return error_response(
-                413,
-                "RequestEntityTooLarge",
-                "The ingested object is larger than this emulator retains",
+                507,
+                "InsufficientStorage",
+                "This channel already holds as many ingested objects as this emulator \
+                 retains",
             );
         }
-        let mut store = state.lock();
-        // Both store bounds are judged under this one hold of the lock, so two concurrent
-        // pushes cannot both see room that only one of them has.
-        match store.record_ingested_object(&target, body.to_vec()) {
-            crate::state::IngestOutcome::Recorded => {}
-            crate::state::IngestOutcome::NoSuchChannel => {
-                return error_response(
-                    404,
-                    "NotFound",
-                    "The requested path is not an ingest path this service publishes",
-                );
-            }
-            crate::state::IngestOutcome::ObjectCountReached => {
-                return error_response(
-                    507,
-                    "InsufficientStorage",
-                    "This channel already holds as many ingested objects as this emulator \
-                     retains",
-                );
-            }
-            crate::state::IngestOutcome::StoreFull => {
-                return error_response(
-                    507,
-                    "InsufficientStorage",
-                    "This emulator is already retaining as many ingested bytes as it holds",
-                );
-            }
+        crate::state::IngestOutcome::StoreFull => {
+            return error_response(
+                507,
+                "InsufficientStorage",
+                "This emulator is already retaining as many ingested bytes as it holds",
+            );
         }
-        let mut resp = RtResponse::new(
-            StatusCode::try_from(200u16).expect("200 is a valid status"),
-            SdkBody::empty(),
-        );
-        resp.headers_mut().insert("content-length", "0");
-        resp
     }
+    let mut resp = RtResponse::new(
+        StatusCode::try_from(200u16).expect("200 is a valid status"),
+        SdkBody::empty(),
+    );
+    resp.headers_mut().insert("content-length", "0");
+    resp
+}
+
+/// Which of this service's data planes a request's `Host` names, or `None` when the host is
+/// not one of the hostnames this service publishes.
+///
+/// The `Host` header is what a buffered HTTP/1 request carries; an HTTP/2 request carries
+/// the same authority on its URI instead.
+fn data_plane_of_request(req: &RtRequest) -> Option<crate::state::DataPlane> {
+    let host = req.headers().get("host").or_else(|| authority_of(req.uri()))?;
+    crate::state::data_plane_of_host(host)
 }
 
 /// The action an anonymous player needs on an origin endpoint to fetch its content with

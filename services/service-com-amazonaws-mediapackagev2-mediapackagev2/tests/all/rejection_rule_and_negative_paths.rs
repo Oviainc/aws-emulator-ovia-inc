@@ -24,7 +24,10 @@
 //! 6. The ingest and egress URLs the control plane publishes are SERVED, and are gated:
 //!    an anonymous egress fetch is 403 until the endpoint's resource policy grants
 //!    `mediapackagev2:GetObject` to `*` and 404 once it does, and an ingest push with no
-//!    credential is 403.
+//!    credential is 403. This suite runs with request authentication OFF, where the
+//!    emulator verifies no signature anywhere, so a push that merely PRESENTS a credential
+//!    is served; `data_plane_credentials.rs` covers what verification does with one when
+//!    authentication is on.
 
 use std::sync::{Arc, Barrier};
 
