@@ -23,13 +23,23 @@
 //! `id`, `trace_id` and `start_time` are required, `end_time`/`in_progress` say
 //! whether the segment is complete, and `error`/`fault`/`throttle`, `http`,
 //! `parent_id` and `annotations` are optional.
+//!
+//! Daemon telemetry (`PutTelemetryRecords`, "used by the Amazon Web Services
+//! X-Ray daemon to upload telemetry") is kept the same way: each submitted
+//! `TelemetryRecord` is stored VERBATIM under the reporting source the request
+//! identifies, beside the running totals accumulated over every record that
+//! source ever had accepted — including records that have since fallen out of
+//! its [`MAX_TELEMETRY_RECORDS_PER_SOURCE`] window. No modelled operation reads
+//! telemetry back — `PutTelemetryRecordsResult` carries no members and X-Ray
+//! publishes no telemetry reader — so the store is what the ingest asserts, and
+//! it is bounded like the trace store is.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::ops::types::{
     EncryptionConfig, Group, GroupSummary, IndexingRule, IndexingRuleValue, InsightsConfiguration,
-    ProbabilisticRuleValue,
+    ProbabilisticRuleValue, TelemetryRecord,
 };
 
 /// The region an ARN carries when the request's SigV4 scope names none.
@@ -264,6 +274,21 @@ pub const MAX_TRACES: usize = 1_000;
 
 /// The most groups the store keeps; `CreateGroup` past this is refused.
 pub const MAX_GROUPS: usize = 250;
+/// The most telemetry records one `PutTelemetryRecords` call accepts.
+///
+/// `TelemetryRecordList` carries no modelled length bound, so the batch is
+/// bounded here — as `PutTraceSegments`'s is — rather than letting one call
+/// drive unbounded work and growth.
+pub const MAX_TELEMETRY_RECORDS_PER_CALL: usize = 500;
+
+/// The most telemetry records kept per reporting source: a rolling window of the
+/// most recently submitted ones. Older records fall out of the window, while the
+/// source's running [`TelemetryTotals`] keep counting every record accepted.
+pub const MAX_TELEMETRY_RECORDS_PER_SOURCE: usize = 1_000;
+
+/// The most reporting sources the telemetry store keeps. A report from a new
+/// source past this evicts the one that has gone longest without reporting.
+pub const MAX_TELEMETRY_SOURCES: usize = 500;
 
 /// The most user-applied tags one taggable resource holds.
 ///
@@ -365,6 +390,12 @@ pub struct ComAmazonawsXrayAwsxrayState {
     pub group_seq: u64,
     /// Ingest counter, stamped on a trace so the oldest can be evicted.
     pub ingest_seq: u64,
+    /// Daemon telemetry, keyed by the reporting source the request identified,
+    /// at most [`MAX_TELEMETRY_SOURCES`] of them.
+    pub telemetry: BTreeMap<TelemetrySource, TelemetryReporter>,
+    /// Report counter, stamped on a reporter so the least recently reporting one
+    /// can be evicted; never reset.
+    pub telemetry_seq: u64,
     /// The encryption configuration `PutEncryptionConfig` stores and
     /// `GetEncryptionConfig` reports; X-Ray's default until one is put.
     pub encryption: EncryptionConfigRecord,
@@ -375,6 +406,46 @@ pub struct ComAmazonawsXrayAwsxrayState {
     /// The account's indexing rules, which `GetIndexingRules` reports and
     /// `UpdateIndexingRule` rewrites.
     pub indexing_rules: IndexingRuleStore,
+}
+
+/// Who reported telemetry: the `PutTelemetryRecords` request's own reporter
+/// identity (`EC2InstanceId`, `Hostname`, `ResourceARN`), which is what
+/// distinguishes one daemon's counters from another's.
+///
+/// A member carrying the empty string identifies nothing, so it is held as
+/// absent: each of the three is modelled `len 0..N`
+/// (`smithy_query(query="operation",operation="PutTelemetryRecords")`), so a
+/// daemon that sends `""` for a field it does not know reports as the same
+/// source as one that omits it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TelemetrySource {
+    /// `PutTelemetryRecordsRequest$EC2InstanceId`.
+    pub ec2_instance_id: Option<String>,
+    /// `PutTelemetryRecordsRequest$Hostname`.
+    pub hostname: Option<String>,
+    /// `PutTelemetryRecordsRequest$ResourceARN`.
+    pub resource_arn: Option<String>,
+}
+
+impl TelemetrySource {
+    /// The source a request identifies, with an empty-string member held as
+    /// absent.
+    pub fn new(
+        ec2_instance_id: Option<&str>,
+        hostname: Option<&str>,
+        resource_arn: Option<&str>,
+    ) -> Self {
+        let identifier = |value: Option<&str>| {
+            value
+                .filter(|text| !text.is_empty())
+                .map(str::to_string)
+        };
+        Self {
+            ec2_instance_id: identifier(ec2_instance_id),
+            hostname: identifier(hostname),
+            resource_arn: identifier(resource_arn),
+        }
+    }
 }
 
 /// The account's trace segment destination, as stored.
@@ -443,6 +514,89 @@ impl Default for IndexingRuleStore {
         };
         Self {
             rules: BTreeMap::from([(record.name.clone(), record)]),
+        }
+    }
+}
+
+/// One reporting source's telemetry: the records it submitted, how much it has
+/// submitted, and the totals recomputed from every record accepted.
+#[derive(Debug, Clone, Default)]
+pub struct TelemetryReporter {
+    /// The source these records came from.
+    pub source: TelemetrySource,
+    /// The most recent [`MAX_TELEMETRY_RECORDS_PER_SOURCE`] records, in
+    /// submission order, each stored exactly as submitted.
+    pub records: Vec<TelemetryRecord>,
+    /// How many records this source has had accepted, including any that have
+    /// since fallen out of [`records`](Self::records).
+    pub records_accepted: u64,
+    /// How many `PutTelemetryRecords` calls this source has made, counting one
+    /// that carried an empty batch.
+    pub reports: u64,
+    /// The sums of every accepted record's counters.
+    pub totals: TelemetryTotals,
+    /// When this source last reported, in [`ComAmazonawsXrayAwsxrayState::telemetry_seq`]
+    /// ticks. Orders eviction once the telemetry store is full.
+    pub last_report_seq: u64,
+}
+
+/// The running sums of a reporting source's telemetry counters: one field per
+/// `NullableInteger` member of `TelemetryRecord` and of its
+/// `BackendConnectionErrors`
+/// (`smithy_query(query="closure",operation="PutTelemetryRecords")`).
+///
+/// Held as `i64` and added saturatingly, so no sequence of calls can overflow a
+/// total.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TelemetryTotals {
+    /// Sum of `TelemetryRecord$SegmentsReceivedCount`.
+    pub segments_received: i64,
+    /// Sum of `TelemetryRecord$SegmentsSentCount`.
+    pub segments_sent: i64,
+    /// Sum of `TelemetryRecord$SegmentsSpilloverCount`.
+    pub segments_spillover: i64,
+    /// Sum of `TelemetryRecord$SegmentsRejectedCount`.
+    pub segments_rejected: i64,
+    /// Sum of `BackendConnectionErrors$TimeoutCount`.
+    pub backend_timeouts: i64,
+    /// Sum of `BackendConnectionErrors$ConnectionRefusedCount`.
+    pub backend_connection_refused: i64,
+    /// Sum of `BackendConnectionErrors$HTTPCode4XXCount`.
+    pub backend_http_code_4xx: i64,
+    /// Sum of `BackendConnectionErrors$HTTPCode5XXCount`.
+    pub backend_http_code_5xx: i64,
+    /// Sum of `BackendConnectionErrors$UnknownHostCount`.
+    pub backend_unknown_host: i64,
+    /// Sum of `BackendConnectionErrors$OtherCount`.
+    pub backend_other: i64,
+}
+
+impl TelemetryTotals {
+    /// Add one record's counters. An absent counter contributes nothing, which
+    /// is what `NullableInteger` being optional means.
+    fn add(&mut self, record: &TelemetryRecord) {
+        let accumulate = |total: &mut i64, count: Option<i32>| {
+            if let Some(count) = count {
+                *total = total.saturating_add(i64::from(count));
+            }
+        };
+        accumulate(&mut self.segments_received, record.segments_received_count);
+        accumulate(&mut self.segments_sent, record.segments_sent_count);
+        accumulate(
+            &mut self.segments_spillover,
+            record.segments_spillover_count,
+        );
+        accumulate(&mut self.segments_rejected, record.segments_rejected_count);
+        if let Some(errors) = record.backend_connection_errors.as_ref() {
+            accumulate(&mut self.backend_timeouts, errors.timeout_count);
+            accumulate(
+                &mut self.backend_connection_refused,
+                errors.connection_refused_count,
+            );
+            accumulate(&mut self.backend_http_code_4xx, errors.http_code4_xx_count);
+            accumulate(&mut self.backend_http_code_5xx, errors.http_code5_xx_count);
+            accumulate(&mut self.backend_unknown_host, errors.unknown_host_count);
+            accumulate(&mut self.backend_other, errors.other_count);
         }
     }
 }
@@ -1264,6 +1418,58 @@ impl ComAmazonawsXrayAwsxrayState {
             }
         }
         Err(GroupLookupError::NotFound)
+    }
+
+    /// Store one `PutTelemetryRecords` batch under the source that reported it.
+    ///
+    /// Appending, not replacing: a source's records accumulate across calls, and
+    /// its [`TelemetryTotals`] are the sums over every record ever accepted from
+    /// it. The call itself is counted too, so a batch that carried no records is
+    /// still a report from a known source.
+    ///
+    /// Bounded in both directions: a source keeps at most
+    /// [`MAX_TELEMETRY_RECORDS_PER_SOURCE`] records (the oldest fall out of the
+    /// window first), and the store holds at most [`MAX_TELEMETRY_SOURCES`]
+    /// sources (a report from a new source past that evicts the least recently
+    /// reporting one).
+    pub fn record_telemetry(&mut self, source: TelemetrySource, records: &[TelemetryRecord]) {
+        if !self.telemetry.contains_key(&source) && self.telemetry.len() >= MAX_TELEMETRY_SOURCES {
+            self.evict_least_recently_reporting_source();
+        }
+        self.telemetry_seq += 1;
+        let seq = self.telemetry_seq;
+        let reporter = self
+            .telemetry
+            .entry(source.clone())
+            .or_insert_with(|| TelemetryReporter {
+                source,
+                ..TelemetryReporter::default()
+            });
+        reporter.last_report_seq = seq;
+        reporter.reports += 1;
+        for record in records {
+            reporter.totals.add(record);
+            reporter.records_accepted += 1;
+            reporter.records.push(record.clone());
+        }
+        if reporter.records.len() > MAX_TELEMETRY_RECORDS_PER_SOURCE {
+            let overflow = reporter.records.len() - MAX_TELEMETRY_RECORDS_PER_SOURCE;
+            reporter.records.drain(..overflow);
+        }
+    }
+
+    /// Drop the reporting source that has gone longest without a report, to keep
+    /// the telemetry store at [`MAX_TELEMETRY_SOURCES`]. Walked only when the
+    /// store is full.
+    fn evict_least_recently_reporting_source(&mut self) {
+        let oldest = self
+            .telemetry
+            .iter()
+            .min_by_key(|(_, reporter)| reporter.last_report_seq)
+            .map(|(source, _)| source.clone());
+        if let Some(source) = oldest {
+            self.telemetry.remove(&source);
+        }
     }
 
     /// Apply an `UpdateGroup` to the stored group `group_name`, returning the

@@ -23,6 +23,9 @@ mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 
+#[path = "all/telemetry_records.rs"]
+mod telemetry_records;
+
 #[path = "all/trace_ingest_and_groups.rs"]
 mod trace_ingest_and_groups;
 

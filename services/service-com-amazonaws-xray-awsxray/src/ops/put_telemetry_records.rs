@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutTelemetryRecords
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutTelemetryRecords`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutTelemetryRecords::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores every submitted `TelemetryRecord` VERBATIM under the reporting source
+//! the request identifies (`EC2InstanceId` / `Hostname` / `ResourceARN`), and
+//! accumulates that source's counter totals from the stored records. Records
+//! accumulate across calls: this is the daemon's periodic counter upload, not a
+//! replace. A batch larger than `crate::state::MAX_TELEMETRY_RECORDS_PER_CALL`,
+//! and a record carrying a negative counter, are refused with
+//! `InvalidRequestException`.
+//!
+//! `PutTelemetryRecordsResult` models no members, so the response body is empty;
+//! what the call asserts is the store.
 //!
 //! ## Shape of an operation
 //!
@@ -135,20 +137,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutTelemetryRecords` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutTelemetryRecordsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutTelemetryRecords"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutTelemetryRecordsErrorModeled::ThrottledException(
+                ThrottledException {
+                    message: Some(
+                        "the X-Ray telemetry store is unavailable on this emulator engine"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // `TelemetryRecordList` carries no modelled length bound, so the batch
+        // ONE call may submit is bounded here. The CUMULATIVE bounds — the
+        // records kept per source and the number of sources — are
+        // `crate::state::MAX_TELEMETRY_RECORDS_PER_SOURCE` and
+        // `crate::state::MAX_TELEMETRY_SOURCES`, enforced by
+        // `record_telemetry`, so no sequence of calls grows the store without
+        // limit either.
+        let submitted = input.telemetry_records.len();
+        if submitted > crate::state::MAX_TELEMETRY_RECORDS_PER_CALL {
+            return Err(invalid(format!(
+                "TelemetryRecords carries {submitted} records; at most {} are accepted per call",
+                crate::state::MAX_TELEMETRY_RECORDS_PER_CALL
+            )));
+        }
+
+        // Every counter on a `TelemetryRecord` is a count of events the reporter
+        // observed since its last report, so a negative one is an invalid
+        // parameter — the model constrains none of them, so it is refused here
+        // rather than accumulated into a total that then means nothing.
+        for (position, record) in input.telemetry_records.iter().enumerate() {
+            if let Some((member, count)) = negative_counter(record) {
+                return Err(invalid(format!(
+                    "TelemetryRecords[{position}].{member} is {count}; a telemetry counter cannot be negative"
+                )));
+            }
+        }
+
+        let source = crate::state::TelemetrySource::new(
+            input.ec2_instance_id.as_deref(),
+            input.hostname.as_deref(),
+            input.resource_arn.as_deref(),
+        );
+        state
+            .lock()
+            .record_telemetry(source, &input.telemetry_records);
+
+        Ok(PutTelemetryRecordsOutput {})
     }
+}
+
+/// Refuse a request with the error this operation models for an invalid one.
+fn invalid(message: impl Into<String>) -> PutTelemetryRecordsError {
+    PutTelemetryRecordsErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The first negative counter on `record`, as the member name the request used
+/// and its value, or `None` when every counter it carries is zero or above.
+///
+/// The member names are the modelled ones
+/// (`smithy_query(query="closure",operation="PutTelemetryRecords")`), so the
+/// refusal names the field the caller sent.
+fn negative_counter(record: &TelemetryRecord) -> Option<(&'static str, i32)> {
+    let errors = record.backend_connection_errors.as_ref();
+    let backend = |pick: fn(&BackendConnectionErrors) -> Option<i32>| errors.and_then(pick);
+    [
+        ("SegmentsReceivedCount", record.segments_received_count),
+        ("SegmentsSentCount", record.segments_sent_count),
+        ("SegmentsSpilloverCount", record.segments_spillover_count),
+        ("SegmentsRejectedCount", record.segments_rejected_count),
+        (
+            "BackendConnectionErrors.TimeoutCount",
+            backend(|errors| errors.timeout_count),
+        ),
+        (
+            "BackendConnectionErrors.ConnectionRefusedCount",
+            backend(|errors| errors.connection_refused_count),
+        ),
+        (
+            "BackendConnectionErrors.HTTPCode4XXCount",
+            backend(|errors| errors.http_code4_xx_count),
+        ),
+        (
+            "BackendConnectionErrors.HTTPCode5XXCount",
+            backend(|errors| errors.http_code5_xx_count),
+        ),
+        (
+            "BackendConnectionErrors.UnknownHostCount",
+            backend(|errors| errors.unknown_host_count),
+        ),
+        (
+            "BackendConnectionErrors.OtherCount",
+            backend(|errors| errors.other_count),
+        ),
+    ]
+    .into_iter()
+    .find_map(|(member, count)| match count {
+        Some(count) if count < 0 => Some((member, count)),
+        _ => None,
+    })
 }
