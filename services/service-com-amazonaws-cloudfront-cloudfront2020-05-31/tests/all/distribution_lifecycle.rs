@@ -42,23 +42,23 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// A SigV4 credential scope naming this service's signing name (`cloudfront`). It is
 /// what routes a request to this service.
-const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
+pub(crate) const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIDEXAMPLE/20260101/us-east-1/cloudfront/aws4_request, \
      SignedHeaders=host, Signature=abc";
 
 /// The host every request below is addressed to, and so the authority a `Location`
 /// header names.
-const HOST: &str = "cloudfront.amazonaws.com";
+pub(crate) const HOST: &str = "cloudfront.amazonaws.com";
 
 /// The account id every emulated ARN carries (`engine::EMULATOR_ACCOUNT_ID`), spelled
 /// out here so a changed ARN fails this suite.
-const ACCOUNT_ID: &str = "000000000000";
+pub(crate) const ACCOUNT_ID: &str = "000000000000";
 
 /// This service's API version, which every route and `Location` is under.
-const API_VERSION: &str = "2020-05-31";
+pub(crate) const API_VERSION: &str = "2020-05-31";
 
 /// One emulator: a router carrying only this service, over one shared engine.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -73,7 +73,7 @@ fn emulator() -> MultiServiceRouter {
 /// One element of a parsed response document: its local name, its text and its
 /// children.
 #[derive(Debug, Clone, Default)]
-struct Node {
+pub(crate) struct Node {
     name: String,
     text: String,
     children: Vec<Node>,
@@ -86,12 +86,12 @@ impl Node {
     }
 
     /// The element at a `/`-separated path of element names.
-    fn at(&self, path: &str) -> Option<&Node> {
+    pub(crate) fn at(&self, path: &str) -> Option<&Node> {
         path.split('/').try_fold(self, |node, part| node.child(part))
     }
 
     /// The text of the element at `path`.
-    fn text_at(&self, path: &str) -> Option<&str> {
+    pub(crate) fn text_at(&self, path: &str) -> Option<&str> {
         self.at(path).map(|node| node.text.as_str())
     }
 
@@ -104,7 +104,7 @@ impl Node {
     }
 
     /// The text of every descendant element called `name`, depth first.
-    fn find_text(&self, name: &str) -> Option<&str> {
+    pub(crate) fn find_text(&self, name: &str) -> Option<&str> {
         if self.name == name {
             return Some(self.text.as_str());
         }
@@ -211,26 +211,26 @@ fn local_name(raw: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// What the emulator answered: the status, the headers and the parsed body.
-struct Answer {
-    status: u16,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
     headers: ::http::HeaderMap,
-    raw: String,
+    pub(crate) raw: String,
     body: Node,
 }
 
 impl Answer {
     /// The document's root element, or an empty node when the answer carried no body.
-    fn root(&self) -> &Node {
+    pub(crate) fn root(&self) -> &Node {
         self.body.children.first().unwrap_or(&self.body)
     }
 
     /// The wire error code (`<Code>` in the restXml error envelope), or `""`.
-    fn error_code(&self) -> &str {
+    pub(crate) fn error_code(&self) -> &str {
         self.root().find_text("Code").unwrap_or_default()
     }
 
     /// One response header's value, or `""`.
-    fn header(&self, name: &str) -> &str {
+    pub(crate) fn header(&self, name: &str) -> &str {
         self.headers
             .get(name)
             .and_then(|value| value.to_str().ok())
@@ -239,7 +239,7 @@ impl Answer {
 }
 
 /// Send one request through the router.
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,

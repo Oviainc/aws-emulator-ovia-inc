@@ -1,0 +1,992 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! End-to-end tests for the WorkMail Message Flow in-transit message surface.
+//!
+//! Every assertion goes over the wire: a request is built, dispatched through the
+//! same [`MultiServiceRouter`] the production emulator mounts, and only the HTTP
+//! status, the `x-amzn-errortype` header and the response payload are inspected.
+//! The store is reached only to SEED it — to stand in for WorkMail delivery, which
+//! puts a message in transit, and for S3, which holds the object a
+//! `PutRawMessageContent` reference names. Neither producer is modeled by this API.
+//!
+//! The tests are tables: each row is one input along the axis the rule under test
+//! generalises over (id form and length, content form and size, reference
+//! versioning, bucket region, bucket owner, MIME defect), and the
+//! `00000000-0000-0000-0000-000000000001` case from the bootstrap issue is one row.
+//! The two round-trip invariants — what is stored is what is reported — are also
+//! checked over a generated spread of ids, byte patterns and MIME messages,
+//! computed arithmetically so every run drives exactly the same inputs.
+
+use std::sync::Arc;
+
+use bytes::Bytes;
+use serde_json::{json, Value};
+use service_com_amazonaws_workmailmessageflow_giraffemessageintransitservice::state::{
+    service_state, S3Object, S3Ref,
+    ComAmazonawsWorkmailmessageflowGiraffemessageintransitserviceState as FlowState,
+};
+use service_com_amazonaws_workmailmessageflow_giraffemessageintransitservice::EmulatedService;
+use smithy_server_runtime::MultiServiceRouter;
+
+/// The region every test signs with unless it is exercising the region rule itself.
+const REGION: &str = "us-east-1";
+
+/// `messageId` is `len 1..120, pattern ^[a-z0-9\-]*$` on both operations (model:
+/// `smithy_query(query="operation", operation="GetRawMessageContent")`).
+const MESSAGE_ID_MIN_LEN: usize = 1;
+const MESSAGE_ID_MAX_LEN: usize = 120;
+
+/// The RFC 5321 line limit the `RawMessageContent` documentation cites, including
+/// the CRLF.
+const MAX_LINE_OCTETS: usize = 1000;
+
+/// How many cases each generated round-trip test runs. Bounded: these are
+/// integration tests, not a fuzzing session.
+const GENERATED_CASES: usize = 32;
+
+/// One wire answer, reduced to what a client branches on.
+#[derive(Debug)]
+struct Reply {
+    status: u16,
+    error_type: String,
+    payload: Bytes,
+}
+
+impl Reply {
+    /// The payload as JSON, or `Value::Null` when it is not JSON (a
+    /// `GetRawMessageContent` success payload is raw MIME, not JSON).
+    fn json(&self) -> Value {
+        if self.payload.is_empty() {
+            return Value::Null;
+        }
+        serde_json::from_slice(&self.payload).unwrap_or(Value::Null)
+    }
+
+    /// The payload rendered for an assertion message, without dumping a megabyte
+    /// of MIME into the test log.
+    fn summary(&self) -> String {
+        let shown = String::from_utf8_lossy(&self.payload[..self.payload.len().min(120)]);
+        format!(
+            "{} byte(s) {shown:?}{}",
+            self.payload.len(),
+            if self.payload.len() > 120 { "…" } else { "" }
+        )
+    }
+}
+
+/// An emulator with just this service mounted on a fresh engine, driven in-process
+/// through the production router.
+struct Emulator {
+    router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
+}
+
+impl Emulator {
+    fn new() -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        // Signatures are not what these tests are about; the router still routes by
+        // the SigV4 credential scope below, which is also where the request's region
+        // comes from.
+        router.set_request_authentication(false);
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// Reach the store, to stand in for one of the two producers this API does not
+    /// model. Never used to read a response value: those come off the wire.
+    fn with_state<R>(&self, apply: impl FnOnce(&mut FlowState) -> R) -> R {
+        let state = service_state(&*self.engine).expect("this service's store is reachable");
+        let mut guard = state.lock();
+        apply(&mut guard)
+    }
+
+    /// Put `content` in transit under `message_id`, as WorkMail delivery does.
+    fn seed_message(&self, message_id: &str, content: &[u8]) {
+        self.with_state(|state| {
+            state.seed_in_transit_message(message_id, content.to_vec());
+        });
+    }
+
+    /// Make `content` resolvable at `reference`, as an S3 `PutObject` does.
+    fn seed_object(&self, reference: &S3Ref, object: S3Object) {
+        self.with_state(|state| state.seed_s3_object(reference.clone(), object));
+    }
+
+    async fn send(&self, method: &str, uri: &str, region: &str, body: Option<Vec<u8>>) -> Reply {
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/workmailmessageflow/aws4_request, \
+             SignedHeaders=host, Signature=deadbeef"
+        );
+        let builder = http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", format!("workmailmessageflow.{region}.amazonaws.com"))
+            .header("authorization", authorization);
+        let request = match body {
+            Some(bytes) => builder
+                .header("content-type", "application/json")
+                .body(Bytes::from(bytes))
+                .expect("build request"),
+            None => builder.body(Bytes::new()).expect("build request"),
+        };
+
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let error_type = response
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        Reply {
+            status,
+            error_type,
+            payload: response.into_body(),
+        }
+    }
+
+    async fn get_raw_message_content(&self, region: &str, message_id: &str) -> Reply {
+        self.send("GET", &format!("/messages/{message_id}"), region, None)
+            .await
+    }
+
+    async fn put_raw_message_content(
+        &self,
+        region: &str,
+        message_id: &str,
+        reference: &S3Ref,
+    ) -> Reply {
+        let mut s3_reference = json!({ "bucket": reference.bucket, "key": reference.key });
+        if let Some(version) = &reference.object_version {
+            s3_reference["objectVersion"] = json!(version);
+        }
+        let body = json!({ "content": { "s3Reference": s3_reference } });
+        self.send(
+            "POST",
+            &format!("/messages/{message_id}"),
+            region,
+            Some(serde_json::to_vec(&body).expect("serialize body")),
+        )
+        .await
+    }
+}
+
+/// A well-formed MIME message whose `Subject` is `subject` and whose body is
+/// `body`.
+fn mime(subject: &str, body: &str) -> Vec<u8> {
+    format!("From: sender@example.com\r\nSubject: {subject}\r\n\r\n{body}\r\n").into_bytes()
+}
+
+/// The bucket every test that is not exercising the location rules resolves
+/// against. 3..63 chars, `^[a-z0-9][a-z0-9\-]*$` (model: `S3Reference$bucket`).
+const BUCKET: &str = "mailbucket";
+
+/// A reference to `key` in [`BUCKET`], unversioned.
+///
+/// Note the keys these tests use carry no `.`: the model constrains
+/// `S3Reference$key` to `^[a-zA-Z0-9\-/]*$` (`smithy_query(query="shape",
+/// shape="S3Reference")`), which excludes it, so a key like `updated/message.mime`
+/// is refused at the boundary before any handler runs.
+fn reference(key: &str) -> S3Ref {
+    S3Ref::new(BUCKET, key, None)
+}
+
+// ---------------------------------------------------------------------------
+// GetRawMessageContent reports the bytes the store holds.
+// ---------------------------------------------------------------------------
+
+/// Every content form, read back byte for byte as the raw HTTP payload with no
+/// JSON envelope. The axis is the shape and size of the stored MIME content.
+#[tokio::test]
+async fn get_reports_the_stored_bytes_verbatim_as_the_raw_payload() {
+    let cases: Vec<(&str, String, Vec<u8>)> = vec![
+        (
+            "the issue's recorded case",
+            "00000000-0000-0000-0000-000000000001".to_string(),
+            b"From: a@example.com\r\nSubject: original\r\n\r\nbody".to_vec(),
+        ),
+        (
+            "headers only, no body",
+            "headers-only".to_string(),
+            b"Subject: headers only\r\n".to_vec(),
+        ),
+        (
+            "multipart",
+            "multipart-0".to_string(),
+            concat!(
+                "From: sender@example.com\r\n",
+                "Subject: multipart\r\n",
+                "MIME-Version: 1.0\r\n",
+                "Content-Type: multipart/mixed; boundary=\"b0\"\r\n",
+                "\r\n",
+                "--b0\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "first part\r\n",
+                "--b0\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "second part\r\n",
+                "--b0--\r\n",
+            )
+            .as_bytes()
+            .to_vec(),
+        ),
+        (
+            "8-bit body bytes survive unchanged",
+            "eight-bit".to_string(),
+            {
+                let mut content =
+                    b"From: a@example.com\r\nSubject: binary\r\n\r\n".to_vec();
+                content.extend((0u8..=255).rev());
+                content
+            },
+        ),
+        (
+            "minimum-length id",
+            "a".repeat(MESSAGE_ID_MIN_LEN),
+            mime("min id", "body"),
+        ),
+        (
+            "maximum-length id",
+            "m".repeat(MESSAGE_ID_MAX_LEN),
+            mime("max id", "body"),
+        ),
+        ("large content", "large-0".to_string(), {
+            let mut content = b"From: a@example.com\r\nSubject: large\r\n\r\n".to_vec();
+            for index in 0..1024 {
+                content.extend(format!("line {index} {}\r\n", "x".repeat(60)).as_bytes());
+            }
+            content
+        }),
+    ];
+
+    for (case, message_id, content) in cases {
+        let message_id = message_id.as_str();
+        let emulator = Emulator::new();
+        emulator.seed_message(message_id, &content);
+
+        let reply = emulator.get_raw_message_content(REGION, message_id).await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case:?}: expected HTTP 200, got {} ({})",
+            reply.status,
+            reply.summary()
+        );
+        assert_eq!(
+            reply.payload.as_ref(),
+            content.as_slice(),
+            "case {case:?}: expected the stored bytes back verbatim, got {}",
+            reply.summary()
+        );
+
+        // A read does not change what the next caller sees.
+        let again = emulator.get_raw_message_content(REGION, message_id).await;
+        assert_eq!(
+            again.payload.as_ref(),
+            content.as_slice(),
+            "case {case:?}: a second read reported something else: {}",
+            again.summary()
+        );
+    }
+}
+
+/// A message that is no longer eligible for update is still readable: freezing
+/// stops `PutRawMessageContent`, not `GetRawMessageContent`.
+#[tokio::test]
+async fn get_reports_a_frozen_message_too() {
+    let emulator = Emulator::new();
+    let content = mime("frozen", "body");
+    emulator.with_state(|state| {
+        state.seed_in_transit_message("frozen-0", content.clone()).frozen = true;
+    });
+
+    let reply = emulator.get_raw_message_content(REGION, "frozen-0").await;
+    assert_eq!(
+        reply.status, 200,
+        "case \"frozen\": expected HTTP 200, got {} ({})",
+        reply.status,
+        reply.summary()
+    );
+    assert_eq!(
+        reply.payload.as_ref(),
+        content.as_slice(),
+        "case \"frozen\": expected the stored bytes, got {}",
+        reply.summary()
+    );
+}
+
+/// An id no message is stored under is a 404 `ResourceNotFoundException`, whatever
+/// form the id takes.
+#[tokio::test]
+async fn get_of_an_unknown_message_is_not_found() {
+    let emulator = Emulator::new();
+    emulator.seed_message("present-0", &mime("present", "body"));
+
+    let cases = [
+        ("the issue's unknown id", "does-not-exist".to_string()),
+        ("one character", "z".to_string()),
+        ("digits", "123456789".to_string()),
+        ("dashes only", "---".to_string()),
+        ("a near miss on a stored id", "present-1".to_string()),
+        ("maximum-length unknown id", "q".repeat(MESSAGE_ID_MAX_LEN)),
+    ];
+
+    for (case, message_id) in cases {
+        let reply = emulator.get_raw_message_content(REGION, &message_id).await;
+        assert_eq!(
+            reply.status, 404,
+            "case {case:?}: expected HTTP 404, got {} ({})",
+            reply.status,
+            reply.summary()
+        );
+        assert_eq!(
+            reply.error_type, "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {:?}",
+            reply.error_type
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PutRawMessageContent resolves the reference and replaces the stored content.
+// ---------------------------------------------------------------------------
+
+/// The acceptance demo, over a table: seed, read the original, put a reference to
+/// different content, read the new content. The axis is the content being
+/// installed and the form of the reference that names it.
+#[tokio::test]
+async fn put_replaces_the_stored_content_and_the_next_get_reports_it() {
+    let cases: Vec<(&str, S3Ref, Vec<u8>)> = vec![
+        (
+            "the issue's recorded case",
+            reference("updated/message-mime"),
+            b"Subject: rewritten".to_vec(),
+        ),
+        (
+            "a versioned reference",
+            S3Ref::new(BUCKET, "updated/message-mime", Some("v2".to_string())),
+            mime("rewritten at v2", "body"),
+        ),
+        (
+            "content shorter than the original",
+            reference("short"),
+            b"Subject: s\r\n".to_vec(),
+        ),
+        ("content much longer than the original", reference("long"), {
+            let mut content = b"From: a@example.com\r\nSubject: long\r\n\r\n".to_vec();
+            for index in 0..512 {
+                content.extend(format!("paragraph {index}\r\n").as_bytes());
+            }
+            content
+        }),
+        (
+            "multipart content",
+            reference("multipart/object"),
+            concat!(
+                "From: sender@example.com\r\n",
+                "Subject: rewritten multipart\r\n",
+                "MIME-Version: 1.0\r\n",
+                "Content-Type: multipart/alternative; boundary=\"zz\"\r\n",
+                "\r\n",
+                "--zz\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "text\r\n",
+                "--zz\r\n",
+                "Content-Type: text/html\r\n\r\n",
+                "<p>html</p>\r\n",
+                "--zz--\r\n",
+            )
+            .as_bytes()
+            .to_vec(),
+        ),
+        (
+            "a line exactly at the RFC 5321 limit",
+            reference("at-the-limit"),
+            padded_line_message(MAX_LINE_OCTETS),
+        ),
+        (
+            "a bucket name at the modeled minimum length",
+            S3Ref::new("abc", "k", None),
+            mime("tiny bucket", "body"),
+        ),
+    ];
+
+    for (case, s3_reference, replacement) in cases {
+        let emulator = Emulator::new();
+        let message_id = "00000000-0000-0000-0000-000000000001";
+        let original = b"From: a@example.com\r\nSubject: original\r\n\r\nbody".to_vec();
+        emulator.seed_message(message_id, &original);
+        emulator.seed_object(&s3_reference, S3Object::new(replacement.clone()));
+
+        let before = emulator.get_raw_message_content(REGION, message_id).await;
+        assert_eq!(
+            before.payload.as_ref(),
+            original.as_slice(),
+            "case {case:?}: expected the seeded content before the update, got {}",
+            before.summary()
+        );
+
+        let put = emulator
+            .put_raw_message_content(REGION, message_id, &s3_reference)
+            .await;
+        assert_eq!(
+            put.status, 200,
+            "case {case:?}: expected HTTP 200 from the update, got {} ({})",
+            put.status,
+            put.summary()
+        );
+        // `PutRawMessageContentResponse` has no members, so the framework renders
+        // it as the empty restJson1 document.
+        assert!(
+            put.payload.is_empty() || put.json() == json!({}),
+            "case {case:?}: expected a response carrying no members, got {}",
+            put.summary()
+        );
+
+        let after = emulator.get_raw_message_content(REGION, message_id).await;
+        assert_eq!(
+            after.status, 200,
+            "case {case:?}: expected HTTP 200 after the update, got {} ({})",
+            after.status,
+            after.summary()
+        );
+        assert_eq!(
+            after.payload.as_ref(),
+            replacement.as_slice(),
+            "case {case:?}: expected the resolved object's bytes, got {}",
+            after.summary()
+        );
+        assert_ne!(
+            after.payload.as_ref(),
+            original.as_slice(),
+            "case {case:?}: the update did not change the stored content"
+        );
+    }
+}
+
+/// The accepted reference is retained whole, object version included, so the
+/// update that produced the current content stays observable. Only the two modeled
+/// operations are on the wire, and neither reports it, so this one assertion reads
+/// the store.
+#[tokio::test]
+async fn an_accepted_reference_is_retained_with_its_object_version() {
+    let cases = [
+        ("unversioned", None),
+        ("versioned", Some("3HL4kqtJlcpXroDTDmJ+rmSpXd3dIbrHY+MTRCxf3vjVBH40Nr8X8gdRQBpUMLUo")),
+        ("a one-character version", Some("1")),
+    ];
+
+    for (case, version) in cases {
+        let emulator = Emulator::new();
+        let message_id = "retained-0";
+        emulator.seed_message(message_id, &mime("original", "body"));
+        let s3_reference = S3Ref::new(BUCKET, "updated/object", version.map(str::to_string));
+        emulator.seed_object(&s3_reference, S3Object::new(mime("rewritten", "body")));
+
+        let put = emulator
+            .put_raw_message_content(REGION, message_id, &s3_reference)
+            .await;
+        assert_eq!(
+            put.status, 200,
+            "case {case:?}: expected HTTP 200, got {} ({})",
+            put.status,
+            put.summary()
+        );
+
+        let retained = emulator.with_state(|state| {
+            state
+                .messages
+                .get(message_id)
+                .and_then(|message| message.last_s3_reference.clone())
+        });
+        assert_eq!(
+            retained,
+            Some(s3_reference.clone()),
+            "case {case:?}: expected the accepted reference to be retained whole, got {retained:?}"
+        );
+    }
+}
+
+/// An update to a message that is not in transit is a 404, and nothing is written.
+#[tokio::test]
+async fn put_to_an_unknown_message_is_not_found() {
+    let emulator = Emulator::new();
+    let s3_reference = reference("updated/object");
+    emulator.seed_object(&s3_reference, S3Object::new(mime("rewritten", "body")));
+
+    let cases = [
+        ("the issue's unknown id", "does-not-exist".to_string()),
+        ("one character", "q".to_string()),
+        ("maximum-length unknown id", "w".repeat(MESSAGE_ID_MAX_LEN)),
+    ];
+
+    for (case, message_id) in cases {
+        let reply = emulator
+            .put_raw_message_content(REGION, &message_id, &s3_reference)
+            .await;
+        assert_eq!(
+            reply.status, 404,
+            "case {case:?}: expected HTTP 404, got {} ({})",
+            reply.status,
+            reply.summary()
+        );
+        assert_eq!(
+            reply.error_type, "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {:?}",
+            reply.error_type
+        );
+        let readback = emulator.get_raw_message_content(REGION, &message_id).await;
+        assert_eq!(
+            readback.status, 404,
+            "case {case:?}: the refused update created a message: {}",
+            readback.summary()
+        );
+    }
+}
+
+/// A frozen message refuses the update with `MessageFrozen` and keeps its content.
+#[tokio::test]
+async fn put_to_a_frozen_message_is_refused_and_changes_nothing() {
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("plain", mime("frozen plain", "body")),
+        ("headers only", b"Subject: frozen\r\n".to_vec()),
+    ];
+
+    for (case, original) in cases {
+        let emulator = Emulator::new();
+        let message_id = "frozen-1";
+        emulator.with_state(|state| {
+            state
+                .seed_in_transit_message(message_id, original.clone())
+                .frozen = true;
+        });
+        let s3_reference = reference("updated/object");
+        emulator.seed_object(&s3_reference, S3Object::new(mime("rewritten", "body")));
+
+        let reply = emulator
+            .put_raw_message_content(REGION, message_id, &s3_reference)
+            .await;
+        assert_eq!(
+            reply.status, 400,
+            "case {case:?}: expected HTTP 400, got {} ({})",
+            reply.status,
+            reply.summary()
+        );
+        assert_eq!(
+            reply.error_type, "MessageFrozen",
+            "case {case:?}: expected MessageFrozen, got {:?}",
+            reply.error_type
+        );
+
+        let after = emulator.get_raw_message_content(REGION, message_id).await;
+        assert_eq!(
+            after.payload.as_ref(),
+            original.as_slice(),
+            "case {case:?}: the refused update changed the stored content: {}",
+            after.summary()
+        );
+    }
+}
+
+/// Every way a reference can fail to resolve to a readable object answers
+/// `InvalidContentLocation` and leaves the message alone. The rows are the
+/// documented reasons: nothing stored there, the bucket's region is not the
+/// request's region, and the bucket owner is not the calling account.
+#[tokio::test]
+async fn put_with_an_unreadable_object_is_an_invalid_content_location() {
+    let stored = reference("updated/message-mime");
+    let versioned = S3Ref::new(BUCKET, "versioned/object", Some("v1".to_string()));
+
+    let cases: Vec<(&str, S3Ref)> = vec![
+        ("the issue's missing key", reference("missing/object")),
+        ("an unknown bucket", S3Ref::new("otherbucket", stored.key.clone(), None)),
+        (
+            "a version that is not stored",
+            S3Ref::new(BUCKET, versioned.key.clone(), Some("v9".to_string())),
+        ),
+        (
+            "an unversioned reference to a versioned object",
+            S3Ref::new(BUCKET, versioned.key.clone(), None),
+        ),
+        ("an object in another region", reference("other-region/object")),
+        ("an object owned by another account", reference("other-owner/object")),
+    ];
+
+    for (case, s3_reference) in cases {
+        let emulator = Emulator::new();
+        let message_id = "00000000-0000-0000-0000-000000000001";
+        let original = mime("original", "body");
+        emulator.seed_message(message_id, &original);
+        emulator.seed_object(&stored, S3Object::new(mime("rewritten", "body")));
+        emulator.seed_object(&versioned, S3Object::new(mime("rewritten v1", "body")));
+        emulator.seed_object(
+            &reference("other-region/object"),
+            S3Object::new(mime("elsewhere", "body")).in_region("eu-west-1"),
+        );
+        emulator.seed_object(
+            &reference("other-owner/object"),
+            S3Object::new(mime("someone else's", "body")).owned_by("210987654321"),
+        );
+
+        let reply = emulator
+            .put_raw_message_content(REGION, message_id, &s3_reference)
+            .await;
+        assert_eq!(
+            reply.status, 400,
+            "case {case:?}: expected HTTP 400, got {} ({})",
+            reply.status,
+            reply.summary()
+        );
+        assert_eq!(
+            reply.error_type, "InvalidContentLocation",
+            "case {case:?}: expected InvalidContentLocation, got {:?} ({})",
+            reply.error_type,
+            reply.summary()
+        );
+
+        let after = emulator.get_raw_message_content(REGION, message_id).await;
+        assert_eq!(
+            after.payload.as_ref(),
+            original.as_slice(),
+            "case {case:?}: the refused update changed the stored content: {}",
+            after.summary()
+        );
+    }
+
+    // The control: the same object, referenced correctly, is accepted — so the
+    // rows above fail for the reason under test and not because the fixture is
+    // broken.
+    let emulator = Emulator::new();
+    emulator.seed_message("control-0", &mime("original", "body"));
+    emulator.seed_object(&stored, S3Object::new(mime("rewritten", "body")));
+    let reply = emulator
+        .put_raw_message_content(REGION, "control-0", &stored)
+        .await;
+    assert_eq!(
+        reply.status, 200,
+        "case \"control\": expected HTTP 200, got {} ({})",
+        reply.status,
+        reply.summary()
+    );
+}
+
+/// An object in the request's own region resolves; the same object in any other
+/// region does not. The axis is the region pair.
+#[tokio::test]
+async fn an_object_resolves_only_in_the_region_the_request_was_made_in() {
+    let cases = [
+        ("us-east-1", "us-east-1", true),
+        ("us-west-2", "us-west-2", true),
+        ("eu-central-1", "eu-central-1", true),
+        ("us-east-1", "us-west-2", false),
+        ("eu-west-1", "us-east-1", false),
+        ("ap-southeast-2", "eu-central-1", false),
+    ];
+
+    for (request_region, bucket_region, expected_ok) in cases {
+        let case = format!("request in {request_region}, bucket in {bucket_region}");
+        let emulator = Emulator::new();
+        let message_id = "region-0";
+        let original = mime("original", "body");
+        let replacement = mime("rewritten", "body");
+        emulator.seed_message(message_id, &original);
+        let s3_reference = reference("updated/object");
+        emulator.seed_object(
+            &s3_reference,
+            S3Object::new(replacement.clone()).in_region(bucket_region),
+        );
+
+        let reply = emulator
+            .put_raw_message_content(request_region, message_id, &s3_reference)
+            .await;
+        let after = emulator
+            .get_raw_message_content(request_region, message_id)
+            .await;
+        if expected_ok {
+            assert_eq!(
+                reply.status, 200,
+                "case {case:?}: expected HTTP 200, got {} ({})",
+                reply.status,
+                reply.summary()
+            );
+            assert_eq!(
+                after.payload.as_ref(),
+                replacement.as_slice(),
+                "case {case:?}: expected the resolved bytes, got {}",
+                after.summary()
+            );
+        } else {
+            assert_eq!(
+                reply.status, 400,
+                "case {case:?}: expected HTTP 400, got {} ({})",
+                reply.status,
+                reply.summary()
+            );
+            assert_eq!(
+                reply.error_type, "InvalidContentLocation",
+                "case {case:?}: expected InvalidContentLocation, got {:?}",
+                reply.error_type
+            );
+            assert_eq!(
+                after.payload.as_ref(),
+                original.as_slice(),
+                "case {case:?}: the refused update changed the stored content: {}",
+                after.summary()
+            );
+        }
+    }
+}
+
+/// A message whose MIME content breaks one of the documented criteria is rejected
+/// with `MessageRejected`, and the stored content is untouched. Each row is one
+/// criterion from the `RawMessageContent` documentation; the accepted rows pin the
+/// published bound from the inside.
+#[tokio::test]
+async fn put_with_unusable_mime_content_is_rejected() {
+    let refused: Vec<(&str, Vec<u8>)> = vec![
+        ("an empty object", Vec::new()),
+        (
+            "no header field at all",
+            b"this is not a message at all\r\n".to_vec(),
+        ),
+        ("a header field with an empty name", b": no name\r\n\r\nbody".to_vec()),
+        (
+            "a header name containing a space",
+            b"Bad Header Name\r\n\r\nbody".to_vec(),
+        ),
+        (
+            "one octet past the RFC 5321 line limit",
+            padded_line_message(MAX_LINE_OCTETS + 1),
+        ),
+        (
+            "far past the RFC 5321 line limit",
+            padded_line_message(MAX_LINE_OCTETS * 4),
+        ),
+        (
+            "a duplicated Subject header",
+            b"From: a@example.com\r\nSubject: one\r\nSubject: two\r\n\r\nbody\r\n".to_vec(),
+        ),
+        (
+            "a duplicated From header",
+            b"From: a@example.com\r\nFrom: b@example.com\r\nSubject: s\r\n\r\nbody\r\n".to_vec(),
+        ),
+        (
+            "a duplicated Message-ID header, in different cases",
+            b"message-id: <1@example.com>\r\nMESSAGE-ID: <2@example.com>\r\n\r\nbody\r\n".to_vec(),
+        ),
+        (
+            "a duplicated Subject header, the second one folded over two lines",
+            b"Subject: one\r\nSubject: two\r\n and more\r\n\r\nbody\r\n".to_vec(),
+        ),
+    ];
+
+    for (case, content) in refused {
+        let emulator = Emulator::new();
+        let message_id = "mime-0";
+        let original = mime("original", "body");
+        emulator.seed_message(message_id, &original);
+        let s3_reference = reference("updated/object");
+        emulator.seed_object(&s3_reference, S3Object::new(content));
+
+        let reply = emulator
+            .put_raw_message_content(REGION, message_id, &s3_reference)
+            .await;
+        assert_eq!(
+            reply.status, 400,
+            "case {case:?}: expected HTTP 400, got {} ({})",
+            reply.status,
+            reply.summary()
+        );
+        assert_eq!(
+            reply.error_type, "MessageRejected",
+            "case {case:?}: expected MessageRejected, got {:?} ({})",
+            reply.error_type,
+            reply.summary()
+        );
+        assert!(
+            !reply.json()["message"]
+                .as_str()
+                .unwrap_or_default()
+                .is_empty(),
+            "case {case:?}: expected a message saying what caused the rejection, got {}",
+            reply.summary()
+        );
+
+        let after = emulator.get_raw_message_content(REGION, message_id).await;
+        assert_eq!(
+            after.payload.as_ref(),
+            original.as_slice(),
+            "case {case:?}: the rejected update changed the stored content: {}",
+            after.summary()
+        );
+    }
+
+    let accepted: Vec<(&str, Vec<u8>)> = vec![
+        ("a line exactly at the limit", padded_line_message(MAX_LINE_OCTETS)),
+        (
+            "a line one octet inside the limit",
+            padded_line_message(MAX_LINE_OCTETS - 1),
+        ),
+        (
+            "the shortest possible header-only message",
+            b"a:\r\n".to_vec(),
+        ),
+        (
+            "a header that may repeat, repeated",
+            b"From: a@example.com\r\nReceived: by one\r\nReceived: by two\r\n\r\nbody\r\n".to_vec(),
+        ),
+        (
+            "a folded continuation line is not a second header",
+            b"From: a@example.com\r\nSubject: one\r\n continued here\r\n\r\nbody\r\n".to_vec(),
+        ),
+    ];
+    for (case, content) in accepted {
+        let emulator = Emulator::new();
+        let message_id = "mime-1";
+        emulator.seed_message(message_id, &mime("original", "body"));
+        let s3_reference = reference("updated/object");
+        emulator.seed_object(&s3_reference, S3Object::new(content.clone()));
+
+        let reply = emulator
+            .put_raw_message_content(REGION, message_id, &s3_reference)
+            .await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case:?}: expected HTTP 200, got {} ({})",
+            reply.status,
+            reply.summary()
+        );
+        let after = emulator.get_raw_message_content(REGION, message_id).await;
+        assert_eq!(
+            after.payload.as_ref(),
+            content.as_slice(),
+            "case {case:?}: expected the accepted content back, got {}",
+            after.summary()
+        );
+    }
+}
+
+/// A message with one header line of exactly `octets` octets, counting its CRLF.
+fn padded_line_message(octets: usize) -> Vec<u8> {
+    let prefix = "X-Pad: ";
+    let padding = octets
+        .saturating_sub(prefix.len() + "\r\n".len())
+        .max(1);
+    format!(
+        "From: a@example.com\r\n{prefix}{}\r\n\r\nbody\r\n",
+        "a".repeat(padding)
+    )
+    .into_bytes()
+}
+
+// ---------------------------------------------------------------------------
+// The round-trip invariants, over a generated spread of inputs.
+// ---------------------------------------------------------------------------
+
+/// What the store holds is what `GetRawMessageContent` reports, for any bytes: the
+/// operation returns the payload verbatim and never interprets it.
+///
+/// The cases are generated rather than listed, so the spread covers lengths from
+/// empty to a few kilobytes and every byte value, not a handful of hand-picked
+/// strings. They are generated arithmetically (no generator crate is installed),
+/// so every run drives exactly the same inputs and a failure names its case index.
+#[tokio::test]
+async fn get_round_trips_every_generated_byte_pattern() {
+    for case in 0..GENERATED_CASES {
+        let message_id = case_message_id(case);
+        let content = case_bytes(case);
+        let emulator = Emulator::new();
+        emulator.seed_message(&message_id, &content);
+
+        let reply = emulator.get_raw_message_content(REGION, &message_id).await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case} (id {message_id:?}, {} byte(s)): expected HTTP 200, got {} ({})",
+            content.len(),
+            reply.status,
+            reply.summary()
+        );
+        assert_eq!(
+            reply.payload.as_ref(),
+            content.as_slice(),
+            "case {case} (id {message_id:?}): expected the stored bytes back, got {}",
+            reply.summary()
+        );
+    }
+}
+
+/// What `PutRawMessageContent` resolves is what the next `GetRawMessageContent`
+/// reports, for any MIME content: the update installs the object's bytes unchanged.
+#[tokio::test]
+async fn put_then_get_round_trips_every_generated_mime_message() {
+    for case in 0..GENERATED_CASES {
+        let message_id = case_message_id(case);
+        let original = case_mime(case);
+        let replacement = case_mime(case + GENERATED_CASES);
+        let s3_reference = S3Ref::new(
+            BUCKET,
+            format!("objects/{case}"),
+            // Half the cases name a version, half do not.
+            if case % 2 == 0 {
+                Some(format!("v{case}"))
+            } else {
+                None
+            },
+        );
+
+        let emulator = Emulator::new();
+        emulator.seed_message(&message_id, &original);
+        emulator.seed_object(&s3_reference, S3Object::new(replacement.clone()));
+
+        let put = emulator
+            .put_raw_message_content(REGION, &message_id, &s3_reference)
+            .await;
+        assert_eq!(
+            put.status, 200,
+            "case {case} (id {message_id:?}, {} byte(s)): expected HTTP 200, got {} ({})",
+            replacement.len(),
+            put.status,
+            put.summary()
+        );
+
+        let after = emulator.get_raw_message_content(REGION, &message_id).await;
+        assert_eq!(
+            after.payload.as_ref(),
+            replacement.as_slice(),
+            "case {case} (id {message_id:?}): expected the resolved bytes, got {}",
+            after.summary()
+        );
+    }
+}
+
+/// The id for case `index`, inside the modeled constraint: `len 1..120`,
+/// `^[a-z0-9\-]*$`. The length walks the whole permitted range as `index` grows.
+fn case_message_id(index: usize) -> String {
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789-";
+    let span = MESSAGE_ID_MAX_LEN - MESSAGE_ID_MIN_LEN + 1;
+    let length = MESSAGE_ID_MIN_LEN + (index * 37) % span;
+    (0..length)
+        .map(|position| ALPHABET[(position * 13 + index * 5) % ALPHABET.len()] as char)
+        .collect()
+}
+
+/// The bytes for case `index`: a length between 0 and a few kilobytes, filled with
+/// a byte sequence that walks all 256 values.
+fn case_bytes(index: usize) -> Vec<u8> {
+    let length = (index * 271) % 4096;
+    (0..length)
+        .map(|position| ((position * 31 + index * 17) % 256) as u8)
+        .collect()
+}
+
+/// A well-formed MIME message whose body is [`case_bytes`] mapped into printable
+/// US-ASCII and folded into lines well inside the RFC 5321 limit.
+fn case_mime(index: usize) -> Vec<u8> {
+    let mut content =
+        format!("From: a@example.com\r\nSubject: case {index}\r\n\r\n").into_bytes();
+    for chunk in case_bytes(index).chunks(64) {
+        content.extend(chunk.iter().map(|byte| 33 + (byte % 94)));
+        content.extend(b"\r\n");
+    }
+    content
+}
