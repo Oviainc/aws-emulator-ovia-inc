@@ -19,6 +19,8 @@ mod configuration_lifecycle;
 mod cost_estimation;
 #[path = "all/event_sources_config.rs"]
 mod event_sources_config;
+#[path = "all/insight_feedback.rs"]
+mod insight_feedback;
 #[path = "all/insight_listing.rs"]
 mod insight_listing;
 #[path = "all/insight_reads.rs"]

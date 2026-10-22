@@ -7,7 +7,8 @@
 //! adds (`AddNotificationChannel`), the service-integration configuration it sets
 //! (`UpdateServiceIntegration`), the event-source integration it toggles
 //! (`UpdateEventSourcesConfig`) and the cost estimation it starts
-//! (`StartCostEstimation`).
+//! (`StartCostEstimation`). Insight feedback a client submits (`PutFeedback`) lives
+//! here too, in [`ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::insight_feedback`].
 //!
 //! Insights are produced by DevOps Guru's own analysis, never by a client call, so
 //! [`ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::insights`] is the map
@@ -44,6 +45,19 @@ pub struct ComAmazonawsDevopsguruCapstonecontrolplaneserviceState {
     /// The last `UpdateEventSourcesConfig` configuration, which
     /// `DescribeEventSourcesConfig` reports.
     pub event_sources: EventSourcesRecord,
+    /// Insight feedback the client submitted through `PutFeedback`, keyed by the
+    /// `InsightFeedback.Id` it named, and reported by `DescribeFeedback`.
+    ///
+    /// One entry per insight: `PutFeedback` is a PUT, and `DescribeFeedback`
+    /// reports "the most recent feedback submitted", so resubmitting feedback for
+    /// the same insight replaces what was stored for it rather than adding a
+    /// second opinion about it. Independent of [`Self::insights`]: DevOps Guru
+    /// accepts feedback about an insight this account has never seen.
+    pub insight_feedback: BTreeMap<String, InsightFeedbackRecord>,
+    /// How many `PutFeedback` submissions this store has accepted, which stamps
+    /// each record's [`InsightFeedbackRecord::submission`] so the one submitted
+    /// most recently is identifiable without a wall clock.
+    pub feedback_submissions: u64,
     /// The insights DevOps Guru's analysis produced for this account, keyed by
     /// `InsightId`.
     ///
@@ -52,6 +66,19 @@ pub struct ComAmazonawsDevopsguruCapstonecontrolplaneserviceState {
     /// writes and what the insight reads walk. A `BTreeMap` because the reads page over
     /// it: the key order is stable, which is what a page cursor needs.
     pub insights: BTreeMap<String, InsightRecord>,
+}
+
+/// One insight's feedback, as `PutFeedback` stored it.
+#[derive(Debug, Clone, Default)]
+pub struct InsightFeedbackRecord {
+    /// `InsightFeedback.Id` — the insight the feedback is about.
+    pub insight_id: String,
+    /// `InsightFeedback.Feedback` (`InsightFeedbackOption`).
+    pub feedback: String,
+    /// The 1-based ordinal of the `PutFeedback` call that wrote this record.
+    /// `DescribeFeedback` with no `InsightId` reports the highest one, which is
+    /// the most recent feedback submitted in this account and Region.
+    pub submission: u64,
 }
 
 /// One insight, as the insight reads report it.
@@ -608,12 +635,13 @@ pub const PAGE_SIZE: usize = 100;
 // Per-entry SIZE is already bounded by the model, which the boundary validator
 // enforces before a handler runs: `StackName` len 1..128, `AppBoundaryKey`
 // len 1..128, `TagValue` len 0..256, `TopicArn` len 36..1024, `KMSKeyId` len
-// 1..2048. Nothing caller-sized reaches the store unchecked.
+// 1..2048, `InsightId` len 1..100. Nothing caller-sized reaches the store unchecked.
 //
 // The product is therefore finite: at most MAX_COVERED_STACK_NAMES stack names, the
 // account's one app-boundary key ([`APP_BOUNDARY_KEYS_PER_ACCOUNT`]) holding at most
-// MAX_TAG_VALUES_PER_KEY values, at most MAX_NOTIFICATION_CHANNELS channels, one
-// service-integration record of fixed shape, and one cost estimation.
+// MAX_TAG_VALUES_PER_KEY values, at most MAX_NOTIFICATION_CHANNELS channels, at most
+// MAX_FEEDBACK_INSIGHTS feedback records, one service-integration record of fixed
+// shape, and one cost estimation.
 //
 // The cost estimation is not a growth site either: `StartCostEstimation` replaces the
 // single record in place, and the collection it stores is bounded by the model
@@ -635,6 +663,14 @@ pub const MAX_COVERED_STACK_NAMES: usize = 500;
 /// holds for the account's app-boundary key. `UpdateTagCollectionFilters` declares no
 /// list length, so without this one request could add arbitrarily many values.
 pub const MAX_TAG_VALUES_PER_KEY: usize = 500;
+
+/// Emulator resource guard, NOT a published AWS quota: the most insights this store
+/// holds feedback for. DevOps Guru models no operation that withdraws feedback, so a
+/// record is never reclaimed; without this one caller could grow the store without
+/// bound by submitting feedback for fresh insight ids. Resubmitting feedback for an
+/// insight already in the store replaces its record and so is never refused. Set well
+/// above any ordinary workflow: a human rates a handful of insights.
+pub const MAX_FEEDBACK_INSIGHTS: usize = 1_000;
 
 /// Emulator resource guard, NOT a published AWS quota: the most notification channels
 /// this store holds. `AddNotificationChannel` refuses past it with the

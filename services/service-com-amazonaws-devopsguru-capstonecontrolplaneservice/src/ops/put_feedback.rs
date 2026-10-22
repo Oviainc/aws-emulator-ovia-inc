@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutFeedback
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutFeedback`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutFeedback::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Collects the customer's feedback about one insight and stores it, so
+//! `DescribeFeedback` reports what was submitted.
+//!
+//! The feedback is keyed by the insight id the request names. DevOps Guru does NOT
+//! check that the insight exists: insights are produced by its own analysis, and a
+//! `PutFeedback` naming an insight this account has never seen is accepted and
+//! persisted all the same. So this handler refuses only a request that names no
+//! insight or no feedback option, and `ResourceNotFoundException` has no reachable
+//! condition here.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +147,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutFeedback` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutFeedbackErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutFeedback"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutFeedbackError::Modeled(PutFeedbackErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the DevOps Guru insight feedback store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            ))
+        })?;
+
+        // A field-level refusal, worded the way the boundary validator words one: the
+        // member that was wrong, and the rule it has to satisfy.
+        let invalid = |member: &str, requirement: String| -> PutFeedbackError {
+            PutFeedbackErrorModeled::ValidationException(ValidationException {
+                message: format!("{member} {requirement}"),
+                reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                fields: Some(vec![ValidationExceptionField {
+                    name: member.to_string(),
+                    message: requirement,
+                }]),
+            })
+            .into()
+        };
+
+        // `InsightFeedback` is the whole payload of this operation: a request without
+        // it collects no feedback about anything.
+        let submitted = input.insight_feedback.as_ref().ok_or_else(|| {
+            invalid(
+                "InsightFeedback",
+                "is required to collect feedback about an insight".to_string(),
+            )
+        })?;
+
+        // Feedback is ABOUT an insight, so it is stored under that insight's id; a
+        // submission naming none identifies nothing to store it against.
+        let insight_id = match submitted.id.as_deref() {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => {
+                return Err(invalid(
+                    "InsightFeedback.Id",
+                    "is required and must be the ID of the insight the feedback is about"
+                        .to_string(),
+                ));
+            }
+        };
+
+        // `Feedback` is what the call collects, so a submission without one records no
+        // opinion about the insight and is refused. A value outside
+        // `InsightFeedbackOption` never reaches here — the boundary validator refuses
+        // it against the model's enum first — and the membership test is what keeps
+        // that true of the store: only a declared option is ever persisted.
+        let feedback = match submitted.feedback.as_deref() {
+            Some(feedback) if INSIGHT_FEEDBACK_OPTION_VALUES.contains(&feedback) => {
+                feedback.to_string()
+            }
+            other => {
+                let allowed = INSIGHT_FEEDBACK_OPTION_VALUES.join(" | ");
+                return Err(invalid(
+                    "InsightFeedback.Feedback",
+                    match other {
+                        Some(value) => format!("must be one of {allowed}, got '{value}'"),
+                        None => format!("is required and must be one of {allowed}"),
+                    },
+                ));
+            }
+        };
+
+        let mut guard = state.lock();
+
+        // STORE BOUND. Nothing withdraws feedback, so the store carries a maximum
+        // entry count; past it a submission about an insight the store holds no
+        // feedback for is refused. `PutFeedback` models no quota-specific error, so
+        // the refusal is the modelled `ThrottlingException` (HTTP 429) carrying the
+        // quota it names — the quota code is this emulator's own name for its resource
+        // guard, not a quota AWS publishes, so no client is expected to match on it.
+        // The retry hint is 0 deliberately: waiting does not clear this condition,
+        // because nothing withdraws feedback, so a positive hint would promise a
+        // retry that cannot succeed. Checked before the write, so a refusal stores
+        // nothing, and replacing an existing record never trips it.
+        if guard.insight_feedback.len() >= crate::state::MAX_FEEDBACK_INSIGHTS
+            && !guard.insight_feedback.contains_key(&insight_id)
+        {
+            return Err(PutFeedbackErrorModeled::ThrottlingException(ThrottlingException {
+                message: format!(
+                    "this account already holds feedback for the maximum of {} insights",
+                    crate::state::MAX_FEEDBACK_INSIGHTS
+                ),
+                quota_code: Some("FeedbackInsightsPerAccount".to_string()),
+                service_code: Some("devops-guru".to_string()),
+                retry_after_seconds: 0,
+            })
+            .into());
+        }
+
+        // Submitting feedback again for the same insight REPLACES that insight's
+        // record: `DescribeFeedback` reports the most recent feedback submitted, so a
+        // customer who changed their mind is reported as having changed it. The
+        // submission ordinal advances on every accepted call, which is what makes the
+        // most recent submission across insights identifiable.
+        guard.feedback_submissions += 1;
+        let submission = guard.feedback_submissions;
+        guard.insight_feedback.insert(
+            insight_id.clone(),
+            crate::state::InsightFeedbackRecord {
+                insight_id,
+                feedback,
+                submission,
+            },
+        );
+
+        Ok(PutFeedbackOutput::default())
     }
 }
