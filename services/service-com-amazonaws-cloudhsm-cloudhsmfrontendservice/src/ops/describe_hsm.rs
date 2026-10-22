@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeHsm
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeHsm`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeHsm::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one stored HSM, resolved by `HsmArn` or `HsmSerialNumber`. Every member of
+//! the answer comes out of the [`crate::state::Hsm`] record `CreateHsm` persisted; the
+//! only thing this operation writes is the `PENDING` -> `RUNNING` transition the clock
+//! has already made due.
 //!
 //! ## Shape of an operation
 //!
@@ -181,20 +177,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeHsm` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeHsmErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeHsm"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeHsmErrorModeled::CloudHsmInternalException(CloudHsmInternalException {
+                message: Some("the CloudHSM store is unavailable".to_string()),
+                retryable: false,
+            })
+        })?;
+        // The guard is mutable only so the clock-owed PENDING -> RUNNING transition can
+        // be written down. Nothing else about the record changes on a describe.
+        let mut state = state.lock();
+        materialize_due_transitions(&mut state);
+
+        // Both members are optional in the model, but one of them has to identify an
+        // HSM: the model cannot express "at least one of", so the handler enforces it.
+        let arn = match (input.hsm_arn.as_deref(), input.hsm_serial_number.as_deref()) {
+            (None, None) => {
+                return Err(DescribeHsmErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(
+                            "specify either HsmArn or HsmSerialNumber to identify the HSM"
+                                .to_string(),
+                        ),
+                        retryable: false,
+                    },
+                )
+                .into())
+            }
+            // An ARN and a serial number both given must name the SAME HSM; a pair no
+            // stored HSM satisfies identifies nothing.
+            (Some(arn), Some(serial)) => state
+                .hsms
+                .get(arn)
+                .filter(|hsm| hsm.serial_number == serial)
+                .map(|hsm| hsm.hsm_arn.clone()),
+            (Some(arn), None) => state.hsms.get(arn).map(|hsm| hsm.hsm_arn.clone()),
+            (None, Some(serial)) => state.hsm_arn_by_serial_number(serial),
+        };
+
+        // A well-formed identifier no stored HSM answers to is a service exception, not
+        // an empty success: the caller asked about an HSM that does not exist.
+        let Some(hsm) = arn.and_then(|arn| state.hsms.get(&arn)) else {
+            return Err(DescribeHsmErrorModeled::CloudHsmServiceException(
+                CloudHsmServiceException {
+                    message: Some("no HSM matches the identifier in the request".to_string()),
+                    retryable: false,
+                },
+            )
+            .into());
+        };
+
+        Ok(hsm.to_describe_output())
+    }
+}
+
+/// Write down every transition the clock has already made due.
+///
+/// A provisioning HSM becomes `RUNNING` [`crate::state::PROVISIONING_DELAY`] after its
+/// create, whether or not anybody describes it, so materialising it here reports a
+/// change that was already owed at this instant rather than one this call caused.
+fn materialize_due_transitions(
+    state: &mut crate::state::ComAmazonawsCloudhsmCloudhsmfrontendserviceState,
+) {
+    let now = ::std::time::SystemTime::now();
+    for hsm in state.hsms.values_mut() {
+        hsm.materialize_due(now);
     }
 }
