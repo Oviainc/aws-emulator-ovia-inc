@@ -1128,3 +1128,183 @@ async fn the_remembered_transaction_tokens_are_budgeted() {
         "case the newest token: it is still remembered, got {still_counted}"
     );
 }
+
+/// A transactional refusal's CLASS says where it was decided: one the transaction
+/// reaches while keying the item an element writes CANCELS the transaction, so the
+/// answer is `TransactionCanceledException` whose `CancellationReasons` name that
+/// element `ValidationError` and every other element `None`; one the service decides
+/// about the REQUEST, before any element is applied, is a plain `ValidationException`
+/// with no reasons at all.
+///
+/// "ValidationError - Code: ValidationError, Message: One or more parameter values were
+/// invalid" ("Cancellation reason codes and possible error messages", the
+/// `TransactWriteItems` doc). The rows span what the refusal is about (an item whose key
+/// attribute is not of the type the table declares, a `Key` member that does not name
+/// this table's key, an item addressed twice, an entry naming no action), which position
+/// in the transaction carries it, and how many elements stand beside it — and in every
+/// row the element that would otherwise have landed did not.
+#[tokio::test]
+async fn a_refusals_class_says_whether_the_transaction_was_cancelled() {
+    let router = emulator();
+    let table = "transact-failure-class";
+    create_active_table(&router, table, &[("pk", "HASH", "S")]).await;
+
+    // The element nothing is wrong with, which must not land in any row.
+    let innocent = json!({
+        "Put": {"TableName": table, "Item": {"pk": {"S": "innocent"}, "ver": {"N": "1"}}}
+    });
+    // A `Put` whose ITEM types the partition key as a number, which the table declares
+    // as a string: the transaction reaches that when it keys the item.
+    let mistyped_item = json!({
+        "Put": {"TableName": table, "Item": {"pk": {"N": "1"}, "ver": {"N": "1"}}}
+    });
+
+    // One row: what it is called, the elements it sends, the error code it must be
+    // answered with, and the `CancellationReason$Code`s that answer carries (`None`
+    // when a request-level refusal carries no reasons at all).
+    struct Row {
+        case: &'static str,
+        elements: Vec<Value>,
+        code: &'static str,
+        reasons: Option<Vec<&'static str>>,
+    }
+    let cases: Vec<Row> = vec![
+        Row {
+            case: "an item typing the key attribute the table does not",
+            elements: vec![mistyped_item.clone()],
+            code: "TransactionCanceledException",
+            reasons: Some(vec!["ValidationError"]),
+        },
+        Row {
+            case: "that item after an element nothing is wrong with",
+            elements: vec![innocent.clone(), mistyped_item.clone()],
+            code: "TransactionCanceledException",
+            reasons: Some(vec!["None", "ValidationError"]),
+        },
+        Row {
+            case: "that item before two elements nothing is wrong with",
+            elements: vec![
+                mistyped_item.clone(),
+                innocent.clone(),
+                json!({"Delete": {"TableName": table, "Key": {"pk": {"S": "absent"}}}}),
+            ],
+            code: "TransactionCanceledException",
+            reasons: Some(vec!["ValidationError", "None", "None"]),
+        },
+        Row {
+            case: "a Key member that does not name this table's key",
+            elements: vec![
+                innocent.clone(),
+                json!({"Delete": {"TableName": table, "Key": {"other": {"S": "x"}}}}),
+            ],
+            code: "ValidationException",
+            reasons: None,
+        },
+        Row {
+            case: "a Key member typing the key attribute the table does not",
+            elements: vec![
+                innocent.clone(),
+                json!({"Update": {
+                    "TableName": table,
+                    "Key": {"pk": {"N": "1"}},
+                    "UpdateExpression": "SET ver = :one",
+                    "ExpressionAttributeValues": {":one": {"N": "1"}},
+                }}),
+            ],
+            code: "ValidationException",
+            reasons: None,
+        },
+        Row {
+            case: "one item addressed twice",
+            elements: vec![
+                innocent.clone(),
+                json!({"Delete": {"TableName": table, "Key": {"pk": {"S": "innocent"}}}}),
+            ],
+            code: "ValidationException",
+            reasons: None,
+        },
+        Row {
+            case: "an entry naming no action",
+            elements: vec![innocent.clone(), json!({})],
+            code: "ValidationException",
+            reasons: None,
+        },
+    ];
+    for Row {
+        case,
+        elements,
+        code,
+        reasons,
+    } in cases
+    {
+        let (status, refused) = call(
+            &router,
+            "TransactWriteItems",
+            json!({"TransactItems": elements}),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case}: expected HTTP 400, got {status} with {refused}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            code,
+            "case {case}: expected {code}, got {refused}"
+        );
+        match reasons {
+            None => assert!(
+                refused.get("CancellationReasons").is_none(),
+                "case {case}: a request-level refusal carries no reasons, got {refused}"
+            ),
+            Some(expected) => {
+                let reported: Vec<String> = refused["CancellationReasons"]
+                    .as_array()
+                    .map(|reasons| {
+                        reasons
+                            .iter()
+                            .map(|reason| reason["Code"].as_str().unwrap_or_default().to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                assert_eq!(
+                    reported, expected,
+                    "case {case}: expected the reason codes {expected:?}, got {refused}"
+                );
+                let at = expected
+                    .iter()
+                    .position(|code| *code == "ValidationError")
+                    .expect("a row that cancels names the refused element");
+                let message = refused["CancellationReasons"][at]["Message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                assert!(
+                    message.starts_with("One or more parameter values were invalid"),
+                    "case {case}: the refused element's reason states the documented clause, \
+                     got {message:?}"
+                );
+                for (index, reason) in refused["CancellationReasons"]
+                    .as_array()
+                    .expect("the reported reasons")
+                    .iter()
+                    .enumerate()
+                {
+                    if index != at {
+                        assert!(
+                            reason.get("Message").is_none(),
+                            "case {case}: the element nothing was wrong with carries no \
+                             message, got {reason}"
+                        );
+                    }
+                }
+            }
+        }
+        let absent = stored(&router, table, &json!({"pk": {"S": "innocent"}})).await;
+        assert_eq!(
+            absent,
+            Value::Null,
+            "case {case}: the element that would have landed did not, got {absent}"
+        );
+    }
+}
