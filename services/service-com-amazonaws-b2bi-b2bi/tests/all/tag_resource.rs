@@ -7,10 +7,12 @@
 //! RULE under test: `TagResource` attaches the key-value pairs it is given to the
 //! resource whose ARN it names — a key the resource does not carry yet is ADDED, a key it
 //! already carries has its value REPLACED, and every other tag on that resource, and
-//! every other resource, is left as it was. An ARN that does not satisfy the ARN grammar
-//! is a client-side mistake, refused with the modelled `ValidationException` (400); a
-//! well-formed ARN naming no resource this service holds is the modelled
-//! `ResourceNotFoundException` (404); and neither refusal writes anything.
+//! every other resource, is left as it was. An ARN this write cannot act on is refused
+//! with the modelled `ValidationException` (400) and writes nothing — both a value that
+//! does not satisfy the ARN grammar and a well-formed ARN naming no resource this service
+//! holds, which is the answer RECORDED against AWS for this operation (trace
+//! `b2bi.tag-resource-nonexistent-arn-not-found`). The reporting `ListTagsForResource`
+//! keeps the 404 for that second class (see `tagging.rs`).
 //!
 //! Each test asserts that rule over a TABLE of inputs rather than one recorded request:
 //! the rows differ along the resource kind, the tags the resource already carries, the
@@ -285,8 +287,7 @@ async fn tag_resource_writes_only_the_resource_its_arn_names() {
 /// RULE: a `ResourceARN` that does not satisfy the ARN grammar
 /// `arn:<partition>:<service>:<region>:<account-id>:<resource>` is refused with the
 /// modelled `ValidationException` (HTTP 400) — a client-side syntax error, answered
-/// without any lookup, so it is NOT the 404 a well-formed ARN gets — and the refusal
-/// writes nothing.
+/// without any lookup at all — and the refusal writes nothing.
 ///
 /// The rows span a value with no colons at all, a truncated ARN at each field count the
 /// grammar needs, an empty partition / service / resource field, the `arn` prefix
@@ -362,17 +363,26 @@ async fn an_arn_that_is_not_an_arn_is_refused_with_validation_exception() {
     );
 }
 
-/// RULE: a well-formed ARN that names no resource this service holds is the modelled
-/// `ResourceNotFoundException` (HTTP 404) — including a stored resource's own ARN once it
-/// is deleted, and an ARN differing from a stored one only in the partition, the region or
-/// the account it names (AWS: "the resource exists in a region other than the region
-/// specified in the API call").
+/// RULE: a well-formed ARN that this WRITE cannot act on — one that names no resource this
+/// service holds — is refused with the modelled `ValidationException` (HTTP 400) and
+/// writes nothing, including a stored resource's own ARN once it is deleted and an ARN
+/// differing from a stored one only in the partition, the region or the account it names
+/// (AWS: "the resource exists in a region other than the region specified in the API
+/// call").
+///
+/// 400 rather than 404 is the RECORDED answer for this operation: trace
+/// `b2bi.tag-resource-nonexistent-arn-not-found`, in
+/// `issues/things-that-now-work/20261022T031134Z-b2bi-tagging-test-harness-and-transformer-operations-answer.md`
+/// (cause 1), asserts `ValidationException` for tagging a deleted profile's well-formed
+/// ARN — this write validates `ResourceARN` as the request parameter it is. The REPORTING
+/// `ListTagsForResource` keeps the 404 for the same class of ARN (see `tagging.rs`), which
+/// is the split the recordings show.
 ///
 /// The rows span an unknown id of each resource kind, another service's ARN, a global ARN
 /// with the region and account fields empty, a rewritten partition / region / account, and
 /// a deleted profile's ARN.
 #[tokio::test]
-async fn a_well_formed_arn_naming_nothing_stored_is_a_404() {
+async fn a_well_formed_arn_naming_nothing_stored_is_refused_and_writes_nothing() {
     let (router, profile_id, capability_id) = b2bi_fixtures().await;
     let live = given_tagged_resource(
         &router,
@@ -449,13 +459,13 @@ async fn a_well_formed_arn_naming_nothing_stored_is_a_404() {
     for (case, candidate) in cases {
         let (status, body) = tag_resource(&router, candidate, &[("env", "written")]).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: TagResource({candidate}) must be 404, got {status} {body}"
+            status, 400,
+            "case {case:?}: TagResource({candidate}) must be 400, got {status} {body}"
         );
         assert_eq!(
             error_code(&body),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {body}"
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {body}"
         );
         assert!(
             message(&body).contains(candidate.as_str()),
@@ -464,7 +474,7 @@ async fn a_well_formed_arn_naming_nothing_stored_is_a_404() {
     }
 
     assert_eq!(
-        stored_tags(&router, "live profile after every 404", &live).await,
+        stored_tags(&router, "live profile after every refusal", &live).await,
         expected_pairs(&[("env", "prod")]),
         "no refused call may have written a tag"
     );

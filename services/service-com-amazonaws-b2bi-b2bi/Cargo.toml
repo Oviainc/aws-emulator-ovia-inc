@@ -45,10 +45,15 @@ serde_json = { workspace = true }
 # `serde::Serialize` for the starter mapping template's document tree, so a segment's
 # elements keep their positional order (a `serde_json::Value` map would sort them).
 serde = { workspace = true }
-# XML writer for the XSLT starter mapping template: it escapes and indents the
-# stylesheet this service generates.
+# XML writer for the XSLT starter mapping template (it escapes and indents the
+# stylesheet this service generates) and XML reader for the test-harness operations
+# (checking that a document handed to them really is the XML, or XSLT, it was declared
+# to be). Same version the vendored framework uses.
 quick-xml = "0.41"
 tracing = { workspace = true }
+# SHA-256 for the `@idempotencyToken` request digest CreateTransformer stores, so a
+# replay can tell the same request from a different one under a used token.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

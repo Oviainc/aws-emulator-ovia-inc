@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListOpenWorkflowExecutions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListOpenWorkflowExecutions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListOpenWorkflowExecutions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: every execution this answers with comes from the domain's stored
+//! executions — the OPEN ones whose start instant falls in the request's
+//! `startTimeFilter` window and that satisfy whichever one of `executionFilter` /
+//! `typeFilter` / `tagFilter` the request named — ordered by start time and paged
+//! through `nextPageToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -185,20 +181,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListOpenWorkflowExecutions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListOpenWorkflowExecutionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListOpenWorkflowExecutions"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListOpenWorkflowExecutionsErrorModeled::OperationNotPermittedFault(
+                OperationNotPermittedFault {
+                    message: Some("the SWF domain store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // "executionFilter, typeFilter and tagFilter are mutually exclusive. You can
+        // specify at most one of these in a request."
+        crate::state::validate_exclusive_filters(&[
+            ("executionFilter", input.execution_filter.is_some()),
+            ("typeFilter", input.type_filter.is_some()),
+            ("tagFilter", input.tag_filter.is_some()),
+        ])
+        .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        let guard = state.lock();
+        // A listing is scoped to one domain, and the domain's registration status does
+        // not gate it: deprecating a domain stops new registrations and starts in it,
+        // while its executions stay visible.
+        let domain = guard.domains.get(&input.domain).ok_or_else(|| {
+            ListOpenWorkflowExecutionsErrorModeled::UnknownResourceFault(UnknownResourceFault {
+                message: Some(format!("Unknown domain: {}", input.domain)),
+            })
+        })?;
+
+        let mut matching: Vec<&crate::state::Execution> = domain
+            .executions
+            .values()
+            .filter(|execution| {
+                // OPEN only: a run that has closed is reported by the closed-execution
+                // listing instead, whatever its close status is.
+                execution.is_open()
+                    && crate::state::within_time_window(
+                        execution.start_timestamp,
+                        &input.start_time_filter,
+                    )
+                    && crate::state::execution_matches_filters(
+                        execution,
+                        input.execution_filter.as_ref(),
+                        input.type_filter.as_ref(),
+                        input.tag_filter.as_ref(),
+                    )
+            })
+            .collect();
+
+        // "By default the results are returned in descending order of the start time of
+        // the executions"; `reverseOrder` returns them ascending instead. Sorting is by
+        // the full order key, so the position of two runs started in the same instant
+        // is still defined — the store holds them in a map with no order of its own.
+        matching.sort_by_key(|execution| crate::state::execution_order_key(execution));
+        if !input.reverse_order {
+            matching.reverse();
+        }
+
+        // `maximumPageSize` defaults to 0 ("not specified"), which means every match up
+        // to the modelled page maximum. The modelled `PageSize` range (0..1000) is
+        // enforced by the boundary validator before this handler runs, so a value above
+        // the maximum never reaches here; the clamp is the internal safety bound that
+        // keeps one response bounded regardless.
+        let page_size = match usize::try_from(input.maximum_page_size) {
+            Ok(size) if size > 0 => size.min(crate::state::MAX_EXECUTION_PAGE_SIZE),
+            _ => crate::state::MAX_EXECUTION_PAGE_SIZE,
+        };
+
+        // The token names the position the previous page ended at, so this page starts
+        // at the first match that sorts after it in THIS ordering. `partition_point`
+        // reads that off the sorted ordering, so a run that started or closed between
+        // the two calls shifts nothing the token addresses.
+        let start = match crate::state::non_empty(&input.next_page_token) {
+            Some(token) => {
+                let resume_after =
+                    crate::state::decode_execution_page_token(&token, input.reverse_order)
+                        .map_err(crate::scaffolded::Scaffolded::validation)?;
+                matching.partition_point(|execution| {
+                    let key = crate::state::execution_order_key(execution);
+                    if input.reverse_order {
+                        key <= resume_after
+                    } else {
+                        key >= resume_after
+                    }
+                })
+            }
+            None => 0,
+        };
+        let total = matching.len();
+        let end = (start + page_size).min(total);
+        let page = &matching[start..end];
+
+        Ok(ListOpenWorkflowExecutionsOutput {
+            execution_infos: page.iter().map(|execution| execution.info()).collect(),
+            // The token names the last execution of THIS page, so `last()` is what the
+            // cursor is built from, and it is issued only while matches remain.
+            next_page_token: page.last().filter(|_| end < total).map(|last| {
+                crate::state::encode_execution_page_token(
+                    input.reverse_order,
+                    &crate::state::execution_order_key(last),
+                )
+            }),
+        })
     }
 }

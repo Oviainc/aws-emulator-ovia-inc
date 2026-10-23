@@ -92,6 +92,27 @@ pub const MAX_RETAINED_PROFILE_BYTES: usize = 64 * 1024 * 1024;
 /// quota increase." (The real service also caps profiling groups per account.)
 pub const MAX_PROFILING_GROUPS: usize = 256;
 
+/// The most tags one resource holds. AWS's general tagging limit, not an emulator
+/// choice — "Maximum number of tags per resource: 50" in the AWS tagging quotas the
+/// CodeGuru Profiler tagging operations follow — so a `TagResource` (or a create) that
+/// would leave a group past it is refused with the operation's modelled
+/// `ValidationException` instead of growing the store. `UntagResource` frees the budget
+/// again, so this is a bound on what one resource holds, not on how often it is
+/// re-tagged.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The longest tag KEY, in characters, and the shortest: AWS's tagging limits give a
+/// key 1..128 characters. The model constrains `TagsMap`'s key with nothing
+/// (`smithy_query(query="shape",shape="TagsMap")` -> `{key: String, value: String}`),
+/// so the boundary validator clamps neither and [`validate_tags`] is what holds the
+/// published range.
+pub const MAX_TAG_KEY_CHARS: usize = 128;
+
+/// The longest tag VALUE, in characters: AWS's tagging limits give a value 0..256
+/// characters (an empty value is a valid one). Same reason as [`MAX_TAG_KEY_CHARS`] for
+/// enforcing it here.
+pub const MAX_TAG_VALUE_CHARS: usize = 256;
+
 /// The page size `ListProfilingGroups` uses when the caller gives no `maxResults`, so
 /// one unparameterised request cannot materialise a response that grows with the
 /// stored group count. Inside the modelled `maxResults` range (1..1000).
@@ -733,6 +754,79 @@ pub fn profiling_group_arn(region: &str, name: &str) -> String {
         ARN_NAMESPACE,
         region,
         &format!("{PROFILING_GROUP_RESOURCE_PREFIX}{name}"),
+    )
+}
+
+/// Why a caller-supplied `resourceArn` that names no profiling group of this service is
+/// refused on the INPUT: it names the member and the form the member must take, so the
+/// caller can fix the request from the message alone.
+pub fn resource_arn_validation_message(resource_arn: &str) -> String {
+    format!(
+        "Value '{resource_arn}' at 'resourceArn' failed to satisfy constraint: Member \
+         must be the ARN of a CodeGuru Profiler profiling group, \
+         arn:<partition>:{ARN_NAMESPACE}:<region>:<account>:{PROFILING_GROUP_RESOURCE_PREFIX}<name>"
+    )
+}
+
+/// Refuse a caller-supplied tag map no AWS-tagged resource can hold: more than
+/// [`MAX_TAGS_PER_RESOURCE`] entries, a key outside 1..[`MAX_TAG_KEY_CHARS`]
+/// characters, or a value longer than [`MAX_TAG_VALUE_CHARS`].
+///
+/// `Ok(())` when every entry is inside those limits; otherwise the message naming the
+/// member (`member`, the request member the map arrived in), the entry and the
+/// constraint it failed, which each handler lifts into its own modelled
+/// `ValidationException`. Every path that WRITES a resource's tags checks this BEFORE
+/// storing anything, so a refused request leaves the stored map exactly as it was and
+/// no request can grow the store past the published limits.
+pub fn validate_tags(member: &str, tags: &HashMap<String, String>) -> Result<(), String> {
+    if tags.len() > MAX_TAGS_PER_RESOURCE {
+        return Err(format!(
+            "Value at '{member}' failed to satisfy constraint: Member must have length \
+             less than or equal to {MAX_TAGS_PER_RESOURCE}"
+        ));
+    }
+    // Lexicographic order, so the entry a message blames is the same one on every run
+    // whatever order the request's map was read in.
+    let mut keys: Vec<&String> = tags.keys().collect();
+    keys.sort();
+    for key in keys {
+        let key_chars = key.chars().count();
+        if !(1..=MAX_TAG_KEY_CHARS).contains(&key_chars) {
+            return Err(format!(
+                "Value '{key}' at '{member}' failed to satisfy constraint: Map keys must \
+                 have length between 1 and {MAX_TAG_KEY_CHARS}"
+            ));
+        }
+        let value = &tags[key];
+        if value.chars().count() > MAX_TAG_VALUE_CHARS {
+            return Err(format!(
+                "Value at '{member}.{key}' failed to satisfy constraint: Member must have \
+                 length less than or equal to {MAX_TAG_VALUE_CHARS}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// How many tags `stored` would hold once `applied` has been merged into it: a key
+/// `stored` already carries is re-tagged rather than added, so only a NEW key grows the
+/// map. What [`MAX_TAGS_PER_RESOURCE`] is checked against before a merge is written.
+pub fn merged_tag_count(
+    stored: &HashMap<String, String>,
+    applied: &HashMap<String, String>,
+) -> usize {
+    stored.len() + applied.keys().filter(|key| !stored.contains_key(*key)).count()
+}
+
+/// Why a merge that would leave a resource past [`MAX_TAGS_PER_RESOURCE`] is refused:
+/// the member it arrived in, how many tags it would leave, and the limit. Beside
+/// [`merged_tag_count`] and worded like [`validate_tags`], so every tag refusal of this
+/// service speaks with one voice.
+pub fn too_many_tags_message(member: &str, resulting: usize) -> String {
+    format!(
+        "Value at '{member}' failed to satisfy constraint: applying these tags would \
+         leave {resulting} tags on the resource, past the maximum of \
+         {MAX_TAGS_PER_RESOURCE} tags per resource"
     )
 }
 

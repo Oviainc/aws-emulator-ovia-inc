@@ -20,22 +20,22 @@ use service_com_amazonaws_mgn_applicationmigrationservice::{
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region the test requests sign for; it is the region every ARN must carry.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The account every ARN carries: the emulator's canonical placeholder account.
-const EMULATOR_ACCOUNT: &str = "000000000000";
+pub(crate) const EMULATOR_ACCOUNT: &str = "000000000000";
 
 /// A 12-digit account id the test never initializes, for the "uninitialized" rule.
-const OTHER_ACCOUNT: &str = "123456789012";
+pub(crate) const OTHER_ACCOUNT: &str = "123456789012";
 
 /// One emulator with only this service mounted, driven through the router.
-struct Mgn {
+pub(crate) struct Mgn {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Mgn {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -45,7 +45,7 @@ impl Mgn {
 
     /// The service's own store, for seeding a precondition no sequence of calls can
     /// reach (another account's records, a full store) and for reading state back.
-    fn store(&self) -> engine::ServiceState<MgnState> {
+    pub(crate) fn store(&self) -> engine::ServiceState<MgnState> {
         service_state(&*self.engine).expect("this service has a store in this engine")
     }
 
@@ -75,7 +75,7 @@ impl Mgn {
 
     /// POST `/<operation>` with `body`, answering the status and the parsed JSON body
     /// (`Value::Null` for an empty one).
-    async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri(format!("https://mgn.{REGION}.amazonaws.com/{operation}"))
@@ -106,7 +106,7 @@ impl Mgn {
     }
 
     /// `InitializeService` for the caller's own account.
-    async fn initialize(&self) {
+    pub(crate) async fn initialize(&self) {
         let (status, body) = self.call("InitializeService", &json!({})).await;
         assert_eq!(
             status, 204,
@@ -180,7 +180,7 @@ fn ids_of(list: &Value) -> Vec<String> {
         .collect()
 }
 
-fn error_code(body: &Value) -> &str {
+pub(crate) fn error_code(body: &Value) -> &str {
     body["__type"].as_str().unwrap_or("<no __type>")
 }
 

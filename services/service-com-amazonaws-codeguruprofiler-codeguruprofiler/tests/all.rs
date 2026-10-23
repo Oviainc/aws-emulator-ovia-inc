@@ -27,6 +27,8 @@ mod resource_policy;
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_resource.rs"]
+mod tag_resource;
 #[path = "all/untag_resource.rs"]
 mod untag_resource;
 #[path = "all/update_profiling_group.rs"]

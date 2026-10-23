@@ -10,9 +10,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::ops::types::{
-    ApplicationAggregatedStatus, ConflictException, CreateApplicationOutput,
-    InternalServerException, ResourceNotFoundException, ServiceQuotaExceededException,
-    UninitializedAccountException, ValidationException,
+    ApplicationAggregatedStatus, ConflictException, CreateApplicationOutput, DataReplicationInfo,
+    InternalServerException, LaunchedInstance, LifeCycle, ResourceNotFoundException,
+    ServiceQuotaExceededException, SourceProperties, SourceServerConnectorAction,
+    UninitializedAccountException, UpdateSourceServerOutput, ValidationException,
 };
 
 /// The region an ARN carries when the request names none: the emulator's default.
@@ -29,6 +30,13 @@ const APPLICATION_ID_PREFIX: &str = "app-";
 /// (model pattern `^app-[0-9a-zA-Z]{17}$`, length 21..21).
 const APPLICATION_ID_BODY_LEN: usize = 17;
 
+/// The `sourceServerID` prefix the model's `^s-[0-9a-zA-Z]{17}$` pattern requires.
+const SOURCE_SERVER_ID_PREFIX: &str = "s-";
+
+/// How many `[0-9a-zA-Z]` characters follow the prefix of a `SourceServerID`
+/// (model pattern `^s-[0-9a-zA-Z]{17}$`, length 19..19).
+const SOURCE_SERVER_ID_BODY_LEN: usize = 17;
+
 /// The most applications this store holds at a time — per account AND in total.
 ///
 /// This is the emulator's own bound on a caller-driven growth site, not a claim about
@@ -39,6 +47,15 @@ const APPLICATION_ID_BODY_LEN: usize = 17;
 /// varying the request's `accountID`. `DeleteApplication` releases records, so a
 /// maximum count needs no eviction policy behind it.
 pub const APPLICATION_QUOTA: usize = 1_000;
+
+/// The most source servers this store holds at a time — per account AND in total.
+///
+/// The emulator's own bound on the source-server growth site, not a claim about any
+/// AWS quota: the same reasoning as [`APPLICATION_QUOTA`]. Whatever registers a source
+/// server checks [`ComAmazonawsMgnApplicationmigrationserviceState::source_server_store_is_full`]
+/// before minting anything, so the record count cannot be grown past the bound by
+/// varying the request's `accountID`.
+pub const SOURCE_SERVER_QUOTA: usize = 1_000;
 
 /// The most accounts this store tracks as initialized at a time.
 ///
@@ -59,6 +76,11 @@ pub struct ComAmazonawsMgnApplicationmigrationserviceState {
     /// The `applicationID`s in creation order, so `ListApplications` pages in a
     /// stable order and a `nextToken` resumes where the previous page stopped.
     pub application_order: Vec<String>,
+    /// Every source server, by `sourceServerID`.
+    pub source_servers: HashMap<String, SourceServer>,
+    /// The `sourceServerID`s in registration order, so `DescribeSourceServers` pages
+    /// in a stable order and a `nextToken` resumes where the previous page stopped.
+    pub source_server_order: Vec<String>,
 }
 
 impl ComAmazonawsMgnApplicationmigrationserviceState {
@@ -157,6 +179,137 @@ impl ComAmazonawsMgnApplicationmigrationserviceState {
         self.application_of(account_id, application_id)?;
         self.application_order.retain(|id| id != application_id);
         self.applications.remove(application_id)
+    }
+
+    /// Every source server of `account_id`, in registration order.
+    pub fn source_servers_of(&self, account_id: &str) -> Vec<&SourceServer> {
+        self.source_server_order
+            .iter()
+            .filter_map(|id| self.source_servers.get(id))
+            .filter(|server| server.account_id == account_id)
+            .collect()
+    }
+
+    /// The source server `source_server_id` names within `account_id`, or `None` — a
+    /// source server of another account is not visible to this one.
+    pub fn source_server_of(
+        &self,
+        account_id: &str,
+        source_server_id: &str,
+    ) -> Option<&SourceServer> {
+        self.source_servers
+            .get(source_server_id)
+            .filter(|server| server.account_id == account_id)
+    }
+
+    /// A fresh `sourceServerID` no stored source server holds.
+    pub fn mint_source_server_id(&self) -> String {
+        loop {
+            let candidate = mint_id(SOURCE_SERVER_ID_PREFIX, SOURCE_SERVER_ID_BODY_LEN);
+            if !self.source_servers.contains_key(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
+    /// Whether the source-server store is full: either the account already holds
+    /// [`SOURCE_SERVER_QUOTA`] source servers, or the whole store does.
+    pub fn source_server_store_is_full(&self, account_id: &str) -> bool {
+        self.source_servers.len() >= SOURCE_SERVER_QUOTA
+            || self.source_servers_of(account_id).len() >= SOURCE_SERVER_QUOTA
+    }
+
+    /// Store a source server, remembering its place in registration order.
+    ///
+    /// Answers whether it was stored, exactly as [`Self::insert_application`] does:
+    /// a store already at [`SOURCE_SERVER_QUOTA`] refuses rather than growing past the
+    /// bound, and re-storing a known id keeps its place in the registration order
+    /// rather than duplicating it.
+    pub fn insert_source_server(&mut self, server: SourceServer) -> bool {
+        let known = self.source_servers.contains_key(&server.source_server_id);
+        if !known && self.source_servers.len() >= SOURCE_SERVER_QUOTA {
+            return false;
+        }
+        if !known {
+            self.source_server_order
+                .push(server.source_server_id.clone());
+        }
+        self.source_servers
+            .insert(server.source_server_id.clone(), server);
+        true
+    }
+}
+
+/// One stored source server: the modelled `SourceServer` record, as whatever
+/// registered the server (an agent installation, a vCenter discovery, an import)
+/// stored it. `DescribeSourceServers` reports these members and NOTHING it computes
+/// per read, so two reads of an unchanged server answer the same record.
+#[derive(Debug, Clone, Default)]
+pub struct SourceServer {
+    pub source_server_id: String,
+    pub arn: String,
+    /// The account the source server lives in (the registering request's `accountID`,
+    /// or the emulator's own account when it named none).
+    pub account_id: String,
+    pub is_archived: bool,
+    pub tags: BTreeMap<String, String>,
+    /// One of the model's `ReplicationType` values (`AGENT_BASED`,
+    /// `SNAPSHOT_SHIPPING`), or absent while nothing has set one.
+    pub replication_type: Option<String>,
+    /// The server's `LifeCycle`, whose `state` is one of the model's `LifeCycleState`
+    /// values (`STOPPED`, `NOT_READY`, `READY_FOR_TEST`, `TESTING`,
+    /// `READY_FOR_CUTOVER`, `CUTTING_OVER`, `CUTOVER`, `DISCONNECTED`, `DISCOVERED`,
+    /// `PENDING_INSTALLATION`).
+    pub life_cycle: Option<LifeCycle>,
+    pub data_replication_info: Option<DataReplicationInfo>,
+    pub source_properties: Option<SourceProperties>,
+    pub launched_instance: Option<LaunchedInstance>,
+    pub connector_action: Option<SourceServerConnectorAction>,
+    /// The application this server is associated with, once something associated it.
+    pub application_id: Option<String>,
+    pub user_provided_id: Option<String>,
+    pub fqdn_for_action_framework: Option<String>,
+    /// The vCenter client that discovered the server, when one did.
+    pub vcenter_client_id: Option<String>,
+}
+
+impl SourceServer {
+    /// The server's `lifeCycle.state`, or `None` while it carries no life cycle — the
+    /// value the `lifeCycleStates` filter selects on.
+    pub fn life_cycle_state(&self) -> Option<&str> {
+        self.life_cycle
+            .as_ref()
+            .and_then(|life_cycle| life_cycle.state.as_deref())
+    }
+
+    /// The `tags` member: the stored tags, or absent when the server carries none.
+    pub fn tags_shape(&self) -> Option<std::collections::HashMap<String, String>> {
+        if self.tags.is_empty() {
+            None
+        } else {
+            Some(self.tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        }
+    }
+
+    /// This server as the model's `SourceServer` structure — the shape
+    /// `DescribeSourceServers` lists.
+    pub fn to_shape(&self) -> UpdateSourceServerOutput {
+        UpdateSourceServerOutput {
+            source_server_id: Some(self.source_server_id.clone()),
+            arn: Some(self.arn.clone()),
+            is_archived: Some(self.is_archived),
+            tags: self.tags_shape(),
+            launched_instance: self.launched_instance.clone(),
+            data_replication_info: self.data_replication_info.clone(),
+            life_cycle: self.life_cycle.clone(),
+            source_properties: self.source_properties.clone(),
+            replication_type: self.replication_type.clone(),
+            vcenter_client_id: self.vcenter_client_id.clone(),
+            application_id: self.application_id.clone(),
+            user_provided_id: self.user_provided_id.clone(),
+            fqdn_for_action_framework: self.fqdn_for_action_framework.clone(),
+            connector_action: self.connector_action.clone(),
+        }
     }
 }
 
@@ -277,6 +430,16 @@ pub fn application_arn(region: &str, application_id: &str) -> String {
     )
 }
 
+/// The ARN of a source server:
+/// `arn:aws:mgn:<region>:<account>:source-server/<sourceServerID>`.
+pub fn source_server_arn(region: &str, source_server_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("source-server/{source_server_id}"),
+    )
+}
+
 /// Now, as the model's `ISO8601DatetimeString`: `YYYY-MM-DDTHH:MM:SS.fffffffffZ`.
 ///
 /// 30 characters, inside the modelled length 19..32 and matching the modelled
@@ -326,14 +489,22 @@ fn mint_id(prefix: &str, body_len: usize) -> String {
 
 /// The modelled refusal every operation but `InitializeService` answers until that
 /// operation has run for the account.
-pub fn uninitialized_account(account_id: &str) -> UninitializedAccountException {
+///
+/// The message names no request value: this refusal is about the account the request
+/// is signed for, and the service answers one fixed sentence for it
+/// (`Account not initialized`) rather than echoing the caller's `accountID` back. One
+/// text for one condition, so a client matching the refusal sees the same message
+/// whichever operation it called.
+pub fn uninitialized_account() -> UninitializedAccountException {
     UninitializedAccountException {
-        message: Some(format!(
-            "Account {account_id} is not initialized for Application Migration Service. Call InitializeService first."
-        )),
+        message: Some(UNINITIALIZED_ACCOUNT_MESSAGE.to_string()),
         code: None,
     }
 }
+
+/// The message [`uninitialized_account`] carries, as Application Migration Service
+/// answers it for an account `InitializeService` has not completed for.
+const UNINITIALIZED_ACCOUNT_MESSAGE: &str = "Account not initialized";
 
 /// The modelled refusal for an `applicationID` the account holds no record of.
 pub fn application_not_found(application_id: &str) -> ResourceNotFoundException {
