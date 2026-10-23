@@ -200,6 +200,16 @@ fn cluster_resolving(cluster: &str) -> Vec<Row> {
             }),
         ),
         row(
+            "CreateNodegroup",
+            "POST",
+            format!("/clusters/{name}/node-groups"),
+            serde_json::json!({
+                "nodegroupName": "probe-nodegroup",
+                "nodeRole": ROLE_ARN,
+                "subnets": ["subnet-aaaa1111", "subnet-bbbb2222"],
+            }),
+        ),
+        row(
             "ListPodIdentityAssociations",
             "GET",
             format!("/clusters/{name}/pod-identity-associations"),

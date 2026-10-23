@@ -820,11 +820,20 @@ const PUBLISHED_CATALOG: [PublishedStandard; 13] = [
 /// name is the key a client matches the catalog on.
 const ABBREVIATED_NAME_FORMS: [&str; 5] = ["NIST SP", "SP 800", " Rev.", " Rev ", "Pub."];
 
-/// The three catalog descriptions whose published text is quoted verbatim in the
-/// AWS catalog (and in the divergence report this suite was extended for), asserted
-/// byte-for-byte here — including the U+2019 RIGHT SINGLE QUOTATION MARK the catalog
-/// spells the possessive "AWS\u{2019}s" with, which an ASCII apostrophe would break.
-const VERBATIM_DESCRIPTIONS: [(&str, &str); 3] = [
+/// The catalog descriptions whose published text is known verbatim — the text AWS
+/// serves for that standard, asserted byte-for-byte here, typography included: the
+/// AWS Foundational Security Best Practices entry spells its possessive
+/// "AWS\u{2019}s" with the U+2019 RIGHT SINGLE QUOTATION MARK, while the Azure entry
+/// that otherwise repeats that sentence spells "Azure's" with a plain ASCII
+/// apostrophe, so typography is per entry and not a catalog-wide rule.
+///
+/// Source: the recorded AWS `DescribeStandards` response for these standards, as
+/// quoted in the two catalog divergence reports this suite was extended for. The
+/// rows span every description style the catalog uses — the "set of automated
+/// security checks" family (AI, both Foundational Security Best Practices entries,
+/// resource tagging), the CIS benchmark family, and the NIST publications — and
+/// include entries no report cited (AI, resource tagging) beside the ones that were.
+const VERBATIM_DESCRIPTIONS: [(&str, &str); 7] = [
     (
         "AI Security Best Practices v1.0.0",
         "The AI Security Best Practices standard is a set of automated security checks that detect when deployed AI resources do not align with security best practices. The standard is defined by AWS security experts. This curated set of controls helps improve your security posture for most popular AI services.",
@@ -836,6 +845,57 @@ const VERBATIM_DESCRIPTIONS: [(&str, &str); 3] = [
     (
         "AWS Resource Tagging Standard v1.0.0",
         "The AWS Resource Tagging standard is a set of automated security checks that detect when AWS resources are not tagged.",
+    ),
+    (
+        "Azure Foundational Security Best Practices v1.0.0",
+        "The Azure Foundational Security Best Practices standard is a set of automated security checks that detect when Azure resources do not align to security best practices. The standard is defined by AWS security experts. This curated set of controls helps improve your security posture in Azure, and cover Azure's most popular and foundational services.",
+    ),
+    (
+        "CIS Azure Foundations Benchmark v4.0.0",
+        "The Center for Internet Security (CIS) Microsoft Azure Foundations Benchmark v4.0.0 is a set of security configuration best practices for Azure. This Security Hub standard automatically checks your compliance readiness against a subset of CIS requirements.",
+    ),
+    (
+        "NIST Special Publication 800-171 Revision 2",
+        "NIST Special Publication 800-171 Revision 2 provides recommended security requirements for protecting the confidentiality of Controlled Unclassified Information. This Security Hub standard automatically checks for your compliance readiness against a subset of NIST 800-171 R2 requirements.",
+    ),
+    (
+        "NIST Special Publication 800-53 Revision 5",
+        "NIST Special Publication 800-53 Revision 5 provides a catalog of security and privacy controls for information systems and organizations. This Security Hub standard automatically checks for your compliance readiness against a subset of NIST 800-53 R5 requirements.",
+    ),
+];
+
+/// Wordings the published catalog does NOT use, each with the entry it would show up
+/// in if that entry's description had been written locally instead of copied: an
+/// expanded acronym where the catalog keeps the publication's published name, the
+/// catalog's own abbreviation of a defined term, a lowercased defined term, a
+/// benchmark's provider named without the vendor the catalog names it with, and the
+/// "checks for your" form in the entry whose published text says "checks your".
+///
+/// Source: the same recorded `DescribeStandards` response as `VERBATIM_DESCRIPTIONS`
+/// (each of these is a difference the recording shows). Stated as forbidden
+/// SUBSTRINGS rather than whole strings, so a fresh rewording of the same entry
+/// fails here too.
+const PARAPHRASE_FORMS: [(&str, &str); 6] = [
+    (
+        "NIST Special Publication 800-171 Revision 2",
+        "The National Institute of Standards and Technology (NIST)",
+    ),
+    ("NIST Special Publication 800-171 Revision 2", "(CUI)"),
+    (
+        "NIST Special Publication 800-171 Revision 2",
+        "controlled unclassified information",
+    ),
+    (
+        "NIST Special Publication 800-53 Revision 5",
+        "The National Institute of Standards and Technology (NIST)",
+    ),
+    (
+        "CIS Azure Foundations Benchmark v4.0.0",
+        "(CIS) Azure Foundations Benchmark",
+    ),
+    (
+        "CIS Azure Foundations Benchmark v4.0.0",
+        "checks for your compliance readiness",
     ),
 ];
 
@@ -923,12 +983,13 @@ async fn the_catalog_reports_every_published_standard_under_its_full_name() {
              {:?}, got {description:?}",
             standard.description_mentions
         );
-        // The published catalog's typography: its one possessive uses U+2019, and no
-        // entry carries a straightened ASCII apostrophe in its place.
+        // The published catalog's typography is per entry: the one entry whose
+        // possessive is U+2019 is never served with that possessive straightened to
+        // an ASCII apostrophe.
         assert!(
-            !description.contains('\''),
-            "case {case:?}: the published catalog uses U+2019, not an ASCII \
-             apostrophe, got {description:?}"
+            !description.contains("AWS's"),
+            "case {case:?}: the catalog spells this possessive \"AWS\\u{{2019}}s\" \
+             with U+2019, not an ASCII apostrophe, got {description:?}"
         );
     }
 
@@ -940,6 +1001,101 @@ async fn the_catalog_reports_every_published_standard_under_its_full_name() {
             Some(text),
             "case {case:?}: expected the published description verbatim, got {entry}"
         );
+    }
+}
+
+/// RULE: a catalog entry's `Description` is the text AWS publishes for THAT standard,
+/// copied rather than composed — so it is byte-for-byte the published sentence
+/// (typography included), it carries none of the rewordings a locally written summary
+/// introduces (an expanded acronym, an abbreviated or lowercased defined term, a
+/// vendor dropped from a benchmark's name, "checks for your" where the published text
+/// says "checks your"), it is never another entry's text, and it does not vary with
+/// the request.
+///
+/// The table spans every description style the catalog uses and both providers, and
+/// the invariants below run over the WHOLE catalog, not only the entries a recording
+/// flagged: a description copied from a sibling revision, or one quietly reworded,
+/// fails here.
+#[tokio::test]
+async fn catalog_descriptions_are_the_published_text_not_a_local_paraphrase() {
+    // Two Regions: the catalog text is service metadata, so it cannot vary with the
+    // Region the request was signed for (only the ARNs do).
+    for region in ["us-east-1", "ap-northeast-1"] {
+        let harness = Harness::new(region);
+        let (status, body) = harness.describe_standards("").await;
+        assert_eq!(
+            status, 200,
+            "region {region:?}: expected 200, got {status} with {body}"
+        );
+
+        for (case, text) in VERBATIM_DESCRIPTIONS {
+            let entry = entry_named(&body, case).unwrap_or_else(|| {
+                panic!("case {case:?} in {region}: the catalog must report this standard")
+            });
+            assert_eq!(
+                entry["Description"].as_str(),
+                Some(text),
+                "case {case:?} in {region}: expected the published description \
+                 verbatim, got {entry}"
+            );
+        }
+
+        for (case, paraphrase) in PARAPHRASE_FORMS {
+            let entry = entry_named(&body, case).unwrap_or_else(|| {
+                panic!("case {case:?} in {region}: the catalog must report this standard")
+            });
+            let description = entry["Description"].as_str().unwrap_or_default();
+            assert!(
+                !description.contains(paraphrase),
+                "case {case:?} in {region}: the published catalog does not word it \
+                 {paraphrase:?}, got {description:?}"
+            );
+        }
+
+        // A description belongs to one standard: no two entries may serve the same
+        // text, and an entry may not name another entry's version (which is what a
+        // description copied from a sibling revision looks like).
+        let versions: Vec<String> = PUBLISHED_CATALOG
+            .iter()
+            .map(|standard| format!("v{}", standard.version))
+            .collect();
+        let mut seen: Vec<(String, String)> = Vec::new();
+        for standard in &PUBLISHED_CATALOG {
+            let case = standard.name;
+            let entry = entry_named(&body, case).unwrap_or_else(|| {
+                panic!("case {case:?} in {region}: the catalog must report this standard")
+            });
+            let description = entry["Description"].as_str().unwrap_or_default().to_string();
+            assert_eq!(
+                description.trim(),
+                description,
+                "case {case:?} in {region}: a description carries no padding \
+                 whitespace, got {description:?}"
+            );
+            assert!(
+                description.len() > standard.name.len(),
+                "case {case:?} in {region}: a description describes the standard \
+                 rather than repeating its name, got {description:?}"
+            );
+            let own_version = format!("v{}", standard.version);
+            for other in &versions {
+                if *other == own_version {
+                    continue;
+                }
+                assert!(
+                    !description.contains(other.as_str()),
+                    "case {case:?} in {region}: the description names another \
+                     standard's version {other:?}, got {description:?}"
+                );
+            }
+            if let Some((twin, _)) = seen.iter().find(|(_, text)| *text == description) {
+                panic!(
+                    "case {case:?} in {region}: serves the same description as \
+                     {twin:?}: {description:?}"
+                );
+            }
+            seen.push((case.to_string(), description));
+        }
     }
 }
 

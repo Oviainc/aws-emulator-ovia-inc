@@ -435,10 +435,17 @@ pub struct StandardDefinition {
 /// catalog's own wording: the FULL published name of the standard (the catalog spells
 /// a standard out — "NIST Special Publication 800-53 Revision 5" — rather than
 /// abbreviating it, and a name is what `DescribeStandards` callers key the catalog on)
-/// and the catalog's description text for it, with the catalog's own typography
-/// preserved, including non-ASCII punctuation such as U+2019. A paraphrase of either
-/// is a divergence, because a client reads a standard out of this catalog before it
-/// drives `BatchEnableStandards` from the entry.
+/// and the catalog's description text for it, copied rather than summarised, with that
+/// entry's own typography preserved (non-ASCII punctuation such as U+2019 included).
+/// A paraphrase of either is a divergence, because a client reads a standard out of
+/// this catalog before it drives `BatchEnableStandards` from the entry, and anything
+/// that surfaces the catalog renders this text.
+///
+/// The text is per entry, not generated from a family template: entries of one family
+/// differ in whether the catalog expands an acronym (the NIST entries do not, the PCI
+/// and CIS entries do), in "checks your" versus "checks for your", and in the
+/// typography of a possessive. So each description is copied from the catalog for that
+/// standard, never derived from a neighbour's.
 ///
 /// Ordered by `Name`, which is the order `DescribeStandards` reports the catalog in,
 /// so a page boundary falls in the same place on every call.
@@ -476,10 +483,12 @@ pub const STANDARDS_CATALOG: [StandardDefinition; 13] = [
         slug: "azure-foundational-security-best-practices",
         version: "1.0.0",
         name: "Azure Foundational Security Best Practices v1.0.0",
-        // Published in the same catalog family as the AI standard above (a
-        // best-practices standard AWS defines over another provider's resources), so
-        // it carries that family's wording with its own provider substituted.
-        description: "The Azure Foundational Security Best Practices standard is a set of automated security checks that detect when deployed Azure resources do not align with security best practices. The standard is defined by AWS security experts. This curated set of controls helps improve your security posture for most popular Azure services.",
+        // The catalog's own text for this standard, which follows the AWS
+        // Foundational Security Best Practices entry's wording rather than the AI
+        // standard's — but NOT its typography: this entry's possessive "Azure's" is
+        // a plain ASCII apostrophe where the AWS entry's "AWS\u{2019}s" is U+2019, so
+        // typography is per entry and not a catalog-wide rule.
+        description: "The Azure Foundational Security Best Practices standard is a set of automated security checks that detect when Azure resources do not align to security best practices. The standard is defined by AWS security experts. This curated set of controls helps improve your security posture in Azure, and cover Azure's most popular and foundational services.",
         provider: "Azure",
         enabled_by_default: false,
         partition_wide_ruleset: false,
@@ -527,9 +536,11 @@ pub const STANDARDS_CATALOG: [StandardDefinition; 13] = [
         slug: "cis-azure-foundations-benchmark",
         version: "4.0.0",
         name: "CIS Azure Foundations Benchmark v4.0.0",
-        // The CIS benchmark family's catalog wording (see the CIS AWS entries above),
-        // with the benchmark's own version and evaluated provider substituted.
-        description: "The Center for Internet Security (CIS) Azure Foundations Benchmark v4.0.0 is a set of security configuration best practices for Azure. This Security Hub standard automatically checks for your compliance readiness against a subset of CIS requirements.",
+        // The catalog spells this benchmark's provider out as "Microsoft Azure" and
+        // says "checks your compliance readiness", where the older CIS AWS entries
+        // above say "checks for your": the text is per entry, not generated from a
+        // family template.
+        description: "The Center for Internet Security (CIS) Microsoft Azure Foundations Benchmark v4.0.0 is a set of security configuration best practices for Azure. This Security Hub standard automatically checks your compliance readiness against a subset of CIS requirements.",
         provider: "Azure",
         enabled_by_default: false,
         partition_wide_ruleset: false,
@@ -538,7 +549,11 @@ pub const STANDARDS_CATALOG: [StandardDefinition; 13] = [
         slug: "nist-800-171",
         version: "2.0.0",
         name: "NIST Special Publication 800-171 Revision 2",
-        description: "The National Institute of Standards and Technology (NIST) Special Publication 800-171 Revision 2 provides recommended requirements for protecting the confidentiality of controlled unclassified information (CUI). This Security Hub standard automatically checks for your compliance readiness against a subset of NIST Special Publication 800-171 Revision 2 requirements.",
+        // The catalog opens with the publication's name as published (it does not
+        // expand the NIST acronym), capitalises the defined term "Controlled
+        // Unclassified Information", and names the subset in the catalog's short
+        // form "NIST 800-171 R2".
+        description: "NIST Special Publication 800-171 Revision 2 provides recommended security requirements for protecting the confidentiality of Controlled Unclassified Information. This Security Hub standard automatically checks for your compliance readiness against a subset of NIST 800-171 R2 requirements.",
         provider: "AWS",
         enabled_by_default: false,
         partition_wide_ruleset: false,
@@ -547,7 +562,10 @@ pub const STANDARDS_CATALOG: [StandardDefinition; 13] = [
         slug: "nist-800-53",
         version: "5.0.0",
         name: "NIST Special Publication 800-53 Revision 5",
-        description: "The National Institute of Standards and Technology (NIST) Special Publication 800-53 Revision 5 provides a catalog of security and privacy controls for information systems and organizations. This Security Hub standard automatically checks for your compliance readiness against a subset of NIST Special Publication 800-53 Revision 5 requirements.",
+        // Same catalog wording as the 800-171 entry above: the publication's name
+        // unexpanded, the publication's own summary of what it provides, and the
+        // subset named in the catalog's short form "NIST 800-53 R5".
+        description: "NIST Special Publication 800-53 Revision 5 provides a catalog of security and privacy controls for information systems and organizations. This Security Hub standard automatically checks for your compliance readiness against a subset of NIST 800-53 R5 requirements.",
         provider: "AWS",
         enabled_by_default: false,
         partition_wide_ruleset: false,
@@ -565,8 +583,12 @@ pub const STANDARDS_CATALOG: [StandardDefinition; 13] = [
         slug: "pci-dss",
         version: "4.0.1",
         name: "PCI DSS v4.0.1",
-        // The PCI DSS family's catalog wording (see the v3.2.1 entry above), with this
-        // revision's version substituted.
+        // The PCI DSS family's published catalog wording (identical to the v3.2.1
+        // entry above, which the recording confirms, with this revision's version
+        // substituted). AWS's own text for THIS revision is the one catalog string
+        // this emulator has no source for: it is not in the model, not in the issue
+        // report and the replay withholds it, so the entry keeps the family's
+        // published wording rather than an invented sentence.
         description: "The Payment Card Industry Data Security Standard (PCI DSS) v4.0.1 is an information security standard for entities that store, process, and/or transmit cardholder data. This Security Hub standard automatically checks for your compliance readiness against a subset of PCI DSS requirements.",
         provider: "AWS",
         enabled_by_default: false,
