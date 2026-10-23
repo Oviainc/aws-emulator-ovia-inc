@@ -21,6 +21,8 @@ mod channel_lifecycle;
 mod cluster_lifecycle;
 #[path = "all/compatible_kafka_versions.rs"]
 mod compatible_kafka_versions;
+#[path = "all/configuration_lifecycle.rs"]
+mod configuration_lifecycle;
 #[path = "all/connectivity_update.rs"]
 mod connectivity_update;
 #[path = "all/describe_cluster_v2.rs"]
@@ -31,6 +33,8 @@ mod kafka_harness;
 mod kafka_versions;
 #[path = "all/list_clusters_v2.rs"]
 mod list_clusters_v2;
+#[path = "all/refusal_wording.rs"]
+mod refusal_wording;
 #[path = "all/replicator_lifecycle.rs"]
 mod replicator_lifecycle;
 #[path = "all/replicator_listing.rs"]
