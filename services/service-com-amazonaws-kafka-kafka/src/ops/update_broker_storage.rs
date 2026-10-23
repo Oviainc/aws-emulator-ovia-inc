@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateBrokerStorage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateBrokerStorage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Updates the EBS storage of every broker in a provisioned cluster, as the
+//! asynchronous cluster operation the real service performs: the call records the
+//! change and hands back the `ClusterOperationArn` that names it, the cluster moves
+//! to `UPDATING`, and the new volume size (and provisioned throughput) take effect
+//! when the clock makes the operation due.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateBrokerStorage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `TargetBrokerEBSVolumeInfo` must carry exactly one entry whose
+//! `KafkaBrokerNodeId` is the keyword `ALL` — "The broker identifier must be set to
+//! the keyword ALL. This means the changes apply to all the brokers in the
+//! cluster", per `BrokerEBSVolumeInfo`'s model documentation — and that entry must
+//! set a volume size, provisioned throughput, or both. A requested volume size is
+//! held to the 1..16384 GiB range the model puts on `EBSStorageInfo$VolumeSize`
+//! (the member this update writes; the requested `VolumeSizeGB` is a plain
+//! `__integer`, so the boundary validator does not check it) and may not be smaller
+//! than the cluster's current one, because an EBS volume cannot be shrunk.
+//!
+//! A `ClusterArn` that is not shaped like an MSK cluster ARN is a
+//! `BadRequestException`; a well-formed one this endpoint's region holds no cluster
+//! for — absent, or belonging to another region — is a `NotFoundException`, the
+//! error the service answers for a missing cluster even though this operation's own
+//! error list omits it (see the `extra_errors` note below).
 //!
 //! ## Shape of an operation
 //!
@@ -88,12 +100,23 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-kafka-kafka.json");
 // here — hence the `UpdateBrokerStorageError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.kafka#UpdateBrokerStorage")]
+//
+// `NotFoundException` is widened in through `extra_errors`: the SERVICE models it
+// (HTTP 404, and `DeleteCluster`, `DescribeCluster` and `UpdateStorage` all declare
+// it), and the recorded behaviour of this operation for a cluster ARN that was never
+// issued is HTTP 404 `NotFoundException` — so a missing cluster is answered with the
+// error the service really uses, not squeezed into `BadRequestException` because
+// this one operation's error list omits it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.kafka#UpdateBrokerStorage",
+    extra_errors = ["NotFoundException"]
+)]
 #[derive(Debug)]
 pub enum UpdateBrokerStorageErrorModeled {
     BadRequestException(BadRequestException),
     ForbiddenException(ForbiddenException),
     InternalServerErrorException(InternalServerErrorException),
+    NotFoundException(NotFoundException),
     ServiceUnavailableException(ServiceUnavailableException),
     UnauthorizedException(UnauthorizedException),
 }
@@ -149,18 +172,183 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateBrokerStorage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateBrokerStorageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateBrokerStorage"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateBrokerStorageErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        invalid_parameter: None,
+                        message: Some("the kafka service state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        // Request-only checks run first, before the registry lock is taken: none of
+        // them depends on stored state.
+        if !crate::state::is_cluster_arn(&input.cluster_arn) {
+            return Err(bad_request(
+                "ClusterArn",
+                format!(
+                    "{} is not a valid Amazon MSK cluster ARN.",
+                    input.cluster_arn
+                ),
+            ));
+        }
+
+        // ALL means every broker, so one entry describes the whole update and a
+        // second one could only contradict it.
+        let [target] = input.target_broker_ebs_volume_info.as_slice() else {
+            return Err(bad_request(
+                "TargetBrokerEBSVolumeInfo",
+                format!(
+                    "TargetBrokerEBSVolumeInfo must carry exactly one entry, for broker {}, not {}.",
+                    crate::state::ALL_BROKERS,
+                    input.target_broker_ebs_volume_info.len()
+                ),
+            ));
+        };
+        if target.kafka_broker_node_id != crate::state::ALL_BROKERS {
+            return Err(bad_request(
+                "TargetBrokerEBSVolumeInfo",
+                format!(
+                    "KafkaBrokerNodeId must be the keyword {}, not '{}': a broker storage update \
+                     applies to every broker in the cluster.",
+                    crate::state::ALL_BROKERS, target.kafka_broker_node_id
+                ),
+            ));
+        }
+        if target.volume_size_gb.is_none() && target.provisioned_throughput.is_none() {
+            return Err(bad_request(
+                "TargetBrokerEBSVolumeInfo",
+                "a broker storage update must set VolumeSizeGB, ProvisionedThroughput or both."
+                    .to_string(),
+            ));
+        }
+        if let Some(volume_size) = target.volume_size_gb {
+            // `VolumeSizeGB` is a plain `__integer` in the model, so the boundary
+            // validator passes any value through: the range the stored
+            // `EBSStorageInfo$VolumeSize` carries is enforced here instead, the
+            // same way `UpdateStorage` enforces it.
+            if !(crate::state::MIN_VOLUME_SIZE_GB..=crate::state::MAX_VOLUME_SIZE_GB)
+                .contains(&volume_size)
+            {
+                return Err(bad_request(
+                    "TargetBrokerEBSVolumeInfo",
+                    format!(
+                        "VolumeSizeGB must be between {} and {}, not {volume_size}.",
+                        crate::state::MIN_VOLUME_SIZE_GB,
+                        crate::state::MAX_VOLUME_SIZE_GB
+                    ),
+                ));
+            }
+        }
+
+        let now = std::time::SystemTime::now();
+        let mut state = state.lock();
+        // Resolved through the settling lookup every other operation uses, so the
+        // transitions the clock already owed this cluster — its own provisioning,
+        // and an earlier update of its own whose completion has come due — are
+        // materialised before this call judges its state and version.
+        let Some(cluster) = state.settled_cluster_in(&region, &input.cluster_arn, now) else {
+            return Err(
+                UpdateBrokerStorageErrorModeled::NotFoundException(NotFoundException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        };
+        // Copied out of the record: the checks below are followed by a write, so
+        // the borrow of the registry has to end here.
+        let cluster_state = cluster.state.clone();
+        let current_version = cluster.current_version.clone();
+        let current_volume_size = cluster.volume_size_gb();
+
+        // A cluster reconfigures one change at a time, and one that is still being
+        // provisioned, deleted or updated has no settled configuration to update
+        // from. Worded as the sibling update operations word the same check, so the
+        // service says one thing about one condition.
+        if cluster_state != crate::state::CLUSTER_STATE_ACTIVE {
+            return Err(bad_request(
+                "ClusterArn",
+                format!(
+                    "The cluster is in the {cluster_state} state; it must be {} to be updated.",
+                    crate::state::CLUSTER_STATE_ACTIVE
+                ),
+            ));
+        }
+        // The optimistic-concurrency check: the version the caller updates from must
+        // be the one the cluster is actually at, so a stale version means the caller
+        // has not seen the cluster's latest state.
+        if input.current_version != current_version {
+            return Err(bad_request(
+                "currentVersion",
+                format!(
+                    "The cluster's current version is {current_version}, not {}.",
+                    input.current_version
+                ),
+            ));
+        }
+        // Amazon MSK documents that broker storage can only be expanded — "you can
+        // only increase storage, you cannot decrease it" (Amazon MSK Developer
+        // Guide, broker storage scaling) — so a smaller size is refused rather than
+        // shrinking the volumes.
+        if let (Some(target_size), Some(current)) = (target.volume_size_gb, current_volume_size) {
+            if target_size < current {
+                return Err(bad_request(
+                    "TargetBrokerEBSVolumeInfo",
+                    format!(
+                        "VolumeSizeGB can only be increased: the cluster's volumes are {current} \
+                         GiB, so {target_size} GiB is not allowed."
+                    ),
+                ));
+            }
+        }
+
+        // The registry starts the operation: it records what changes, moves the
+        // cluster to UPDATING and stores the instant the change comes due. The same
+        // path `UpdateStorage` starts its own through, under this operation's own
+        // `OperationType` — a broker-storage update names no `StorageMode`, which
+        // this operation's model carries no member for.
+        let Some(operation_arn) = state.start_storage_update(
+            &region,
+            &input.cluster_arn,
+            now,
+            crate::state::OPERATION_TYPE_UPDATE_BROKER_STORAGE,
+            crate::state::StorageChange {
+                volume_size_gb: target.volume_size_gb,
+                provisioned_throughput: target.provisioned_throughput.clone(),
+                storage_mode: None,
+            },
+        ) else {
+            return Err(
+                UpdateBrokerStorageErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        invalid_parameter: None,
+                        message: Some(
+                            "the cluster vanished while its update was starting".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        Ok(UpdateBrokerStorageOutput {
+            cluster_arn: Some(input.cluster_arn),
+            cluster_operation_arn: Some(operation_arn),
+        })
     }
+}
+
+/// Refuse the request with the modeled `BadRequestException`, naming the member at
+/// fault and what was wrong with it — the caller has to fix the request from this
+/// text alone.
+fn bad_request(parameter: &str, message: String) -> UpdateBrokerStorageError {
+    UpdateBrokerStorageErrorModeled::BadRequestException(BadRequestException {
+        invalid_parameter: Some(parameter.to_string()),
+        message: Some(message),
+    })
+    .into()
 }

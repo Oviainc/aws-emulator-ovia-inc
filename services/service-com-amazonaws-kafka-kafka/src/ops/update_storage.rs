@@ -311,8 +311,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The registry starts the operation: it records what changes, moves the
         // cluster to UPDATING and stores the instant the change comes due.
-        let Some(operation_arn) = state.start_storage_update(&region, &input.cluster_arn, now, change)
-        else {
+        let Some(operation_arn) = state.start_storage_update(
+            &region,
+            &input.cluster_arn,
+            now,
+            crate::state::OPERATION_TYPE_UPDATE_STORAGE,
+            change,
+        ) else {
             return Err(UpdateStorageErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
                     invalid_parameter: None,

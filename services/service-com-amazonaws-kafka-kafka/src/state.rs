@@ -21,11 +21,12 @@
 //! outlive the cluster that holds it.
 //!
 //! A cluster's configuration also changes after creation: an update operation
-//! (`UpdateConnectivity`, `UpdateStorage`) records a [`PendingUpdate`] on the
-//! cluster, and [`Cluster::settle`] folds it into the record once the clock owes
-//! its completion — so one place decides what every reader then reports. The
-//! operation itself is kept in the cluster-operation registry, which is what its
-//! `ClusterOperationArn` names and what `DescribeClusterOperation` renders with
+//! (`UpdateConnectivity`, `UpdateStorage`, `UpdateBrokerStorage`) records a
+//! [`PendingUpdate`] on the cluster, and [`Cluster::settle`] folds it into the
+//! record once the clock owes its completion — so one place decides what every
+//! reader then reports. The operation itself is kept in the cluster-operation
+//! registry, which is what its `ClusterOperationArn` names and what
+//! `DescribeClusterOperation` renders with
 //! [`ClusterOperation::to_cluster_operation_info`].
 //!
 //! The channel registry lives beside it, keyed by channel ARN and indexed by
@@ -75,6 +76,12 @@ use crate::ops::types::{
 /// the state errors that go with it) while a caller that waits sees `ACTIVE`.
 pub const CLUSTER_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
 
+/// The `KafkaBrokerNodeId` a broker-storage update must name, per
+/// `BrokerEBSVolumeInfo`'s model documentation: "The broker identifier must be set
+/// to the keyword ALL. This means the changes apply to all the brokers in the
+/// cluster."
+pub const ALL_BROKERS: &str = "ALL";
+
 /// The smallest EBS data-volume size a broker may be given, from the `range` on
 /// `EBSStorageInfo$VolumeSize` (`__integerMin1Max16384`, 1..16384) in the model.
 pub const MIN_VOLUME_SIZE_GB: i32 = 1;
@@ -100,6 +107,9 @@ pub const MAX_OPERATIONS_PER_CLUSTER: usize = 64;
 /// the SCREAMING_SNAKE_CASE form MSK's cluster-operation types take.
 pub const OPERATION_TYPE_UPDATE_STORAGE: &str = "UPDATE_STORAGE";
 
+/// The `OperationType` an `UpdateBrokerStorage` call records, in the same form.
+pub const OPERATION_TYPE_UPDATE_BROKER_STORAGE: &str = "UPDATE_BROKER_STORAGE";
+
 /// The state MSK reports for a cluster operation that is still running.
 pub const OPERATION_STATE_IN_PROGRESS: &str = "UPDATE_IN_PROGRESS";
 
@@ -117,7 +127,8 @@ pub const CLUSTER_STATE_CREATING: &str = "CREATING";
 /// The `ClusterState` of a cluster an accepted update is still being applied to.
 pub const CLUSTER_STATE_UPDATING: &str = "UPDATING";
 
-/// How long a cluster update (`UpdateConnectivity`, `UpdateStorage` and the
+/// How long a cluster update (`UpdateConnectivity`, `UpdateStorage`,
+/// `UpdateBrokerStorage` and the
 /// sibling update operations) stays in flight before the cluster leaves
 /// `UPDATING`.
 ///
@@ -569,6 +580,8 @@ pub struct Cluster {
     /// `clusterType` both read it off the record instead of assuming one.
     pub cluster_type: String,
     pub kafka_version: String,
+    /// The `CurrentVersion` token an update call must quote, derived from
+    /// [`Self::revision`] so it changes exactly when the cluster does.
     pub current_version: String,
     pub creation_time: SystemTime,
     /// The instant the clock owes this cluster its `CREATING` -> `ACTIVE`
@@ -641,9 +654,9 @@ pub enum ClusterChange {
         connectivity_info: Option<ConnectivityInfo>,
         zookeeper_access: Option<ZookeeperAccess>,
     },
-    /// `UpdateStorage`: the brokers' EBS volume size, their provisioned
-    /// throughput, the cluster's storage mode, or any combination the request
-    /// named.
+    /// `UpdateStorage` and `UpdateBrokerStorage`: the brokers' EBS volume size,
+    /// their provisioned throughput, the cluster's storage mode, or any
+    /// combination the request named.
     Storage(StorageChange),
 }
 
@@ -1482,6 +1495,8 @@ impl ComAmazonawsKafkaKafkaState {
         now: SystemTime,
     ) -> Option<&mut Cluster> {
         let cluster = self.clusters.get_mut(arn)?;
+        // A regional endpoint serves only its own region's clusters, so this
+        // resolves a cluster of another region to `None` exactly as an absent one.
         if cluster.region != region {
             return None;
         }
@@ -1674,9 +1689,11 @@ impl ComAmazonawsKafkaKafkaState {
     /// writer is scoped to its own region exactly as every reader is, and it
     /// updates a record whose clock-owed transitions have landed.
     ///
-    /// The one path that starts an update, so the operation record, the cluster's
-    /// pending change, its active operation ARN and its operation history cannot
-    /// drift apart. The history is bounded here: the records past
+    /// The one path that starts a storage update — `UpdateStorage` and
+    /// `UpdateBrokerStorage` both come through it, each naming its own
+    /// `operation_type` — so the operation record, the cluster's pending change,
+    /// its active operation ARN and its operation history cannot drift apart. The
+    /// history is bounded here: the records past
     /// [`MAX_OPERATIONS_PER_CLUSTER`] are the cluster's own oldest, so the trim
     /// costs one walk of THAT cluster's history rather than of the registry.
     pub fn start_storage_update(
@@ -1684,6 +1701,7 @@ impl ComAmazonawsKafkaKafkaState {
         region: &str,
         arn: &str,
         now: SystemTime,
+        operation_type: &str,
         change: StorageChange,
     ) -> Option<String> {
         let cluster = self.settled_cluster_in_mut(region, arn, now)?;
@@ -1699,7 +1717,7 @@ impl ComAmazonawsKafkaKafkaState {
             arn: operation_arn.clone(),
             cluster_arn,
             region: operation_region,
-            operation_type: OPERATION_TYPE_UPDATE_STORAGE.to_string(),
+            operation_type: operation_type.to_string(),
             creation_time: now,
             end_due: now + CLUSTER_UPDATE_DELAY,
             source_cluster_info,
@@ -2494,6 +2512,8 @@ impl Cluster {
             .collect();
 
         Self {
+            // The first version of a cluster is revision 1; each applied update
+            // generates the next one.
             current_version: current_version_token(&arn, 1),
             arn,
             name: input.cluster_name,
@@ -2654,14 +2674,7 @@ impl Cluster {
     /// A member `change` does not name is left alone, so an update of one
     /// storage attribute does not reset the others.
     pub fn begin_storage_update(&mut self, now: SystemTime, change: StorageChange) -> String {
-        let operation_arn = self.operation_arn(self.revision + 1);
-        self.pending_update = Some(PendingUpdate {
-            operation_arn: operation_arn.clone(),
-            due: now + CLUSTER_UPDATE_DELAY,
-            change: ClusterChange::Storage(change),
-        });
-        self.state = CLUSTER_STATE_UPDATING.to_string();
-        operation_arn
+        self.begin_update(now, ClusterChange::Storage(change))
     }
 
     /// Start a connectivity update: the cluster enters `UPDATING` with the
@@ -2682,14 +2695,27 @@ impl Cluster {
         connectivity_info: Option<ConnectivityInfo>,
         zookeeper_access: Option<ZookeeperAccess>,
     ) -> String {
+        self.begin_update(
+            now,
+            ClusterChange::Connectivity {
+                connectivity_info,
+                zookeeper_access,
+            },
+        )
+    }
+
+    /// Record `change` as the cluster's one in-flight update and move it to
+    /// `UPDATING`, handing back the ARN of the operation that will apply it.
+    ///
+    /// The one path that starts an update, so a cluster is `UPDATING` with an
+    /// active operation ARN exactly while it holds a [`PendingUpdate`], whichever
+    /// update operation recorded it.
+    fn begin_update(&mut self, now: SystemTime, change: ClusterChange) -> String {
         let operation_arn = self.operation_arn(self.revision + 1);
         self.pending_update = Some(PendingUpdate {
             operation_arn: operation_arn.clone(),
             due: now + CLUSTER_UPDATE_DELAY,
-            change: ClusterChange::Connectivity {
-                connectivity_info,
-                zookeeper_access,
-            },
+            change,
         });
         self.state = CLUSTER_STATE_UPDATING.to_string();
         operation_arn
