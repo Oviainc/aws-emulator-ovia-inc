@@ -218,8 +218,9 @@ macro_rules! template_group_response {
 
 /// The schema and the serializer for one eventbridge rule TEMPLATE response shape.
 ///
-/// `CreateEventBridgeRuleTemplateResponse` and `GetEventBridgeRuleTemplateResponse` are
-/// member for member the same shape (`smithy_query(query="shape",shape="…")`): ten
+/// `CreateEventBridgeRuleTemplateResponse`, `GetEventBridgeRuleTemplateResponse` and
+/// `UpdateEventBridgeRuleTemplateResponse` are member for member the same shape
+/// (`smithy_query(query="shape",shape="…")`): ten
 /// members, in the model's order, with `CreatedAt` and `ModifiedAt` targeting
 /// `__timestampIso8601`. See [`template_group_response`] for why the schema is written out
 /// and why no deserializer is emitted.

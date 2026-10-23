@@ -172,8 +172,9 @@ pub(crate) use multiplexes::{multiplex_description_output, multiplex_program_des
 pub mod event_bridge_rule_templates;
 
 pub use event_bridge_rule_templates::{
-    is_event_target_arn, is_event_type, EventBridgeRuleTemplateRecord,
-    EventBridgeRuleTemplateRefusal, NewEventBridgeRuleTemplate,
+    is_event_target_arn, is_event_type, EventBridgeRuleTemplateChanges,
+    EventBridgeRuleTemplateRecord, EventBridgeRuleTemplateRefusal,
+    EventBridgeRuleTemplateUpdateRefusal, NewEventBridgeRuleTemplate,
     EVENT_BRIDGE_RULE_TEMPLATE_EVENT_TYPES, MAX_EVENT_BRIDGE_RULE_TEMPLATES,
     MAX_EVENT_BRIDGE_RULE_TEMPLATE_TARGETS, MAX_EVENT_BRIDGE_RULE_TEMPLATE_TOKENS,
     MAX_EVENT_TARGET_ARN_LEN,
