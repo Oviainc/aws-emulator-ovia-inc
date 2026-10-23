@@ -20,6 +20,14 @@
 //!   the trust document's shape (one string or a list, a wildcard action, an explicit
 //!   deny, another service's principal), the role's path, and a role that was never
 //!   created.
+//! * THE ORDER THE TWO RUN IN. A create of a resource INSIDE a cluster resolves the
+//!   cluster its `@httpLabel` names against EKS's own state — answering one it cannot
+//!   resolve with the 404 that names only that cluster — BEFORE it resolves anything the
+//!   body names against EC2 or IAM, so a caller whose cluster does not exist is told
+//!   that rather than that the subnet or the role it supplied is unusable. Rows span
+//!   both child creates that resolve a peer, the peer-owned member each gets wrong, and
+//!   the form of the cluster name; the control half is the same body against a cluster
+//!   that resolves, which is still refused 400.
 //!
 //! Assembling the whole router costs stack (see `boot_serve.rs`), so it is built — and
 //! the requests driven — on a sized thread.
@@ -789,6 +797,152 @@ fn eks_resolves_its_subnets_against_ec2_and_its_connector_role_against_iam() {
                         "case {case:?}: a refused create must store nothing, got {read:?}"
                     );
                 }
+            }
+
+            // ---------------------------------------------------------------
+            // RULE: the PARENT resolves first. A create of a resource inside a
+            // cluster resolves the cluster its `@httpLabel` names against EKS's own
+            // state — and answers one it cannot resolve with the 404 that names only
+            // that cluster — BEFORE it resolves anything the body names against EC2
+            // or IAM. A caller whose cluster does not exist is told THAT, not that
+            // the subnet or the role it supplied is unusable, so its recovery
+            // (create the cluster, retry) is the one the answer points at.
+            //
+            // The rows reuse the fixtures above — a role IAM holds that does not
+            // trust Amazon EKS, a role IAM never created, and subnet ids no subnet of
+            // the account carries — each of which IS refused on a cluster that
+            // resolves (the control half below), and span both child creates that
+            // resolve a peer, the member they get wrong, and the form of the cluster
+            // name the request carries (`clusterName` is `length 1..100`).
+            // ---------------------------------------------------------------
+            let ghost_longest = "g".repeat(100);
+            let ghost_clusters: Vec<(&str, &str)> = vec![
+                ("a cluster that was never created", "ghost-cluster"),
+                (
+                    "a cluster name differing only in case from a real one",
+                    "CAPABILITY-HOST",
+                ),
+                (
+                    "a cluster name at the documented length ceiling",
+                    ghost_longest.as_str(),
+                ),
+                ("a one-character cluster name", "g"),
+            ];
+            // (case, the collection under the cluster, a body whose peer-owned member
+            // resolves to nothing)
+            let peer_rows: Vec<(&str, &str, serde_json::Value)> = vec![
+                (
+                    "CreateCapability naming a role that does not trust Amazon EKS",
+                    "capabilities",
+                    serde_json::json!({
+                        "capabilityName": "orphan-capability",
+                        "type": "ACK",
+                        "roleArn": role_arn("lambda-exec-role"),
+                        "deletePropagationPolicy": "RETAIN",
+                    }),
+                ),
+                (
+                    "CreateCapability naming a role IAM never created",
+                    "capabilities",
+                    serde_json::json!({
+                        "capabilityName": "orphan-capability",
+                        "type": "ARGOCD",
+                        "roleArn": role_arn("never-created-capability"),
+                        "deletePropagationPolicy": "RETAIN",
+                    }),
+                ),
+                (
+                    "CreateNodegroup naming one subnet EC2 does not hold",
+                    "node-groups",
+                    serde_json::json!({
+                        "nodegroupName": "orphan-nodes",
+                        "nodeRole": role_arn("eksNodeRole"),
+                        "subnets": [client_subnets[0].clone(), unknown_long.clone()],
+                    }),
+                ),
+                (
+                    "CreateNodegroup naming only subnets EC2 does not hold",
+                    "node-groups",
+                    serde_json::json!({
+                        "nodegroupName": "orphan-nodes",
+                        "nodeRole": role_arn("eksNodeRole"),
+                        "subnets": [unknown_long.clone(), unknown_short.clone()],
+                    }),
+                ),
+            ];
+
+            for (why, ghost) in &ghost_clusters {
+                for (row, collection, body) in &peer_rows {
+                    let case = format!("{why} / {row}");
+                    let answer = eks(
+                        &router,
+                        &runtime,
+                        "POST",
+                        &format!("/clusters/{ghost}/{collection}"),
+                        Some(body.clone()),
+                    );
+                    assert_eq!(
+                        (answer.status, answer.error_type.as_deref()),
+                        (404, Some("ResourceNotFoundException")),
+                        "case {case:?}: the unresolvable cluster must be reported before the \
+                         peer-owned member, got {answer:?}"
+                    );
+                    assert_eq!(
+                        answer
+                            .body
+                            .get("clusterName")
+                            .and_then(serde_json::Value::as_str),
+                        Some(*ghost),
+                        "case {case:?}: the payload must name the cluster that was not found, \
+                         got {}",
+                        answer.text
+                    );
+                    assert_eq!(
+                        answer.message(),
+                        service_com_amazonaws_eks_awswesleyfrontend::state::cluster_not_found_message(
+                            ghost
+                        ),
+                        "case {case:?}: expected the message built from the request, got {}",
+                        answer.text
+                    );
+                    // The cluster is the resource reported missing, so the child the
+                    // request asked for is not echoed into the payload.
+                    for member in ["nodegroupName", "addonName", "fargateProfileName"] {
+                        assert!(
+                            answer
+                                .body
+                                .get(member)
+                                .is_none_or(serde_json::Value::is_null),
+                            "case {case:?}: the payload must not echo the request's {member}, \
+                             got {}",
+                            answer.text
+                        );
+                    }
+                }
+            }
+
+            // CONTROL: the rule is about ORDER, not about dropping the peer
+            // resolution — against a cluster that DOES resolve, every one of those
+            // bodies is still refused 400 `InvalidParameterException`.
+            for (row, collection, body) in &peer_rows {
+                let resolvable = if *collection == "capabilities" {
+                    capability_host
+                } else {
+                    host
+                };
+                let answer = eks(
+                    &router,
+                    &runtime,
+                    "POST",
+                    &format!("/clusters/{resolvable}/{collection}"),
+                    Some(body.clone()),
+                );
+                assert_eq!(
+                    (answer.status, answer.error_type.as_deref()),
+                    (400, Some("InvalidParameterException")),
+                    "case {row:?}: once the cluster resolves, the peer-owned member is still \
+                     resolved, got {answer:?}"
+                );
             }
         })
         .expect("spawn the eks cluster-inputs thread")

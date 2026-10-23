@@ -11,11 +11,10 @@
 //! The preconditions themselves come from the model's own documentation
 //! (`smithy_query(query="operation",operation="CreateEnvironment")` and the member
 //! docs it quotes): `termsAccepted` is the caller's confirmation that it holds the VCF
-//! licenses, `SELF_DEPLOYED` supports none of `licenseInfo`, `hosts`, `vcfHostnames`,
-//! `siteId`, `connectivityInfo`, `dedicatedHostId` and `placementGroupId` cannot be
-//! used together, a VLAN subnet block is between /24 and /28 and overlaps no other,
-//! `hcxNetworkAclId` is required for a public HCX VLAN, and an environment name is
-//! unique per Region.
+//! licenses, `dedicatedHostId` and `placementGroupId` cannot be used together, a VLAN
+//! subnet block is between /24 and /28 and overlaps no other, `hcxNetworkAclId` is
+//! required for a public HCX VLAN, an environment name is unique per Region, and the
+//! `vpcId`/`serviceAccessSubnetId` name a network the account holds.
 //!
 //! Each row below breaks a DIFFERENT number and mix of those preconditions, from one
 //! to six at a time, so what is asserted is the aggregation rule and not one recorded
@@ -29,7 +28,7 @@ use service_com_amazonaws_evs_amazonelasticvmwareservice::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::environment_lifecycle::{call, create_request, emulator, error_type, vlans_with_prefix};
+use crate::environment_lifecycle::{call, emulator, error_type, vlans_with_prefix};
 
 /// The `ValidationExceptionReason` a field-level refusal carries (the model's enum
 /// values are `unknownOperation`, `cannotParse`, `fieldValidationFailed`, `other`).
@@ -120,8 +119,13 @@ fn assert_aggregated_refusal(case: &str, status: u16, body: &Value, expected_mem
         .collect();
     for (entry, text) in entries.iter().zip(&texts) {
         let name = entry["name"].as_str().unwrap_or_default();
+        // The clause has to NAME the member it refuses, but not necessarily in the
+        // member's camelCase spelling: the network clauses state it the way AWS's own
+        // recorded wording does ("The VPC id <id> is not valid …"), so the comparison
+        // ignores case and spaces.
+        let flattened = |value: &str| value.to_lowercase().replace(' ', "");
         assert!(
-            text.contains(name),
+            flattened(text).contains(&flattened(name)),
             "case {case:?}: the entry for {name} must name the member it refuses, got {text:?}"
         );
     }
@@ -179,16 +183,16 @@ async fn a_create_that_fails_preconditions_is_refused_once_naming_every_failure(
             vec!["termsAccepted"],
         ),
         (
-            "terms not accepted together with an unsupported install parameter",
+            "terms not accepted together with a parameter SELF_DEPLOYED does not use",
             json!({
                 "termsAccepted": false,
                 "vcfVersion": "SELF_DEPLOYED",
                 "siteId": "site-1",
             }),
-            vec!["termsAccepted", "siteId"],
+            vec!["termsAccepted"],
         ),
         (
-            "every parameter SELF_DEPLOYED refuses, and terms not accepted",
+            "every parameter SELF_DEPLOYED does not use, and terms not accepted",
             json!({
                 "termsAccepted": false,
                 "vcfVersion": "SELF_DEPLOYED",
@@ -198,14 +202,8 @@ async fn a_create_that_fails_preconditions_is_refused_once_naming_every_failure(
                 "connectivityInfo": connectivity,
                 "hosts": hosts_with(&json!({}), &[]),
             }),
-            vec![
-                "termsAccepted",
-                "siteId",
-                "licenseInfo",
-                "vcfHostnames",
-                "connectivityInfo",
-                "hosts",
-            ],
+            // Only the terms: carrying those five parameters is no failure at all.
+            vec!["termsAccepted"],
         ),
         (
             "two of four hosts name both placement mechanisms",
@@ -270,7 +268,7 @@ async fn a_create_that_fails_preconditions_is_refused_once_naming_every_failure(
     for (case, overrides, expected_members) in rows {
         // A fresh emulator per row, so "nothing was created" is exact.
         let router = emulator();
-        let mut request = create_request(None);
+        let mut request = router.create_request(None);
         for (member, value) in overrides.as_object().expect("the overrides are an object") {
             request[member] = value.clone();
         }
@@ -302,12 +300,17 @@ async fn a_create_that_fails_preconditions_is_refused_once_naming_every_failure(
 #[tokio::test]
 async fn a_refusal_aggregates_the_state_scoped_precondition_too() {
     let router = emulator();
-    let (status, body) = call(&router, "CreateEnvironment", &create_request(Some("taken"))).await;
+    let (status, body) = call(
+        &router,
+        "CreateEnvironment",
+        &router.create_request(Some("taken")),
+    )
+    .await;
     assert_eq!(status, 200, "first create: expected 200, got {status} {body}");
 
     // The name is taken AND the terms are not accepted: both are reported at once,
     // even though only one of them can be decided from the request alone.
-    let mut request = create_request(Some("taken"));
+    let mut request = router.create_request(Some("taken"));
     request["termsAccepted"] = json!(false);
     let (status, body) = call(&router, "CreateEnvironment", &request).await;
     assert_aggregated_refusal(
@@ -329,8 +332,9 @@ async fn a_vpc_carries_one_deployed_environment_at_a_time() {
     // EVS does not provide multi-VPC support for environments at this time."
     // (`vpcId` doc.)
     let router = emulator();
-    let first = create_request(Some("vpc-owner"));
+    let first = router.create_request(Some("vpc-owner"));
     let vpc = first["vpcId"].clone();
+    let subnet = first["serviceAccessSubnetId"].clone();
     let (status, body) = call(&router, "CreateEnvironment", &first).await;
     assert_eq!(status, 200, "first create: expected 200, got {status} {body}");
     let owner = body["environment"]["environmentId"]
@@ -340,8 +344,9 @@ async fn a_vpc_carries_one_deployed_environment_at_a_time() {
 
     // A second environment in that VPC is refused — and when the same request also
     // leaves the terms unaccepted, BOTH failures are reported at once.
-    let mut second = create_request(Some("vpc-squatter"));
+    let mut second = router.create_request(Some("vpc-squatter"));
     second["vpcId"] = vpc.clone();
+    second["serviceAccessSubnetId"] = subnet.clone();
     let (status, body) = call(&router, "CreateEnvironment", &second).await;
     assert_aggregated_refusal(
         "a VPC already carrying an environment",
@@ -350,8 +355,9 @@ async fn a_vpc_carries_one_deployed_environment_at_a_time() {
         &["vpcId"],
     );
 
-    let mut third = create_request(Some("vpc-squatter"));
+    let mut third = router.create_request(Some("vpc-squatter"));
     third["vpcId"] = vpc.clone();
+    third["serviceAccessSubnetId"] = subnet.clone();
     third["termsAccepted"] = json!(false);
     let (status, body) = call(&router, "CreateEnvironment", &third).await;
     assert_aggregated_refusal(
@@ -375,8 +381,9 @@ async fn a_vpc_carries_one_deployed_environment_at_a_time() {
     )
     .await;
     assert_eq!(status, 200, "delete: expected 200, got {status} {body}");
-    let mut while_deleting = create_request(Some("vpc-next-while-deleting"));
+    let mut while_deleting = router.create_request(Some("vpc-next-while-deleting"));
     while_deleting["vpcId"] = vpc.clone();
+    while_deleting["serviceAccessSubnetId"] = subnet.clone();
     let (status, body) = call(&router, "CreateEnvironment", &while_deleting).await;
     assert_aggregated_refusal(
         "a VPC whose environment is still DELETING",
@@ -388,8 +395,9 @@ async fn a_vpc_carries_one_deployed_environment_at_a_time() {
     // Long enough for the deletion this service owes to come due (its span is under a
     // second by construction).
     std::thread::sleep(std::time::Duration::from_millis(900));
-    let mut reuse = create_request(Some("vpc-next"));
+    let mut reuse = router.create_request(Some("vpc-next"));
     reuse["vpcId"] = vpc.clone();
+    reuse["serviceAccessSubnetId"] = subnet.clone();
     let (status, body) = call(&router, "CreateEnvironment", &reuse).await;
     assert_eq!(
         status, 200,
@@ -404,10 +412,149 @@ async fn a_vpc_carries_one_deployed_environment_at_a_time() {
 }
 
 #[tokio::test]
+async fn the_network_a_create_names_has_to_exist_in_the_account() {
+    // An Amazon EVS environment is deployed INTO the caller's existing network, so the
+    // `vpcId` must name a VPC the account holds and the `serviceAccessSubnetId` a subnet
+    // OF THAT VPC. Both facts belong to Amazon EC2, so the service asks EC2's own store
+    // (`state::ec2_resources`), which is what the harness writes through
+    // `Emulator::fresh_network`.
+    //
+    // There is deliberately no row for "an engine that carries no EC2 store refuses
+    // nothing": such an engine carries no Amazon EVS store either, so the handler
+    // answers `InternalServerException` before any precondition is reached.
+    let license = json!([{
+        "solutionKey": "AAAAA-BBBBB-CCCCC-DDDDD-EEEEE",
+        "vsanKey": "FFFFF-GGGGG-HHHHH-IIIII-JJJJJ",
+    }]);
+    let hostnames = json!({
+        "vCenter": "vcenter", "nsx": "nsx", "nsxManager1": "nsxm1", "nsxManager2": "nsxm2",
+        "nsxManager3": "nsxm3", "nsxEdge1": "nsxe1", "nsxEdge2": "nsxe2",
+        "sddcManager": "sddc", "cloudBuilder": "builder",
+    });
+    let connectivity = json!({ "privateRouteServerPeerings": ["rsp-1", "rsp-2"] });
+
+    // Each row: the case, what it overrides on a request whose network IS registered,
+    // and the input members the refusal must name — none for a row that is accepted.
+    // The ids below are well formed (the modelled `^vpc-[a-f0-9]{8}([a-f0-9]{9})?$` /
+    // `^subnet-[a-f0-9]{8}([a-f0-9]{9})?$`) and name nothing the account holds, which is
+    // the condition under test; `OTHER_NETWORK` marks the row that crosses two VPCs.
+    const UNKNOWN_VPC: &str = "vpc-00000000";
+    const UNKNOWN_SUBNET: &str = "subnet-00000000";
+    const OTHER_NETWORK: &str = "<another registered VPC>";
+    let rows: Vec<(&str, Value, Vec<&str>)> = vec![
+        (
+            "the registered network of the request is accepted",
+            json!({}),
+            vec![],
+        ),
+        (
+            "a vpcId the account holds no VPC for",
+            json!({ "vpcId": UNKNOWN_VPC }),
+            vec!["vpcId"],
+        ),
+        (
+            // The recorded request: a nonexistent VPC together with all five parameters
+            // `SELF_DEPLOYED` does not use. Only the VPC is a failure.
+            "a vpcId that names no VPC, with every SELF_DEPLOYED-unsupported parameter",
+            json!({
+                "vpcId": UNKNOWN_VPC,
+                "serviceAccessSubnetId": UNKNOWN_SUBNET,
+                "vcfVersion": "SELF_DEPLOYED",
+                "siteId": "site-1",
+                "licenseInfo": license,
+                "vcfHostnames": hostnames,
+                "connectivityInfo": connectivity,
+                "hosts": hosts_with(&json!({}), &[]),
+            }),
+            vec!["vpcId"],
+        ),
+        (
+            "a serviceAccessSubnetId the account holds no subnet for",
+            json!({ "serviceAccessSubnetId": UNKNOWN_SUBNET }),
+            vec!["serviceAccessSubnetId"],
+        ),
+        (
+            "a serviceAccessSubnetId that belongs to another VPC",
+            json!({ "serviceAccessSubnetId": OTHER_NETWORK }),
+            vec!["serviceAccessSubnetId"],
+        ),
+        (
+            "an unknown VPC aggregated with another failed precondition",
+            json!({ "vpcId": UNKNOWN_VPC, "termsAccepted": false }),
+            vec!["termsAccepted", "vpcId"],
+        ),
+    ];
+
+    for (case, overrides, expected_members) in rows {
+        // A fresh emulator per row, so "nothing was created" is exact.
+        let router = emulator();
+        let mut request = router.create_request(Some("network-env"));
+        // A second registered network, so one row can name a subnet that exists but
+        // belongs to a VPC other than the one the request gives.
+        let (_, other_subnet) = router.fresh_network();
+        for (member, value) in overrides.as_object().expect("the overrides are an object") {
+            request[member] = if value == &json!(OTHER_NETWORK) {
+                json!(other_subnet)
+            } else {
+                value.clone()
+            };
+        }
+
+        let (status, body) = call(&router, "CreateEnvironment", &request).await;
+        if expected_members.is_empty() {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200, got {status} ({}) {body}",
+                error_type(&body)
+            );
+            continue;
+        }
+        assert_aggregated_refusal(case, status, &body, &expected_members);
+        assert_eq!(
+            environment_count(&router).await,
+            0,
+            "case {case:?}: a refused create must not persist an environment"
+        );
+
+        // The clause is the service's own wording for the member it refuses, built from
+        // the id the request gave, and it names nothing else: no clause about the five
+        // parameters `SELF_DEPLOYED` does not use, and none about the subnet when it is
+        // the VPC that could not be resolved.
+        let message = body["message"].as_str().unwrap_or_default();
+        if expected_members.contains(&"vpcId") {
+            assert!(
+                message.contains(&format!(
+                    "The VPC id {UNKNOWN_VPC} is not valid or does not exist."
+                )),
+                "case {case:?}: expected the clause to name the vpcId the request gave, \
+                 got {message:?}"
+            );
+            assert!(
+                !message.contains("subnet"),
+                "case {case:?}: an unresolved VPC leaves no VPC to judge the subnet \
+                 against, so no subnet clause may be stated, got {message:?}"
+            );
+        }
+        if expected_members.contains(&"serviceAccessSubnetId") {
+            assert!(
+                message.contains("is not valid or does not exist in VPC"),
+                "case {case:?}: expected the clause to name the subnet and the VPC it \
+                 has to belong to, got {message:?}"
+            );
+        }
+        assert!(
+            !message.contains("SELF_DEPLOYED"),
+            "case {case:?}: carrying a parameter that mode does not use is no failure, \
+             so no clause may mention it, got {message:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn accepting_the_terms_is_what_lets_the_same_request_through() {
     let router = emulator();
 
-    let mut request = create_request(Some("terms-env"));
+    let mut request = router.create_request(Some("terms-env"));
     request["termsAccepted"] = json!(false);
     let (status, body) = call(&router, "CreateEnvironment", &request).await;
     assert_aggregated_refusal("terms not accepted", status, &body, &["termsAccepted"]);
