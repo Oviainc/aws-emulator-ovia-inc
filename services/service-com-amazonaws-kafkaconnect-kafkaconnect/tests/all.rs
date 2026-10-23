@@ -15,6 +15,8 @@
 mod custom_plugin_and_connector_lifecycle;
 #[path = "all/custom_plugin_file_location.rs"]
 mod custom_plugin_file_location;
+#[path = "all/duplicate_name_conflict_message.rs"]
+mod duplicate_name_conflict_message;
 #[path = "all/iso8601_timestamps.rs"]
 mod iso8601_timestamps;
 #[path = "all/state_roundtrip.rs"]

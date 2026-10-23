@@ -714,10 +714,12 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 // Both builders live here so every handler in `src/ops/` renders the one form
 // rather than each inventing a sentence.
 //
-// They are for a rejection of a member's VALUE — a value the service cannot
-// parse, or one naming a resource it does not hold. A conflict with state the
-// account already holds (a name already taken) and a quota refusal are not
-// rejections of the value, and keep their own wording.
+// They are for a rejection the service blames on a member of the request: a
+// value it cannot parse, one naming a resource it does not hold, and one whose
+// value collides with state the account already holds (a name already taken) —
+// the request's own `name`/`connectorName` is the member that conflicted, so the
+// same member-naming form carries the modelled conflict reason. A quota refusal
+// blames no member of the request and keeps its own wording.
 // ---------------------------------------------------------------------------
 
 /// The lead-in of every kafkaconnect parameter-rejection message.
@@ -730,6 +732,17 @@ pub const RESOURCE_DOES_NOT_EXIST: &str = "The requested resource doesn\u{2019}t
 /// The reason a parameter that must carry an ARN, and does not, is rejected
 /// with.
 pub const INVALID_ARN: &str = "Invalid ARN.";
+
+/// The reason a create whose name is already taken is refused with: the
+/// modelled `ConflictException` sentence, as its own documentation states it
+/// ("HTTP Status Code 409: Conflict. A resource with this name already exists.
+/// Retry your request with another name." — the status prefix is the HTTP status
+/// itself and the retry advice is advice, so the reason is the middle sentence).
+///
+/// It names NO resource and interpolates nothing: the conflict is the same
+/// whatever name was asked for and whatever ARN the held resource carries, and a
+/// generated ARN in a message would differ on every run.
+pub const NAME_ALREADY_EXISTS: &str = "A resource with this name already exists.";
 
 /// The message for a rejection of the member `member`, with no further reason:
 /// `Invalid parameter <member>.`

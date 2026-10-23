@@ -181,11 +181,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
         state.settle_due();
 
-        if let Some(existing) = state.worker_configuration_named(&input.name) {
+        // A name already taken is a refusal this service blames on the request
+        // member that carried it, so it answers in the same
+        // `Invalid parameter <member>: <reason>` form every other kafkaconnect
+        // rejection uses, with the modelled `ConflictException` reason. The held
+        // resource's own name and generated ARN stay out of the message: the
+        // conflict is the same whatever they are, and an ARN would differ on
+        // every run.
+        if state.worker_configuration_named(&input.name).is_some() {
             return Err(CreateWorkerConfigurationErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "A worker configuration named {} already exists ({}). Retry your request with another name.",
-                    input.name, existing.arn
+                message: Some(crate::state::invalid_parameter_because(
+                    "name",
+                    crate::state::NAME_ALREADY_EXISTS,
                 )),
             })
             .into());

@@ -247,11 +247,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        if let Some(existing) = state.connector_named(&input.connector_name) {
+        // A name already taken: refused on the request member that carried it
+        // (`connectorName` here — the member is the one the REQUEST names), in
+        // the service's `Invalid parameter <member>: <reason>` form with the
+        // modelled `ConflictException` reason and no generated ARN in the text.
+        if state.connector_named(&input.connector_name).is_some() {
             return Err(CreateConnectorErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "A connector named {} already exists ({}). Retry your request with another name.",
-                    input.connector_name, existing.arn
+                message: Some(crate::state::invalid_parameter_because(
+                    "connectorName",
+                    crate::state::NAME_ALREADY_EXISTS,
                 )),
             })
             .into());

@@ -235,11 +235,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
         state.settle_due();
 
-        if let Some(existing) = state.custom_plugin_named(&input.name) {
+        // A name already taken: refused on the request member that carried it,
+        // in the service's `Invalid parameter <member>: <reason>` form with the
+        // modelled `ConflictException` reason, and with no generated ARN in the
+        // text (see `crate::state::NAME_ALREADY_EXISTS`).
+        if state.custom_plugin_named(&input.name).is_some() {
             return Err(CreateCustomPluginErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "A custom plugin named {} already exists ({}). Retry your request with another name.",
-                    input.name, existing.arn
+                message: Some(crate::state::invalid_parameter_because(
+                    "name",
+                    crate::state::NAME_ALREADY_EXISTS,
                 )),
             })
             .into());
