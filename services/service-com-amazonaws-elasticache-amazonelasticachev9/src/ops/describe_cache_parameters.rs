@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCacheParameters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeCacheParameters`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: this operation answers from this service's state. The SCAFFOLDED
+//! marker line is gone, which is what records it as no longer a stub
+//! (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`); the paragraphs below
+//! are the scaffold's notes on how an operation of this service is wired. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeCacheParameters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -119,6 +115,40 @@ impl From<DescribeCacheParametersErrorModeled> for DescribeCacheParametersError 
     }
 }
 
+/// The pagination key a `Marker` of THIS operation carries: the cache parameter
+/// group the page belongs to and the record it starts at.
+///
+/// A marker is only meaningful inside one group's parameter list, so the group
+/// it was minted for travels in the token and is checked when it comes back: a
+/// token from another group (or from another paginated describe of this service)
+/// names a different group or no group at all, and is refused rather than
+/// silently resolving to an offset into the wrong list. This mirrors
+/// `describe_engine_default_parameters`, which keys its own marker by family.
+fn marker_key(group: &str, page_key: &str) -> String {
+    format!("{group}|{page_key}")
+}
+
+/// The record key `marker` resumes at, or `None` when it is not a token this
+/// operation minted for `group`.
+fn marker_start(marker: &str, group: &str) -> Option<String> {
+    let decoded = crate::state::decode_marker(marker)?;
+    let (minted_for, page_key) = decoded.split_once('|')?;
+    (minted_for == group).then(|| page_key.to_string())
+}
+
+/// `message` as this operation's modelled `InvalidParameterValueException`
+/// ("The value for a parameter is invalid", HTTP 400) — the refusal for a value
+/// a member of this request may not take, so every place that reaches it words
+/// it the same way.
+fn invalid_parameter_value(message: String) -> DescribeCacheParametersError {
+    DescribeCacheParametersErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
 /// The `DescribeCacheParameters` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -153,20 +183,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeCacheParameters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeCacheParametersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeCacheParameters"))
+        // "Returns the detailed parameter list for a particular cache parameter
+        // group": a pure read of the group's effective parameters. A parameter
+        // group has no lifecycle the clock drives — its values are what the last
+        // write left — so this handler writes nothing at all.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // `MaxRecords` carries no modelled `@range`, a `Marker` carries no
+        // modelled format and `Source` carries no modelled enum, so this
+        // operation's documented "Default: 100. Constraints: minimum 20;
+        // maximum 100" window, a token this service did not mint for this group
+        // and a source outside "user | system | engine-default" are all refused
+        // here, through the same helpers every paginated describe and every
+        // unconstrained filter vocabulary of this service shares.
+        // `InvalidParameterValueException` is what this operation models for a
+        // value a parameter may not take.
+        let page_size = match crate::state::page_size(input.max_records) {
+            Ok(size) => size,
+            Err(message) => return Err(invalid_parameter_value(message)),
+        };
+        // "The parameter types to return": no `Source` at all is every type.
+        let source_filter = match input.source.as_deref() {
+            Some(value) => match crate::state::parameter_source_filter(value) {
+                Ok(source) => Some(source),
+                Err(message) => return Err(invalid_parameter_value(message)),
+            },
+            None => None,
+        };
+
+        let store = state.lock();
+        // "The requested cache parameter group name does not refer to an
+        // existing cache parameter group" is the modelled 404, resolved through
+        // the one lookup every handler naming a `CacheParameterGroupName`
+        // shares.
+        let name = input.cache_parameter_group_name;
+        let Some(group) = store.parameter_group(&name) else {
+            return Err(
+                DescribeCacheParametersErrorModeled::CacheParameterGroupNotFoundFault(
+                    CacheParameterGroupNotFoundFault {
+                        message: Some(format!("CacheParameterGroup {name} not found.")),
+                    },
+                )
+                .into(),
+            );
+        };
+        // A group's parameters are its FAMILY's: the engine defaults this
+        // service publishes for that family, with the values set on this group
+        // laid over them. Every stored group names a published family (the
+        // create refuses any other), so this lookup cannot miss; a family with
+        // no published catalog would be answered as a group with no parameters
+        // at all, which would be a defect in this crate's state rather than
+        // anything the request asked for, so it is refused instead.
+        let Some(parameters) = store.engine_defaults(&group.family) else {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "the stored cache parameter group {name} names the cache parameter group family \
+                 {}, which this service publishes no parameter catalog for",
+                group.family
+            )));
+        };
+
+        // The marker is checked AGAINST the group: a token this operation did
+        // not mint for this group resumes nothing.
+        let resume_from = match input.marker.as_deref() {
+            Some(marker) => match marker_start(marker, &group.name) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(invalid_parameter_value(format!(
+                        "Invalid value {marker} for Marker."
+                    )))
+                }
+            },
+            None => None,
+        };
+
+        // `CacheParameterGroupDetails` carries two parameter lists and ONE
+        // `Marker`, so a page is a window over both: the stored key order runs
+        // the plain parameters first and the node-type-specific ones after (see
+        // `state::ParameterRecord::page_key`), and each record of the page lands
+        // in the list its own kind belongs to.
+        let mut page_plain: Vec<Parameter> = Vec::new();
+        let mut page_node_type_specific: Vec<CacheNodeTypeSpecificParameter> = Vec::new();
+        let mut marker = None;
+        // A `Marker` carries the inclusive start key of its page, so the page is
+        // a RANGE of the stored order rather than a scan of all of it.
+        let start = match resume_from.as_deref() {
+            Some(key) => ::std::ops::Bound::Included(key),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        for (key, parameter) in parameters.range::<str, _>((start, ::std::ops::Bound::Unbounded)) {
+            // Whether this group reports the customer's value for a parameter or
+            // the engine's own is exactly what `Source` selects on, so the
+            // filter is applied to the source the GROUP reports it under rather
+            // than to the catalog row.
+            let set_value = group.set_value(&parameter.name);
+            if source_filter.is_some_and(|source| source != parameter.source_in_group(set_value)) {
+                continue;
+            }
+            if page_plain.len() + page_node_type_specific.len() == page_size {
+                // More records exist than `MaxRecords`, so the response carries
+                // the marker the next call resumes from.
+                marker = Some(crate::state::encode_marker(&marker_key(&group.name, key)));
+                break;
+            }
+            if parameter.is_node_type_specific() {
+                page_node_type_specific.push(parameter.to_node_type_specific());
+            } else {
+                page_plain.push(parameter.to_modeled_in_group(set_value));
+            }
+        }
+
+        Ok(DescribeCacheParametersOutput {
+            marker,
+            parameters: Some(page_plain),
+            cache_node_type_specific_parameters: Some(page_node_type_specific),
+        })
     }
 }

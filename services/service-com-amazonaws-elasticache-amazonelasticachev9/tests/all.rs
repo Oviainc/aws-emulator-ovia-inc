@@ -79,3 +79,7 @@ mod subnet_resolution_and_error_envelope;
 mod query_error_envelope;
 #[path = "all/cache_parameter_group_delete.rs"]
 mod cache_parameter_group_delete;
+
+// Appended for the same reason: the `DescribeCacheParameters` suite.
+#[path = "all/describe_cache_parameters.rs"]
+mod describe_cache_parameters;

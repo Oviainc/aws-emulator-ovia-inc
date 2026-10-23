@@ -50,10 +50,14 @@
 //! A cache parameter group is a supporting resource:
 //! `CreateCacheParameterGroup` mints a custom one and
 //! `DescribeCacheParameterGroups` reports it beside the family defaults the
-//! service publishes. The parameter VALUES inside a group are not held here —
-//! `DescribeCacheParameters`, `ModifyCacheParameterGroup` and
-//! `ResetCacheParameterGroup` are still scaffolded 501s and own their own gap
-//! issues.
+//! service publishes. The parameter VALUES a group has had SET on it live on
+//! that record ([`CacheParameterGroupRecord::parameter_values`]), because a
+//! group reports its family's engine defaults with exactly those values laid
+//! over them — which is what `DescribeCacheParameters` answers with.
+//! `ModifyCacheParameterGroup` and `ResetCacheParameterGroup`, the two
+//! operations that WRITE that map, are still scaffolded 501s and own their own
+//! gap issues; keeping the map on the group record is what will let them write
+//! the copy the reader already reads instead of a second one beside it.
 //!
 //! Beside the cache resources sits the RBAC user: `CreateUser` mints one and
 //! `DescribeUsers` reports it, over the one [`UserRecord`] map below, which also
@@ -600,6 +604,9 @@ pub fn default_parameter_groups() -> BTreeMap<String, CacheParameterGroupRecord>
                 description: format!("Default parameter group for {family}"),
                 // Nothing tags a group the service itself provides.
                 tags: Vec::new(),
+                // A family default starts out being exactly its family's engine
+                // defaults: nothing has set a value on it.
+                parameter_values: BTreeMap::new(),
             };
             (record.name.clone(), record)
         })
@@ -614,10 +621,6 @@ pub fn default_parameter_groups() -> BTreeMap<String, CacheParameterGroupRecord>
 /// default is provided in every Region, and a custom one is created in the
 /// Region of the create — so the ARN a read reports names the Region of the
 /// request reading it; see [`CacheParameterGroupRecord::to_modeled`].
-///
-/// The parameter VALUES inside a group are not here: `DescribeCacheParameters`,
-/// `ModifyCacheParameterGroup` and `ResetCacheParameterGroup` are scaffolded
-/// 501s with their own issues.
 #[derive(Debug, Clone)]
 pub struct CacheParameterGroupRecord {
     /// The group's identity, which "is stored as a lowercase string"
@@ -630,9 +633,30 @@ pub struct CacheParameterGroupRecord {
     /// The tags `CreateCacheParameterGroup` was given; see
     /// [`CacheClusterRecord::tags`].
     pub tags: Vec<(String, String)>,
+    /// The value SET on this group for a parameter, keyed by
+    /// `Parameter$ParameterName`.
+    ///
+    /// A group holds only the values it DIFFERS from its family's engine
+    /// defaults by, never a copy of the catalog: that is what makes a group's
+    /// effective parameter list "the family defaults with these laid over
+    /// them", and what makes a parameter's `Parameter$Source` derivable — a
+    /// name in this map is the customer's value ([`PARAMETER_SOURCE_USER`]),
+    /// one that is not is the service's ([`PARAMETER_SOURCE_SYSTEM`]).
+    /// `ModifyCacheParameterGroup` sets an entry and
+    /// `ResetCacheParameterGroup` removes one; both are still scaffolded 501s
+    /// with their own issues, so a group answers its family's defaults until
+    /// one of them lands.
+    pub parameter_values: BTreeMap<String, String>,
 }
 
 impl CacheParameterGroupRecord {
+    /// The value set on this group for the parameter `name`, or `None` when
+    /// this group reports the engine's own default for it; see
+    /// [`Self::parameter_values`].
+    pub fn set_value(&self, name: &str) -> Option<&str> {
+        self.parameter_values.get(name).map(String::as_str)
+    }
+
     /// This record as the modelled `CacheParameterGroup`, read from `region`.
     pub fn to_modeled(&self, region: &str) -> CacheParameterGroup {
         CacheParameterGroup {
@@ -658,6 +682,49 @@ impl CacheParameterGroupRecord {
 /// engine-default"); an engine default is the service's own value, so it is
 /// reported as `system`.
 pub const PARAMETER_SOURCE_SYSTEM: &str = "system";
+
+/// The `Parameter$Source` of a value a customer set on the group being read,
+/// from the same `DescribeCacheParameters$Source` vocabulary as
+/// [`PARAMETER_SOURCE_SYSTEM`].
+pub const PARAMETER_SOURCE_USER: &str = "user";
+
+/// The third spelling `DescribeCacheParameters$Source` accepts as a FILTER
+/// ("Valid values: user | system | engine-default").
+///
+/// It selects the same parameters as [`PARAMETER_SOURCE_SYSTEM`] — the ones a
+/// group reports the engine's own default for — because an engine default IS
+/// the service's value and is reported under the `system` spelling; see
+/// [`PARAMETER_SOURCE_SYSTEM`].
+pub const PARAMETER_SOURCE_FILTER_ENGINE_DEFAULT: &str = "engine-default";
+
+/// The `Parameter$Source` the `DescribeCacheParameters$Source` filter `value`
+/// selects, or the reason that value is refused.
+///
+/// `Source` is a plain string with NO modelled enum or pattern, so the
+/// vocabulary its own documentation states ("Valid values: user | system |
+/// engine-default") is enforced here, and it is a SUPERSET of the two spellings
+/// a response reports: `engine-default` and `system` both select the parameters
+/// whose value is the engine's own. Matched ignoring ASCII case, as this
+/// service's other unconstrained filter vocabularies are (see
+/// [`snapshot_source_filter`]): a source is a vocabulary word, not an identity.
+pub fn parameter_source_filter(value: &str) -> Result<&'static str, String> {
+    for (spelling, selected) in [
+        (PARAMETER_SOURCE_USER, PARAMETER_SOURCE_USER),
+        (PARAMETER_SOURCE_SYSTEM, PARAMETER_SOURCE_SYSTEM),
+        (
+            PARAMETER_SOURCE_FILTER_ENGINE_DEFAULT,
+            PARAMETER_SOURCE_SYSTEM,
+        ),
+    ] {
+        if value.eq_ignore_ascii_case(spelling) {
+            return Ok(selected);
+        }
+    }
+    Err(format!(
+        "Invalid value {value} for Source: must be one of {PARAMETER_SOURCE_USER} | \
+         {PARAMETER_SOURCE_SYSTEM} | {PARAMETER_SOURCE_FILTER_ENGINE_DEFAULT}."
+    ))
+}
 
 /// `ChangeType`'s values (`smithy_query(query="shape", shape="ChangeType")`:
 /// `immediate | requires-reboot`): whether a change to the parameter is applied
@@ -1454,6 +1521,33 @@ impl ParameterRecord {
             minimum_engine_version: Some(self.minimum_engine_version.clone()),
             change_type: Some(self.change_type.clone()),
         }
+    }
+
+    /// The `Parameter$Source` a group reporting this parameter answers under:
+    /// the customer's when the group holds a value for it, the service's
+    /// otherwise; see [`CacheParameterGroupRecord::parameter_values`].
+    ///
+    /// A parameter whose value is per cache node type is never the customer's:
+    /// its value is the node's own capacity, which is why every such row of the
+    /// published catalog is `IsModifiable: false` and so can hold no set value.
+    pub fn source_in_group(&self, set_value: Option<&str>) -> &'static str {
+        if set_value.is_some() && !self.is_node_type_specific() {
+            PARAMETER_SOURCE_USER
+        } else {
+            PARAMETER_SOURCE_SYSTEM
+        }
+    }
+
+    /// This record as the modelled `Parameter` of a group that holds
+    /// `set_value` for it: the value the group was given, reported as the
+    /// customer's, or the engine's own default reported as the service's.
+    pub fn to_modeled_in_group(&self, set_value: Option<&str>) -> Parameter {
+        let mut parameter = self.to_modeled();
+        parameter.source = Some(self.source_in_group(set_value).to_string());
+        if let Some(value) = set_value {
+            parameter.parameter_value = Some(value.to_string());
+        }
+        parameter
     }
 
     /// This record as the modelled `CacheNodeTypeSpecificParameter`, for a
