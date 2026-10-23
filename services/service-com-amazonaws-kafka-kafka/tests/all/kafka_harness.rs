@@ -206,6 +206,48 @@ impl Emulator {
             })
             .to_string()
     }
+
+    /// `ListVpcConnections`, which the model binds to `GET /v1/vpc-connections`
+    /// with `MaxResults` and `NextToken` as query parameters; `query` is the
+    /// whole query string including its `?`, or empty.
+    pub async fn list_vpc_connections(&self, query: &str) -> Reply {
+        self.list_vpc_connections_in(REGION, query).await
+    }
+
+    /// The same listing, as the endpoint of `region` serves it.
+    pub async fn list_vpc_connections_in(&self, region: &str, query: &str) -> Reply {
+        self.call_in(region, "GET", &format!("/v1/vpc-connections{query}"), None)
+            .await
+    }
+
+    /// Create `request` under `region`'s endpoint, assert it succeeded, and hand
+    /// back the minted ARN — the regional counterpart of
+    /// [`Self::create_vpc_connection_ok`].
+    pub async fn create_vpc_connection_ok_in(
+        &self,
+        region: &str,
+        request: &ConnectionRequest,
+    ) -> String {
+        let reply = self
+            .call_in(
+                region,
+                "POST",
+                "/v1/vpc-connection",
+                Some(request.to_json()),
+            )
+            .await;
+        assert_eq!(
+            reply.status, 200,
+            "case {region} {request:?}: expected CreateVpcConnection to return 200, got {} {}",
+            reply.status, reply.body
+        );
+        reply.body["vpcConnectionArn"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("case {region} {request:?}: CreateVpcConnection returned no vpcConnectionArn")
+            })
+            .to_string()
+    }
 }
 
 /// The resource URI of one MSK VPC connection, with the ARN percent-encoded into

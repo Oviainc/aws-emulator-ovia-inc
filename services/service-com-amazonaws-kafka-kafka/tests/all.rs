@@ -45,3 +45,5 @@ mod storage_updates;
 mod topic_lifecycle;
 #[path = "all/vpc_connection_lifecycle.rs"]
 mod vpc_connection_lifecycle;
+#[path = "all/vpc_connection_listing.rs"]
+mod vpc_connection_listing;
