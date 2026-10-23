@@ -167,9 +167,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // `DeleteBranchResult$branch` is @required: the record as it existed at delete
-        // time, which is the copy just taken out of state.
+        // time, which is the copy just taken out of state. The branch's jobs went with
+        // it: a job exists only as part of the branch it ran on.
         Ok(DeleteBranchOutput {
-            branch: BranchProjection::written(removed),
+            branch: BranchProjection::written(removed.branch),
         })
     }
 }
