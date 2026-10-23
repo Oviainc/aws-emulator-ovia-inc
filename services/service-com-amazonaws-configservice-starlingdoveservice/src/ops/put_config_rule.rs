@@ -339,7 +339,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::RULE_EVALUATION_VISIBILITY_EXTERNAL.to_string(),
                     ),
                     created_at: ::std::time::SystemTime::now(),
-                    tags: input.tags.clone().unwrap_or_default(),
+                    tags: crate::state::tag_set(input.tags.as_deref().unwrap_or_default()),
                     resource_compliance: ::std::collections::BTreeMap::new(),
                 },
             );
