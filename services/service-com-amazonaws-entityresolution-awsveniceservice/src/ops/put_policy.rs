@@ -201,6 +201,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             })?;
 
+        // The entry is keyed by the resource's OWN `<resourceType>/<name>` identity,
+        // never by the request-scoped ARN: the region segment of that ARN comes from
+        // the caller's credential scope, so keying by it would let one live resource
+        // accumulate an unprunable entry per region string a client signs with (see
+        // `crate::state::policies`).
+        let policy_key = crate::state::policy_key(&input.arn, &region)
+            .ok_or_else(|| {
+                PutPolicyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(crate::state::messages::policy_resource_not_found(&input.arn)),
+                })
+            })?
+            .to_string();
+
         if !document_is_object {
             return Err(PutPolicyErrorModeled::ValidationException(ValidationException {
                 message: Some(crate::state::messages::POLICY_NOT_JSON.to_string()),
@@ -232,6 +245,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // policied and deleted.
         store.prune_orphaned_policies();
 
+        // The explicit bound on the collection, enforced after the prune: unreachable
+        // through the API (a policy needs a live resource, and the resource quotas sum
+        // to this bound), and enforced anyway so the store stays bounded even if the
+        // pruning predicate regresses.
+        if !store.has_room_for_policy(&policy_key) {
+            return Err(PutPolicyErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::messages::resource_policies_at_capacity(
+                    crate::state::MAX_RESOURCE_POLICIES,
+                )),
+            })
+            .into());
+        }
+
         // A write produces a NEW revision, so it mints a new token: the token a caller
         // holds from an earlier revision stops matching, which is what makes the
         // conflict above detectable.
@@ -244,7 +270,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this response therefore cannot disagree about what was written. The record is
         // read back through the vacant-or-occupied slot it was written into, so nothing
         // here indexes a key that might be absent.
-        let stored = match store.policies.entry(input.arn.clone()) {
+        let stored = match store.policies.entry(policy_key) {
             ::std::collections::btree_map::Entry::Occupied(slot) => {
                 let slot = slot.into_mut();
                 *slot = record;

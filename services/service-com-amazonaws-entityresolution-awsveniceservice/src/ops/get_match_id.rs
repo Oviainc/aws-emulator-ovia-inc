@@ -1,15 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMatchId
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMatchId`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reads the Match ID of a customer record from the match index of a rule-based
+//! matching workflow — the index `GenerateMatchId` writes, persisted in
+//! [`crate::state::ComAmazonawsEntityresolutionAwsveniceserviceState::match_index`].
+//! A REPORTING operation: it answers from the index and writes nothing, which is what
+//! lets it be "a dry run of an incremental load".
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMatchId::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The scan is bounded by the same maxima as the writer's: at most
+//! [`crate::state::MAX_INDEXED_RECORDS_PER_WORKFLOW`] candidate records, and the
+//! modelled rule, matching-key, input-source and schema-field maxima.
+//!
+//! Authorization is deliberately NOT emulated: the modelled `AccessDeniedException`
+//! is unreachable here, because this emulator holds no principals or policies to
+//! decide a 403 from. Every other modelled refusal is reachable.
+//!
+//! What it reports is what the writer STORED for the record its attributes identify —
+//! both the `matchId` and the `matchRule` — never a rule re-derived here, so this
+//! reader and `GenerateMatchId` cannot disagree about a group.
+//!
+//! This reader gates on the workflow's `resolutionType` but DELIBERATELY not on
+//! `enableRealTimeMatching`, where the writer refuses: real-time matching is what
+//! admits a WRITE to the index ("When you enable real-time matching, you can use the
+//! GenerateMatchId operation with the workflow"), so a workflow that never had it
+//! enabled has simply indexed nothing and this reporting operation answers the empty
+//! result for it — the same answer it gives for a record the index does not hold. A
+//! read is not refused for a condition that only bounds writes; do not "align" the two
+//! sides by adding the writer's refusal here.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +171,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMatchId` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMatchIdErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMatchId"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetMatchIdErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "the Entity Resolution emulator has no state store attached".to_string(),
+                ),
+            })
+        })?;
+
+        let store = state.lock();
+
+        let workflow = store
+            .matching_workflows
+            .get(&input.workflow_name)
+            .cloned()
+            .ok_or_else(|| {
+                GetMatchIdErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(
+                        crate::state::messages::GET_MATCH_ID_WORKFLOW_NOT_FOUND.to_string(),
+                    ),
+                })
+            })?;
+
+        // A Match ID is a product of the workflow's matching RULES, so this reader is
+        // defined only over a rule-based matching workflow.
+        if workflow.resolution_techniques.resolution_type != crate::state::RULE_MATCHING {
+            return Err(GetMatchIdErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::messages::get_match_id_not_rule_based(
+                    &workflow.workflow_name,
+                    &workflow.resolution_techniques.resolution_type,
+                )),
+            })
+            .into());
+        }
+
+        // `applyNormalization` is modelled with a default of `true`, which the
+        // deserializer has already applied by the time this runs, so the member is a
+        // plain `bool` here.
+        let normalize = input.apply_normalization;
+
+        // No record of its own is submitted here, so nothing is excluded from the
+        // comparison: every record the workflow has processed is a candidate. The
+        // answer is the STORED record — both its `matchId` and the `matchRule`
+        // `GenerateMatchId` recorded for it — so this reader and that writer cannot
+        // disagree about a group's rule. Both output members are optional, so a record
+        // that matches nothing answers neither: it "has not been processed in a
+        // rule-based matching workflow" yet.
+        let identified = store.identify_record(
+            &workflow.workflow_name,
+            &workflow,
+            &input.record,
+            normalize,
+        );
+        let (match_id, match_rule) = identified.map_or((None, None), |record| {
+            (Some(record.match_id), Some(record.match_rule))
+        });
+
+        // An access record for the read, naming the resource and the outcome only:
+        // the submitted `record` is modelled @sensitive and the `matchId` identifies a
+        // customer record group, so neither is logged.
+        ::tracing::debug!(
+            operation = "GetMatchId",
+            workflow_name = %workflow.workflow_name,
+            akid = %::emulator_server::extract_akid(&ctx.parts().headers),
+            matched = match_id.is_some(),
+            "match id read"
+        );
+
+        Ok(GetMatchIdOutput {
+            match_id,
+            match_rule,
+        })
     }
 }

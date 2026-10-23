@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GenerateMatchId
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GenerateMatchId`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Generates or retrieves the Match IDs of the records submitted to a rule-based
+//! matching workflow, from the records that workflow has already processed — the
+//! match index this service persists in
+//! [`crate::state::ComAmazonawsEntityresolutionAwsveniceserviceState::match_index`].
+//! `GetMatchId` is the reader of the same index.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GenerateMatchId::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every factor of this operation's cost and growth is bounded before the store is
+//! touched: the batch by the modelled `records` `length` maximum
+//! ([`crate::state::MAX_RECORDS_PER_CALL`]), the index by
+//! [`crate::state::MAX_INDEXED_RECORDS_PER_WORKFLOW`] (released by
+//! `DeleteMatchingWorkflow`), and the comparison by the modelled rule, matching-key,
+//! input-source and schema-field maxima.
+//!
+//! Authorization is deliberately NOT emulated: the modelled `AccessDeniedException`
+//! is unreachable here, because this emulator holds no principals or policies to
+//! decide a 403 from. Every other modelled refusal is reachable.
+//!
+//! The writer and the reader agree on a group's `matchRule`: this operation matches a
+//! SUBMITTED record against the OTHER records of the workflow (its own `uniqueId` is
+//! excluded) and STORES the rule that joined it — the empty string when none did —
+//! and `GetMatchId` reports that stored value rather than re-deriving one.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +179,226 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GenerateMatchId` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GenerateMatchIdErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GenerateMatchId"))
+        // An access record for the ATTEMPT, emitted before any refusal can return, so
+        // a call that is refused is recorded too. Request metadata only.
+        ::tracing::info!(
+            operation = "GenerateMatchId",
+            workflow_name = %input.workflow_name,
+            akid = %::emulator_server::extract_akid(&ctx.parts().headers),
+            records = input.records.len(),
+            "match id generation requested"
+        );
+
+        // The batch is bounded BEFORE the store is touched — and before the guard is
+        // taken — so neither the work this call does nor the growth it causes depends
+        // on a caller-chosen count. The bound is the model's own `records`
+        // `length 1..1`, both ends of it, enforced here rather than relied on from the
+        // boundary validator.
+        if input.records.len() > crate::state::MAX_RECORDS_PER_CALL
+            || input.records.len() < crate::state::MIN_RECORDS_PER_CALL
+        {
+            return Err(GenerateMatchIdErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::messages::generate_match_id_batch_out_of_range(
+                    input.records.len(),
+                    crate::state::MIN_RECORDS_PER_CALL,
+                    crate::state::MAX_RECORDS_PER_CALL,
+                )),
+            })
+            .into());
+        }
+
+        // The processing mode decides ONE thing here: whether the workflow's existing
+        // records are consulted. `EVENTUAL_NO_LOOKUP` "generates new match IDs without
+        // checking existing matches"; `CONSISTENT` (the documented default when the
+        // member is absent) and `EVENTUAL` both "perform initial match ID lookup or
+        // generation immediately", so both answer from the index. The difference
+        // between those two — whether the rest of the matching is finished
+        // synchronously or in the background, and reflected in S3 — is not visible
+        // through this API, and this emulator writes no S3 output. A value outside the
+        // modelled enum is REFUSED rather than read as the default.
+        let processing_type = input.processing_type.as_deref();
+        if let Some(mode) = processing_type {
+            if !crate::state::PROCESSING_TYPES.contains(&mode) {
+                return Err(GenerateMatchIdErrorModeled::ValidationException(ValidationException {
+                    message: Some(
+                        crate::state::messages::generate_match_id_unknown_processing_type(
+                            mode,
+                            crate::state::PROCESSING_TYPES,
+                        ),
+                    ),
+                })
+                .into());
+            }
+        }
+        let lookup = processing_type != Some(crate::state::EVENTUAL_NO_LOOKUP);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GenerateMatchIdErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "the Entity Resolution emulator has no state store attached".to_string(),
+                ),
+            })
+        })?;
+
+        let mut store = state.lock();
+
+        // "The rule-based matching workflow must exist and be active before calling
+        // this operation": the workflow is looked up first, and a name that is not in
+        // the store is a 404 — nothing is minted or indexed for it.
+        let workflow = store
+            .matching_workflows
+            .get(&input.workflow_name)
+            .cloned()
+            .ok_or_else(|| {
+                GenerateMatchIdErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(
+                        crate::state::messages::GENERATE_MATCH_ID_WORKFLOW_NOT_FOUND.to_string(),
+                    ),
+                })
+            })?;
+
+        // Match IDs come from the workflow's matching RULES, so only a RULE_MATCHING
+        // workflow can serve this operation, and only with real-time matching enabled
+        // ("When you enable real-time matching, you can use the GenerateMatchId
+        // operation with the workflow").
+        if workflow.resolution_techniques.resolution_type != crate::state::RULE_MATCHING {
+            return Err(GenerateMatchIdErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::messages::generate_match_id_not_rule_based(
+                    &workflow.workflow_name,
+                    &workflow.resolution_techniques.resolution_type,
+                )),
+            })
+            .into());
+        }
+        if !crate::state::real_time_matching_enabled(&workflow) {
+            return Err(GenerateMatchIdErrorModeled::ValidationException(ValidationException {
+                message: Some(
+                    crate::state::messages::generate_match_id_real_time_matching_disabled(
+                        &workflow.workflow_name,
+                    ),
+                ),
+            })
+            .into());
+        }
+
+        // `failedRecords` is "The records that didn't receive a generated Match ID".
+        // Every record that reaches the loop below receives one: a record no rule of
+        // the workflow can be applied to still opens its own group, which is what
+        // `EVENTUAL_NO_LOOKUP` shows is possible ("Generates new match IDs without
+        // checking existing matches"). The per-record failures AWS reports here come
+        // from the asynchronous, S3-backed part of the processing, which this emulator
+        // does not run, so the modelled @required list is answered empty rather than
+        // with a failure nothing produced.
+        let failed_records: Vec<FailedRecord> = Vec::new();
+
+        // The groups this call answers, one per DISTINCT `matchId` and assembled after
+        // every submitted record has been indexed, so a batch cannot amplify into one
+        // copy of a group per record.
+        let mut resolved: Vec<(String, String)> = Vec::new();
+
+        for record in input.records {
+            // The store is bounded: a record whose `uniqueId` the workflow does not
+            // already hold is indexed only below the per-workflow maximum, which
+            // `DeleteMatchingWorkflow` releases. The batch is at most one record, so
+            // this check precedes the only insert the call can make and a refused call
+            // leaves the index exactly as it was.
+            if !store.has_room_to_index(&workflow.workflow_name, &record.unique_id) {
+                return Err(GenerateMatchIdErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::messages::generate_match_id_index_full(
+                        &workflow.workflow_name,
+                        crate::state::MAX_INDEXED_RECORDS_PER_WORKFLOW,
+                    )),
+                })
+                .into());
+            }
+
+            let normalize = crate::state::normalization_for_source(
+                &workflow,
+                record.input_source_arn.as_str(),
+            );
+
+            let previous = store
+                .match_index
+                .get(&workflow.workflow_name)
+                .and_then(|indexed| indexed.get(&record.unique_id))
+                .map(|indexed| (indexed.match_id.clone(), indexed.match_rule.clone()));
+
+            let (match_id, match_rule) = if lookup {
+                // The first rule that joins this record to ANOTHER record of the
+                // workflow decides the group; failing that, a record this workflow has
+                // already processed keeps the Match ID it was given, which is what
+                // makes a repeated call answer the same id; and a record that is new
+                // and matches nothing opens its own group, with no rule to name.
+                store
+                    .resolve_by_rules(
+                        &workflow.workflow_name,
+                        &workflow,
+                        &record.record_attribute_map,
+                        normalize,
+                        Some(record.unique_id.as_str()),
+                    )
+                    .or(previous)
+                    .unwrap_or_else(|| (crate::state::new_match_id(), String::new()))
+            } else {
+                // No lookup: a new Match ID, whatever the index holds.
+                (crate::state::new_match_id(), String::new())
+            };
+
+            store
+                .match_index
+                .entry(workflow.workflow_name.clone())
+                .or_default()
+                .insert(
+                    record.unique_id.clone(),
+                    crate::state::IndexedRecord {
+                        input_source_arn: record.input_source_arn,
+                        unique_id: record.unique_id,
+                        record_attribute_map: record.record_attribute_map,
+                        match_id: match_id.clone(),
+                        match_rule: match_rule.clone(),
+                    },
+                );
+
+            if !resolved.iter().any(|(id, _)| *id == match_id) {
+                resolved.push((match_id, match_rule));
+            }
+        }
+
+        // Each group is answered from the STORED index — every record that shares the
+        // id, not just the one this call submitted — so what this response reports and
+        // what a later `GetMatchId` reads cannot disagree.
+        let match_groups: Vec<MatchGroup> = resolved
+            .into_iter()
+            .map(|(match_id, match_rule)| MatchGroup {
+                records: store
+                    .group_records(&workflow.workflow_name, &match_id)
+                    .into_iter()
+                    .map(|indexed| MatchedRecord {
+                        input_source_arn: indexed.input_source_arn,
+                        record_id: indexed.unique_id,
+                    })
+                    .collect(),
+                match_id,
+                match_rule,
+            })
+            .collect();
+
+        // An access record for the call, so a harness can attribute a mutation of the
+        // match index. Only counts and the resource name are logged: the submitted
+        // `recordAttributeMap` is modelled @sensitive, and the minted `matchId`
+        // identifies a customer record group, so neither belongs in a log.
+        ::tracing::info!(
+            operation = "GenerateMatchId",
+            workflow_name = %workflow.workflow_name,
+            akid = %::emulator_server::extract_akid(&ctx.parts().headers),
+            groups = match_groups.len(),
+            indexed = store.indexed_record_count(&workflow.workflow_name),
+            "match ids generated"
+        );
+
+        Ok(GenerateMatchIdOutput {
+            match_groups,
+            failed_records,
+        })
     }
 }

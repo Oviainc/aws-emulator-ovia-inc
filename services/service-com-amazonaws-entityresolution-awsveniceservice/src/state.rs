@@ -6,7 +6,9 @@
 //! record is the MODELLED type of the member it is returned on, so a reader clones
 //! what the writer stored and the two cannot drift: `CreateSchemaMapping` followed by
 //! `GetSchemaMapping` returns the created record field-for-field, and so does
-//! `CreateIdNamespace` followed by `GetIdNamespace`.
+//! `CreateIdNamespace` followed by `GetIdNamespace`. Beside them sits the data-plane
+//! record this service's real-time matching pair shares: the match index
+//! `GenerateMatchId` writes and `GetMatchId` reads.
 //!
 //! The provider-service collection — [`ProviderService`] — has no create API at all: a
 //! provider
@@ -47,7 +49,7 @@ use crate::ops::types::{
     IncrementalRunConfig, InputSource, JobOutputSource, OutputSource, ProviderComponentSchema,
     ProviderEndpointConfiguration, ProviderIdNameSpaceConfiguration,
     ProviderIntermediateDataAccessConfiguration, ProviderMarketplaceConfiguration,
-    ProviderSchemaAttribute, ResolutionTechniques, SchemaInputAttribute,
+    ProviderSchemaAttribute, ResolutionTechniques, Rule, SchemaInputAttribute,
 };
 
 /// One schema mapping as this service persists it.
@@ -84,6 +86,36 @@ pub struct MatchingWorkflow {
     pub created_at: ::aws_smithy_types::DateTime,
     pub updated_at: ::aws_smithy_types::DateTime,
     pub tags: Option<HashMap<String, String>>,
+}
+
+/// One customer record a rule-based matching workflow has already processed, as the
+/// workflow's match index holds it.
+///
+/// `GenerateMatchId` is what puts a record here ("For existing records, it retrieves
+/// their Match IDs and associated rules. For records without matches, it generates new
+/// Match IDs"), and `GetMatchId` is the reader of the same index ("Returns the
+/// corresponding Match ID of a customer record if the record has been processed in a
+/// rule-based matching workflow"). Both the `matchId` and the `matchRule` are STORED,
+/// never recomputed per call: that is what makes a second call for the same record
+/// answer the same `matchId`.
+#[derive(Debug, Clone)]
+pub struct IndexedRecord {
+    /// `Record$inputSourceARN`, as the caller submitted it.
+    pub input_source_arn: String,
+    /// `Record$uniqueId` — the record's identity inside the workflow, and the key this
+    /// record is held under.
+    pub unique_id: String,
+    /// `Record$recordAttributeMap`, as the caller submitted it: the raw values, so a
+    /// later comparison can choose whether to normalize them.
+    pub record_attribute_map: HashMap<String, String>,
+    /// The `matchId` of the group this record belongs to.
+    pub match_id: String,
+    /// The `ruleName` of the rule that joined this record to its group, and the empty
+    /// string when no rule did — a record that matched nothing opens its own group, so
+    /// there is no rule to name. `MatchGroup$matchRule` is modelled @required, so that
+    /// case is served as the empty string, the same convention this service already
+    /// uses for an @required output member the request carried nothing for.
+    pub match_rule: String,
 }
 
 /// One ID namespace as this service persists it.
@@ -553,10 +585,13 @@ pub struct ResourcePolicy {
 
 /// Per-service state for com-amazonaws-entityresolution-awsveniceservice. A handler reaches it through [`service_state`].
 ///
-/// Every map is a `BTreeMap`, not a `HashMap`, because the list operations are
-/// `@paginated` and a page boundary is only meaningful over a stable order: the
-/// `nextToken` a page returns is the key of the first record it did NOT return, so
-/// the next call resumes at that key.
+/// Every control-plane map is a `BTreeMap`, not a `HashMap`, because the list
+/// operations are `@paginated` and a page boundary is only meaningful over a stable
+/// order: the `nextToken` a page returns is the key of the first record it did NOT
+/// return, so the next call resumes at that key. The match index is ordered for a
+/// related reason: rule evaluation walks it, so an ordered index makes "the first
+/// indexed record this rule matches" a well-defined record rather than whichever one
+/// a hash happened to put first.
 #[derive(Debug)]
 pub struct ComAmazonawsEntityresolutionAwsveniceserviceState {
     /// Every schema mapping that exists, keyed by `schemaName`.
@@ -579,10 +614,24 @@ pub struct ComAmazonawsEntityresolutionAwsveniceserviceState {
     /// create/get/list/delete operations and their own URI prefixes, so the same name
     /// can name one of each.
     pub id_mapping_workflows: BTreeMap<String, IdMappingWorkflow>,
+    /// The records each matching workflow has processed: `workflowName` ->
+    /// `uniqueId` -> the record. A workflow with no processed record has no entry.
+    pub match_index: BTreeMap<String, BTreeMap<String, IndexedRecord>>,
     /// The resource-based policy attached to each resource that has one, keyed by the
-    /// resource's own ARN — the `VeniceGlobalArn` every policy operation takes as its
-    /// `@httpLabel`, which is what makes one map serve all four resource types
-    /// (`schemamapping`, `matchingworkflow`, `idmappingworkflow`, `idnamespace`).
+    /// resource's OWN identity — the `<resourceType>/<name>` segment
+    /// ([`policy_key`]), which is what makes one map serve all four resource types
+    /// (`schemamapping`, `matchingworkflow`, `idmappingworkflow`, `idnamespace`) while
+    /// keying each entry exactly as the collection holding that resource keys it.
+    ///
+    /// The key deliberately carries NO request-supplied segment. The `VeniceGlobalArn`
+    /// a policy operation takes as its `@httpLabel` also carries a partition, account
+    /// and region, and the region a request is served in comes from the caller's own
+    /// SigV4 credential scope ([`request_region`]) rather than from the stored record —
+    /// so keying by the ARN would let one live resource accumulate one entry per
+    /// distinct region string a client signs with, none of them ever prunable. Keyed by
+    /// the resource segment, an entry is the resource's single policy whatever region
+    /// the write was signed for, exactly as the resource itself is one record whatever
+    /// region created it.
     ///
     /// A resource with no policy has NO entry here, which is what distinguishes "the
     /// resource exists but carries no policy" from the policy a write attached to it.
@@ -591,8 +640,10 @@ pub struct ComAmazonawsEntityresolutionAwsveniceserviceState {
     /// not a resource of its own and dies with the resource it is attached to, so a
     /// write drops the entries whose resource is gone before it adds its own (see
     /// [`ComAmazonawsEntityresolutionAwsveniceserviceState::prune_orphaned_policies`]).
-    /// That leaves at most one entry per live resource, and every resource collection
-    /// here carries its own quota.
+    /// That leaves at most one entry per live resource — and every resource collection
+    /// here carries its own quota, which is what
+    /// [`MAX_RESOURCE_POLICIES`] sums; a write refuses past that bound even if the
+    /// pruning predicate were to regress.
     pub policies: BTreeMap<String, ResourcePolicy>,
 }
 
@@ -608,6 +659,9 @@ impl Default for ComAmazonawsEntityresolutionAwsveniceserviceState {
             matching_jobs: BTreeMap::new(),
             provider_services: provider_service_catalog(),
             id_mapping_workflows: BTreeMap::new(),
+            // The data plane starts empty too: a workflow has processed no record
+            // until `GenerateMatchId` indexes one.
+            match_index: BTreeMap::new(),
             policies: BTreeMap::new(),
         }
     }
@@ -1158,6 +1212,104 @@ pub mod messages {
         format!("SchemaMapping {schema_name} does not exist")
     }
 
+    /// `GenerateMatchId`'s `ResourceNotFoundException$message` (HTTP 404) when the
+    /// `workflowName` @httpLabel names no matching workflow — the precondition its own
+    /// doc states ("The rule-based matching workflow must exist and be active before
+    /// calling this operation"). Not recorded; this operation's own constant, spelled
+    /// with the resource type the API uses, in the same form as the recorded
+    /// [`GET_MATCHING_WORKFLOW_NOT_FOUND`].
+    pub const GENERATE_MATCH_ID_WORKFLOW_NOT_FOUND: &str = "MatchingWorkflow Not Found";
+
+    /// `GetMatchId`'s `ResourceNotFoundException$message` (HTTP 404) when the
+    /// `workflowName` @httpLabel names no matching workflow. This operation's own
+    /// constant, derived from no other.
+    pub const GET_MATCH_ID_WORKFLOW_NOT_FOUND: &str = "MatchingWorkflow Not Found";
+
+    /// `GenerateMatchId`'s `ValidationException$message` (HTTP 400) when the workflow
+    /// it names is not a RULE_MATCHING one.
+    ///
+    /// Composed from the request, which is what the message rule allows: it names the
+    /// member that is wrong and the constraint it fails, the way the boundary
+    /// validator does. The constraint is the one `GenerateMatchId`'s own doc states —
+    /// "The rule-based matching workflow must exist and be active before calling this
+    /// operation" — against the `resolutionType` the named workflow was created with.
+    pub fn generate_match_id_not_rule_based(workflow_name: &str, resolution_type: &str) -> String {
+        format!(
+            "GenerateMatchId requires a rule-based matching workflow: MatchingWorkflow \
+             {workflow_name} has resolutionTechniques.resolutionType {resolution_type}, not \
+             RULE_MATCHING"
+        )
+    }
+
+    /// `GenerateMatchId`'s `ValidationException$message` (HTTP 400) when the named
+    /// rule-based workflow does not have real-time matching enabled — the constraint
+    /// `ResolutionTechniques$enableRealTimeMatching` states ("When you enable
+    /// real-time matching, you can use the GenerateMatchId operation with the
+    /// workflow"). Composed from the request, naming the member and the constraint.
+    pub fn generate_match_id_real_time_matching_disabled(workflow_name: &str) -> String {
+        format!(
+            "GenerateMatchId requires real-time matching: MatchingWorkflow {workflow_name} was \
+             created with resolutionTechniques.enableRealTimeMatching disabled"
+        )
+    }
+
+    /// `GetMatchId`'s `ValidationException$message` (HTTP 400) when the workflow it
+    /// names is not a RULE_MATCHING one — the constraint its own doc states
+    /// ("Returns the corresponding Match ID of a customer record if the record has
+    /// been processed in a rule-based matching workflow"). Composed from the request,
+    /// naming the member and the constraint.
+    pub fn get_match_id_not_rule_based(workflow_name: &str, resolution_type: &str) -> String {
+        format!(
+            "GetMatchId requires a rule-based matching workflow: MatchingWorkflow \
+             {workflow_name} has resolutionTechniques.resolutionType {resolution_type}, not \
+             RULE_MATCHING"
+        )
+    }
+
+    /// `GenerateMatchId`'s `ValidationException$message` (HTTP 400) for a `records`
+    /// list outside the modelled `length` range. Composed from the request: it names
+    /// the member, the bound it failed and the value that failed it, the way the
+    /// boundary validator does for a modelled `length`.
+    pub fn generate_match_id_batch_out_of_range(
+        submitted: usize,
+        minimum: usize,
+        maximum: usize,
+    ) -> String {
+        let bound = if submitted > maximum {
+            format!("Member must have length less than or equal to {maximum}")
+        } else {
+            format!("Member must have length greater than or equal to {minimum}")
+        };
+        format!(
+            "1 validation error detected: value at 'records' failed to satisfy constraint: \
+             {bound}, got {submitted}"
+        )
+    }
+
+    /// `GenerateMatchId`'s `ValidationException$message` (HTTP 400) for a
+    /// `processingType` outside the modelled `ProcessingType` enum. Composed from the
+    /// request, naming the member and the values it admits.
+    pub fn generate_match_id_unknown_processing_type(value: &str, admitted: &[&str]) -> String {
+        format!(
+            "1 validation error detected: value {value:?} at 'processingType' failed to satisfy \
+             constraint: Member must satisfy enum value set: [{}]",
+            admitted.join(", ")
+        )
+    }
+
+    /// `GenerateMatchId`'s `ValidationException$message` (HTTP 400) when the workflow
+    /// has reached the number of records this emulator lets one rule-based workflow
+    /// index ([`super::MAX_INDEXED_RECORDS_PER_WORKFLOW`]). Composed from the request
+    /// and the bound, and naming the bound so the caller can act on it;
+    /// `DeleteMatchingWorkflow` releases the index, so the bound is self-healing.
+    pub fn generate_match_id_index_full(workflow_name: &str, maximum: usize) -> String {
+        format!(
+            "MatchingWorkflow {workflow_name} has reached the quota of {maximum} for \
+             \"{}\"; no further record can be indexed",
+            super::INDEXED_RECORDS_QUOTA_NAME
+        )
+    }
+
     /// The `ResourceNotFoundException$message` (HTTP 404) every policy operation
     /// answers when the `arn` @httpLabel names no resource this account holds — a
     /// resource-based policy belongs to a resource, so there is nothing to read or
@@ -1169,6 +1321,22 @@ pub mod messages {
     /// template is the rule — any ARN goes through it unchanged.
     pub fn policy_resource_not_found(arn: &str) -> String {
         format!("Resource {arn} does not exist")
+    }
+
+    /// The `ValidationException$message` (HTTP 400) a policy write answers when this
+    /// store already holds [`super::MAX_RESOURCE_POLICIES`] policies and the resource
+    /// written to carries none yet.
+    ///
+    /// A DEFENSIVE refusal rather than an AWS rule: a policy belongs to a live resource
+    /// and there is at most one entry per resource, each resource collection carrying
+    /// its own quota, so a caller cannot reach this bound through the API. It is
+    /// enforced so the collection stays bounded even if the pruning predicate
+    /// regresses, and the message names the bound so the condition is diagnosable.
+    pub fn resource_policies_at_capacity(maximum: usize) -> String {
+        format!(
+            "this emulator holds the maximum of {maximum} resource-based policies; \
+             delete a resource that carries one before attaching another"
+        )
     }
 
     /// The `ResourceNotFoundException$message` (HTTP 404) the policy paths answer when
@@ -1317,6 +1485,156 @@ pub fn quota_value(maximum: usize) -> Option<i32> {
     i32::try_from(maximum).ok()
 }
 
+/// The resolution type `GenerateMatchId` and `GetMatchId` require of a workflow, as
+/// `ResolutionType` spells it (`smithy_query(query="shape",shape="ResolutionType")` →
+/// `RULE_MATCHING | ML_MATCHING | PROVIDER`): both operations are defined only over a
+/// RULE-BASED matching workflow.
+pub const RULE_MATCHING: &str = "RULE_MATCHING";
+
+/// `ProcessingType$EVENTUAL_NO_LOOKUP` — the mode that "generates new match IDs
+/// without checking existing matches"
+/// (`smithy_query(query="doc",shape="GenerateMatchIdInput",member="processingType")`),
+/// i.e. the one mode that does NOT consult the workflow's match index.
+pub const EVENTUAL_NO_LOOKUP: &str = "EVENTUAL_NO_LOOKUP";
+
+/// Every value `ProcessingType` admits
+/// (`smithy_query(query="shape",shape="ProcessingType")`), in model order.
+///
+/// `GenerateMatchId` refuses anything else with the modelled `ValidationException`
+/// rather than silently reading it as the default mode.
+pub const PROCESSING_TYPES: &[&str] = &["CONSISTENT", "EVENTUAL", EVENTUAL_NO_LOOKUP];
+
+/// How many records one `GenerateMatchId` call may submit: the modelled
+/// `GenerateMatchIdInput$records` `length` range, enforced as a closed interval.
+///
+/// The constraint is on the MEMBER, not on `RecordList` itself, which is why the
+/// generated contract header in `ops/generate_match_id.rs` does not render it;
+/// `smithy_query(query="operation",operation="GenerateMatchId")` reports it verbatim:
+/// `"records": {"target": "RecordList", "length": {"min": 1, "max": 1}, "required":
+/// true}`. So a batch of none or of more than one record is input the model does NOT
+/// admit, and refusing it with the modelled `ValidationException` is the faithful
+/// answer as well as the bound that keeps this operation's work and growth
+/// independent of a caller-chosen count. The maximum of one is also why the capacity
+/// check inside the loop precedes the only insert the call can make.
+pub const MIN_RECORDS_PER_CALL: usize = 1;
+
+/// The upper bound of the modelled `records` `length` range — see
+/// [`MIN_RECORDS_PER_CALL`].
+pub const MAX_RECORDS_PER_CALL: usize = 1;
+
+/// What the comparison value of a matching key joins its fields' values with.
+///
+/// A matching key can name SEVERAL schema fields (every field the schema mapping gave
+/// that `matchKey`), so the value compared for it is those fields' values in schema
+/// order. The separator is the ASCII unit separator, which an attribute value does not
+/// carry, so two records cannot compare equal merely because one field's value spills
+/// into the next field's position.
+const MATCHING_KEY_FIELD_SEPARATOR: &str = "\u{1f}";
+
+/// `value` as a comparison reads it when normalization is asked for.
+///
+/// `InputSource$applyNormalization` and `GetMatchIdInput$applyNormalization` both say
+/// the attributes defined in the schema are normalized in the input data before they
+/// are matched, so under normalization a difference of letter case, or of leading,
+/// trailing and repeated whitespace, is not a difference in the value. The per-type
+/// output FORMATTING AWS additionally applies (rendering a phone number as
+/// `(123)-456-7890`) is a property of the S3 output table, which this emulator does
+/// not write, not of this comparison.
+fn normalized(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// The rules a workflow matches records with, in the order they were declared.
+///
+/// A workflow whose `resolutionTechniques` carries no `ruleBasedProperties` has none,
+/// so nothing can match and every submitted record opens its own group.
+pub fn workflow_rules(workflow: &MatchingWorkflow) -> &[Rule] {
+    workflow
+        .resolution_techniques
+        .rule_based_properties
+        .as_ref()
+        .map_or(&[][..], |properties| properties.rules.as_slice())
+}
+
+/// Is real-time matching enabled on `workflow`?
+///
+/// `ResolutionTechniques$enableRealTimeMatching` is "whether real-time matching is
+/// enabled for the rule-based matching workflow. When you enable real-time matching,
+/// you can use the `GenerateMatchId` operation with the workflow" — so the member is
+/// the gate on `GenerateMatchId`, and an absent member is not enabled.
+pub fn real_time_matching_enabled(workflow: &MatchingWorkflow) -> bool {
+    workflow
+        .resolution_techniques
+        .enable_real_time_matching
+        .unwrap_or(false)
+}
+
+/// Does the workflow ask for normalization of the records that arrive from
+/// `input_source_arn`?
+///
+/// `applyNormalization` is a property of the INPUT SOURCE a record comes from, so the
+/// flag that governs a submitted record is the one on the workflow's
+/// `inputSourceConfig` entry whose `inputSourceARN` the record names. A record from a
+/// source the workflow does not name (and an entry whose optional member is absent)
+/// is not normalized.
+pub fn normalization_for_source(workflow: &MatchingWorkflow, input_source_arn: &str) -> bool {
+    workflow
+        .input_source_config
+        .iter()
+        .find(|source| source.input_source_arn == input_source_arn)
+        .and_then(|source| source.apply_normalization)
+        .unwrap_or(false)
+}
+
+/// The value a record compares under `fields`, or `None` when it carries a value for
+/// NONE of them — a key the record says nothing about cannot match.
+///
+/// A field the record omits holds its position as an empty value, so a record that
+/// omits one of a grouped key's fields does not compare equal to one that fills it.
+fn matching_key_value(
+    fields: &[String],
+    attributes: &HashMap<String, String>,
+    normalize: bool,
+) -> Option<String> {
+    let mut present = false;
+    let parts: Vec<String> = fields
+        .iter()
+        .map(|field| match attributes.get(field) {
+            Some(value) => {
+                present = true;
+                if normalize {
+                    normalized(value)
+                } else {
+                    value.clone()
+                }
+            }
+            None => String::new(),
+        })
+        .collect();
+    present.then(|| parts.join(MATCHING_KEY_FIELD_SEPARATOR))
+}
+
+/// A newly minted `matchId`.
+///
+/// The value is opaque to a client — `MatchGroup$matchId` is a plain `String` with no
+/// modelled form — and it is minted ONCE per group and stored, so every later read of
+/// that group answers the same id and two groups never share one.
+///
+/// The entropy is a random v4 UUID's, reached through `emulator_telemetry`'s
+/// `BatchId::random()` constructor (`uuid::Uuid::new_v4().as_hyphenated()` verbatim,
+/// `vendor/emulator-telemetry/src/types.rs`) — the same in-crate generator
+/// [`new_job_id`] and [`new_policy_token`] borrow, because `emulator-telemetry` is
+/// already one of this crate's dependencies, so nothing new enters the workspace
+/// lockfile. Only the generator is borrowed; the newtype's telemetry meaning is
+/// dropped here.
+pub fn new_match_id() -> String {
+    ::emulator_telemetry::BatchId::random().as_str().to_string()
+}
+
 /// The resource-type segment every `IdNamespaceArn` carries
 /// (`arn:…:entityresolution:<region>:<account>:idnamespace/<name>`). Named here
 /// because the create mints an ARN with it and [`id_namespace_key`] matches one
@@ -1383,15 +1701,31 @@ pub fn venice_global_arn_resource<'a>(arn: &'a str, region: &str) -> Option<(&'a
     resource.split_once('/')
 }
 
-/// The region segment of an ARN — `arn:<partition>:<service>:<region>:<account>:<…>`,
-/// so the fourth `:`-separated field.
+/// The key the resource `arn` names is stored under in
+/// [`ComAmazonawsEntityresolutionAwsveniceserviceState::policies`] — its
+/// `<resourceType>/<name>` segment — or `None` when the value cannot name a resource
+/// served for a request signed for `region`.
 ///
-/// A stored ARN carries the region it was minted in, which is how an entry keyed by an
-/// ARN can be resolved without a request to take the region from (see
-/// [`ComAmazonawsEntityresolutionAwsveniceserviceState::prune_orphaned_policies`]).
-fn arn_region(arn: &str) -> Option<&str> {
-    arn.split(':').nth(3)
+/// The ARN is validated exactly as [`venice_global_arn_resource`] validates it, so an
+/// ARN scoped to another partition, region or account still names nothing; what the key
+/// drops is the scoping segments themselves, so a stored entry carries no
+/// request-supplied data and can be resolved against the live resource without a
+/// request to take a region from.
+pub fn policy_key<'a>(arn: &'a str, region: &str) -> Option<&'a str> {
+    venice_global_arn_resource(arn, region)?;
+    arn.rsplit_once(':').map(|(_, resource)| resource)
 }
+
+/// How many resource-based policies this store holds at once, past which a policy
+/// write refuses.
+///
+/// A policy belongs to a live resource and there is at most one entry per resource
+/// ([`ComAmazonawsEntityresolutionAwsveniceserviceState::policies`]), so this is the
+/// sum of the four resource quotas: the bound the collection already has structurally,
+/// made explicit and enforced, so the collection stays bounded even if the pruning
+/// predicate regresses.
+pub const MAX_RESOURCE_POLICIES: usize =
+    MAX_SCHEMA_MAPPINGS + MAX_MATCHING_WORKFLOWS + MAX_ID_NAMESPACES + MAX_ID_MAPPING_WORKFLOWS;
 
 /// A freshly minted policy revision token: a hyphenated v4 UUID, which is exactly what
 /// the modelled `PolicyToken` requires (`length 36..36`, pattern
@@ -1456,21 +1790,53 @@ impl ComAmazonawsEntityresolutionAwsveniceserviceState {
         arn: &str,
         region: &str,
     ) -> Option<::aws_smithy_types::DateTime> {
-        match venice_global_arn_resource(arn, region)? {
-            (SCHEMA_MAPPING_RESOURCE_TYPE, name) => {
+        let (resource_type, name) = venice_global_arn_resource(arn, region)?;
+        self.resource_created_at(resource_type, name)
+    }
+
+    /// The instant the resource `resource_type`/`name` was created, or `None` when this
+    /// store holds no such resource.
+    ///
+    /// The one lookup both the ARN-addressed reader ([`Self::policy_resource_created_at`])
+    /// and the key-addressed pruner ([`Self::prune_orphaned_policies`]) go through, so
+    /// the two can never disagree about whether a policy's resource is live.
+    fn resource_created_at(
+        &self,
+        resource_type: &str,
+        name: &str,
+    ) -> Option<::aws_smithy_types::DateTime> {
+        match resource_type {
+            SCHEMA_MAPPING_RESOURCE_TYPE => {
                 self.schema_mappings.get(name).map(|record| record.created_at)
             }
-            (MATCHING_WORKFLOW_RESOURCE_TYPE, name) => {
+            MATCHING_WORKFLOW_RESOURCE_TYPE => {
                 self.matching_workflows.get(name).map(|record| record.created_at)
             }
-            (ID_MAPPING_WORKFLOW_RESOURCE_TYPE, name) => {
+            ID_MAPPING_WORKFLOW_RESOURCE_TYPE => {
                 self.id_mapping_workflows.get(name).map(|record| record.created_at)
             }
-            (ID_NAMESPACE_RESOURCE_TYPE, name) => {
+            ID_NAMESPACE_RESOURCE_TYPE => {
                 self.id_namespaces.get(name).map(|record| record.created_at)
             }
             _ => None,
         }
+    }
+
+    /// The instant the resource a STORED policy key names was created, or `None` when
+    /// that resource is gone — the pruner's question, answered without a request,
+    /// because a key carries the resource's own identity and nothing else.
+    fn keyed_resource_created_at(&self, key: &str) -> Option<::aws_smithy_types::DateTime> {
+        let (resource_type, name) = key.split_once('/')?;
+        self.resource_created_at(resource_type, name)
+    }
+
+    /// Has this store room to attach a policy to the resource `key` names?
+    ///
+    /// Replacing the policy of a resource that already carries one does not grow the
+    /// collection, so it is always allowed; a resource that carries none is admitted
+    /// only below [`MAX_RESOURCE_POLICIES`].
+    pub fn has_room_for_policy(&self, key: &str) -> bool {
+        self.policies.contains_key(key) || self.policies.len() < MAX_RESOURCE_POLICIES
     }
 
     /// The resource-based policy currently attached to the resource `arn` names, or
@@ -1481,7 +1847,7 @@ impl ComAmazonawsEntityresolutionAwsveniceserviceState {
     pub fn resource_policy(&self, arn: &str, region: &str) -> Option<&ResourcePolicy> {
         let created_at = self.policy_resource_created_at(arn, region)?;
         self.policies
-            .get(arn)
+            .get(policy_key(arn, region)?)
             .filter(|policy| policy.resource_created_at == created_at)
     }
 
@@ -1498,24 +1864,24 @@ impl ComAmazonawsEntityresolutionAwsveniceserviceState {
     /// [`MAX_ID_MAPPING_WORKFLOWS`]) — however many resources a caller creates,
     /// policies and deletes.
     ///
-    /// An entry is an orphan when the resource its ARN names is gone, and also when
+    /// An entry is an orphan when the resource its key names is gone, and also when
     /// that resource is a LATER incarnation of the name (its `createdAt` differs),
     /// which is the same condition [`resource_policy`] refuses to serve
-    /// ([`ResourcePolicy::resource_created_at`]). The ARN carries the region it was
-    /// minted in, so each entry is resolved against ITS OWN region: pruning while
-    /// serving one region never drops another region's live policy.
+    /// ([`ResourcePolicy::resource_created_at`]). A key is the resource's own
+    /// `<resourceType>/<name>` identity ([`policy_key`]), so it resolves against the
+    /// very record the resource collections hold — never against a region or account a
+    /// request supplied, which is what makes every orphan reachable by this prune.
     ///
     /// [`resource_policy`]: Self::resource_policy
     pub fn prune_orphaned_policies(&mut self) -> usize {
         let orphaned: Vec<String> = self
             .policies
             .iter()
-            .filter(|(arn, policy)| {
-                arn_region(arn)
-                    .and_then(|region| self.policy_resource_created_at(arn, region))
+            .filter(|(key, policy)| {
+                self.keyed_resource_created_at(key)
                     .is_none_or(|created_at| created_at != policy.resource_created_at)
             })
-            .map(|(arn, _)| arn.clone())
+            .map(|(key, _)| key.clone())
             .collect();
         for arn in &orphaned {
             self.policies.remove(arn);
@@ -1537,6 +1903,222 @@ impl ComAmazonawsEntityresolutionAwsveniceserviceState {
                 .iter()
                 .any(|source| source.schema_name == schema_name)
         })
+    }
+
+    /// The record attributes a rule's `matchingKey` compares, in schema order.
+    ///
+    /// `Rule$matchingKeys` is documented as "A list of MatchingKeys. The MatchingKeys
+    /// must have been defined in the SchemaMapping", and
+    /// `SchemaInputAttribute$matchKey` is "A key that allows grouping of multiple
+    /// input attributes into a unified matching group", so a matching key resolves to
+    /// EVERY field of the workflow's schemas that carries that `matchKey` — a group of
+    /// columns compared as one value — else to the schema field of that name.
+    ///
+    /// A key the workflow's present schemas define NEITHER way resolves to nothing, so
+    /// no record can match on it: the modelled constraint above says such a key should
+    /// not exist. The one exception is a workflow one of whose schema mappings has
+    /// since been DELETED — then the key cannot be looked up at all, and it falls back
+    /// to the record attribute of that name so the workflow keeps matching on it.
+    ///
+    /// Bounded by the model: at most 20 input sources
+    /// (`CreateMatchingWorkflow`'s `inputSourceConfig` `length 1..20`) of at most 60
+    /// `mappedInputFields` each, so one call to this is `O(20 × 60)` at worst. It is
+    /// resolved ONCE per rule per request by [`Self::rule_fields`], never per candidate
+    /// record.
+    pub fn matching_key_fields(
+        &self,
+        workflow: &MatchingWorkflow,
+        matching_key: &str,
+    ) -> Vec<String> {
+        let mut grouped: Vec<String> = Vec::new();
+        let mut named: Vec<String> = Vec::new();
+        let mut schema_missing = false;
+        for source in &workflow.input_source_config {
+            let Some(schema) = self.schema_mappings.get(&source.schema_name) else {
+                schema_missing = true;
+                continue;
+            };
+            for attribute in &schema.mapped_input_fields {
+                let target = if attribute.match_key.as_deref() == Some(matching_key) {
+                    &mut grouped
+                } else if attribute.field_name == matching_key {
+                    &mut named
+                } else {
+                    continue;
+                };
+                if !target.contains(&attribute.field_name) {
+                    target.push(attribute.field_name.clone());
+                }
+            }
+        }
+        if !grouped.is_empty() {
+            grouped
+        } else if !named.is_empty() {
+            named
+        } else if schema_missing {
+            vec![matching_key.to_string()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// The fields each `matchingKey` of `rule` compares, resolved ONCE for a request.
+    ///
+    /// Hoisting the resolution out of the candidate scan is what keeps the comparison
+    /// cost linear in the number of indexed records rather than multiplying the schema
+    /// walk by it.
+    fn rule_fields(&self, workflow: &MatchingWorkflow, rule: &Rule) -> Vec<Vec<String>> {
+        rule.matching_keys
+            .iter()
+            .map(|key| self.matching_key_fields(workflow, key))
+            .collect()
+    }
+
+    /// The comparison values of EVERY `matchingKey` of a rule for `attributes`, or
+    /// `None` when the record carries no value for one of them.
+    ///
+    /// A rule matches only when all of its keys do — "Two records are considered to
+    /// match according to this rule if all of the MatchingKeys match"
+    /// (`smithy_query(query="shape",shape="Rule")`) — so a key the record says nothing
+    /// about makes the whole rule inapplicable to it.
+    fn rule_values(
+        fields: &[Vec<String>],
+        attributes: &HashMap<String, String>,
+        normalize: bool,
+    ) -> Option<Vec<String>> {
+        fields
+            .iter()
+            .map(|key_fields| matching_key_value(key_fields, attributes, normalize))
+            .collect()
+    }
+
+    /// The already-indexed record of `workflow_name` that `attributes` match, and the
+    /// `ruleName` of the rule that matched them.
+    ///
+    /// The FIRST rule, in the order the workflow declares them, that matches an
+    /// indexed record of that workflow decides it. `excluding` leaves one `uniqueId`
+    /// out of the comparison, which is how a SUBMITTED record is matched against the
+    /// OTHER records of the workflow rather than against the copy of itself a previous
+    /// call indexed.
+    ///
+    /// Every factor of the cost is bounded: at most 25 rules of at most 15 matching
+    /// keys (the modelled `RuleList` and `MatchingKeys` `length` maxima), each key's
+    /// fields resolved once per call by [`Self::rule_fields`], over at most
+    /// [`MAX_INDEXED_RECORDS_PER_WORKFLOW`] candidates.
+    fn find_by_rules(
+        &self,
+        workflow_name: &str,
+        workflow: &MatchingWorkflow,
+        attributes: &HashMap<String, String>,
+        normalize: bool,
+        excluding: Option<&str>,
+    ) -> Option<(&IndexedRecord, String)> {
+        let indexed = self.match_index.get(workflow_name)?;
+        for rule in workflow_rules(workflow) {
+            let fields = self.rule_fields(workflow, rule);
+            // A rule none of whose matching keys the record carries is simply not
+            // applicable to it; the NEXT rule still can be.
+            let Some(values) = Self::rule_values(&fields, attributes, normalize) else {
+                continue;
+            };
+            let matched = indexed
+                .values()
+                .filter(|record| excluding != Some(record.unique_id.as_str()))
+                .find(|record| {
+                    Self::rule_values(&fields, &record.record_attribute_map, normalize)
+                        .is_some_and(|other| other == values)
+                });
+            if let Some(record) = matched {
+                return Some((record, rule.rule_name.clone()));
+            }
+        }
+        None
+    }
+
+    /// The group a SUBMITTED record joins in `workflow_name`, as `(matchId, ruleName)`:
+    /// the `matchId` of the record it matched, and the rule that joined the two.
+    ///
+    /// This is the writer's question. `excluding` is the submitted record's own
+    /// `uniqueId`, so a record is matched against the OTHER records of the workflow.
+    pub fn resolve_by_rules(
+        &self,
+        workflow_name: &str,
+        workflow: &MatchingWorkflow,
+        attributes: &HashMap<String, String>,
+        normalize: bool,
+        excluding: Option<&str>,
+    ) -> Option<(String, String)> {
+        self.find_by_rules(workflow_name, workflow, attributes, normalize, excluding)
+            .map(|(record, rule_name)| (record.match_id.clone(), rule_name))
+    }
+
+    /// The record of `workflow_name` that `attributes` identify, exactly as it is
+    /// STORED.
+    ///
+    /// This is the reader's question, and it is answered with the stored record rather
+    /// than with the rule that found it: a reader reports the `matchId` AND the
+    /// `matchRule` the workflow recorded for that record, so the writer and the reader
+    /// can never disagree about a group's rule. Nothing is excluded from the
+    /// comparison — a reader submits no record of its own, so every indexed record is
+    /// a candidate.
+    pub fn identify_record(
+        &self,
+        workflow_name: &str,
+        workflow: &MatchingWorkflow,
+        attributes: &HashMap<String, String>,
+        normalize: bool,
+    ) -> Option<IndexedRecord> {
+        self.find_by_rules(workflow_name, workflow, attributes, normalize, None)
+            .map(|(record, _)| record.clone())
+    }
+
+    /// How many records `workflow_name` has indexed, against which
+    /// [`MAX_INDEXED_RECORDS_PER_WORKFLOW`] is enforced.
+    pub fn indexed_record_count(&self, workflow_name: &str) -> usize {
+        self.match_index
+            .get(workflow_name)
+            .map_or(0, BTreeMap::len)
+    }
+
+    /// Has `workflow_name` room to index a record it does not already hold?
+    ///
+    /// Re-indexing a `uniqueId` the workflow already holds REPLACES that entry, so it
+    /// does not grow the store and is always allowed; a new `uniqueId` is allowed only
+    /// below the bound.
+    pub fn has_room_to_index(&self, workflow_name: &str, unique_id: &str) -> bool {
+        self.match_index
+            .get(workflow_name)
+            .is_none_or(|indexed| {
+                indexed.contains_key(unique_id)
+                    || indexed.len() < MAX_INDEXED_RECORDS_PER_WORKFLOW
+            })
+    }
+
+    /// Forget everything `workflow_name` had indexed.
+    ///
+    /// A workflow's match index belongs to the workflow, so deleting the workflow
+    /// releases it — which is what makes [`MAX_INDEXED_RECORDS_PER_WORKFLOW`]
+    /// self-healing, exactly as `DeleteMatchingWorkflow` releasing an entry makes
+    /// [`MAX_MATCHING_WORKFLOWS`] self-healing.
+    pub fn release_match_index(&mut self, workflow_name: &str) {
+        self.match_index.remove(workflow_name);
+    }
+
+    /// Every record of `workflow_name` that belongs to the group `match_id`, in
+    /// `uniqueId` order.
+    ///
+    /// This is what a `MatchGroup$records` list is built from: the group is the set of
+    /// indexed records sharing the id, not just the record this call submitted. The
+    /// list is bounded by [`MAX_INDEXED_RECORDS_PER_WORKFLOW`], and a response assembles
+    /// it once per DISTINCT `matchId`, never once per submitted record.
+    pub fn group_records(&self, workflow_name: &str, match_id: &str) -> Vec<IndexedRecord> {
+        self.match_index
+            .get(workflow_name)
+            .into_iter()
+            .flat_map(|indexed| indexed.values())
+            .filter(|record| record.match_id == match_id)
+            .cloned()
+            .collect()
     }
 
     /// The tags stored on the resource `resource_arn` names, or `None` when no stored
@@ -1716,6 +2298,24 @@ impl ComAmazonawsEntityresolutionAwsveniceserviceState {
         removed
     }
 }
+
+/// How many records this emulator lets ONE matching workflow hold in its real-time
+/// match index, past which `GenerateMatchId` refuses to index a further record with
+/// the modelled `ValidationException` (HTTP 400 — the operation models no
+/// `ExceedsLimitException`).
+///
+/// AWS publishes no quota for the size of a rule-based workflow's real-time match
+/// index, so this is the emulator's OWN bound, and it is what keeps the store from
+/// growing without limit on repeated data-plane calls: the index is the one map here
+/// a caller can grow without creating a resource. It is self-healing in two ways —
+/// re-submitting a `uniqueId` the workflow already holds replaces that entry instead
+/// of adding one, and `DeleteMatchingWorkflow` releases the whole index through
+/// [`ComAmazonawsEntityresolutionAwsveniceserviceState::release_match_index`].
+pub const MAX_INDEXED_RECORDS_PER_WORKFLOW: usize = 200;
+
+/// The name of the bound [`MAX_INDEXED_RECORDS_PER_WORKFLOW`] enforces, as the refusal
+/// message names it.
+pub const INDEXED_RECORDS_QUOTA_NAME: &str = "Records per rule-based matching workflow";
 
 /// The region every ARN this service mints is scoped to when the request carries no
 /// SigV4 credential scope to read it from. It is the region the emulator's own shared

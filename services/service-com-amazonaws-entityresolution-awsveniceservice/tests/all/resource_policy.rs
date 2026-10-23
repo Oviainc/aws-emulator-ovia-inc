@@ -755,3 +755,103 @@ async fn the_policy_store_stays_bounded_however_many_resources_are_policied_and_
         );
     }
 }
+
+/// The same bound along the other axis a request controls: the REGION it is signed for.
+///
+/// A `VeniceGlobalArn` carries a region segment, and the region a request is served in
+/// comes from the caller's own SigV4 credential scope rather than from the stored
+/// record, so a policy collection keyed by the ARN would hold one entry per region
+/// string a client chooses to sign with — each one re-validating against the same live
+/// resource, so never prunable. The entry is keyed by the resource's own
+/// `<resourceType>/<name>` identity instead, so ONE live resource holds ONE policy
+/// however many Regions write it.
+///
+/// Each row is a different region spelling (AWS Region ids, plus the harness default the
+/// resource was created in), writing the same resource's policy from that Region.
+#[tokio::test]
+async fn one_resource_holds_one_policy_whatever_region_the_write_is_signed_for() {
+    // SOURCE: the region is any value a client can put in its credential scope; these
+    // are AWS Region ids, with `REGION` the harness default `create_resource` used.
+    const REGIONS: &[&str] = &[
+        REGION,
+        "us-west-2",
+        "eu-central-1",
+        "ap-southeast-1",
+        "sa-east-1",
+    ];
+
+    let emulator = Emulator::new();
+    let name = "cross-region";
+    create_resource(&emulator, "schemamapping", name).await;
+
+    let mut tokens = BTreeSet::new();
+    for region in REGIONS {
+        // The ARN a client configured for that Region addresses the resource with: this
+        // service mints an ARN scoped to the request's own Region and account.
+        let arn = format!(
+            "arn:aws:entityresolution:{region}:{}:schemamapping/{name}",
+            account_id()
+        );
+        let document = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Sid": region,
+                "Effect": "Allow",
+                "Principal": { "AWS": account_id() },
+                "Action": "entityresolution:GetSchemaMapping",
+                "Resource": arn,
+            }],
+        })
+        .to_string();
+
+        let written = emulator
+            .call_in_region(
+                region,
+                "PUT",
+                &policy_path(&arn),
+                Some(&json!({ "policy": document })),
+            )
+            .await;
+        assert_eq!(
+            written.status, 200,
+            "case {region:?}: writing the policy from that Region must succeed, got {written:?}"
+        );
+        tokens.insert(string_member(&written.body, "token"));
+
+        let keys: Vec<String> = emulator
+            .engine()
+            .state::<ComAmazonawsEntityresolutionAwsveniceserviceState>()
+            .lock()
+            .policies
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            keys,
+            vec![format!("schemamapping/{name}")],
+            "case {region:?}: the store must hold exactly one entry, keyed by the \
+             resource's own identity and carrying no region segment, got {keys:?}"
+        );
+
+        // One entry means one policy: the revision just written is what a read in that
+        // Region serves back.
+        let read = emulator
+            .call_in_region(region, "GET", &policy_path(&arn), None)
+            .await;
+        assert_eq!(
+            read.status, 200,
+            "case {region:?}: reading the policy back must succeed, got {read:?}"
+        );
+        assert_eq!(
+            string_member(&read.body, "policy"),
+            document,
+            "case {region:?}: the read must serve the revision this Region wrote"
+        );
+    }
+
+    assert_eq!(
+        tokens.len(),
+        REGIONS.len(),
+        "each write is its own revision, so each must mint its own token, got {tokens:?}"
+    );
+}

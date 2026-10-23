@@ -163,8 +163,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // An access record for this destructive call, emitted before any refusal can
+        // return so an attempt is recorded whatever its outcome. Request metadata
+        // only: nothing of the stored workflow is logged.
+        ::tracing::info!(
+            operation = "DeleteMatchingWorkflow",
+            workflow_name = %input.workflow_name,
+            akid = %::emulator_server::extract_akid(&ctx.parts().headers),
+            "matching workflow deletion requested"
+        );
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteMatchingWorkflowErrorModeled::InternalServerException(InternalServerException {
                 message: Some(
@@ -209,7 +219,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.matching_workflows.remove(&input.workflow_name);
         // The workflow's jobs go with it: a job belongs to the workflow it runs, so a
         // workflow recreated under the same name must inherit none of them.
-        store.remove_jobs_of(&input.workflow_name);
+        let jobs_removed = store.remove_jobs_of(&input.workflow_name);
+        // Its real-time match index goes with it too, for the same reason: the records
+        // `GenerateMatchId` indexed under this name are the workflow's, which is what
+        // keeps the per-workflow index bound self-healing and stops a deleted
+        // workflow's records reappearing under a workflow later created with the name.
+        let indexed_released = store.indexed_record_count(&input.workflow_name);
+        store.release_match_index(&input.workflow_name);
+
+        // What the delete actually destroyed, as counts: an attribution record for the
+        // cascade, carrying nothing of the records themselves.
+        ::tracing::info!(
+            operation = "DeleteMatchingWorkflow",
+            workflow_name = %input.workflow_name,
+            jobs_removed,
+            indexed_released,
+            "matching workflow deleted"
+        );
 
         // `message` is a modelled @required output member carrying this operation's
         // own constant success text, not a sentence about the removed record.
