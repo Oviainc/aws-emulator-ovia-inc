@@ -23,11 +23,19 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      SignedHeaders=host, Signature=0000";
 
 /// The region the `AUTHORIZATION` scope above signs for; every ARN this service mints
-/// for these requests carries it.
-const REGION: &str = "us-east-1";
+/// for these requests carries it. `pub(crate)` so every suite in this test target
+/// names the emulated region once.
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The canonical emulator account id every emulated ARN carries.
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
+
+/// The ARN this emulator mints for a profiling group of this name, in the region and
+/// account the harness's requests are signed for — the one source of that form for
+/// every suite in this test target.
+pub(crate) fn group_arn(name: &str) -> String {
+    format!("arn:aws:codeguru-profiler:{REGION}:{ACCOUNT}:profilingGroup/{name}")
+}
 
 /// One HTTP answer, reduced to what these tests assert on. `pub(crate)` so the other
 /// suites in this test target drive the same harness instead of forking it.
@@ -311,10 +319,7 @@ impl GroupCase {
     }
 
     pub(crate) fn expected_arn(&self) -> String {
-        format!(
-            "arn:aws:codeguru-profiler:{REGION}:{ACCOUNT}:profilingGroup/{}",
-            self.name
-        )
+        group_arn(&self.name)
     }
 }
 

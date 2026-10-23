@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Associates tags with the export the ARN names: a submitted key the export does not
+//! carry is added, one it already carries takes the submitted value, and a key the
+//! request does not mention is left alone — so the operation is additive and repeating it
+//! with the same list changes nothing. The tags are persisted on the stored export, which
+//! is what `ListTagsForResource` reports.
+//!
+//! IMPLEMENTED. This is the ONLY file to touch for this operation; the notes below on
+//! reaching this service's state and the modelled contract still apply.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +147,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: "The export store is unavailable.".to_string(),
+            })
+        })?;
+
+        // The request is read before the resource is looked up: a list that cannot be
+        // read as a tag set at all is a bad request whatever ARN it was sent to.
+        let submitted = crate::state::tag_map(input.resource_tags)
+            .map_err(TagResourceErrorModeled::ValidationException)?;
+
+        let mut store = state.lock();
+        let stored = store.exports.get_mut(&input.resource_arn).ok_or_else(|| {
+            TagResourceErrorModeled::ResourceNotFoundException(crate::state::export_not_found(
+                &input.resource_arn,
+            ))
+        })?;
+
+        // A key already on the export takes a new value rather than adding a tag, so only
+        // the keys this request introduces grow the set.
+        let added = submitted
+            .keys()
+            .filter(|key| !stored.tags.contains_key(*key))
+            .count();
+        let total = stored.tags.len() + added;
+        if total > crate::state::MAX_RESOURCE_TAGS {
+            return Err(TagResourceErrorModeled::ValidationException(
+                crate::state::too_many_tags(total),
+            )
+            .into());
+        }
+
+        // "Adds tags for an existing data export definition": additive, so a key the
+        // request does not name keeps its value. The tag set is not part of the export
+        // DEFINITION — `ExportStatus.LastUpdatedAt` is "the timestamp of when the export
+        // was updated", which `UpdateExport` owns — so tagging moves no status timestamp.
+        stored.tags.extend(submitted);
+        drop(store);
+
+        Ok(TagResourceOutput {})
     }
 }

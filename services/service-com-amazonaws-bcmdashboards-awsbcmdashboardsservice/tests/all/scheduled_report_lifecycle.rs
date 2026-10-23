@@ -1,0 +1,567 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! `CreateScheduledReport` and the read that proves it, end to end over the wire.
+//!
+//! The rule under test: `CreateScheduledReport` mints a fresh `ScheduledReportArn`,
+//! persists the submitted `scheduledReport` configuration under it with
+//! `scheduleConfig.state` resolved to `ENABLED` when the request left it unset, and
+//! `GetScheduledReport` answers that stored record — every optional member exactly as
+//! it was stored, `createdAt == updatedAt` on a report that was never updated, and
+//! neither an execution time nor a health status until something executes the report.
+//! A `clientToken` is an at-most-once create key, and a `dashboardArn` no stored
+//! dashboard answers to is refused.
+//!
+//! Each assertion spans the class rather than one recorded request: the table below
+//! differs in which optional members are present, in schedule state (absent, `ENABLED`,
+//! `DISABLED`), in widget-id count (absent, empty, one) and in whether a client token
+//! is presented.
+
+use serde_json::{json, Value};
+use smithy_server_runtime::MultiServiceRouter;
+
+use super::dashboard_lifecycle::{call, graph_config, ok_call, router, timestamp};
+
+/// A well-formed `ServiceRoleArn` (pattern
+/// `^arn:aws[-a-z0-9]*:iam::[0-9]{12}:role/[a-zA-Z0-9+=,.@_/-]+$`, source:
+/// `smithy_query(query="operation",operation="CreateScheduledReport")`).
+const EXECUTION_ROLE_ARN: &str = "arn:aws:iam::123456789012:role/BCMDashboardsReportRole";
+
+/// A well-formed `DashboardArn` that no dashboard in a fresh store is keyed by, so a
+/// create naming it is a reference to a missing resource rather than a malformed input.
+const MISSING_DASHBOARD_ARN: &str = "arn:aws:bcm-dashboards::123456789012:dashboard/no-such-board";
+
+/// `ScheduledReportArn`'s modelled `@pattern`, checked by hand because this crate has
+/// no regex dependency. Source: the `arn` member of `CreateScheduledReportResponse`
+/// reported by `smithy_query(query="operation",operation="CreateScheduledReport")` —
+/// `^arn:aws[-a-z0-9]*:bcm-dashboards::[0-9]{12}:scheduled-report/(\*|[-a-z0-9]+)$`,
+/// length 20..2048.
+fn is_scheduled_report_arn(arn: &str) -> bool {
+    fn lower_or_digit_or_dash(s: &str) -> bool {
+        s.chars()
+            .all(|c| c == '-' || c.is_ascii_lowercase() || c.is_ascii_digit())
+    }
+    let Some(rest) = arn.strip_prefix("arn:aws") else {
+        return false;
+    };
+    let Some((partition_suffix, rest)) = rest.split_once(':') else {
+        return false;
+    };
+    if !lower_or_digit_or_dash(partition_suffix) {
+        return false;
+    }
+    let Some(rest) = rest.strip_prefix("bcm-dashboards::") else {
+        return false;
+    };
+    let Some((account, resource)) = rest.split_once(':') else {
+        return false;
+    };
+    if account.len() != 12 || !account.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let Some(id) = resource.strip_prefix("scheduled-report/") else {
+        return false;
+    };
+    let id_ok = id == "*" || (!id.is_empty() && lower_or_digit_or_dash(id));
+    id_ok && (20..=2048).contains(&arn.len())
+}
+
+/// The wire error code (`__type`) of an error body.
+fn error_code(body: &Value) -> String {
+    body.get("__type")
+        .and_then(Value::as_str)
+        .unwrap_or("<no __type>")
+        .to_string()
+}
+
+/// Create a dashboard with one widget and return `(dashboard arn, widget id)` — the
+/// resource a scheduled report has to point at.
+async fn source_dashboard(router: &MultiServiceRouter, name: &str) -> (String, String) {
+    let created = ok_call(
+        router,
+        "CreateDashboard",
+        &json!({
+            "name": name,
+            "widgets": [{
+                "title": "Spend",
+                "configs": [graph_config("UnblendedCost", "LINE", "MONTHLY")]
+            }]
+        }),
+    )
+    .await;
+    let arn = created["arn"]
+        .as_str()
+        .expect("CreateDashboard returns an arn")
+        .to_string();
+    let fetched = ok_call(router, "GetDashboard", &json!({"arn": arn})).await;
+    let widget_id = fetched["widgets"][0]["id"]
+        .as_str()
+        .expect("the stored widget carries a minted id")
+        .to_string();
+    (arn, widget_id)
+}
+
+/// One row of the create table: a request, and what the stored record must read back as.
+struct ReportCase {
+    label: &'static str,
+    name: &'static str,
+    description: Option<&'static str>,
+    /// The `scheduleConfig` as submitted.
+    schedule_config: Value,
+    /// The `scheduleConfig.state` the stored record must carry — `ENABLED` where the
+    /// request omitted it.
+    expected_state: &'static str,
+    /// `None` when the request omits `widgetIds`, otherwise the list it submits.
+    widget_ids: Option<Vec<String>>,
+    widget_date_range_override: Option<Value>,
+    resource_tags: Option<Value>,
+    client_token: Option<&'static str>,
+}
+
+/// The table. `widget_id` is a real widget of the source dashboard, so the one row
+/// that names a widget names an existing one.
+fn cases(widget_id: &str) -> Vec<ReportCase> {
+    vec![
+        ReportCase {
+            label: "required members only, no state, no token",
+            name: "Monthly Rollup",
+            description: None,
+            // `scheduleExpression`/`scheduleExpressionTimeZone` are free-form
+            // `GenericString`s in the model, so a cron expression is stored verbatim.
+            schedule_config: json!({"scheduleExpression": "cron(0 8 1 * ? *)"}),
+            expected_state: "ENABLED",
+            widget_ids: None,
+            widget_date_range_override: None,
+            resource_tags: None,
+            client_token: None,
+        },
+        ReportCase {
+            label: "state omitted, timezone and schedule period present",
+            name: "Weekly_Spend-1",
+            description: Some("Weekly spend, by service."),
+            schedule_config: json!({
+                "scheduleExpression": "rate(7 days)",
+                "scheduleExpressionTimeZone": "Europe/Berlin",
+                // GenericTimeStamp members, epoch seconds on the awsJson1_0 wire.
+                "schedulePeriod": {"startTime": 1_767_225_600, "endTime": 1_798_761_600}
+            }),
+            expected_state: "ENABLED",
+            widget_ids: Some(vec![]),
+            widget_date_range_override: None,
+            resource_tags: Some(json!([{"key": "team", "value": "finops"}])),
+            client_token: Some("token-weekly-0001"),
+        },
+        ReportCase {
+            label: "state ENABLED explicitly, one widget id, date range override",
+            name: "Quarterly Deep Dive",
+            description: Some("One widget only."),
+            // `ScheduleState` values, source: the `ScheduleState` enum in the model.
+            schedule_config: json!({
+                "scheduleExpression": "cron(0 6 1 1,4,7,10 ? *)",
+                "state": "ENABLED"
+            }),
+            expected_state: "ENABLED",
+            widget_ids: Some(vec![widget_id.to_string()]),
+            widget_date_range_override: Some(json!({
+                "startTime": {"type": "RELATIVE", "value": "-P3M"},
+                "endTime": {"type": "RELATIVE", "value": "P0D"}
+            })),
+            resource_tags: Some(json!([
+                {"key": "team", "value": "finops"},
+                {"key": "empty-value-is-legal", "value": ""}
+            ])),
+            client_token: Some("token-quarterly-0002"),
+        },
+        ReportCase {
+            label: "state DISABLED is kept, absolute date range override",
+            name: "Paused Report",
+            description: None,
+            schedule_config: json!({"scheduleExpression": "cron(0 7 ? * MON *)", "state": "DISABLED"}),
+            expected_state: "DISABLED",
+            widget_ids: Some(vec![widget_id.to_string()]),
+            widget_date_range_override: Some(json!({
+                "startTime": {"type": "ABSOLUTE", "value": "2025-01-01"},
+                "endTime": {"type": "ABSOLUTE", "value": "2025-07-01"}
+            })),
+            resource_tags: None,
+            client_token: Some("token-paused-0003"),
+        },
+    ]
+}
+
+/// The `scheduledReport` member of a create request for `case`.
+fn report_input(case: &ReportCase, dashboard_arn: &str) -> Value {
+    let mut report = json!({
+        "name": case.name,
+        "dashboardArn": dashboard_arn,
+        "scheduledReportExecutionRoleArn": EXECUTION_ROLE_ARN,
+        "scheduleConfig": case.schedule_config.clone(),
+    });
+    if let Some(description) = case.description {
+        report["description"] = json!(description);
+    }
+    if let Some(widget_ids) = &case.widget_ids {
+        report["widgetIds"] = json!(widget_ids);
+    }
+    if let Some(range) = &case.widget_date_range_override {
+        report["widgetDateRangeOverride"] = range.clone();
+    }
+    report
+}
+
+fn create_request(case: &ReportCase, dashboard_arn: &str) -> Value {
+    let mut request = json!({"scheduledReport": report_input(case, dashboard_arn)});
+    if let Some(tags) = &case.resource_tags {
+        request["resourceTags"] = tags.clone();
+    }
+    if let Some(token) = case.client_token {
+        request["clientToken"] = json!(token);
+    }
+    request
+}
+
+/// CreateScheduledReport stores the submitted configuration under a freshly minted ARN
+/// and GetScheduledReport reads that record back — over a table of reports differing in
+/// which optional members they carry, in schedule state, in widget-id count and in
+/// whether they present a client token.
+#[tokio::test]
+async fn create_scheduled_report_persists_the_configuration_and_get_reads_it_back() {
+    let router = router();
+    let (dashboard_arn, widget_id) = source_dashboard(&router, "ReportSource").await;
+
+    let mut minted: Vec<String> = Vec::new();
+    for case in cases(&widget_id) {
+        let label = case.label;
+        let request = create_request(&case, &dashboard_arn);
+        let created = ok_call(&router, "CreateScheduledReport", &request).await;
+
+        let arn = created["arn"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {label}: CreateScheduledReport returned no arn: {created}"))
+            .to_string();
+        assert!(
+            is_scheduled_report_arn(&arn),
+            "case {label}: expected a ScheduledReportArn, got {arn:?}"
+        );
+        assert!(
+            !minted.contains(&arn),
+            "case {label}: every create mints a distinct arn, but {arn:?} repeats {minted:?}"
+        );
+        minted.push(arn.clone());
+
+        let fetched = ok_call(&router, "GetScheduledReport", &json!({"arn": arn})).await;
+        let report = fetched
+            .get("scheduledReport")
+            .unwrap_or_else(|| panic!("case {label}: no scheduledReport in {fetched}"));
+
+        assert_eq!(
+            report.get("arn").and_then(Value::as_str),
+            Some(arn.as_str()),
+            "case {label}: the record reports the arn it is stored under, got {report}"
+        );
+        assert_eq!(
+            report.get("name").and_then(Value::as_str),
+            Some(case.name),
+            "case {label}: expected name {:?}, got {report}",
+            case.name
+        );
+        assert_eq!(
+            report.get("dashboardArn").and_then(Value::as_str),
+            Some(dashboard_arn.as_str()),
+            "case {label}: expected dashboardArn {dashboard_arn:?}, got {report}"
+        );
+        assert_eq!(
+            report
+                .get("scheduledReportExecutionRoleArn")
+                .and_then(Value::as_str),
+            Some(EXECUTION_ROLE_ARN),
+            "case {label}: expected the submitted execution role, got {report}"
+        );
+        assert_eq!(
+            report.get("description").and_then(Value::as_str),
+            case.description,
+            "case {label}: expected description {:?}, got {report}",
+            case.description
+        );
+
+        // The schedule config is stored verbatim except for `state`, which is resolved
+        // to ENABLED when the request left it unset.
+        let stored_schedule = report
+            .get("scheduleConfig")
+            .unwrap_or_else(|| panic!("case {label}: no scheduleConfig in {report}"));
+        assert_eq!(
+            stored_schedule.get("state").and_then(Value::as_str),
+            Some(case.expected_state),
+            "case {label}: expected scheduleConfig.state {:?}, got {stored_schedule}",
+            case.expected_state
+        );
+        for member in ["scheduleExpression", "scheduleExpressionTimeZone"] {
+            assert_eq!(
+                stored_schedule.get(member),
+                case.schedule_config.get(member),
+                "case {label}: scheduleConfig.{member} must be stored verbatim, got {stored_schedule}"
+            );
+        }
+        match case.schedule_config.get("schedulePeriod") {
+            Some(submitted) => {
+                let stored = stored_schedule
+                    .get("schedulePeriod")
+                    .unwrap_or_else(|| panic!("case {label}: schedulePeriod was dropped: {stored_schedule}"));
+                for member in ["startTime", "endTime"] {
+                    assert_eq!(
+                        stored.get(member).and_then(Value::as_f64),
+                        submitted.get(member).and_then(Value::as_f64),
+                        "case {label}: schedulePeriod.{member} must round-trip, got {stored}"
+                    );
+                }
+            }
+            None => assert!(
+                stored_schedule.get("schedulePeriod").is_none(),
+                "case {label}: a schedule with no period must not grow one: {stored_schedule}"
+            ),
+        }
+
+        match &case.widget_ids {
+            Some(submitted) => assert_eq!(
+                report.get("widgetIds"),
+                Some(&json!(submitted)),
+                "case {label}: expected widgetIds {submitted:?}, got {report}"
+            ),
+            None => assert!(
+                report.get("widgetIds").is_none(),
+                "case {label}: a report that named no widget must not grow widgetIds: {report}"
+            ),
+        }
+        assert_eq!(
+            report.get("widgetDateRangeOverride"),
+            case.widget_date_range_override.as_ref(),
+            "case {label}: expected widgetDateRangeOverride {:?}, got {report}",
+            case.widget_date_range_override
+        );
+
+        let created_at = timestamp(report, "createdAt", label);
+        let updated_at = timestamp(report, "updatedAt", label);
+        assert_eq!(
+            created_at, updated_at,
+            "case {label}: a report that was never updated has createdAt == updatedAt"
+        );
+        assert!(
+            created_at > 1_700_000_000.0,
+            "case {label}: createdAt {created_at} is not a plausible epoch-seconds instant"
+        );
+
+        // Nothing has executed the report, so there is no execution time and no health.
+        assert!(
+            report.get("lastExecutionAt").is_none(),
+            "case {label}: a report that never ran has no lastExecutionAt: {report}"
+        );
+        assert!(
+            report.get("healthStatus").is_none(),
+            "case {label}: a report that never ran has no healthStatus: {report}"
+        );
+
+        // A read changes nothing a later reader sees.
+        let again = ok_call(&router, "GetScheduledReport", &json!({"arn": arn})).await;
+        assert_eq!(
+            again, fetched,
+            "case {label}: reading the report twice must answer the same record"
+        );
+    }
+
+    assert_eq!(
+        minted.len(),
+        4,
+        "every row of the table must have created a report, got {minted:?}"
+    );
+}
+
+/// A `clientToken` creates at most one report: the first call presenting it wins and
+/// every later one — whatever parameters it carries — is refused with the modelled
+/// ConflictException (409), leaving the winner's record untouched.
+#[tokio::test]
+async fn a_client_token_creates_at_most_one_scheduled_report() {
+    let router = router();
+    let (dashboard_arn, _) = source_dashboard(&router, "TokenSource").await;
+
+    let token = "retry-token-9f";
+    let first = json!({
+        "clientToken": token,
+        "scheduledReport": {
+            "name": "Token Winner",
+            "dashboardArn": dashboard_arn,
+            "scheduledReportExecutionRoleArn": EXECUTION_ROLE_ARN,
+            "scheduleConfig": {"scheduleExpression": "cron(0 8 1 * ? *)"}
+        }
+    });
+    let winner = ok_call(&router, "CreateScheduledReport", &first).await;
+    let winner_arn = winner["arn"].as_str().expect("an arn").to_string();
+    let winner_record = ok_call(&router, "GetScheduledReport", &json!({"arn": winner_arn})).await;
+
+    // Two retries: the identical request, and one whose parameters differ. The token is
+    // the create key, so both are refused.
+    let mut different = first.clone();
+    different["scheduledReport"]["name"] = json!("Token Loser");
+    different["scheduledReport"]["scheduleConfig"] = json!({"scheduleExpression": "rate(1 day)", "state": "DISABLED"});
+    for (label, request) in [
+        ("identical retry", first.clone()),
+        ("retry with different parameters", different),
+    ] {
+        let (status, body) = call(&router, "CreateScheduledReport", &request).await;
+        assert_eq!(
+            status, 409,
+            "case {label}: a reused clientToken is refused with 409, got {status}: {body}"
+        );
+        assert!(
+            error_code(&body).ends_with("ConflictException"),
+            "case {label}: expected ConflictException, got {body}"
+        );
+    }
+
+    // The winner is still there, unchanged, and is still the only report that token
+    // ever created: a fresh token mints a different ARN.
+    assert_eq!(
+        ok_call(&router, "GetScheduledReport", &json!({"arn": winner_arn})).await,
+        winner_record,
+        "the refused retries must not have touched the winning record"
+    );
+    let second = ok_call(
+        &router,
+        "CreateScheduledReport",
+        &json!({
+            "clientToken": "another-token-0a",
+            "scheduledReport": {
+                "name": "Token Winner",
+                "dashboardArn": dashboard_arn,
+                "scheduledReportExecutionRoleArn": EXECUTION_ROLE_ARN,
+                "scheduleConfig": {"scheduleExpression": "cron(0 8 1 * ? *)"}
+            }
+        }),
+    )
+    .await;
+    assert_ne!(
+        second["arn"].as_str(),
+        Some(winner_arn.as_str()),
+        "a different clientToken creates a distinct report: {second}"
+    );
+}
+
+/// With no `clientToken` there is no create key, so identical requests are distinct
+/// creates — each one mints its own ARN and its own record.
+#[tokio::test]
+async fn creates_without_a_client_token_are_distinct_reports() {
+    let router = router();
+    let (dashboard_arn, _) = source_dashboard(&router, "NoTokenSource").await;
+
+    let request = json!({
+        "scheduledReport": {
+            "name": "Same Name",
+            "dashboardArn": dashboard_arn,
+            "scheduledReportExecutionRoleArn": EXECUTION_ROLE_ARN,
+            "scheduleConfig": {"scheduleExpression": "cron(0 8 1 * ? *)"}
+        }
+    });
+    let mut arns = Vec::new();
+    for attempt in 0..3 {
+        let created = ok_call(&router, "CreateScheduledReport", &request).await;
+        let arn = created["arn"]
+            .as_str()
+            .unwrap_or_else(|| panic!("attempt {attempt}: no arn in {created}"))
+            .to_string();
+        assert!(
+            !arns.contains(&arn),
+            "attempt {attempt}: expected a distinct arn, but {arn:?} repeats {arns:?}"
+        );
+        arns.push(arn);
+    }
+    for arn in &arns {
+        let fetched = ok_call(&router, "GetScheduledReport", &json!({"arn": arn})).await;
+        assert_eq!(
+            fetched["scheduledReport"]["arn"].as_str(),
+            Some(arn.as_str()),
+            "each create must have its own stored record: {fetched}"
+        );
+    }
+}
+
+/// A create that names a dashboard this account does not store is refused with the
+/// modelled ValidationException (400), nothing is persisted, and the clientToken it
+/// presented is still free for the retry that gets the dashboard right.
+#[tokio::test]
+async fn a_report_on_a_missing_dashboard_is_refused_and_persists_nothing() {
+    let router = router();
+    let (dashboard_arn, _) = source_dashboard(&router, "MissingSource").await;
+
+    let token = "fix-the-arn-then-retry";
+    let mut request = json!({
+        "clientToken": token,
+        "scheduledReport": {
+            "name": "Orphan Report",
+            "dashboardArn": MISSING_DASHBOARD_ARN,
+            "scheduledReportExecutionRoleArn": EXECUTION_ROLE_ARN,
+            "scheduleConfig": {"scheduleExpression": "cron(0 8 1 * ? *)"}
+        }
+    });
+    let (status, body) = call(&router, "CreateScheduledReport", &request).await;
+    assert_eq!(
+        status, 400,
+        "a report on a missing dashboard is refused with 400, got {status}: {body}"
+    );
+    assert!(
+        error_code(&body).ends_with("ValidationException"),
+        "expected ValidationException, got {body}"
+    );
+    assert!(
+        body.get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains(MISSING_DASHBOARD_ARN)),
+        "the refusal names the dashboard arn it could not resolve: {body}"
+    );
+
+    // The refused call created nothing, so it consumed neither the token nor an ARN.
+    request["scheduledReport"]["dashboardArn"] = json!(dashboard_arn);
+    let created = ok_call(&router, "CreateScheduledReport", &request).await;
+    let arn = created["arn"].as_str().expect("an arn").to_string();
+    let fetched = ok_call(&router, "GetScheduledReport", &json!({"arn": arn})).await;
+    assert_eq!(
+        fetched["scheduledReport"]["dashboardArn"].as_str(),
+        Some(dashboard_arn.as_str()),
+        "the retry under the same token must have created the report: {fetched}"
+    );
+}
+
+/// GetScheduledReport refuses an ARN no report is stored under with the modelled
+/// ResourceNotFoundException (404) — including the ARN of a report that was never
+/// created and a well-formed ARN of another resource's shape.
+#[tokio::test]
+async fn getting_a_report_that_was_never_created_is_not_found() {
+    let router = router();
+    let (dashboard_arn, _) = source_dashboard(&router, "NotFoundSource").await;
+    // One real report exists, so a miss is a miss on a populated store.
+    ok_call(
+        &router,
+        "CreateScheduledReport",
+        &json!({
+            "scheduledReport": {
+                "name": "The Only One",
+                "dashboardArn": dashboard_arn,
+                "scheduledReportExecutionRoleArn": EXECUTION_ROLE_ARN,
+                "scheduleConfig": {"scheduleExpression": "cron(0 8 1 * ? *)"}
+            }
+        }),
+    )
+    .await;
+
+    for arn in [
+        "arn:aws:bcm-dashboards::123456789012:scheduled-report/never-created",
+        "arn:aws-cn:bcm-dashboards::000000000000:scheduled-report/ffffffffffffffffffffffffffffffff",
+    ] {
+        let (status, body) = call(&router, "GetScheduledReport", &json!({"arn": arn})).await;
+        assert_eq!(
+            status, 404,
+            "case {arn}: an unknown report arn answers 404, got {status}: {body}"
+        );
+        assert!(
+            error_code(&body).ends_with("ResourceNotFoundException"),
+            "case {arn}: expected ResourceNotFoundException, got {body}"
+        );
+    }
+}

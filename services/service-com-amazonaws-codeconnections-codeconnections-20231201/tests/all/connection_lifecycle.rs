@@ -42,16 +42,25 @@ fn some_host_arn() -> String {
 
 /// One emulator holding only this service, driven in-process.
 pub(crate) fn router() -> MultiServiceRouter {
+    router_with_engine().0
+}
+
+/// The same emulator, with the engine it was built over.
+///
+/// A suite that has to seed state the API cannot yet write (a resource's sync state,
+/// say — `CreateSyncConfiguration` is still a scaffold) reaches the store through this
+/// engine, which is the SAME one every handler of the returned router reads.
+pub(crate) fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // These tests assert handler behaviour, not signature verification.
     router.set_request_authentication(false);
     router.register_service(
         service_com_amazonaws_codeconnections_codeconnections_20231201::EmulatedService::new(
-            engine,
+            Arc::clone(&engine),
         ),
     );
-    router
+    (router, engine)
 }
 
 /// Call one operation and return its HTTP status and parsed JSON body.
