@@ -21,6 +21,8 @@ mod managed_thing_lifecycle;
 mod managed_thing_read_side_attributes;
 #[path = "all/not_found_messages.rs"]
 mod not_found_messages;
+#[path = "all/ota_task_configuration_lifecycle.rs"]
+mod ota_task_configuration_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/validation_error_messages.rs"]

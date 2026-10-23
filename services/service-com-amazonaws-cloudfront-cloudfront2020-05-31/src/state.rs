@@ -474,6 +474,34 @@ pub fn tags_projection(tags: &TagSet) -> Tags {
     }
 }
 
+/// Add `added` to the tag set `into`, or report the REASON the resulting tag set is one
+/// no resource can carry.
+///
+/// The ADD rule for every resource kind this service tags: a tagging call associates the
+/// tags it names with the resource, so a key the resource already carries takes the value
+/// the call names and every other key the resource carries is left exactly as it was —
+/// adding tags is not replacing the tag set. The resulting set is still bounded by
+/// [`MAX_TAGS_PER_RESOURCE`], counted over the UNION of the keys (a call that only
+/// changes the values of keys the resource already carries adds nothing to the count).
+///
+/// All-or-nothing: the bound is decided before anything is written, so a refused add
+/// leaves `into` exactly as it was. The reason carries no error wording of its own, for
+/// the same reason [`tag_set`]'s does not: each caller prefixes it with the wording of
+/// whichever refusal its own model declares.
+pub fn merge_tags(into: &mut TagSet, added: TagSet) -> Result<(), String> {
+    // The keys `added` contributes are the ones the resource does not carry yet, so the
+    // union is counted without building a second set of every key.
+    let resulting = into.len() + added.keys().filter(|key| !into.contains_key(*key)).count();
+    if resulting > MAX_TAGS_PER_RESOURCE {
+        return Err(format!(
+            "a CloudFront resource carries at most {MAX_TAGS_PER_RESOURCE} tags but the \
+             request would leave it carrying {resulting}"
+        ));
+    }
+    into.extend(added);
+    Ok(())
+}
+
 /// The modelled `InvalidTagging` for a tag set no resource can carry, wording `reason`
 /// as that error documents itself — "The tagging specified is not valid."
 pub fn invalid_tagging(reason: String) -> InvalidTagging {
@@ -1081,6 +1109,27 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             .values()
             .find(|store| store.arn == arn)
             .map(|store| &store.tags)
+    }
+
+    /// The tag set of the resource `arn` names, MUTABLY, so a tagging call writes the
+    /// very set a tag read reports rather than a second copy of it.
+    ///
+    /// Resolves the ARN exactly as [`ComAmazonawsCloudfrontCloudfront20200531State::tags_for_resource`]
+    /// does — across every resource kind this store holds, comparing against the STORED
+    /// ARN — so a tagging call and a tag read can never disagree about which resource an
+    /// ARN names. `None` is an ARN this emulator holds no resource for.
+    pub fn tags_for_resource_mut(&mut self, arn: &str) -> Option<&mut TagSet> {
+        if let Some(distribution) = self
+            .distributions
+            .values_mut()
+            .find(|distribution| distribution.arn == arn)
+        {
+            return Some(&mut distribution.tags);
+        }
+        self.key_value_stores
+            .values_mut()
+            .find(|store| store.arn == arn)
+            .map(|store| &mut store.tags)
     }
 
     /// Persist a new distribution carrying `config` and `tags`, and report the record

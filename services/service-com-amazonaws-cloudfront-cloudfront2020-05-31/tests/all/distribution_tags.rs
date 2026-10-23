@@ -38,10 +38,13 @@ use crate::distribution_lifecycle::{
 };
 
 /// A tag as a request names it: a key, and a value the request may leave out entirely.
-type SubmittedTag = (String, Option<String>);
+///
+/// `pub(crate)` so the sibling tagging suites in `tests/all/` name a tag the same way
+/// rather than each declaring its own.
+pub(crate) type SubmittedTag = (String, Option<String>);
 
 /// The tag set a read reports: key -> the value that key carries, if any.
-type ReportedTags = BTreeMap<String, Option<String>>;
+pub(crate) type ReportedTags = BTreeMap<String, Option<String>>;
 
 // ---------------------------------------------------------------------------
 // Calling the tagging surface
@@ -49,7 +52,7 @@ type ReportedTags = BTreeMap<String, Option<String>>;
 
 /// `POST /2020-05-31/distribution?WithTags`, whose payload is a
 /// `DistributionConfigWithTags`.
-async fn create_distribution_with_tags(
+pub(crate) async fn create_distribution_with_tags(
     router: &MultiServiceRouter,
     config: &Config,
     submitted: Option<&[SubmittedTag]>,
@@ -76,7 +79,7 @@ async fn create_distribution_with_tags(
 /// The ARN is sent as it is: every character a CloudFront ARN uses is legal in a query
 /// value, and none of them is `&`, `=` or `%`, so there is nothing for an encoding to
 /// change.
-async fn list_tags_for_resource(router: &MultiServiceRouter, arn: &str) -> Answer {
+pub(crate) async fn list_tags_for_resource(router: &MultiServiceRouter, arn: &str) -> Answer {
     call(
         router,
         "GET",
@@ -92,7 +95,7 @@ async fn list_tags_for_resource(router: &MultiServiceRouter, arn: &str) -> Answe
 /// `None` is a request that names no `Items` at all (`<Tags/>`), which is a different
 /// document from one carrying an empty `Items` list — both mean "no tags", and the rule
 /// has to hold for each.
-fn tags_xml(submitted: Option<&[SubmittedTag]>) -> String {
+pub(crate) fn tags_xml(submitted: Option<&[SubmittedTag]>) -> String {
     let Some(items) = submitted else {
         return "<Tags/>".to_string();
     };
@@ -112,7 +115,7 @@ fn tags_xml(submitted: Option<&[SubmittedTag]>) -> String {
 }
 
 /// The tag set a `Tags` element reports, read out of the answered document.
-fn reported_tags(tags: &Node) -> ReportedTags {
+pub(crate) fn reported_tags(tags: &Node) -> ReportedTags {
     tags.at("Items")
         .map(|items| {
             items
@@ -130,7 +133,7 @@ fn reported_tags(tags: &Node) -> ReportedTags {
 }
 
 /// The tags a `Tags` element reports, in the order the document lists them.
-fn reported_order(tags: &Node) -> Vec<String> {
+pub(crate) fn reported_order(tags: &Node) -> Vec<String> {
     tags.at("Items")
         .map(|items| {
             items
@@ -170,7 +173,7 @@ impl TagCase {
     }
 }
 
-fn tag(key: &str, value: Option<&str>) -> SubmittedTag {
+pub(crate) fn tag(key: &str, value: Option<&str>) -> SubmittedTag {
     (key.to_string(), value.map(str::to_string))
 }
 
@@ -249,7 +252,7 @@ fn tag_table() -> Vec<TagCase> {
 
 /// A configuration for `reference`, drawn from the lifecycle suite's table so each row
 /// creates a DIFFERENT distribution configuration rather than the same one.
-fn config_for(index: usize, reference: &str) -> Config {
+pub(crate) fn config_for(index: usize, reference: &str) -> Config {
     let table = config_table();
     let template = table[index % table.len()].clone();
     Config {
