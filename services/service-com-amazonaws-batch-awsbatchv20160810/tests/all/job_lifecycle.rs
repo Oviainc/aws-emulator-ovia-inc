@@ -172,6 +172,16 @@ pub(crate) async fn job_definition(
     )
 }
 
+/// The wire error code of an error response, with any namespace prefix dropped
+/// the way an SDK client drops it: the single copy this crate's suites share.
+pub(crate) fn error_code(body: &Value) -> String {
+    let raw = body
+        .get("__type")
+        .and_then(Value::as_str)
+        .unwrap_or("<none>");
+    raw.rsplit(['#', '/']).next().unwrap_or(raw).to_string()
+}
+
 /// The smallest container properties a definition can carry.
 pub(crate) fn container_properties() -> Value {
     json!({
