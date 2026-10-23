@@ -19,7 +19,7 @@
 //! * `EncryptionConfiguration$KmsKeyArn` — "Required when KeyType is
 //!   CUSTOMER_MANAGED_KEY. Cannot be specified when KeyType is AWS_OWNED_KMS_KEY";
 //! * an `InstanceArn` no instance of this account carries is a missing resource
-//!   (`ResourceNotFoundException`, 404).
+//!   (`ResourceNotFoundException`).
 //!
 //! Every call goes through `MultiServiceRouter::dispatch`, so the modelled constraints and
 //! the `X-Amz-Target` routing are exercised rather than bypassed. The harness is the one
@@ -452,7 +452,9 @@ async fn a_refused_update_writes_nothing() {
         (
             "a pattern-valid InstanceArn that was never created",
             json!({"InstanceArn": UNKNOWN_INSTANCE_ARN, "Name": "Orphan"}),
-            404,
+            // Every refusal of a request on this awsJson1_1 surface is HTTP 400; the
+            // error code is what tells a missing instance from a bad one.
+            400,
             "ResourceNotFoundException",
         ),
     ];
