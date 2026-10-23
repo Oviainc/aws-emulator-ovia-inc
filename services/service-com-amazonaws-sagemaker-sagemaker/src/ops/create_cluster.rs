@@ -208,6 +208,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
+        // A name already in use is refused, never overwritten: otherwise the caller
+        // reads a 200 for a cluster it did not create, and the one it did create is gone.
+        // `ResourceInUse` is the conflict this operation models, and it is decided before
+        // the quota below: a create that cannot add a record cannot exceed a count limit,
+        // so the answer to a conflicting name does not depend on how full the store is.
+        if let Some(existing) = store.clusters.get(&input.cluster_name) {
+            let arn = existing.arn.clone();
+            return Err(CreateClusterErrorModeled::ResourceInUse(ResourceInUse {
+                message: Some(format!(
+                    "Cannot create already existing cluster \"{arn}\"."
+                )),
+            })
+            .into());
+        }
         // The store is bounded, so a caller varying `ClusterName` cannot grow it without
         // end. `ResourceLimitExceeded` is the limit failure this operation models.
         if !store.clusters_below_quota() {
@@ -221,18 +235,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )),
                 },
             )
-            .into());
-        }
-        // A name already in use is refused, never overwritten: otherwise the caller
-        // reads a 200 for a cluster it did not create, and the one it did create is gone.
-        // `ResourceInUse` is the conflict this operation models.
-        if let Some(existing) = store.clusters.get(&input.cluster_name) {
-            let arn = existing.arn.clone();
-            return Err(CreateClusterErrorModeled::ResourceInUse(ResourceInUse {
-                message: Some(format!(
-                    "Cannot create already existing cluster \"{arn}\"."
-                )),
-            })
             .into());
         }
 
@@ -267,6 +269,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 tags: input.tags.unwrap_or_default(),
                 creation_time: now,
                 in_service_at: now + crate::state::CLUSTER_IN_SERVICE_AFTER,
+                // A cluster is created with no nodes: provisioning the instances a group
+                // asks for is work this emulator does not do, so the nodes a cluster
+                // holds are the ones `BatchAddClusterNodes` added to it.
+                nodes: ::std::collections::BTreeMap::new(),
+                node_additions: ::std::collections::BTreeMap::new(),
             },
         );
         drop(store);

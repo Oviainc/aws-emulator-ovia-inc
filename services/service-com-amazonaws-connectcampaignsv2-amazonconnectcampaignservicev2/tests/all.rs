@@ -13,6 +13,12 @@
 // points it into `tests/all/`.
 #[path = "all/campaign_lifecycle.rs"]
 mod campaign_lifecycle;
+#[path = "all/common.rs"]
+mod common;
+#[path = "all/instance_onboarding.rs"]
+mod instance_onboarding;
+#[path = "all/instance_onboarding_tags_and_outbound_requests.rs"]
+mod instance_onboarding_tags_and_outbound_requests;
 #[path = "all/signing_name_path_claim.rs"]
 mod signing_name_path_claim;
 #[path = "all/state_roundtrip.rs"]

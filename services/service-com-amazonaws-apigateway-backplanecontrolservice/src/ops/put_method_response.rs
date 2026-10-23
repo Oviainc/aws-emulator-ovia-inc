@@ -127,6 +127,18 @@ fn is_field_name_char(character: char) -> bool {
     character.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(character)
 }
 
+/// The `BadRequestException` message for a `responseParameters` key that is not a
+/// `method.response.header.{name}` mapping expression; see [`is_method_response_header`].
+///
+/// `pub` because `UpdateMethodResponse` writes the same member under the same rule, so the
+/// two operations cannot disagree on how a key outside the documented form is stated.
+pub fn invalid_response_parameter(key: &str) -> String {
+    format!(
+        "Invalid mapping expression specified: {key}; a method response parameter must \
+         match {METHOD_RESPONSE_HEADER_PREFIX}{{name}}, where name is a valid header name"
+    )
+}
+
 /// Refuse a request whose caller-sized members would grow the store past a bound.
 ///
 /// Called BEFORE the store lock is taken, so an over-sized request never reaches the
@@ -171,10 +183,7 @@ fn method_response_of(
 ) -> Result<GetMethodResponseOutput, String> {
     for key in input.response_parameters.iter().flatten().map(|(key, _)| key) {
         if !is_method_response_header(key) {
-            return Err(format!(
-                "Invalid mapping expression specified: {key}; a method response parameter must \
-                 match {METHOD_RESPONSE_HEADER_PREFIX}{{name}}, where name is a valid header name"
-            ));
+            return Err(invalid_response_parameter(key));
         }
     }
     Ok(GetMethodResponseOutput {

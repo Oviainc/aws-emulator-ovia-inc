@@ -4,20 +4,20 @@
 //! a copy of a stored cluster and `DescribeSnapshots` reports the stored
 //! copies.
 //!
-//! Every assertion goes over the wire through the same [`Emulator`] harness the
-//! cluster suite uses: an `awsQuery` form-urlencoded request is dispatched
-//! through the production router and only the HTTP status and the XML body are
-//! inspected. Nothing reaches into the service's state struct, so a response
-//! that is not computed from persisted state cannot pass.
+//! Every assertion goes over the wire through the shared [`crate::harness`]:
+//! an `awsQuery` form-urlencoded request is dispatched through the production
+//! router and only the HTTP status and the XML body are inspected. Nothing
+//! reaches into the service's state struct, so a response that is not computed
+//! from persisted state cannot pass.
 //!
 //! The tests are tables: each row is one input along the axis the rule under
 //! test generalises over (engine, node count, port, retention settings, filter
 //! member, page size, name form), never a single recorded case.
 
 use crate::cache_cluster_lifecycle::{
-    create_available_cluster, create_cluster, describe_cluster, params, Emulator, RefusalCase,
-    Reply, PAST_TRANSITION,
+    create_available_cluster, create_cluster, describe_cluster,
 };
+use crate::harness::{params, Emulator, RefusalCase, Reply, PAST_TRANSITION};
 
 /// One filter row: the case name, the filter's form pairs, and the snapshots it
 /// selects in the order the describe reports them.

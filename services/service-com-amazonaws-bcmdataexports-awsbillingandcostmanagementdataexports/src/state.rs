@@ -48,7 +48,10 @@ pub mod query;
 // operations that read it, exactly as they were before the catalog grew its own module.
 // The query reader is reached as `crate::state::…` by the two operations that accept an
 // export definition, for the same reason the catalog is: both of them read it.
-pub use query::{query_tables, validate_data_query, QueryRefusal};
+pub use query::{
+    effective_table_configurations, query_tables, validate_data_query, QueryRefusal,
+    TableConfigurations,
+};
 
 // The authorization decision is reached as `crate::state::…` by every operation whose
 // model declares `AccessDeniedException`; see [`authorization`] for why the others are
@@ -56,9 +59,9 @@ pub use query::{query_tables, validate_data_query, QueryRefusal};
 pub use authorization::authorize;
 
 pub use catalog::{
-    table_spec, unknown_table, ColumnGroup, ColumnSpec, TablePropertySpec, TableSpec,
-    PROPERTY_ANY_VALUE, PROPERTY_BILLING_VIEW_ARN, PROPERTY_DEPRECATED, PROPERTY_FALSE,
-    PROPERTY_FILTER,
+    primary_billing_view_arn, table_spec, unknown_table, ColumnGroup, ColumnSpec,
+    PropertyDefault, TablePropertySpec, TableSpec, PROPERTY_ANY_VALUE,
+    PROPERTY_BILLING_VIEW_ARN, PROPERTY_DEPRECATED, PROPERTY_FALSE, PROPERTY_FILTER,
     PROPERTY_INCLUDE_ALL_RECOMMENDATIONS, PROPERTY_INCLUDE_CAPACITY_RESERVATION_DATA,
     PROPERTY_INCLUDE_IAM_PRINCIPAL_DATA, PROPERTY_INCLUDE_MANUAL_DISCOUNT_COMPATIBILITY,
     PROPERTY_INCLUDE_RESOURCES, PROPERTY_INCLUDE_SPLIT_COST_ALLOCATION_DATA,
@@ -195,6 +198,23 @@ impl ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState {
         let key = (execution.export_arn.clone(), execution.execution_id.clone());
         self.executions.insert(key, execution);
     }
+
+    /// Forget every recorded execution of the export `export_arn`.
+    ///
+    /// An execution is addressed by `(ExportArn, ExecutionId)`, so an execution of an
+    /// export that no longer exists can be addressed by nobody: `DeleteExport` calls this
+    /// so no reader reports the history of an export the store no longer holds.
+    pub fn remove_executions_of(&mut self, export_arn: &str) {
+        let doomed: Vec<(String, String)> = self
+            .executions
+            .range((export_arn.to_string(), String::new())..)
+            .take_while(|((arn, _), _)| arn == export_arn)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in doomed {
+            self.executions.remove(&key);
+        }
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -208,9 +228,23 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .map(::engine::InMemoryEngine::state::<ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState>)
 }
 
-/// The current wall-clock instant, as the modelled `Timestamp` type.
+/// The current wall-clock instant, as the modelled `Timestamp` type, at WHOLE-SECOND
+/// precision.
+///
+/// RECORDED AWS behaviour: an `ExportStatus` timestamp comes back carrying no sub-second
+/// part — the recorded instants are whole epoch seconds, and a replay of the recording
+/// against an emulator emitting a fractional epoch value reports the difference in shape.
+/// The instants this service records are therefore truncated here, in the ONE place that
+/// mints them, rather than at each serializer, where one path could keep a fraction the
+/// others drop.
+///
+/// The instant itself is wall-clock, so it is a per-run value: what is pinned is its
+/// type, its units and its precision, not the number.
 pub fn now() -> ::aws_smithy_types::DateTime {
-    ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now())
+    let seconds = ::std::time::SystemTime::now()
+        .duration_since(::std::time::UNIX_EPOCH)
+        .map_or(0, |since_epoch| since_epoch.as_secs() as i64);
+    ::aws_smithy_types::DateTime::from_secs(seconds)
 }
 
 /// The region an ARN minted for this request carries: the region of the request's
@@ -248,7 +282,8 @@ pub fn export_arn(region: &str, name: &str) -> String {
     )
 }
 
-/// The `Message` every `ResourceNotFoundException` of this service carries.
+/// The `Message` a `ResourceNotFoundException` of the EXPORT-DEFINITION operations
+/// carries (`GetExport`, `UpdateExport`, `DeleteExport`).
 ///
 /// Recorded AWS behavior: BCM Data Exports answers a lookup of an export ARN that
 /// resolves to nothing with this one fixed string, whatever the ARN was — an ARN in the
@@ -260,24 +295,109 @@ pub fn export_arn(region: &str, name: &str) -> String {
 /// where the model puts it.
 pub const EXPORT_NOT_FOUND_MESSAGE: &str = "No matching definition found";
 
-/// The modelled 404 for an export ARN that names nothing.
-pub fn export_not_found(arn: &str) -> ResourceNotFoundException {
+/// The `Message` a `ResourceNotFoundException` of the RESOURCE-TAGGING operations carries
+/// (`ListTagsForResource`, `TagResource`, `UntagResource`).
+///
+/// Recorded AWS behavior: the tagging operations word the same condition as a resource
+/// miss rather than as a missing export definition — the wire recording for a tag
+/// listing of an absent export ARN, and the one for a `TagResource` of it, both carry this
+/// string where the definition operations carry [`EXPORT_NOT_FOUND_MESSAGE`]. Like that
+/// one it is a fixed, request-independent constant: which ARN was not found is reported in
+/// `ResourceId`.
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource not found";
+
+/// The `Message` a `ResourceNotFoundException` of the EXECUTION lookup carries — the
+/// resource `GetExecution` addresses.
+///
+/// Recorded AWS behavior: a `GetExecution` whose pair resolves to no execution reports the
+/// EXECUTION as missing, with this string, and does so whether it was the `ExecutionId`
+/// that named no execution of its export or the `ExportArn` that named no export at all:
+/// the execution is the resource the operation addresses, and the export ARN only scopes
+/// it. Like the two above it is a fixed, request-independent constant naming the KIND of
+/// resource that was missed; WHICH identifier missed is reported in `ResourceId` /
+/// `ResourceType`.
+pub const EXECUTION_NOT_FOUND_MESSAGE: &str = "Execution not found";
+
+/// The modelled `ResourceNotFoundException` for an export ARN that names nothing, worded
+/// with `message`: [`EXPORT_NOT_FOUND_MESSAGE`] on the export-definition operations and
+/// [`RESOURCE_NOT_FOUND_MESSAGE`] on the resource-tagging ones.
+pub fn resource_not_found(arn: &str, message: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: EXPORT_NOT_FOUND_MESSAGE.to_string(),
+        message: message.to_string(),
         resource_id: arn.to_string(),
         resource_type: EXPORT_RESOURCE_TYPE.to_string(),
     }
 }
 
-/// The modelled 404 for an `ExecutionId` that names no execution of the export it was
-/// asked about.
+/// The modelled `ResourceNotFoundException` an export-definition operation answers an
+/// export ARN that names nothing with.
+pub fn export_not_found(arn: &str) -> ResourceNotFoundException {
+    resource_not_found(arn, EXPORT_NOT_FOUND_MESSAGE)
+}
+
+/// The modelled `ResourceNotFoundException` `GetExecution` answers an `ExportArn` that
+/// names no export with: the EXECUTION it was asked for is what is missing (see
+/// [`EXECUTION_NOT_FOUND_MESSAGE`]), while the members still name the export ARN that
+/// resolved to nothing, because that is what the caller has to fix.
+pub fn execution_export_not_found(export_arn: &str) -> ResourceNotFoundException {
+    resource_not_found(export_arn, EXECUTION_NOT_FOUND_MESSAGE)
+}
+
+/// The HTTP status this service answers `ResourceNotFoundException` with.
 ///
-/// It carries the same fixed [`EXPORT_NOT_FOUND_MESSAGE`] as every other lookup of this
-/// service that resolves to nothing, for the reason stated there: the identity of what
-/// was not found is reported in the modelled `ResourceId`, not in the prose.
+/// The error SHAPE carries `@httpError 404`
+/// (`smithy_query(query="shape",shape="ResourceNotFoundException")`), but the SERVICE
+/// answers the not-found condition with 400 carrying that same shape, its members
+/// and its `__type`: the wire recordings for a read, an update, a delete, a tag listing, a
+/// `TagResource` and an execution lookup of a resource that resolves to nothing all answer
+/// HTTP 400. A client
+/// branches on the status as well as on the code — and an HTTP-level proxy treats a 404
+/// as a routing failure rather than an API error — so the pair it sees has to be the pair
+/// the service sends. The status is stated here once and applied through
+/// [`crate::scaffolded::Scaffolded::ModeledWithStatus`], which leaves the shape, its
+/// members and its wire code the model's.
+pub const EXPORT_NOT_FOUND_STATUS: u16 = 400;
+
+/// [`export_not_found`] lifted into an operation's error channel, answered with
+/// [`EXPORT_NOT_FOUND_STATUS`].
+///
+/// `wrap` is the calling operation's own `ResourceNotFoundException` variant, so every
+/// operation that looks an export ARN up reports the miss through this ONE place and none
+/// of them can drift back to the shape's own status.
+pub fn export_not_found_error<E>(
+    arn: &str,
+    wrap: impl FnOnce(ResourceNotFoundException) -> E,
+) -> crate::scaffolded::Scaffolded<E> {
+    not_found_error(export_not_found(arn), wrap)
+}
+
+/// As [`export_not_found_error`], for the resource-tagging operations, which word the
+/// condition with [`RESOURCE_NOT_FOUND_MESSAGE`].
+pub fn tagged_resource_not_found_error<E>(
+    arn: &str,
+    wrap: impl FnOnce(ResourceNotFoundException) -> E,
+) -> crate::scaffolded::Scaffolded<E> {
+    not_found_error(resource_not_found(arn, RESOURCE_NOT_FOUND_MESSAGE), wrap)
+}
+
+/// `error` lifted into an operation's error channel at [`EXPORT_NOT_FOUND_STATUS`].
+pub fn not_found_error<E>(
+    error: ResourceNotFoundException,
+    wrap: impl FnOnce(ResourceNotFoundException) -> E,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::modeled_with_status(wrap(error), EXPORT_NOT_FOUND_STATUS)
+}
+
+/// The modelled not-found for an `ExecutionId` that names no execution of the export it
+/// was asked about.
+///
+/// It carries [`EXECUTION_NOT_FOUND_MESSAGE`], the sentence of the resource kind this
+/// lookup missed — an execution, not the export definition the `ExportArn` resolved to.
+/// Like every other not-found of this service the sentence is a constant: the identity of
+/// what was not found is reported in the modelled `ResourceId`, not in the prose.
 pub fn execution_not_found(execution_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: EXPORT_NOT_FOUND_MESSAGE.to_string(),
+        message: EXECUTION_NOT_FOUND_MESSAGE.to_string(),
         resource_id: execution_id.to_string(),
         resource_type: EXECUTION_RESOURCE_TYPE.to_string(),
     }
@@ -567,3 +687,8 @@ pub(crate) fn clip_for_message(value: &str) -> String {
     let head: String = value.chars().take(MESSAGE_VALUE_CLIP).collect();
     format!("{head}...")
 }
+
+// The export's data query — its parsing, its bounds and its refusals — lives in
+// [`query`], which `CreateExport` and `UpdateExport` both read through
+// [`validate_data_query`]: a definition cannot be judged one way by one and another way
+// by the other.

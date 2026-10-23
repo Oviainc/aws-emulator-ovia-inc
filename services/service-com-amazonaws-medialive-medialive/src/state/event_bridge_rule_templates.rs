@@ -127,6 +127,39 @@ pub enum EventBridgeRuleTemplateRefusal {
     StoreFull,
 }
 
+/// Why [`ComAmazonawsMedialiveMedialiveState::update_event_bridge_rule_template`]
+/// changed nothing. Each variant is one modelled refusal of
+/// `UpdateEventBridgeRuleTemplate`.
+#[derive(Debug)]
+pub enum EventBridgeRuleTemplateUpdateRefusal {
+    /// No template in the request's region has that id or name, so there is no
+    /// template to change. Carries the identifier that resolved to nothing.
+    NotFound { identifier: String },
+    /// No eventbridge rule template group in the request's region has that id or
+    /// name, so there is no group to move the template into. Carries the
+    /// identifier that resolved to nothing.
+    GroupNotFound { identifier: String },
+    /// Another template in the same region already carries the name asked for,
+    /// which `Name` is documented to make unique there. Carries the name and the
+    /// id of the template that holds it.
+    NameTaken { id: String, name: String },
+}
+
+/// What one update asks the store to change: a member the request carried is
+/// `Some` and replaces the stored one, a member it omitted is `None` and leaves
+/// that setting as it was.
+#[derive(Debug, Clone, Default)]
+pub struct EventBridgeRuleTemplateChanges {
+    /// The identifier of the group to move the template into ("Can be either be
+    /// its id or current name"), resolved to a group id before anything is
+    /// written.
+    pub group_identifier: Option<String>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub event_type: Option<String>,
+    pub event_targets: Option<Vec<String>>,
+}
+
 /// One created eventbridge rule template, as `CreateEventBridgeRuleTemplate`
 /// stored it.
 ///
@@ -242,6 +275,90 @@ impl ComAmazonawsMedialiveMedialiveState {
         Ok(id)
     }
 
+    /// Apply `changes` to the eventbridge rule template `identifier` names in
+    /// `region` and answer its id — or refuse, changing nothing.
+    ///
+    /// "Updates the specified eventbridge rule template": a member `changes`
+    /// carries replaces the stored one and a member it omits leaves that setting
+    /// as it was, so an update is a partial write rather than a replacement of
+    /// the whole record. The id, the ARN, the region and `CreatedAt` are the
+    /// template's identity and are never rewritten; `ModifiedAt` moves to `now`
+    /// because this call is what modified it.
+    ///
+    /// The identifier resolution, the group resolution, the name-uniqueness rule
+    /// and the write live together here, so a handler cannot check one of them
+    /// and write past another; the handler's job is only to turn an
+    /// [`EventBridgeRuleTemplateUpdateRefusal`] into the operation's own modelled
+    /// error.
+    pub fn update_event_bridge_rule_template(
+        &mut self,
+        region: &str,
+        identifier: &str,
+        changes: EventBridgeRuleTemplateChanges,
+        now: SystemTime,
+    ) -> Result<String, EventBridgeRuleTemplateUpdateRefusal> {
+        let Some(template) = self.event_bridge_rule_template(region, identifier) else {
+            return Err(EventBridgeRuleTemplateUpdateRefusal::NotFound {
+                identifier: identifier.to_string(),
+            });
+        };
+        let id = template.id.clone();
+
+        // A `GroupIdentifier` is resolved against the groups of the request's
+        // region, exactly as the create resolves it, so the stored `GroupId` is
+        // a group that exists rather than whatever the request spelled.
+        let group_id = match changes.group_identifier.as_deref() {
+            Some(group_identifier) => {
+                let Some(group) = self.event_bridge_rule_template_group(region, group_identifier)
+                else {
+                    return Err(EventBridgeRuleTemplateUpdateRefusal::GroupNotFound {
+                        identifier: group_identifier.to_string(),
+                    });
+                };
+                Some(group.id.clone())
+            }
+            None => None,
+        };
+
+        // A rename collides only with ANOTHER template: a request that renames a
+        // template to the name it already carries asks for no change and is not
+        // a conflict.
+        if let Some(name) = changes.name.as_deref() {
+            if let Some(taken) = self
+                .event_bridge_rule_template_named(region, name)
+                .filter(|taken| taken.id != id)
+            {
+                return Err(EventBridgeRuleTemplateUpdateRefusal::NameTaken {
+                    id: taken.id.clone(),
+                    name: name.to_string(),
+                });
+            }
+        }
+
+        let Some(template) = self.event_bridge_rule_templates.get_mut(&id) else {
+            return Err(EventBridgeRuleTemplateUpdateRefusal::NotFound {
+                identifier: identifier.to_string(),
+            });
+        };
+        if let Some(group_id) = group_id {
+            template.group_id = group_id;
+        }
+        if let Some(name) = changes.name {
+            template.name = name;
+        }
+        if let Some(description) = changes.description {
+            template.description = Some(description);
+        }
+        if let Some(event_type) = changes.event_type {
+            template.event_type = event_type;
+        }
+        if let Some(event_targets) = changes.event_targets {
+            template.event_targets = event_targets;
+        }
+        template.modified_at = now;
+        Ok(id)
+    }
+
     /// The template `identifier` names in `region`, resolving it as the
     /// template's id or its current name — the two forms
     /// `GetEventBridgeRuleTemplateRequest$Identifier` documents ("Can be either
@@ -271,6 +388,30 @@ impl ComAmazonawsMedialiveMedialiveState {
         self.event_bridge_rule_templates
             .values()
             .find(|template| template.region == region && template.name == name)
+    }
+
+    /// The eventbridge rule templates stored in `region`, in the order their ids
+    /// were minted, beginning at the template `start` names when a `NextToken`
+    /// carried a resume point.
+    ///
+    /// The store itself is private, so this is how a listing reads it: a
+    /// `BTreeMap` range scan from the resume point, which is why a token naming a
+    /// template deleted since the previous page resumes at the next surviving id
+    /// instead of failing. Templates of other regions are invisible, for the
+    /// reason [`Self::event_bridge_rule_template`] states.
+    pub fn event_bridge_rule_templates_in<'a>(
+        &'a self,
+        region: &'a str,
+        start: Option<&'a str>,
+    ) -> impl Iterator<Item = &'a EventBridgeRuleTemplateRecord> + 'a {
+        let first = match start {
+            Some(token) => ::std::ops::Bound::Included(token),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        self.event_bridge_rule_templates
+            .range::<str, _>((first, ::std::ops::Bound::Unbounded))
+            .map(|(_, template)| template)
+            .filter(move |template| template.region == region)
     }
 
     /// The ids of the templates stored in the eventbridge rule template group
@@ -351,9 +492,8 @@ impl ComAmazonawsMedialiveMedialiveState {
 
 /// Project a stored [`EventBridgeRuleTemplateRecord`] onto one of the
 /// structurally identical per-operation template output shapes
-/// (`CreateEventBridgeRuleTemplateOutput` and
-/// `GetEventBridgeRuleTemplateOutput` today;
-/// `UpdateEventBridgeRuleTemplateOutput` when its own issue lands).
+/// (`CreateEventBridgeRuleTemplateOutput`, `GetEventBridgeRuleTemplateOutput`
+/// and `UpdateEventBridgeRuleTemplateOutput`).
 ///
 /// One macro rather than a hand-written copy per operation, so a create and the
 /// read that follows it cannot report the same stored template differently.
@@ -396,3 +536,30 @@ macro_rules! event_bridge_rule_template_output {
 }
 
 pub(crate) use event_bridge_rule_template_output;
+
+/// Project a stored [`EventBridgeRuleTemplateRecord`] onto the
+/// `EventBridgeRuleTemplateSummary` a listing reports.
+///
+/// The summary is the same stored template the flat shape above reports, read
+/// through the list shape: every member it shares with that shape carries the
+/// stored value, so a listing and the `GetEventBridgeRuleTemplate` beside it
+/// cannot disagree about one template. Where the two shapes differ, the summary
+/// reports `EventTargetCount` instead of the targets themselves — "the number of
+/// targets configured to send matching events", which is the LENGTH of the stored
+/// target list rather than anything recorded at create time.
+pub fn event_bridge_rule_template_summary(
+    template: &EventBridgeRuleTemplateRecord,
+) -> crate::ops::types::EventBridgeRuleTemplateSummary {
+    crate::ops::types::EventBridgeRuleTemplateSummary {
+        arn: template.arn.clone(),
+        created_at: ::aws_smithy_types::DateTime::from(template.created_at),
+        description: template.description.clone(),
+        event_target_count: i32::try_from(template.event_targets.len()).unwrap_or(i32::MAX),
+        event_type: template.event_type.clone(),
+        group_id: template.group_id.clone(),
+        id: template.id.clone(),
+        modified_at: Some(::aws_smithy_types::DateTime::from(template.modified_at)),
+        name: template.name.clone(),
+        tags: Some(template.tags.clone()),
+    }
+}

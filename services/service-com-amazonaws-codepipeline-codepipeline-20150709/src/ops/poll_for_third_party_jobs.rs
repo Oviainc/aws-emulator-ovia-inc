@@ -136,17 +136,6 @@ impl From<PollForThirdPartyJobsErrorModeled> for PollForThirdPartyJobsError {
     }
 }
 
-/// How many jobs a poll asks for: `maxBatchSize` when it carries a count, and every
-/// job waiting when the member is absent.
-///
-/// `MaxBatchSize` is modelled `range 1..` and the framework refuses anything below 1
-/// before this handler runs, so the conversion cannot actually fail. It is mapped to 0
-/// — no jobs — rather than to "every job" deliberately: a cap that cannot be honoured
-/// must never WIDEN the answer.
-fn poll_limit(max_batch_size: Option<i32>) -> usize {
-    max_batch_size.map_or(usize::MAX, |size| usize::try_from(size).unwrap_or(0))
-}
-
 /// The `PollForThirdPartyJobs` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -208,8 +197,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::not_whitelisted_message(action_type),
                 ));
             }
-            // How many jobs this poll asks for.
-            let limit = poll_limit(input.max_batch_size);
+            // How many jobs this poll asks for (the rule both poll operations share).
+            let limit = crate::state::poll_limit(input.max_batch_size);
             state.third_party_jobs_for(action_type, limit)
         };
 

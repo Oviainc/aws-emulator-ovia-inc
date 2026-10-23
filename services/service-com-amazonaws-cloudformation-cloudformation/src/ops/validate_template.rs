@@ -8,6 +8,15 @@
 //! validating the same body get the same answer and neither changes what a later one
 //! sees.
 //!
+//! What it refuses is a matter of FORM: "CloudFormation first checks if the template is
+//! valid JSON. If it isn't, CloudFormation checks if the template is valid YAML. If both
+//! these checks fail, CloudFormation returns a template validation error" — that, a body
+//! declaring no resource, and a `Description` past its documented maximum. It does NOT
+//! consult the resource-type registry: a template declaring a resource type CloudFormation
+//! does not recognise is well-formed, and that type is what refuses the stack OPERATION
+//! submitting it (`CreateStack`, `UpdateStack`, `CreateChangeSet`; see
+//! [`crate::state::resource_types`]), not this verdict on the body.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -210,6 +219,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 template::MAX_DESCRIPTION_BYTES
             )));
         }
+        // No resource-type check here, deliberately: this operation's documented scope is
+        // the body's FORM ("CloudFormation first checks if the template is valid JSON. If
+        // it isn't, CloudFormation checks if the template is valid YAML"), and a template
+        // declaring a type CloudFormation does not recognise is still well-formed. That
+        // type is refused by the operations that submit the template for DEPLOYMENT, which
+        // are the ones that consult the resource-type registry
+        // (`crate::state::resource_types`).
         let required = template::required_capabilities(&template);
         Ok(ValidateTemplateOutput {
             // One `TemplateParameter` per parameter the template declares, carrying what

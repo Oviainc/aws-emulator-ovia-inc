@@ -678,6 +678,14 @@ pub struct RegisteredTopicRule {
     pub aws_iot_sql_version: String,
     /// The action to run when an action fails, when the rule has one.
     pub error_action: Option<Action>,
+    /// The topic filter the rule's SQL statement selects from — what
+    /// `TopicRuleListItem$topicPattern` reports — resolved ONCE, on the write, by
+    /// [`topic_pattern_of_sql`], so every listing of the rule reports the same
+    /// pattern and none of them re-reads the statement.
+    ///
+    /// `None` for a statement that names no topic filter: the pattern is then
+    /// unknown, and a reader reports the member as absent rather than inventing one.
+    pub topic_pattern: Option<String>,
     /// The `x-amz-tagging` query string the create request carried, verbatim.
     ///
     /// `CreateTopicRule$tags` is a raw `key1=value1&key2=value2` string rather than a
@@ -698,17 +706,19 @@ impl RegisteredTopicRule {
         payload: TopicRulePayload,
         tags: Option<String>,
     ) -> Self {
+        let payload_sql = payload.sql;
         Self {
             rule_name,
             rule_arn,
             created_at,
-            sql: payload.sql,
             description: payload.description,
             actions: payload.actions,
             rule_disabled: payload.rule_disabled.unwrap_or(false),
             aws_iot_sql_version: payload
                 .aws_iot_sql_version
                 .unwrap_or_else(|| DEFAULT_AWS_IOT_SQL_VERSION.to_string()),
+            topic_pattern: topic_pattern_of_sql(&payload_sql),
+            sql: payload_sql,
             error_action: payload.error_action,
             tags,
         }
@@ -731,6 +741,132 @@ impl RegisteredTopicRule {
             error_action: self.error_action.clone(),
         }
     }
+}
+
+/// The most characters of a rule's SQL statement [`topic_pattern_of_sql`] reads.
+///
+/// `TopicRulePayload$sql` carries NO modelled length constraint
+/// (`smithy_query(query="shape",shape="TopicRulePayload")`), so the statement a caller
+/// stores is bounded only by the request body, while the topic filter it names is in
+/// the statement's FIRST clause — reading past a generous prefix of it can never find
+/// one. The value is the EMULATOR's choice: the AWS IoT SQL reference's statements are
+/// a few hundred characters, so 64 Ki characters is orders of magnitude above any real
+/// rule and keeps this pass's work and its single allocation finite whatever a caller
+/// stored.
+pub const MAX_SQL_SCAN_CHARACTERS: usize = 64 * 1024;
+
+/// The topic filter a rule's SQL statement selects from — what
+/// `TopicRuleListItem$topicPattern` ("The pattern for the topic names that apply")
+/// reports for that rule.
+///
+/// The AWS IoT SQL reference gives a rule's statement as `SELECT <attributes> FROM
+/// <topic filter> [WHERE <condition>]`, with the topic filter written as a
+/// single-quoted string (`SELECT * FROM 'a/b/+'`), so the pattern is the quoted
+/// literal the statement's first `FROM` names, whatever the clause's casing, spacing
+/// or comments.
+///
+/// The statement is LEXED rather than matched out of its text: this is a single
+/// left-to-right pass that knows where whitespace, a `--` line comment, a `/* */`
+/// block comment, a bare word and a single-quoted literal (with `''` for a quote
+/// inside one) begin and end, and it answers with the first literal the first `FROM`
+/// names. It is written here, and not delegated to a SQL parser crate, because the
+/// clause is AWS IoT's OWN dialect: standard SQL names a RELATION after `FROM`, never
+/// a string literal, so no SQL grammar parses this clause and a parser crate could
+/// only ever lend its lexer to it. The pass is iterative, reads at most
+/// [`MAX_SQL_SCAN_CHARACTERS`] of the statement and allocates only the literal it
+/// returns, so a caller-supplied statement can neither recurse nor grow its work
+/// without bound.
+///
+/// `None` when the statement has no `FROM` followed by a quoted topic filter inside
+/// that prefix (an unquoted relation, an unterminated literal, no `FROM` at all): the
+/// pattern is then unknown, and a reader reports the member as absent rather than
+/// inventing one.
+pub fn topic_pattern_of_sql(sql: &str) -> Option<String> {
+    let characters: Vec<char> = sql.chars().take(MAX_SQL_SCAN_CHARACTERS).collect();
+    let mut index = 0;
+    let mut after_from = false;
+    while index < characters.len() {
+        let character = characters[index];
+        match character {
+            // Whitespace separates the clause's parts and carries nothing.
+            _ if character.is_whitespace() => index += 1,
+            // `-- …` comments out the rest of the line.
+            '-' if characters.get(index + 1) == Some(&'-') => {
+                while index < characters.len() && characters[index] != '\n' {
+                    index += 1;
+                }
+            }
+            // `/* … */` comments out everything up to its close.
+            '/' if characters.get(index + 1) == Some(&'*') => {
+                index += 2;
+                while index < characters.len()
+                    && !(characters[index] == '*' && characters.get(index + 1) == Some(&'/'))
+                {
+                    index += 1;
+                }
+                index = index.saturating_add(2).min(characters.len());
+            }
+            // A single-quoted literal. After `FROM` it IS the topic filter; anywhere
+            // else (a selected constant, a `WHERE` comparand) it is skipped.
+            '\'' => {
+                let mut literal = String::new();
+                index += 1;
+                loop {
+                    match characters.get(index) {
+                        // A doubled quote is one quote inside the literal.
+                        Some('\'') if characters.get(index + 1) == Some(&'\'') => {
+                            literal.push('\'');
+                            index += 2;
+                        }
+                        Some('\'') => {
+                            index += 1;
+                            break;
+                        }
+                        Some(other) => {
+                            literal.push(*other);
+                            index += 1;
+                        }
+                        // An unterminated literal names no topic filter.
+                        None => return None,
+                    }
+                }
+                if after_from {
+                    return Some(literal);
+                }
+            }
+            // A bare word. `FROM` is the one this looks for, whatever its casing; a
+            // word AFTER it is an unquoted relation, which names no topic filter.
+            _ if is_word_character(character) => {
+                let start = index;
+                while index < characters.len() && is_word_character(characters[index]) {
+                    index += 1;
+                }
+                if after_from {
+                    return None;
+                }
+                after_from = characters[start..index]
+                    .iter()
+                    .collect::<String>()
+                    .eq_ignore_ascii_case("FROM");
+            }
+            // Anything else — an operator, a bracket, a comma, a quoted identifier.
+            // Before `FROM` it is part of the select clause; after it, it is not a
+            // quoted topic filter.
+            _ => {
+                if after_from {
+                    return None;
+                }
+                index += 1;
+            }
+        }
+    }
+    None
+}
+
+/// Whether `character` can appear in a bare word of an AWS IoT SQL statement: the
+/// keywords, function names and attribute names a statement writes unquoted.
+fn is_word_character(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '_' | '.' | '$')
 }
 
 /// The ARN of a command: `arn:aws:iot:<region>:<account>:command/<commandId>`.

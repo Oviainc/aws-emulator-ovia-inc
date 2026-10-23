@@ -31,6 +31,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_emrcontainers_awschicagowebservice::state;
 
 use crate::virtual_cluster_job_run_loop::{
     assert_resource_id, field, instant_millis, text, Answer, Emr, REGION,
@@ -627,15 +628,20 @@ async fn a_created_job_template_is_described_from_state() {
             "case {label:?}: the described tags are not the submitted ones, got {:?}",
             template.get("tags")
         );
-        // Nothing attributed this template to an IAM identity and nothing was encrypted,
-        // so neither member is reported.
-        for absent in ["createdBy", "decryptionError"] {
-            assert!(
-                template.get(absent).is_none(),
-                "case {label:?}: {absent} must stay absent, got {:?}",
-                template.get(absent)
-            );
-        }
+        // `createdBy` names the caller principal that created the template (its own rule
+        // and table live in `crate::created_metadata_wire_form`); nothing was encrypted,
+        // so no decryption failed and `decryptionError` stays absent.
+        assert_eq!(
+            template.get("createdBy").and_then(Value::as_str),
+            Some(state::caller_identity_arn().as_str()),
+            "case {label:?}: createdBy must name the caller principal, got {:?}",
+            template.get("createdBy")
+        );
+        assert!(
+            template.get("decryptionError").is_none(),
+            "case {label:?}: decryptionError must stay absent, got {:?}",
+            template.get("decryptionError")
+        );
     }
 
     // RULE 4 for the reader's refusal: an id that names no stored template is not found.

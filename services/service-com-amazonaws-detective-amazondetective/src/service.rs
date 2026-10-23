@@ -41,9 +41,98 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The error code every refusal below keeps: Detective words these refusals its own
+/// way, but a client still branches on the modelled `ValidationException` code.
+const VALIDATION_EXCEPTION_CODE: &str = "ValidationException";
+
+/// The path segment the validating walk puts between a collection and its element
+/// (`accounts.1.member.accountId`).
+const COLLECTION_STEP: &str = "member";
+
+/// `CreateMembers$Accounts`' path prefix, as the validating walk spells it: the member
+/// name in lowerCamel.
+const ACCOUNTS_PATH_PREFIX: &str = "accounts.";
+
+/// `UpdateDatasourcePackages$DatasourcePackages`' path prefix, likewise.
+const DATASOURCE_PACKAGES_PATH_PREFIX: &str = "datasourcePackages.";
+
+/// How Detective states a refusal the framework described structurally.
+///
+/// Two of its operations validate a member themselves rather than leaving it to the
+/// generic constraint reporter, and both say so with a message that does not read like
+/// one:
+///
+/// * `CreateMembers` reports a `@pattern` failure of a member of one of its `Accounts`
+///   entries as `<Shape>.<Member> did not match the pattern.` — a fixed sentence that
+///   names the member in its API-level spelling and echoes neither the offending value
+///   nor its position in the list. Recorded: two different 12-character non-numeric
+///   `AccountId`s produce the one same message.
+/// * `UpdateDatasourcePackages` reports values outside the `DatasourcePackage` value
+///   set by LISTING them, which is the only place the service names which packages it
+///   did not recognise.
+///
+/// Everything else keeps the framework's generic `N validation error(s) detected: …`
+/// envelope, which is what AWS answers for the rest of this service's members
+/// (`GetInvestigation$InvestigationId`, say).
+fn detective_refusal(violations: &[Violation]) -> Option<Refused> {
+    unknown_datasource_packages(violations)
+        .or_else(|| account_member_pattern(violations))
+        .map(|message| Refused {
+            code: VALIDATION_EXCEPTION_CODE.to_string(),
+            message,
+        })
+}
+
+/// The `UpdateDatasourcePackages` message naming every requested package outside the
+/// `DatasourcePackage` value set, in the order the request listed them, or `None` when
+/// no violation is one of those.
+fn unknown_datasource_packages(violations: &[Violation]) -> Option<String> {
+    let unknown: Vec<&str> = violations
+        .iter()
+        .filter(|violation| {
+            matches!(violation.kind, ViolationKind::EnumValue(_))
+                && violation.path.starts_with(DATASOURCE_PACKAGES_PATH_PREFIX)
+                && violation.path.ends_with(COLLECTION_STEP)
+        })
+        .filter_map(|violation| violation.value.as_deref())
+        .collect();
+    if unknown.is_empty() {
+        return None;
+    }
+    Some(crate::state::unknown_datasource_packages_message(&unknown))
+}
+
+/// The `CreateMembers` message for a `@pattern` failure of a member of one of its
+/// `Accounts` entries, or `None` when no violation is one of those.
+fn account_member_pattern(violations: &[Violation]) -> Option<String> {
+    violations
+        .iter()
+        .filter(|violation| matches!(violation.kind, ViolationKind::Pattern(_)))
+        .find_map(|violation| account_member_name(&violation.path))
+        .map(|member| crate::state::account_member_pattern_message(&member))
+}
+
+/// The API-level spelling of the `Account` member `path` names
+/// (`accounts.1.member.accountId` -> `AccountId`), or `None` when `path` does not name
+/// one.
+///
+/// The validating walk spells a member in lowerCamel, and Detective's own message
+/// spells it as the model does, so the one difference is the leading character.
+fn account_member_name(path: &str) -> Option<String> {
+    let member = path
+        .strip_prefix(ACCOUNTS_PATH_PREFIX)?
+        .split_once(&format!(".{COLLECTION_STEP}."))
+        .map(|(position, member)| (position.bytes().all(|b| b.is_ascii_digit()), member))
+        .filter(|(positional, member)| *positional && !member.contains('.'))
+        .map(|(_, member)| member)?;
+    let mut chars = member.chars();
+    let first = chars.next()?;
+    Some(format!("{}{}", first.to_ascii_uppercase(), chars.as_str()))
+}
 
 /// The `com-amazonaws-detective-amazondetective` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -97,16 +186,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it. Two of this service's operations validate a member themselves
+        // rather than leaving it to the generic constraint reporter, and
+        // `detective_refusal` above states those two the way the service does —
+        // replacing the code and the message together. Everything else answers `None`,
+        // which keeps the framework's wording (the form AWS itself returns for the rest
+        // of this service's members).
+        match refusal {
+            Refusal::Invalid(violations) => detective_refusal(violations),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAlias
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAlias`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAlias::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the one alias of a function the request names, read out of the record
+//! [`crate::ops::create_alias`] persisted: the version it invokes, its description, its
+//! traffic-shifting configuration and the revision id it was stored with. A reporting
+//! operation (`@readonly`), so it writes nothing of its own and two reads of an
+//! unchanged alias answer the same configuration.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +157,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAlias` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAliasErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAlias"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetAliasErrorModeled::ServiceException(ServiceException {
+                r#type: None,
+                message: Some("Lambda state is not reachable on this engine".to_string()),
+            })
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // An alias belongs to the function, so the function is addressed the way every
+        // other operation addresses it (any of the documented `FunctionName` forms) and
+        // the alias by its own name.
+        let (record, version) = crate::state::resolve_function(
+            &mut store,
+            &input.function_name,
+            None,
+            &region,
+            now,
+        )
+        .map_err(|failure| match failure {
+            crate::state::ResolveFailure::Malformed(message) => {
+                GetAliasErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+            crate::state::ResolveFailure::NotFound(message) => {
+                GetAliasErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    r#type: None,
+                    message: Some(message),
+                })
+            }
+        })?;
+        // The alias to report is the one `Name` names; a `FunctionName` that qualifies a
+        // version or an alias of its own names no function whose aliases to look in.
+        if version != crate::state::VERSION_LATEST {
+            return Err(GetAliasErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    r#type: None,
+                    message: Some(format!(
+                        "An alias belongs to a function and is named by 'Name', and the \
+                         qualifier '{version}' in 'functionName' names a published version or \
+                         an alias"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let Some(alias) = record.aliases.get(&input.name) else {
+            return Err(GetAliasErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    r#type: None,
+                    message: Some(format!(
+                        "Alias not found: {}",
+                        record.versioned_arn(&input.name)
+                    )),
+                },
+            )
+            .into());
+        };
+        Ok(alias_configuration(record.alias_configuration(alias)))
+    }
+}
+
+/// The one `AliasConfiguration` the model declares, in this operation's own generated
+/// shape of it.
+///
+/// [`crate::state::FunctionRecord::alias_configuration`] builds the shared one
+/// (generated as `CreateAliasOutput`) that every operation reporting an alias answers
+/// with; this operation's output is generated as its own struct over the same shape, so
+/// the members are carried across one for one rather than rebuilt from state a second
+/// time.
+fn alias_configuration(configuration: CreateAliasOutput) -> GetAliasOutput {
+    GetAliasOutput {
+        alias_arn: configuration.alias_arn,
+        name: configuration.name,
+        function_version: configuration.function_version,
+        description: configuration.description,
+        routing_config: configuration.routing_config,
+        revision_id: configuration.revision_id,
     }
 }

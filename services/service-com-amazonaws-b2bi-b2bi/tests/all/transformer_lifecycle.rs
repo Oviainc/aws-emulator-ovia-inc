@@ -371,11 +371,15 @@ async fn mixing_the_deprecated_and_current_configuration_members_is_refused() {
 
 /// RULE: `clientToken` is this operation's `@idempotencyToken`, so repeating a create
 /// with the same token answers with the transformer the first call created — same id,
-/// same ARN, same timestamp — while a different token mints a different transformer.
+/// same ARN, same timestamp — once that create has settled, while a duplicate sent WHILE
+/// it is in flight is refused with `ConflictException` (409); a different token mints a
+/// different transformer.
 ///
 /// The rows span both configuration styles and a token reused twice as well as once.
 #[tokio::test]
 async fn repeating_a_create_with_the_same_client_token_returns_the_same_transformer() {
+    use service_com_amazonaws_b2bi_b2bi::state::IDEMPOTENT_CREATE_IN_FLIGHT;
+
     let router = b2bi_router();
 
     // (case, the configuration this row creates, how many replays it sends)
@@ -416,6 +420,17 @@ async fn repeating_a_create_with_the_same_client_token_returns_the_same_transfor
             minted.insert(first_id.clone()),
             "case {case:?}: transformerId {first_id:?} was minted twice"
         );
+
+        // While the create is still in flight, a duplicate is the racer AWS refuses with
+        // ConflictException; once it has settled, the same token answers with the
+        // transformer it minted, however often it is repeated.
+        let (status, raced) = call(&router, "CreateTransformer", request("token-alpha")).await;
+        assert_eq!(
+            status, 409,
+            "case {case:?}: a duplicate sent while the create is in flight must be \
+             refused with ConflictException, got {status} {raced}"
+        );
+        tokio::time::sleep(IDEMPOTENT_CREATE_IN_FLIGHT).await;
 
         for replay_index in 0..*replays {
             let (status, replay) = call(&router, "CreateTransformer", request("token-alpha")).await;

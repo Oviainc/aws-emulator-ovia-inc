@@ -17,7 +17,8 @@
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::cache_cluster_lifecycle::{create_available_cluster, params, Emulator, Reply};
+use crate::cache_cluster_lifecycle::create_available_cluster;
+use crate::harness::{params, Emulator, Reply};
 
 /// One published service update, reduced to what these tests select on.
 #[derive(Debug, Clone)]

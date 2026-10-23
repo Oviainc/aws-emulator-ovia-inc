@@ -340,6 +340,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // for.
             crate::state::validate_template_body(body)
                 .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+            // A change set is a plan over a template CloudFormation can deploy: a body
+            // declaring a resource type it does not recognise is refused before the change
+            // set is created (`crate::state::resource_types`).
+            crate::state::validate_resource_types(body)
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -618,7 +623,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .resolve(&stack_id)
             .map(|stack| stack.stack_name.clone())
             .unwrap_or_else(|| input.stack_name.clone());
+        // "The drift status of the stack when the change set was created": read off the
+        // stack now, so a later detection on the stack does not rewrite what this change
+        // set reports.
+        let stack_drift_status = store
+            .resolve(&stack_id)
+            .map_or_else(
+                || crate::state::DRIFT_STATUS_NOT_CHECKED.to_string(),
+                |stack| stack.drift_status.clone(),
+            );
         store.change_sets.push(StoredChangeSet {
+            stack_drift_status,
             change_set_id: change_set_id.clone(),
             change_set_name: input.change_set_name.clone(),
             stack_id: stack_id.clone(),

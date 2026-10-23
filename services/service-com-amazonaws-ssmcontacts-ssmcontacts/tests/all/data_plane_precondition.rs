@@ -11,10 +11,14 @@
 //! > without writing anything, with the operation's own modelled `ValidationException`
 //! > (HTTP 400) whenever the account has no ACTIVE replication set.
 //!
-//! The contact registry (`CreateContact`/`ListContacts`/`GetContact`, exercised by
-//! `contact_lifecycle.rs`) is exempt and is the suite's positive control: it answers while
-//! the account is not onboarded, which is what makes a 400 from the ten gated operations a
-//! statement about the gate rather than about the service being down.
+//! The contact registry's own writes (`CreateContact`, `CreateContactChannel`,
+//! `UpdateContact`, `DeleteContact`, `DeleteContactChannel`) are gated by the SAME account
+//! precondition — `tests/all/replication_set_precondition.rs` is the suite about them — so
+//! this suite's `Emulator` is onboarded before it creates the resources the ten gated
+//! operations name. The contact registry's READS (`ListContacts`, `GetContact`) are the
+//! positive control: they answer whatever the account's state is, which is what makes a
+//! 400 from the ten gated operations a statement about the gate rather than about the
+//! service being down.
 //!
 //! The remaining suites assert what each of those operations DOES once the gate is open,
 //! each over a table spanning what its rule generalises over: the activation code that was

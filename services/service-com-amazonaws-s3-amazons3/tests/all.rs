@@ -35,14 +35,22 @@ mod bucket_tagging;
 mod bucket_versioning;
 #[path = "all/error_message_envelope.rs"]
 mod error_message_envelope;
+// Deliberately empty: this fix's own table for the error-message rule was folded into
+// `error_message_envelope`, which spans the same rule from the model's own catalog.
+#[path = "all/error_messages.rs"]
+mod error_messages;
 #[path = "all/head_object_read_back.rs"]
 mod head_object_read_back;
 #[path = "all/list_buckets.rs"]
 mod list_buckets;
+#[path = "all/listing_encoding_type.rs"]
+mod listing_encoding_type;
 #[path = "all/object_and_policy.rs"]
 mod object_and_policy;
 #[path = "all/object_and_tagging_roundtrip.rs"]
 mod object_and_tagging_roundtrip;
+#[path = "all/object_encryption.rs"]
+mod object_encryption;
 #[path = "all/object_listing_and_deletion.rs"]
 mod object_listing_and_deletion;
 #[path = "all/object_storage.rs"]

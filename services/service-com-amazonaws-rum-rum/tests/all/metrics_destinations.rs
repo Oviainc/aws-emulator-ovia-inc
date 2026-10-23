@@ -12,8 +12,9 @@
 //! experiments, and the order the puts arrive in; the idempotence table re-puts each
 //! kind of destination; the refusal table walks every forbidden `Destination` /
 //! `DestinationArn` / `IamRoleArn` pairing the model states in prose plus a destination
-//! outside the catalog; and the pagination test is an invariant check over a grid of
-//! store sizes and page sizes.
+//! outside the catalog; the pagination test is an invariant check over a grid of
+//! store sizes and page sizes; and the `MaxResults` table walks each published bound of
+//! the modelled range plus one past each, beside the documented default page size.
 
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
@@ -826,4 +827,99 @@ async fn deleting_an_app_monitor_drops_the_destinations_it_held() {
         destinations.is_empty(),
         "case \"re-create\": a re-created monitor must hold no destination, got {destinations:?}"
     );
+}
+
+#[tokio::test]
+async fn list_pages_at_the_modelled_max_results_range_and_the_documented_default() {
+    // `ListRumMetricsDestinationsRequest$MaxResults` is `@range(min: 1, max: 100)` and
+    // documents "The default is 50. The maximum that you can specify is 100."
+    // Source: `smithy_query(query="operation", operation="ListRumMetricsDestinations")`.
+    const DOCUMENTED_DEFAULT: usize = 50;
+
+    let router = emulator();
+    let monitor = "max-results-monitor";
+    create_monitor(&router, "setup", monitor).await;
+
+    // One destination MORE than the documented default, so a page that stops at the
+    // default is distinguishable from one that returns the whole store.
+    let mut stored = vec![Destination::cloud_watch()];
+    while stored.len() <= DOCUMENTED_DEFAULT {
+        let index = stored.len();
+        stored.push(Destination::evidently(
+            &format!("experiment-{index}"),
+            &format!("writer-{index}"),
+        ));
+    }
+    for destination in &stored {
+        put_destination_ok(&router, "setup", monitor, destination).await;
+    }
+
+    // No `MaxResults`: the page holds the documented default and carries a token, since
+    // the store holds more than one page.
+    let (page, next_token) = list_destinations(&router, "no maxResults", monitor, "").await;
+    assert_eq!(
+        page.len(),
+        DOCUMENTED_DEFAULT,
+        "case \"no maxResults\": expected the documented default page of {DOCUMENTED_DEFAULT}, \
+         got {}",
+        page.len()
+    );
+    assert!(
+        next_token.is_some(),
+        "case \"no maxResults\": a page that left {} destination(s) unreported must carry a \
+         NextToken",
+        stored.len() - DOCUMENTED_DEFAULT
+    );
+
+    // Each published bound of the modelled range, and one past each: inside the range a
+    // page holds at most `MaxResults` summaries; outside it the request is refused.
+    for (case, max_results, accepted) in [
+        ("one below the range", 0_usize, false),
+        ("the range's minimum", 1, true),
+        ("the range's maximum", 100, true),
+        ("one above the range", 101, false),
+    ] {
+        let reply = call(
+            &router,
+            "GET",
+            &format!("/rummetrics/{monitor}/metricsdestination?maxResults={max_results}"),
+            None,
+        )
+        .await;
+        if !accepted {
+            assert_eq!(
+                reply.status,
+                400,
+                "case {case:?}: expected maxResults={max_results} to be refused with 400, got \
+                 {} {:?}",
+                reply.status,
+                String::from_utf8_lossy(&reply.body)
+            );
+            assert_eq!(
+                reply.error_code(case),
+                "ValidationException",
+                "case {case:?}: expected the modelled ValidationException, got {:?}",
+                String::from_utf8_lossy(&reply.body)
+            );
+            continue;
+        }
+        assert_eq!(
+            reply.status,
+            200,
+            "case {case:?}: expected maxResults={max_results} to be accepted, got {} {:?}",
+            reply.status,
+            String::from_utf8_lossy(&reply.body)
+        );
+        let body = reply.json(case);
+        let reported = body["Destinations"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: no Destinations in {body}"));
+        assert_eq!(
+            reported.len(),
+            max_results.min(stored.len()),
+            "case {case:?}: expected a page of {} summaries, got {}",
+            max_results.min(stored.len()),
+            reported.len()
+        );
+    }
 }

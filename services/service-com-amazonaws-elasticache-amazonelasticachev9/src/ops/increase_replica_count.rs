@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op IncreaseReplicaCount
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `IncreaseReplicaCount`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`IncreaseReplicaCount::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -183,18 +179,185 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `IncreaseReplicaCount` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(IncreaseReplicaCountErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("IncreaseReplicaCount"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // `ApplyImmediately` is documented with one accepted value — "if True,
+        // the number of replica nodes is increased immediately.
+        // ApplyImmediately=False is not currently supported" — so a deferred
+        // request is refused rather than accepted and never applied.
+        if !input.apply_immediately {
+            return Err(IncreaseReplicaCountErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(
+                        "Invalid value false for ApplyImmediately: ApplyImmediately=False is not \
+                         currently supported."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // Argument validation FIRST: this operation validates its arguments
+        // before it resolves `ReplicationGroupId`, which is why an id the
+        // account does not hold is answered `InvalidParameterValue` below
+        // rather than `ReplicationGroupNotFoundFault`. See
+        // `crate::state::replica_count_targets`.
+        let targets = match crate::state::replica_count_targets(
+            input.new_replica_count,
+            input.replica_configuration.as_deref().unwrap_or_default(),
+        ) {
+            Ok(targets) => targets,
+            Err(crate::state::ReplicaCountRefusal::Value(message)) => {
+                return Err(IncreaseReplicaCountErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(message),
+                    },
+                )
+                .into())
+            }
+            Err(crate::state::ReplicaCountRefusal::Combination(message)) => {
+                return Err(
+                    IncreaseReplicaCountErrorModeled::InvalidParameterCombinationException(
+                        InvalidParameterCombinationException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                )
+            }
+        };
+
+        let key = input.replication_group_id.to_ascii_lowercase();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let Some(group) = store.settled_replication_group_mut(&key, now) else {
+            return Err(IncreaseReplicaCountErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(format!(
+                        "Replication group {} does not exist.",
+                        input.replication_group_id
+                    )),
+                },
+            )
+            .into());
+        };
+        if group.status != crate::state::STATUS_AVAILABLE {
+            return Err(
+                IncreaseReplicaCountErrorModeled::InvalidReplicationGroupStateFault(
+                    InvalidReplicationGroupStateFault {
+                        message: Some(format!(
+                            "Replication group {key} is in {} state, not {}.",
+                            group.status,
+                            crate::state::STATUS_AVAILABLE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // What each shard is asked to end up with, resolved against the shards
+        // the group actually has.
+        let requested: Vec<(String, i32)> = match targets {
+            crate::state::ReplicaTargets::EveryShard(count) => group
+                .node_groups
+                .iter()
+                .map(|node_group| (node_group.node_group_id.clone(), count))
+                .collect(),
+            crate::state::ReplicaTargets::PerShard(targets) => targets,
+        };
+        for (node_group_id, target) in &requested {
+            if !group
+                .node_groups
+                .iter()
+                .any(|node_group| &node_group.node_group_id == node_group_id)
+            {
+                return Err(IncreaseReplicaCountErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "Invalid value {node_group_id} for NodeGroupId: replication group \
+                             {key} has no such node group."
+                        )),
+                    },
+                )
+                .into());
+            }
+            // "Increase": a target that is not above the shard's current
+            // replica count asks for nothing, which is what `NoOperationFault`
+            // is for.
+            let current = group
+                .shard_replica_count(node_group_id)
+                .unwrap_or_default();
+            if *target <= current {
+                return Err(IncreaseReplicaCountErrorModeled::NoOperationFault(
+                    NoOperationFault {
+                        message: Some(format!(
+                            "Node group {node_group_id} of replication group {key} already has \
+                             {current} replicas."
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+        // CC-02 growth bound: every replica is a cache cluster of its own, so
+        // the clusters this scaling would mint are counted against the
+        // ACCOUNT's cluster quota — the same `CLUSTER_QUOTA` that bounds
+        // `CreateCacheCluster` — before any of them is created.
+        let added: i32 = requested
+            .iter()
+            .map(|(node_group_id, target)| {
+                target - group.shard_replica_count(node_group_id).unwrap_or_default()
+            })
+            .sum();
+        if store.cache_clusters.len() + usize::try_from(added).unwrap_or(0)
+            > crate::state::CLUSTER_QUOTA
+        {
+            return Err(
+                IncreaseReplicaCountErrorModeled::NodeQuotaForCustomerExceededFault(
+                    NodeQuotaForCustomerExceededFault {
+                        message: Some(format!(
+                            "Adding {added} replica(s) to replication group {key} would take this \
+                             account past the maximum of {} cache clusters.",
+                            crate::state::CLUSTER_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The change is applied to the stored shards — each new replica is a
+        // member CLUSTER of its own, minted into the same store
+        // `DescribeCacheClusters` reads — and the group answers `modifying`
+        // until the clock settles it, so a caller acting straight after the call
+        // still sees the transient status.
+        for (node_group_id, target) in &requested {
+            store.set_shard_replica_count(&key, node_group_id, *target, &[], now);
+        }
+        let Some(group) = store.replication_groups.get_mut(&key) else {
+            // Unreachable: resolved under this same lock above.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+        group.begin_transition(crate::state::STATUS_MODIFYING, now);
+
+        let Some(answer) = store.modeled_replication_group(&key) else {
+            // Unreachable, for the same reason.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+        Ok(IncreaseReplicaCountOutput {
+            replication_group: Some(answer),
+        })
     }
 }

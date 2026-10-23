@@ -1,0 +1,48 @@
+Issue-Severity: MEDIUM
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: verifiedpermissions.create-identity-source-nonexistent-user-pool-rejected verifiedpermissions.put-schema-strict-mode-validates-policy-actions
+Issue-Shape-Id: com.amazonaws.verifiedpermissions#VerifiedPermissions
+Issue-Key: verifiedpermissions.create-identity-source-nonexistent-user-pool-rejected|run#16|AssertionError|assert malformed == expected_malformed, (
+Issue-Key: verifiedpermissions.put-schema-strict-mode-validates-policy-actions|run#12|AssertionError|assert err.get("fieldList") == expected_fields, f"unexpected fieldList={err.get('fieldList')!r}"
+Issue-Commit: e2dfe022d58b39493003b3d90859f84840a12f00
+
+# VerifiedPermissions ValidationException contents diverge: CreateIdentitySource uses the generic constraint-violation message shape, and STRICT-mode CreatePolicy reports only one of the two fieldList entries
+
+> _Note: this issue was identified against the code base at commit `e2dfe022d58b39493003b3d90859f84840a12f00`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateIdentitySource
+
+## Description
+TWO distinct root causes in service-com-amazonaws-verifiedpermissions-verifiedpermissions, both in what the service puts INSIDE a 400 ValidationException. In both cases the HTTP status (400) and the error code (ValidationException) are correct; the payload is not. Both must be closed before this issue is submitted.
+
+Cause 1 of 2: CreateIdentitySource's input-constraint ValidationException is rendered with the generic Smithy constraint-violation shape (dotted member path, echoed value, colon after "detected") instead of the shape Verified Permissions uses (JSON-pointer path, no echoed value, period after "detected").
+AWS: Smithy (com.amazonaws.verifiedpermissions) CreateIdentitySource takes configuration: Configuration; CognitoUserPoolConfiguration.userPoolArn is @required with @length 1..255 and @pattern `^arn:[a-zA-Z0-9-]+:cognito-idp:(([a-zA-Z0-9-]+:\d{12}:userpool/[\w-]+_[0-9a-zA-Z]+))$`, and the operation models ValidationException (400). The message is BUILT FROM THE REQUEST, so the rule — not the sentence — is the requirement: AVP reports `1 validation error detected. Value at '<json-pointer to the offending member>' failed to satisfy constraint: Member must satisfy regular expression pattern: <the pattern>`, i.e. the member is addressed as a slash-delimited JSON pointer rooted at the request body (`/configuration/cognitoUserPoolConfiguration/userPoolArn`), the sentence is terminated with a period after "detected", and the submitted value is NOT echoed back (userPoolArn can carry caller data).
+Emulator: same 400 and same `ValidationException` code, but the message is `1 validation error detected: Value 'arn:aws:s3:::not-a-user-pool-us-west-2' at 'configuration.cognitoUserPoolConfiguration.userPoolArn' failed to satisfy constraint: Member must satisfy regular expression pattern: ^arn:...$` — a colon instead of a period, a dotted member path instead of a JSON pointer, and the rejected value echoed inline.
+Why: the member path is the machine-readable part of these messages; consoles, IaC providers and client-side validators parse it to attribute the failure to a request field, and a dotted path rooted differently matches nothing they expect. Echoing the submitted value also leaks request content into logs that AWS keeps out of them.
+Fix: the shared request-constraint validation/serialization path for this service (the code that formats constraint violations for ValidationException) — emit the AVP JSON-pointer form and drop the echoed value. Related open issue `20261023T031610Z-verifiedpermissions-response-fidelity-getschema-drops-definition-and-reformats.md` reports a wrongly anchored path inside `fieldList` for CreatePolicyTemplate; it is a different field (fieldList[].path, not the top-level message), carries no key for this check, and does not cover CreateIdentitySource.
+Traces: verifiedpermissions.create-identity-source-nonexistent-user-pool-rejected.
+
+Cause 2 of 2: for a static policy that references an action the schema does not declare, CreatePolicy in a STRICT-validation store returns only the "unrecognized action" fieldList entry and omits the second entry AWS also reports.
+AWS: Smithy ValidationException(400) carries `fieldList: ValidationExceptionFieldList` of ValidationExceptionField{path [required], message [required]}; the doc enumerates the reasons, including UnrecognizedActionId ("The policy includes an action id that isn't found in the schema") and ImpossiblePolicy. Recorded behavior for the combination: a `permit` whose action is undeclared yields TWO fields, both with path `/definition` — `for policy \`policy0\`, unrecognized action \`PhotoApp::Action::"deletePhoto"\`` AND `for policy \`policy0\`, unable to find an applicable action given the policy scope constraints` — because Cedar reports both the unrecognized action id and the resulting unsatisfiable scope. The top-level message (`Invalid input`), the code and the 400 status already match.
+Emulator: fieldList has a single element, `[{'path': '/definition', 'message': 'for policy `policy0`, unrecognized action `PhotoApp::Action::"deletePhoto"`'}]` — the second diagnostic is never produced.
+Why: fieldList is the structured, per-diagnostic channel clients use to surface every validation problem at once; dropping a diagnostic makes the emulator look as if only one thing is wrong with the policy, and any client or test that compares the full diagnostic set (or counts entries) disagrees with AWS. Note the earlier issue on this surface, `20261022T174803Z-verifiedpermissions-control-plane-template-linked-createpolicy-updatepolicy-and.md` (STRICT-mode fieldList), is marked FIXED — fieldList is now populated, but incompletely, so this is a net-new residual defect, not that issue.
+Fix: the STRICT-mode Cedar schema-validation step behind CreatePolicy (the code that turns validator diagnostics into ValidationExceptionField entries) — report every diagnostic Cedar produces for the policy, not just the first.
+Traces: verifiedpermissions.put-schema-strict-mode-validates-policy-actions.
+
+## Evidence
+Cause 1 — check verifiedpermissions.create-identity-source-nonexistent-user-pool-rejected, CreateIdentitySource with configuration={'cognitoUserPoolConfiguration': {'userPoolArn': 'arn:aws:s3:::not-a-user-pool-us-west-2'}}; 400/ValidationException both sides.
+Expected (AWS): ('ValidationException', "1 validation error detected. Value at '/configuration/cognitoUserPoolConfiguration/userPoolArn' failed to satisfy constraint: Member must satisfy regular expression pattern: ^arn:[a-zA-Z0-9-]+:cognito-idp:(([a-zA-Z0-9-]+:\\d{12}:userpool/[\\w-]+_[0-9a-zA-Z]+))$")
+Actual (emulator): ('ValidationException', "1 validation error detected: Value 'arn:aws:s3:::not-a-user-pool-us-west-2' at 'configuration.cognitoUserPoolConfiguration.userPoolArn' failed to satisfy constraint: Member must satisfy regular expression pattern: ^arn:[a-zA-Z0-9-]+:cognito-idp:(([a-zA-Z0-9-]+:\\d{12}:userpool/[\\w-]+_[0-9a-zA-Z]+))$")
+Differences: '/'-delimited JSON pointer vs dotted path; 'detected.' vs 'detected:'; value echoed. (Because the check asserts on the malformed-ARN case first, the well-formed-but-nonexistent-pool branch of the same check was never reached and is not part of this report.)
+
+Cause 2 — check verifiedpermissions.put-schema-strict-mode-validates-policy-actions: PutSchema(PhotoApp with only action 'viewPhoto') -> UpdatePolicyStore(validationSettings={'mode':'STRICT'}) -> CreatePolicy(static statement using PhotoApp::Action::"deletePhoto"). Code 'ValidationException' and message 'Invalid input' both matched.
+Expected fieldList (AWS): [{'path': '/definition', 'message': 'for policy `policy0`, unrecognized action `PhotoApp::Action::"deletePhoto"`'}, {'path': '/definition', 'message': 'for policy `policy0`, unable to find an applicable action given the policy scope constraints'}]
+Actual fieldList (emulator): [{'path': '/definition', 'message': 'for policy `policy0`, unrecognized action `PhotoApp::Action::"deletePhoto"`'}]
+AssertionError: unexpected fieldList=[{'path': '/definition', 'message': 'for policy `policy0`, unrecognized action `PhotoApp::Action::"deletePhoto"`'}]
+
+## Steps to Reproduce
+Cause 1: CreatePolicyStore(validationSettings={'mode':'OFF'}) -> CreateIdentitySource(policyStoreId, configuration={'cognitoUserPoolConfiguration': {'userPoolArn': 'arn:aws:s3:::not-a-user-pool-us-west-2'}}). Inspect the 400 ValidationException message: expect the JSON-pointer path '/configuration/cognitoUserPoolConfiguration/userPoolArn', 'detected.' and no echoed value; observe the dotted path, 'detected:' and the echoed ARN. Replay check verifiedpermissions.create-identity-source-nonexistent-user-pool-rejected.
+
+Cause 2: CreatePolicyStore -> PutSchema(definition={'cedarJson': '{"PhotoApp":{"entityTypes":{"User":{},"Photo":{}},"actions":{"viewPhoto":{"appliesTo":{"principalTypes":["User"],"resourceTypes":["Photo"]}}}}}'}) -> UpdatePolicyStore(validationSettings={'mode':'STRICT'}) -> CreatePolicy(definition={'static': {'statement': 'permit(principal == PhotoApp::User::"alice", action == PhotoApp::Action::"deletePhoto", resource == PhotoApp::Photo::"vacation.jpg");'}}). Inspect ValidationException['fieldList']: expect two entries (unrecognized action, and 'unable to find an applicable action given the policy scope constraints'); observe one. Replay check verifiedpermissions.put-schema-strict-mode-validates-policy-actions.

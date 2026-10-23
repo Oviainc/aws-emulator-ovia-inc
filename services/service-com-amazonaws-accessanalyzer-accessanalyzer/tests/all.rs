@@ -21,6 +21,8 @@ mod archive_rule_update;
 mod check_no_public_access;
 #[path = "all/error_payloads.rs"]
 mod error_payloads;
+#[path = "all/fixed_refusal_texts.rs"]
+mod fixed_refusal_texts;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/modeled_rejections.rs"]

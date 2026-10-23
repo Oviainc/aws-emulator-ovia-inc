@@ -38,6 +38,9 @@ mod error_envelope;
 #[path = "all/event_bridge_rule_template_groups.rs"]
 mod event_bridge_rule_template_groups;
 
+#[path = "all/event_bridge_rule_template_listing.rs"]
+mod event_bridge_rule_template_listing;
+
 #[path = "all/event_bridge_rule_templates.rs"]
 mod event_bridge_rule_templates;
 

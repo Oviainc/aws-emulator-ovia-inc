@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisableAddressTransfer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisableAddressTransfer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: withdraws the pending transfer offer on one of the account's Elastic IP
+//! addresses, so `DescribeAddressTransfers` reports it as `disabled`. This is the ONLY file
+//! to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisableAddressTransfer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Only a `pending` offer can be withdrawn; an address with no such offer is refused with
+//! the code the transfer surface answers for one
+//! ([`crate::state::address_transfer_not_available`]).
 //!
 //! ## Shape of an operation
 //!
@@ -134,18 +132,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisableAddressTransfer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisableAddressTransferErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisableAddressTransfer"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            address_transfer_not_available, internal_error, require_known_address,
+            require_service_state,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // The offer this call would withdraw may already have expired on its own, and that
+        // expiry was owed at its instant whether or not anybody called — so it is applied
+        // before this call reads whether there is anything to withdraw.
+        store.materialize_due_transitions();
+
+        // "The allocation ID of an Elastic IP address"
+        // (`DisableAddressTransferRequest$AllocationId`): `require_known_address` answers
+        // `InvalidAllocationID.Malformed` for a value that is not an allocation id at all
+        // before `InvalidAllocationID.NotFound` for a well-formed one the account has no
+        // address for, the way the service orders the two.
+        let allocation_id = input.allocation_id.clone();
+        require_known_address(&store, &allocation_id)?;
+
+        // There is nothing to disable unless the address carries a PENDING offer: an
+        // accepted transfer has already moved the address and a disabled one is already
+        // withdrawn. The address is named rather than the allocation id, the way the
+        // transfer surface words this refusal.
+        let address = store
+            .addresses
+            .get(&allocation_id)
+            .and_then(|address| address.public_ip.clone())
+            .unwrap_or_else(|| allocation_id.clone());
+        let pending = store
+            .address_transfers
+            .get(&allocation_id)
+            .is_some_and(|record| {
+                record.transfer.address_transfer_status.as_deref()
+                    == Some(crate::state::ADDRESS_TRANSFER_STATUS_PENDING)
+            });
+        if !pending {
+            return Err(address_transfer_not_available(&address));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and BEFORE the first write:
+        // the flag asks whether the request WOULD have worked, so one that would have been
+        // refused is refused with that reason instead, and one that would have succeeded
+        // leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // The check above already established there is a pending offer, and nothing can
+        // have moved it: the store is still locked. So this cannot answer `false` — it is
+        // read rather than discarded so no path can withdraw nothing and report a success.
+        if !store.withdraw_address_transfer(&allocation_id) {
+            return Err(address_transfer_not_available(&address));
+        }
+
+        // Read the response back OUT of the store, so the caller sees what a later
+        // `DescribeAddressTransfers` will see rather than a record built here.
+        let stored = store.address_transfers.get(&allocation_id).ok_or_else(|| {
+            internal_error(format!(
+                "the transfer just disabled for '{allocation_id}' could not be read back"
+            ))
+        })?;
+        Ok(DisableAddressTransferOutput {
+            address_transfer: Some(stored.transfer.clone()),
+        })
     }
 }

@@ -16,7 +16,7 @@
 //! against itself.
 
 use serde_json::{json, Value};
-use sha2::Digest;
+use sha1::Digest;
 
 // The wire harness — building the emulator, signing a call, reading an answer,
 // and the small value helpers — is the shared one in
@@ -36,11 +36,11 @@ fn git_identity(user: &Value) -> String {
     format!("{name} <{email}> {date}")
 }
 
-/// The object name of the commit the payload describes: the git commit object
-/// encoding over its tree, parents, author, committer and message, hashed and
-/// truncated to the 20 bytes an object name is wide. Computed here from the
-/// RETURNED fields, independently of the service, so `commitId` is checked against
-/// the commit it claims to describe.
+/// The object name of the commit the payload describes: git's own object name
+/// function over the commit object encoding of its tree, parents, author,
+/// committer and message. Computed here from the RETURNED fields, independently
+/// of the service, so `commitId` is checked against the commit it claims to
+/// describe.
 ///
 /// This deliberately re-derives the encoding `crate::state::commit_id` implements
 /// (`src/state.rs`, "The `commitId` of a commit"): an independent computation is
@@ -71,10 +71,10 @@ fn git_commit_id(commit: &Value) -> String {
     if let Some(message) = commit.get("message").and_then(Value::as_str) {
         payload.push_str(message);
     }
-    let mut hasher = sha2::Sha256::new();
+    let mut hasher = sha1::Sha1::new();
     hasher.update(format!("commit {}\0", payload.len()).as_bytes());
     hasher.update(payload.as_bytes());
-    hex::encode(&hasher.finalize()[..20])
+    hex::encode(hasher.finalize())
 }
 
 /// One write in a row's history: one `PutFile` call, so one commit.

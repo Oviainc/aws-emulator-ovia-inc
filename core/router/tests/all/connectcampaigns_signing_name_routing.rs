@@ -43,6 +43,14 @@ macro_rules! encoded_arn {
     };
 }
 
+/// The same, for a campaign id neither version's store holds — so the answer is
+/// whichever version claimed the route saying the resource is not there.
+macro_rules! encoded_missing_arn {
+    () => {
+        "arn%3Aaws%3Aconnect-campaigns%3Aus-east-1%3A000000000000%3Acampaign%2F999999999999"
+    };
+}
+
 /// A V2 `CreateCampaign` body: `channelSubtypeConfig` is a member only the V2 model
 /// has, and v1's own create requires `dialerConfig`/`outboundCallConfig` instead.
 const V2_CREATE: &str = r#"{"name":"v2-campaign","connectInstanceId":"instance-1",
@@ -69,6 +77,31 @@ fn build_router() -> MultiServiceRouter {
         ),
     );
     router
+}
+
+/// Onboard the Connect instance the V2 create bodies name, and wait out the span the
+/// clock owes the onboarding job.
+///
+/// V2 `CreateCampaign` mints a campaign only for an instance onboarded to Campaigns,
+/// and the job it starts settles one `ONBOARDING_JOB_DURATION` later — so a V2 create
+/// in this suite is preceded by this, exactly as a client would.
+async fn onboard_v2_instance(router: &MultiServiceRouter) {
+    let (status, _, payload) = dispatch(
+        router,
+        "PUT",
+        "/v2/connect-instance/instance-1/onboarding",
+        r#"{"encryptionConfig":{"enabled":false}}"#,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "V2 StartInstanceOnboardingJob: expected 200, got {status} {payload}"
+    );
+    tokio::time::sleep(
+        service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::ONBOARDING_JOB_DURATION
+            + std::time::Duration::from_millis(100),
+    )
+    .await;
 }
 
 async fn dispatch(
@@ -114,6 +147,10 @@ const ROUTER_REFUSALS: [&str; 2] = ["AmbiguousService", "UnknownService"];
 #[tokio::test]
 async fn each_connect_campaigns_api_version_serves_its_own_route_space() {
     let router = build_router();
+    // The V2 create row below needs its Connect instance onboarded; the onboarding
+    // route is a V2 route family in its own right, and its own row asserts that it is
+    // the V2 version that answers it.
+    onboard_v2_instance(&router).await;
 
     // One row per modelled route family of each version (sources: the `smithy_query`
     // digests of the two models — 22 v1 operations over `/campaigns`,
@@ -157,30 +194,32 @@ async fn each_connect_campaigns_api_version_serves_its_own_route_space() {
             Expect::Error("NotImplemented"),
         ),
         (
-            "V2 StartInstanceOnboardingJob (still a stub)",
+            "V2 StartInstanceOnboardingJob",
             "PUT",
             "/v2/connect-instance/instance-1/onboarding",
             r#"{"encryptionConfig":{"enabled":false}}"#,
-            501,
-            Expect::Error("NotImplemented"),
+            200,
+            Expect::Member("connectInstanceOnboardingJobStatus"),
         ),
         (
-            "V2 PutOutboundRequestBatch (still a stub)",
+            "V2 PutOutboundRequestBatch for a campaign no store holds",
             "PUT",
-            "/v2/campaigns/000000000000/outbound-requests",
+            "/v2/campaigns/nosuchcampaign/outbound-requests",
             r#"{"outboundRequests":[{"clientToken":"token-1",
-                "expirationTime":1767225600,"channelSubtypeParameters":{"telephony":{
+                "expirationTime":"2099-01-01T00:00:00Z","channelSubtypeParameters":{"telephony":{
                     "destinationPhoneNumber":"+15550100","attributes":{}}}}]}"#,
-            501,
-            Expect::Error("NotImplemented"),
+            404,
+            Expect::Error("ResourceNotFoundException"),
         ),
         (
-            "V2 ListTagsForResource (still a stub)",
+            "V2 ListTagsForResource for a campaign no store holds",
             "GET",
-            concat!("/v2/tags/", encoded_arn!()),
+            concat!("/v2/tags/", encoded_missing_arn!()),
             "",
-            501,
-            Expect::Error("NotImplemented"),
+            404,
+            // The wire code ConnectCampaignsV2 answers a tag operation with, which
+            // neither the shared model shape name nor v1's stub can produce.
+            Expect::Error("NotFoundException"),
         ),
         // ---- v1: unprefixed ----
         (
@@ -278,6 +317,7 @@ async fn each_connect_campaigns_api_version_serves_its_own_route_space() {
 #[tokio::test]
 async fn a_campaign_created_through_one_version_belongs_to_that_version_alone() {
     let router = build_router();
+    onboard_v2_instance(&router).await;
 
     // Create through V2, with a member only the V2 model carries.
     let (status, error_code, payload) = dispatch(&router, "PUT", "/v2/campaigns", V2_CREATE).await;

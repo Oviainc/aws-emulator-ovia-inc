@@ -166,10 +166,11 @@
 //!   documentation ("Maps the input file according to the provided template file") and the
 //!   recorded round-trip units both say the member carries the MAPPED DOCUMENT, which is
 //!   what this handler answers. Nothing here should be "fixed" back to a fingerprint;
-//! * nothing here makes an authorization decision: `TestMapping` models
-//!   `AccessDeniedException` (403) and this handler never constructs it, because the
-//!   operation owns no resource and reads no per-caller state. Real `TestMapping` applies
-//!   an IAM decision, so the 403 path is not testable against this emulator;
+//! * the request IS authorized, like every other operation of this service whose model
+//!   declares `AccessDeniedException` (403): the caller's IAM identity policies decide it
+//!   ([`crate::state::authorize`], against [`crate::state::ANY_RESOURCE`] because a
+//!   mapping dry run addresses no resource ARN), so an explicit `Deny` on
+//!   `b2bi:TestMapping` refuses the call and nothing is evaluated;
 //! * a mapped answer carries HTTP 201, which is the `@http` code the model puts on this
 //!   operation and the status the scaffold generated for it (`SUCCESS_STATUS`), kept so
 //!   every implemented operation in this crate answers the code its model declares. B2BI
@@ -311,9 +312,43 @@ impl From<TestMappingErrorModeled> for TestMappingError {
 /// This operation's name, as the `tracing` records and the modelled messages spell it.
 const OPERATION: &str = "TestMapping";
 
+/// The bounded JSONata evaluation of a caller-supplied mapping template, for the OTHER
+/// operation of this service that evaluates one: the mapping a transformer job applies
+/// (`super::start_transformer_job`).
+///
+/// It is [`map_document`] — THIS operation's own body — so a job's mapping runs under
+/// exactly the containment a `TestMapping` request's does, and the two cannot drift: the
+/// evaluation permit and the live-thread ceiling, the thread with its own sized stack, the
+/// arena's allocation limit, the interpreter's time box and depth bound, the unwind guard,
+/// and the ceilings on the template, the document and the mapped result. There is one
+/// evaluation substrate in this service and this is it.
+///
+/// The failure is reported as TEXT rather than as a modelled error, because a transformer
+/// job carries the reason in its own `failed` message: the request that started the job was
+/// served, and it is the RUN that could not be performed.
+pub(crate) async fn evaluate_mapping_template(
+    template: String,
+    document: String,
+) -> Result<String, String> {
+    map_document(TestMappingInput {
+        mapping_template: template,
+        input_file_content: document,
+        // The document a transformer job evaluates a mapping over is the JSON form of the
+        // parsed interchange, which is what a JSONata expression navigates.
+        file_format: FILE_FORMAT_JSON.to_string(),
+    })
+    .await
+    .map(|mapped| mapped.mapped_file_content)
+    .map_err(|failure| failure.to_string())
+}
+
 /// The `FileFormat` value that declares `inputFileContent` holds an XML document
 /// (`com.amazonaws.b2bi#FileFormat` is `XML | JSON | NOT_USED`).
 const FILE_FORMAT_XML: &str = "XML";
+
+/// The `FileFormat` value that declares it holds a JSON document — the form a JSONata
+/// expression navigates.
+const FILE_FORMAT_JSON: &str = "JSON";
 
 /// Wall-clock ceiling on ONE JSONata evaluation, in milliseconds, passed to the
 /// interpreter's own time box.
@@ -1212,10 +1247,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Deliberately unused: a mapping dry run is a pure function of its request, so
-        // this handler reaches neither the store on `self.engine` nor the request
-        // metadata on `ctx`. Both are bound so that omission reads as a decision.
-        let _ = (ctx, &self.engine);
+        // Authorization first: nothing is evaluated for a caller IAM refuses. A mapping
+        // dry run addresses no resource ARN, so the request is matched against the policy
+        // wildcard — the same decision `TestParsing` takes, which has the same shape.
+        if let Err(denied) =
+            crate::state::authorize(&*self.engine, ctx, Self::NAME, crate::state::ANY_RESOURCE)
+        {
+            return Err(TestMappingErrorModeled::AccessDeniedException(denied).into());
+        }
+
+        // Beyond that decision a mapping dry run is a pure function of its request: no
+        // state of this service is read or written here.
 
         let template_bytes = input.mapping_template.len();
         let document_bytes = input.input_file_content.len();

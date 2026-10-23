@@ -49,14 +49,17 @@
 //! ## The media type this service announces
 //!
 //! The model declares `restJson1`, whose serializer announces
-//! [`crate::state::JSON_CONTENT_TYPE`] on every JSON body, but every recorded RUM
-//! response — every operation, a 200 and a 404 alike — carries
-//! [`crate::state::RESPONSE_CONTENT_TYPE`], and the announced media type is what a
-//! client selecting a parser or validating the response's type reads. The value is a
-//! property of the SERVICE, uniform across operations and across success and error
-//! paths, so it is applied once here rather than in twenty handlers:
+//! [`crate::state::JSON_CONTENT_TYPE`] on every JSON body, but a recorded RUM response to
+//! a request that carried NO payload — every operation, a 200 and a 404 alike — carries
+//! [`crate::state::RESPONSE_CONTENT_TYPE`] instead, and the announced media type is what a
+//! client selecting a parser or validating the response's type reads. What the frontend
+//! answers in is the media type the REQUEST's payload declared, and a request that carried
+//! none declared nothing, so such an answer falls back to RUM's own JSON type; a request
+//! that DID carry a payload declared `restJson1`'s `application/json` and is answered in
+//! it. Both halves are a property of the SERVICE, uniform across operations and across
+//! success and error paths, so they are applied once here rather than in twenty handlers:
 //! [`AnnouncedMediaType`] fronts every request this service serves, runs the operation
-//! the model names unchanged, and re-announces that one header on the way out
+//! the model names unchanged, and settles that one header on the way out
 //! ([`announced`]). A response whose body is not the JSON envelope keeps the type its own
 //! target shape maps to.
 //!
@@ -256,7 +259,7 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for AnnouncedMediaType<Eng> {
                 // two cases above.
                 None => svc.definition().routing_error_response(req),
             };
-            announced(response)
+            announced(req, response)
         })
     }
 
@@ -270,14 +273,36 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for AnnouncedMediaType<Eng> {
     }
 }
 
+/// Whether this request carried a payload — a body with bytes in it.
+///
+/// A request that carries one declares its media type (`restJson1` has exactly one for a
+/// JSON payload, [`crate::state::JSON_CONTENT_TYPE`]); a request whose members are all
+/// bound to the URI, the query string or the headers carries no body and declares nothing.
+/// That is the distinction [`announced`] settles the response's media type on, so it is
+/// read off the BODY rather than off a `content-type` header a client may send on a
+/// payload-less request anyway.
+///
+/// A body whose bytes are not in memory (a stream of unknown length) is a payload: only a
+/// body that is known to be empty is not one.
+fn carries_a_payload(req: &RtRequest) -> bool {
+    req.body()
+        .bytes()
+        .is_none_or(|bytes: &[u8]| !bytes.is_empty())
+}
+
 /// The response as this service announces it: one media type for every JSON body it
-/// produces, successes and failures alike.
+/// produces in answer to a payload-less request, successes and failures alike.
 ///
 /// Only the `restJson1` JSON envelope is re-announced
-/// ([`crate::state::JSON_CONTENT_TYPE`] -> [`crate::state::RESPONSE_CONTENT_TYPE`]); a
-/// body that is not that envelope carries the type its own target shape maps to and is
-/// left exactly as the serializer produced it.
-fn announced(mut response: RtResponse) -> RtResponse {
+/// ([`crate::state::JSON_CONTENT_TYPE`] -> [`crate::state::RESPONSE_CONTENT_TYPE`]), and
+/// only for a request that declared no media type of its own by carrying no payload (see
+/// [`carries_a_payload`] and the module docs). A body that is not that envelope, and an
+/// answer to a request that did carry a payload, carries the type its own target shape
+/// maps to and is left exactly as the serializer produced it.
+fn announced(req: &RtRequest, mut response: RtResponse) -> RtResponse {
+    if carries_a_payload(req) {
+        return response;
+    }
     if response.headers().get("content-type") == Some(crate::state::JSON_CONTENT_TYPE) {
         response
             .headers_mut()

@@ -31,7 +31,8 @@ pub struct ComAmazonawsGuarddutyGuarddutyapiserviceState {
     /// Everything a detector owns is bounded in turn
     /// ([`MAX_MEMBERS_PER_DETECTOR`], [`MAX_FILTERS_PER_ACCOUNT_PER_REGION`],
     /// [`IP_SETS_PER_DETECTOR`] plus [`DELETED_IP_SETS_RETAINED`],
-    /// [`THREAT_INTEL_SETS_PER_DETECTOR`]), so the whole map is finite whatever a
+    /// [`THREAT_INTEL_SETS_PER_DETECTOR`],
+    /// [`THREAT_ENTITY_SETS_PER_DETECTOR`]), so the whole map is finite whatever a
     /// caller sends.
     pub detectors: HashMap<String, Detector>,
     /// `ClientToken` -> the detector a `CreateDetector` minted under it, so a
@@ -87,6 +88,24 @@ pub struct ComAmazonawsGuarddutyGuarddutyapiserviceState {
     /// into it directly.
     pub malware_protection_plan_client_tokens:
         HashMap<(String, String), MalwareProtectionPlanTokenRecord>,
+    /// Every malware scan this service holds, keyed by its minted `ScanId`.
+    ///
+    /// A scan is NOT owned by a detector: `StartMalwareScan` names the resource to
+    /// scan by ARN and carries no `DetectorId`
+    /// (`smithy_query(operation="StartMalwareScan")`), so a scan hangs off the
+    /// service and survives a `DeleteDetector` the way a
+    /// [`MalwareProtectionPlan`] does. It is still REGIONAL — the Region the start
+    /// call was signed for is the only endpoint that reports it, which
+    /// [`Self::malware_scan_in`] enforces.
+    ///
+    /// BOUNDED at [`MAX_MALWARE_SCANS_PER_REGION`] scans per Region across at most
+    /// [`MAX_MALWARE_SCAN_REGIONS`] Regions, both of which `StartMalwareScan`
+    /// enforces before it writes ([`Self::malware_scan_count_in`],
+    /// [`Self::malware_scan_regions_exhausted`]). The `ClientToken` a start carried
+    /// lives ON the scan record ([`MalwareScan::client_token`]) rather than in an
+    /// index of its own, so the idempotency mappings are bounded by the scan store
+    /// itself and no mapping can outlive the scan it names.
+    pub malware_scans: HashMap<String, MalwareScan>,
     /// GuardDuty's own catalogue of custom detection rules, materialised when this
     /// service's store is created.
     ///
@@ -418,6 +437,59 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
             regions.insert(plan.region.as_str());
         }
         !regions.contains(region) && regions.len() >= MAX_MALWARE_PROTECTION_PLAN_REGIONS
+    }
+
+    /// The malware scan `region`'s endpoint serves for `scan_id`, if any.
+    ///
+    /// Regional for the same reason a detector and a plan are: a scan is started
+    /// through one Region's endpoint and only that endpoint reports it.
+    pub fn malware_scan_in(&self, region: &str, scan_id: &str) -> Option<&MalwareScan> {
+        self.malware_scans
+            .get(scan_id)
+            .filter(|scan| scan.region == region)
+    }
+
+    /// [`Self::malware_scan_in`], for a caller that materialises the status change
+    /// the clock already owes the scan ([`MalwareScan::settle`]).
+    pub fn malware_scan_in_mut(&mut self, region: &str, scan_id: &str) -> Option<&mut MalwareScan> {
+        self.malware_scans
+            .get_mut(scan_id)
+            .filter(|scan| scan.region == region)
+    }
+
+    /// The scan `region`'s endpoint started under `token`, if a start recorded one.
+    ///
+    /// The token is a pure REPLAY key: it resolves to the scan the first start
+    /// minted and nothing about the replaying request is compared against it, so a
+    /// replay answers with that scan rather than starting a second one.
+    pub fn malware_scan_for_client_token(&self, region: &str, token: &str) -> Option<&MalwareScan> {
+        self.malware_scans
+            .values()
+            .filter(|scan| scan.region == region)
+            .find(|scan| scan.client_token.as_deref() == Some(token))
+    }
+
+    /// How many malware scans `region`'s endpoint holds — the count
+    /// [`MAX_MALWARE_SCANS_PER_REGION`] is measured against.
+    pub fn malware_scan_count_in(&self, region: &str) -> usize {
+        self.malware_scans
+            .values()
+            .filter(|scan| scan.region == region)
+            .count()
+    }
+
+    /// Would a scan started through `region`'s endpoint partition the scan store
+    /// into one Region more than it will hold ([`MAX_MALWARE_SCAN_REGIONS`])?
+    ///
+    /// The Region is request-chosen, so this is the bound on the number of
+    /// PARTITIONS that makes the per-Region scan ceiling a bound on the whole scan
+    /// map. A Region the store already holds a scan for is never refused by it.
+    pub fn malware_scan_regions_exhausted(&self, region: &str) -> bool {
+        let mut regions: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for scan in self.malware_scans.values() {
+            regions.insert(scan.region.as_str());
+        }
+        !regions.contains(region) && regions.len() >= MAX_MALWARE_SCAN_REGIONS
     }
 }
 
@@ -1466,6 +1538,16 @@ pub struct Detector {
     /// (`smithy_query(operation="CreateTrustedEntitySet")`) — so
     /// `DeleteDetector` drops them with it.
     pub trusted_entity_sets: BTreeMap<String, EntitySetRecord>,
+    /// This detector's threat entity sets, keyed by the minted entity-set id.
+    /// They hang off the detector like the trusted entity sets above — every
+    /// operation on one is reached through
+    /// `/detector/{DetectorId}/threatentityset`
+    /// (`smithy_query(operation="CreateThreatEntitySet")`) — so `DeleteDetector`
+    /// drops them with it.
+    ///
+    /// BOUNDED by [`THREAT_ENTITY_SETS_PER_DETECTOR`], which
+    /// `CreateThreatEntitySet` enforces before it writes.
+    pub threat_entity_sets: BTreeMap<String, EntitySetRecord>,
     /// This detector's IPSets (trusted IP lists), keyed by the minted `IpSetId`.
     /// They are sub-resources of the detector — every IPSet operation is bound
     /// under `/detector/{DetectorId}/ipset`
@@ -1702,6 +1784,19 @@ impl Detector {
             .find(|set| set.client_token.as_deref() == Some(token))
     }
 
+    /// The threat entity set a create already minted for `token`, if any — the
+    /// seam that makes `CreateThreatEntitySet` idempotent under a replayed
+    /// `ClientToken`.
+    ///
+    /// Scoped to the THREAT sets: a token resolves to a resource of the type the
+    /// create that carried it made, so one token replayed across the two
+    /// entity-set creates never hands back the other one's id.
+    pub fn threat_entity_set_for_token(&self, token: &str) -> Option<&EntitySetRecord> {
+        self.threat_entity_sets
+            .values()
+            .find(|set| set.client_token.as_deref() == Some(token))
+    }
+
     /// The IPSet a create already minted for `token`, if any — the seam that makes
     /// `CreateIPSet` idempotent under a replayed `ClientToken`.
     ///
@@ -1713,6 +1808,27 @@ impl Detector {
         self.ip_sets
             .values()
             .find(|ip_set| ip_set.client_token.as_deref() == Some(token) && !ip_set.is_deleting())
+    }
+
+    /// The ids of the LIVE IPSets this detector holds, in `IpSetId` order.
+    ///
+    /// The order is TOTAL — the id is the key the IPSets are stored under, so it is
+    /// unique within a detector — which is what makes a page token mean the same
+    /// thing on the call that hands it back.
+    ///
+    /// LIVE is the same set [`Self::live_ip_set_count`] counts: a list whose delete
+    /// has been accepted is no longer one of the detector's IPSets, so `ListIPSets`
+    /// stops naming it. Its record is still retained
+    /// ([`DELETED_IP_SETS_RETAINED`]) so `GetIPSet` can report the
+    /// [`IP_SET_DELETE_PENDING`] / [`IP_SET_DELETED`] status the delete moved it
+    /// to — being readable on its own id is not the same as being part of the
+    /// collection a list enumerates.
+    pub fn live_ip_set_ids(&self) -> Vec<String> {
+        self.ip_sets
+            .values()
+            .filter(|ip_set| !ip_set.is_deleting())
+            .map(|ip_set| ip_set.id.clone())
+            .collect()
     }
 
     /// How many of this detector's IPSets are LIVE — held and not being deleted.
@@ -2239,6 +2355,12 @@ pub const ENTITY_SET_TRANSITION_MILLIS: i64 = 500;
 /// `trustedEntitySetId`). It is what a rejection names.
 pub const TRUSTED_ENTITY_SET_ID_MEMBER: &str = "trustedEntitySetId";
 
+/// The wire name of the `ThreatEntitySetId` member, as the request carries it in
+/// its URI label and the create reports it
+/// (`smithy_query(operation="GetThreatEntitySet")` renders the `jsonName`
+/// `threatEntitySetId`). It is what a rejection names.
+pub const THREAT_ENTITY_SET_ID_MEMBER: &str = "threatEntitySetId";
+
 /// The wire name of the `Name` member an entity-set create carries
 /// (`jsonName` `name`), for the same reason.
 pub const ENTITY_SET_NAME_MEMBER: &str = "name";
@@ -2253,6 +2375,36 @@ pub const ENTITY_SET_LOCATION_MEMBER: &str = "location";
 /// off the detector, which is the account/Region-level resource.
 pub const TRUSTED_ENTITY_SET_ALREADY_EXISTS_MESSAGE: &str =
     "The request is rejected because a trusted entity set already exists for the input detectorId.";
+
+/// How many threat entity sets one detector may hold.
+///
+/// Unlike a trusted entity set, of which "at any given time, you can have only
+/// one" (`smithy_query(query="doc",shape="CreateTrustedEntitySet")`), AWS
+/// documents no such rule for a threat entity set
+/// (`smithy_query(query="doc",shape="CreateThreatEntitySet")`), so a detector may
+/// hold several.
+///
+/// This ceiling is therefore EMULATOR-CHOSEN, not a published threat-entity-set
+/// quota: it reuses the number AWS publishes for the account's threat lists in a
+/// Region ([`THREAT_INTEL_SETS_PER_DETECTOR`]) because an entity set is the same
+/// kind of uploaded list under a newer API, and a detector is the account's
+/// single resource in a Region. Read it as "the emulator holds this many", never
+/// as a documented AWS limit.
+///
+/// A ceiling of some kind is what BOUNDS this store: without it a caller varying
+/// or omitting `ClientToken` would grow [`Detector::threat_entity_sets`] by one
+/// entry per request, and the `@idempotencyToken` scan over it
+/// ([`Detector::threat_entity_set_for_token`]) would grow with it.
+pub const THREAT_ENTITY_SETS_PER_DETECTOR: usize = THREAT_INTEL_SETS_PER_DETECTOR;
+
+/// The message a `CreateThreatEntitySet` past
+/// [`THREAT_ENTITY_SETS_PER_DETECTOR`] is refused with. It names the limit, never
+/// the caller's values.
+pub fn threat_entity_set_limit_message() -> String {
+    format!(
+        "The request is rejected because the account has reached the limit of {THREAT_ENTITY_SETS_PER_DETECTOR} threat entity sets."
+    )
+}
 
 /// Does `name` hold only the characters an entity-set `Name` may contain?
 ///
@@ -2354,6 +2506,56 @@ pub struct EntitySetRecord {
 }
 
 impl EntitySetRecord {
+    /// An entity set created at `now`: the record BOTH entity-set creates store,
+    /// so the trusted and the threat set cannot drift on what a create persists.
+    /// It is the entity-set counterpart of [`IpSetRecord::created`].
+    ///
+    /// `Activate` is "a boolean value that indicates whether GuardDuty should
+    /// start using the uploaded threat entity set to generate findings"
+    /// (`smithy_query(query="doc",shape="CreateThreatEntitySetRequest",member="Activate")`):
+    /// a set the caller asked to activate is not in use yet, so it starts in the
+    /// transitional [`ENTITY_SET_ACTIVATING`] and the clock owes it
+    /// [`ENTITY_SET_ACTIVE`] at [`ENTITY_SET_TRANSITION_MILLIS`], while one the
+    /// caller did not ask to activate is stored unused — [`ENTITY_SET_INACTIVE`],
+    /// which is settled, so nothing is owed on it until an update activates it.
+    ///
+    /// Nothing failed, so a created set carries no [`Self::error_details`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn created(
+        id: String,
+        name: String,
+        format: String,
+        location: String,
+        expected_bucket_owner: Option<String>,
+        tags: BTreeMap<String, String>,
+        activate: bool,
+        client_token: Option<String>,
+        now: i64,
+    ) -> Self {
+        let (status, status_due_millis) = if activate {
+            (
+                ENTITY_SET_ACTIVATING,
+                Some(now.saturating_add(ENTITY_SET_TRANSITION_MILLIS)),
+            )
+        } else {
+            (ENTITY_SET_INACTIVE, None)
+        };
+        Self {
+            id,
+            name,
+            format,
+            location,
+            expected_bucket_owner,
+            tags,
+            client_token,
+            status: status.to_string(),
+            status_due_millis,
+            created_at_millis: now,
+            updated_at_millis: now,
+            error_details: None,
+        }
+    }
+
     /// Apply the status change the CLOCK already made due, if any.
     ///
     /// The move out of [`ENTITY_SET_ACTIVATING`] was owed at
@@ -2523,6 +2725,266 @@ pub struct MalwareProtectionPlan {
     pub created_at_millis: i64,
     /// `MalwareProtectionPlanStatus`.
     pub status: String,
+}
+
+// ---------------------------------------------------------------------------
+// Malware scans
+//
+// `StartMalwareScan` starts a scan of the resource its `ResourceArn` names and
+// hands back the `ScanId` the caller tracks it by: "When the malware scan
+// starts, you can use the associated scan ID to track the status of the scan"
+// (`smithy_query(query="doc",shape="StartMalwareScan")`). `GetMalwareScan`
+// reports that scan. The CONTROL plane is real here — the scan resource, its id,
+// the resource and configuration the start named, its status and its instants —
+// while the scan ITSELF is work this emulator cannot perform: there is no
+// malware scanner and no EBS volume content to read. So no result is
+// synthesised; the run ends in the modelled failure state carrying the reason it
+// could not run, exactly as an investigation does
+// ([`INVESTIGATION_ENGINE_UNAVAILABLE`]).
+// ---------------------------------------------------------------------------
+
+/// `MalwareProtectionScanStatus`: the NON-terminal status a scan the start call
+/// just accepted reports, until the clock owes it its terminal status. The enum is
+/// `RUNNING | COMPLETED | COMPLETED_WITH_ISSUES | FAILED | SKIPPED`
+/// (`smithy_query(shape="MalwareProtectionScanStatus")`).
+pub const MALWARE_SCAN_RUNNING: &str = "RUNNING";
+
+/// The terminal status a scan this emulator accepted ends in.
+///
+/// GuardDuty Malware Protection scans the EBS volumes behind the resource the
+/// start named. This emulator has no scanner and no volume content, so it does NOT
+/// synthesise a scan result, a threat list or a file count: the run it cannot
+/// perform ends FAILED, the modelled failure member of
+/// `MalwareProtectionScanStatus`.
+pub const MALWARE_SCAN_FAILED: &str = "FAILED";
+
+/// Why a scan this emulator accepted ends [`MALWARE_SCAN_FAILED`].
+///
+/// `ScanStatusReason` is a CLOSED enum (`smithy_query(shape="ScanStatusReason")`),
+/// so the reason is one of its members rather than free text, and
+/// `RESOURCE_UNAVAILABLE` is the member that says what is true here: the resource
+/// the scan would have read was never available to the scanner.
+pub const MALWARE_SCAN_UNAVAILABLE_REASON: &str = "RESOURCE_UNAVAILABLE";
+
+/// How long a scan spends in [`MALWARE_SCAN_RUNNING`] before the clock owes it
+/// [`MALWARE_SCAN_FAILED`].
+///
+/// AWS documents no duration for a malware scan, so this span is CHOSEN: non-zero,
+/// so a caller reading straight after the start still observes the `RUNNING` status
+/// the real service reports, and short enough that the terminal status lands
+/// without anybody sleeping on it. Defined AS [`INVESTIGATION_TRANSITION_MILLIS`]:
+/// it is the same span for the same reason, so the two cannot drift.
+pub const MALWARE_SCAN_TERMINAL_SPAN_MILLIS: i64 = INVESTIGATION_TRANSITION_MILLIS;
+
+/// `MalwareProtectionScanType`: the initiator of a scan a caller asked for.
+///
+/// Every scan this emulator holds was started through `StartMalwareScan`, which is
+/// the caller asking on demand; `GUARDDUTY_INITIATED` and `BACKUP_INITIATED` name
+/// the scans GuardDuty and AWS Backup start by themselves, which nothing here does
+/// (`smithy_query(shape="MalwareProtectionScanType")`).
+pub const MALWARE_SCAN_TYPE_ON_DEMAND: &str = "ON_DEMAND";
+
+/// `ScanCategory`: the whole resource is scanned unless the start asked for an
+/// incremental scan (`smithy_query(shape="ScanCategory")`).
+pub const MALWARE_SCAN_CATEGORY_FULL: &str = "FULL_SCAN";
+
+/// `ScanCategory`: "When specified, the scan will only process changes since the
+/// baseline resource"
+/// (`smithy_query(query="doc",shape="StartMalwareScanConfiguration",member="IncrementalScanDetails")`),
+/// so a start carrying `IncrementalScanDetails` is an incremental scan.
+pub const MALWARE_SCAN_CATEGORY_INCREMENTAL: &str = "INCREMENTAL_SCAN";
+
+/// The wire name of the `ScanId` member `GetMalwareScan` carries in its URI
+/// (`smithy_query(operation="GetMalwareScan")`), for a rejection to name.
+pub const SCAN_ID_MEMBER: &str = "scanId";
+
+/// The wire name of `StartMalwareScan`'s `ResourceArn` member, for the same reason.
+pub const RESOURCE_ARN_MEMBER: &str = "resourceArn";
+
+/// The message a read of a scan this account and Region does not hold answers with.
+///
+/// Built through the shared [`not_owned_message`], like
+/// [`malware_protection_plan_not_found_message`] and for the same reason: "never
+/// existed" and "belongs to someone else" are one refusal, so one account cannot
+/// probe another's scan ids, and every operation rejects the same input the same
+/// way.
+pub fn malware_scan_not_found_message() -> String {
+    not_owned_message(SCAN_ID_MEMBER)
+}
+
+/// The message a start is refused with when the Region's endpoint holds no
+/// detector.
+///
+/// Malware Protection is a GuardDuty detector feature
+/// (`EBS_MALWARE_PROTECTION` is a `DetectorFeature` member —
+/// `smithy_query(shape="DetectorFeature")`) and a detector is per account per
+/// Region, so an endpoint with no detector has no Malware Protection to run a scan
+/// with.
+pub const MALWARE_SCAN_WITHOUT_DETECTOR_MESSAGE: &str =
+    "The request is rejected because GuardDuty is not enabled for this account in this Region.";
+
+/// The most malware scans one Region's endpoint retains.
+///
+/// A STORE GUARD, not a modelled quota, like [`MAX_CLIENT_TOKENS`]: AWS publishes
+/// no ceiling a caller can read, and a scan has no expiry of its own, so without
+/// this a caller could make the store retain records without limit. Past it a start
+/// is refused rather than an existing scan evicted: a scan a caller holds the id of
+/// must stay readable.
+pub const MAX_MALWARE_SCANS_PER_REGION: usize = 1_000;
+
+/// How many Regions the scan store partitions into, the same ceiling and for the
+/// same reason as [`MAX_MALWARE_PROTECTION_PLAN_REGIONS`]: the Region comes from the
+/// request's credential scope, so the partition KEY is request-chosen too.
+pub const MAX_MALWARE_SCAN_REGIONS: usize = MAX_MALWARE_PROTECTION_PLAN_REGIONS;
+
+/// The message a start past [`MAX_MALWARE_SCANS_PER_REGION`] is refused with.
+pub fn malware_scan_limit_message() -> String {
+    format!(
+        "The request is rejected because the account has reached the limit of {MAX_MALWARE_SCANS_PER_REGION} malware scans in this Region."
+    )
+}
+
+/// The `MalwareProtectionResourceType` the ARN `resource_arn` names, or `None` when
+/// it names nothing Malware Protection scans.
+///
+/// The TYPE is derived from the ARN rather than taken from the request, which
+/// carries no type member at all: `StartMalwareScan` documents that the resource an
+/// ARN names decides what the call does ("if the resourceArn belongs to an EC2
+/// instance" — `smithy_query(query="doc",shape="StartMalwareScan")`). The four
+/// resources below are the EC2/EBS members of
+/// [`crate::ops::types::shared_types::MALWARE_PROTECTION_RESOURCE_TYPE_VALUES`],
+/// matched on the resource-type segment of the standard EC2 ARN forms
+/// (`…:instance/i-…`, `…:volume/vol-…`, `…:snapshot/snap-…`, `…:image/ami-…`). The
+/// S3 and recovery-point members are not reachable through this operation: an S3
+/// bucket ARN carries no account id, which `ResourceArn`'s own pattern
+/// `^arn:[A-Za-z-]+:[A-Za-z0-9]+:[A-Za-z0-9-]+:\d+:…` requires
+/// (`smithy_query(operation="StartMalwareScan")`), and a recovery point's type is
+/// not derivable from its ARN.
+pub fn malware_scan_resource_type(resource_arn: &str) -> Option<&'static str> {
+    if !is_arn_for("ec2", resource_arn) {
+        return None;
+    }
+    let resource = resource_arn.splitn(6, ':').nth(5)?;
+    let (kind, id) = resource.split_once('/')?;
+    if id.is_empty() {
+        return None;
+    }
+    match kind {
+        "instance" => Some("EC2_INSTANCE"),
+        "volume" => Some("EBS_VOLUME"),
+        "snapshot" => Some("EBS_SNAPSHOT"),
+        "image" => Some("EC2_AMI"),
+        _ => None,
+    }
+}
+
+/// One malware scan: what the start call named, plus the status the scan is in.
+///
+/// The status moves only when the CLOCK owes it, through [`Self::settle`], so a
+/// reporting operation materialises it without deciding it.
+#[derive(Debug, Clone)]
+pub struct MalwareScan {
+    /// The minted `ScanId`.
+    pub id: String,
+    /// The Region whose endpoint started this scan, and the only one that serves
+    /// it.
+    pub region: String,
+    /// The detector that Region's endpoint held when the scan started, if any:
+    /// "The unique ID of the detector that is associated with the request, if it
+    /// belongs to an account which is a GuardDuty customer"
+    /// (`smithy_query(operation="GetMalwareScan")`).
+    pub detector_id: Option<String>,
+    /// `ResourceArn`: the resource the scan was invoked on, stored verbatim.
+    pub resource_arn: String,
+    /// The `MalwareProtectionResourceType` [`malware_scan_resource_type`] derived
+    /// from [`Self::resource_arn`].
+    pub resource_type: String,
+    /// `MalwareProtectionScanType`.
+    pub scan_type: String,
+    /// `ScanCategory`.
+    pub scan_category: String,
+    /// `ScanConfiguration.Role`: the IAM role the scan was asked to run as.
+    pub role: Option<String>,
+    /// `IncrementalScanDetails.BaselineResourceArn`, when the start asked for an
+    /// incremental scan.
+    pub baseline_resource_arn: Option<String>,
+    /// `RecoveryPoint.BackupVaultName`, when the start named a recovery point.
+    pub recovery_point_vault: Option<String>,
+    /// `ContinuousScanDetails.StartTime`, in epoch milliseconds.
+    pub continuous_scan_start_millis: Option<i64>,
+    /// `ContinuousScanDetails.EndTime`, in epoch milliseconds. Present exactly when
+    /// the start carried `ContinuousScanDetails`, whose `EndTime` is required
+    /// (`smithy_query(shape="ContinuousScanDetails")`).
+    pub continuous_scan_end_millis: Option<i64>,
+    /// The `ClientToken` the start carried, so a replay answers with this same scan
+    /// instead of starting a second one.
+    pub client_token: Option<String>,
+    /// `MalwareProtectionScanStatus`.
+    pub status: String,
+    /// `ScanStatusReason`, once the scan has one.
+    pub status_reason: Option<String>,
+    pub started_at_millis: i64,
+    /// When the clock owes this scan its terminal status. See
+    /// [`MALWARE_SCAN_TERMINAL_SPAN_MILLIS`].
+    pub terminal_due_millis: i64,
+    /// When it reached a terminal status, once it has.
+    pub completed_at_millis: Option<i64>,
+}
+
+impl MalwareScan {
+    /// A scan started at `now`, still [`MALWARE_SCAN_RUNNING`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn started(
+        id: String,
+        region: String,
+        detector_id: Option<String>,
+        resource_arn: String,
+        resource_type: &str,
+        scan_category: &str,
+        client_token: Option<String>,
+        now: i64,
+    ) -> Self {
+        Self {
+            id,
+            region,
+            detector_id,
+            resource_arn,
+            resource_type: resource_type.to_string(),
+            scan_type: MALWARE_SCAN_TYPE_ON_DEMAND.to_string(),
+            scan_category: scan_category.to_string(),
+            role: None,
+            baseline_resource_arn: None,
+            recovery_point_vault: None,
+            continuous_scan_start_millis: None,
+            continuous_scan_end_millis: None,
+            client_token,
+            status: MALWARE_SCAN_RUNNING.to_string(),
+            status_reason: None,
+            started_at_millis: now,
+            terminal_due_millis: now.saturating_add(MALWARE_SCAN_TERMINAL_SPAN_MILLIS),
+            completed_at_millis: None,
+        }
+    }
+
+    /// Has the scan reached a terminal status?
+    pub fn is_terminal(&self) -> bool {
+        self.status != MALWARE_SCAN_RUNNING
+    }
+
+    /// Apply the status change the CLOCK already made due, if any.
+    ///
+    /// The move out of `RUNNING` was owed at [`Self::terminal_due_millis`] whether
+    /// or not anybody called, which is why a reporting operation may apply it. It is
+    /// applied exactly once: a terminal scan never moves again, and it carries the
+    /// due instant rather than the instant somebody happened to read it.
+    pub fn settle(&mut self, now: i64) {
+        if self.is_terminal() || now < self.terminal_due_millis {
+            return;
+        }
+        self.status = MALWARE_SCAN_FAILED.to_string();
+        self.status_reason = Some(MALWARE_SCAN_UNAVAILABLE_REASON.to_string());
+        self.completed_at_millis = Some(self.terminal_due_millis);
+    }
 }
 
 /// One publishing destination: the resource a detector exports its findings to,

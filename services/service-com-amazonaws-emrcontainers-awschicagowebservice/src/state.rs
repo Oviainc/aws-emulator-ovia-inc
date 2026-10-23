@@ -203,6 +203,25 @@ pub fn request_region(ctx: &::smithy_server_runtime::OperationContext<'_>) -> St
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
+/// The ARN of the IAM principal every caller of this emulator authenticates as, and so
+/// the value of a "who created this" member (`JobTemplate$createdBy`,
+/// `SecurityConfiguration$createdBy`, `JobRun$createdBy`: "The user who created …").
+///
+/// `RequestIdentityUserArn`'s pattern is
+/// `^arn:(aws[a-zA-Z0-9-]*):(iam|sts)::(\d{12})?:[\w/+=,.@-]+$`, so the ARN carries no
+/// region — `::engine::emulator_arn` with an empty region produces exactly that form, and
+/// the result is 44 characters, inside the shape's 20..2048 length.
+///
+/// It names the one IAM user this emulator publishes — the very principal its
+/// `sts:GetCallerIdentity` answers, built the same way — so the principal a response
+/// reports is one the caller can look up. Deliberately NOT derived from the request's
+/// access key id: a member AWS fills from the AUTHENTICATED identity has to name an
+/// identity the identity service knows, and a per-request name spelled out of an access
+/// key id is not one.
+pub fn caller_identity_arn() -> String {
+    ::engine::emulator_arn("iam", "", "user/emulator")
+}
+
 /// A status change the clock owes a resource: at [`due_at`](Self::due_at) its state
 /// becomes [`next_state`](Self::next_state).
 ///
@@ -298,6 +317,9 @@ pub struct JobRunRecord {
     pub finished_at_millis: Option<i64>,
     pub state_details: Option<String>,
     pub tags: HashMap<String, String>,
+    /// The principal that submitted this run ([`caller_identity_arn`]), recorded at
+    /// `StartJobRun` so every later read attributes the run to the same identity.
+    pub created_by: String,
     /// Creation sequence, so job runs minted within one millisecond still have a total
     /// order for `ListJobRuns` to page through.
     pub sequence: u64,
@@ -324,9 +346,9 @@ impl JobRunRecord {
 
     /// The modelled `JobRun` this record represents.
     ///
-    /// `createdBy`, `failureReason` and `retryPolicyExecution` stay absent: no identity
-    /// created this run, nothing failed, and no attempt was executed — this emulator
-    /// runs no Spark job, so reporting an attempt count would be fabricated.
+    /// `failureReason` and `retryPolicyExecution` stay absent: nothing failed, and no
+    /// attempt was executed — this emulator runs no Spark job, so reporting an attempt
+    /// count would be fabricated.
     pub fn to_job_run(&self) -> JobRun {
         JobRun {
             id: Some(self.id.clone()),
@@ -340,7 +362,7 @@ impl JobRunRecord {
             configuration_overrides: self.configuration_overrides.clone(),
             job_driver: self.job_driver.clone(),
             created_at: Some(date_time(self.created_at_millis)),
-            created_by: None,
+            created_by: Some(self.created_by.clone()),
             finished_at: self.finished_at_millis.map(date_time),
             state_details: self.state_details.clone(),
             failure_reason: None,
@@ -545,6 +567,9 @@ pub struct JobTemplateRecord {
     pub job_template_data: JobTemplateData,
     pub kms_key_arn: Option<String>,
     pub client_token: String,
+    /// The principal that created this template ([`caller_identity_arn`]), recorded at
+    /// `CreateJobTemplate` so every later read attributes it to the same identity.
+    pub created_by: String,
     /// [`job_template_fingerprint`] of the request that minted this template, so a later
     /// call carrying the same `clientToken` is answered as a replay only when it is the
     /// same request.
@@ -557,9 +582,7 @@ pub struct JobTemplateRecord {
 impl JobTemplateRecord {
     /// The modelled `JobTemplate` this record represents.
     ///
-    /// `createdBy` stays absent: no IAM identity created this template — the emulator
-    /// verifies a signature but mints no `RequestIdentityUserArn` to attribute it to.
-    /// `decryptionError` stays absent too: a `kmsKeyArn` is persisted as submitted and
+    /// `decryptionError` stays absent: a `kmsKeyArn` is persisted as submitted and
     /// nothing is encrypted, so no decryption ever failed.
     pub fn to_job_template(&self) -> JobTemplate {
         JobTemplate {
@@ -567,7 +590,7 @@ impl JobTemplateRecord {
             name: Some(self.name.clone()),
             arn: Some(self.arn.clone()),
             created_at: Some(date_time(self.created_at_millis)),
-            created_by: None,
+            created_by: Some(self.created_by.clone()),
             tags: Some(self.tags.clone()),
             job_template_data: self.job_template_data.clone(),
             kms_key_arn: self.kms_key_arn.clone(),
@@ -590,26 +613,29 @@ pub struct SecurityConfigurationRecord {
     pub container_provider: Option<ContainerProvider>,
     pub tags: HashMap<String, String>,
     pub client_token: String,
+    /// The principal that created this configuration ([`caller_identity_arn`]), recorded
+    /// at `CreateSecurityConfiguration` so every later read attributes it to the same
+    /// identity.
+    pub created_by: String,
 }
 
 impl SecurityConfigurationRecord {
     /// The modelled `SecurityConfiguration` this record represents.
     ///
-    /// `createdBy` stays absent: no identity created this configuration in the emulator,
-    /// so reporting one would be fabricating a principal.
-    ///
-    /// `containerProvider` is stored (the create accepts it) but is NOT a member of the
-    /// `SecurityConfiguration` shape, so nothing reports it: see the shape's members in
-    /// `ops::types::shared_types`.
+    /// `containerProvider` is reported from the record `CreateSecurityConfiguration`
+    /// persisted it on: the create accepts one, and AWS echoes it back on every read of
+    /// the configuration even though the on-disk model does not declare the member — see
+    /// the shape in `ops::types::shared_types` for why it is carried there.
     pub fn to_security_configuration(&self) -> SecurityConfiguration {
         SecurityConfiguration {
             id: Some(self.id.clone()),
             name: Some(self.name.clone()),
             arn: Some(self.arn.clone()),
             created_at: Some(date_time(self.created_at_millis)),
-            created_by: None,
+            created_by: Some(self.created_by.clone()),
             security_configuration_data: Some(self.security_configuration_data.clone()),
             tags: Some(self.tags.clone()),
+            container_provider: self.container_provider.clone(),
         }
     }
 }
@@ -941,6 +967,21 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
         );
         self.security_configurations
             .insert(record.id.clone(), record);
+    }
+
+    /// Remove a stored security configuration and the idempotency entry that named it.
+    /// `None` when the id names no configuration.
+    ///
+    /// The entry goes WITH the record, on the same terms as [`Self::remove_job_template`]:
+    /// this emulator's token index holds exactly one entry per stored configuration and so
+    /// stays bounded by [`MAX_SECURITY_CONFIGURATIONS`].
+    pub fn remove_security_configuration(&mut self, id: &str) -> Option<SecurityConfigurationRecord> {
+        let record = self.security_configurations.remove(id)?;
+        self.idempotency.remove(&(
+            CREATE_SECURITY_CONFIGURATION_SCOPE.to_string(),
+            record.client_token.clone(),
+        ));
+        Some(record)
     }
 
     /// The modelled `SecurityConfiguration` for this id.

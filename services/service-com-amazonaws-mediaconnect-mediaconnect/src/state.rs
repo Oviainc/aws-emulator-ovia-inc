@@ -18,11 +18,14 @@ use crate::ops::types::{
     Bridge, BridgeFlowSource, BridgeNetworkOutput, BridgeNetworkSource, BridgeOutput, BridgeSource,
     DestinationConfiguration, EgressGatewayBridge, EncodingConfig, EncodingParameters, Encryption,
     Entitlement, FailoverConfig, Flow, FlowTransitEncryption, Gateway, GatewayNetwork,
-    GrantEntitlementRequest, IngressGatewayBridge, Interface, ListedBridge, ListedFlow,
+    GatewayBridgeSource, GrantEntitlementRequest, IngressGatewayBridge, InputConfiguration,
+    Interface, ListedBridge, ListedFlow,
     ListedGateway,
     Maintenance, MediaStream, MediaStreamAttributes, MediaStreamAttributesRequest,
-    MediaStreamOutputConfiguration, MediaStreamOutputConfigurationRequest, MonitoringConfig,
-    NdiConfig, Output, SetSourceRequest, Source, Transport, UpdateFailoverConfig, VpcInterface,
+    MediaStreamOutputConfiguration, MediaStreamOutputConfigurationRequest,
+    MediaStreamSourceConfiguration, MediaStreamSourceConfigurationRequest, MonitoringConfig,
+    NdiConfig, Output, SetSourceRequest, Source, Transport, UpdateEncryption,
+    UpdateFailoverConfig, VpcInterface,
     VpcInterfaceAttachment,
 };
 
@@ -569,6 +572,57 @@ pub fn merged_failover_config(
     resolved_failover_config(merged)
 }
 
+/// The encryption a resource holds after `update` is applied to `stored`, or `None` when
+/// the merge would leave an encryption with no role ARN.
+///
+/// `UpdateEncryption` mirrors `Encryption` member for member and every member of it is
+/// optional, so applying one is a member-wise merge — the same merge
+/// [`merged_failover_config`] performs for an `UpdateFailoverConfig`: a member the request
+/// carries replaces its counterpart, one it omits keeps the stored value.
+///
+/// `Encryption$RoleArn` is REQUIRED (`smithy_query(query="shape",shape="Encryption")`)
+/// while `UpdateEncryption$RoleArn` is not, so a resource that holds no encryption yet can
+/// only be given one by a request that names the role: `None` says the merge is not
+/// expressible, and the caller refuses the request with its own modelled client error.
+///
+/// Every operation that applies an `UpdateEncryption` resolves it HERE — UpdateFlowOutput's
+/// `Encryption`, UpdateFlowEntitlement's and UpdateFlowSource's `Decryption`, which target
+/// the same request shape and the same stored `Encryption` — so one request shape always
+/// becomes the same stored record.
+pub fn merged_encryption(stored: Option<&Encryption>, update: &UpdateEncryption) -> Option<Encryption> {
+    let role_arn = update
+        .role_arn
+        .clone()
+        .or_else(|| stored.map(|encryption| encryption.role_arn.clone()))?;
+    let mut merged = stored.cloned().unwrap_or_default();
+    merged.role_arn = role_arn;
+    if let Some(algorithm) = update.algorithm.clone() {
+        merged.algorithm = Some(algorithm);
+    }
+    if let Some(vector) = update.constant_initialization_vector.clone() {
+        merged.constant_initialization_vector = Some(vector);
+    }
+    if let Some(device_id) = update.device_id.clone() {
+        merged.device_id = Some(device_id);
+    }
+    if let Some(key_type) = update.key_type.clone() {
+        merged.key_type = Some(key_type);
+    }
+    if let Some(region) = update.region.clone() {
+        merged.region = Some(region);
+    }
+    if let Some(resource_id) = update.resource_id.clone() {
+        merged.resource_id = Some(resource_id);
+    }
+    if let Some(secret_arn) = update.secret_arn.clone() {
+        merged.secret_arn = Some(secret_arn);
+    }
+    if let Some(url) = update.url.clone() {
+        merged.url = Some(url);
+    }
+    Some(merged)
+}
+
 /// A status change the clock owes: at `due_at` the flow's status becomes `status`.
 #[derive(Debug, Clone)]
 pub struct PendingStatus {
@@ -602,6 +656,15 @@ pub struct StoredSource {
     /// flow source when router integration is enabled", as the request that set the
     /// source configured it.
     pub router_integration_transit_decryption: Option<FlowTransitEncryption>,
+    /// `Source$MediaStreamSourceConfigurations` — "the media streams that are associated
+    /// with the source, and the parameters for those associations", as
+    /// [`materialise_media_stream_source_configurations`] materialised the request's.
+    /// `None` for a source that is associated with no media stream, so the member is
+    /// absent rather than an empty list.
+    pub media_stream_source_configurations: Option<Vec<MediaStreamSourceConfiguration>>,
+    /// `Source$GatewayBridgeSource` — "the source configuration for cloud flows receiving
+    /// a stream from a bridge", as the request that set the source configured it.
+    pub gateway_bridge_source: Option<GatewayBridgeSource>,
 }
 
 impl StoredSource {
@@ -654,6 +717,25 @@ impl StoredSource {
             router_integration_transit_decryption: request
                 .router_integration_transit_decryption
                 .clone(),
+            // "The media streams that are associated with the source": the association
+            // list the request carries, materialised the one way this crate materialises
+            // that request shape. A request that carries none, or an empty list,
+            // associates no media stream, so the member is absent rather than empty.
+            media_stream_source_configurations: request
+                .media_stream_source_configurations
+                .as_deref()
+                .filter(|configurations| !configurations.is_empty())
+                .map(|configurations| {
+                    materialise_media_stream_source_configurations(configurations, suffix)
+                }),
+            // `SetGatewayBridgeSourceRequest` mirrors `GatewayBridgeSource` member for
+            // member, with `BridgeArn` required on both.
+            gateway_bridge_source: request.gateway_bridge_source.as_ref().map(|bridge| {
+                GatewayBridgeSource {
+                    bridge_arn: bridge.bridge_arn.clone(),
+                    vpc_interface_attachment: bridge.vpc_interface_attachment.clone(),
+                }
+            }),
             // `Transport.Protocol` is required, so a source that names no protocol (an
             // entitled one, say) carries no transport rather than an empty one.
             transport: request.protocol.clone().map(|protocol| Transport {
@@ -694,9 +776,52 @@ impl StoredSource {
             sender_control_port: self.sender_control_port,
             decryption: self.decryption.clone(),
             transport: self.transport.clone(),
+            media_stream_source_configurations: self.media_stream_source_configurations.clone(),
+            gateway_bridge_source: self.gateway_bridge_source.clone(),
             ..Source::default()
         }
     }
+}
+
+/// Materialise the `MediaStreamSourceConfigurationRequest`s a request carries into the
+/// `MediaStreamSourceConfiguration`s the source record keeps.
+///
+/// The crate's ONE materialisation of that request shape: CreateFlow's `Source` /
+/// `Sources` and AddFlowSources reach it through [`StoredSource::from_set_request`] and
+/// UpdateFlowSource applies it to the source it updates, so one request shape always
+/// becomes the same stored record.
+///
+/// The request and the stored shape mirror each other member for member except
+/// `InputConfiguration$InputIp`, which has no counterpart in the request shape and is
+/// REQUIRED on the stored one: it is "the IP address that the flow listens on for incoming
+/// content for a media stream", so the SERVICE assigns it, from the same documentation
+/// range a source's own ingest address is drawn from ([`assigned_ingest_ip`]) and keyed by
+/// the ARN counter value `suffix` of the call that materialised the association. It is
+/// stored, so every later read reports the same address.
+pub fn materialise_media_stream_source_configurations(
+    requests: &[MediaStreamSourceConfigurationRequest],
+    suffix: u64,
+) -> Vec<MediaStreamSourceConfiguration> {
+    let input_ip = assigned_ingest_ip(suffix);
+    requests
+        .iter()
+        .map(|request| MediaStreamSourceConfiguration {
+            media_stream_name: request.media_stream_name.clone(),
+            encoding_name: request.encoding_name.clone(),
+            input_configurations: request.input_configurations.as_ref().map(|configurations| {
+                configurations
+                    .iter()
+                    .map(|configuration| InputConfiguration {
+                        input_ip: input_ip.clone(),
+                        input_port: configuration.input_port,
+                        interface: Interface {
+                            name: configuration.interface.name.clone(),
+                        },
+                    })
+                    .collect()
+            }),
+        })
+        .collect()
 }
 
 /// An output of a stored flow.
@@ -1120,6 +1245,38 @@ impl StoredFlow {
             .iter()
             .map(|entitlement| entitlement.name.clone())
             .collect()
+    }
+
+    /// What the media stream named `media_stream_name` is associated with, as the phrase a
+    /// refusal names it by, or `None` when nothing of this flow carries it.
+    ///
+    /// A media stream is associated with a source through
+    /// `Source.MediaStreamSourceConfigurations` ("the media streams that are associated
+    /// with the source") and with an output through
+    /// `Output.MediaStreamOutputConfigurations` ("the configuration for each media stream
+    /// that is associated with the output"), and both name the media stream by name. The
+    /// lookup is stated once here because every operation whose documented precondition is
+    /// an association — RemoveFlowMediaStream ("only available if the media stream is not
+    /// associated with a source or output") — must read the SAME associations.
+    pub fn media_stream_association(&self, media_stream_name: &str) -> Option<String> {
+        let source = self.sources.iter().find(|source| {
+            source
+                .media_stream_source_configurations
+                .iter()
+                .flatten()
+                .any(|configuration| configuration.media_stream_name == media_stream_name)
+        });
+        if let Some(source) = source {
+            return Some(format!("source {}", source.source_arn));
+        }
+        let output = self.outputs.iter().find(|output| {
+            output
+                .media_stream_output_configurations
+                .iter()
+                .flatten()
+                .any(|configuration| configuration.media_stream_name == media_stream_name)
+        });
+        output.map(|output| format!("output {}", output.output_arn))
     }
 
     /// `ListedFlow.SourceType`: `ENTITLED` when the flow ingests through an entitlement

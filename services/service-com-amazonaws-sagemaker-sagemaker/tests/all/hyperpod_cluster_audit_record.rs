@@ -241,6 +241,10 @@ fn seed_not_due(emulator: &Emulator, name: &str) -> String {
             tags: Vec::new(),
             creation_time: now,
             in_service_at: now + FAR_FROM_DUE,
+            // A cluster holds the nodes `BatchAddClusterNodes` added to it; a seeded one
+            // has none, the same as one `CreateCluster` just made.
+            nodes: std::collections::BTreeMap::new(),
+            node_additions: std::collections::BTreeMap::new(),
         },
     );
     arn

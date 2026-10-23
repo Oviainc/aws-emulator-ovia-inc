@@ -7,6 +7,12 @@
 //! configuration whose lock date has passed is immutable and refused with
 //! `InvalidRequestException`.
 //!
+//! The vault is resolved through
+//! [`crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::visible_vault_mut`],
+//! which decides ACCESS before EXISTENCE: a vault-lock action is authorized
+//! against the named vault, so a vault outside the caller's visibility is
+//! refused with 403 `AccessDeniedException` before any existence lookup.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -179,20 +185,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
-        let Some(vault) = store.vaults.get_mut(&input.backup_vault_name) else {
-            return Err(
-                DeleteBackupVaultLockConfigurationErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "Backup vault {} not found",
-                            input.backup_vault_name
-                        )),
-                        ..Default::default()
-                    },
-                )
-                .into(),
-            );
-        };
+        // The same access-before-existence decision `PutBackupVaultLockConfiguration`
+        // makes: a vault-lock action is authorized against the named vault, so a
+        // vault outside the caller's visibility is refused with 403
+        // `AccessDeniedException` rather than reported as missing, and the two
+        // vault-lock actions answer an invisible vault identically.
+        let vault = store.visible_vault_mut(&input.backup_vault_name, None)?;
 
         // "If the Vault Lock configuration is immutable, then you cannot delete
         // Vault Lock using API operations, and you will receive an

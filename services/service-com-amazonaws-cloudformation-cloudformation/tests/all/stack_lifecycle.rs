@@ -3,10 +3,12 @@
 //! The stack lifecycle, end to end over the awsQuery wire.
 //!
 //! Every case here drives the real request path — form-encoded body in, XML envelope out
-//! — through a router carrying only this service, so what it asserts is what a client
+//! — through the router, so what it asserts is what a client
 //! sees: `CreateStack` persists a stack, and `DescribeStacks`, `ListStacks`,
 //! `GetTemplate`, `UpdateStack`, `DeleteStack` and `DescribeStackEvents` read and mutate
-//! THAT stack rather than echoing the request back.
+//! THAT stack rather than echoing the request back. That router carries Amazon S3 beside
+//! this service on one engine, because a stack that declares an `AWS::S3::Bucket`
+//! provisions it by calling S3 in process (see `router_with_engine`).
 //!
 //! The wire harness here (`call`, `member`, the XML readers, `router`) is this crate's
 //! one such harness: `stack_outputs.rs` drives its cases through these same helpers.

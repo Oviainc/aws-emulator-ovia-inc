@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAutoScalingGroupRecommendations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAutoScalingGroupRecommendations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAutoScalingGroupRecommendations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the Auto Scaling group analysis held in this service's state
+//! (`crate::state::AnalyzedAutoScalingGroup`), one page at a time, for an account that
+//! is opted in and whose analysis is due. Every value in a recommendation is either an
+//! observation stored with the analysis or a figure computed from it: the finding from
+//! the candidate configurations, each option's rank from its position, its projected
+//! utilization from the observed utilization and the capacity it is projected onto, its
+//! savings from the stored on-demand prices, its migration effort from the CPU
+//! architectures and the inferred workload types, and the look-back period and the
+//! effective preferences from the account's stored recommendation preferences.
+//!
+//! This operation REPORTS; it writes nothing to the store.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +182,415 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAutoScalingGroupRecommendations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAutoScalingGroupRecommendationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAutoScalingGroupRecommendations"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetAutoScalingGroupRecommendationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The Compute Optimizer recommendation store is unavailable.".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // A malformed request is refused BEFORE the store is read, so
+        // InvalidParameterValueException takes precedence over the opt-in gate below, as
+        // it does in this service's other readers.
+        let account_ids: Vec<String> = input.account_ids.clone().unwrap_or_default();
+        // "Only one account ID can be specified per request."
+        if account_ids.len() > 1 {
+            return Err(invalid_parameter(format!(
+                "The value supplied for parameter accountIds is not valid: only one account ID \
+                 can be specified per request, not {}.",
+                account_ids.len(),
+            )));
+        }
+        if let Some(account_id) = account_ids
+            .iter()
+            .find(|id| !crate::state::is_account_id(id))
+        {
+            return Err(invalid_parameter(format!(
+                "The value supplied for parameter accountIds is not valid: {account_id} is not a \
+                 12-digit Amazon Web Services account ID.",
+            )));
+        }
+
+        // Every `autoScalingGroupArns` entry must be the ARN of an Auto Scaling group;
+        // an ARN that names something else cannot identify a group to report on. The
+        // refusal carries the message the service answers for this condition, which the
+        // recorded AWS behaviour pins to this exact wording for any malformed ARN.
+        let requested_arns: Vec<String> = input.auto_scaling_group_arns.clone().unwrap_or_default();
+        if requested_arns.iter().any(|arn| {
+            crate::state::parse_resource_arn(arn).is_none_or(|parsed| {
+                parsed.resource_type != crate::state::RESOURCE_TYPE_AUTO_SCALING_GROUP
+            })
+        }) {
+            return Err(invalid_parameter(
+                "Invalid Auto Scaling group ARN.".to_string(),
+            ));
+        }
+
+        for filter in input.filters.iter().flatten() {
+            if let Some(reason) = filter_rejection(filter) {
+                return Err(invalid_parameter(reason));
+            }
+        }
+
+        // `cpuVendorArchitectures` selects which candidate configurations are reported:
+        // "when you specify AWS_ARM64 with a GetAutoScalingGroupRecommendations request,
+        // Compute Optimizer returns recommendations that consist of Graviton instance
+        // types only".
+        let requested_architectures: Vec<String> = input
+            .recommendation_preferences
+            .as_ref()
+            .and_then(|preferences| preferences.cpu_vendor_architectures.clone())
+            .unwrap_or_default();
+        if let Some(architecture) = requested_architectures
+            .iter()
+            .find(|value| !CPU_VENDOR_ARCHITECTURE_VALUES.contains(&value.as_str()))
+        {
+            return Err(invalid_parameter(format!(
+                "The value supplied for parameter recommendationPreferences is not valid: \
+                 {architecture} is not a CPU vendor architecture.",
+            )));
+        }
+
+        // A `nextToken` this service did not issue cannot name a page boundary.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_resource_page_token(token) {
+                Some(arn) => Some(arn),
+                None => {
+                    return Err(invalid_parameter(
+                        "The value supplied for parameter nextToken is not valid.".to_string(),
+                    ))
+                }
+            },
+        };
+
+        // `maxResults` is modelled 0..1000 (the boundary refuses anything outside that).
+        // Whatever it asks for, the page is capped at `MAX_PAGE_SIZE` so no number a
+        // request carries can size the response or the allocation that builds it; a
+        // request naming no size (or the range's lower bound `0`, which the service
+        // documents no meaning for) gets `DEFAULT_PAGE_SIZE`.
+        let page_size = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .filter(|requested| *requested > 0)
+            .unwrap_or(crate::state::DEFAULT_PAGE_SIZE)
+            .min(crate::state::MAX_PAGE_SIZE);
+
+        let guard = state.lock();
+        if !guard.enrollment.is_opted_in() {
+            return Err(
+                GetAutoScalingGroupRecommendationsErrorModeled::OptInRequiredException(
+                    OptInRequiredException {
+                        message: Some(
+                            "The account is not opted in to Compute Optimizer.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The ID of the Amazon Web Services account for which to return Auto Scaling
+        // group recommendations": the one account the request names, or the caller's own
+        // account where it names none.
+        let account_id = account_ids
+            .first()
+            .cloned()
+            .unwrap_or_else(|| ::engine::emulator_account_id().to_string());
+
+        // When the Auto Scaling group recommendations were last generated: the analysis
+        // the account's enrollment started, which came due one analysis span after the
+        // enrollment record was written. Derived from the store, so every read of the
+        // same analysis reports the same instant.
+        let last_refresh_timestamp = guard.enrollment.last_updated_timestamp.map(|written| {
+            ::aws_smithy_types::DateTime::from_secs_f64(
+                written.as_secs_f64() + crate::state::ANALYSIS_DELAY.as_secs_f64(),
+            )
+        });
+
+        let analyses = guard.visible_auto_scaling_group_analyses();
+        let for_account: Vec<&crate::state::AnalyzedAutoScalingGroup> = analyses
+            .iter()
+            .filter(|group| group.account_id == account_id)
+            .filter(|group| requested_arns.is_empty() || requested_arns.contains(&group.arn))
+            .collect();
+
+        // An identifier the request named that this analysis holds no recommendation for
+        // is reported in `errors` — "an error is returned if you request recommendations
+        // for an unsupported Auto Scaling group" — rather than silently omitted, so a
+        // caller can tell "no recommendation for this group" from "not asked about".
+        let errors: Vec<GetRecommendationError> = requested_arns
+            .iter()
+            .filter(|arn| !for_account.iter().any(|group| &&group.arn == arn))
+            .map(|arn| GetRecommendationError {
+                identifier: Some(arn.clone()),
+                code: Some(NO_RECOMMENDATION_CODE.to_string()),
+                message: Some(format!(
+                    "Compute Optimizer has no Auto Scaling group recommendation for {arn}.",
+                )),
+            })
+            .collect();
+
+        // Each surviving group with the preferences its recommendation is generated
+        // under: the account's stored preferences resolved for that group's ARN.
+        let resolved: Vec<(&crate::state::AnalyzedAutoScalingGroup, crate::state::EffectivePreferences)> =
+            for_account
+                .into_iter()
+                .filter_map(|group| {
+                    let parsed = crate::state::parse_resource_arn(&group.arn)?;
+                    Some((group, guard.effective_preferences(&group.arn, parsed)))
+                })
+                .filter(|(group, preferences)| {
+                    input
+                        .filters
+                        .iter()
+                        .flatten()
+                        .all(|filter| filter_matches(filter, group, preferences))
+                })
+                .collect();
+
+        // One page of the selected recommendations, resuming at the group a `nextToken`
+        // names, plus a token naming the group the page after this one starts at. A token
+        // this service issued whose group the current selection does not hold cannot name
+        // a boundary of THIS result set — the request changed its filters, or the analysis
+        // moved on — so it is refused rather than answered with an empty final page a
+        // caller would read as "no more recommendations".
+        let start = match &resume_at {
+            None => 0,
+            Some(arn) => match resolved.iter().position(|(group, _)| &group.arn == arn) {
+                Some(index) => index,
+                None => {
+                    return Err(invalid_parameter(
+                        "The value supplied for parameter nextToken is not valid.".to_string(),
+                    ))
+                }
+            },
+        };
+        let page = resolved.get(start..).unwrap_or_default();
+        let next_token = page
+            .get(page_size)
+            .map(|(group, _)| crate::state::encode_resource_page_token(&group.arn));
+
+        let recommendations = page
+            .iter()
+            .take(page_size)
+            .map(|(group, preferences)| {
+                recommendation(
+                    group,
+                    preferences,
+                    &requested_architectures,
+                    last_refresh_timestamp,
+                )
+            })
+            .collect();
+
+        Ok(GetAutoScalingGroupRecommendationsOutput {
+            next_token,
+            auto_scaling_group_recommendations: Some(recommendations),
+            errors: Some(errors),
+        })
+    }
+}
+
+/// The `code` an `errors` entry carries for an identifier this service holds no
+/// recommendation for.
+///
+/// `GetRecommendationError$code` is "the error code", a free-form string the model names
+/// no vocabulary for, so this is the emulator's own stable code — the same one this
+/// service's other per-identifier error reports
+/// ([`crate::state::NO_RECOMMENDATION_CODE`]), so a client sees one spelling of one
+/// condition across the service. The requirement the entry carries is its `identifier`.
+const NO_RECOMMENDATION_CODE: &str = crate::state::NO_RECOMMENDATION_CODE;
+
+/// Refuse a request this operation cannot act on: "the value supplied for the input
+/// parameter is out of range or not valid" (HTTP 400).
+fn invalid_parameter(message: String) -> GetAutoScalingGroupRecommendationsError {
+    GetAutoScalingGroupRecommendationsErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// Why `filter` is not a filter this operation accepts, or `None` when it is.
+///
+/// The name must be a `FilterName` and each value must belong to the vocabulary that name
+/// filters on — the modelled enum for it, so a value the model knows is accepted even
+/// where no Auto Scaling group recommendation can carry it (a `Finding` of
+/// `Underprovisioned`, which is an EC2 instance finding, or a finding reason code, which
+/// an Auto Scaling group recommendation does not report): such a filter is well formed and
+/// selects nothing.
+fn filter_rejection(filter: &Filter) -> Option<String> {
+    let Some(name) = filter.name.as_deref() else {
+        // A filter is a name/value pair: values with no name name no vocabulary to
+        // filter on, so the request cannot be acted on.
+        return Some(
+            "The value supplied for parameter filters is not valid: a filter name must be \
+             supplied."
+                .to_string(),
+        );
+    };
+    if !FILTER_NAME_VALUES.contains(&name) {
+        return Some(format!(
+            "The value supplied for parameter filters is not valid: {name} is not a filter name.",
+        ));
+    }
+    let vocabulary: &[&str] = match name {
+        "Finding" => FINDING_VALUES,
+        "RecommendationSourceType" => RECOMMENDATION_SOURCE_TYPE_VALUES,
+        "InferredWorkloadTypes" => INFERRED_WORKLOAD_TYPE_VALUES,
+        // `FindingReasonCodes` filters on either reason-code vocabulary the model
+        // declares; the instance one is the superset this operation checks against.
+        _ => INSTANCE_RECOMMENDATION_FINDING_REASON_CODE_VALUES,
+    };
+    let value = filter
+        .values
+        .iter()
+        .flatten()
+        .find(|value| !vocabulary.contains(&value.as_str()))?;
+    Some(format!(
+        "The value supplied for parameter filters is not valid: {value} is not a value of the \
+         {name} filter.",
+    ))
+}
+
+/// Whether `group` passes `filter`.
+///
+/// A filter with no values constrains nothing. `Finding` matches the group's computed
+/// finding, `RecommendationSourceType` the resource type this operation reports
+/// (`AutoScalingGroup`), and `InferredWorkloadTypes` any workload type the analysis
+/// inferred for the group — none, when the account deactivated the inference.
+/// `FindingReasonCodes` selects nothing: an Auto Scaling group recommendation reports no
+/// finding reason codes.
+fn filter_matches(
+    filter: &Filter,
+    group: &crate::state::AnalyzedAutoScalingGroup,
+    preferences: &crate::state::EffectivePreferences,
+) -> bool {
+    let Some(name) = filter.name.as_deref() else {
+        return true;
+    };
+    let values = filter.values.as_deref().unwrap_or_default();
+    if values.is_empty() {
+        return true;
+    }
+    match name {
+        "Finding" => values.iter().any(|value| value == group.finding()),
+        "RecommendationSourceType" => values
+            .iter()
+            .any(|value| value == crate::state::RESOURCE_TYPE_AUTO_SCALING_GROUP),
+        "InferredWorkloadTypes" => {
+            preferences.infers_workload_types()
+                && values
+                    .iter()
+                    .any(|value| group.inferred_workload_types.contains(value))
+        }
+        _ => false,
+    }
+}
+
+/// One Auto Scaling group's recommendation, computed from the stored analysis and the
+/// preferences in force for the group.
+///
+/// `currentInstanceGpuInfo` and an option's `instanceGpuInfo` are left unreported: no
+/// instance type in this analysis has an attached accelerator, and those members describe
+/// "the GPU accelerator settings" of one that does.
+fn recommendation(
+    group: &crate::state::AnalyzedAutoScalingGroup,
+    preferences: &crate::state::EffectivePreferences,
+    requested_architectures: &[String],
+    last_refresh_timestamp: Option<::aws_smithy_types::DateTime>,
+) -> AutoScalingGroupRecommendation {
+    // The candidates the request's CPU vendor architecture preference admits; a request
+    // that states no preference restricts nothing.
+    let options: Vec<&crate::state::GroupConfiguration> = group
+        .candidates
+        .iter()
+        .filter(|candidate| {
+            requested_architectures.is_empty()
+                || requested_architectures.contains(&candidate.architecture)
+        })
+        .collect();
+
+    // "Describes the CPU vendor and architecture for an instance or Auto Scaling group
+    // recommendations": the architectures the reported options actually consist of.
+    let mut architectures: Vec<String> = Vec::new();
+    for option in &options {
+        if !architectures.contains(&option.architecture) {
+            architectures.push(option.architecture.clone());
+        }
+    }
+
+    let recommendation_options = options
+        .iter()
+        .enumerate()
+        .map(|(index, option)| {
+            let (saving, percentage) = group.savings(option, 0.0);
+            let after_discounts = preferences.after_discounts().then(|| {
+                let (saving, percentage) =
+                    group.savings(option, group.savings_plans_discount_rate);
+                AutoScalingGroupSavingsOpportunityAfterDiscounts {
+                    savings_opportunity_percentage: percentage,
+                    estimated_monthly_savings: Some(AutoScalingGroupEstimatedMonthlySavings {
+                        currency: Some(crate::state::CURRENCY_USD.to_string()),
+                        value: saving,
+                    }),
+                }
+            });
+            AutoScalingGroupRecommendationOption {
+                configuration: Some(option.to_wire()),
+                instance_gpu_info: None,
+                projected_utilization_metrics: Some(
+                    group.projected_utilization_metrics(option),
+                ),
+                performance_risk: option.performance_risk,
+                // "The top recommendation option is ranked as 1."
+                rank: i32::try_from(index + 1).unwrap_or(i32::MAX),
+                savings_opportunity: Some(SavingsOpportunity {
+                    savings_opportunity_percentage: percentage,
+                    estimated_monthly_savings: Some(EstimatedMonthlySavings {
+                        currency: Some(crate::state::CURRENCY_USD.to_string()),
+                        value: saving,
+                    }),
+                }),
+                savings_opportunity_after_discounts: after_discounts,
+                migration_effort: Some(
+                    group
+                        .migration_effort(option, preferences.infers_workload_types())
+                        .to_string(),
+                ),
+            }
+        })
+        .collect();
+
+    AutoScalingGroupRecommendation {
+        account_id: Some(group.account_id.clone()),
+        auto_scaling_group_arn: Some(group.arn.clone()),
+        auto_scaling_group_name: Some(group.name.clone()),
+        finding: Some(group.finding().to_string()),
+        utilization_metrics: Some(group.utilization_metrics()),
+        // "The number of days for which utilization metrics were analyzed", which is the
+        // length of the look-back period in force for the group.
+        look_back_period_in_days: crate::state::look_back_period_in_days(
+            &preferences.look_back_period,
+        ),
+        current_configuration: Some(group.current.to_wire()),
+        current_instance_gpu_info: None,
+        recommendation_options: Some(recommendation_options),
+        last_refresh_timestamp,
+        current_performance_risk: Some(group.current_performance_risk.clone()),
+        effective_recommendation_preferences: Some(preferences.to_wire(architectures)),
+        // "The applications that might be running on the instances in the Auto Scaling
+        // group as inferred by Compute Optimizer" — reported unless the account
+        // deactivated the inference with a recommendation preference.
+        inferred_workload_types: preferences
+            .infers_workload_types()
+            .then(|| group.inferred_workload_types.clone()),
     }
 }

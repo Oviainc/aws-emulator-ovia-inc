@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCacheParameterGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCacheParameterGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCacheParameterGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation answers from this service's state. The SCAFFOLDED
+//! marker line is gone, which is what records it as no longer a stub
+//! (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`); the paragraphs below
+//! are the scaffold's notes on how an operation of this service is wired.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +156,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCacheParameterGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteCacheParameterGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCacheParameterGroup"))
+        // "Deletes the specified cache parameter group" — a mutation, and the only
+        // thing read back out is whether the delete may happen at all. `ctx` carries
+        // nothing this operation needs: the group's identity is its name and the
+        // response has no members, so no Region is resolved here.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // Same identity rule as `CreateCacheParameterGroup`:
+        // `CacheParameterGroupName` "is stored as a lowercase string", so the name
+        // this request resolves against the store is its lowercased form.
+        let name = input.cache_parameter_group_name.to_ascii_lowercase();
+        let now = ::std::time::SystemTime::now();
+        // One lock spans the checks and the removal, so of two concurrent deletes of
+        // the same name exactly one can be the one that found it present.
+        let mut store = state.lock();
+
+        // "The requested cache parameter group name does not refer to an existing
+        // cache parameter group" is the modelled 404, resolved through the one
+        // lookup every handler naming a `CacheParameterGroupName` shares.
+        if store.parameter_group(&name).is_none() {
+            return Err(
+                DeleteCacheParameterGroupErrorModeled::CacheParameterGroupNotFoundFault(
+                    CacheParameterGroupNotFoundFault {
+                        message: Some(format!("CacheParameterGroup {name} not found.")),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "You cannot delete the default cache parameter groups in your account":
+        // the groups in the `default.` namespace are the service's, one per
+        // published family, and they outlive every call. The name a request may
+        // not take is what the modelled parameter-value error refuses.
+        if name.starts_with(crate::state::DEFAULT_PARAMETER_GROUP_PREFIX) {
+            return Err(
+                DeleteCacheParameterGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "Invalid value {name} for CacheParameterGroupName: the default cache \
+                             parameter groups in your account cannot be deleted."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "You cannot delete a cache parameter group if it is associated with any
+        // cache clusters." A cluster carries the group it was created with, and a
+        // replication group carries one for its member clusters, so both are what
+        // an association means in this store.
+        let in_use_by_cluster = store
+            .cache_clusters
+            .values()
+            .any(|cluster| cluster.cache_parameter_group_name == name);
+        let in_use_by_replication_group = store
+            .replication_groups
+            .values()
+            .any(|group| group.cache_parameter_group_name == name);
+        if in_use_by_cluster || in_use_by_replication_group {
+            return Err(
+                DeleteCacheParameterGroupErrorModeled::InvalidCacheParameterGroupStateFault(
+                    InvalidCacheParameterGroupStateFault {
+                        message: Some(format!(
+                            "CacheParameterGroup {name} is still associated with a cache cluster \
+                             and cannot be deleted."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The group leaves the store, so a following `DescribeCacheParameterGroups`
+        // for the name answers `CacheParameterGroupNotFoundFault`, the quota it
+        // counted against frees up, and a create of the same name finds it vacant.
+        store.cache_parameter_groups.remove(&name);
+        // Deleting a cache parameter group is one of the events this service
+        // records, under the same source type the create records; see
+        // `crate::state::EventRecord`. The log outlives the record, so the events of
+        // a deleted group are still reported.
+        store.record_event(
+            crate::state::SOURCE_TYPE_CACHE_PARAMETER_GROUP,
+            &name,
+            "Cache parameter group deleted",
+            now,
+        );
+
+        // The operation's output shape is `Unit`: there is nothing to report but the
+        // 200 and the envelope's own `ResponseMetadata`.
+        Ok(DeleteCacheParameterGroupOutput)
     }
 }

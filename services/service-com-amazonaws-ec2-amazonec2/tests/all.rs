@@ -11,8 +11,14 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/describe_vpcs.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/address_transfers.rs"]
+mod address_transfers;
+#[path = "all/allowed_images_settings.rs"]
+mod allowed_images_settings;
 #[path = "all/application_status.rs"]
 mod application_status;
+#[path = "all/associate_address.rs"]
+mod associate_address;
 #[path = "all/availability_zones.rs"]
 mod availability_zones;
 #[path = "all/byoip_cidr_lifecycle.rs"]
@@ -27,6 +33,8 @@ mod coip_pools;
 mod copy_volumes;
 #[path = "all/create_security_group.rs"]
 mod create_security_group;
+#[path = "all/dedicated_hosts.rs"]
+mod dedicated_hosts;
 #[path = "all/default_network.rs"]
 mod default_network;
 #[path = "all/delete_vpc.rs"]
@@ -46,6 +54,10 @@ mod dry_run_and_unknown_ids;
 // The shared ec2Query plumbing every suite drives the service through.
 #[path = "all/ec2_query.rs"]
 mod ec2_query;
+// The ec2Query response envelope: the success flag and the media type every response
+// carries, whichever operation answered.
+#[path = "all/ec2_query_envelope.rs"]
+mod ec2_query_envelope;
 #[path = "all/elastic_ip_addresses.rs"]
 mod elastic_ip_addresses;
 #[path = "all/fast_launch_images.rs"]
@@ -54,6 +66,8 @@ mod fast_launch_images;
 mod fpga_image_tasks_and_volume_io;
 #[path = "all/get_password_data.rs"]
 mod get_password_data;
+#[path = "all/image_usage_reports.rs"]
+mod image_usage_reports;
 #[path = "all/images.rs"]
 mod images;
 #[path = "all/import_image_tasks.rs"]
@@ -72,6 +86,10 @@ mod mac_dedicated_hosts;
 mod modify_subnet_attribute;
 #[path = "all/network_performance_data.rs"]
 mod network_performance_data;
+#[path = "all/placement_groups.rs"]
+mod placement_groups;
+#[path = "all/regions.rs"]
+mod regions;
 #[path = "all/secondary_networks.rs"]
 mod secondary_networks;
 #[path = "all/secondary_subnets.rs"]
@@ -92,11 +110,15 @@ mod state_roundtrip;
 mod transit_gateway_acceptance;
 #[path = "all/transit_gateway_lifecycle.rs"]
 mod transit_gateway_lifecycle;
+#[path = "all/transit_gateway_route_table_propagation.rs"]
+mod transit_gateway_route_table_propagation;
 // The Verified Access trust provider slice: create, then read it back.
 #[path = "all/verified_access_trust_providers.rs"]
 mod verified_access_trust_providers;
 #[path = "all/volume_lifecycle.rs"]
 mod volume_lifecycle;
+#[path = "all/volume_modifications.rs"]
+mod volume_modifications;
 #[path = "all/vpc_attributes.rs"]
 mod vpc_attributes;
 #[path = "all/vpc_block_public_access_exclusions.rs"]

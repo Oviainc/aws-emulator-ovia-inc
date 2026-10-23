@@ -18,7 +18,7 @@ use smithy_server_runtime::multi_service_router::MultiServiceRouter;
 
 /// The canonical account id every ARN a generated emulator mints carries
 /// (`engine::emulator_account_id`).
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// The values the model's `ExecutionState` enum declares, from
 /// `smithy_query(query="shape", shape="ExecutionState", model_path="services/service-com-amazonaws-arcregionswitch-arcregionswitch/smithy-model/com-amazonaws-arcregionswitch-arcregionswitch.json")`.
@@ -37,7 +37,7 @@ const EXECUTION_STATES: &[&str] = &[
 ];
 
 /// A router carrying this one service on a fresh shared engine.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // This suite exercises operation behaviour, not request signing.
@@ -49,7 +49,11 @@ fn router() -> MultiServiceRouter {
 }
 
 /// Call one operation and return its HTTP status and parsed body.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -77,7 +81,7 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u1
 }
 
 /// The wire error code of an error response: the `__type` member's shape name.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or("<no __type>")
@@ -88,7 +92,7 @@ fn error_code(body: &Value) -> String {
 }
 
 /// One workflow with `step_names` manual-approval steps.
-fn workflow(action: &str, step_names: &[&str]) -> Value {
+pub(crate) fn workflow(action: &str, step_names: &[&str]) -> Value {
     let steps: Vec<Value> = step_names
         .iter()
         .map(|name| {
@@ -114,7 +118,7 @@ fn workflow(action: &str, step_names: &[&str]) -> Value {
 }
 
 /// The workflow set most cases use: one per traffic-shifting action.
-fn default_workflows() -> Value {
+pub(crate) fn default_workflows() -> Value {
     json!([
         workflow("activate", &["scale-up", "shift-traffic"]),
         workflow("deactivate", &["shift-traffic", "scale-down"]),
@@ -157,7 +161,12 @@ fn unrunnable_workflow(action: &str, step_names: &[&str]) -> Value {
 }
 
 /// A `CreatePlan` request carrying only the required members plus `workflows`.
-fn create_request(name: &str, regions: [&str; 2], approach: &str, workflows: Value) -> Value {
+pub(crate) fn create_request(
+    name: &str,
+    regions: [&str; 2],
+    approach: &str,
+    workflows: Value,
+) -> Value {
     json!({
         "name": name,
         "regions": regions,
@@ -168,7 +177,11 @@ fn create_request(name: &str, regions: [&str; 2], approach: &str, workflows: Val
 }
 
 /// Create a plan and return its ARN.
-async fn create_plan(router: &MultiServiceRouter, name: &str, regions: [&str; 2]) -> String {
+pub(crate) async fn create_plan(
+    router: &MultiServiceRouter,
+    name: &str,
+    regions: [&str; 2],
+) -> String {
     let request = create_request(name, regions, "activePassive", default_workflows());
     let (status, created) = call(router, "CreatePlan", &request).await;
     assert_eq!(
@@ -825,9 +838,9 @@ async fn a_client_token_maps_to_one_execution_and_a_plan_runs_one_at_a_time() {
 }
 
 /// An execution is created in a transient state and the clock — not the read — moves it
-/// on, so a caller acting straight after the start still sees the transient state. The
-/// outcome the clock owes it is the service's modelled FAILURE state, because this
-/// emulator runs no workflow execution block; and failing RELEASES the plan.
+/// on, so a caller acting straight after the start still sees the transient state. An
+/// execution whose next step is a block this emulator does not run reaches the service's
+/// modelled FAILURE state, with the reason recorded; and failing RELEASES the plan.
 #[tokio::test]
 async fn an_execution_starts_pending_and_the_clock_settles_it_into_the_failure_state() {
     let router = router();
@@ -879,6 +892,28 @@ async fn an_execution_starts_pending_and_the_clock_settles_it_into_the_failure_s
         later["startTime"], immediately["startTime"],
         "case \"after the outcome came due\": startTime expected {}, got {}",
         immediately["startTime"], later["startTime"]
+    );
+    // The step it stopped at is the one that was not performed; the one behind it was
+    // never reached.
+    let stopped: Vec<(&str, &str)> = later["stepStates"]
+        .as_array()
+        .map(|steps| {
+            steps
+                .iter()
+                .map(|step| {
+                    (
+                        step["name"].as_str().unwrap_or_default(),
+                        step["status"].as_str().unwrap_or_default(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        stopped,
+        vec![("scale-up", "failed"), ("shift-traffic", "notStarted")],
+        "case \"after the outcome came due\": expected the first step failed and the rest \
+         unreached, got {stopped:?}"
     );
 
     // The reason is told, not left to guess: the executionFailed event carries it.
@@ -1267,8 +1302,8 @@ async fn list_plan_execution_events_reports_the_timeline_the_execution_recorded(
         );
     }
 
-    // `name` selects one step's events; the execution's own lifecycle events carry none,
-    // so a step filter answers an empty timeline here.
+    // `name` selects one step's events; the execution's own lifecycle events carry no step
+    // name, so a step filter answers an empty timeline here.
     let (status, filtered) = call(
         &router,
         "ListPlanExecutionEvents",
@@ -1284,6 +1319,23 @@ async fn list_plan_execution_events_reports_the_timeline_the_execution_recorded(
         json!([]),
         "case \"filtered by step name\": expected no step events, got {}",
         filtered["items"]
+    );
+
+    let (status, unreached) = call(
+        &router,
+        "ListPlanExecutionEvents",
+        &json!({"planArn": plan_arn, "executionId": execution_id, "name": "shift-traffic"}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case \"filtered by an unreached step\": expected 200, got {status} with {unreached}"
+    );
+    assert_eq!(
+        unreached["items"],
+        json!([]),
+        "case \"filtered by an unreached step\": expected no events, got {}",
+        unreached["items"]
     );
 
     let (status, body) = call(

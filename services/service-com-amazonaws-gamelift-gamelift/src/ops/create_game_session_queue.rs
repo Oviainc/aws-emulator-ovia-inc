@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGameSessionQueue
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGameSessionQueue`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateGameSessionQueue::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates the placement queue the request describes and persists it, so this response
+//! and every later read of the queue (`DescribeGameSessionQueues`) are served from the
+//! one stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -215,18 +210,153 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGameSessionQueue` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGameSessionQueueErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGameSessionQueue"))
+        use crate::state::{
+            DEFAULT_QUEUE_TIMEOUT_SECONDS, MAX_GAME_SESSION_QUEUES_PER_ACCOUNT,
+            MAX_QUEUE_DESTINATIONS, MAX_QUEUE_PLAYER_LATENCY_POLICIES, QUEUE_TIMEOUT_RANGE_SECONDS,
+        };
+
+        let invalid = |message: String| -> Self::Error {
+            CreateGameSessionQueueErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        // The two list members the model leaves unbounded are what one request could
+        // otherwise make a stored queue occupy — the record holds them for as long as the
+        // queue exists — so they are refused HERE, before any state is locked and before
+        // anything is stored. (`Tags`, `Name`, `CustomEventData` and `NotificationTarget`
+        // carry modelled lengths, and the `PriorityConfiguration` and
+        // `FilterConfiguration` lists are bounded by the model at 4 and 100 entries, so
+        // the boundary walk has already refused an oversized one of those.)
+        let destination_count = input.destinations.as_ref().map_or(0, Vec::len);
+        if destination_count > MAX_QUEUE_DESTINATIONS {
+            return Err(invalid(format!(
+                "Destinations lists {destination_count} destinations; a queue may list at most \
+                 {MAX_QUEUE_DESTINATIONS}."
+            )));
+        }
+        let policy_count = input.player_latency_policies.as_ref().map_or(0, Vec::len);
+        if policy_count > MAX_QUEUE_PLAYER_LATENCY_POLICIES {
+            return Err(invalid(format!(
+                "PlayerLatencyPolicies lists {policy_count} policies; a queue may list at most \
+                 {MAX_QUEUE_PLAYER_LATENCY_POLICIES}."
+            )));
+        }
+
+        // "The maximum time, in seconds, that a new game session placement request
+        // remains in the queue [...] The minimum value is 10 and the maximum value is
+        // 600." The modelled `WholeNumber` range bounds the member only below, so the
+        // documented bounds are what this refusal enforces — and the message names the
+        // member, the value and the bounds it missed.
+        let (min_timeout, max_timeout) = QUEUE_TIMEOUT_RANGE_SECONDS;
+        let timeout_in_seconds = match input.timeout_in_seconds {
+            Some(requested) if !(min_timeout..=max_timeout).contains(&requested) => {
+                return Err(invalid(format!(
+                    "TimeoutInSeconds must be between {min_timeout} and {max_timeout}; the \
+                     request asked for {requested}."
+                )))
+            }
+            Some(requested) => requested,
+            // "If you don't specify a request timeout, the queue uses a default value."
+            None => DEFAULT_QUEUE_TIMEOUT_SECONDS,
+        };
+
+        // `PriorityConfiguration$PriorityOrder`: "Each priority type is listed once."
+        // `$LocationOrder`: "Each location must be listed only once." The modelled list
+        // lengths and the `PriorityType` enum are refused by the boundary walk before
+        // this handler runs; the uniqueness of each sequence is the service's own rule.
+        if let Some(priority) = &input.priority_configuration {
+            if let Some(duplicate) = first_duplicate(priority.priority_order.as_deref()) {
+                return Err(invalid(format!(
+                    "PriorityConfiguration.PriorityOrder lists each priority type once; \
+                     {duplicate} is listed more than once."
+                )));
+            }
+            if let Some(duplicate) = first_duplicate(priority.location_order.as_deref()) {
+                return Err(invalid(format!(
+                    "PriorityConfiguration.LocationOrder lists each location once; {duplicate} \
+                     is listed more than once."
+                )));
+            }
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateGameSessionQueueErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the GameLift emulator state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.tick(now);
+
+        // "Queue names must be unique within each Region", so a second queue cannot take
+        // the name of one that exists: the stored queue is left exactly as it was.
+        if state.game_session_queues.contains_key(&input.name) {
+            return Err(invalid(format!(
+                "A game session queue named {} already exists; queue names must be unique.",
+                input.name
+            )));
+        }
+        if state.game_session_queues.len() >= MAX_GAME_SESSION_QUEUES_PER_ACCOUNT {
+            return Err(CreateGameSessionQueueErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The maximum number of game session queues \
+                         ({MAX_GAME_SESSION_QUEUES_PER_ACCOUNT}) has already been created."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx);
+        // `GameSessionQueue$GameSessionQueueArn` doc: "Format is
+        // `arn:aws:gamelift:<region>::gamesessionqueue/<queue name>`", and "the resource
+        // ID matches the Name value".
+        let queue_arn =
+            crate::state::gamelift_arn(&region, &format!("gamesessionqueue/{}", input.name));
+        let record = crate::state::GameSessionQueueRecord {
+            name: input.name.clone(),
+            queue_arn,
+            timeout_in_seconds,
+            player_latency_policies: input.player_latency_policies.clone().unwrap_or_default(),
+            destinations: input.destinations.clone().unwrap_or_default(),
+            filter_configuration: input.filter_configuration.clone(),
+            priority_configuration: input.priority_configuration.clone(),
+            custom_event_data: input.custom_event_data.clone(),
+            notification_target: input.notification_target.clone(),
+            tags: input.tags.clone().unwrap_or_default(),
+            creation_time: now,
+            region,
+        };
+        state.game_session_queues.insert(input.name.clone(), record);
+
+        // Report the STORED record, so this response and every later describe of the same
+        // queue can only agree.
+        let Some(stored) = state.game_session_queues.get(&input.name) else {
+            return Err(CreateGameSessionQueueErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the new game session queue could not be read back".to_string()),
+                },
+            )
+            .into());
+        };
+        Ok(CreateGameSessionQueueOutput {
+            game_session_queue: Some(stored.to_modelled()),
+        })
     }
+}
+
+/// The first entry a sequence lists twice, if any: what a "listed only once" refusal
+/// names. An absent sequence lists nothing twice.
+fn first_duplicate(entries: Option<&[String]>) -> Option<String> {
+    let mut seen = ::std::collections::HashSet::new();
+    entries?
+        .iter()
+        .find(|entry| !seen.insert((*entry).clone()))
+        .cloned()
 }

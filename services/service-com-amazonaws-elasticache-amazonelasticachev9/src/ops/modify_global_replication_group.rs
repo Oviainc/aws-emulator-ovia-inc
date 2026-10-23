@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyGlobalReplicationGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyGlobalReplicationGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`ModifyGlobalReplicationGroup::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -161,18 +157,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyGlobalReplicationGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyGlobalReplicationGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyGlobalReplicationGroup"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // A deferred change has nowhere to be reported — see
+        // `crate::state::APPLY_IMMEDIATELY_REQUIRED`.
+        if !input.apply_immediately {
+            return Err(
+                ModifyGlobalReplicationGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(crate::state::APPLY_IMMEDIATELY_REQUIRED.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+        // A Global datastore is "for Valkey or Redis OSS only", so those are
+        // the engines it can be moved to.
+        let engine = match input.engine.as_deref().map(crate::state::normalize_user_engine) {
+            Some(Ok(engine)) => Some(engine),
+            Some(Err(message)) => {
+                return Err(
+                    ModifyGlobalReplicationGroupErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                )
+            }
+            None => None,
+        };
+        // The `GlobalReplicationGroup` shape has no parameter-group member, so
+        // a request that changes one would get a 200 and no way to read the
+        // change back: it is refused rather than accepted and dropped.
+        if let Some(name) = input.cache_parameter_group_name.as_deref() {
+            return Err(
+                ModifyGlobalReplicationGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "Invalid value {name} for CacheParameterGroupName: the \
+                             GlobalReplicationGroup shape has no member to report a parameter \
+                             group, so this emulator cannot report the change back."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let key = input.global_replication_group_id.to_ascii_lowercase();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let Some(group) = store.settled_global_replication_group_mut(&key, now) else {
+            return Err(
+                ModifyGlobalReplicationGroupErrorModeled::GlobalReplicationGroupNotFoundFault(
+                    GlobalReplicationGroupNotFoundFault {
+                        message: Some(format!(
+                            "Global Replication Group {} not found.",
+                            input.global_replication_group_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        if !crate::state::GLOBAL_ACTIONABLE_STATUSES.contains(&group.status.as_str()) {
+            return Err(
+                ModifyGlobalReplicationGroupErrorModeled::InvalidGlobalReplicationGroupStateFault(
+                    InvalidGlobalReplicationGroupStateFault {
+                        message: Some(format!(
+                            "Global Replication Group {key} is in {} state, not {}.",
+                            group.status,
+                            crate::state::GLOBAL_ACTIONABLE_STATUSES.join(" or ")
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Every member the request names is persisted, so the datastore reports
+        // what was asked for and not what it had.
+        if let Some(engine) = engine {
+            group.engine = engine;
+        }
+        if let Some(version) = input.engine_version {
+            group.engine_version = version;
+        }
+        if let Some(node_type) = input.cache_node_type {
+            group.cache_node_type = Some(node_type);
+        }
+        if let Some(description) = input.global_replication_group_description {
+            group.description = Some(description);
+        }
+        // Automatic failover is a property of each member replication group,
+        // which is where `GlobalReplicationGroupMember$AutomaticFailover`
+        // reports it.
+        if let Some(enabled) = input.automatic_failover_enabled {
+            let status = if enabled {
+                crate::state::FAILOVER_ENABLED
+            } else {
+                crate::state::FAILOVER_DISABLED
+            };
+            for member in &mut group.members {
+                member.automatic_failover = status.to_string();
+            }
+        }
+        // The change is applied at once, and the datastore answers `modifying`
+        // until the clock settles it, so a caller acting straight after sees the
+        // transient status.
+        group.begin_transition(crate::state::STATUS_MODIFYING, now);
+
+        Ok(ModifyGlobalReplicationGroupOutput {
+            global_replication_group: Some(group.to_modeled(true)),
+        })
     }
 }

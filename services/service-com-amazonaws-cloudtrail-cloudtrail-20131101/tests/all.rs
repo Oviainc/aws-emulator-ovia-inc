@@ -29,6 +29,8 @@ mod disable_federation;
 mod emulator;
 #[path = "all/event_configuration.rs"]
 mod event_configuration;
+#[path = "all/event_data_store_ingestion.rs"]
+mod event_data_store_ingestion;
 #[path = "all/event_data_store_reads.rs"]
 mod event_data_store_reads;
 #[path = "all/event_selectors.rs"]
@@ -49,12 +51,18 @@ mod insights_metric_data;
 mod lake_queries;
 #[path = "all/query_cancellation.rs"]
 mod query_cancellation;
+#[path = "all/refusal_fidelity.rs"]
+mod refusal_fidelity;
 #[path = "all/resource_policies.rs"]
 mod resource_policies;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_refusal_envelope.rs"]
+mod tag_refusal_envelope;
+#[path = "all/tagging_arn_spelling.rs"]
+mod tagging_arn_spelling;
 #[path = "all/target_prefix_dispatch.rs"]
 mod target_prefix_dispatch;
 #[path = "all/target_prefix_routing.rs"]

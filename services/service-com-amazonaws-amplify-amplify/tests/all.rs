@@ -23,3 +23,5 @@ mod branch_deletion_visibility;
 mod branch_revision_echo;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/webhook_lifecycle.rs"]
+mod webhook_lifecycle;

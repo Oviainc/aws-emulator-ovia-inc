@@ -160,6 +160,12 @@ pub struct HeadBucket<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// The wire code a HEAD of a bucket this emulator does not hold answers with: the one the
+/// modelled `NotFound` shape carries, sent with the 404 `HeadBucket` documents. Its
+/// `<Message>` is the one the crate's error channel documents for that code, so one code
+/// cannot answer two different messages.
+const NOT_FOUND_CODE: &str = "NotFound";
+
 impl<Eng> HeadBucket<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -199,7 +205,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is written — a later caller sees exactly what this one saw.
         let store = state.lock();
         let Some(bucket) = store.bucket(&input.bucket) else {
-            return Err(HeadBucketErrorModeled::NotFound(NotFound {}).into());
+            // "If the bucket doesn't exist or you don't have permission to access it, the
+            // HEAD request returns a generic 400 Bad Request, 403 Forbidden, or 404 Not
+            // Found HTTP status code. A message body isn't included, so you can't determine
+            // the exception beyond these HTTP response codes" (`HeadBucket`'s own
+            // documentation). Of those three, 404 is the one that means "the bucket is not
+            // there": 403 is the permission case, which this emulator — serving one account
+            // that owns every bucket it holds — never has, and 400 is a request S3 could
+            // not read. The status is the WHOLE of what tells a caller which it was, since
+            // a HEAD carries no body, and the modelled `NotFound` shape cannot carry it:
+            // it has no `@httpError`, so the framework would render the client-error
+            // default (400) and an SDK waiter keying on 404 would never see the bucket as
+            // absent. The code and status go out directly instead, exactly as `HeadObject`
+            // sends its own.
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                NOT_FOUND_CODE,
+                404,
+                crate::scaffolded::documented_error_message(NOT_FOUND_CODE)
+                    .unwrap_or_default(),
+            ));
         };
 
         Ok(HeadBucketOutput {

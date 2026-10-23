@@ -24,16 +24,10 @@ use serde_json::{json, Value};
 use super::delivery_stream_lifecycle::{
     error_code, s3_configuration, Emulator, BUCKET_ARN, ROLE_ARN,
 };
-
-/// The `message` of an error body. The firehose exceptions model the member as
-/// `message`; a refusal the framework renders uses the same key.
-pub(crate) fn error_message(body: &Value) -> String {
-    body.get("message")
-        .or_else(|| body.get("Message"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("no message in {body:?}"))
-}
+// `error_message` lives beside `error_code` in the lifecycle suite, so every suite in this
+// test crate reads a refusal the same way rather than carrying its own copy. It is
+// re-exported here because a sibling suite imports it from this module.
+pub(crate) use super::delivery_stream_lifecycle::error_message;
 
 /// The envelope one constraint violation is reported in.
 fn one_error(clause: String) -> String {

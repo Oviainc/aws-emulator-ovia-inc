@@ -17,6 +17,12 @@
 //! the clock already made due. Nothing sleeps, and no read invents a transition that
 //! was not owed.
 //!
+//! An update to a function is owed the same way. `UpdateFunctionCode` and
+//! `UpdateFunctionConfiguration` report `LastUpdateStatus` `InProgress` on the call that
+//! accepted the change, and [`FunctionRecord::begin_update`] stores the instant the move
+//! to `Successful` becomes due, which `materialize` applies exactly as it applies the
+//! move to `Active`.
+//!
 //! The resource-policy slice hangs off the same record. A function's resource-based
 //! policy is attached to the ARN the permission names, so [`FunctionRecord::policies`]
 //! holds one [`PolicyRecord`] per qualifier a statement was added to — the
@@ -25,6 +31,24 @@
 //! `GetPolicy` reports the document those statements make up, so no policy text is ever
 //! echoed back out of a request body.
 //!
+//! The asynchronous-invocation slice hangs off the same record. `InvokeAsync` answers
+//! "202 Accepted ... the request is queued for invocation", so what it persists is the
+//! queued event itself — on [`FunctionRecord::async_invocations`], one
+//! [`AsyncInvocationRecord`] per accepted event, against the version it was addressed
+//! to. The event is never executed here (this emulator has no in-process runtime for a
+//! deployment package), so the entry's outcome settles into
+//! [`AsyncInvocationOutcome::Failed`] once its delivery attempt is due, carrying the
+//! reason; nothing invents a result, a log tail or a duration for a function that did
+//! not run.
+//!
+//! The capacity-provider slice is the other resource this store holds, in
+//! [`ComAmazonawsLambdaAwsgirapiserviceState::capacity_providers`]: one
+//! [`CapacityProviderRecord`] per provider `CreateCapacityProvider` persisted, keyed by
+//! its name so `ListCapacityProviders` pages through them deterministically. A provider
+//! has a lifetime of its own too — it is created `Pending` and the move to `Active` is
+//! owed by the CLOCK (see [`CapacityProviderRecord::materialize`]) — and every member
+//! reported for it comes out of the record.
+//!
 //! `GetAccountSettings` reports on the same records at the account level:
 //! "Retrieves details about your account's limits and usage in an Amazon Web Services
 //! Region", so its usage is what the store holds and its unreserved concurrency is what
@@ -32,16 +56,21 @@
 //! [`ComAmazonawsLambdaAwsgirapiserviceState::account_usage`] and
 //! [`ComAmazonawsLambdaAwsgirapiserviceState::account_limit`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
 use sha2::Digest as _;
 
 use crate::ops::types::{
-    AccountLimit, AccountUsage, Cors, CreateFunctionOutput, EnvironmentResponse, EphemeralStorage,
-    FunctionCodeLocation, GetLayerVersionOutput, Layer, LayerVersionContentOutput,
-    PutFunctionConcurrencyOutput, ResolvedS3Object, TracingConfigResponse,
+    AccountLimit, AccountUsage, AliasRoutingConfiguration, CapacityProvider,
+    CapacityProviderConfig, CapacityProviderPermissionsConfig, CapacityProviderScalingConfig,
+    CapacityProviderTelemetryConfig, CapacityProviderVpcConfig, Cors, CreateAliasOutput,
+    CreateFunctionOutput, DeadLetterConfig, DurableConfig, Environment, EnvironmentResponse,
+    EphemeralStorage, FileSystemConfig, FunctionCodeLocation, GetLayerVersionOutput, ImageConfig,
+    ImageConfigResponse, InstanceRequirements, Layer, LayerVersionContentOutput, LoggingConfig,
+    PropagateTags, PutFunctionConcurrencyOutput, ResolvedS3Object, SnapStartResponse,
+    TenancyConfig, TracingConfigResponse, VpcConfig, VpcConfigResponse,
 };
 
 /// The ARN namespace this service stamps into every ARN it mints
@@ -81,6 +110,16 @@ pub const STATE_REASON_CREATING: &str = "The function is being created.";
 /// function is still `Pending`.
 pub const LAST_UPDATE_STATUS_SUCCESSFUL: &str = "Successful";
 
+/// The `LastUpdateStatus` a function carries while an update is still being applied,
+/// from the model's `LastUpdateStatus` enum. `UpdateFunctionConfiguration`'s own
+/// documentation describes the window it covers: "When you update a function, Lambda
+/// provisions an instance of the function and its supporting resources. [...] During
+/// this time, you can't modify the function, but you can still invoke it. The
+/// LastUpdateStatus [...] fields in the response from GetFunctionConfiguration indicate
+/// when the update is complete". A code update is a change to the same function, so
+/// `UpdateFunctionCode` reports it too; see [`FunctionRecord::begin_update`].
+pub const LAST_UPDATE_STATUS_IN_PROGRESS: &str = "InProgress";
+
 /// How long after `CreateFunction` the move from `Pending` to `Active` becomes due.
 ///
 /// An EMULATOR-CHOSEN span (the real provisioning time depends on the package and on
@@ -88,6 +127,30 @@ pub const LAST_UPDATE_STATUS_SUCCESSFUL: &str = "Successful";
 /// non-zero, so a caller that acts immediately after `CreateFunction` still observes
 /// the `Pending` state the model documents and the state errors that go with it.
 pub const ACTIVATION_DELAY: Duration = Duration::from_millis(500);
+
+/// How long after an accepted update (of a function's code or of its configuration) the
+/// move from [`LAST_UPDATE_STATUS_IN_PROGRESS`] to [`LAST_UPDATE_STATUS_SUCCESSFUL`]
+/// becomes due.
+///
+/// An EMULATOR-CHOSEN span, for the same reason as [`ACTIVATION_DELAY`]: the real time
+/// to provision a new instance of the function is not in the model ("If your function
+/// connects to a VPC, this process can take a minute"). It is deliberately non-zero, so
+/// a caller that modifies the function again immediately still meets the refusal the
+/// same documentation describes ("During this time, you can't modify the function").
+pub const UPDATE_DELAY: Duration = Duration::from_millis(500);
+
+/// The `SnapStart$ApplyOn` value that asks Lambda to snapshot an initialized execution
+/// environment, from the model's `SnapStartApplyOn` enum (`PublishedVersions | None`).
+pub const SNAP_START_APPLY_ON_PUBLISHED_VERSIONS: &str = "PublishedVersions";
+
+/// `SnapStartResponse$OptimizationStatus` values, from the model's
+/// `SnapStartOptimizationStatus` enum (`On | Off`). The member reports, "When you
+/// provide a qualified Amazon Resource Name (ARN), this response element indicates
+/// whether SnapStart is activated for the specified function version", so a version
+/// whose configuration applies SnapStart reports `On` and everything else reports `Off`.
+pub const SNAP_START_OPTIMIZATION_STATUS_ON: &str = "On";
+/// See [`SNAP_START_OPTIMIZATION_STATUS_ON`].
+pub const SNAP_START_OPTIMIZATION_STATUS_OFF: &str = "Off";
 
 /// The default `MemorySize`, in MB: "The default value is 128 MB", as AWS documents
 /// for the member (the model carries only its 128..32768 range).
@@ -223,6 +286,15 @@ pub struct CodeRecord {
     pub s3_key: Option<String>,
     /// The S3 object version of the deployment package.
     pub s3_object_version: Option<String>,
+    /// How the deployment package is stored, when the caller said: `COPY` (the default,
+    /// "Uploads a copy of your deployment package to Lambda") or `REFERENCE` ("Lambda
+    /// references the deployment package from the specified Amazon S3 bucket"). See
+    /// [`S3_OBJECT_STORAGE_MODE_COPY`] and [`S3_OBJECT_STORAGE_MODE_REFERENCE`].
+    pub s3_object_storage_mode: Option<String>,
+    /// The ARN of the customer managed KMS key the .zip deployment package is encrypted
+    /// with, when the caller named one; `FunctionCodeLocation$SourceKMSKeyArn` reports
+    /// it back.
+    pub source_kms_key_arn: Option<String>,
     /// The container image URI, for an `Image` package.
     pub image_uri: Option<String>,
 }
@@ -232,6 +304,113 @@ impl CodeRecord {
     #[must_use]
     pub fn is_image(&self) -> bool {
         self.image_uri.is_some()
+    }
+}
+
+/// The members of a request that name a deployment package.
+///
+/// `CreateFunction` carries them on its `Code` member and `UpdateFunctionCode` carries
+/// them on the request itself, but they name the same package in the same forms, so both
+/// resolve them through [`resolve_package_code`] rather than each deciding for itself
+/// what a package may be.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PackageMembers<'a> {
+    /// `ZipFile` — the deployment package bytes, uploaded inline.
+    pub zip_file: Option<&'a [u8]>,
+    /// `S3Bucket` — the bucket holding the deployment package.
+    pub s3_bucket: Option<&'a str>,
+    /// `S3Key` — the key of the deployment package.
+    pub s3_key: Option<&'a str>,
+    /// `S3ObjectVersion` — "For versioned objects, the version of the deployment package
+    /// object to use."
+    pub s3_object_version: Option<&'a str>,
+    /// `S3ObjectStorageMode` — `COPY` or `REFERENCE`.
+    pub s3_object_storage_mode: Option<&'a str>,
+    /// `ImageUri` — the container image in the Amazon ECR registry.
+    pub image_uri: Option<&'a str>,
+    /// `SourceKMSKeyArn` — the customer managed key the .zip package is encrypted with.
+    pub source_kms_key_arn: Option<&'a str>,
+}
+
+impl PackageMembers<'_> {
+    /// Whether any member that only an S3-sourced package has was named.
+    fn names_s3_object(&self) -> bool {
+        self.s3_bucket.is_some()
+            || self.s3_key.is_some()
+            || self.s3_object_version.is_some()
+            || self.s3_object_storage_mode.is_some()
+    }
+}
+
+/// The [`CodeRecord`] `package_type` admits for `members`, or the message of the refusal.
+///
+/// The model states the rule on both operations: "If the function's package type is
+/// Image, then you must specify the code package in ImageUri as the URI of a container
+/// image in the Amazon ECR registry. If the function's package type is Zip, then you must
+/// specify the deployment package as a .zip file archive. Enter the Amazon S3 bucket and
+/// key of the code .zip file location. You can also provide the function code inline
+/// using the ZipFile field."
+pub fn resolve_package_code(
+    package_type: &str,
+    members: PackageMembers<'_>,
+) -> Result<CodeRecord, String> {
+    if package_type == PACKAGE_TYPE_IMAGE {
+        let Some(image_uri) = members.image_uri else {
+            return Err(
+                "ImageUri is required for a function whose PackageType is Image".to_string(),
+            );
+        };
+        if members.zip_file.is_some() || members.names_s3_object() {
+            return Err(
+                "Only ImageUri may name the code of a function whose PackageType is Image"
+                    .to_string(),
+            );
+        }
+        return Ok(CodeRecord {
+            image_uri: Some(image_uri.to_string()),
+            ..CodeRecord::default()
+        });
+    }
+
+    if members.image_uri.is_some() {
+        return Err(
+            "ImageUri may only name the code of a function whose PackageType is Image"
+                .to_string(),
+        );
+    }
+    match (members.zip_file, members.s3_bucket, members.s3_key) {
+        (Some(zip_file), None, None) if !members.names_s3_object() => {
+            // `AccountLimit$CodeSizeZipped` is "The maximum size of a deployment package
+            // when it's uploaded directly to Lambda", which is the ceiling on these
+            // bytes — and, since they are held in memory here, on the store too.
+            if i64::try_from(zip_file.len()).unwrap_or(i64::MAX) > CODE_SIZE_ZIPPED_LIMIT {
+                return Err(format!(
+                    "ZipFile must be smaller than {CODE_SIZE_ZIPPED_LIMIT} bytes for a direct \
+                     upload; use S3Bucket and S3Key for a larger deployment package"
+                ));
+            }
+            Ok(CodeRecord {
+                zip_bytes: Some(zip_file.to_vec()),
+                source_kms_key_arn: members.source_kms_key_arn.map(str::to_string),
+                ..CodeRecord::default()
+            })
+        }
+        (None, Some(bucket), Some(key)) => Ok(CodeRecord {
+            s3_bucket: Some(bucket.to_string()),
+            s3_key: Some(key.to_string()),
+            s3_object_version: members.s3_object_version.map(str::to_string),
+            s3_object_storage_mode: members.s3_object_storage_mode.map(str::to_string),
+            source_kms_key_arn: members.source_kms_key_arn.map(str::to_string),
+            ..CodeRecord::default()
+        }),
+        // Either neither form was named, or both were: the inline bytes and the S3
+        // object each name a whole package, so a request carrying members of both names
+        // no single one.
+        _ => Err(
+            "The code must name either ZipFile or both S3Bucket and S3Key for a function \
+             whose PackageType is Zip"
+                .to_string(),
+        ),
     }
 }
 
@@ -294,6 +473,30 @@ pub struct FunctionConfig {
     pub last_modified: String,
     /// The revision this configuration is at.
     pub revision_id: String,
+    /// The VPC the function is attached to, when the caller named one.
+    pub vpc_config: Option<VpcConfig>,
+    /// The dead-letter queue for failed asynchronous invocations, when the caller named
+    /// one.
+    pub dead_letter_config: Option<DeadLetterConfig>,
+    /// The file systems the function mounts, in the order the caller named them (the
+    /// model's `FileSystemConfigList` holds at most one).
+    pub file_system_configs: Vec<FileSystemConfig>,
+    /// The container image overrides, when the caller named any.
+    pub image_config: Option<ImageConfig>,
+    /// `SnapStart$ApplyOn`, when the caller set it.
+    pub snap_start_apply_on: Option<String>,
+    /// The CloudWatch Logs configuration, when the caller named one.
+    pub logging_config: Option<LoggingConfig>,
+    /// The capacity provider that manages this function's compute, when the caller
+    /// named one.
+    pub capacity_provider_config: Option<CapacityProviderConfig>,
+    /// The durable-execution settings, when the caller named them.
+    pub durable_config: Option<DurableConfig>,
+    /// The tenant isolation settings, when the caller named them. `CreateFunction` is
+    /// the only operation that sets this one: "Tenant isolation configuration cannot be
+    /// modified after function creation", and `UpdateFunctionConfiguration` models no
+    /// member for it.
+    pub tenancy_config: Option<TenancyConfig>,
 }
 
 /// One published version of a function: its frozen configuration plus when it was
@@ -603,6 +806,155 @@ impl FunctionUrlConfigRecord {
     }
 }
 
+/// What has become of one queued asynchronous invocation.
+///
+/// A queued event is NOT a run: the queue is the only thing an asynchronous
+/// invocation's accepting call ("A success response (202 Accepted) indicates that the
+/// request is queued for invocation") promises, and this emulator has no in-process
+/// runtime that can run a deployment package. So an entry starts [`Self::Queued`] and,
+/// once its first delivery attempt is due, settles into [`Self::Failed`] carrying the
+/// reason it never ran. Nothing here ever reports a result, a log tail or a duration
+/// for a function that did not execute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AsyncInvocationOutcome {
+    /// Accepted and waiting for its delivery attempt, which is due at
+    /// [`AsyncInvocationRecord::attempt_due`].
+    Queued,
+    /// The delivery attempt came due and the event was never executed; the string is
+    /// why.
+    Failed(String),
+}
+
+/// One asynchronous invocation this emulator accepted for a function.
+///
+/// Held per function on [`FunctionRecord::async_invocations`], because Lambda queues an
+/// asynchronous event against the function version it was addressed to.
+#[derive(Debug, Clone)]
+pub struct AsyncInvocationRecord {
+    /// The version label the event was addressed to (`$LATEST` or a published version).
+    pub version: String,
+    /// The event payload, exactly as the caller supplied it.
+    pub payload: Vec<u8>,
+    /// ISO-8601 instant the event was accepted for invocation.
+    pub received: String,
+    /// When the first delivery attempt becomes due; see [`ASYNC_DELIVERY_DELAY`].
+    pub attempt_due: SystemTime,
+    /// What has become of the event.
+    pub outcome: AsyncInvocationOutcome,
+}
+
+/// How long after an asynchronous invocation is accepted its first delivery attempt
+/// becomes due.
+///
+/// An EMULATOR-CHOSEN span, like [`ACTIVATION_DELAY`]: Lambda publishes no latency for
+/// the asynchronous event queue. It is deliberately non-zero, so a caller that looks
+/// straight after the accepting call still sees the event [`AsyncInvocationOutcome::Queued`].
+pub const ASYNC_DELIVERY_DELAY: Duration = Duration::from_millis(250);
+
+/// Why a queued asynchronous invocation never ran, recorded on the entry when its
+/// delivery attempt comes due.
+pub const ASYNC_NOT_EXECUTED_REASON: &str =
+    "the event was accepted and queued, but no in-process runtime in this emulator can \
+     run the function's deployment package, so it was never executed";
+
+/// The most queued asynchronous invocations this emulator keeps for one function.
+///
+/// An EMULATOR-CHOSEN ceiling for the same reason as [`MAX_FUNCTIONS`]: the queue is in
+/// memory and every accepted event adds its payload to it, so past this point the
+/// oldest entry is dropped rather than the store growing without bound. Dropping the
+/// oldest does not change what any call answers — the accepting call reports only that
+/// the event was queued, and no operation reads the queue back out.
+pub const MAX_QUEUED_ASYNC_INVOCATIONS: usize = 100;
+
+/// The most aliases this emulator keeps for one function.
+///
+/// An EMULATOR-CHOSEN ceiling, in the sense [`MAX_FUNCTIONS`] is: the store is in memory
+/// and every `CreateAlias` adds to it. AWS bounds the aliases of a function too and
+/// answers the modelled `AliasLimitExceededException` for the create that would pass the
+/// bound ("Lambda couldn't create the alias because your Amazon Web Services account has
+/// exceeded the maximum number of aliases allowed per Lambda function"), but neither the
+/// model nor the published quotas carry the number, so this slice picks one and answers
+/// that same modelled error past it.
+pub const MAX_FUNCTION_ALIASES: usize = 100;
+
+/// The most versions one alias may route to BESIDE the version it invokes.
+///
+/// `CreateAlias`'s own documentation describes traffic shifting as a split between two
+/// versions — "You can also map an alias to split invocation requests between two
+/// versions. Use the RoutingConfig parameter to specify a second version and the
+/// percentage of invocation requests that it receives" — so `AdditionalVersionWeights`
+/// names at most one.
+pub const MAX_ALIAS_ADDITIONAL_VERSIONS: usize = 1;
+
+/// The model's `Alias` pattern, which every operation naming an alias puts on it.
+pub const ALIAS_NAME_PATTERN: &str = r"^(?!^[0-9]+$)([a-zA-Z0-9-_]+)$";
+
+/// Whether `name` is a name an alias may carry.
+///
+/// An alias shares the qualifier namespace with a function's published version numbers,
+/// and [`ALIAS_NAME_PATTERN`] is what keeps the two apart: its negative lookahead
+/// refuses an all-digit name, so no alias can ever be confused with a version.
+#[must_use]
+pub fn is_alias_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.bytes().all(|byte| byte.is_ascii_digit())
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
+        })
+}
+
+/// The refusal for a name no alias may carry: a validation message built from the
+/// request, naming the member and the constraint it failed.
+#[must_use]
+pub fn alias_name_message(name: &str) -> String {
+    format!(
+        "1 validation error detected: Value '{name}' at 'name' failed to satisfy constraint: \
+         Member must satisfy regular expression pattern: {ALIAS_NAME_PATTERN}"
+    )
+}
+
+/// One alias of a function: "a function identifier that you can update to invoke a
+/// different version", as `CreateAlias` documents it.
+///
+/// Held per name on [`FunctionRecord::aliases`], because an alias belongs to the
+/// function rather than to one of its versions, and a function has at most one alias of
+/// a given name.
+#[derive(Debug, Clone)]
+pub struct AliasRecord {
+    /// The name the alias is addressed by, which is also the qualifier of its ARN.
+    pub name: String,
+    /// "The function version that the alias invokes": [`VERSION_LATEST`] or a published
+    /// version number.
+    pub function_version: String,
+    /// The description, exactly as supplied; absent when the caller gave none.
+    pub description: Option<String>,
+    /// The second version this alias routes part of its invocations to, and the share it
+    /// receives, keyed by version number so the configuration reports in a stable order.
+    /// Empty when the alias does no traffic shifting.
+    pub additional_version_weights: BTreeMap<String, f64>,
+    /// "A unique identifier that changes when you update the alias", minted on every
+    /// write to it.
+    pub revision_id: String,
+}
+
+impl AliasRecord {
+    /// The `AliasRoutingConfiguration` the wire reports for this alias, present only
+    /// once the alias routes to a second version: the model gives the member no
+    /// default, so an alias that shifts no traffic carries no routing configuration at
+    /// all.
+    #[must_use]
+    pub fn routing_config(&self) -> Option<AliasRoutingConfiguration> {
+        (!self.additional_version_weights.is_empty()).then(|| AliasRoutingConfiguration {
+            additional_version_weights: Some(
+                self.additional_version_weights
+                    .iter()
+                    .map(|(version, weight)| (version.clone(), *weight))
+                    .collect(),
+            ),
+        })
+    }
+}
+
 /// One Lambda function: its unpublished (`$LATEST`) configuration, its code, its
 /// lifecycle state, its tags and its published versions.
 #[derive(Debug, Clone)]
@@ -624,6 +976,10 @@ pub struct FunctionRecord {
     pub state_reason_code: Option<String>,
     /// The model's `LastUpdateStatus`, first set once creation completes.
     pub last_update_status: Option<String>,
+    /// When the move from [`LAST_UPDATE_STATUS_IN_PROGRESS`] to
+    /// [`LAST_UPDATE_STATUS_SUCCESSFUL`] becomes due, while an update is in flight. Set
+    /// by [`FunctionRecord::begin_update`].
+    pub last_update_due: Option<SystemTime>,
     /// When the move to [`STATE_ACTIVE`] becomes due.
     pub active_due: SystemTime,
     /// Function-level tags, as supplied.
@@ -652,21 +1008,113 @@ pub struct FunctionRecord {
     /// each qualifier has at most one, so a second create on the same qualifier
     /// conflicts rather than replacing it.
     pub url_configs: BTreeMap<String, FunctionUrlConfigRecord>,
+    /// The aliases of this function, keyed by alias name so `ListAliases` pages through
+    /// them in a stable order. An alias belongs to the function, not to one of its
+    /// versions, and names the version it invokes.
+    pub aliases: BTreeMap<String, AliasRecord>,
+    /// The asynchronous invocations accepted for this function, oldest first, bounded
+    /// by [`MAX_QUEUED_ASYNC_INVOCATIONS`].
+    pub async_invocations: VecDeque<AsyncInvocationRecord>,
 }
 
 impl FunctionRecord {
     /// Bring this record up to whatever the clock has already made due.
     ///
-    /// The ONLY transition it applies is the one the clock owed at `now`: a function
-    /// that has finished provisioning becomes `Active`. It would have been owed at the
-    /// same instant even if nobody had called, so applying it on a read reports the
-    /// truth rather than inventing a change.
+    /// The ONLY transitions it applies are the ones the clock owed at `now`: a function
+    /// that has finished provisioning becomes `Active`, and an update that has finished
+    /// being applied becomes `Successful`. Both would have been owed at the same instant
+    /// even if nobody had called, so applying them on a read reports the truth rather
+    /// than inventing a change.
     pub fn materialize(&mut self, now: SystemTime) {
         if self.state == STATE_PENDING && now >= self.active_due {
             self.state = STATE_ACTIVE.to_string();
             self.state_reason = None;
             self.state_reason_code = None;
+            // "This is first set to Successful after function creation completes" — an
+            // update accepted while the function was still being provisioned is settled
+            // by its own due instant below, so creation completing does not settle it.
+            if self.last_update_status.is_none() {
+                self.last_update_status = Some(LAST_UPDATE_STATUS_SUCCESSFUL.to_string());
+            }
+        }
+        if self.last_update_due.is_some_and(|due| now >= due) {
             self.last_update_status = Some(LAST_UPDATE_STATUS_SUCCESSFUL.to_string());
+            self.last_update_due = None;
+        }
+        // The same rule for the asynchronous event queue: a queued event whose delivery
+        // attempt the clock has already made due has had that attempt, and this emulator
+        // runs no deployment package, so the attempt ended without the function ever
+        // executing. The outcome would have been owed at the same instant even if nobody
+        // had called.
+        for invocation in &mut self.async_invocations {
+            if invocation.outcome == AsyncInvocationOutcome::Queued && now >= invocation.attempt_due
+            {
+                invocation.outcome =
+                    AsyncInvocationOutcome::Failed(ASYNC_NOT_EXECUTED_REASON.to_string());
+            }
+        }
+    }
+
+    /// Record that an update to this function's code or configuration was accepted at
+    /// `now`: the model's `LastUpdateStatus` is [`LAST_UPDATE_STATUS_IN_PROGRESS`] until
+    /// the clock makes the move to [`LAST_UPDATE_STATUS_SUCCESSFUL`] due,
+    /// [`UPDATE_DELAY`] later.
+    pub fn begin_update(&mut self, now: SystemTime) {
+        self.last_update_status = Some(LAST_UPDATE_STATUS_IN_PROGRESS.to_string());
+        self.last_update_due = Some(now + UPDATE_DELAY);
+    }
+
+    /// Freeze `config` as this function's next published version, answering the number
+    /// it got.
+    ///
+    /// Versions are numbered from 1 upwards and a number is never reused, so the next
+    /// one follows the highest ever published rather than the count held. `None` when no
+    /// further number can be assigned.
+    pub fn publish_next_version(
+        &mut self,
+        config: FunctionConfig,
+        now: SystemTime,
+    ) -> Option<u64> {
+        let version = self.latest_version.checked_add(1)?;
+        self.versions.insert(
+            version,
+            FunctionVersionRecord {
+                version,
+                config,
+                created: iso8601(now),
+            },
+        );
+        self.latest_version = version;
+        Some(version)
+    }
+
+    /// Whether an update of this function is still being applied — the window
+    /// `UpdateFunctionConfiguration` documents as "During this time, you can't modify
+    /// the function, but you can still invoke it".
+    ///
+    /// Read it only after [`FunctionRecord::materialize`], so an update the clock has
+    /// already settled is not reported as still in flight.
+    #[must_use]
+    pub fn update_in_progress(&self) -> bool {
+        self.last_update_due.is_some()
+    }
+
+    /// Queue one asynchronous invocation of `version` carrying `payload`, accepted at
+    /// `now`.
+    ///
+    /// The queue is bounded by [`MAX_QUEUED_ASYNC_INVOCATIONS`]: once it is full the
+    /// oldest entry makes room for the newest, so accepting an event never fails for
+    /// want of memory.
+    pub fn queue_async_invocation(&mut self, version: &str, payload: Vec<u8>, now: SystemTime) {
+        self.async_invocations.push_back(AsyncInvocationRecord {
+            version: version.to_string(),
+            payload,
+            received: iso8601(now),
+            attempt_due: now + ASYNC_DELIVERY_DELAY,
+            outcome: AsyncInvocationOutcome::Queued,
+        });
+        while self.async_invocations.len() > MAX_QUEUED_ASYNC_INVOCATIONS {
+            self.async_invocations.pop_front();
         }
     }
 
@@ -682,18 +1130,62 @@ impl FunctionRecord {
         }
     }
 
+    /// The version label `qualifier` names, or `None` when this function has no such
+    /// version or alias.
+    ///
+    /// [`VERSION_LATEST`] and a published version number name themselves; every other
+    /// qualifier names an alias, and an alias names the version it invokes — "use
+    /// aliases to provide clients with a function identifier that you can update to
+    /// invoke a different version" (`CreateAlias`).
+    #[must_use]
+    pub fn resolved_version(&self, qualifier: &str) -> Option<String> {
+        if qualifier == VERSION_LATEST {
+            return Some(VERSION_LATEST.to_string());
+        }
+        if let Ok(number) = qualifier.parse::<u64>() {
+            return self
+                .versions
+                .contains_key(&number)
+                .then(|| number.to_string());
+        }
+        self.aliases
+            .get(qualifier)
+            .map(|alias| alias.function_version.clone())
+    }
+
     /// The configuration of `version`, or `None` when this function has no such
-    /// version.
+    /// version. An alias resolves to the configuration of the version it invokes; see
+    /// [`Self::resolved_version`].
     #[must_use]
     pub fn config_of(&self, version: &str) -> Option<&FunctionConfig> {
-        if version == VERSION_LATEST {
+        let resolved = self.resolved_version(version)?;
+        if resolved == VERSION_LATEST {
             return Some(&self.config);
         }
-        version
+        resolved
             .parse::<u64>()
             .ok()
             .and_then(|number| self.versions.get(&number))
             .map(|published| &published.config)
+    }
+
+    /// The `AliasConfiguration` the wire reports for one of this function's aliases,
+    /// built entirely out of what is stored.
+    ///
+    /// The model declares ONE `AliasConfiguration`, generated here as
+    /// [`CreateAliasOutput`]; an operation whose output is generated as its own struct
+    /// over that shape carries these members across one for one rather than rebuilding
+    /// them from state a second time.
+    #[must_use]
+    pub fn alias_configuration(&self, alias: &AliasRecord) -> CreateAliasOutput {
+        CreateAliasOutput {
+            alias_arn: Some(self.versioned_arn(&alias.name)),
+            name: Some(alias.name.clone()),
+            function_version: Some(alias.function_version.clone()),
+            description: alias.description.clone(),
+            routing_config: alias.routing_config(),
+            revision_id: Some(alias.revision_id.clone()),
+        }
     }
 
     /// The `FunctionConfiguration` the wire reports for `version`, built entirely out
@@ -712,7 +1204,13 @@ impl FunctionRecord {
             memory_size: Some(config.memory_size),
             last_modified: Some(config.last_modified.clone()),
             code_sha256: config.code_sha256.clone(),
-            version: Some(version.to_string()),
+            // The `Version` member's own pattern (`^(\$LATEST|[0-9]+)$`) admits no alias
+            // name, so a request addressed by an alias reports the version that alias
+            // invokes, while the ARN above keeps the qualifier the caller named.
+            version: Some(
+                self.resolved_version(version)
+                    .unwrap_or_else(|| version.to_string()),
+            ),
             environment: (!config.environment.is_empty()).then(|| EnvironmentResponse {
                 variables: Some(
                     config
@@ -745,12 +1243,73 @@ impl FunctionRecord {
             state: Some(self.state.clone()),
             state_reason: self.state_reason.clone(),
             state_reason_code: self.state_reason_code.clone(),
-            last_update_status: self.last_update_status.clone(),
+            last_update_status: if version == VERSION_LATEST {
+                self.last_update_status.clone()
+            } else {
+                // `LastUpdateStatus` is "The status of the last update that was
+                // performed on the function", and the update
+                // `UpdateFunctionConfiguration` describes is applied to the UNPUBLISHED
+                // version only ("You can't modify the configuration of a published
+                // version, only the unpublished version"). A published version froze its
+                // configuration before any such update began, so it is not the thing
+                // being updated and reports the settled status rather than the in-flight
+                // one.
+                self.last_update_status.as_ref().map(|status| {
+                    if status == LAST_UPDATE_STATUS_IN_PROGRESS {
+                        LAST_UPDATE_STATUS_SUCCESSFUL.to_string()
+                    } else {
+                        status.clone()
+                    }
+                })
+            },
             package_type: Some(config.package_type.clone()),
             architectures: Some(config.architectures.clone()),
             ephemeral_storage: Some(EphemeralStorage {
                 size: config.ephemeral_storage_mb,
             }),
+            // `VpcConfig` goes in and `VpcConfigResponse` comes out: the two differ only
+            // by the `VpcId` of the VPC the subnets belong to, which lives in EC2. This
+            // emulator resolves no EC2 state, so it reports no id it did not look up.
+            vpc_config: config.vpc_config.as_ref().map(|vpc| VpcConfigResponse {
+                subnet_ids: vpc.subnet_ids.clone(),
+                security_group_ids: vpc.security_group_ids.clone(),
+                vpc_id: None,
+                ipv6_allowed_for_dual_stack: vpc.ipv6_allowed_for_dual_stack,
+            }),
+            dead_letter_config: config.dead_letter_config.clone(),
+            // A function the caller mounted no file system on carries no
+            // `FileSystemConfigs` member at all, for the same reason as `Layers` above.
+            file_system_configs: (!config.file_system_configs.is_empty())
+                .then(|| config.file_system_configs.clone()),
+            // `ImageConfigResponse` wraps the stored overrides together with the error
+            // of resolving them; nothing here resolves an image, so there is no error
+            // to report.
+            image_config_response: config.image_config.clone().map(|image_config| {
+                ImageConfigResponse {
+                    image_config: Some(image_config),
+                    error: None,
+                }
+            }),
+            snap_start: config
+                .snap_start_apply_on
+                .clone()
+                .map(|apply_on| SnapStartResponse {
+                    optimization_status: Some(
+                        if version != VERSION_LATEST
+                            && apply_on == SNAP_START_APPLY_ON_PUBLISHED_VERSIONS
+                        {
+                            SNAP_START_OPTIMIZATION_STATUS_ON
+                        } else {
+                            SNAP_START_OPTIMIZATION_STATUS_OFF
+                        }
+                        .to_string(),
+                    ),
+                    apply_on: Some(apply_on),
+                }),
+            logging_config: config.logging_config.clone(),
+            capacity_provider_config: config.capacity_provider_config.clone(),
+            durable_config: config.durable_config.clone(),
+            tenancy_config: config.tenancy_config.clone(),
             ..CreateFunctionOutput::default()
         }
     }
@@ -776,11 +1335,27 @@ impl FunctionRecord {
                 &self.config.name,
                 &self.config.revision_id,
             )),
-            resolved_s3_object: self.code.s3_bucket.as_ref().map(|bucket| ResolvedS3Object {
-                s3_bucket: Some(bucket.clone()),
-                s3_key: self.code.s3_key.clone(),
-                s3_object_version: self.code.s3_object_version.clone(),
-            }),
+            // "The resolved Amazon S3 object that contains the deployment package" — in
+            // `REFERENCE` mode that object is the caller's, because "Lambda references
+            // the deployment package from the specified Amazon S3 bucket". In the default
+            // `COPY` mode Lambda "uploads a copy of your deployment package" and serves it
+            // from storage of its own, so the caller's object is no longer where the
+            // package is served from and none is reported — the same rule
+            // [`LayerVersionRecord::content`] applies to a layer archive.
+            resolved_s3_object: self
+                .code
+                .s3_bucket
+                .clone()
+                .filter(|_| {
+                    self.code.s3_object_storage_mode.as_deref()
+                        == Some(S3_OBJECT_STORAGE_MODE_REFERENCE)
+                })
+                .map(|bucket| ResolvedS3Object {
+                    s3_bucket: Some(bucket),
+                    s3_key: self.code.s3_key.clone(),
+                    s3_object_version: self.code.s3_object_version.clone(),
+                }),
+            source_kms_key_arn: self.code.source_kms_key_arn.clone(),
             ..FunctionCodeLocation::default()
         }
     }
@@ -951,6 +1526,107 @@ impl LayerRecord {
     }
 }
 
+/// `CapacityProviderState` values this slice moves a capacity provider through, from
+/// the model's `CapacityProviderState` enum (`Pending | Active | Failed | Deleting`).
+pub const CAPACITY_PROVIDER_STATE_PENDING: &str = "Pending";
+/// See [`CAPACITY_PROVIDER_STATE_PENDING`].
+pub const CAPACITY_PROVIDER_STATE_ACTIVE: &str = "Active";
+
+/// How long after `CreateCapacityProvider` the move from `Pending` to `Active` becomes
+/// due.
+///
+/// An EMULATOR-CHOSEN span (how long Lambda takes to stand the compute resources up is
+/// not in the model), deliberately non-zero for the same reason as
+/// [`ACTIVATION_DELAY`]: a caller that reads the provider straight after creating it
+/// sees the `Pending` state the create answered with. The instant it becomes due is
+/// stored on the record and nothing sleeps for it.
+pub const CAPACITY_PROVIDER_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
+
+/// The most capacity providers this emulator keeps.
+///
+/// An EMULATOR-CHOSEN ceiling, not an AWS quota: the store is in memory and every
+/// `CreateCapacityProvider` adds to it, so past this point the slice answers the
+/// modelled `CapacityProviderLimitExceededException` ("The maximum number of capacity
+/// providers for your account has been exceeded") rather than growing without bound.
+pub const MAX_CAPACITY_PROVIDERS: usize = 100;
+
+/// One capacity provider this emulator holds.
+///
+/// `CreateCapacityProvider` "creates a capacity provider that manages compute resources
+/// for Lambda Event Functions", so what it persists is the configuration the request
+/// described — the VPC it launches instances in, the role it manages them with, the
+/// instance requirements, the scaling configuration, the encryption key, the tag
+/// propagation and the telemetry configuration — beside the lifecycle this emulator
+/// owns. Every member `GetCapacityProvider` reports comes back out of this record (see
+/// [`CapacityProviderRecord::reported`]), so nothing of a request is echoed straight
+/// back to its caller.
+#[derive(Debug, Clone)]
+pub struct CapacityProviderRecord {
+    /// The provider's bare name, which is also the key it is stored under.
+    pub name: String,
+    /// The ARN minted for it once, at creation; see [`capacity_provider_arn`].
+    pub arn: String,
+    /// The region that ARN carries.
+    pub region: String,
+    /// `VpcConfig`: the subnets and security groups instances are launched in.
+    pub vpc_config: CapacityProviderVpcConfig,
+    /// `PermissionsConfig`: the operator role the provider manages compute with.
+    pub permissions_config: CapacityProviderPermissionsConfig,
+    /// `InstanceRequirements`, when the request stated any.
+    pub instance_requirements: Option<InstanceRequirements>,
+    /// `CapacityProviderScalingConfig`, when the request stated one.
+    pub scaling_config: Option<CapacityProviderScalingConfig>,
+    /// `KmsKeyArn`, when the request named a key.
+    pub kms_key_arn: Option<String>,
+    /// The tags associated with the provider, kept in key order.
+    pub tags: BTreeMap<String, String>,
+    /// `PropagateTags`, when the request stated it.
+    pub propagate_tags: Option<PropagateTags>,
+    /// `TelemetryConfig`, when the request stated one.
+    pub telemetry_config: Option<CapacityProviderTelemetryConfig>,
+    /// The provider's `State`, one of the model's `CapacityProviderState` values.
+    pub state: String,
+    /// When the move from `Pending` to `Active` becomes due; see
+    /// [`CapacityProviderRecord::materialize`].
+    pub active_due: SystemTime,
+    /// `LastModified`: "The date and time when the capacity provider was last
+    /// modified", in the same ISO-8601 form as every other timestamp this service
+    /// reports.
+    pub last_modified: String,
+}
+
+impl CapacityProviderRecord {
+    /// Bring this record up to whatever the clock has already made due.
+    ///
+    /// The ONLY transition it applies is the one the clock owed at `now`: a provider
+    /// whose compute resources have finished being stood up becomes `Active`. It would
+    /// have been owed at the same instant even if nobody had called, so applying it on a
+    /// read reports the truth rather than inventing a change.
+    pub fn materialize(&mut self, now: SystemTime) {
+        if self.state == CAPACITY_PROVIDER_STATE_PENDING && now >= self.active_due {
+            self.state = CAPACITY_PROVIDER_STATE_ACTIVE.to_string();
+        }
+    }
+
+    /// The `CapacityProvider` the wire reports for this record, built entirely out of
+    /// what is stored.
+    #[must_use]
+    pub fn reported(&self) -> CapacityProvider {
+        CapacityProvider {
+            capacity_provider_arn: self.arn.clone(),
+            state: self.state.clone(),
+            vpc_config: self.vpc_config.clone(),
+            permissions_config: self.permissions_config.clone(),
+            instance_requirements: self.instance_requirements.clone(),
+            capacity_provider_scaling_config: self.scaling_config.clone(),
+            kms_key_arn: self.kms_key_arn.clone(),
+            last_modified: Some(self.last_modified.clone()),
+            propagate_tags: self.propagate_tags.clone(),
+            telemetry_config: self.telemetry_config.clone(),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-lambda-awsgirapiservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsLambdaAwsgirapiserviceState {
@@ -960,6 +1636,9 @@ pub struct ComAmazonawsLambdaAwsgirapiserviceState {
     /// Every layer this emulator holds, keyed by layer name so `ListLayers` pages
     /// through them in a stable order.
     pub layers: BTreeMap<String, LayerRecord>,
+    /// Every capacity provider this emulator holds, keyed by provider name so
+    /// `ListCapacityProviders` pages through them in a stable order.
+    pub capacity_providers: BTreeMap<String, CapacityProviderRecord>,
 }
 
 /// One entry of a `ListFunctions` page: the key it is addressed by in the flattened
@@ -973,11 +1652,15 @@ pub struct ListedFunction {
 }
 
 impl ComAmazonawsLambdaAwsgirapiserviceState {
-    /// Bring every function up to whatever the clock has already made due; see
-    /// [`FunctionRecord::materialize`].
+    /// Bring every function and every capacity provider up to whatever the clock has
+    /// already made due; see [`FunctionRecord::materialize`] and
+    /// [`CapacityProviderRecord::materialize`].
     pub fn materialize_all(&mut self, now: SystemTime) {
         for function in self.functions.values_mut() {
             function.materialize(now);
+        }
+        for provider in self.capacity_providers.values_mut() {
+            provider.materialize(now);
         }
     }
 
@@ -1122,6 +1805,73 @@ pub fn function_arn(region: &str, name: &str) -> String {
 #[must_use]
 pub fn layer_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("layer:{name}"))
+}
+
+/// The ARN of a capacity provider:
+/// `arn:aws:lambda:<region>:<account>:capacity-provider:<name>`, as the model's
+/// `CapacityProviderArn` pattern requires.
+#[must_use]
+pub fn capacity_provider_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("capacity-provider:{name}"),
+    )
+}
+
+/// The bare provider name a `CapacityProviderName` names.
+///
+/// The model's `CapacityProviderName` pattern admits two forms — a capacity-provider ARN
+/// and a bare name — and both name the same record, so an ARN resolves here to the name
+/// it carries. `None` when the value is an `arn:`-prefixed string that is not a
+/// capacity-provider ARN of this service, which names no provider at all.
+#[must_use]
+pub fn parse_capacity_provider_name(value: &str) -> Option<String> {
+    if !value.starts_with("arn:") {
+        return (!value.is_empty()).then(|| value.to_string());
+    }
+    // arn:<partition>:lambda:<region>:<account>:capacity-provider:<name>. The resource
+    // type is required, so an ARN of another Lambda resource is not read as a provider
+    // named after its resource type.
+    let parts: Vec<&str> = value.split(':').collect();
+    if parts.len() != 7 || parts[2] != ARN_NAMESPACE || parts[5] != "capacity-provider" {
+        return None;
+    }
+    (!parts[6].is_empty()).then(|| parts[6].to_string())
+}
+
+/// The message a `CapacityProviderName` that names no provider is refused with.
+#[must_use]
+pub fn capacity_provider_name_message(value: &str) -> String {
+    format!(
+        "1 validation error detected: Value '{value}' at 'capacityProviderName' failed to \
+         satisfy constraint: Member must satisfy one of the documented name formats (name \
+         or capacity provider ARN)"
+    )
+}
+
+/// Resolve a `CapacityProviderName` (in either of its documented forms) to one stored
+/// capacity provider.
+///
+/// The record is brought up to whatever the clock already made due before it is handed
+/// back, so every caller reports the same lifecycle state at the same instant.
+pub fn resolve_capacity_provider<'a>(
+    store: &'a mut ComAmazonawsLambdaAwsgirapiserviceState,
+    capacity_provider_name: &str,
+    region: &str,
+    now: SystemTime,
+) -> Result<&'a mut CapacityProviderRecord, ResolveFailure> {
+    let name = parse_capacity_provider_name(capacity_provider_name).ok_or_else(|| {
+        ResolveFailure::Malformed(capacity_provider_name_message(capacity_provider_name))
+    })?;
+    let Some(record) = store.capacity_providers.get_mut(&name) else {
+        return Err(ResolveFailure::NotFound(format!(
+            "Capacity provider not found: {}",
+            capacity_provider_arn(region, &name)
+        )));
+    };
+    record.materialize(now);
+    Ok(record)
 }
 
 /// The download location a layer version's `Content$Location` reports ("A link to the
@@ -1302,6 +2052,36 @@ pub fn mint_revision_id() -> String {
     ::uuid::Uuid::new_v4().to_string()
 }
 
+/// AWS's published Lambda quota for environment variables: 4 KB for all of a function's
+/// environment variables combined.
+pub const MAX_ENVIRONMENT_BYTES: usize = 4 * 1024;
+
+/// The environment variables an `Environment` member asks a function to hold, ordered so
+/// a read reports them deterministically.
+///
+/// `Err` carries the message of the refusal: the set is larger than the documented
+/// quota. Every operation that accepts an `Environment` applies the same quota, so the
+/// check lives here rather than once per operation.
+pub fn environment_variables(
+    environment: Option<&Environment>,
+) -> Result<BTreeMap<String, String>, String> {
+    let variables: BTreeMap<String, String> = environment
+        .and_then(|environment| environment.variables.clone())
+        .map(|variables| variables.into_iter().collect())
+        .unwrap_or_default();
+    let size: usize = variables
+        .iter()
+        .map(|(name, value)| name.len() + value.len())
+        .sum();
+    if size > MAX_ENVIRONMENT_BYTES {
+        return Err(format!(
+            "Environment.Variables must be smaller than {MAX_ENVIRONMENT_BYTES} bytes for all \
+             environment variables combined, and this request's are {size} bytes"
+        ));
+    }
+    Ok(variables)
+}
+
 /// A `FunctionName` the wire accepted, split into the parts that identify a record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionReference {
@@ -1373,6 +2153,86 @@ pub fn parse_function_reference(value: &str) -> Option<FunctionReference> {
         name: name.to_string(),
         qualifier: qualifier.map(str::to_string),
         was_arn,
+    })
+}
+
+/// What a `TaggableResource` ARN — the `Resource` label of the
+/// `/2017-03-31/tags/{Resource}` operations — names.
+///
+/// The member's own pattern admits exactly five Lambda resource types
+/// (`smithy_query(query="operation", operation="ListTags")`): a function, optionally
+/// qualified by a published version or an alias, a code-signing configuration, an event
+/// source mapping, a capacity provider and a network connector. A function and a capacity
+/// provider are the ones this store holds records of; the rest are reported by their
+/// resource type and answered as what is true of them here — a resource of that type this
+/// account does not have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggableResourceRef {
+    /// `…:function:<name>` — one function, whose tag set is
+    /// [`FunctionRecord::tags`].
+    Function(String),
+    /// `…:function:<name>:<qualifier>` — a published version or an alias of a function.
+    /// The `Resource` member's own documentation says "Lambda does not support adding
+    /// tags to function aliases or versions", so a qualified ARN names no tag set.
+    FunctionQualifier {
+        /// The bare function name the ARN carries.
+        name: String,
+        /// The version label or alias name qualifying it.
+        qualifier: String,
+    },
+    /// `…:capacity-provider:<name>` — one capacity provider, whose tag set is
+    /// [`CapacityProviderRecord::tags`].
+    CapacityProvider(String),
+    /// Another Lambda resource type the pattern admits, by its ARN resource type.
+    Other(String),
+}
+
+/// Split a `TaggableResource` into the parts that identify what it names, or `None`
+/// when the value is not a `lambda` resource ARN at all.
+///
+/// The ARN is read through `service_common::arn` — the one parse this repository states
+/// for a caller-supplied ARN — so the `<type>:<id>` and `<type>/<id>` conventions are
+/// handled in one place, and the function form is then split by
+/// [`parse_function_reference`] so that every tag operation resolves a function exactly
+/// the way every other operation on this service does.
+///
+/// The ARN's region and account fields are read by that parse and deliberately NOT
+/// reported: this store keys a function by its name alone, exactly as
+/// [`resolve_function`] resolves every other `FunctionName`, so reporting them here
+/// would invite a caller to refuse a cross-region or cross-account ARN that every
+/// other operation on this service accepts. A tag operation that needs to refuse one
+/// has to make that rule hold for the whole service, and should call
+/// `service_common::arn::parse_of` for the fields when it does.
+///
+/// [`TaggableResourceRef::Other`] is only a resource TYPE because this store holds no
+/// records of those types yet — whoever implements `CreateCodeSigningConfig`,
+/// `CreateEventSourceMapping` or the network-connector operations has to carry the type's
+/// id through here and turn the tag handlers' `Other` branch into a real lookup against
+/// the new records, the way a capacity provider is resolved here.
+#[must_use]
+pub fn parse_taggable_resource(value: &str) -> Option<TaggableResourceRef> {
+    let arn = service_common::arn::parse_of(value, ARN_NAMESPACE)?;
+    let resource_type = arn.resource_type();
+    if resource_type.is_empty() {
+        return None;
+    }
+    // A capacity provider is named by `…:capacity-provider:<name>`, and this store holds
+    // one record per provider, so the ARN resolves to the name that record is keyed by.
+    if resource_type == "capacity-provider" {
+        return Some(TaggableResourceRef::CapacityProvider(
+            parse_capacity_provider_name(value)?,
+        ));
+    }
+    if resource_type != "function" {
+        return Some(TaggableResourceRef::Other(resource_type.to_string()));
+    }
+    let reference = parse_function_reference(value)?;
+    Some(match reference.qualifier {
+        Some(qualifier) => TaggableResourceRef::FunctionQualifier {
+            name: reference.name,
+            qualifier,
+        },
+        None => TaggableResourceRef::Function(reference.name),
     })
 }
 
@@ -1479,6 +2339,74 @@ mod tests {
                 qualifier,
                 "case {input:?}: expected qualifier {qualifier:?}, got {:?}",
                 parsed.qualifier
+            );
+        }
+    }
+
+    #[test]
+    fn a_taggable_resource_arn_names_the_resource_it_carries() {
+        // One row per alternative the `TaggableResource` pattern admits
+        // (`smithy_query(query="operation", operation="ListTags")`), plus a value that
+        // is no `lambda` resource ARN at all.
+        let cases: Vec<(&str, Option<TaggableResourceRef>)> = vec![
+            (
+                "arn:aws:lambda:us-east-1:000000000000:function:my-function",
+                Some(TaggableResourceRef::Function("my-function".to_string())),
+            ),
+            (
+                "arn:aws-us-gov:lambda:us-gov-west-1:000000000000:function:my-function",
+                Some(TaggableResourceRef::Function("my-function".to_string())),
+            ),
+            (
+                "arn:aws:lambda:us-east-1:000000000000:function:my-function:3",
+                Some(TaggableResourceRef::FunctionQualifier {
+                    name: "my-function".to_string(),
+                    qualifier: "3".to_string(),
+                }),
+            ),
+            (
+                "arn:aws:lambda:us-east-1:000000000000:function:my-function:$LATEST",
+                Some(TaggableResourceRef::FunctionQualifier {
+                    name: "my-function".to_string(),
+                    qualifier: "$LATEST".to_string(),
+                }),
+            ),
+            (
+                "arn:aws:lambda:us-east-1:000000000000:function:my-function:blue",
+                Some(TaggableResourceRef::FunctionQualifier {
+                    name: "my-function".to_string(),
+                    qualifier: "blue".to_string(),
+                }),
+            ),
+            (
+                "arn:aws:lambda:us-east-1:000000000000:code-signing-config:csc-0123456789abcdefg",
+                Some(TaggableResourceRef::Other(
+                    "code-signing-config".to_string(),
+                )),
+            ),
+            (
+                "arn:aws:lambda:us-east-1:000000000000:event-source-mapping:\
+                 12345678-1234-1234-1234-123456789012",
+                Some(TaggableResourceRef::Other(
+                    "event-source-mapping".to_string(),
+                )),
+            ),
+            (
+                "arn:aws:lambda:us-east-1:000000000000:capacity-provider:fleet-1",
+                Some(TaggableResourceRef::CapacityProvider("fleet-1".to_string())),
+            ),
+            (
+                "arn:aws:lambda:us-east-1:000000000000:network-connector:link-1",
+                Some(TaggableResourceRef::Other("network-connector".to_string())),
+            ),
+            ("arn:aws:sqs:us-east-1:000000000000:queue:q", None),
+            ("my-function", None),
+        ];
+        for (input, expected) in cases {
+            let actual = parse_taggable_resource(input);
+            assert_eq!(
+                actual, expected,
+                "case {input:?}: expected {expected:?}, got {actual:?}"
             );
         }
     }

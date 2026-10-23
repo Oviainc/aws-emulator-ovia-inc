@@ -225,41 +225,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = state.tick_millis();
         let id = state.mint_id();
 
-        // A set the caller asked to activate is not in use yet: it starts
-        // `ACTIVATING` and the clock owes it `ACTIVE`. One the caller did not ask to
-        // activate is `INACTIVE`, which is where it stays until an update activates
-        // it, so nothing is owed on it.
-        let (status, status_due_millis) = if input.activate {
-            (
-                crate::state::ENTITY_SET_ACTIVATING,
-                Some(now.saturating_add(crate::state::ENTITY_SET_TRANSITION_MILLIS)),
-            )
-        } else {
-            (crate::state::ENTITY_SET_INACTIVE, None)
-        };
-        let record = crate::state::EntitySetRecord {
-            id: id.clone(),
-            name: input.name.clone(),
-            format: input.format.clone(),
-            location: input.location.clone(),
-            expected_bucket_owner: input.expected_bucket_owner.clone(),
-            tags: input
+        // The record is built by the shared entity-set constructor, which also
+        // decides the status `Activate` asks for, so the trusted and the threat
+        // create cannot drift on what a create persists.
+        let record = crate::state::EntitySetRecord::created(
+            id.clone(),
+            input.name.clone(),
+            input.format.clone(),
+            input.location.clone(),
+            input.expected_bucket_owner.clone(),
+            input
                 .tags
                 .as_ref()
                 .map(|tags| {
                     tags.iter()
                         .map(|(key, value)| (key.clone(), value.clone()))
-                        .collect::<std::collections::BTreeMap<_, _>>()
+                        .collect()
                 })
                 .unwrap_or_default(),
-            client_token: token,
-            status: status.to_string(),
-            status_due_millis,
-            created_at_millis: now,
-            updated_at_millis: now,
-            // Nothing failed, so there are no error details to report.
-            error_details: None,
-        };
+            input.activate,
+            token,
+            now,
+        );
 
         let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
             // Unreachable: the same detector resolved above under the same lock.

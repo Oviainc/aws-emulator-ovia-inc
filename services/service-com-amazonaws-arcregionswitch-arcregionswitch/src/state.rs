@@ -33,8 +33,8 @@ use std::time::{Duration, SystemTime};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    AbbreviatedPlan, ExecutionBlockConfiguration, ExecutionEvent, Plan, Route53HealthCheck, Step,
-    StepState,
+    AbbreviatedExecution, AbbreviatedPlan, ExecutionBlockConfiguration, ExecutionEvent, Plan,
+    Route53HealthCheck, Step, StepState,
 };
 
 /// How long after the call that starts one the clock owes an execution its NEXT
@@ -221,9 +221,9 @@ pub fn plan_not_found_message(arn: &str) -> String {
 
 /// The page size a paginated operation of this service serves.
 ///
-/// Both `ListPlans` and `GetPlanExecution`/`ListPlanExecutionEvents` constrain
-/// `maxResults` to `@range(1..100)`; an absent one asks for as many as that range allows.
-/// One helper so the rule is written once.
+/// `ListPlans`, `GetPlanExecution`, `ListPlanExecutionEvents` and `ListPlanExecutions`
+/// all constrain `maxResults` to `@range(1..100)`; an absent one asks for as many as
+/// that range allows. One helper so the rule is written once.
 pub fn page_size(requested: Option<i32>) -> usize {
     const MAX_PAGE_SIZE: i32 = 100;
     let clamped = requested.unwrap_or(MAX_PAGE_SIZE).clamp(1, MAX_PAGE_SIZE);
@@ -423,8 +423,9 @@ pub struct StoredExecution {
     /// What the clock needs to know about each of those steps, in the same order.
     pub planned_steps: Vec<PlannedStep>,
     /// The execution's events, oldest first, as `ListPlanExecutionEvents` reports them.
-    /// Bounded by the step count of the workflow the execution runs plus the two
-    /// lifecycle events, so it cannot grow per request.
+    /// Bounded by the step count of the workflow the execution runs — each step records at
+    /// most one event of its own — plus its lifecycle events, so it cannot grow per
+    /// request.
     pub events: Vec<ExecutionEvent>,
     /// When the clock owes this execution its next transition; `None` once it owes none —
     /// because the execution has reached a state it never leaves, or because it is waiting
@@ -457,6 +458,30 @@ impl StoredExecution {
         self.step_states
             .iter()
             .position(|step| step.name.as_deref() == Some(name))
+    }
+
+    /// The `AbbreviatedExecution` projection `ListPlanExecutions` reports: the execution
+    /// record without the per-step detail, the plan and the report `GetPlanExecution`
+    /// adds.
+    ///
+    /// `actualRecoveryTime` is absent for the same reason it is absent from
+    /// `GetPlanExecution`: no execution block ran, so nothing measured a recovery time.
+    pub fn as_abbreviated_execution(&self) -> AbbreviatedExecution {
+        AbbreviatedExecution {
+            plan_arn: self.plan_arn.clone(),
+            execution_id: self.execution_id.clone(),
+            version: Some(self.plan_version.clone()),
+            updated_at: Some(self.updated_at),
+            comment: self.comment.clone(),
+            start_time: self.start_time,
+            end_time: self.end_time,
+            mode: self.mode.clone(),
+            execution_state: self.execution_state.clone(),
+            execution_action: self.action.clone(),
+            execution_region: self.execution_region.clone(),
+            recovery_execution_id: self.recovery_execution_id.clone(),
+            actual_recovery_time: None,
+        }
     }
 }
 
@@ -491,6 +516,11 @@ enum Advance {
 pub enum ApprovalOutcome {
     /// The decision was applied.
     Applied,
+    /// This emulator holds no plan under that ARN.
+    NoSuchPlan,
+    /// The plan is ongoing no execution at all, so it has nothing to decide: every
+    /// execution it ever started has reached a state it never leaves.
+    NoOngoingExecution,
     /// This plan holds no execution with that id.
     NoSuchExecution,
     /// The execution runs no step of that name.
@@ -651,12 +681,17 @@ impl ComAmazonawsArcregionswitchArcregionswitchState {
 
     /// Apply a manual-approval decision to one step of one execution.
     ///
+    /// The decision applies to the execution the plan is ONGOING, and to the step that
+    /// execution is actually waiting on. An execution that has reached a state it never
+    /// leaves is past deciding, so once the plan is ongoing none there is nothing to
+    /// decide at all ([`ApprovalOutcome::NoOngoingExecution`]) — which is what a caller
+    /// deciding a step twice runs into when the first decision finished the execution.
+    ///
     /// Approving releases the step — it reports [`STEP_COMPLETED`], the execution
     /// [`IN_PROGRESS`], and the clock owes the next step after [`EXECUTION_START_SPAN`],
     /// so a caller reading straight after the approval still sees the execution between
     /// steps. Declining stops the execution: the step is [`STEP_CANCELED`], the execution
-    /// [`CANCELED`], and the plan is released. Only the step the execution is actually
-    /// waiting on can be decided.
+    /// [`CANCELED`], and the plan is released.
     pub fn apply_approval(
         &mut self,
         key: &(String, String),
@@ -665,6 +700,20 @@ impl ComAmazonawsArcregionswitchArcregionswitchState {
         comment: Option<String>,
         now: SystemTime,
     ) -> ApprovalOutcome {
+        let Some(plan) = self.plans.get(&key.0) else {
+            return ApprovalOutcome::NoSuchPlan;
+        };
+        let ongoing = plan.active_execution.clone().filter(|execution_id| {
+            self.executions
+                .get(&(key.0.clone(), execution_id.clone()))
+                .is_some_and(|execution| !execution.is_terminal())
+        });
+        let Some(ongoing) = ongoing else {
+            return ApprovalOutcome::NoOngoingExecution;
+        };
+        if ongoing != key.1 {
+            return ApprovalOutcome::NoSuchExecution;
+        }
         let Some(execution) = self.executions.get(key) else {
             return ApprovalOutcome::NoSuchExecution;
         };
@@ -784,7 +833,7 @@ impl ComAmazonawsArcregionswitchArcregionswitchState {
         );
         if let Some(execution) = self.executions.get_mut(key) {
             let previous_event_id = execution.events.last().map(|event| event.event_id.clone());
-            execution.events.push(ExecutionEvent {
+            let event = ExecutionEvent {
                 timestamp: Some(at),
                 r#type: Some(event_type.to_string()),
                 step_name,
@@ -794,7 +843,8 @@ impl ComAmazonawsArcregionswitchArcregionswitchState {
                 description,
                 event_id,
                 previous_event_id,
-            });
+            };
+            execution.events.push(event);
         }
     }
 

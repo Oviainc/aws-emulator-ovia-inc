@@ -128,7 +128,7 @@ fn expected_action_type(request: &Value) -> Value {
 /// Not plain equality: a response may also carry a member the request left to its
 /// modelled default (`queryable`, say), which is not a difference these cases are
 /// about. A list, though, must match element for element and in order.
-fn contains(expected: &Value, actual: &Value) -> bool {
+pub(crate) fn contains(expected: &Value, actual: &Value) -> bool {
     match (expected, actual) {
         (Value::Object(expected), Value::Object(actual)) => expected
             .iter()

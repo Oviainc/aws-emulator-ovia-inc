@@ -63,12 +63,21 @@ const ENVIRONMENT_STATES: [&str; 5] = [
 /// (`smithy_query(query="shape", shape="VcfVersion")`).
 const VCF_VERSIONS: [&str; 3] = ["VCF-5.2.1", "VCF-5.2.2", "SELF_DEPLOYED"];
 
+/// The VPC and the subnet inside it that [`create_request`] names. `CreateEnvironment`
+/// checks the network a request names against the account's own Amazon EC2 store, so
+/// [`emulator`] registers these there — what these tests exercise is the wording of a
+/// MODELLED-constraint refusal, not that precondition.
+const VPC_ID: &str = "vpc-0123456789abcdef0";
+/// See [`VPC_ID`].
+const SUBNET_ID: &str = "subnet-0123456789abcdef0";
+
 /// One emulator: a router carrying only this service, over one shared engine.
 fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // These tests exercise wording, not signing: the request below is unsigned.
     router.set_request_authentication(false);
+    crate::environment_lifecycle::register_network(&engine, VPC_ID, SUBNET_ID);
     router.register_service(
         service_com_amazonaws_evs_amazonelasticvmwareservice::EmulatedService::new(engine),
     );
@@ -148,8 +157,8 @@ fn vlans() -> Value {
 /// then breaks in exactly the members it is a case of.
 fn create_request() -> Value {
     json!({
-        "vpcId": "vpc-0123456789abcdef0",
-        "serviceAccessSubnetId": "subnet-0123456789abcdef0",
+        "vpcId": VPC_ID,
+        "serviceAccessSubnetId": SUBNET_ID,
         "vcfVersion": "VCF-5.2.1",
         "termsAccepted": true,
         "initialVlans": vlans(),
@@ -532,10 +541,16 @@ async fn a_value_inside_every_constraint_is_not_refused() {
             json!({ "state": ENVIRONMENT_STATES }),
         ),
         (
-            "a setting value at its length ceiling",
+            // A setting's value is also checked against the DOMAIN
+            // `AccountSetting$name` documents for the named setting (a numeric string,
+            // at most 1,000,000 cores for `vcfPortedCoreCount`) — see
+            // `tests/all/account_settings.rs`, which owns that rule. So the value that
+            // may not be worded as a modelled-constraint refusal is one inside BOTH: the
+            // documented maximum, which no 128-character value could be.
+            "a setting value at the maximum its documentation gives it",
             "PutAccountSettings",
             put_settings(json!([
-                { "name": "vcfPortedCoreCount", "value": "a".repeat(128) },
+                { "name": "vcfPortedCoreCount", "value": "1000000" },
             ])),
         ),
         (

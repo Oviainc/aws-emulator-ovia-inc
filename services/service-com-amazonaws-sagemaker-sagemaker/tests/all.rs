@@ -29,10 +29,16 @@ mod automl_job_v2_lifecycle;
 mod batch_describe_model_packages;
 #[path = "all/batch_transform_jobs.rs"]
 mod batch_transform_jobs;
+#[path = "all/cluster_scheduler_config_lifecycle.rs"]
+mod cluster_scheduler_config_lifecycle;
 #[path = "all/code_repositories.rs"]
 mod code_repositories;
 #[path = "all/code_repository_deletion.rs"]
 mod code_repository_deletion;
+#[path = "all/compute_quota_lifecycle.rs"]
+mod compute_quota_lifecycle;
+#[path = "all/control_plane_preconditions.rs"]
+mod control_plane_preconditions;
 #[path = "all/custom_images.rs"]
 mod custom_images;
 #[path = "all/endpoint_config_deletion.rs"]
@@ -49,6 +55,8 @@ mod hyperpod_cluster_audit_record;
 mod hyperpod_cluster_listing;
 #[path = "all/inference_deployment_lifecycle.rs"]
 mod inference_deployment_lifecycle;
+#[path = "all/inference_recommendations_jobs.rs"]
+mod inference_recommendations_jobs;
 #[path = "all/lineage_action_lifecycle.rs"]
 mod lineage_action_lifecycle;
 #[path = "all/lineage_associations.rs"]
@@ -73,6 +81,8 @@ mod mlflow_app_lifecycle;
 mod mlflow_tracking_server;
 #[path = "all/model_card_deletion.rs"]
 mod model_card_deletion;
+#[path = "all/model_card_export_jobs.rs"]
+mod model_card_export_jobs;
 #[path = "all/model_card_governance.rs"]
 mod model_card_governance;
 #[path = "all/model_card_updates.rs"]
@@ -109,3 +119,10 @@ mod state_roundtrip;
 mod studio_app_lifecycle;
 #[path = "all/trial_component_tracking.rs"]
 mod trial_component_tracking;
+// Declared after the sorted list rather than among the other `hyperpod_*` suites: the
+// cluster operations are being implemented one issue at a time, so that run of lines is
+// where every concurrent cluster change inserts its own suite.
+#[path = "all/hyperpod_cluster_lifecycle.rs"]
+mod hyperpod_cluster_lifecycle;
+#[path = "all/create_cluster_admission.rs"]
+mod create_cluster_admission;

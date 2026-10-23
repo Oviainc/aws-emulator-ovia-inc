@@ -26,6 +26,13 @@ tracing = { workspace = true }
 # this adds nothing to Cargo.lock).
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Git object names are SHA-1 digests: that is what the git wire format the
+# smart-HTTP transport speaks defines an object name to be (see
+# `src/state/git_object.rs`), so a client's ids and the emulator's agree.
+sha1 = "0.10"
+# zlib, which is how a packfile carries each object's bytes (and how a git
+# client may gzip a request body).
+flate2 = "1"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

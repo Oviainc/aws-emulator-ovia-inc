@@ -6,7 +6,8 @@
 //! The rule under test: a rename re-keys the STORED repository, so the same
 //! resource — its id, creation date, description, default branch and whole history
 //! — answers to the new name and no longer to the old one, while every field
-//! CodeCommit derives from the name (the ARN and both clone URLs) is rebuilt for it
+//! CodeCommit derives from the name (the ARN, and both clone URLs, which name the
+//! repository under the endpoint the asking request arrived at) is rebuilt for it
 //! and the last-modified instant moves to the rename; and the new name has to be
 //! one the account does not already hold, which is also why a rename frees the old
 //! name for another repository.
@@ -23,7 +24,9 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::repository_lifecycle::{emulator, error, is_uuid, ok, string_at, REGION};
+use crate::repository_lifecycle::{
+    emulator, error, is_uuid, ok, string_at, ENDPOINT_AUTHORITY, REGION,
+};
 
 /// The `repositoryMetadata` a `GetRepository` read reports for a name.
 async fn metadata_of(router: &MultiServiceRouter, name: &str) -> Value {
@@ -213,18 +216,12 @@ async fn a_renamed_repository_keeps_its_identity_and_answers_to_the_new_name() {
         );
         assert_eq!(
             string_at(&after, "/cloneUrlHttp"),
-            format!(
-                "https://git-codecommit.{REGION}.amazonaws.com/v1/repos/{}",
-                case.new_name
-            ),
+            format!("https://{ENDPOINT_AUTHORITY}/v1/repos/{}", case.new_name),
             "case {label:?}: cloneUrlHttp must address the new name"
         );
         assert_eq!(
             string_at(&after, "/cloneUrlSsh"),
-            format!(
-                "ssh://git-codecommit.{REGION}.amazonaws.com/v1/repos/{}",
-                case.new_name
-            ),
+            format!("ssh://{ENDPOINT_AUTHORITY}/v1/repos/{}", case.new_name),
             "case {label:?}: cloneUrlSsh must address the new name"
         );
 

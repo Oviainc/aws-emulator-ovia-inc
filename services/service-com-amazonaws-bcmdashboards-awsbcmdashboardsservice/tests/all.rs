@@ -15,6 +15,8 @@
 mod audit_records;
 #[path = "all/dashboard_lifecycle.rs"]
 mod dashboard_lifecycle;
+#[path = "all/resource_not_found.rs"]
+mod resource_not_found;
 #[path = "all/resource_policy.rs"]
 mod resource_policy;
 #[path = "all/response_media_type.rs"]
@@ -27,3 +29,5 @@ mod scheduled_report_lifecycle;
 mod scheduled_report_listing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/untag_resource.rs"]
+mod untag_resource;

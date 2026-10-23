@@ -31,10 +31,14 @@ mod findings_feedback;
 mod investigation_lifecycle;
 #[path = "all/ip_set_lifecycle.rs"]
 mod ip_set_lifecycle;
+#[path = "all/ip_set_listing.rs"]
+mod ip_set_listing;
 #[path = "all/ip_set_update_and_delete.rs"]
 mod ip_set_update_and_delete;
 #[path = "all/malware_protection_plan.rs"]
 mod malware_protection_plan;
+#[path = "all/malware_scan.rs"]
+mod malware_scan;
 #[path = "all/malware_scan_settings.rs"]
 mod malware_scan_settings;
 #[path = "all/member_accounts.rs"]
@@ -51,6 +55,8 @@ mod request_region_partition_bounds;
 mod sample_finding_catalog;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/threat_entity_set_lifecycle.rs"]
+mod threat_entity_set_lifecycle;
 #[path = "all/threat_intel_sets.rs"]
 mod threat_intel_sets;
 #[path = "all/trusted_entity_set_lifecycle.rs"]

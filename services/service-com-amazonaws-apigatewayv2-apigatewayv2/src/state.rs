@@ -54,6 +54,11 @@ pub const DEFAULT_API_KEY_SELECTION_EXPRESSION: &str = "$request.header.x-api-ke
 /// default for a new API.
 pub const DEFAULT_IP_ADDRESS_TYPE: &str = "ipv4";
 
+/// The `ProtocolType` value that selects a WebSocket API, from
+/// `PROTOCOL_TYPE_VALUES` (`HTTP | WEBSOCKET`) — the protocol whose two-way
+/// communication the route-response resources belong to.
+pub const WEBSOCKET_PROTOCOL_TYPE: &str = "WEBSOCKET";
+
 /// The `AuthorizationType` a route gets when the request names none. One of
 /// `AUTHORIZATION_TYPE_VALUES`; `NONE` is the value the `Route$AuthorizationType`
 /// doc gives for open access.
@@ -77,6 +82,40 @@ pub const MAX_ROUTES_PER_API: usize = 300;
 /// The most integrations one api may hold, after which CreateIntegration is refused.
 /// AWS's published API Gateway quota is 300 integrations per API.
 pub const MAX_INTEGRATIONS_PER_API: usize = 300;
+
+/// The most route responses one route may hold, after which CreateRouteResponse is
+/// refused.
+///
+/// AWS publishes no separate route-responses-per-route quota, so this is a CHOSEN
+/// bound, set to the per-parent quota this service already enforces for routes
+/// ([`MAX_ROUTES_PER_API`]): what it buys is that no loop of CreateRouteResponse calls
+/// can grow this store without end, and that the per-route duplicate-key scan stays
+/// bounded. `TooManyRequestsException` ("A limit has been exceeded") is the modelled
+/// error the operation refuses with.
+pub const MAX_ROUTE_RESPONSES_PER_ROUTE: usize = 300;
+
+/// The most models one api may hold, after which CreateModel is refused.
+///
+/// An EMULATOR growth bound, not a figure AWS publishes: API Gateway publishes per-api
+/// quotas for the other child resources of an api (300 routes, 300 integrations) and
+/// this takes the same bound for models, so no loop of CreateModel calls can grow this
+/// store without end. Cite the routes/integrations quotas for those; do not cite this
+/// as a published models quota.
+pub const MAX_MODELS_PER_API: usize = 300;
+
+/// The most deployments one api may hold, after which CreateDeployment is refused.
+///
+/// API Gateway publishes a quota of 500 deployments per API, so this is the faithful
+/// bound AND what stops a loop of CreateDeployment calls growing this store without
+/// end — every call mints a new deployment, so nothing else bounds it.
+pub const MAX_DEPLOYMENTS_PER_API: usize = 500;
+
+/// The `DeploymentStatus` a deployment carries once the service has released it, from
+/// `DEPLOYMENT_STATUS_VALUES` (`DEPLOYED | FAILED | PENDING`). Deploying an api is
+/// synchronous here — the deployment captures the api's current routes and
+/// integrations, which this store already holds — so a minted deployment is reported
+/// released, the terminal status, and never moves again.
+pub const DEPLOYMENT_STATUS_DEPLOYED: &str = "DEPLOYED";
 
 /// The `ConnectionType` an integration gets when the request names none. From
 /// `Integration$ConnectionType`: "Specify INTERNET for connections through the public
@@ -152,6 +191,16 @@ pub struct Api {
     pub integration_id_seed: u64,
     /// This api's stages, keyed by `StageName`. Reserved for the stage slice.
     pub stages: BTreeMap<String, Stage>,
+    /// This api's models, keyed by `ModelId`.
+    pub models: BTreeMap<String, Model>,
+    /// Drives [`Api::mint_model_id`]. Per-api, for the same reason as
+    /// [`Api::route_id_seed`]: a `ModelId` is unique within its api.
+    pub model_id_seed: u64,
+    /// This api's deployments, keyed by `DeploymentId`.
+    pub deployments: BTreeMap<String, Deployment>,
+    /// Drives [`Api::mint_deployment_id`]. Per-api, for the same reason as
+    /// [`Api::route_id_seed`]: a `DeploymentId` is unique within its api.
+    pub deployment_id_seed: u64,
 }
 
 impl Api {
@@ -167,6 +216,20 @@ impl Api {
     pub fn mint_integration_id(&mut self) -> String {
         self.integration_id_seed = self.integration_id_seed.wrapping_add(1);
         mint_id(self.integration_id_seed)
+    }
+
+    /// Mint a fresh `ModelId` for this api: ten lowercase alphanumerics, never one
+    /// this api already minted.
+    pub fn mint_model_id(&mut self) -> String {
+        self.model_id_seed = self.model_id_seed.wrapping_add(1);
+        mint_id(self.model_id_seed)
+    }
+
+    /// Mint a fresh `DeploymentId` for this api: ten lowercase alphanumerics, never
+    /// one this api already minted.
+    pub fn mint_deployment_id(&mut self) -> String {
+        self.deployment_id_seed = self.deployment_id_seed.wrapping_add(1);
+        mint_id(self.deployment_id_seed)
     }
 }
 
@@ -219,9 +282,23 @@ pub struct Route {
     /// "If you created an API using quick create, the $default route is managed by
     /// API Gateway" (`Route$ApiGatewayManaged`).
     pub api_gateway_managed: bool,
+    /// This route's route responses, keyed by `RouteResponseId`. Owned by the route,
+    /// so deleting the route (or its api) cascades to them in one `remove`.
+    pub route_responses: BTreeMap<String, RouteResponse>,
+    /// Drives [`Route::mint_route_response_id`]. Per-route, because a
+    /// `RouteResponseId` only has to be unique within the route that owns the
+    /// response.
+    pub route_response_id_seed: u64,
 }
 
 impl Route {
+    /// Mint a fresh `RouteResponseId` for this route: ten lowercase alphanumerics,
+    /// never one this route already minted.
+    pub fn mint_route_response_id(&mut self) -> String {
+        self.route_response_id_seed = self.route_response_id_seed.wrapping_add(1);
+        mint_id(self.route_response_id_seed)
+    }
+
     /// Project the record onto the modelled `Route` shape.
     pub fn to_wire(&self) -> wire::Route {
         wire::Route {
@@ -248,6 +325,45 @@ impl Route {
             route_key: self.route_key.clone(),
             route_response_selection_expression: self.route_response_selection_expression.clone(),
             target: self.target.clone(),
+        }
+    }
+}
+
+/// A persisted `RouteResponse` resource, owned by its parent [`Route`].
+///
+/// A route response is WebSocket-only: `RouteResponse$ModelSelectionExpression` is
+/// "Supported only for WebSocket APIs", and the selection keys it is matched against
+/// are the WebSocket API's route response selection expressions.
+#[derive(Debug, Clone, Default)]
+pub struct RouteResponse {
+    pub route_response_id: String,
+    /// Required on the modelled `RouteResponse` shape, so the record always carries
+    /// one. Unique within the owning route.
+    pub route_response_key: String,
+    pub model_selection_expression: Option<String>,
+    pub response_models: BTreeMap<String, String>,
+    pub response_parameters: BTreeMap<String, wire::ParameterConstraints>,
+}
+
+impl RouteResponse {
+    /// Project the record onto the modelled `RouteResponse` shape.
+    pub fn to_wire(&self) -> wire::RouteResponse {
+        wire::RouteResponse {
+            model_selection_expression: self.model_selection_expression.clone(),
+            response_models: Some(
+                self.response_models
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            ),
+            response_parameters: Some(
+                self.response_parameters
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            ),
+            route_response_id: Some(self.route_response_id.clone()),
+            route_response_key: self.route_response_key.clone(),
         }
     }
 }
@@ -343,14 +459,157 @@ impl Integration {
     }
 }
 
+/// A persisted `Model` resource, owned by its parent [`Api`].
+///
+/// The record keeps the schema SOURCE the create accepted, verbatim: every reader of
+/// the model reports the document the caller supplied, and [`Model::to_wire`] projects
+/// the record onto the modelled shape the handlers serialize.
+#[derive(Debug, Clone, Default)]
+pub struct Model {
+    pub model_id: String,
+    pub name: String,
+    pub content_type: Option<String>,
+    pub description: Option<String>,
+    pub schema: String,
+}
+
+impl Model {
+    /// Project the record onto the modelled `Model` shape.
+    pub fn to_wire(&self) -> wire::Model {
+        wire::Model {
+            content_type: self.content_type.clone(),
+            description: self.description.clone(),
+            model_id: Some(self.model_id.clone()),
+            name: self.name.clone(),
+            schema: Some(self.schema.clone()),
+        }
+    }
+}
+
+/// Is `name` a `Model$Name` the service accepts?
+///
+/// "The name of the model. Must be alphanumeric" (`CreateModel$Name`), so a name
+/// carrying anything but letters and digits is refused. The length bounds (1..128) are
+/// the modelled constraint and are already refused before a handler runs, so this is
+/// only the alphabet.
+///
+/// `CreateModel` and `UpdateModel` both route through here: the requirement is a
+/// property of the request, so it cannot differ between the two.
+pub fn model_name_is_alphanumeric(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|character| character.is_ascii_alphanumeric())
+}
+
+/// Does `content_type` name a media type whose schema language is JSON Schema?
+///
+/// A JSON media type is one whose subtype is `json` or ends in `+json`
+/// (RFC 6839's `+json` structured syntax suffix), with any parameters
+/// (`; charset=utf-8`) ignored. A model that names NO content type is a JSON model
+/// too: `application/json` is the content type the service's own documentation gives
+/// for a model (`Model$ContentType`: "for example, \"application/json\"").
+pub fn is_json_media_type(content_type: Option<&str>) -> bool {
+    let Some(content_type) = content_type else {
+        return true;
+    };
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let subtype = media_type.split('/').nth(1).unwrap_or_default();
+    subtype == "json" || subtype.ends_with("+json")
+}
+
+/// Refuse a `Schema` that is not a schema document of the model's content type.
+///
+/// For a JSON model (see [`is_json_media_type`]) the schema is a JSON Schema document:
+/// "For application/json models, this should be JSON schema draft 4 model"
+/// (`CreateModel$Schema`), and "A JSON Schema is a JSON document, and that document
+/// MUST be an object" (JSON Schema draft-04, section 3.2). A schema that does not
+/// parse as JSON, or parses as a value that is not an object, is therefore no JSON
+/// Schema at all and nothing reading the model could treat it as one.
+///
+/// A model of any OTHER content type carries a schema in that content type's own
+/// language, which this service has no reader for, so its schema is stored verbatim
+/// rather than refused for not being JSON.
+///
+/// What this does NOT do is check a document against the whole of draft-04 — that
+/// every keyword is one draft-04 defines and carries a value of the type draft-04
+/// gives it. A partial schema is legitimate input (`{}` matches everything), and the
+/// document is handed back verbatim by every reader of the model.
+///
+/// `Ok(())` or the message for the operation's `BadRequestException`: it names the
+/// member and what was wrong with it, and echoes no schema back.
+pub fn validate_model_schema(content_type: Option<&str>, schema: &str) -> Result<(), String> {
+    if !is_json_media_type(content_type) {
+        return Ok(());
+    }
+    let document: ::serde_json::Value = ::serde_json::from_str(schema)
+        .map_err(|error| format!("Invalid model specified: Schema is not valid JSON: {error}"))?;
+    if document.is_object() {
+        return Ok(());
+    }
+    // The JSON type the schema turned out to be, so the caller can see what it sent
+    // without the document being echoed back.
+    let kind = match document {
+        ::serde_json::Value::Null => "null",
+        ::serde_json::Value::Bool(_) => "a boolean",
+        ::serde_json::Value::Number(_) => "a number",
+        ::serde_json::Value::String(_) => "a string",
+        ::serde_json::Value::Array(_) => "an array",
+        ::serde_json::Value::Object(_) => "an object",
+    };
+    Err(format!(
+        "Invalid model specified: Schema is not a valid JSON schema document: a JSON schema \
+         is a JSON object, but this Schema is {kind}."
+    ))
+}
+
 /// A persisted `Stage`. Reserved so the stage operations can land without a state
-/// rewrite; nothing writes one yet.
+/// rewrite; nothing creates one yet, but [`Deployment`] already points stages at the
+/// deployment they serve.
 #[derive(Debug, Clone, Default)]
 pub struct Stage {
     pub stage_name: String,
     pub description: Option<String>,
     pub auto_deploy: bool,
     pub tags: BTreeMap<String, String>,
+    /// The `DeploymentId` this stage serves, set by the create that deployed to it:
+    /// "A Deployment must be associated with a Stage for it to be callable over the
+    /// internet" (the `Deployment` shape's own doc).
+    pub deployment_id: Option<String>,
+}
+
+/// A persisted `Deployment` resource, owned by its parent [`Api`].
+///
+/// "An immutable representation of an API that can be called by users" (the
+/// `Deployment` shape doc), so nothing but its description is ever rewritten.
+#[derive(Debug, Clone)]
+pub struct Deployment {
+    pub deployment_id: String,
+    pub description: Option<String>,
+    /// One of `DEPLOYMENT_STATUS_VALUES`.
+    pub deployment_status: String,
+    pub deployment_status_message: Option<String>,
+    /// True only for a deployment the service released by itself, for a stage whose
+    /// `AutoDeploy` is on: "Specifies whether a deployment was automatically released"
+    /// (`Deployment$AutoDeployed`). A deployment the caller asked for is not one.
+    pub auto_deployed: bool,
+    pub created_date: SystemTime,
+}
+
+impl Deployment {
+    /// Project the record onto the modelled `Deployment` shape.
+    pub fn to_wire(&self) -> wire::Deployment {
+        wire::Deployment {
+            auto_deployed: Some(self.auto_deployed),
+            created_date: Some(to_timestamp(self.created_date)),
+            deployment_id: Some(self.deployment_id.clone()),
+            deployment_status: Some(self.deployment_status.clone()),
+            deployment_status_message: self.deployment_status_message.clone(),
+            description: self.description.clone(),
+        }
+    }
 }
 
 /// Render a stored instant as the modelled `__timestampIso8601` member.

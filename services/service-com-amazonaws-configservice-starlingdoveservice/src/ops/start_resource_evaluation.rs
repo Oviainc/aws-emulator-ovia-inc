@@ -264,12 +264,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     StartResourceEvaluationErrorModeled::IdempotentParameterMismatch(
                         IdempotentParameterMismatch {
-                            message: Some(format!(
-                                "The ClientToken '{token}' provided in the request already \
-                                 started a resource evaluation with different parameters. \
-                                 Specify a new client token with the parameter changes and \
-                                 try again."
-                            )),
+                            message: Some(
+                                crate::state::idempotent_parameter_mismatch_message(token),
+                            ),
                         },
                     )
                     .into(),

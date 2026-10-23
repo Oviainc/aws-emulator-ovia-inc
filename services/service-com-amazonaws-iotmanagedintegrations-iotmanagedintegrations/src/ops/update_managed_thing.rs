@@ -200,13 +200,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // `HubNetworkMode` is a modelled enum, so a value outside it is a client error.
+        // The model's own constraint walk refuses one before this handler runs; this
+        // second line states it through the SAME formatter, so the two cannot word one
+        // refusal two ways (`crate::service::enum_value_set_refusal`).
         if let Some(mode) = input.hub_network_mode.as_deref() {
             if !crate::state::HUB_NETWORK_MODE_VALUES.contains(&mode) {
                 return Err(UpdateManagedThingErrorModeled::ValidationException(
                     ValidationException {
-                        message: Some(format!(
-                            "HubNetworkMode must be one of {:?}, got {mode:?}",
-                            crate::state::HUB_NETWORK_MODE_VALUES
+                        message: Some(crate::service::enum_value_set_refusal(
+                            "hubNetworkMode",
+                            crate::state::HUB_NETWORK_MODE_VALUES,
+                            mode,
                         )),
                     },
                 )

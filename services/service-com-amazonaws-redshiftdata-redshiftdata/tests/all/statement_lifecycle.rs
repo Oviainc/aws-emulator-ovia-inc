@@ -223,6 +223,28 @@ async fn reported_rows_are_what_the_engine_produced_for_the_submitted_sql() {
             case.label
         );
 
+        // A statement that produced a result set is read back through
+        // `GetStatementResult`; one that produced none has no RESULT to read,
+        // so the read is refused rather than answered with an empty page.
+        if !case.has_result_set {
+            let (status, refused) = emulator
+                .call("GetStatementResult", &json!({"Id": id}))
+                .await;
+            assert_eq!(
+                status, 404,
+                "case {}: a statement with no result set has no result to fetch, got {status} \
+                 {refused}",
+                case.label
+            );
+            assert_eq!(
+                error_code(&refused),
+                "ResourceNotFoundException",
+                "case {}: expected ResourceNotFoundException, got {refused}",
+                case.label
+            );
+            continue;
+        }
+
         let fetched = emulator.ok("GetStatementResult", &json!({"Id": id})).await;
         let expected_records = (case.records)();
         assert_eq!(
@@ -230,11 +252,7 @@ async fn reported_rows_are_what_the_engine_produced_for_the_submitted_sql() {
             "case {}: expected Records {expected_records}, got {fetched}",
             case.label
         );
-        let expected_total = if case.has_result_set {
-            case.result_rows
-        } else {
-            0
-        };
+        let expected_total = case.result_rows;
         assert_eq!(
             number(&fetched, "TotalNumRows"),
             expected_total,
@@ -684,8 +702,13 @@ async fn a_statement_the_engine_rejects_ends_failed_with_the_engine_s_error() {
             .call("GetStatementResult", &json!({"Id": id}))
             .await;
         assert_eq!(
-            status, 400,
-            "case {sql}: a failed statement has no rows to fetch, got {refused}"
+            status, 404,
+            "case {sql}: a failed statement has no result to fetch, got {status} {refused}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "ResourceNotFoundException",
+            "case {sql}: expected ResourceNotFoundException, got {refused}"
         );
     }
 }
@@ -1304,9 +1327,9 @@ async fn a_next_token_this_service_did_not_issue_is_refused() {
         "expected ValidationException, got {response}"
     );
 
-    // The refusal rule does not depend on the statement having produced rows: a
-    // statement with no result set (DDL) pages the same way, so a token it never
-    // issued is refused there too rather than answered with an empty page.
+    // The refusal rule does not depend on the statement having produced rows,
+    // but a statement with no result set has no result to page at all: the read
+    // is refused as a missing result (404) before any token is considered.
     let no_result_set = emulator.run("CREATE TABLE token_probe (a INTEGER)").await;
     for token in [
         "not-hexadecimal",
@@ -1321,32 +1344,25 @@ async fn a_next_token_this_service_did_not_issue_is_refused() {
             )
             .await;
         assert_eq!(
-            status, 400,
-            "case {token:?} on a statement with no result set: expected 400, got {status} {response}"
+            status, 404,
+            "case {token:?} on a statement with no result set: expected 404, got {status} \
+             {response}"
         );
         assert_eq!(
             error_code(&response),
-            "ValidationException",
-            "case {token:?} on a statement with no result set: expected ValidationException, got {response}"
+            "ResourceNotFoundException",
+            "case {token:?} on a statement with no result set: expected \
+             ResourceNotFoundException, got {response}"
         );
     }
 
-    // And the first page of that statement is still served, empty.
-    let empty = emulator
-        .ok("GetStatementResult", &json!({"Id": no_result_set}))
+    // And so is its first page, with no token at all.
+    let (status, response) = emulator
+        .call("GetStatementResult", &json!({"Id": no_result_set}))
         .await;
     assert_eq!(
-        number(&empty, "TotalNumRows"),
-        0,
-        "a statement with no result set reports no rows: {empty}"
-    );
-    assert!(
-        list(&empty, "Records").is_empty(),
-        "a statement with no result set returns no records: {empty}"
-    );
-    assert!(
-        empty.get("NextToken").is_none(),
-        "nothing remains to page: {empty}"
+        status, 404,
+        "a statement with no result set has no page to serve, got {status} {response}"
     );
 }
 
@@ -1420,10 +1436,10 @@ async fn execute_statement_refuses_a_request_that_names_no_single_target() {
         "a refused request must store no statement, got {page}"
     );
 
-    // The session-reuse form is a VALID request this slice cannot serve: the
-    // warehouse and database belong to the session, which is not modelled yet.
-    // It is answered with the scaffold's 501, not with a 400 that would blame
-    // the caller, and it stores nothing either.
+    // The session-reuse form carries its connection on the SESSION, so a
+    // `SessionId` that names no live session names no warehouse and no database
+    // either: a missing resource, not a 400 that would blame the request, and it
+    // stores nothing.
     let (status, response) = emulator
         .call(
             "ExecuteStatement",
@@ -1434,18 +1450,18 @@ async fn execute_statement_refuses_a_request_that_names_no_single_target() {
         )
         .await;
     assert_eq!(
-        status, 501,
-        "a session-only connection target is not implemented, not invalid: got {status} {response}"
+        status, 404,
+        "a SessionId naming no live session is a missing resource: got {status} {response}"
     );
     assert_eq!(
         error_code(&response),
-        "NotImplemented",
-        "expected NotImplemented, got {response}"
+        "ResourceNotFoundException",
+        "expected ResourceNotFoundException, got {response}"
     );
     let page = emulator.ok("ListStatements", &json!({})).await;
     assert!(
         list(&page, "Statements").is_empty(),
-        "an unimplemented form must store no statement, got {page}"
+        "a refused request must store no statement, got {page}"
     );
 }
 
@@ -2036,7 +2052,7 @@ async fn the_number_of_open_databases_is_bounded() {
 #[tokio::test]
 async fn the_operations_outside_this_slice_still_answer_not_implemented() {
     let emulator = Emulator::new();
-    let cases: [(&str, Value); 6] = [
+    let cases: [(&str, Value); 4] = [
         ("GetStatementResultV2", json!({"Id": ABSENT_ID})),
         ("ListDatabases", json!({"ClusterIdentifier": "my-cluster", "Database": "dev"})),
         (
@@ -2047,11 +2063,6 @@ async fn the_operations_outside_this_slice_still_answer_not_implemented() {
             "ListTables",
             json!({"ClusterIdentifier": "my-cluster", "Database": "dev"}),
         ),
-        (
-            "DescribeTable",
-            json!({"ClusterIdentifier": "my-cluster", "Database": "dev"}),
-        ),
-        ("ListSessions", json!({})),
     ];
 
     for (operation, request) in &cases {

@@ -245,6 +245,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refuses.
         let cluster_filter = match input.cache_cluster_id.as_deref() {
             Some(id) => {
+                // The FORM of the identifier first: a value no cluster could
+                // ever carry is a bad parameter value rather than a cluster
+                // that does not exist.
+                if let Some(message) = crate::state::identifier_refusal(
+                    "Cache Cluster ID",
+                    "CacheClusterIdentifier",
+                    id,
+                    crate::state::LOOKUP_IDENTIFIER_MAX_LEN,
+                ) {
+                    return Err(
+                        DescribeSnapshotsErrorModeled::InvalidParameterValueException(
+                            InvalidParameterValueException {
+                                message: Some(message),
+                            },
+                        )
+                        .into(),
+                    );
+                }
                 let key = id.to_ascii_lowercase();
                 let known = store.cache_clusters.contains_key(&key)
                     || store

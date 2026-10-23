@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAllowedImagesSettings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAllowedImagesSettings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAllowedImagesSettings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the account's Allowed AMIs setting in the Region the request was signed for, out
+//! of [`crate::state`]: the state the feature is in, the criteria stored beside it, and the
+//! entity that manages the setting.
+//!
+//! A READ, and only a read — "gets the current state of the Allowed AMIs setting and the
+//! list of Allowed AMIs criteria at the account level in the specified Region" — so a
+//! Region nothing has configured is REPORTED at the setting an account that never enabled
+//! the feature has ([`crate::state::AllowedImagesSettings::default`]) rather than having
+//! one stored for it, and two calls report the same setting.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +148,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAllowedImagesSettings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAllowedImagesSettingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{MANAGED_BY_ACCOUNT, request_region, require_service_state};
+
+        // This request carries nothing else to validate — `DryRun` is its only member — so
+        // the flag's question ("would this request have succeeded?") is answered right
+        // away, ahead of the read, the way a write path answers it ahead of its first
+        // write: a dry run reports nothing about the account's settings.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAllowedImagesSettings"))
+        // `DryRun` documents two outcomes: `DryRunOperation` for a caller that holds the
+        // permissions the action needs, `UnauthorizedOperation` for one that does not. This
+        // emulator models no principal permissions at all — the framework verifies a
+        // request's signature and no operation of this crate evaluates IAM — so every
+        // caller is one that holds them and only the first outcome can be answered here.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // "at the account level in the specified Amazon Web Services Region": the Region
+        // this request was signed for is which setting it asks about.
+        let region = request_region(ctx.parts());
+
+        let state = require_service_state(&*self.engine)?;
+        let store = state.lock();
+        let settings = store.allowed_images_settings_in(&region);
+
+        Ok(GetAllowedImagesSettingsOutput {
+            state: Some(settings.state.clone()),
+            // "The list of criteria for images that are discoverable and usable in the
+            // account in the specified Amazon Web Services Region": the criteria stored for
+            // this Region, in the order the replace that set them gave. A setting with none
+            // reports an EMPTY list rather than no list — the criteria are part of the
+            // answer whichever state the feature is in.
+            image_criteria: Some(settings.image_criteria.clone()),
+            // "The entity that manages the Allowed AMIs settings": the account, the only
+            // writer of them this emulator has — see `MANAGED_BY_ACCOUNT`.
+            managed_by: Some(MANAGED_BY_ACCOUNT.to_string()),
+        })
     }
 }

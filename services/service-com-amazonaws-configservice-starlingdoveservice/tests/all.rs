@@ -39,6 +39,8 @@ mod config_setup_and_rule_loop;
 mod config_stored_queries;
 #[path = "all/config_tagging.rs"]
 mod config_tagging;
+#[path = "all/config_third_party_service_linked_recorder.rs"]
+mod config_third_party_service_linked_recorder;
 #[path = "all/discovered_resources.rs"]
 mod discovered_resources;
 #[path = "all/error_message_rules.rs"]
@@ -62,3 +64,7 @@ mod config_custom_rule_policy;
 mod compliance_details_by_config_rule;
 #[path = "all/proactive_resource_evaluation.rs"]
 mod proactive_resource_evaluation;
+#[path = "all/aggregate_resource_config.rs"]
+mod aggregate_resource_config;
+#[path = "all/resource_evaluation_surface.rs"]
+mod resource_evaluation_surface;

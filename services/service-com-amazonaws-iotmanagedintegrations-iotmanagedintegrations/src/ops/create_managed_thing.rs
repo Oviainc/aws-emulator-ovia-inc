@@ -204,12 +204,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // `Role` and `AuthenticationMaterialType` are modelled enums, so a value
-        // outside the enum is a client error rather than a stored record.
+        // outside the enum is a client error rather than a stored record. The model's
+        // own constraint walk refuses one before this handler runs; this second line
+        // states it through the SAME formatter, so the two cannot word one refusal two
+        // ways (`crate::service::enum_value_set_refusal`).
         if !crate::state::ROLE_VALUES.contains(&input.role.as_str()) {
             return Err(CreateManagedThingErrorModeled::ValidationException(ValidationException {
-                message: Some(format!(
-                    "Role must be one of {:?}, got {:?}",
-                    crate::state::ROLE_VALUES, input.role
+                message: Some(crate::service::enum_value_set_refusal(
+                    "role",
+                    crate::state::ROLE_VALUES,
+                    &input.role,
                 )),
             })
             .into());
@@ -218,9 +222,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .contains(&input.authentication_material_type.as_str())
         {
             return Err(CreateManagedThingErrorModeled::ValidationException(ValidationException {
-                message: Some(format!(
-                    "AuthenticationMaterialType must be one of {:?}, got {:?}",
-                    crate::state::AUTH_MATERIAL_TYPE_VALUES, input.authentication_material_type
+                message: Some(crate::service::enum_value_set_refusal(
+                    "authenticationMaterialType",
+                    crate::state::AUTH_MATERIAL_TYPE_VALUES,
+                    &input.authentication_material_type,
                 )),
             })
             .into());
@@ -240,8 +245,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let replayed = input
             .client_token
             .as_deref()
-            .and_then(|token| store.idempotency_tokens.get(token))
-            .map(|record| record.managed_thing_id.clone());
+            .and_then(|token| {
+                store.replayed_resource_id(crate::state::MANAGED_THING_RESOURCE_TYPE, token)
+            });
         if let Some(created) = replayed.and_then(|id| store.managed_thing_in(&region, &id)) {
             return Ok(CreateManagedThingOutput {
                 id: Some(created.id.clone()),
@@ -316,14 +322,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         if let Some(token) = input.client_token {
-            // Keep the map under its cap before minting one more record.
-            store.make_room_for_idempotency_token();
-            store.idempotency_tokens.insert(
-                token,
-                crate::state::IdempotencyRecord {
-                    managed_thing_id: id.clone(),
-                    minted_at: created_at,
-                },
+            store.record_idempotency_token(
+                crate::state::MANAGED_THING_RESOURCE_TYPE,
+                &token,
+                &id,
+                created_at,
             );
         }
         store.managed_thing_order.push(id.clone());

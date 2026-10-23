@@ -451,10 +451,10 @@ pub fn unknown_trail_message(identifier: &str) -> String {
 /// Check a bare trail name against the rules the model documents for
 /// `CreateTrailRequest$Name`:
 ///
-/// * only ASCII letters, digits, periods, underscores or dashes,
-/// * starts and ends with a letter or digit,
 /// * between [`TRAIL_NAME_MIN_LEN`] and [`TRAIL_NAME_MAX_LEN`] characters,
+/// * starts and ends with a letter or digit,
 /// * no two adjacent periods, underscores or dashes,
+/// * only ASCII letters, digits, periods, underscores or dashes,
 /// * not in IP-address format.
 ///
 /// A refusal names the ONE rule the name broke — and, where that rule is a length
@@ -462,6 +462,15 @@ pub fn unknown_trail_message(identifier: &str) -> String {
 /// the caller can fix the name from the refusal alone. The rules are checked in the
 /// order they are listed above, so a name that breaks several is refused for the
 /// first.
+///
+/// That order is the order the real service applies them in, not an arbitrary one:
+/// a name whose last character is neither a letter nor a digit is refused for the
+/// terminal-character rule even when that character is also outside the charset
+/// (recorded: `bad name!` answers "Trail name must end with a letter or number.",
+/// not the charset sentence), and a name shorter than the minimum is refused for
+/// its length whatever else it breaks. So the charset rule — which every
+/// ill-formed name also breaks — is checked LAST of the character rules, and only
+/// a name that satisfies the edge and adjacency rules can be refused for it.
 pub fn validate_trail_name(name: &str) -> Result<(), IdentifierRejection> {
     let reject = |message: String| Err(IdentifierRejection::InvalidName(message));
 
@@ -477,16 +486,6 @@ pub fn validate_trail_name(name: &str) -> Result<(), IdentifierRejection> {
             "Trail name too long. Maximum allowed length: {TRAIL_NAME_MAX_LEN} characters. \
              Specified name length: {length} characters."
         ));
-    }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || TRAIL_NAME_PUNCTUATION.contains(&c))
-    {
-        return reject(
-            "Trail name or ARN can only contain ASCII letters (a-z, A-Z), numbers (0-9), \
-             periods (.), underscores (_), or dashes (-)."
-                .to_string(),
-        );
     }
     // The two edges are separate rules, so a refusal names the edge that broke.
     if name
@@ -515,6 +514,16 @@ pub fn validate_trail_name(name: &str) -> Result<(), IdentifierRejection> {
                 .to_string(),
         );
     }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || TRAIL_NAME_PUNCTUATION.contains(&c))
+    {
+        return reject(
+            "Trail name or ARN can only contain ASCII letters (a-z, A-Z), numbers (0-9), \
+             periods (.), underscores (_), or dashes (-)."
+                .to_string(),
+        );
+    }
     // "Not be in IP address format (for example, 192.168.5.4)" — a dotted quad is
     // exactly what `Ipv4Addr`'s parser accepts, and a name cannot hold the colons an
     // IPv6 literal needs.
@@ -536,6 +545,24 @@ pub fn parse_trail_identifier(value: &str) -> Result<TrailIdentifier, Identifier
     Ok(TrailIdentifier::Name(value.to_string()))
 }
 
+/// The Region, account and resource segments of a CloudTrail resource ARN —
+/// `arn:<partition>:cloudtrail:<region>:<account>:<resource>` — or `None` when `value`
+/// is not one.
+///
+/// The ARN itself is read through [`::service_common::arn`], this tree's ONE parse of a
+/// caller-supplied resource ARN — the same one [`parse_taggable_arn`] uses — so no
+/// parser in this module can disagree with another, or with another service, about what
+/// an ARN is. What this adds is CloudTrail's own part: every taggable or addressable
+/// CloudTrail resource lives in a Region and belongs to an account, so an ARN leaving
+/// either field empty names none of them, unlike the partition-global ARNs the shared
+/// parse deliberately admits. What the RESOURCE segment must look like stays the
+/// caller's rule, because it differs per resource type.
+pub fn cloudtrail_arn_fields(value: &str) -> Option<(&str, &str, &str)> {
+    let arn = ::service_common::arn::parse_of(value, SERVICE_NAMESPACE)?;
+    (!arn.region.is_empty() && !arn.account.is_empty())
+        .then_some((arn.region, arn.account, arn.resource))
+}
+
 /// Read `arn:<partition>:cloudtrail:<region>:<account>:trail/<name>`.
 fn parse_trail_arn(value: &str) -> Result<TrailIdentifier, IdentifierRejection> {
     // The refusal names the ARN the caller supplied, which is the one thing the
@@ -547,18 +574,9 @@ fn parse_trail_arn(value: &str) -> Result<TrailIdentifier, IdentifierRejection> 
         )))
     };
 
-    let fields: Vec<&str> = value.split(':').collect();
-    let [arn, partition, service, region, account, resource] = fields.as_slice() else {
+    let Some((region, _account, resource)) = cloudtrail_arn_fields(value) else {
         return reject();
     };
-    if *arn != "arn"
-        || partition.is_empty()
-        || *service != SERVICE_NAMESPACE
-        || region.is_empty()
-        || account.is_empty()
-    {
-        return reject();
-    }
     let Some(name) = resource.strip_prefix(TRAIL_RESOURCE_PREFIX) else {
         return reject();
     };
@@ -566,7 +584,7 @@ fn parse_trail_arn(value: &str) -> Result<TrailIdentifier, IdentifierRejection> 
         return reject();
     }
     Ok(TrailIdentifier::Arn {
-        region: (*region).to_string(),
+        region: region.to_string(),
         name: name.to_string(),
     })
 }
@@ -583,14 +601,57 @@ fn parse_trail_arn(value: &str) -> Result<TrailIdentifier, IdentifierRejection> 
 /// `ops::describe_query`.
 pub const TRAIL_NOT_FOUND_STATUS: u16 = 400;
 
-/// The refusal text that names the trail by its ARN — what `GetTrailStatus`,
-/// `DeleteTrail`, `StartLogging`, `StopLogging` and `UpdateTrail` answer with, each
-/// of which addresses exactly one Region's trail, so a caller who passed a bare name
-/// is told which Region's trail was looked for. `GetTrail`'s recorded refusal carries
-/// the identifier as the request sent it instead ([`unknown_trail_message`]).
+/// The refusal text that names the trail by the ARN the identifier RESOLVED to —
+/// the subject every trail operation's `TrailNotFoundException` carries unless its
+/// own recorded refusal echoes the caller's identifier instead.
+///
+/// A caller who passed a bare name is told which Region's trail was looked for,
+/// which is what the recorded refusals of `GetTrailStatus`, `DeleteTrail`,
+/// `StartLogging`, `StopLogging`, `UpdateTrail` and `PutEventSelectors` carry. The
+/// three exceptions, each pinned by its own recording, echo the identifier as the
+/// request sent it ([`unknown_trail_message`]): `GetTrail`, `GetInsightSelectors`
+/// and the tag writes.
 pub fn trail_not_found_arn_message(region: &str, name: &str) -> String {
     unknown_trail_message(&trail_arn(region, name))
 }
+
+/// The refusal text for `TrailAlreadyExistsException`: `CreateTrail`'s duplicate-name
+/// refusal, which names the trail the request asked for and the account that already
+/// holds one of that name.
+///
+/// Request-derived (the `Name` the caller sent) plus the caller's account, the way
+/// the recorded response words it — the Region is NOT in it, even though a trail name
+/// is scoped to one Region, because "for customer: <account>" is the subject the
+/// service states.
+pub fn trail_already_exists_message(name: &str) -> String {
+    format!(
+        "Trail {name} already exists for customer: {}",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// The refusal text for `InsightNotEnabledException`, shared by every operation that
+/// reports or reads Insights events on a resource that has none enabled
+/// (`GetInsightSelectors` and the Insights data operations).
+///
+/// Request-derived (the ARN of the resource the call addressed) plus the fixed tail
+/// the recorded response carries, which tells the caller what to change. `kind` is the
+/// noun the subject opens with: `Trail` for a trail, which is the form the recorded
+/// refusal carries, and [`EVENT_DATA_STORE_SUBJECT`] for an event data store, whose
+/// own wording no recording pins — so it states the same rule about the resource it
+/// was actually given.
+pub fn insight_not_enabled_message(kind: &str, resource_arn: &str) -> String {
+    format!(
+        "{kind} {resource_arn} does not have Insights enabled. Edit the trail settings to \
+         enable Insights, and then try the operation again."
+    )
+}
+
+/// The subject noun of a refusal about a trail: `Trail <arn>`.
+pub const TRAIL_SUBJECT: &str = "Trail";
+
+/// The subject noun of a refusal about an event data store.
+pub const EVENT_DATA_STORE_SUBJECT: &str = "Event data store";
 
 /// Render an instant the way the modelled string timestamp members carry it
 /// (ISO 8601, e.g. `2026-10-21T21:38:12Z`).
@@ -779,7 +840,46 @@ impl EventDataStoreState {
     pub fn is_queryable(self) -> bool {
         !matches!(self, Self::PendingDeletion)
     }
+
+    /// The status an in-flight ingestion transition settles into once the clock
+    /// has run, or `None` for a status the clock owes nothing on.
+    ///
+    /// The model's `EventDataStoreStatus` enum carries `STARTING_INGESTION` and
+    /// `STOPPING_INGESTION` precisely because the Start/Stop ingestion pair is
+    /// asynchronous: a store told to stop reads `STOPPING_INGESTION` until
+    /// ingestion has stopped, and `STOPPED_INGESTION` after. Every other value
+    /// is terminal — the clock moves none of them on its own.
+    pub fn settled(self) -> Option<Self> {
+        match self {
+            Self::StartingIngestion => Some(Self::Enabled),
+            Self::StoppingIngestion => Some(Self::StoppedIngestion),
+            Self::Created | Self::Enabled | Self::PendingDeletion | Self::StoppedIngestion => None,
+        }
+    }
 }
+
+/// The event categories whose ingestion can be stopped and started.
+///
+/// From the model doc for `StopEventDataStoreIngestion` (and, in the same words,
+/// `StartEventDataStoreIngestion`): "To stop ingestion, the event data store
+/// `Status` must be `ENABLED` and the `eventCategory` must be `Management`,
+/// `Data`, `NetworkActivity`, or `ConfigurationItem`." A store collecting any
+/// other category (CloudTrail Insights events, Audit Manager evidence, events
+/// from outside Amazon Web Services) ingests nothing a caller can pause, which is
+/// what the modelled `InvalidEventDataStoreCategoryException` reports.
+pub const INGESTION_CONTROLLABLE_EVENT_CATEGORIES: &[&str] =
+    &["Management", "Data", "NetworkActivity", "ConfigurationItem"];
+
+/// How long an event data store reads `STARTING_INGESTION` / `STOPPING_INGESTION`
+/// before the clock settles it into `ENABLED` / `STOPPED_INGESTION`.
+///
+/// The model's `EventDataStoreStatus` enum carries both in-flight values, so the
+/// Start/Stop ingestion pair IS asynchronous. CloudTrail publishes no duration
+/// for either, so this span is the emulator's own: short enough not to stall a
+/// workflow, non-zero so a caller that reads the store straight after the call
+/// still sees the transient status — and so the state errors that transient
+/// status carries are reachable.
+pub const INGESTION_SETTLE_AFTER: Duration = Duration::from_millis(500);
 
 /// The billing mode of an event data store: one variant per value of the model's
 /// `BillingMode` enum.
@@ -911,6 +1011,10 @@ pub struct EventDataStoreRecord {
     /// The Region the store lives in; it is reachable only from there.
     pub region: String,
     pub status: EventDataStoreState,
+    /// When an in-flight ingestion `status` (`STARTING_INGESTION` /
+    /// `STOPPING_INGESTION`) is due to settle into the status it is heading for;
+    /// `None` once it has, and for a store whose ingestion is not moving.
+    pub ingestion_settles_at: Option<SystemTime>,
     /// The account the store belongs to, or `None` for the emulator's own
     /// account. A cross-account query echoes it back as
     /// `EventDataStoreOwnerAccountId`.
@@ -950,8 +1054,8 @@ pub struct EventDataStoreRecord {
     /// them. Empty for a store nobody has configured; the model bounds
     /// `ContextKeySelectors` to 0..=2 entries.
     pub context_key_selectors: Vec<ContextKeySelector>,
-    /// The store's tag set, as `CreateEventDataStore` seeds it, `RemoveTags` drops
-    /// keys from it and `ListTags` reports it.
+    /// The store's tag set, as `CreateEventDataStore` seeds it, `AddTags` merges into
+    /// it, `RemoveTags` drops keys from it and `ListTags` reports it.
     pub tags: Vec<Tag>,
     /// The Insights selectors `PutInsightSelectors` configured on this store and
     /// `GetInsightSelectors` reports. EMPTY means Insights event logging is off,
@@ -1020,6 +1124,57 @@ impl EventDataStoreRecord {
                 self.federation_role_arn = None;
             }
         }
+    }
+
+    /// Materialise the ingestion transition the clock already owes:
+    /// `STARTING_INGESTION` into `ENABLED`, `STOPPING_INGESTION` into
+    /// `STOPPED_INGESTION`.
+    ///
+    /// A reporting operation may call this: the transition was due at
+    /// `ingestion_settles_at` whether or not anybody read the store, so applying
+    /// it changes nothing a later caller would otherwise have seen.
+    pub fn settle_ingestion(&mut self, now: SystemTime) {
+        let Some(due) = self.ingestion_settles_at else {
+            return;
+        };
+        if now < due {
+            return;
+        }
+        self.ingestion_settles_at = None;
+        if let Some(settled) = self.status.settled() {
+            self.status = settled;
+        }
+    }
+
+    /// Whether ingestion can be stopped or started on this store at all: it
+    /// collects one of the [`INGESTION_CONTROLLABLE_EVENT_CATEGORIES`].
+    ///
+    /// Decided from the store's OWN advanced event selectors — the only place an
+    /// event data store states which category of events it collects — so the
+    /// answer is the same for every caller that addresses it.
+    pub fn ingestion_is_controllable(&self) -> bool {
+        INGESTION_CONTROLLABLE_EVENT_CATEGORIES
+            .iter()
+            .any(|category| self.logs_event_category(category))
+    }
+
+    /// The event categories this store collects, in the order its selectors state
+    /// them — what a refusal about the store's category names.
+    pub fn event_categories(&self) -> Vec<String> {
+        let mut categories: Vec<String> = Vec::new();
+        for selector in &self.advanced_event_selectors {
+            for field_selector in &selector.field_selectors {
+                if field_selector.field != EVENT_CATEGORY_FIELD {
+                    continue;
+                }
+                for value in field_selector.equals.iter().flatten() {
+                    if !categories.contains(value) {
+                        categories.push(value.clone());
+                    }
+                }
+            }
+        }
+        categories
     }
 }
 
@@ -1200,26 +1355,25 @@ pub fn parse_event_data_store_identifier(
         });
     }
 
-    let fields: Vec<&str> = value.split(':').collect();
-    let [arn, partition, service, region, account, resource] = fields.as_slice() else {
-        return Err(EventDataStoreRejection::InvalidArn(value.to_string()));
+    let reject = || Err(EventDataStoreRejection::InvalidArn(value.to_string()));
+    let Some((region, _account, resource)) = cloudtrail_arn_fields(value) else {
+        return reject();
     };
-    let id = resource.strip_prefix(EVENT_DATA_STORE_RESOURCE_PREFIX);
-    match id {
-        Some(id)
-            if *arn == "arn"
-                && !partition.is_empty()
-                && *service == SERVICE_NAMESPACE
-                && !region.is_empty()
-                && !account.is_empty()
-                && !id.is_empty() =>
-        {
-            Ok(EventDataStoreIdentifier {
-                id: id.to_string(),
-                region: Some((*region).to_string()),
-            })
-        }
-        _ => Err(EventDataStoreRejection::InvalidArn(value.to_string())),
+    // The shared parse keeps every colon the resource field carries, because an ARN of
+    // the `<type>:<id>` form is as well formed as one of the `<type>/<id>` form. An
+    // event data store ARN is only ever the slash form ("the ARN (or the ID suffix of
+    // the ARN) of an event data store", whose published format is
+    // `…:eventdatastore/<id>`), so a further colon here is a seventh field this
+    // identifier cannot carry.
+    if resource.contains(':') {
+        return reject();
+    }
+    match resource.strip_prefix(EVENT_DATA_STORE_RESOURCE_PREFIX) {
+        Some(id) if !id.is_empty() => Ok(EventDataStoreIdentifier {
+            id: id.to_string(),
+            region: Some(region.to_string()),
+        }),
+        _ => reject(),
     }
 }
 
@@ -1373,6 +1527,28 @@ pub struct ComAmazonawsCloudtrailCloudtrail20131101State {
     pub resource_policies: BTreeMap<String, String>,
 }
 
+/// What a reporting operation found for the identifier it was given: the registry
+/// key the identifier addressed, and the trail stored under it, if any.
+#[derive(Debug)]
+pub struct AddressedTrail<'a> {
+    /// The name and Region the identifier addressed — the ARN's own Region for a
+    /// trail ARN, the request's Region for a bare name.
+    pub key: TrailKey,
+    /// The trail stored under [`Self::key`]; `None` is a well-formed identifier
+    /// naming no trail, which is `TrailNotFoundException`.
+    pub record: Option<&'a TrailRecord>,
+}
+
+impl AddressedTrail<'_> {
+    /// The refusal text for an identifier that names no trail: the ARN the
+    /// identifier resolved to, plus the account the lookup ran in
+    /// ([`trail_not_found_arn_message`]).
+    pub fn not_found_message(&self) -> String {
+        let (name, region) = &self.key;
+        trail_not_found_arn_message(region, name)
+    }
+}
+
 /// What a mutating operation found for the identifier it was given.
 ///
 /// The three failing variants are what keeps `TrailNotFoundException` (no such
@@ -1422,6 +1598,23 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
     ) -> Result<Option<&TrailRecord>, IdentifierRejection> {
         let key = self.addressed_key(identifier, request_region)?;
         Ok(self.trails.get(&key))
+    }
+
+    /// Resolve a caller-supplied identifier the way [`Self::resolve`] does, keeping
+    /// the key it ADDRESSED beside the trail stored under it.
+    ///
+    /// A reporting operation whose not-found refusal names the trail by its resolved
+    /// ARN needs both: the record when there is one, and the ARN the identifier
+    /// resolved to when there is not
+    /// ([`AddressedTrail::not_found_message`]).
+    pub fn resolve_addressed(
+        &self,
+        identifier: &str,
+        request_region: &str,
+    ) -> Result<AddressedTrail<'_>, IdentifierRejection> {
+        let key = self.addressed_key(identifier, request_region)?;
+        let record = self.trails.get(&key);
+        Ok(AddressedTrail { key, record })
     }
 
     /// Every Region holding a trail of this name, in Region order.
@@ -1784,24 +1977,14 @@ pub fn is_valid_dashboard_name(name: &str) -> bool {
 /// A value that starts with `arn:` is read as an ARN — the modelled `DashboardArn`
 /// pattern admits both forms — and anything else as a bare name.
 pub fn parse_dashboard_identifier(value: &str) -> Option<DashboardIdentifier> {
-    if let Some(rest) = value.strip_prefix("arn:") {
-        let fields: Vec<&str> = rest.split(':').collect();
-        let [partition, service, region, account, resource] = fields.as_slice() else {
-            return None;
-        };
-        if partition.is_empty()
-            || *service != SERVICE_NAMESPACE
-            || region.is_empty()
-            || account.is_empty()
-        {
-            return None;
-        }
+    if value.starts_with("arn:") {
+        let (region, _account, resource) = cloudtrail_arn_fields(value)?;
         let name = resource.strip_prefix(DASHBOARD_RESOURCE_PREFIX)?;
         if !is_valid_dashboard_name(name) {
             return None;
         }
         return Some(DashboardIdentifier::Arn {
-            region: (*region).to_string(),
+            region: region.to_string(),
             name: name.to_string(),
         });
     }
@@ -2495,6 +2678,26 @@ impl TaggableArnRejection {
     }
 }
 
+/// The character set a CloudTrail resource ARN is written from.
+///
+/// The model constrains the ARN of three of the four taggable kinds — `ChannelArn`,
+/// `EventDataStoreArn` and `DashboardArn`, each `^[a-zA-Z0-9._/\-:]+$`
+/// (`smithy_query(query="shape", shape="ChannelArn,EventDataStoreArn,DashboardArn")`) —
+/// so that set is what a CloudTrail ARN is spelled with, whatever resource type is
+/// written inside it. A tagging `ResourceId` carries no `@pattern` of its own (it
+/// targets a plain `String`), so nothing has applied this before
+/// [`parse_taggable_arn`] does.
+const ARN_PUNCTUATION: [char; 5] = ['.', '_', '/', '-', ':'];
+
+/// Whether `value` is written only from the characters a CloudTrail resource ARN is
+/// spelled with ([`ARN_PUNCTUATION`] plus ASCII letters and digits).
+fn is_arn_spelling(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || ARN_PUNCTUATION.contains(&c))
+}
+
 /// Read a tagging `ResourceId` as the ARN of one of the four taggable resources.
 ///
 /// The member is documented as "the ARN of the trail, event data store, dashboard, or
@@ -2507,8 +2710,9 @@ impl TaggableArnRejection {
 /// caller-supplied resource ARN in this tree, so the resource field keeps the colons
 /// the model's `ChannelArn` / `EventDataStoreArn` pattern (`^[a-zA-Z0-9._/\-:]+$`)
 /// admits and the `<type>/<id>` and `<type>:<id>` forms are read the same way. What
-/// this function adds is this service's own part: WHICH of the four kinds the ARN
-/// names, and that kind's naming rules.
+/// this function adds is this service's own part: that the value is spelled like an ARN
+/// at all ([`is_arn_spelling`]), WHICH of the four kinds the ARN names, and that kind's
+/// naming rules.
 ///
 /// It is also why a tagging call does not read its identifier through
 /// [`parse_trail_identifier`] or [`parse_event_data_store_identifier`]: those accept
@@ -2520,6 +2724,16 @@ impl TaggableArnRejection {
 /// surface; see the note there for what keeps the two apart and what merging them
 /// would take.
 pub fn parse_taggable_arn(value: &str) -> Result<TaggableArn, TaggableArnRejection> {
+    // A value carrying a character no CloudTrail resource ARN is spelled with is not
+    // one, whatever resource type is written inside it, so it is refused as an ARN
+    // before its kind is read: the kind-specific errors below answer for a value that
+    // IS written as that kind's ARN, and reading a kind out of a value that is no ARN
+    // would let a resource id the model's ARN pattern cannot hold be looked up as if
+    // it named something.
+    if !is_arn_spelling(value) {
+        return Err(TaggableArnRejection::CloudTrailArn(value.to_string()));
+    }
+
     let reject = || {
         if value.contains(CHANNEL_RESOURCE_PREFIX) {
             TaggableArnRejection::ChannelArn(value.to_string())
@@ -2569,8 +2783,9 @@ pub fn parse_taggable_arn(value: &str) -> Result<TaggableArn, TaggableArnRejecti
         }
         // A channel id and an event data store id are opaque to this service: the
         // model constrains the WHOLE ARN (`ChannelArn` / `EventDataStoreArn`, length
-        // 3..256 of `^[a-zA-Z0-9._/\-:]+$`), which the boundary validator has already
-        // applied, and says nothing further about the id itself.
+        // 3..256 of `^[a-zA-Z0-9._/\-:]+$`), whose character set every value reaching
+        // here already satisfies (see `is_arn_spelling` above), and says nothing
+        // further about the id itself.
         "channel" => Ok(TaggableArn::Channel {
             region,
             id: id.to_string(),
@@ -2633,6 +2848,23 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
             TaggableArn::Channel { .. } => None,
         }
     }
+}
+
+/// Merge `added` into `existing` the way `AddTags` documents it: "Overwrites an
+/// existing tag's value when a new value is specified for an existing tag key", and a
+/// key not already on the resource is appended.
+///
+/// The merged set is handed back rather than written in place, so a caller can hold it
+/// against the per-resource limit before it becomes the resource's tag set.
+pub fn tags_merged(existing: &[Tag], added: Vec<Tag>) -> Vec<Tag> {
+    let mut merged = existing.to_vec();
+    for tag in added {
+        match merged.iter_mut().find(|held| held.key == tag.key) {
+            Some(held) => held.value = tag.value,
+            None => merged.push(tag),
+        }
+    }
+    merged
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

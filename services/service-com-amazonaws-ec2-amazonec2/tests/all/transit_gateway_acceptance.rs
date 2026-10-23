@@ -451,15 +451,16 @@ fn seed_multicast_domain(engine: &engine::InMemoryEngine) -> (String, Vec<String
             pending: None,
         })
         .collect();
-    let domain_id = guard.insert_transit_gateway_multicast_domain(TransitGatewayMulticastDomainRecord {
-        transit_gateway_multicast_domain_id: String::new(),
-        transit_gateway_id: "tgw-0123456789abcdef0".to_string(),
-        owner_id: engine::emulator_account_id().to_string(),
-        // The `TransitGatewayMulticastDomainState` enum's `available` member.
-        state: "available".to_string(),
-        associations,
-    })
-    .expect("the store holds the seeded multicast domain");
+    let domain_id = guard
+        .insert_transit_gateway_multicast_domain(TransitGatewayMulticastDomainRecord {
+            transit_gateway_multicast_domain_id: String::new(),
+            transit_gateway_id: "tgw-0123456789abcdef0".to_string(),
+            owner_id: engine::emulator_account_id().to_string(),
+            // The `TransitGatewayMulticastDomainState` enum's `available` member.
+            state: "available".to_string(),
+            associations,
+        })
+        .expect("the store holds the seeded multicast domain");
     (domain_id, attachments)
 }
 

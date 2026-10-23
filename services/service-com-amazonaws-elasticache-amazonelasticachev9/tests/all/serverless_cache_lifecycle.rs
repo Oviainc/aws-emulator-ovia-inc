@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::cache_cluster_lifecycle::{params, Emulator, Reply};
+use crate::harness::{params, Emulator, Reply};
 
 /// Long enough past [`state::SERVERLESS_CACHE_TRANSITION`] that the clock owes a
 /// serverless cache its next status; the handlers never sleep, so only the test
@@ -50,10 +50,10 @@ struct CacheCase {
     description: Option<&'static str>,
     /// `sse-kms` when the request named a `KmsKeyId`, else `sse-elasticache`.
     storage_encryption_type: &'static str,
-    /// The subnets the cache must report, or `None` when the request named none
-    /// and ElastiCache selected the Region's three defaults (every row of this
-    /// table is created in us-east-1).
-    subnet_ids: Option<&'static [&'static str]>,
+    /// How many of the account's subnets (`state::region_subnets`) the request
+    /// names, or `None` when it names none and ElastiCache selects the Region's
+    /// defaults (every row of this table is created in us-east-1).
+    subnet_ids: Option<usize>,
     /// Every `(element suffix, text)` pair the response must additionally
     /// carry — the members this row sets and nothing else reports.
     reported: &'static [(&'static str, &'static str)],
@@ -61,8 +61,18 @@ struct CacheCase {
 
 /// Create one serverless cache.
 async fn create_cache(emulator: &Emulator, name: &str, extra: &[(&str, &str)]) -> Reply {
+    create_cache_with(emulator, name, &params(extra)).await
+}
+
+/// Create one serverless cache from already-owned form pairs — what a row that
+/// derives a value (a subnet the account has) sends.
+async fn create_cache_with(
+    emulator: &Emulator,
+    name: &str,
+    extra: &[(String, String)],
+) -> Reply {
     let mut pairs = params(&[("ServerlessCacheName", name)]);
-    pairs.extend(params(extra));
+    pairs.extend(extra.iter().cloned());
     emulator.call("CreateServerlessCache", &pairs).await
 }
 
@@ -148,19 +158,31 @@ fn assert_reports_case(case: &CacheCase, where_from: &str, reply: &Reply, status
         );
     }
     let reported_subnets = reply.all("SubnetId");
-    match case.subnet_ids {
-        Some(expected) => assert_eq!(
-            reported_subnets, expected,
-            "case {name} ({where_from}): expected SubnetIds {expected:?}, got {reported_subnets:?}"
-        ),
-        // "For all other Regions, if no subnet IDs are given then ElastiCache
-        // will select 3 default subnets across AZs in your default VPC" — the
-        // literal the member documents, for the us-east-1 these rows sign with.
-        None => assert_eq!(
+    // The subnets a cache reports are subnets the account HAS: the ones the
+    // request named, or — "For all other Regions, if no subnet IDs are given
+    // then ElastiCache will select 3 default subnets across AZs in your default
+    // VPC" — the Region's own defaults.
+    let account_subnets: Vec<String> = state::selected_default_subnets("us-east-1")
+        .into_iter()
+        .map(|subnet| subnet.subnet_id)
+        .collect();
+    let expected: Vec<&str> = match case.subnet_ids {
+        Some(count) => account_subnets[..count]
+            .iter()
+            .map(String::as_str)
+            .collect(),
+        None => account_subnets.iter().map(String::as_str).collect(),
+    };
+    assert_eq!(
+        reported_subnets, expected,
+        "case {name} ({where_from}): expected SubnetIds {expected:?}, got {reported_subnets:?}"
+    );
+    if case.subnet_ids.is_none() {
+        assert_eq!(
             reported_subnets.len(),
             3,
             "case {name} ({where_from}): expected 3 default subnets, got {reported_subnets:?}"
-        ),
+        );
     }
 }
 
@@ -225,8 +247,6 @@ async fn a_created_serverless_cache_is_read_back_from_persisted_state() {
             name: "placed-cache",
             extra: &[
                 ("Engine", "redis"),
-                ("SubnetIds.SubnetId.1", "subnet-11111111"),
-                ("SubnetIds.SubnetId.2", "subnet-22222222"),
                 ("SecurityGroupIds.SecurityGroupId.1", "sg-0123456789abcdef0"),
                 (
                     "KmsKeyId",
@@ -242,7 +262,7 @@ async fn a_created_serverless_cache_is_read_back_from_persisted_state() {
             port: "6379",
             description: None,
             storage_encryption_type: "sse-kms",
-            subnet_ids: Some(&["subnet-11111111", "subnet-22222222"]),
+            subnet_ids: Some(2),
             reported: &[
                 ("SecurityGroupId", "sg-0123456789abcdef0"),
                 (
@@ -283,7 +303,24 @@ async fn a_created_serverless_cache_is_read_back_from_persisted_state() {
 
     for case in &cases {
         let emulator = Emulator::new();
-        let created = create_cache(&emulator, case.name, case.extra).await;
+        // A row that names subnets names the account's own: those are the only
+        // ids `CreateServerlessCache` accepts.
+        let mut extra = params(case.extra);
+        if let Some(count) = case.subnet_ids {
+            let account_subnets: Vec<String> = state::region_subnets("us-east-1")
+                .into_iter()
+                .map(|subnet| subnet.subnet_id)
+                .collect();
+            extra.extend(
+                account_subnets[..count]
+                    .iter()
+                    .enumerate()
+                    .map(|(index, id)| {
+                        (format!("SubnetIds.SubnetId.{}", index + 1), id.clone())
+                    }),
+            );
+        }
+        let created = create_cache_with(&emulator, case.name, &extra).await;
         assert_eq!(
             created.status,
             200,
@@ -532,6 +569,18 @@ async fn a_create_this_emulator_cannot_honour_is_refused_not_dropped() {
                 ("ServerlessCacheName", "refused"),
                 ("Engine", "redis"),
                 ("SubnetIds.SubnetId.1", "vpc-11111111"),
+            ],
+            400,
+            "InvalidParameterValue",
+        ),
+        (
+            // Subnet-SHAPED, but naming no subnet of the account: the cache's
+            // VPC endpoint could never be deployed into it.
+            "subnet that does not exist",
+            &[
+                ("ServerlessCacheName", "refused"),
+                ("Engine", "redis"),
+                ("SubnetIds.SubnetId.1", "subnet-0123456789abcdef0"),
             ],
             400,
             "InvalidParameterValue",

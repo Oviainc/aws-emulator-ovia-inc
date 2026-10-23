@@ -227,16 +227,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the unused-access or internal-access family does not scan a resource's
         // policies, so the request is refused rather than recorded against it. The
         // refusal is about the analyzer the request names rather than about one malformed
-        // member, so it carries no `fieldList`; see
-        // [`crate::state::unsupported_action_exception`], and `UpdateAnalyzer`, which
-        // refuses the complementary family the same way.
+        // member, so it carries no `fieldList` and its message is the service's fixed
+        // text for an unsupported action (it names neither the operation nor the
+        // analyzer's type); see [`crate::state::unsupported_action_exception`], and
+        // `UpdateAnalyzer`, which refuses the complementary family the same way.
         if analyzer.configured_access().is_some() {
-            let analyzer_type = analyzer.r#type.clone();
             crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::ValidationRefused);
             return Err(StartResourceScanErrorModeled::ValidationException(
-                crate::state::unsupported_action_exception(format!(
-                    "StartResourceScan is supported only for external access analyzers, so it is not supported for an analyzer of type {analyzer_type}"
-                )),
+                crate::state::unsupported_action_exception(),
             )
             .into());
         }

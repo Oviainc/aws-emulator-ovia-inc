@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCapacityProvider
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCapacityProvider`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCapacityProvider::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates ONE capacity provider of the name the request gives and persists it in
+//! [`crate::state`] — the VPC configuration, the operator role, the instance
+//! requirements, the scaling configuration, the encryption key, the tags, the tag
+//! propagation and the telemetry configuration exactly as supplied — then answers the
+//! `CapacityProvider` read back out of that record. The ARN is minted once from the
+//! region the caller signed for and the provider's name, and the provider is created
+//! `Pending`: standing its compute resources up is owed by the clock, so a later
+//! `GetCapacityProvider` reports `Active` once that is due.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +169,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCapacityProvider` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCapacityProviderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCapacityProvider"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateCapacityProviderErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some("Lambda state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `CapacityProviderName` is "the name of the capacity provider", and its pattern
+        // admits a capacity-provider ARN beside the bare name; both name the same record.
+        let name = crate::state::parse_capacity_provider_name(&input.capacity_provider_name)
+            .ok_or_else(|| {
+                invalid_parameter(crate::state::capacity_provider_name_message(
+                    &input.capacity_provider_name,
+                ))
+            })?;
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // A provider name identifies at most one provider, so a second create of the
+        // same name conflicts rather than replacing the first: an already existing
+        // resource is what `ResourceConflictException` covers beside "another operation
+        // is in progress".
+        if let Some(existing) = store.capacity_providers.get(&name) {
+            return Err(CreateCapacityProviderErrorModeled::ResourceConflictException(
+                ResourceConflictException {
+                    r#type: None,
+                    message: Some(format!("Capacity provider already exists: {}", existing.arn)),
+                },
+            )
+            .into());
+        }
+
+        // The store is in memory, so the slice answers the modelled account-limit error
+        // past its own ceiling rather than growing without bound.
+        if store.capacity_providers.len() >= crate::state::MAX_CAPACITY_PROVIDERS {
+            return Err(
+                CreateCapacityProviderErrorModeled::CapacityProviderLimitExceededException(
+                    CapacityProviderLimitExceededException {
+                        r#type: None,
+                        message: Some(format!(
+                            "Capacity provider limit exceeded: this account already holds \
+                             the maximum of {} capacity providers.",
+                            crate::state::MAX_CAPACITY_PROVIDERS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let record = crate::state::CapacityProviderRecord {
+            name: name.clone(),
+            arn: crate::state::capacity_provider_arn(&region, &name),
+            region,
+            // Every configuration member is stored exactly as supplied: one the caller
+            // described no further carries nothing this emulator made up.
+            vpc_config: input.vpc_config.clone(),
+            permissions_config: input.permissions_config.clone(),
+            instance_requirements: input.instance_requirements.clone(),
+            scaling_config: input.capacity_provider_scaling_config.clone(),
+            kms_key_arn: input.kms_key_arn.clone(),
+            tags: input
+                .tags
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            propagate_tags: input.propagate_tags.clone(),
+            telemetry_config: input.telemetry_config.clone(),
+            // A capacity provider "manages compute resources", and this call only starts
+            // standing them up — the operation answers 202 Accepted. The move to
+            // `Active` is owed by the clock at `active_due`, and nothing waits for it
+            // here.
+            state: crate::state::CAPACITY_PROVIDER_STATE_PENDING.to_string(),
+            active_due: now + crate::state::CAPACITY_PROVIDER_ACTIVATION_DELAY,
+            last_modified: crate::state::iso8601(now),
+        };
+        store.capacity_providers.insert(name.clone(), record);
+
+        // Answered by reading the record back out of the store, so
+        // `GetCapacityProvider` reports exactly what this call persisted.
+        let Some(stored) = store.capacity_providers.get(&name) else {
+            return Err(CreateCapacityProviderErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some(
+                        "The created capacity provider could not be read back".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        Ok(CreateCapacityProviderOutput {
+            capacity_provider: stored.reported(),
+        })
     }
+}
+
+/// The modelled 400 this operation refuses a request it cannot satisfy with.
+fn invalid_parameter(message: String) -> CreateCapacityProviderError {
+    CreateCapacityProviderErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
 }

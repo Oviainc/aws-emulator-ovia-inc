@@ -320,15 +320,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            crate::state::TrailForMutation::Absent { .. } => {
+            crate::state::TrailForMutation::Absent { name } => {
                 // The model says 404 for a not-found trail; CloudTrail answers 400
-                // (`crate::state::TRAIL_NOT_FOUND_STATUS`). No recording pins this
-                // operation's wording, so it carries the shared text: the identifier
-                // as the request sent it, plus the account the lookup ran in.
+                // (`crate::state::TRAIL_NOT_FOUND_STATUS`), and this operation's
+                // recorded refusal names the trail by the ARN the identifier
+                // resolved to, not by the identifier the request sent
+                // (`crate::state::trail_not_found_arn_message`).
                 return Err(crate::scaffolded::Scaffolded::modeled_with_status(
                     PutEventSelectorsErrorModeled::TrailNotFoundException(
                         TrailNotFoundException {
-                            message: Some(crate::state::unknown_trail_message(&input.trail_name)),
+                            message: Some(crate::state::trail_not_found_arn_message(
+                                &region, &name,
+                            )),
                         },
                     ),
                     crate::state::TRAIL_NOT_FOUND_STATUS,
@@ -358,9 +361,12 @@ fn read_configuration(
     advanced_event_selectors: Option<Vec<AdvancedEventSelector>>,
 ) -> Result<crate::state::EventSelectorConfig, String> {
     match (event_selectors, advanced_event_selectors) {
+        // The recorded refusal for a request carrying both members, which states the
+        // documented rule itself ("You can use either AdvancedEventSelectors or
+        // EventSelectors, but not both").
         (Some(_), Some(_)) => Err(
-            "A PutEventSelectors request carries either EventSelectors or \
-             AdvancedEventSelectors, not both"
+            "You can select events by using either EventSelectors or \
+             AdvancedEventSelectors, but not both."
                 .to_string(),
         ),
         (None, None) => Err(
@@ -389,10 +395,13 @@ fn read_configuration(
 /// phrasing in `InvalidEventSelectorsException`'s doc is read as the remedy for too
 /// MANY selectors rather than as a floor.
 fn normalize_event_selectors(selectors: Vec<EventSelector>) -> Result<Vec<EventSelector>, String> {
+    // Each count refusal states the REMEDY for the bound it broke, naming that
+    // bound — the wording the model's own `InvalidEventSelectorsException` doc
+    // gives under "You can:", and the wording the recorded refusal of a request
+    // past the selector bound carries.
     if selectors.len() > crate::state::EVENT_SELECTORS_PER_TRAIL_LIMIT {
         return Err(format!(
-            "EventSelectors carries {} event selectors; a trail can have up to {}",
-            selectors.len(),
+            "Specify a valid number of selectors (1 to {}) for your trail",
             crate::state::EVENT_SELECTORS_PER_TRAIL_LIMIT
         ));
     }
@@ -403,8 +412,7 @@ fn normalize_event_selectors(selectors: Vec<EventSelector>) -> Result<Vec<EventS
         .sum();
     if data_resources > crate::state::DATA_RESOURCES_PER_TRAIL_LIMIT {
         return Err(format!(
-            "EventSelectors carries {data_resources} data resources across all event \
-             selectors; a trail is limited to {}",
+            "Specify a valid number of data resources (1 to {}) for an event selector",
             crate::state::DATA_RESOURCES_PER_TRAIL_LIMIT
         ));
     }
@@ -413,7 +421,11 @@ fn normalize_event_selectors(selectors: Vec<EventSelector>) -> Result<Vec<EventS
         .into_iter()
         .map(|selector| {
             // `ReadWriteType` is a modelled enum, so a value outside it is already
-            // refused at the boundary before this handler runs.
+            // refused before this handler runs — as `InvalidEventSelectorsException`,
+            // which is what the model's own doc for that error calls it ("Specify a
+            // valid value for a parameter. For example, specifying the ReadWriteType
+            // parameter with a value of read-only is not valid"); see
+            // `EmulatedService::override_refusal`.
             for resource in selector.data_resources.iter().flatten() {
                 // "You can specify the following basic event selector resource
                 // types"; anything else needs advanced event selectors.
@@ -494,9 +506,12 @@ fn validate_advanced_event_selectors(selectors: &[AdvancedEventSelector]) -> Res
         }
     }
     if values > crate::state::ADVANCED_SELECTOR_VALUES_PER_TRAIL_LIMIT {
+        // The remedy the model's `InvalidEventSelectorsException` doc states for
+        // this bound: "Specify up to 500 values for all conditions in all advanced
+        // event selectors for a trail."
         return Err(format!(
-            "AdvancedEventSelectors carries {values} condition values across all selectors; \
-             a trail is limited to {}",
+            "Specify up to {} values for all conditions in all advanced event selectors \
+             for a trail",
             crate::state::ADVANCED_SELECTOR_VALUES_PER_TRAIL_LIMIT
         ));
     }

@@ -79,6 +79,16 @@ pub const ADMIN_PASSWORD_AUTH_FLOWS: [&str; 2] =
 /// `UserPoolTierType` defaults to `ESSENTIALS` (`CreateUserPool.UserPoolTier`).
 const DEFAULT_USER_POOL_TIER: &str = "ESSENTIALS";
 
+/// `UserPoolMfaType` is `OFF` for a pool that configures no MFA
+/// (`MfaConfiguration`: "Sets multi-factor authentication (MFA) to be on, off, or
+/// optional" in this service's model).
+const DEFAULT_MFA_CONFIGURATION: &str = "OFF";
+
+/// Deletion protection is opt-in: "When active, `DeletionProtection` prevents
+/// accidental deletion of your user pool" (this service's model), so a pool that
+/// asks for none can be deleted.
+const DEFAULT_DELETION_PROTECTION: &str = "INACTIVE";
+
 /// `PreventUserExistenceErrors` "Defaults to `LEGACY`"
 /// (`CreateUserPoolClient.PreventUserExistenceErrors` in this service's model),
 /// which is the mode that answers `UserNotFoundException` for an absent user.
@@ -986,6 +996,16 @@ pub fn effective_user_pool_tier(requested: Option<String>) -> String {
     requested.unwrap_or_else(|| DEFAULT_USER_POOL_TIER.to_string())
 }
 
+/// The MFA mode a request leaves unset: MFA is `OFF`.
+pub fn effective_mfa_configuration(requested: Option<String>) -> String {
+    requested.unwrap_or_else(|| DEFAULT_MFA_CONFIGURATION.to_string())
+}
+
+/// The deletion-protection mode a request leaves unset: `INACTIVE`.
+pub fn effective_deletion_protection(requested: Option<String>) -> String {
+    requested.unwrap_or_else(|| DEFAULT_DELETION_PROTECTION.to_string())
+}
+
 /// `PreventUserExistenceErrors` a request leaves unset: "Defaults to `LEGACY`".
 pub fn effective_prevent_user_existence_errors(requested: Option<String>) -> String {
     requested.unwrap_or_else(|| DEFAULT_PREVENT_USER_EXISTENCE_ERRORS.to_string())
@@ -1112,10 +1132,8 @@ pub fn new_user_pool(name: String, region: &str, now: SystemTime) -> UserPool {
         last_modified_date: now,
         policies: effective_policies(None),
         lambda_config: None,
-        // `UserPoolMfaType` is OFF for a pool that configures no MFA.
-        mfa_configuration: "OFF".to_string(),
-        // Deletion protection is opt-in: a pool created without it can be deleted.
-        deletion_protection: "INACTIVE".to_string(),
+        mfa_configuration: effective_mfa_configuration(None),
+        deletion_protection: effective_deletion_protection(None),
         user_pool_tier: DEFAULT_USER_POOL_TIER.to_string(),
         username_attributes: Vec::new(),
         alias_attributes: Vec::new(),
@@ -1277,6 +1295,112 @@ fn unix_seconds(time: SystemTime) -> i64 {
 /// absent on the wire rather than an empty one.
 pub fn non_empty<T: Clone>(values: &[T]) -> Option<Vec<T>> {
     (!values.is_empty()).then(|| values.to_vec())
+}
+
+// ---------------------------------------------------------------------------
+// Pagination
+//
+// Every paginated listing of this service pages the same way: over a stable
+// ascending order of keys, with an OPAQUE `NextToken` naming the key the next
+// page resumes strictly after.
+// ---------------------------------------------------------------------------
+
+/// The most items one page of a paginated listing holds, and what a request
+/// that asks for no page size gets: `QueryLimitType`'s modelled range is 0..60
+/// (this service's model, e.g. `AdminListGroupsForUser.Limit`), so 60 is the
+/// most a caller can ask for.
+pub const MAX_QUERY_LIMIT: i32 = 60;
+
+/// Marks a `NextToken` as one THIS service minted, so a token it never minted
+/// is refused on its prefix rather than on whether its bytes happen to decode.
+const PAGE_TOKEN_PREFIX: &str = "cognito-idp-page-1:";
+
+/// Separates a page token's listing scope from the key it resumes after. ASCII
+/// unit separator: `PaginationKey`'s pattern is `^[\S]+$`, but the token is
+/// base64-encoded before it reaches the wire, so the separator only has to be a
+/// byte no scope carries.
+const PAGE_TOKEN_SEPARATOR: char = '\u{1f}';
+
+/// A `NextToken` that resumes `scope`'s listing strictly after `last_key`.
+///
+/// `scope` names the listing the token belongs to — the operation plus the
+/// resource whose items it pages — so a token one listing issued names no page
+/// of another. The token is base64-encoded with `aws_smithy_types::base64`, the
+/// codec the wire protocols already carry, which keeps it opaque to the caller
+/// and free of the whitespace `PaginationKey`'s pattern `^[\S]+$` excludes.
+#[must_use]
+pub fn encode_page_token(scope: &str, last_key: &str) -> String {
+    ::aws_smithy_types::base64::encode(format!(
+        "{PAGE_TOKEN_PREFIX}{scope}{PAGE_TOKEN_SEPARATOR}{last_key}"
+    ))
+}
+
+/// The key `token` resumes `scope`'s listing after, or `None` when `token` is
+/// not a token this service minted for that listing.
+#[must_use]
+pub fn decode_page_token(scope: &str, token: &str) -> Option<String> {
+    let decoded = String::from_utf8(::aws_smithy_types::base64::decode(token).ok()?).ok()?;
+    let body = decoded.strip_prefix(PAGE_TOKEN_PREFIX)?;
+    let (token_scope, last_key) = body.split_once(PAGE_TOKEN_SEPARATOR)?;
+    (token_scope == scope).then(|| last_key.to_string())
+}
+
+/// One page of a paginated listing: the keys it serves and the `NextToken` the
+/// page after it resumes at, absent when this page is the last one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Page {
+    pub keys: Vec<String>,
+    pub next_token: Option<String>,
+}
+
+/// How many items a listing serves for `limit`.
+///
+/// `QueryLimitType`'s modelled range (0..60) is refused at the boundary before
+/// a handler runs, so the cap here never changes a request the framework
+/// accepted. A request that asks for no limit takes the modelled maximum, and
+/// so does one that asks for `0`: a page that may hold no item terminates no
+/// pagination loop, and this service's model already reads a submitted `0` as
+/// "no value" elsewhere (`PasswordPolicyType.TemporaryPasswordValidityDays`).
+#[must_use]
+pub fn page_size(limit: Option<i32>) -> usize {
+    let maximum = MAX_QUERY_LIMIT as usize;
+    match limit {
+        Some(limit) if limit > 0 => (limit as usize).min(maximum),
+        _ => maximum,
+    }
+}
+
+/// The page of `keys` that `limit` and `next_token` ask for in `scope`'s
+/// listing, or `None` when `next_token` is not a token this listing minted —
+/// which the calling operation refuses with its own modelled error.
+///
+/// `keys` must be in the listing's stable ASCENDING order; the page resumes at
+/// the first key strictly after the one the token names, so a key deleted
+/// between two pages neither repeats nor skips the keys around it.
+#[must_use]
+pub fn page_of(
+    scope: &str,
+    keys: &[String],
+    limit: Option<i32>,
+    next_token: Option<&str>,
+) -> Option<Page> {
+    let start = match next_token {
+        None => 0,
+        Some(token) => {
+            let after = decode_page_token(scope, token)?;
+            keys.partition_point(|key| key <= &after)
+        }
+    };
+    let end = start.saturating_add(page_size(limit)).min(keys.len());
+    let served = keys.get(start..end).unwrap_or_default().to_vec();
+    let next_token = match served.last() {
+        Some(last) if end < keys.len() => Some(encode_page_token(scope, last)),
+        _ => None,
+    };
+    Some(Page {
+        keys: served,
+        next_token,
+    })
 }
 
 /// Whether `c` counts as a symbol for a password policy: anything that is

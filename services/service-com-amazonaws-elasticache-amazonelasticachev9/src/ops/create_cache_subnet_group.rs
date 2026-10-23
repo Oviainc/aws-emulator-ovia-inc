@@ -74,6 +74,10 @@
 //! * `CacheSubnetQuotaExceededFault` (HTTP 400) — The request cannot be processed because it
 //!   would exceed the allowed number of subnets in a cache subnet group.
 //! * `InvalidSubnet` (HTTP 400) — An invalid subnet identifier was specified.
+//! * `InvalidParameterValueException` (HTTP 400, awsQuery code `InvalidParameterValue`) —
+//!   widened in through `extra_errors` (see below): the SERVICE models it and ElastiCache
+//!   answers it for a `SubnetIds` entry that names no subnet of the account, which the
+//!   model's `errors` list for this operation omits.
 //! * `SubnetNotAllowedFault` (HTTP 400) — At least one subnet ID does not match the other
 //!   subnet IDs. This mismatch typically occurs when a user sets one subnet ID to a regional
 //!   Availability Zone and a different one to an outpost. Or when a user sets the subnet ID
@@ -96,12 +100,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-elasticache-amazonelast
 // here — hence the `CreateCacheSubnetGroupError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.elasticache#CreateCacheSubnetGroup")]
+// `InvalidParameterValueException` is widened in through `extra_errors`: this SERVICE
+// models it (awsQuery code `InvalidParameterValue`, HTTP 400) and it is what ElastiCache
+// answers a request naming subnets the account does not have with ("Some input subnets in
+// :[…] are invalid."), but the model's `errors` list for THIS operation omits it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.elasticache#CreateCacheSubnetGroup",
+    extra_errors = ["InvalidParameterValueException"]
+)]
 #[derive(Debug)]
 pub enum CreateCacheSubnetGroupErrorModeled {
     CacheSubnetGroupAlreadyExistsFault(CacheSubnetGroupAlreadyExistsFault),
     CacheSubnetGroupQuotaExceededFault(CacheSubnetGroupQuotaExceededFault),
     CacheSubnetQuotaExceededFault(CacheSubnetQuotaExceededFault),
+    InvalidParameterValueException(InvalidParameterValueException),
     InvalidSubnet(InvalidSubnet),
     SubnetNotAllowedFault(SubnetNotAllowedFault),
     TagQuotaPerResourceExceeded(TagQuotaPerResourceExceeded),
@@ -252,6 +264,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx.parts());
+
+        // Every subnet id has to name a subnet the account HAS: a subnet group
+        // is where a cluster is placed, so one built on an id that names
+        // nothing could never hold a cluster. Which subnets the account has is
+        // a fact of the Region (`crate::state::region_subnets`), and resolving
+        // them here — before anything is written — is what keeps the group's
+        // zones and VPC the resolved subnets' own rather than invented.
+        //
+        // One pass: an id that resolves becomes one of the group's subnets, an
+        // id that does not is one the refusal names, so the two cannot drift
+        // apart.
+        let mut subnets: Vec<crate::state::SubnetRecord> =
+            Vec::with_capacity(input.subnet_ids.len());
+        let mut unresolved: Vec<&str> = Vec::new();
+        for subnet_id in &input.subnet_ids {
+            match crate::state::resolve_subnet(&region, subnet_id) {
+                Some(subnet) => subnets.push(crate::state::SubnetRecord {
+                    subnet_identifier: subnet.subnet_id,
+                    availability_zone: subnet.availability_zone,
+                }),
+                None => unresolved.push(subnet_id),
+            }
+        }
+        if !unresolved.is_empty() {
+            return Err(
+                CreateCacheSubnetGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(crate::state::invalid_subnets_message(&unresolved)),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
@@ -280,21 +326,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let vpc_id = store.mint_vpc_id();
         let record = crate::state::CacheSubnetGroupRecord {
             arn: crate::state::subnet_group_arn(&region, &name),
-            subnets: input
-                .subnet_ids
-                .into_iter()
-                .enumerate()
-                .map(|(index, subnet_identifier)| crate::state::SubnetRecord {
-                    subnet_identifier,
-                    availability_zone: crate::state::availability_zone(&region, index),
-                })
-                .collect(),
+            subnets,
             name: name.clone(),
             description: input.cache_subnet_group_description,
-            vpc_id,
+            // The VPC of the subnets the group holds, not an invented one:
+            // every subnet the account has belongs to its default VPC.
+            vpc_id: crate::state::default_vpc_id(&region),
             tags,
         };
         store.cache_subnet_groups.insert(name.clone(), record);

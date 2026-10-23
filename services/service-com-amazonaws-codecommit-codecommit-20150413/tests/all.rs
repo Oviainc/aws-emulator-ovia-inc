@@ -11,6 +11,8 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/approval_rule_template_content_canonicalization.rs"]
+mod approval_rule_template_content_canonicalization;
 #[path = "all/approval_rule_template_content_update.rs"]
 mod approval_rule_template_content_update;
 #[path = "all/approval_rule_templates.rs"]
@@ -51,8 +53,14 @@ mod differences;
 mod file_commit_history;
 #[path = "all/folder_listing.rs"]
 mod folder_listing;
+#[path = "all/git_object_ids.rs"]
+mod git_object_ids;
+#[path = "all/git_transport.rs"]
+mod git_transport;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/object_store_bounds.rs"]
+mod object_store_bounds;
 #[path = "all/repositories_for_approval_rule_template.rs"]
 mod repositories_for_approval_rule_template;
 #[path = "all/repository_description.rs"]

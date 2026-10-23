@@ -18,13 +18,15 @@ use service_com_amazonaws_cognitoidentity_awscognitoidentityservice::EmulatedSer
 use smithy_server_runtime::MultiServiceRouter;
 
 /// One emulator holding this service, reached exactly as the production router reaches
-/// it: one shared engine, one `MultiServiceRouter`.
-struct Emulator {
+/// it: one shared engine, one `MultiServiceRouter`. `pub(crate)` so a sibling suite in
+/// this test target drives the service through the same harness rather than a second
+/// copy of it.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.register_service(EmulatedService::new(engine));
@@ -33,7 +35,7 @@ impl Emulator {
 
     /// Call one operation and return its HTTP status with the parsed JSON body (`Null`
     /// for an empty body).
-    async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("https://cognito-identity.us-east-1.amazonaws.com/")
@@ -72,7 +74,7 @@ impl Emulator {
     }
 
     /// Call an operation that must succeed, returning its output object.
-    async fn ok(&self, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn ok(&self, operation: &str, body: &Value) -> Value {
         let (status, parsed) = self.call(operation, body).await;
         assert_eq!(
             status, 200,
@@ -82,7 +84,7 @@ impl Emulator {
     }
 
     /// Create a pool and return its minted `IdentityPoolId`.
-    async fn pool(&self, name: &str, allow_unauthenticated: bool) -> String {
+    pub(crate) async fn pool(&self, name: &str, allow_unauthenticated: bool) -> String {
         let created = self
             .ok(
                 "CreateIdentityPool",
@@ -99,7 +101,7 @@ impl Emulator {
     }
 
     /// Mint an identity with the given `Logins` map (absent when `logins` is `None`).
-    async fn identity(&self, pool_id: &str, logins: Option<Value>) -> String {
+    pub(crate) async fn identity(&self, pool_id: &str, logins: Option<Value>) -> String {
         let mut request = Map::new();
         request.insert("IdentityPoolId".to_string(), json!(pool_id));
         if let Some(logins) = logins {
@@ -133,7 +135,7 @@ fn is_cognito_id(value: &str) -> bool {
 }
 
 /// The error code an error response carries (`__type` on the awsJson protocols).
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body["__type"]
         .as_str()
         .unwrap_or_else(|| panic!("an error response carries a __type: {body}"))
@@ -141,7 +143,7 @@ fn error_code(body: &Value) -> String {
 }
 
 /// A well-formed `IdentityPoolId` that no pool was ever created with.
-const ABSENT_POOL_ID: &str = "us-east-1:00000000-0000-0000-0000-000000000000";
+pub(crate) const ABSENT_POOL_ID: &str = "us-east-1:00000000-0000-0000-0000-000000000000";
 /// A well-formed `IdentityId` that no `GetId` ever minted.
 const ABSENT_IDENTITY_ID: &str = "us-east-1:11111111-1111-1111-1111-111111111111";
 

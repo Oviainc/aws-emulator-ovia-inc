@@ -14,6 +14,13 @@
 //! here named after an operation would make that operation's own module name
 //! ambiguous inside `ops` (`E0659`).
 
+// The schema/codec macros every structure with a `@timestampFormat("date-time")` member
+// uses, because the vendored codegen drops that trait. Hand-added, not generated; see the
+// module's own note. `#[macro_use]`, and declared FIRST, so the macros are in the textual
+// scope of every `*_types` module below.
+#[macro_use]
+pub mod date_time_wire;
+
 pub mod cancel_job_run_types;
 pub mod create_job_template_types;
 pub mod create_managed_endpoint_types;

@@ -192,6 +192,47 @@ fn quota_exceeded() -> CreateProfileError {
     .into()
 }
 
+/// The modelled refusal for a repeat of a `clientToken` that asks for something else — the
+/// wording every create of this service refuses it with
+/// ([`crate::state::token_already_used`]).
+fn token_already_used(minted: &str) -> CreateProfileError {
+    CreateProfileErrorModeled::ConflictException(ConflictException {
+        message: crate::state::token_already_used("profile", minted),
+    })
+    .into()
+}
+
+/// A digest of everything this create request asks for, as the `@idempotencyToken` replay
+/// check compares it ([`crate::state::request_digest`]). The tag list is sorted, so two
+/// requests differing only in tag ORDER are the same request; `clientToken` is excluded,
+/// being the key rather than part of the payload.
+fn request_digest(input: &CreateProfileInput) -> String {
+    // Destructured, not field-accessed, so the member set is EXHAUSTIVE at compile time: a
+    // member added by a model update breaks this line instead of being silently left out
+    // of the digest (which would answer a genuinely different request as a replay).
+    let CreateProfileInput {
+        name,
+        email,
+        phone,
+        business_name,
+        logging,
+        client_token: _,
+        tags,
+    } = input;
+
+    let mut tags: Vec<(&str, &str)> = tags
+        .iter()
+        .flatten()
+        .map(|tag| (tag.key.as_str(), tag.value.as_str()))
+        .collect();
+    tags.sort_unstable();
+
+    crate::state::request_digest(&format!(
+        "{:?}",
+        (name, email, phone, business_name, logging, &tags)
+    ))
+}
+
 /// The modelled refusal for a log group this service could not provision: with
 /// `logging` ENABLED the profile's `logGroupName` must resolve in CloudWatch Logs, so a
 /// profile is not minted at all when the group cannot be created.
@@ -325,6 +366,10 @@ enum Settled {
     /// A concurrent call carrying the same `clientToken` stored one first, so this
     /// request answers with THAT profile and stores nothing.
     Replayed(CreateProfileOutput),
+    /// A concurrent call carrying the same `clientToken` stored a profile for a DIFFERENT
+    /// request, so this one can neither replay it nor store a second profile: one token
+    /// names one request.
+    TokenUsed(String),
 }
 
 /// The response for a stored profile — every member read back off the record, so a
@@ -379,6 +424,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        if let Err(denied) =
+            crate::state::authorize(&*self.engine, ctx, Self::NAME, crate::state::ANY_RESOURCE)
+        {
+            return Err(CreateProfileErrorModeled::AccessDeniedException(denied).into());
+        }
         let Some(store) = crate::state::service_state(&*self.engine) else {
             return Err(CreateProfileErrorModeled::InternalServerException(
                 InternalServerException {
@@ -390,7 +440,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `clientToken` is this operation's `@idempotencyToken`: a repeat carrying the
-        // same token answers with the resource the first call created, not a second one.
+        // same token answers with the resource the first call created, not a second one —
+        // and a repeat under a token that already created a DIFFERENT profile is the
+        // modelled conflict, which [`request_digest`] is what tells apart.
+        let digest = request_digest(&input);
         let idempotency_key = input
             .client_token
             .as_deref()
@@ -405,12 +458,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let profile_id = {
                 let mut state = store.lock();
                 if let Some(key) = idempotency_key.as_deref() {
-                    if let Some(existing) = state
-                        .idempotency
-                        .get(key)
-                        .and_then(|id| state.profiles.get(id))
-                    {
-                        return Ok(stored_profile_response(existing));
+                    match state.replay(key, ::std::time::Instant::now()) {
+                        Some(crate::state::TokenReplay::InFlight) => {
+                            return Err(CreateProfileErrorModeled::ConflictException(
+                                ConflictException {
+                                    message: crate::state::create_in_flight(
+                                        "profile",
+                                        input.client_token.as_deref().unwrap_or_default(),
+                                    ),
+                                },
+                            )
+                            .into())
+                        }
+                        Some(crate::state::TokenReplay::Completed(minted)) => {
+                            if let Some(existing) = state.profiles.get(&minted) {
+                                if existing.request_digest != digest {
+                                    return Err(token_already_used(&minted));
+                                }
+                                return Ok(stored_profile_response(existing));
+                            }
+                        }
+                        None => {}
                     }
                 }
 
@@ -467,10 +535,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state.reserved_profile_ids.remove(&profile_id);
             let replayed = idempotency_key
                 .as_deref()
-                .and_then(|key| state.idempotency.get(key).cloned())
-                .and_then(|id| state.profiles.get(&id).map(stored_profile_response));
-            if let Some(response) = replayed {
-                Settled::Replayed(response)
+                .and_then(|key| match state.replay(key, ::std::time::Instant::now()) {
+                    // A concurrent create carrying this token stored a profile while this
+                    // one provisioned its log group: that profile IS this token's result,
+                    // so this request answers with it (and releases the group it made)
+                    // rather than refusing a request it can answer. The in-flight arm is
+                    // for a DUPLICATE that arrives while a create runs, which is the
+                    // check above, not for the create that is already here.
+                    Some(crate::state::TokenReplay::InFlight)
+                    | Some(crate::state::TokenReplay::Completed(_)) => state
+                        .idempotency
+                        .get(key)
+                        .map(|record| record.resource_id.clone()),
+                    None => None,
+                })
+                .and_then(|id| state.profiles.get(&id))
+                .map(|existing| {
+                    if existing.request_digest == digest {
+                        Settled::Replayed(stored_profile_response(existing))
+                    } else {
+                        Settled::TokenUsed(existing.profile_id.clone())
+                    }
+                });
+            if let Some(settled) = replayed {
+                settled
             } else {
                 let profile = crate::state::Profile {
                     profile_arn: ::engine::emulator_arn(
@@ -488,6 +576,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     created_at: crate::state::now(),
                     modified_at: None,
                     tags: input.tags.unwrap_or_default(),
+                    request_digest: digest,
                 };
                 let response = stored_profile_response(&profile);
                 state.profiles.insert(profile_id.clone(), profile);
@@ -511,6 +600,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                 }
                 Ok(response)
+            }
+            // Nothing was stored here either, so the same release applies.
+            Settled::TokenUsed(minted) => {
+                if provisioned_here {
+                    if let Some(name) = log_group_name.as_deref() {
+                        release_log_group(ctx, &region, name).await;
+                    }
+                }
+                Err(token_already_used(&minted))
             }
         }
     }

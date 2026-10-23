@@ -115,6 +115,29 @@ pub const GLOSSARY_STATUS_DISABLED: &str = "DISABLED";
 /// revisioned resource carries: DataZone numbers revisions from 1, as a decimal string.
 pub const FIRST_REVISION: &str = "1";
 
+/// The `ListingStatus` members (model enum `com.amazonaws.datazone#ListingStatus`:
+/// CREATING | ACTIVE | INACTIVE).
+pub const LISTING_STATUS_CREATING: &str = "CREATING";
+pub const LISTING_STATUS_ACTIVE: &str = "ACTIVE";
+pub const LISTING_STATUS_INACTIVE: &str = "INACTIVE";
+
+/// The `ChangeAction` members (model enum `com.amazonaws.datazone#ChangeAction`:
+/// PUBLISH | UNPUBLISH) — the two change sets `CreateListingChangeSet` applies.
+pub const CHANGE_ACTION_PUBLISH: &str = "PUBLISH";
+pub const CHANGE_ACTION_UNPUBLISH: &str = "UNPUBLISH";
+
+/// The `EntityType` members (model enum `com.amazonaws.datazone#EntityType`:
+/// ASSET | DATA_PRODUCT) — what a listing can be a record OF.
+pub const ENTITY_TYPE_ASSET: &str = "ASSET";
+pub const ENTITY_TYPE_DATA_PRODUCT: &str = "DATA_PRODUCT";
+
+/// The `listingRevision` that names a listing's newest revision: the `@default` the
+/// model puts on `GetListingInput::listingRevision` (smithy_query operation="GetListing").
+pub const LISTING_REVISION_LATEST: &str = "latest";
+
+/// `ListingName`'s modelled maximum length, 1..64 (smithy_query shape="ListingName").
+pub const LISTING_NAME_MAX_LEN: usize = 64;
+
 /// Milliseconds since the Unix epoch, now.
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -179,6 +202,231 @@ pub struct Domain {
     /// which is created with the domain itself. Bounded by
     /// [`MAX_DOMAIN_UNITS_PER_DOMAIN`].
     pub domain_units: BTreeMap<String, DomainUnit>,
+    /// The catalog listings stored in this domain, keyed by their `ListingId` — the
+    /// identifier `GetListing`/`DeleteListing` address one by — so they go with the
+    /// domain when it is deleted. Bounded by [`MAX_LISTINGS_PER_DOMAIN`].
+    pub listings: BTreeMap<String, Listing>,
+}
+
+impl Domain {
+    /// The listing that records the entity `entity_type`/`entity_id`, when that entity
+    /// has been published in this domain's catalog.
+    ///
+    /// At most one listing records one entity: a listing IS the entity's record in the
+    /// catalog, and `CreateListingChangeSet` adds a revision to that record rather than
+    /// a second listing. A linear scan, deliberately: the map is bounded by
+    /// [`MAX_LISTINGS_PER_DOMAIN`], so one lookup rule shared by every handler is worth
+    /// more than a second index to keep in step (the same trade
+    /// [`ComAmazonawsDatazoneDatazoneState::live_domain_named`] makes).
+    pub fn listing_for_entity(&self, entity_type: &str, entity_id: &str) -> Option<&Listing> {
+        self.listings
+            .values()
+            .find(|listing| listing.entity_type == entity_type && listing.entity_id == entity_id)
+    }
+
+    /// [`Self::listing_for_entity`], for a change set that writes the listing.
+    pub fn listing_for_entity_mut(
+        &mut self,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Option<&mut Listing> {
+        self.listings
+            .values_mut()
+            .find(|listing| listing.entity_type == entity_type && listing.entity_id == entity_id)
+    }
+}
+
+/// One stored catalog listing: an entity published in the domain's catalog.
+///
+/// A listing is "a record of an asset at a given time" (smithy_query
+/// operation="CreateListingChangeSet"), so each PUBLISH change set records a further
+/// [`ListingRevision`] — a snapshot of the published entity as it was at that instant —
+/// while the listing itself keeps the identity (`id`) the catalog addresses it by.
+/// An UNPUBLISH change set takes the record out of the catalog by moving `status` to
+/// [`LISTING_STATUS_INACTIVE`]; it adds no snapshot, because nothing about the entity
+/// was recorded.
+#[derive(Debug, Clone)]
+pub struct Listing {
+    pub id: String,
+    pub domain_id: String,
+    /// Which kind of entity this listing records: one of [`ENTITY_TYPE_ASSET`] /
+    /// [`ENTITY_TYPE_DATA_PRODUCT`].
+    pub entity_type: String,
+    /// The id of the entity this listing records, within the same domain.
+    pub entity_id: String,
+    /// One of [`LISTING_STATUS_CREATING`] / [`LISTING_STATUS_ACTIVE`] /
+    /// [`LISTING_STATUS_INACTIVE`].
+    pub status: String,
+    /// When a [`LISTING_STATUS_CREATING`] listing becomes [`LISTING_STATUS_ACTIVE`].
+    /// `None` for a settled listing — one that is ACTIVE or INACTIVE.
+    pub status_due_ms: Option<i64>,
+    /// The caller and instant of the change set that FIRST published this entity.
+    pub created_by: String,
+    pub created_at_ms: i64,
+    /// The caller and instant of the LATEST change set applied to this listing.
+    pub updated_by: String,
+    pub updated_at_ms: i64,
+    /// Every recorded revision, keyed by its number so the greatest key is the latest.
+    /// Bounded by [`MAX_LISTING_REVISIONS`].
+    pub revisions: BTreeMap<u32, ListingRevision>,
+    /// The `clientToken` of the UNPUBLISH change set that last deactivated this
+    /// listing, so a replay of that request is answered rather than re-applied.
+    pub unpublish_client_token: Option<String>,
+}
+
+impl Listing {
+    /// The greatest revision number recorded, i.e. the one a `GetListing` that asks for
+    /// [`LISTING_REVISION_LATEST`] reports.
+    pub fn latest_revision(&self) -> Option<&ListingRevision> {
+        self.revisions.values().next_back()
+    }
+
+    /// The revision addressed by a `listingRevision` string, which is the decimal
+    /// number the change set that recorded it returned. Addressing is exact: only the
+    /// canonical decimal resolves, so `"01"` and `"+1"` name no revision — the same
+    /// rule [`FormType::revision`] applies.
+    pub fn revision(&self, revision: &str) -> Option<&ListingRevision> {
+        let number = revision.parse::<u32>().ok()?;
+        if number.to_string() != revision {
+            return None;
+        }
+        self.revisions.get(&number)
+    }
+
+    /// The number the NEXT recorded revision gets: one past the greatest ever recorded,
+    /// so revision numbers never go backwards.
+    pub fn next_revision_number(&self) -> u32 {
+        self.revisions.keys().next_back().copied().unwrap_or(0) + 1
+    }
+
+    /// The revision carrying `token`, if a PUBLISH change set with that `clientToken`
+    /// already recorded one of this listing's revisions.
+    pub fn revision_with_token(&self, token: &str) -> Option<&ListingRevision> {
+        self.revisions
+            .values()
+            .find(|revision| revision.client_token.as_deref() == Some(token))
+    }
+}
+
+/// One recorded revision of a listing: the published entity as it was when the PUBLISH
+/// change set that recorded it ran.
+///
+/// The snapshot is taken at publish time deliberately — a listing is a record of the
+/// entity AT A GIVEN TIME, so a later change to the entity does not rewrite a revision
+/// the catalog already holds.
+#[derive(Debug, Clone)]
+pub struct ListingRevision {
+    /// The revision number, rendered as the modelled `Revision` string: the first one
+    /// recorded for a listing renders as [`FIRST_REVISION`].
+    pub revision: u32,
+    /// The revision of the ENTITY this snapshot records.
+    pub entity_revision: String,
+    /// The entity's name, clipped to [`LISTING_NAME_MAX_LEN`] by [`listing_name`].
+    pub name: String,
+    pub description: Option<String>,
+    /// The entity's own type — an asset's `typeIdentifier`, reported as the listing
+    /// item's `assetType`.
+    pub entity_type_name: String,
+    /// The project that owns the published entity.
+    pub owning_project_id: String,
+    /// When the published ENTITY was created, which is what a listing item's
+    /// `createdAt` reports (smithy_query shape="AssetListing" member="createdAt").
+    pub entity_created_at_ms: i64,
+    /// The entity's metadata forms as the modelled `Forms` string, built by
+    /// [`listing_forms`]. `None` when the entity has no form attached.
+    pub forms: Option<String>,
+    /// The caller and instant of the change set that recorded this revision.
+    pub created_by: String,
+    pub created_at_ms: i64,
+    /// That change set's `clientToken`, so a replay of it is answered with this
+    /// revision rather than recording a second one.
+    pub client_token: Option<String>,
+}
+
+/// An entity's name as the listing that records it reports it.
+///
+/// `ListingName` is 1..64 while the name of a publishable entity is longer-ranged
+/// (`AssetName` is 1..256, smithy_query shape="AssetName"), so a name that does not fit
+/// the listing's own modelled bound is clipped to it — on a CHARACTER boundary, so the
+/// result is still valid UTF-8 — rather than reported in violation of the model.
+pub fn listing_name(entity_name: &str) -> String {
+    entity_name.chars().take(LISTING_NAME_MAX_LEN).collect()
+}
+
+/// An entity's metadata forms as the modelled `Forms` string a listing reports.
+///
+/// `Forms` is a plain string (smithy_query shape="Forms") and a listing reports the
+/// forms attached to the published entity, so they are rendered as ONE JSON object
+/// keyed by `formName` — the name a form is addressed by on its entity — whose value is
+/// that form's content. Content that is itself JSON nests as that JSON, so the
+/// rendering round-trips through a parser instead of double-encoding; content that is
+/// not JSON stays a JSON string, and a form with no content renders as `null`.
+///
+/// `None` when the entity carries no form at all: there is then no object to report.
+pub fn listing_forms(forms: &[StoredForm]) -> Option<String> {
+    if forms.is_empty() {
+        return None;
+    }
+    let mut rendered = serde_json::Map::new();
+    for form in forms {
+        let value = match form.content.as_deref() {
+            None => serde_json::Value::Null,
+            Some(content) => serde_json::from_str(content)
+                .unwrap_or_else(|_| serde_json::Value::String(content.to_string())),
+        };
+        rendered.insert(form.form_name.clone(), value);
+    }
+    serde_json::to_string(&serde_json::Value::Object(rendered)).ok()
+}
+
+/// A recorded revision as the modelled `ListingItem` union (smithy_query
+/// shape="ListingItem"), shared by every operation that reports a listing's item so the
+/// forms cannot drift apart.
+///
+/// Which member of the union is reported follows the listing's own `entity_type`: the
+/// snapshot is the same either way, and each union member names it with that entity's
+/// own vocabulary (`assetId`/`assetRevision` against
+/// `dataProductId`/`dataProductRevision`).
+///
+/// `glossaryTerms` is a `DetailedGlossaryTerms` — each term's NAME and short
+/// description, not its id (smithy_query shape="DetailedGlossaryTerm") — and a term's
+/// record is a resource this emulator does not store yet (`CreateGlossaryTerm` is a
+/// scaffold), so no stored term can resolve the ids an entity carries and the member is
+/// left absent rather than filled with an id dressed up as a name.
+pub fn listing_item(
+    listing: &Listing,
+    revision: &ListingRevision,
+) -> crate::ops::types::ListingItem {
+    use crate::ops::types::{AssetListing, DataProductListing, ListingItem};
+
+    if listing.entity_type == ENTITY_TYPE_DATA_PRODUCT {
+        return ListingItem::dataProductListing(DataProductListing {
+            data_product_id: Some(listing.entity_id.clone()),
+            data_product_revision: Some(revision.entity_revision.clone()),
+            created_at: Some(date_time(revision.entity_created_at_ms)),
+            forms: revision.forms.clone(),
+            glossary_terms: None,
+            owning_project_id: Some(revision.owning_project_id.clone()),
+            // The assets of a data product listing come from the data product's own
+            // record, which no store holds yet.
+            items: None,
+        });
+    }
+    ListingItem::assetListing(AssetListing {
+        asset_id: Some(listing.entity_id.clone()),
+        asset_revision: Some(revision.entity_revision.clone()),
+        asset_type: Some(revision.entity_type_name.clone()),
+        created_at: Some(date_time(revision.entity_created_at_ms)),
+        forms: revision.forms.clone(),
+        // Time series data points are imported by `PostTimeSeriesDataPoints`, which is
+        // still a scaffold, so no published entity has any.
+        latest_time_series_data_point_forms: None,
+        glossary_terms: None,
+        // Governed glossary terms are attached by `AssociateGovernedTerms`, which is
+        // still a scaffold, so no published entity carries any.
+        governed_glossary_terms: None,
+        owning_project_id: Some(revision.owning_project_id.clone()),
+    })
 }
 
 /// One stored DataZone domain unit: a node of the domain's ownership hierarchy.
@@ -742,6 +990,19 @@ pub const MAX_GLOSSARIES_PER_DOMAIN: usize = 500;
 /// with the same refusal (`CreateAssetType` models `ServiceQuotaExceededException` too).
 pub const MAX_ASSET_TYPES_PER_DOMAIN: usize = 500;
 
+/// The most catalog listings this emulator stores in one domain, for the same reason
+/// and with the same refusal (`CreateListingChangeSet` models
+/// `ServiceQuotaExceededException` too). It also bounds the
+/// [`Domain::listing_for_entity`] scan and the per-request
+/// [`ComAmazonawsDatazoneDatazoneState::settle_clock`] walk over listings.
+pub const MAX_LISTINGS_PER_DOMAIN: usize = 500;
+
+/// The most revisions this emulator records for one listing. Publishing an entity that
+/// already has a listing records a further revision, so this is the bound on that
+/// caller-driven growth; the refusal past it is `CreateListingChangeSet`'s
+/// `ServiceQuotaExceededException`.
+pub const MAX_LISTING_REVISIONS: usize = 100;
+
 /// The most tags this emulator keeps on one resource.
 ///
 /// A CHOSEN ceiling, not a published quota: `TagResource` is a caller-driven growth
@@ -1033,8 +1294,9 @@ impl ComAmazonawsDatazoneDatazoneState {
     }
 
     /// Materialise every domain lifecycle step the clock already owes at `now`: a
-    /// `CREATING` domain whose span has elapsed becomes `AVAILABLE`, and a `DELETING`
-    /// one disappears together with its projects.
+    /// `CREATING` domain whose span has elapsed becomes `AVAILABLE`, a `DELETING` one
+    /// disappears together with its projects, and a `CREATING` listing whose span has
+    /// elapsed becomes `ACTIVE`.
     ///
     /// This is the ONLY write a reporting operation makes, and it writes exactly what
     /// was already owed at this instant whether or not anybody called.
@@ -1063,6 +1325,17 @@ impl ComAmazonawsDatazoneDatazoneState {
                 }
                 // No other status carries a due instant.
                 _ => domain.status_due_ms = None,
+            }
+        }
+        // The publish a `CreateListingChangeSet` started has finished: the listing is
+        // in the catalog. Bounded by MAX_DOMAINS * MAX_LISTINGS_PER_DOMAIN, and run
+        // after the domain pass so a domain that has just disappeared is not walked.
+        for domain in self.domains.values_mut() {
+            for listing in domain.listings.values_mut() {
+                if listing.status_due_ms.is_some_and(|due| due <= now) {
+                    listing.status = LISTING_STATUS_ACTIVE.to_string();
+                    listing.status_due_ms = None;
+                }
             }
         }
         // A token naming a domain that has just disappeared can never be replayed
@@ -1245,6 +1518,9 @@ pub enum ResourceKind {
     Project,
     AssetType,
     Glossary,
+    Asset,
+    DataProduct,
+    Listing,
 }
 
 impl ResourceKind {
@@ -1256,6 +1532,9 @@ impl ResourceKind {
             Self::Project => "Project",
             Self::AssetType => "Asset type",
             Self::Glossary => "Glossary",
+            Self::Asset => "Asset",
+            Self::DataProduct => "Data product",
+            Self::Listing => "Listing",
         }
     }
 

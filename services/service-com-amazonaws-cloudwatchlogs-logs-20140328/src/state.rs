@@ -10,10 +10,24 @@
 //! A log group's subscription filters live on the group they are "associated with"
 //! ([`LogGroupRecord::subscription_filters`]), so deleting the group removes them too.
 //!
+//! A log group's log transformer lives on the group too
+//! ([`LogGroupRecord::transformer`]), because `PutTransformer` creates one "for a single
+//! log group" and nothing else identifies it.
+//!
 //! The account's resource policies live here too: an account-scoped one in
 //! [`ComAmazonawsCloudwatchlogsLogs20140328State::account_resource_policies`], a
 //! resource-scoped one on the log group it is attached to
 //! ([`LogGroupRecord::resource_policy`]).
+//!
+//! The account's import tasks — the CloudTrail Lake imports `CreateImportTask` starts and
+//! `DescribeImportTasks` reports — live in
+//! [`ComAmazonawsCloudwatchlogsLogs20140328State::import_tasks`], each one an
+//! [`ImportTaskRecord`] carrying the instant the clock owes it a terminal status.
+//!
+//! A log group's data protection policy lives on that group as well
+//! ([`LogGroupRecord::data_protection_policy`]), because `PutDataProtectionPolicy`
+//! "applies to only the specified log group": one group holds at most one, and deleting
+//! the group takes its policy with it.
 
 use std::collections::BTreeMap;
 
@@ -24,6 +38,14 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// The log group class `CreateLogGroup` applies when the request omits
 /// `logGroupClass` ("If you omit this parameter, the default of STANDARD is used").
 pub const DEFAULT_LOG_GROUP_CLASS: &str = "STANDARD";
+
+/// The one log group class a log-group-level transformer may be created on, from
+/// `PutTransformer`: "You can create transformers only for the log groups in the
+/// Standard log class." Spelled as the model's `LogGroupClass` spells it
+/// (`LOG_GROUP_CLASS_VALUES`). Named apart from [`DEFAULT_LOG_GROUP_CLASS`] because the
+/// two state different rules — the class a group gets when the request names none, and
+/// the class this feature requires — even where the model spells them the same.
+pub const TRANSFORMER_LOG_GROUP_CLASS: &str = "STANDARD";
 
 /// Per-event storage overhead CloudWatch Logs charges a log group's `storedBytes`.
 /// From the PutLogEvents quota: a batch's size "is calculated as the sum of all event
@@ -84,6 +106,23 @@ pub const MAX_LOG_GROUPS: usize = 1_000_000;
 /// stored ON its log group ([`LogGroupRecord::resource_policy`]), so a group can hold
 /// exactly one.
 pub const MAX_ACCOUNT_RESOURCE_POLICIES: usize = 10;
+
+/// The longest `policyDocument` `PutDataProtectionPolicy` admits, from that member's own
+/// documentation: "The JSON specified in policyDocument can be up to 30,720 characters."
+/// The model puts no `@length` on `DataProtectionPolicyDocument`, so nothing refuses an
+/// over-long document before the handler runs.
+pub const MAX_DATA_PROTECTION_POLICY_DOCUMENT_CHARS: usize = 30_720;
+
+/// The `dataProtectionStatus` of a log group that has a data protection policy right
+/// now, from the model's `DataProtectionStatus` enum (`ACTIVATED` | `DELETED` |
+/// `ARCHIVED` | `DISABLED`).
+pub const DATA_PROTECTION_STATUS_ACTIVATED: &str = "ACTIVATED";
+
+/// The `dataProtectionStatus` of a log group whose data protection policy has been
+/// deleted — the "or whether it had one in the past" half of `LogGroup$dataProtectionStatus`
+/// ("Displays whether this log group has a protection policy, or whether it had one in
+/// the past"). From the same `DataProtectionStatus` enum.
+pub const DATA_PROTECTION_STATUS_DELETED: &str = "DELETED";
 
 /// The scope of a policy attached to no resource, from the model's `PolicyScope` enum
 /// (`ACCOUNT` | `RESOURCE`). This is also the scope `DescribeResourcePolicies` reports
@@ -160,6 +199,32 @@ pub const MAX_STREAM_EVENTS: usize = 20_000;
 /// The byte half of the per-stream storage ceiling. See [`MAX_STREAM_EVENTS`].
 pub const MAX_STREAM_BYTES: i64 = 8 * 1024 * 1024;
 
+/// An import task that is still running, from the model's `ImportStatus` enum
+/// (`IN_PROGRESS` | `CANCELLED` | `COMPLETED` | `FAILED`). This is the only
+/// non-terminal one: an import AWS accepts starts here and leaves it on its own.
+pub const IMPORT_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// An import task a caller cancelled, from the model's `ImportStatus` enum.
+pub const IMPORT_STATUS_CANCELLED: &str = "CANCELLED";
+
+/// An import task that finished importing, from the model's `ImportStatus` enum.
+pub const IMPORT_STATUS_COMPLETED: &str = "COMPLETED";
+
+/// An import task that stopped on an error, from the model's `ImportStatus` enum. A task
+/// in this status reports why in `Import$errorMessage` ("Error message related to any
+/// failed imports").
+pub const IMPORT_STATUS_FAILED: &str = "FAILED";
+
+/// How long after it is created an import task becomes `COMPLETED`.
+///
+/// AWS documents no duration for an import ("Starts an import from a data source to
+/// CloudWatch Log"), so this span is THE EMULATOR'S OWN CHOICE: the import runs
+/// asynchronously, so the task is handed back `IN_PROGRESS` and the clock owes it a
+/// terminal status later. The span is deliberately not zero — a caller that reads or
+/// cancels the task straight after creating it still observes `IN_PROGRESS`, and the
+/// state rules that go with it.
+pub const IMPORT_COMPLETION_DELAY_MS: i64 = 500;
+
 /// Per-service state for com-amazonaws-cloudwatchlogs-logs-20140328. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCloudwatchlogsLogs20140328State {
@@ -185,6 +250,11 @@ pub struct ComAmazonawsCloudwatchlogsLogs20140328State {
     /// operations in the account"). `None` until one is associated, and `None` again
     /// after `DisassociateKmsKey`.
     pub query_results_kms_key_id: Option<String>,
+    /// Every import task of this account — the resource `CreateImportTask` starts and
+    /// `DescribeImportTasks` reports — keyed by `importId`. A `BTreeMap` so
+    /// `DescribeImportTasks` enumerates in import-id order without re-sorting, which is
+    /// also what makes its pagination cursor stable.
+    pub import_tasks: BTreeMap<String, ImportTaskRecord>,
 }
 
 impl ComAmazonawsCloudwatchlogsLogs20140328State {
@@ -200,6 +270,20 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
         let seq = self.next_policy_revision;
         self.next_policy_revision = self.next_policy_revision.saturating_add(1);
         seq
+    }
+
+    /// Materialise every import-task status change the clock has ALREADY made due, as of
+    /// `now_ms`.
+    ///
+    /// An import runs asynchronously, so its terminal status is owed by the clock rather
+    /// than by a call: the change was due at [`ImportTaskRecord::completion_due_ms`] even
+    /// if nobody asked. A reporting operation calls this before it reads, so what it
+    /// reports is what the clock already decided — never a status moved on because
+    /// something was polled.
+    pub fn materialize_due_import_transitions(&mut self, now_ms: i64) {
+        for task in self.import_tasks.values_mut() {
+            task.materialize_due_transitions(now_ms);
+        }
     }
 }
 
@@ -230,6 +314,283 @@ impl ResourcePolicyRecord {
             POLICY_SCOPE_ACCOUNT
         }
     }
+}
+
+/// One import task — "An import job to move data from CloudTrail Event Data Store to
+/// CloudWatch" — as it is stored. Every member of the model's `Import` shape is reported
+/// from this record, so `DescribeImportTasks` answers from state alone.
+#[derive(Debug, Clone)]
+pub struct ImportTaskRecord {
+    /// `Import$importId` — "The unique identifier of the import task."
+    pub import_id: String,
+    /// `Import$importSourceArn` — "The ARN of the CloudTrail Lake Event Data Store being
+    /// imported from."
+    pub import_source_arn: String,
+    /// `CreateImportTask$importRoleArn` — "The ARN of the IAM role that grants CloudWatch
+    /// Logs permission to import". No `Import` member reports it, but the task is the only
+    /// record of the role the import runs under, so it is stored with the task. Written by
+    /// `CreateImportTask` once that operation is implemented (it is still a scaffold stub),
+    /// which is also the only caller [`ImportTaskRecord::new`] is waiting for — neither is
+    /// dead code to prune.
+    pub import_role_arn: String,
+    /// `Import$importDestinationArn` — "The ARN of the managed CloudWatch Logs log group
+    /// where the events are being imported to."
+    pub import_destination_arn: String,
+    /// `Import$importStatus`, one of the [`IMPORT_STATUS_IN_PROGRESS`] family.
+    pub import_status: String,
+    /// `ImportFilter$startEventTime`, when the create named one.
+    pub start_event_time_ms: Option<i64>,
+    /// `ImportFilter$endEventTime`, when the create named one.
+    pub end_event_time_ms: Option<i64>,
+    /// `ImportStatistics$bytesImported` — "The total number of bytes that have been
+    /// imported to the managed log group."
+    pub bytes_imported: i64,
+    /// `Import$creationTime`, in epoch milliseconds.
+    pub creation_time_ms: i64,
+    /// `Import$lastUpdatedTime`, in epoch milliseconds.
+    pub last_updated_time_ms: i64,
+    /// The instant this task's asynchronous import is due to reach `COMPLETED`, stored
+    /// rather than waited for: a reporting operation materialises the transition once the
+    /// clock is past it ([`materialize_due_import_transitions`]). `None` once the task is
+    /// in a terminal status, which owes no further transition.
+    ///
+    /// [`materialize_due_import_transitions`]:
+    ///     ComAmazonawsCloudwatchlogsLogs20140328State::materialize_due_import_transitions
+    pub completion_due_ms: Option<i64>,
+    /// `Import$errorMessage` — "Error message related to any failed imports". Only a
+    /// FAILED task carries one.
+    pub error_message: Option<String>,
+}
+
+impl ImportTaskRecord {
+    /// A brand-new import task: running, nothing imported yet, and due to complete
+    /// [`IMPORT_COMPLETION_DELAY_MS`] after it was created. This is what
+    /// `CreateImportTask` stores once it is implemented.
+    pub fn new(
+        import_id: &str,
+        import_source_arn: &str,
+        import_role_arn: &str,
+        import_destination_arn: &str,
+        import_filter: Option<&crate::ops::types::ImportFilter>,
+        creation_time_ms: i64,
+    ) -> Self {
+        Self {
+            import_id: import_id.to_string(),
+            import_source_arn: import_source_arn.to_string(),
+            import_role_arn: import_role_arn.to_string(),
+            import_destination_arn: import_destination_arn.to_string(),
+            import_status: IMPORT_STATUS_IN_PROGRESS.to_string(),
+            start_event_time_ms: import_filter.and_then(|filter| filter.start_event_time),
+            end_event_time_ms: import_filter.and_then(|filter| filter.end_event_time),
+            bytes_imported: 0,
+            creation_time_ms,
+            last_updated_time_ms: creation_time_ms,
+            completion_due_ms: Some(creation_time_ms.saturating_add(IMPORT_COMPLETION_DELAY_MS)),
+            error_message: None,
+        }
+    }
+
+    /// Whether this task has reached a status it can never leave — anything but
+    /// [`IMPORT_STATUS_IN_PROGRESS`], the one status the model's `ImportStatus` enum
+    /// describes as still running. This is the condition `CancelImportTask` refuses on
+    /// ("Cancels an ACTIVE import task"), and the one that tells this record it owes no
+    /// further clock transition.
+    pub fn is_terminal(&self) -> bool {
+        self.import_status != IMPORT_STATUS_IN_PROGRESS
+    }
+
+    /// This task's `importFilter`, or `None` when the create bounded the event time at
+    /// neither end — `ImportFilter`'s two members are both optional, so a task created
+    /// without either carries no filter to report.
+    pub fn import_filter(&self) -> Option<crate::ops::types::ImportFilter> {
+        let filter = crate::ops::types::ImportFilter {
+            start_event_time: self.start_event_time_ms,
+            end_event_time: self.end_event_time_ms,
+        };
+        (filter.start_event_time.is_some() || filter.end_event_time.is_some()).then_some(filter)
+    }
+
+    /// This task's `importStatistics`: what the import has moved so far, counted in state
+    /// rather than reported as progress nothing made.
+    pub fn import_statistics(&self) -> crate::ops::types::ImportStatistics {
+        crate::ops::types::ImportStatistics {
+            bytes_imported: Some(self.bytes_imported),
+        }
+    }
+
+    /// Materialise the status change the clock owes this task: a running import whose
+    /// completion instant has passed is `COMPLETED`, updated AT that instant and not at
+    /// the time something happened to look.
+    pub fn materialize_due_transitions(&mut self, now_ms: i64) {
+        if self.is_terminal() {
+            return;
+        }
+        let Some(due) = self.completion_due_ms else {
+            return;
+        };
+        if due <= now_ms {
+            self.import_status = IMPORT_STATUS_COMPLETED.to_string();
+            self.last_updated_time_ms = due;
+            self.completion_due_ms = None;
+        }
+    }
+}
+
+/// One log group's data protection policy — what `PutDataProtectionPolicy` stores — as
+/// it is stored.
+///
+/// The document is kept VERBATIM, exactly the bytes the request carried: AWS reports it
+/// back through `GetDataProtectionPolicy` unchanged, so re-serializing the parsed JSON
+/// (which would reorder members and drop whitespace) would not be the same document.
+#[derive(Debug, Clone)]
+pub struct DataProtectionPolicyRecord {
+    /// `policyDocument`, byte-for-byte as the put carried it.
+    pub policy_document: String,
+    /// "The date and time that this policy was most recently updated."
+    pub last_updated_time_ms: i64,
+}
+
+/// What a data protection policy document says, once it has been judged: the parts a
+/// handler acts on after [`check_data_protection_policy_document`] accepts it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DataProtectionPolicyShape {
+    /// The data identifiers both of the document's blocks list, in the order the Audit
+    /// block lists them.
+    pub data_identifiers: Vec<String>,
+    /// The log groups the Audit action's `FindingsDestination` sends audit findings to
+    /// (`FindingsDestination.CloudWatchLogs.LogGroup`). A destination this service does
+    /// not own (a Firehose stream, an S3 bucket) is not here: only a log group lives in
+    /// this service's state.
+    pub findings_destination_log_groups: Vec<String>,
+}
+
+/// Judge a `PutDataProtectionPolicy$policyDocument`, answering the message to refuse it
+/// with, or what the accepted document says.
+///
+/// Every rule here is one that member's own documentation states:
+///
+/// * "Specify the data protection policy, in JSON" — and "This policy must include two
+///   JSON blocks", so the document is a JSON object carrying a `Statement` array;
+/// * "The first block must include both a `DataIdentifer` array and an `Operation`
+///   property with an `Audit` action", and "This `Audit` action must contain a
+///   `FindingsDestination` object";
+/// * "The second block must include both a `DataIdentifer` array and an `Operation`
+///   property with an `Deidentify` action", which "must contain the `"MaskConfig": {}`
+///   object. The `"MaskConfig": {}` object must be empty";
+/// * "The contents of the two `DataIdentifer` arrays must match exactly";
+/// * "The JSON specified in `policyDocument` can be up to 30,720 characters."
+///
+/// The documentation spells the member `DataIdentifer` while the API's own policy
+/// documents spell it `DataIdentifier`, so both spellings are read.
+///
+/// Which data identifiers exist, and whether a Firehose stream or S3 bucket named as a
+/// findings destination exists, are NOT judged here: that catalogue and those resources
+/// live outside this service.
+pub fn check_data_protection_policy_document(
+    document: &str,
+) -> Result<DataProtectionPolicyShape, String> {
+    if document.chars().count() > MAX_DATA_PROTECTION_POLICY_DOCUMENT_CHARS {
+        return Err(format!(
+            "policyDocument can be up to {MAX_DATA_PROTECTION_POLICY_DOCUMENT_CHARS} characters"
+        ));
+    }
+    let parsed = serde_json::from_str::<serde_json::Value>(document)
+        .ok()
+        .filter(serde_json::Value::is_object)
+        .ok_or_else(|| {
+            "policyDocument must be a data protection policy in JSON (a JSON object)".to_string()
+        })?;
+    let statements = parsed
+        .get("Statement")
+        .and_then(serde_json::Value::as_array)
+        .filter(|statements| !statements.is_empty())
+        .ok_or_else(|| {
+            "policyDocument must include a Statement array of the policy's two blocks".to_string()
+        })?;
+
+    // One block per action: the Audit block that finds the sensitive data terms, and the
+    // Deidentify block that masks them.
+    let block = |action: &str| {
+        statements.iter().find(|statement| {
+            statement
+                .get("Operation")
+                .and_then(|operation| operation.get(action))
+                .is_some_and(serde_json::Value::is_object)
+        })
+    };
+    let audit = block("Audit").ok_or_else(|| {
+        "policyDocument must include a Statement block whose Operation has an Audit action"
+            .to_string()
+    })?;
+    let deidentify = block("Deidentify").ok_or_else(|| {
+        "policyDocument must include a Statement block whose Operation has a Deidentify action"
+            .to_string()
+    })?;
+
+    let findings_destination = audit
+        .get("Operation")
+        .and_then(|operation| operation.get("Audit"))
+        .and_then(|action| action.get("FindingsDestination"))
+        .filter(|destination| destination.is_object())
+        .ok_or_else(|| {
+            "the Audit action in policyDocument must contain a FindingsDestination object"
+                .to_string()
+        })?;
+    let mask_config = deidentify
+        .get("Operation")
+        .and_then(|operation| operation.get("Deidentify"))
+        .and_then(|action| action.get("MaskConfig"))
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            "the Deidentify action in policyDocument must contain a MaskConfig object".to_string()
+        })?;
+    if !mask_config.is_empty() {
+        return Err("the MaskConfig object in policyDocument must be empty".to_string());
+    }
+
+    let identifiers = |statement: &serde_json::Value| -> Option<Vec<String>> {
+        let listed = statement
+            .get("DataIdentifier")
+            .or_else(|| statement.get("DataIdentifer"))?
+            .as_array()?;
+        if listed.is_empty() {
+            return None;
+        }
+        listed
+            .iter()
+            .map(|identifier| identifier.as_str().map(str::to_string))
+            .collect()
+    };
+    let audit_identifiers = identifiers(audit).ok_or_else(|| {
+        "the Audit block in policyDocument must include a DataIdentifier array of data identifiers"
+            .to_string()
+    })?;
+    let deidentify_identifiers = identifiers(deidentify).ok_or_else(|| {
+        "the Deidentify block in policyDocument must include a DataIdentifier array of data identifiers"
+            .to_string()
+    })?;
+    // "must match exactly" is about the CONTENTS of the two arrays, so the order they are
+    // listed in is not part of the match.
+    let sorted = |mut identifiers: Vec<String>| {
+        identifiers.sort();
+        identifiers
+    };
+    if sorted(audit_identifiers.clone()) != sorted(deidentify_identifiers) {
+        return Err(
+            "the contents of the two DataIdentifier arrays in policyDocument must match exactly"
+                .to_string(),
+        );
+    }
+
+    Ok(DataProtectionPolicyShape {
+        data_identifiers: audit_identifiers,
+        findings_destination_log_groups: findings_destination
+            .get("CloudWatchLogs")
+            .and_then(|destination| destination.get("LogGroup"))
+            .and_then(serde_json::Value::as_str)
+            .map(|log_group| vec![log_group.to_string()])
+            .unwrap_or_default(),
+    })
 }
 
 /// One created log group and everything stored under it.
@@ -264,6 +625,21 @@ pub struct LogGroupRecord {
     /// The resource-scoped policy attached to this group, if one has been put: AWS
     /// allows "one per LogGroup resourceARN", so at most one.
     pub resource_policy: Option<ResourcePolicyRecord>,
+    /// The log-group level transformer `PutTransformer` created for this group, if one
+    /// has been put. A log group has at most one — `PutTransformer` "creates or updates
+    /// a log transformer for a single log group" and names it by nothing but the group —
+    /// and it lives on the group, so deleting the group takes its transformer with it.
+    pub transformer: Option<TransformerRecord>,
+    /// The data protection policy attached to this group, if one has been put:
+    /// `PutDataProtectionPolicy` "applies to only the specified log group" and a put
+    /// replaces the policy the group holds, so at most one. `None` again after
+    /// `DeleteDataProtectionPolicy`, and gone with the group when it is deleted.
+    pub data_protection_policy: Option<DataProtectionPolicyRecord>,
+    /// Whether this group has EVER held a data protection policy, which is what lets
+    /// `LogGroup$dataProtectionStatus` report "whether this log group has a protection
+    /// policy, or whether it had one in the past". See
+    /// [`LogGroupRecord::data_protection_status`].
+    pub had_data_protection_policy: bool,
     /// The data sources that ingest into this group — what `ListLogGroups`'s
     /// `dataSources` filter selects on and what `ListAggregateLogGroupSummaries`
     /// counts log groups by. See [`DataSourceRecord`] for why a group created through
@@ -290,7 +666,27 @@ impl LogGroupRecord {
             streams: BTreeMap::new(),
             subscription_filters: BTreeMap::new(),
             resource_policy: None,
+            transformer: None,
+            data_protection_policy: None,
+            had_data_protection_policy: false,
             data_sources: Vec::new(),
+        }
+    }
+
+    /// This group's `dataProtectionStatus`: `ACTIVATED` while it holds a data protection
+    /// policy, `DELETED` once one it held has been deleted, and absent for a group that
+    /// has never held one — the member "displays whether this log group has a protection
+    /// policy, or whether it had one in the past", so a group with neither has nothing to
+    /// report. The other two values of the `DataProtectionStatus` enum belong to the
+    /// account-level policies of `PutAccountPolicy`, which no operation of this service
+    /// stores yet.
+    pub fn data_protection_status(&self) -> Option<&'static str> {
+        if self.data_protection_policy.is_some() {
+            Some(DATA_PROTECTION_STATUS_ACTIVATED)
+        } else if self.had_data_protection_policy {
+            Some(DATA_PROTECTION_STATUS_DELETED)
+        } else {
+            None
         }
     }
 }
@@ -461,6 +857,91 @@ pub fn log_group_name_matches_pattern(name: &str, pattern: &str) -> bool {
                 None => name.contains(alternative),
             }
         })
+}
+
+/// One log-group level transformer — "a series of processors, where each processor
+/// applies one type of transformation to the log events ingested into this log group" —
+/// as it is stored, on the single log group it transforms for.
+#[derive(Debug, Clone)]
+pub struct TransformerRecord {
+    /// The processors, in the order the put listed them: "The processors work one after
+    /// another, in the order that you list them, like a pipeline", so the order is part
+    /// of the configuration and a read reports it back unchanged.
+    pub processors: Vec<crate::ops::types::Processor>,
+    /// When this transformer was first created for the group. An update keeps it: a put
+    /// over an existing transformer is the same transformer, reconfigured.
+    pub creation_time_ms: i64,
+    /// When the transformer was last put, which for a transformer created and never
+    /// updated is its creation time.
+    pub last_modified_time_ms: i64,
+}
+
+/// The transformations one processor names, as the model spells the members that carry
+/// them.
+///
+/// `Processor` is "the information about one processor in a log transformer" and a
+/// `transformerConfig` is "an array of processors, where each processor applies one type
+/// of transformation", so exactly one of the structure's members is populated. Reporting
+/// the populated ones lets a put refuse a processor that names none, and one that names
+/// several, with a message that lists what it named.
+pub fn processor_transformations(processor: &crate::ops::types::Processor) -> Vec<&'static str> {
+    // Destructured EXHAUSTIVELY — no `..` — so a processor kind the model gains is a
+    // COMPILE error here rather than a member this function silently cannot see, which
+    // would make a put naming only that kind look like a processor naming none.
+    let crate::ops::types::Processor {
+        add_keys,
+        copy_value,
+        csv,
+        date_time_converter,
+        delete_keys,
+        grok,
+        list_to_map,
+        lower_case_string,
+        move_keys,
+        parse_cloudfront,
+        parse_json,
+        parse_key_value,
+        parse_route53,
+        parse_to_ocsf,
+        parse_postgres,
+        parse_vpc,
+        parse_waf,
+        rename_keys,
+        split_string,
+        substitute_string,
+        trim_string,
+        type_converter,
+        upper_case_string,
+    } = processor;
+    // The member names are the model's own (`Processor`'s members), in model order.
+    [
+        ("addKeys", add_keys.is_some()),
+        ("copyValue", copy_value.is_some()),
+        ("csv", csv.is_some()),
+        ("dateTimeConverter", date_time_converter.is_some()),
+        ("deleteKeys", delete_keys.is_some()),
+        ("grok", grok.is_some()),
+        ("listToMap", list_to_map.is_some()),
+        ("lowerCaseString", lower_case_string.is_some()),
+        ("moveKeys", move_keys.is_some()),
+        ("parseCloudfront", parse_cloudfront.is_some()),
+        ("parseJSON", parse_json.is_some()),
+        ("parseKeyValue", parse_key_value.is_some()),
+        ("parseRoute53", parse_route53.is_some()),
+        ("parseToOCSF", parse_to_ocsf.is_some()),
+        ("parsePostgres", parse_postgres.is_some()),
+        ("parseVPC", parse_vpc.is_some()),
+        ("parseWAF", parse_waf.is_some()),
+        ("renameKeys", rename_keys.is_some()),
+        ("splitString", split_string.is_some()),
+        ("substituteString", substitute_string.is_some()),
+        ("trimString", trim_string.is_some()),
+        ("typeConverter", type_converter.is_some()),
+        ("upperCaseString", upper_case_string.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(member, populated)| populated.then_some(member))
+    .collect()
 }
 
 /// One subscription filter — "a real-time stream of log events ingested through

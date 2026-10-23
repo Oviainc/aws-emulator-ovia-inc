@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetReplicationSet
+//!
 //! Reports the replication set an ARN names, or refuses with the modelled
 //! `ResourceNotFoundException` (HTTP 404) when this account's store holds no
 //! replication set under that ARN. `@readonly`: nothing is written here.

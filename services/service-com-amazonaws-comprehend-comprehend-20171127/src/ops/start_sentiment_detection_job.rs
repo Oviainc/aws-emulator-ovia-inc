@@ -3,7 +3,8 @@
 //! @op StartSentimentDetectionJob
 //!
 //! IMPLEMENTED. Mints the job's id and ARN, persists the whole submitted record in
-//! [`crate::state`], and answers `SUBMITTED`. A `ClientRequestToken` re-presented
+//! [`crate::state`], RUNS the sentiment analysis over the input documents and
+//! answers `SUBMITTED`. A `ClientRequestToken` re-presented
 //! with the same request resolves to the job it already created instead of creating
 //! a second one.
 //!
@@ -120,17 +121,36 @@ use super::types::*;
 use std::time::SystemTime;
 
 use crate::state::{
-    AnalysisJob, JobFamily, JobOutcome, JobSubmission, SubmissionKey, PROCESSING_SPAN, QUEUE_SPAN,
+    run_analysis_job, AnalysisJob, Document, JobFamily, JobSubmission, RunOutcomeRecorder,
+    SubmissionKey, PROCESSING_SPAN, QUEUE_SPAN,
 };
 
 /// The family every job this operation creates belongs to.
 const FAMILY: JobFamily = JobFamily::SentimentDetection;
 
-/// The analysis a sentiment-detection job's run would carry out, for the reason a
-/// job of a family this emulator does not run ends `FAILED`
-/// ([`crate::state::unperformed_run_message`]).
-const ANALYSIS: &str = "Sentiment analysis";
-
+/// The output line for one analysed document: the file it came from, its line for a
+/// `ONE_DOC_PER_LINE` input, and the sentiment the engine scored it with.
+///
+/// Scored by `super::detect_sentiment::score_sentiment`, the ONE sentiment scorer
+/// this service has, so a document analysed by this job gets the same verdict
+/// `DetectSentiment` gives it.
+fn output_entry(document: &Document<'_>) -> ::serde_json::Value {
+    let (sentiment, score) = super::detect_sentiment::score_sentiment(document.text);
+    let mut entry = ::serde_json::json!({
+        "File": document.file,
+        "Sentiment": sentiment,
+        "SentimentScore": {
+            "Positive": score.positive,
+            "Negative": score.negative,
+            "Neutral": score.neutral,
+            "Mixed": score.mixed,
+        },
+    });
+    if let Some(line) = document.line {
+        entry["Line"] = ::serde_json::json!(line);
+    }
+    entry
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -247,7 +267,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             redaction_config: None,
         };
         let request_digest = submission.digest();
-        let mut store = state.lock();
 
         // `ClientRequestToken` is `@idempotencyToken`: the same token re-submitted
         // with the same request names the job it already created, which is what an
@@ -256,71 +275,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // member's documentation says, and so is the same token carrying a
         // DIFFERENT request: the pair identifies the submission, and the model
         // declares no error for a token reused on another request.
-        if let Some(token) = input.client_request_token.as_ref() {
-            let key = SubmissionKey {
-                family: FAMILY,
-                client_request_token: token.clone(),
-                request_digest: request_digest.clone(),
-            };
-            if let Some(existing) = store.replayed_job_id(&key) {
-                if let Some(job) = store.analysis_jobs.get_mut(&(FAMILY, existing)) {
-                    // Report the status the clock already owed this job, so a
-                    // retried token and a Describe an instant apart cannot disagree.
-                    job.settle(now);
-                    return Ok(StartSentimentDetectionJobOutput {
-                        job_id: Some(job.job_id.clone()),
-                        job_arn: Some(job.job_arn.clone()),
-                        job_status: Some(job.job_status.clone()),
-                    });
+        //
+        // The guard is scoped so the store lock is released before this handler
+        // awaits the job's own S3 work below.
+        let (job_id, job_arn) = {
+            let mut store = state.lock();
+            if let Some(token) = input.client_request_token.as_ref() {
+                let key = SubmissionKey {
+                    family: FAMILY,
+                    client_request_token: token.clone(),
+                    request_digest: request_digest.clone(),
+                };
+                if let Some(existing) = store.replayed_job_id(&key) {
+                    if let Some(job) = store.analysis_jobs.get_mut(&(FAMILY, existing)) {
+                        // Report the status the clock already owed this job, so a
+                        // retried token and a Describe an instant apart cannot
+                        // disagree.
+                        job.settle(now);
+                        return Ok(StartSentimentDetectionJobOutput {
+                            job_id: Some(job.job_id.clone()),
+                            job_arn: Some(job.job_arn.clone()),
+                            job_status: Some(job.job_status.clone()),
+                        });
+                    }
                 }
             }
-        }
 
-        let (seq, job_id) = store.mint_job_id(now);
-        let job_arn = ::emulator_server::emulator_arn(
-            "comprehend",
+            let (seq, job_id) = store.mint_job_id(now);
+            let job_arn = ::emulator_server::emulator_arn(
+                "comprehend",
+                &region,
+                &format!("{}/{job_id}", FAMILY.arn_resource_type()),
+            );
+            // The record is persisted BEFORE the run starts, so the job exists (and
+            // its token is claimed) from the instant the submission is accepted. Its
+            // terminal outcome is unknown until the run reports, which is exactly
+            // what a job still being processed has.
+            store.insert_analysis_job(
+                FAMILY,
+                AnalysisJob {
+                    seq,
+                    job_id: job_id.clone(),
+                    job_arn: job_arn.clone(),
+                    job_name: input.job_name.clone(),
+                    job_status: "SUBMITTED".to_string(),
+                    message: None,
+                    submit_time: now,
+                    end_time: None,
+                    in_progress_due_at: now + QUEUE_SPAN,
+                    terminal_due_at: now + QUEUE_SPAN + PROCESSING_SPAN,
+                    stopped_due_at: None,
+                    terminal_outcome: None,
+                    input_data_config: input.input_data_config.clone(),
+                    output_data_config: input.output_data_config.clone(),
+                    language_code: Some(input.language_code.clone()),
+                    data_access_role_arn: input.data_access_role_arn.clone(),
+                    volume_kms_key_id: input.volume_kms_key_id.clone(),
+                    vpc_config: input.vpc_config.clone(),
+                    tags,
+                    client_request_token: input.client_request_token.clone(),
+                    // The sentiment family's input models neither a mode nor a
+                    // redaction configuration, so this record carries neither.
+                    mode: None,
+                    redaction_config: None,
+                    request_digest,
+                },
+            );
+            (job_id, job_arn)
+        };
+
+        // From here on the job exists, so whatever the run does — including this
+        // handler never getting to report it — is recorded against the record by the
+        // recorder's `Drop`.
+        let mut recorder = RunOutcomeRecorder::new(state.clone(), FAMILY, job_id.clone());
+        let outcome = run_analysis_job(
+            ctx,
             &region,
-            &format!("{}/{job_id}", FAMILY.arn_resource_type()),
-        );
-        let terminal_outcome = JobOutcome::failed(crate::state::unperformed_run_message(
-            ANALYSIS,
+            FAMILY,
+            &job_id,
             &input.input_data_config,
             &input.output_data_config,
-        ));
-        let job = AnalysisJob {
-            seq,
-            job_id: job_id.clone(),
-            job_arn: job_arn.clone(),
-            job_name: input.job_name,
-            job_status: "SUBMITTED".to_string(),
-            message: None,
-            submit_time: now,
-            end_time: None,
-            in_progress_due_at: now + QUEUE_SPAN,
-            terminal_due_at: now + QUEUE_SPAN + PROCESSING_SPAN,
-            stopped_due_at: None,
-            terminal_outcome: Some(terminal_outcome),
-            input_data_config: input.input_data_config,
-            output_data_config: input.output_data_config,
-            language_code: Some(input.language_code),
-            data_access_role_arn: input.data_access_role_arn,
-            volume_kms_key_id: input.volume_kms_key_id,
-            vpc_config: input.vpc_config,
-            tags,
-            client_request_token: input.client_request_token,
-            // The sentiment family's input models neither a mode nor a redaction
-            // configuration, so this record carries neither.
-            mode: None,
-            redaction_config: None,
-            request_digest,
-        };
-        let job_status = job.job_status.clone();
-        store.insert_analysis_job(FAMILY, job);
+            output_entry,
+        )
+        .await;
+        // The outcome is RECORDED, not revealed: the clock owes the terminal status
+        // (and, with it, the archive's location in `OutputDataConfig$S3Uri`) only
+        // once the job's processing span is over, which `AnalysisJob::settle` applies.
+        recorder.report(outcome);
+        drop(recorder);
 
+        let store = state.lock();
+        // The record can only be missing if the store's own bound evicted it while
+        // the run was in flight — a job no later Describe can report, so the
+        // submission cannot be answered as accepted: the store could not keep it.
+        let Some(job) = store.analysis_jobs.get(&(FAMILY, job_id.clone())) else {
+            return Err(
+                StartSentimentDetectionJobErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(format!(
+                            "The job {job_id} ({job_arn}) could not be retained. Retry your \
+                             request."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
         Ok(StartSentimentDetectionJobOutput {
-            job_id: Some(job_id),
-            job_arn: Some(job_arn),
-            job_status: Some(job_status),
+            job_id: Some(job.job_id.clone()),
+            job_arn: Some(job.job_arn.clone()),
+            job_status: Some(job.job_status.clone()),
         })
     }
 }

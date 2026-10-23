@@ -344,32 +344,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // A user group can only be associated if it exists, and none can: every
-        // user-group operation in this service is still a scaffolded 501, so
-        // there is nothing to associate. It is "available for Valkey and Redis
-        // OSS only", so a Memcached request naming one is the incompatible
-        // combination rather than a missing group.
-        if let Some(group) = input.user_group_id.as_deref() {
-            if engine == "memcached" {
-                return Err(
-                    CreateServerlessCacheErrorModeled::InvalidParameterCombinationException(
-                        InvalidParameterCombinationException {
-                            message: Some(
-                                "UserGroupId is only valid for a serverless cache running valkey \
-                                 or redis, not for memcached."
-                                    .to_string(),
-                            ),
-                        },
-                    )
-                    .into(),
-                );
-            }
-            return Err(CreateServerlessCacheErrorModeled::UserGroupNotFoundFault(
-                UserGroupNotFoundFault {
-                    message: Some(format!("User group {group} not found.")),
-                },
-            )
-            .into());
+        // A user group is "available for Valkey and Redis OSS only", so a
+        // Memcached request naming one is the incompatible combination rather
+        // than a missing group. Whether the group EXISTS is resolved against the
+        // store below, once it is locked.
+        if input.user_group_id.is_some() && engine == "memcached" {
+            return Err(
+                CreateServerlessCacheErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(
+                            "UserGroupId is only valid for a serverless cache running valkey \
+                             or redis, not for memcached."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
         }
 
         // A cache can only be restored from a snapshot that exists, and none
@@ -411,8 +402,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx.parts());
+
+        // Every named subnet has to be one the account HAS: the cache's VPC
+        // endpoint is deployed into it, so an id that names no subnet could
+        // never carry one. Which subnets the account has is a fact of the
+        // Region (`crate::state::region_subnets`) — the same fact the default
+        // selection below reads, so ElastiCache never selects a subnet it would
+        // itself refuse.
+        let unresolved =
+            crate::state::unresolved_subnets(&region, requested_subnets.iter().map(String::as_str));
+        if !unresolved.is_empty() {
+            return Err(invalid_value(crate::state::invalid_subnets_message(
+                &unresolved,
+            )));
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // A user group that has become active since it was created is active
+        // now, so the status read below is the settled one.
+        store.settle_user_groups(now);
 
         if store.serverless_caches.contains_key(&name) {
             return Err(
@@ -441,12 +450,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The user group the cache is attached to has to be one this account
+        // created, and has to be usable: a group still `creating` cannot carry
+        // the cache's access control yet.
+        if let Some(id) = input.user_group_id.as_deref() {
+            let Some(group) = store.user_groups.get(id) else {
+                return Err(CreateServerlessCacheErrorModeled::UserGroupNotFoundFault(
+                    UserGroupNotFoundFault {
+                        message: Some(format!("User group {id} not found.")),
+                    },
+                )
+                .into());
+            };
+            if group.status != crate::state::USER_STATUS_ACTIVE {
+                return Err(
+                    CreateServerlessCacheErrorModeled::InvalidUserGroupStateFault(
+                        InvalidUserGroupStateFault {
+                            message: Some(format!(
+                                "User group {id} is in {} state, not {}.",
+                                group.status,
+                                crate::state::USER_STATUS_ACTIVE
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
         // "If no subnet IDs are given … ElastiCache will select [2 or 3] default
-        // subnets across AZs": the selected ids are minted once and stored, so
-        // every later read reports the same subnets.
+        // subnets across AZs": the ones it selects are default subnets of the
+        // account's Region, so a later read reports subnets that exist and a
+        // request may name them itself.
         let subnet_ids = if requested_subnets.is_empty() {
-            (0..crate::state::default_subnet_count(&region))
-                .map(|_| store.mint_subnet_id())
+            crate::state::selected_default_subnets(&region)
+                .into_iter()
+                .map(|subnet| subnet.subnet_id)
                 .collect()
         } else {
             requested_subnets
@@ -463,7 +502,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             kms_key_id: input.kms_key_id,
             security_group_ids: input.security_group_ids.unwrap_or_default(),
             subnet_ids,
-            user_group_id: None,
+            user_group_id: input.user_group_id,
             snapshot_retention_limit: input.snapshot_retention_limit,
             daily_snapshot_time: input.daily_snapshot_time,
             network_type,
@@ -474,13 +513,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A created cache is NOT ready: it answers `CREATING`, and the clock
         // owes it `AVAILABLE` once the transition span has passed.
-        let name = new.name.clone();
-        let serverless_cache = store.insert_serverless_cache(new).to_modeled();
+        let stored = store.insert_serverless_cache(new);
+        let cache_name = stored.name.clone();
+        let user_group_id = stored.user_group_id.clone();
+        let serverless_cache = stored.to_modeled();
+        // The group reports the cache it now serves, so the two records agree.
+        if let Some(id) = user_group_id {
+            if let Some(group) = store.user_groups.get_mut(&id) {
+                if !group.serverless_cache_names.contains(&cache_name) {
+                    group.serverless_cache_names.push(cache_name.clone());
+                }
+            }
+        }
         // Creating a serverless cache is one of the events this service
         // records; see `crate::state::EventRecord`.
         store.record_event(
             crate::state::SOURCE_TYPE_SERVERLESS_CACHE,
-            &name,
+            &cache_name,
             "Serverless cache created",
             now,
         );

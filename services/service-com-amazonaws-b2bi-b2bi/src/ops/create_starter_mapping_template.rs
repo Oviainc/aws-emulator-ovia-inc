@@ -8,8 +8,22 @@
 //!
 //! The operation mints no resource and persists nothing: its output is a single
 //! `mappingTemplate` string, and the model gives a template no id and no
-//! Get/List/Delete, so the template is a pure function of the request and two identical
-//! requests answer with the identical template.
+//! Get/List/Delete, so the template is a function of the request (and of the sample
+//! object it names) and two identical requests answer with the identical template.
+//!
+//! ## Two sources for the template
+//!
+//! * WITHOUT `outputSampleLocation` the template comes from `templateDetails`: the X12
+//!   envelope the requested transaction set and version determine, with a
+//!   [`PLACEHOLDER_PREFIX`] value wherever the caller must supply an expression.
+//! * WITH `outputSampleLocation` it is DERIVED FROM THAT SAMPLE — "if you provide a sample
+//!   EDI file with the same structure as the EDI files that you wish to generate, then the
+//!   service can generate a mapping template". The object is read through the emulator's
+//!   own Amazon S3 service and parsed as an X12 interchange
+//!   ([`super::test_parsing::parse_x12`]); the template keeps the sample's structure and
+//!   its envelope values, and marks each transaction-set business field with
+//!   [`SAMPLE_PLACEHOLDER_PREFIX`] over the value the sample carried there. Only a sample
+//!   that genuinely does not resolve is the modelled `ResourceNotFoundException`.
 //!
 //! ## The generated document
 //!
@@ -193,6 +207,13 @@ impl MappingFormat {
     }
 }
 
+/// The longest template this operation answers with: the modelled `MappingTemplate` bound
+/// (`len 0..350000`), the member `TestMapping`, `CreateTransformer` and `UpdateTransformer`
+/// accept a template in. A template past it could not be used with the operations it is
+/// generated for, so the request is refused instead of answered with one — which is also
+/// what bounds the amplification from a sample, whose parsed form is larger than the file.
+const MAX_TEMPLATE_CHARS: usize = 350_000;
+
 /// The XSLT namespace every generated stylesheet declares.
 const XSL_NAMESPACE: &str = "http://www.w3.org/1999/XSL/Transform";
 
@@ -206,11 +227,16 @@ const XSL_VERSION: &str = "1.0";
 /// the input to produce an Outbound X12 EDI file".
 const X12_RESPONSIBLE_AGENCY_CODE: &str = "X";
 
-/// The first X12 release whose interchange envelope reads ISA11 as the Repetition
-/// Separator; in the releases before it ISA11 is the Interchange Control Standards
-/// Identifier (ASC X12 interchange control header, element ISA11), so the element's name
-/// in a starter template follows the requested version.
-const FIRST_REPETITION_SEPARATOR_RELEASE: u32 = 4020;
+/// The X12 envelope element names, the document's member names and the release ISA11
+/// changes meaning at all belong to this service's X12 READER (`super::test_parsing`),
+/// which is the module that owns what an X12 document is made of: a starter template
+/// describes the very document that reader builds, so the two cannot disagree about the
+/// name of an element or of a member.
+use super::test_parsing::{
+    isa_element_names, FUNCTIONAL_GROUPS_KEY, FUNCTIONAL_GROUP_ITEM, GE_ELEMENTS, GS_ELEMENTS,
+    IEA_ELEMENTS, INTERCHANGES_KEY, INTERCHANGE_ITEM, SE_ELEMENTS, ST_ELEMENTS, TRANSACTIONS_KEY,
+    TRANSACTION_ITEM,
+};
 
 /// How every placeholder value begins, so a caller can tell a placeholder from a value
 /// the request determined.
@@ -218,6 +244,11 @@ pub const PLACEHOLDER_PREFIX: &str = "replace with the";
 
 /// One node of a starter template's document tree, rendered to JSON for a `JSONATA`
 /// template and to XML for an `XSLT` one.
+///
+/// It mirrors the tree a PARSED X12 interchange takes ([`super::test_parsing::Node`], the
+/// reader's own): the keys a starter template carries placeholders under are the keys a
+/// parsed interchange carries values under, which is what lets
+/// [`sample_derived_document`] turn one into the other member for member.
 ///
 /// A map keeps its members in INSERTION order — the positional order of an X12 segment's
 /// elements — which a `serde_json::Value` (a sorted map) would lose.
@@ -263,6 +294,13 @@ fn render_failed<E: ::std::fmt::Display>(error: E) -> CreateStarterMappingTempla
 /// elements apart — ISA05 and ISA07 are both the Interchange ID Qualifier.
 fn element_key(segment: &str, position: usize, name: &str) -> String {
     format!("{segment}_{position:02}_{name}")
+}
+
+/// The key of an element of a segment INSIDE the transaction: the segment id and the
+/// element's two-digit position alone (`BEG_01`), because the X12 schema of the
+/// transaction set — not the envelope — names those elements.
+fn body_element_key(segment: &str, position: usize) -> String {
+    format!("{segment}_{position:02}")
 }
 
 /// A transaction set's beginning segment: the segment the X12 standard puts first in
@@ -642,7 +680,7 @@ fn body_elements(language: &str, segment: &str, names: &[&str]) -> Vec<(String, 
         .iter()
         .enumerate()
         .map(|(index, name)| {
-            let key = format!("{segment}_{position:02}", position = index + 1);
+            let key = body_element_key(segment, index + 1);
             let value = placeholder(language, &format!("{key} ({name})"));
             (key, value)
         })
@@ -650,60 +688,23 @@ fn body_elements(language: &str, segment: &str, names: &[&str]) -> Vec<(String, 
 }
 
 /// The interchange control header (ISA): sixteen positional elements, all of them the
-/// caller's to supply. ISA11's name follows `release` — see
-/// [`FIRST_REPETITION_SEPARATOR_RELEASE`].
+/// caller's to supply.
 fn isa_elements(language: &str, release: u32) -> Vec<(String, Node)> {
-    let isa11 = if release < FIRST_REPETITION_SEPARATOR_RELEASE {
-        "InterchangeControlStandardsIdentifier"
-    } else {
-        "RepetitionSeparator"
-    };
-    placeholder_elements(
-        language,
-        "ISA",
-        &[
-            "AuthorizationInformationQualifier",
-            "AuthorizationInformation",
-            "SecurityInformationQualifier",
-            "SecurityInformation",
-            "InterchangeIdQualifier",
-            "InterchangeSenderId",
-            "InterchangeIdQualifier",
-            "InterchangeReceiverId",
-            "InterchangeDate",
-            "InterchangeTime",
-            isa11,
-            "InterchangeControlVersionNumber",
-            "InterchangeControlNumber",
-            "AcknowledgmentRequested",
-            "UsageIndicator",
-            "ComponentElementSeparator",
-        ],
-    )
+    placeholder_elements(language, "ISA", &isa_element_names(release))
 }
 
 /// The functional group header (GS). GS07 is fixed at [`X12_RESPONSIBLE_AGENCY_CODE`] and
 /// GS08 is the version/release/industry identifier code the request determines; the first
 /// six elements are the caller's.
 fn gs_elements(language: &str, version_release_industry_code: &str) -> Vec<(String, Node)> {
-    let mut members = placeholder_elements(
-        language,
-        "GS",
-        &[
-            "FunctionalIdentifierCode",
-            "ApplicationSendersCode",
-            "ApplicationReceiversCode",
-            "Date",
-            "Time",
-            "GroupControlNumber",
-        ],
-    );
+    let caller_supplied = GS_ELEMENTS.len() - 2;
+    let mut members = placeholder_elements(language, "GS", &GS_ELEMENTS[..caller_supplied]);
     members.push((
-        element_key("GS", 7, "ResponsibleAgencyCode"),
+        element_key("GS", 7, GS_ELEMENTS[6]),
         Node::Text(X12_RESPONSIBLE_AGENCY_CODE.to_string()),
     ));
     members.push((
-        element_key("GS", 8, "VersionReleaseIndustryIdentifierCode"),
+        element_key("GS", 8, GS_ELEMENTS[7]),
         Node::Text(version_release_industry_code.to_string()),
     ));
     members
@@ -718,10 +719,10 @@ fn st_elements(
     transaction_set_code: &str,
     implementation_convention: Option<&str>,
 ) -> Vec<(String, Node)> {
-    let control_number = element_key("ST", 2, "TransactionSetControlNumber");
+    let control_number = element_key("ST", 2, ST_ELEMENTS[1]);
     let mut members = vec![
         (
-            element_key("ST", 1, "TransactionSetIdentifierCode"),
+            element_key("ST", 1, ST_ELEMENTS[0]),
             Node::Text(transaction_set_code.to_string()),
         ),
         (
@@ -731,7 +732,7 @@ fn st_elements(
     ];
     if let Some(convention) = implementation_convention {
         members.push((
-            element_key("ST", 3, "ImplementationConventionReference"),
+            element_key("ST", 3, ST_ELEMENTS[2]),
             Node::Text(convention.to_string()),
         ));
     }
@@ -757,44 +758,32 @@ fn starter_document(
     if let Some(segment) = beginning_segment(transaction_set_code) {
         transaction.extend(body_elements(language, segment.id, segment.elements));
     }
-    transaction.extend(placeholder_elements(
-        language,
-        "SE",
-        &["NumberOfIncludedSegments", "TransactionSetControlNumber"],
-    ));
+    transaction.extend(placeholder_elements(language, "SE", SE_ELEMENTS));
 
     let mut functional_group = gs_elements(language, version_release_industry_code);
     functional_group.push((
-        "transactions".to_string(),
+        TRANSACTIONS_KEY.to_string(),
         Node::List {
-            item: "transaction".to_string(),
+            item: TRANSACTION_ITEM.to_string(),
             items: vec![Node::Map(transaction)],
         },
     ));
-    functional_group.extend(placeholder_elements(
-        language,
-        "GE",
-        &["NumberOfTransactionSetsIncluded", "GroupControlNumber"],
-    ));
+    functional_group.extend(placeholder_elements(language, "GE", GE_ELEMENTS));
 
     let mut interchange = isa_elements(language, release);
     interchange.push((
-        "functional_groups".to_string(),
+        FUNCTIONAL_GROUPS_KEY.to_string(),
         Node::List {
-            item: "functional_group".to_string(),
+            item: FUNCTIONAL_GROUP_ITEM.to_string(),
             items: vec![Node::Map(functional_group)],
         },
     ));
-    interchange.extend(placeholder_elements(
-        language,
-        "IEA",
-        &["NumberOfIncludedFunctionalGroups", "InterchangeControlNumber"],
-    ));
+    interchange.extend(placeholder_elements(language, "IEA", IEA_ELEMENTS));
 
     Node::Map(vec![(
-        "interchanges".to_string(),
+        INTERCHANGES_KEY.to_string(),
         Node::List {
-            item: "interchange".to_string(),
+            item: INTERCHANGE_ITEM.to_string(),
             items: vec![Node::Map(interchange)],
         },
     )])
@@ -802,8 +791,12 @@ fn starter_document(
 
 /// The `JSONATA` rendering: the document tree as a JSON document, whose values the caller
 /// replaces with JSONata expressions.
-fn jsonata_template(document: &Node) -> Result<String, CreateStarterMappingTemplateError> {
-    ::serde_json::to_string_pretty(document).map_err(render_failed)
+///
+/// The same rendering `TestParsing` answers a parsed document with for `fileFormat` JSON,
+/// over its own copy of the tree — so a template and the document it maps are written in
+/// the same shape.
+fn render_json(document: &Node) -> Result<String, String> {
+    ::serde_json::to_string_pretty(document).map_err(|error| error.to_string())
 }
 
 /// The `XSLT` rendering: an XSLT 1.0 stylesheet whose single template emits the same
@@ -847,7 +840,7 @@ fn xslt_template(
         .write_event(Event::Start(template))
         .map_err(render_failed)?;
     for (key, child) in roots {
-        write_xml_node(&mut writer, key, child)?;
+        write_xml_node(&mut writer, key, child).map_err(render_failed)?;
     }
     writer
         .write_event(Event::End(BytesEnd::new("xsl:template")))
@@ -863,50 +856,153 @@ fn write_xml_node(
     writer: &mut ::quick_xml::Writer<Vec<u8>>,
     name: &str,
     node: &Node,
-) -> Result<(), CreateStarterMappingTemplateError> {
+) -> Result<(), String> {
     use ::quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
 
+    let failed = |error: ::std::io::Error| error.to_string();
     match node {
         Node::Text(text) => {
             writer
                 .write_event(Event::Start(BytesStart::new(name)))
-                .map_err(render_failed)?;
+                .map_err(failed)?;
             writer
                 .write_event(Event::Text(BytesText::new(text)))
-                .map_err(render_failed)?;
+                .map_err(failed)?;
             writer
                 .write_event(Event::End(BytesEnd::new(name)))
-                .map_err(render_failed)?;
+                .map_err(failed)?;
         }
         Node::Map(members) if members.is_empty() => {
             writer
                 .write_event(Event::Empty(BytesStart::new(name)))
-                .map_err(render_failed)?;
+                .map_err(failed)?;
         }
         Node::Map(members) => {
             writer
                 .write_event(Event::Start(BytesStart::new(name)))
-                .map_err(render_failed)?;
+                .map_err(failed)?;
             for (key, child) in members {
                 write_xml_node(writer, key, child)?;
             }
             writer
                 .write_event(Event::End(BytesEnd::new(name)))
-                .map_err(render_failed)?;
+                .map_err(failed)?;
         }
         Node::List { item, items } => {
             writer
                 .write_event(Event::Start(BytesStart::new(name)))
-                .map_err(render_failed)?;
+                .map_err(failed)?;
             for child in items {
                 write_xml_node(writer, item, child)?;
             }
             writer
                 .write_event(Event::End(BytesEnd::new(name)))
-                .map_err(render_failed)?;
+                .map_err(failed)?;
         }
     }
     Ok(())
+}
+
+/// How a template derived FROM A SAMPLE marks a field the caller must supply an
+/// expression for: the marker, then the value the sample carried in that field, so the
+/// caller sees what the field holds in a real document while replacing it.
+///
+/// This is the recorded form for the sample-driven path (trace
+/// `b2bi.create-starter-mapping-template-with-output-sample`: "each transaction-set
+/// business field becomes a `PLACEHOLDER: <sample value>` marker"); the template generated
+/// WITHOUT a sample has no sample value to name, so it carries
+/// [`PLACEHOLDER_PREFIX`] instead.
+pub const SAMPLE_PLACEHOLDER_PREFIX: &str = "PLACEHOLDER: ";
+
+/// Whether `key` names an element of a segment INSIDE the transaction (`BEG_01`) rather
+/// than an envelope element (`ISA_01_AuthorizationInformationQualifier`).
+///
+/// The two keyings are what tell the two kinds of field apart: an envelope element's key
+/// carries the element's name after its position, a transaction-set element's key does
+/// not ([`element_key`] vs [`body_element_key`]).
+fn is_body_element_key(key: &str) -> bool {
+    let mut parts = key.split('_');
+    let segment = parts.next().unwrap_or_default();
+    let position = parts.next().unwrap_or_default();
+    parts.next().is_none()
+        && !segment.is_empty()
+        && position.len() == 2
+        && position.chars().all(|digit| digit.is_ascii_digit())
+}
+
+/// The template derived from a parsed sample interchange: the sample's envelope values
+/// (ISA/GS/ST/SE/GE/IEA) carried through verbatim, and every transaction-set business
+/// field replaced by a [`SAMPLE_PLACEHOLDER_PREFIX`] marker over the value the sample
+/// carried there.
+///
+/// The structure is the sample's own — as many interchanges, functional groups and
+/// transactions as it holds, each segment's elements in positional order — because the
+/// template a caller gets back has to generate documents shaped like the one it provided.
+/// The input is the tree this service's one X12 reader builds
+/// ([`super::test_parsing::parse_x12`]), walked member for member: a BUSINESS field is
+/// told from an envelope field by its key alone ([`is_body_element_key`]), and the
+/// components of a composite business element inherit their element's verdict.
+fn sample_derived_document(parsed: &super::test_parsing::Node) -> Node {
+    use super::test_parsing::Node as Parsed;
+
+    fn derive(node: &Parsed, business: bool) -> Node {
+        match node {
+            Parsed::Text(value) if business => {
+                Node::Text(format!("{SAMPLE_PLACEHOLDER_PREFIX}{value}"))
+            }
+            Parsed::Text(value) => Node::Text(value.clone()),
+            Parsed::Map(members) => Node::Map(
+                members
+                    .iter()
+                    .map(|(member, child)| {
+                        (
+                            member.clone(),
+                            derive(child, business || is_body_element_key(member)),
+                        )
+                    })
+                    .collect(),
+            ),
+            Parsed::List { item, items } => Node::List {
+                item: item.clone(),
+                items: items.iter().map(|child| derive(child, business)).collect(),
+            },
+        }
+    }
+    derive(parsed, false)
+}
+
+/// The modelled refusal for a sample this service could not read, with each failure
+/// reported as the error its kind calls for: a location that names no object, or an
+/// object this service will not read, is the caller's `ValidationException`; an object
+/// that is not there is the `ResourceNotFoundException` the operation models for exactly
+/// that case; and an S3 call that failed is this service's `InternalServerException`.
+fn sample_unreadable(failure: crate::state::ObjectError) -> CreateStarterMappingTemplateError {
+    match &failure {
+        crate::state::ObjectError::NotFound(message) => {
+            CreateStarterMappingTemplateErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "the sample EDI file at outputSampleLocation cannot be read: \
+                         {message}"
+                    ),
+                },
+            )
+            .into()
+        }
+        crate::state::ObjectError::Unreadable(message) => {
+            CreateStarterMappingTemplateErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: message.clone(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into()
+        }
+        crate::state::ObjectError::Incomplete(message)
+        | crate::state::ObjectError::Rejected(message) => {
+            crate::scaffolded::Scaffolded::validation(message.clone())
+        }
+    }
 }
 
 /// The X12 transaction set the request names, decoded from the modelled
@@ -989,15 +1085,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // No state is touched: this operation mints no resource (its output is one
-        // `mappingTemplate` string, and the model gives a template no id and no
-        // Get/List/Delete), so the template is computed from the request alone. Writing
-        // state here would give a generator a side effect a later caller could observe,
-        // which the operation does not have. The engine is bound (and not used) so the
-        // constructor seam every operation shares stays visible here.
-        let _ = &self.engine;
+        // No state of this service is touched: this operation mints no resource (its
+        // output is one `mappingTemplate` string, and the model gives a template no id and
+        // no Get/List/Delete), so the template is a function of the request and of the
+        // sample object it names. Writing state here would give a generator a side effect
+        // a later caller could observe, which the operation does not have.
+        if let Err(denied) =
+            crate::state::authorize(&*self.engine, ctx, Self::NAME, crate::state::ANY_RESOURCE)
+        {
+            return Err(
+                CreateStarterMappingTemplateErrorModeled::AccessDeniedException(denied).into(),
+            );
+        }
 
         let Some(format) = MappingFormat::decode(&input.mapping_type) else {
             return Err(crate::scaffolded::Scaffolded::validation(format!(
@@ -1040,30 +1141,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         };
 
-        // A sample EDI file is read from Amazon S3, and no S3 object is reachable from
-        // this service: rather than answer a template that only LOOKS as though it came
-        // from the sample, a request for one is refused with the modelled
-        // `ResourceNotFoundException` — the sample cannot be found. Without
-        // `outputSampleLocation` the template comes from `templateDetails`, which is what
-        // the operation documents for that case.
-        if let Some(sample) = input.output_sample_location.as_ref() {
-            let bucket = sample.bucket_name.as_deref().unwrap_or_default();
-            let key = sample.key.as_deref().unwrap_or_default();
-            return Err(
-                CreateStarterMappingTemplateErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: format!(
-                            "the sample EDI file at outputSampleLocation \
-                             s3://{bucket}/{key} cannot be read, so no mapping template \
-                             can be generated from it; omit outputSampleLocation to \
-                             generate a template from templateDetails"
-                        ),
-                    },
-                )
-                .into(),
-            );
-        }
-
         // GS08, the version/release/industry identifier code: the six-digit X12 version,
         // followed by the implementation convention reference when the requested
         // transaction set names one (`005010X222`).
@@ -1071,21 +1148,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(convention) => format!("{version_code}{convention}"),
             None => version_code,
         };
-        let document = starter_document(
-            language,
-            &transaction_set_code,
-            implementation_convention.as_deref(),
-            release,
-            &version_release_industry_code,
-        );
+
+        // With `outputSampleLocation` the template is DERIVED FROM THE SAMPLE: "if you
+        // provide a sample EDI file with the same structure as the EDI files that you wish
+        // to generate, then the service can generate a mapping template". The sample is
+        // read through the emulator's own S3 service and parsed as an X12 interchange, and
+        // the template is that document with its envelope values carried through and each
+        // transaction-set business field marked as a placeholder over the sample's value
+        // ([`sample_derived_document`]). `ResourceNotFoundException` is kept for a sample
+        // that genuinely cannot be read. Without `outputSampleLocation` the template comes
+        // from `templateDetails`, which is what the operation documents for that case.
+        let document = match input.output_sample_location.as_ref() {
+            None => starter_document(
+                language,
+                &transaction_set_code,
+                implementation_convention.as_deref(),
+                release,
+                &version_release_industry_code,
+            ),
+            Some(sample) => {
+                let region = crate::state::request_region(ctx.parts());
+                let text =
+                    crate::state::read_edi_object(ctx, &region, sample, "outputSampleLocation")
+                        .await
+                        .map_err(sample_unreadable)?;
+                // Parsing a caller-supplied document is synchronous CPU work, so it runs
+                // on a blocking thread: the `.await` leaves a cancelled request, a request
+                // timeout and graceful shutdown a point to land on while it runs.
+                let parsed = ::tokio::task::spawn_blocking(move || {
+                    super::test_parsing::parse_x12(&text).map(|parsed| sample_derived_document(&parsed))
+                })
+                .await
+                .map_err(|error| {
+                    CreateStarterMappingTemplateErrorModeled::InternalServerException(
+                        InternalServerException {
+                            message: format!("the sample EDI file could not be parsed: {error}"),
+                            retry_after_seconds: None,
+                        },
+                    )
+                })?;
+                parsed.map_err(|failure| {
+                    crate::scaffolded::Scaffolded::validation(format!(
+                        "the sample EDI file at outputSampleLocation could not be parsed: \
+                         {failure}"
+                    ))
+                })?
+            }
+        };
         let mapping_template = match format {
-            MappingFormat::Jsonata => jsonata_template(&document)?,
+            MappingFormat::Jsonata => render_json(&document).map_err(render_failed)?,
             MappingFormat::Xslt => xslt_template(
                 &document,
                 &transaction_set_code,
                 &version_release_industry_code,
             )?,
         };
+        // A template is used with the operations that take a `MappingTemplate`
+        // (`len 0..350000`), so one past that bound could not be used at all: a sample
+        // whose structure describes a larger template than that is refused rather than
+        // answered with one. This is also what bounds the amplification from a sample —
+        // the parsed form of a file is larger than the file.
+        if mapping_template.chars().count() > MAX_TEMPLATE_CHARS {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "the template this sample describes is longer than the \
+                 {MAX_TEMPLATE_CHARS} characters a mappingTemplate carries"
+            )));
+        }
 
         Ok(CreateStarterMappingTemplateOutput { mapping_template })
     }

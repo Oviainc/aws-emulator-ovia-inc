@@ -202,7 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(store) = crate::state::service_state(&*self.engine) else {
             return Err(CreateBillScenarioErrorModeled::DataUnavailableException(
@@ -216,7 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The account-class gate, before the request is read and before anything is
         // written: a bill scenario models what some account will be billed, so planning
         // one belongs to the account that pays that bill.
-        if let Some(refusal) = state.member_account_refusal(Self::NAME) {
+        if let Some(refusal) = state.member_account_refusal() {
             return Err(CreateBillScenarioErrorModeled::ValidationException(refusal).into());
         }
         let now = crate::state::now_secs();
@@ -296,11 +296,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let id = state.mint_resource_id();
         let (interval_start, interval_end) = crate::state::month_bounds(now);
-        let region = crate::state::request_region(&ctx.parts().headers);
         let scenario = crate::state::BillScenario {
             arn: ::engine::emulator_arn(
                 crate::state::ARN_NAMESPACE,
-                &region,
+                crate::state::ARN_REGION,
                 &format!("bill-scenario/{id}"),
             ),
             id: id.clone(),

@@ -159,11 +159,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // value's own length and pattern, are modelled constraints, so the
         // centralized walk has already refused anything outside them with a 400
         // before this body runs.
+        //
+        // The one tag-key rule the walk cannot enforce is the reserved `aws:` prefix:
+        // `TagKey`'s modelled pattern states it with a negative lookahead, which the
+        // regex engine will not compile, and an uncompilable `@pattern` is treated as
+        // satisfied. So this operation enforces it itself, with the same code, status
+        // and wording `TagResource` answers — a reserved key is refused before any
+        // graph is stored.
+        if input
+            .tags
+            .iter()
+            .flat_map(|tags| tags.keys())
+            .any(|key| crate::state::is_reserved_tag_key(key))
+        {
+            return Err(crate::scaffolded::Scaffolded::bad_request(
+                crate::state::RESERVED_TAG_KEY_MESSAGE,
+            ));
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateGraphErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the behavior graph store is unavailable".to_string()),
             })
         })?;
+
+        // The tag map stored on a graph is finite, and this is the other place one is
+        // written: the same bound `TagResource` enforces on the store is enforced on
+        // the seed, so the two paths cannot disagree about how many keys a graph may
+        // hold. (The modelled `Tags` 1..50 length already keeps a single request inside
+        // it; the check is what makes that a property of the STORE.)
+        let tags: ::std::collections::BTreeMap<String, String> =
+            input.tags.unwrap_or_default().into_iter().collect();
+        if tags.len() > crate::state::MAX_TAGS_PER_GRAPH {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "a behavior graph cannot hold more than {} tag keys",
+                crate::state::MAX_TAGS_PER_GRAPH
+            )));
+        }
 
         let region = crate::state::request_region(ctx.parts());
         let created_time_millis = crate::state::now_epoch_millis();
@@ -193,10 +224,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // administers it, which is what every `MemberDetail` of this graph later
             // reports as its `AdministratorId`.
             administrator_id: crate::state::administrator_account_id(),
-            // Stored on the graph now even though the three tagging operations are
-            // still scaffolded: they key off this same graph ARN.
-            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            // Stored on the graph now: `TagResource` and `ListTagsForResource` key off
+            // this same graph ARN.
+            tags,
             members: ::std::collections::BTreeMap::new(),
+            investigations: ::std::collections::BTreeMap::new(),
+            // A new behavior graph ingests the mandatory package and nothing else:
+            // `UpdateDatasourcePackages` refuses a request that omits
+            // `DETECTIVE_CORE`, naming it as the package a graph must have, so a graph
+            // starts with exactly that one started and the rest off.
+            datasource_packages: [(
+                crate::state::MANDATORY_DATASOURCE_PACKAGE.to_string(),
+                crate::state::DatasourcePackageIngest {
+                    state: crate::state::DATASOURCE_PACKAGE_STATE_STARTED.to_string(),
+                    last_state_change_millis: created_time_millis,
+                },
+            )]
+            .into_iter()
+            .collect(),
         });
 
         Ok(CreateGraphOutput {

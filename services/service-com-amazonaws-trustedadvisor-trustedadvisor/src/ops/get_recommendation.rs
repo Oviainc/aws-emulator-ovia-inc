@@ -11,8 +11,11 @@
 //! `length`/`pattern` never reaches this handler — the framework refuses it as a
 //! `ValidationException` (400) before `handle` runs.
 //!
-//! `language` is accepted and does not change the text: the store holds one
-//! (English) copy of each name and description.
+//! `language` SELECTS the text: the store holds this recommendation's `name` and
+//! `description` once per `RecommendationLanguage`
+//! ([`crate::state::TextCatalog`]), and this handler reports the copy the
+//! request asked for — [`crate::state::DEFAULT_LANGUAGE`] when it named no
+//! language.
 //!
 //! ## Shape of an operation
 //!
@@ -83,17 +86,27 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The stored recommendation, as the modelled `Recommendation`.
+/// The stored recommendation, as the modelled `Recommendation`, with its `name`
+/// and `description` in the language the request asked for (`None` when it named
+/// none).
 ///
 /// `createdBy`, `updatedOnBehalfOf` and `updatedOnBehalfOfJobTitle` identify the
 /// Trusted Advisor Priority person who acted on the recommendation; the store
 /// holds no such actor, so those optional members stay absent rather than
-/// carrying an invented name. `pillarSpecificAggregates` and `statusReason` are
-/// absent for the same reason.
+/// carrying an invented name. `statusReason` is absent for the same reason: the
+/// store records no discrepancy in how a status was determined.
+///
+/// `pillarSpecificAggregates` is computed from the recommendation's own
+/// resources by
+/// [`crate::state::ComAmazonawsTrustedadvisorTrustedadvisorState::pillar_aggregates_for`],
+/// and is `None` only for a recommendation that optimizes no cost.
 fn recommendation(
     entry: &crate::state::RecommendationEntry,
     resources_aggregates: RecommendationResourcesAggregates,
+    pillar_specific_aggregates: Option<RecommendationPillarSpecificAggregates>,
+    language: Option<&str>,
 ) -> Recommendation {
+    let text = entry.text.text(language);
     Recommendation {
         id: entry.id.clone(),
         r#type: entry.r#type.clone(),
@@ -103,14 +116,14 @@ fn recommendation(
         pillars: entry.pillars.clone(),
         source: entry.source.clone(),
         aws_services: Some(entry.aws_services.clone()),
-        name: entry.name.clone(),
+        name: text.name.clone(),
         resources_aggregates,
-        pillar_specific_aggregates: None,
+        pillar_specific_aggregates,
         created_at: Some(crate::state::date_time(entry.created_at_millis)),
         last_updated_at: Some(crate::state::date_time(entry.last_updated_at_millis)),
         arn: entry.arn.clone(),
         status_reason: None,
-        description: entry.description.clone(),
+        description: text.description.clone(),
         created_by: None,
         updated_on_behalf_of: None,
         updated_on_behalf_of_job_title: None,
@@ -224,8 +237,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let aggregates = state.aggregates_for(&input.recommendation_identifier);
+        let pillar_aggregates = state.pillar_aggregates_for(&input.recommendation_identifier);
         Ok(GetRecommendationOutput {
-            recommendation: Some(recommendation(entry, aggregates)),
+            recommendation: Some(recommendation(
+                entry,
+                aggregates,
+                pillar_aggregates,
+                input.language.as_deref(),
+            )),
         })
     }
 }

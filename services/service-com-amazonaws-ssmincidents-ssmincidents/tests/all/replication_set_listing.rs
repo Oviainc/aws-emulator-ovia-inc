@@ -13,11 +13,11 @@
 //! set") is ONE row.
 //!
 //! The store is seeded directly through the shared engine because the only operation
-//! that creates a replication set, `CreateReplicationSet`, is still a scaffold stub
-//! (`services/.../src/ops/create_replication_set.rs`; its own issue says the current
-//! service refuses it as deprecated, so no request will ever add one). Seeding the very
-//! `crate::state` map the handler reads is what makes these assertions about persisted
-//! state rather than about a hardcoded answer.
+//! that creates a replication set, `CreateReplicationSet`, refuses every call as
+//! deprecated (Amazon Web Services stopped accepting new Incident Manager customers on
+//! November 7, 2025), so no request will ever add one. Seeding the very `crate::state`
+//! map the handler reads is what makes these assertions about persisted state rather
+//! than about a hardcoded answer.
 
 use aws_smithy_types::DateTime;
 use serde_json::{json, Value};

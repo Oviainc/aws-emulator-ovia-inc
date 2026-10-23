@@ -313,15 +313,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // One customer managed configuration recorder per account per Region — the
         // limit the refusal's message states. The quota is on the recorders this
-        // account creates itself, so the service-linked recorders
-        // `PutServiceLinkedConfigurationRecorder` creates do not count against it.
-        let customer_managed = store
-            .recorders
-            .values()
-            .filter(|recorder| recorder.service_principal.is_none())
-            .count();
+        // account creates itself: a service-linked recorder records for the service it
+        // is linked to, so it neither counts against this quota nor occupies the slot.
         if !store.recorders.contains_key(&name)
-            && customer_managed >= crate::state::CUSTOMER_MANAGED_RECORDERS_QUOTA
+            && store.customer_managed_recorders().count()
+                >= crate::state::CUSTOMER_MANAGED_RECORDERS_QUOTA
         {
             return Err(
                 PutConfigurationRecorderErrorModeled::MaxNumberOfConfigurationRecordersExceededException(
@@ -337,7 +333,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // An update replaces the recorder's configuration but keeps the ARN and the
             // id it was created with; tags are added at creation and are not updated
             // here.
-            existing.role_arn = role_arn.to_string();
+            existing.role_arn = Some(role_arn.to_string());
             existing.recording_group = recording_group;
             existing.recording_mode = recording_mode;
             existing.recording_scope = recording_scope;
@@ -354,11 +350,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     name: name.clone(),
                     id,
                     arn: arn.clone(),
-                    role_arn: role_arn.to_string(),
+                    role_arn: Some(role_arn.to_string()),
                     recording_group,
                     recording_mode,
                     recording_scope,
                     service_principal: None,
+                    connector_arn: None,
+                    scope_configuration: None,
                     // A provider names the third-party cloud this recorder records
                     // from, which only a third-party service-linked recorder has.
                     provider: None,

@@ -272,9 +272,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let key = crate::state::shadow_key(&input.thing_name, input.shadow_name.as_deref());
         let mut guard = state.lock();
-        // A shadow that does not exist yet is at version 0, so its first update may
-        // state `version: 0` and any other expectation conflicts.
-        let stored_version = guard.shadows.get(&key).map_or(0, |shadow| shadow.version);
+        // A conditional update must state the version the shadow name stands at: 0 for a
+        // shadow nothing has written yet, and otherwise the last version the name
+        // consumed — which a delete consumes one of, so a version from before a delete
+        // never matches again.
+        let stored_version = guard.shadow_version(&key);
         if let Some(expected) = expected_version {
             if expected != stored_version {
                 return Err(UpdateThingShadowErrorModeled::ConflictException(
@@ -285,14 +287,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Both halves of the key come from the request, so a caller must not be able
-        // to name a new shadow per call forever. An update of a shadow that is
-        // already stored never trips this; deleting one frees the slot. The cap is
-        // this emulator's, not a quota the service publishes, so its message says so.
+        // to name a new shadow per call forever. An update of a shadow name that
+        // already has a slot never trips this. The cap is this emulator's, not a quota
+        // the service publishes, so its message says so.
         if !guard.shadows.contains_key(&key) && guard.shadows.len() >= crate::state::MAX_SHADOWS {
             return Err(UpdateThingShadowErrorModeled::InvalidRequestException(
                 InvalidRequestException::new(format!(
-                    "this emulator stores at most {} shadow documents; delete a shadow \
-                     before creating another",
+                    "this emulator tracks at most {} shadow names; a shadow name's version \
+                     counter outlives its document, so deleting a shadow does not free one",
                     crate::state::MAX_SHADOWS
                 )),
             )
@@ -303,11 +305,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ACCUMULATED document, not one request, so an update whose result would
         // exceed it has to be refused without having changed what is stored.
         let timestamp_secs = crate::state::now_secs();
-        let mut merged = guard.shadows.get(&key).cloned().unwrap_or_default();
+        let mut merged = guard
+            .stored_shadow(&key)
+            .map(|(document, _)| document.clone())
+            .unwrap_or_default();
         merged.apply(desired, reported, timestamp_secs);
-        merged.version = stored_version + 1;
         merged.timestamp_secs = timestamp_secs;
-        let stored_document = merged.document();
+        let version = stored_version + 1;
+        let stored_document = merged.document(version);
         // The same measure again, on the state the merge would leave STORED: the
         // quota bounds the accumulated state, not one request's document.
         let state_bytes = merged.state_bytes();
@@ -334,7 +339,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        guard.shadows.insert(key, merged);
+        let slot = guard.shadows.entry(key).or_default();
+        // The slot's counter was read under this same guard, so the version it consumes
+        // here is exactly the `version` the reply reports.
+        slot.consume_version();
+        slot.document = Some(merged);
 
         // The reply is the stored document plus the request's own correlation token; the
         // token is not state, so what was just stored — and therefore what every later

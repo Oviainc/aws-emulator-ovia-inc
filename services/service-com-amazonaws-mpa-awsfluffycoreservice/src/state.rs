@@ -7,6 +7,20 @@
 //! `GetApprovalTeam` / `ListApprovalTeams` / `UpdateApprovalTeam` /
 //! `StartActiveApprovalTeamDeletion` all compute their answers from it.
 //!
+//! # Policies attached to a resource
+//!
+//! A team's `Policies` references are also the POLICIES ATTACHED to that team as a
+//! resource, so the resource-policy reads (`GetResourcePolicy`) answer from the same
+//! records rather than from a second copy, and resolve each reference through the
+//! catalog below so that every member they report is the policy record's own:
+//! [`ComAmazonawsMpaAwsfluffycoreserviceState::attached_resource_policy`] turns one
+//! attached `QualifiedPolicyArn` into the [`ResourcePolicy`] those reads report
+//! ([`parse_policy_version_arn`] reading the ARN back, `$DEFAULT` resolving to the
+//! policy's current default version), and
+//! [`ComAmazonawsMpaAwsfluffycoreserviceState::resource_policies`] /
+//! [`ComAmazonawsMpaAwsfluffycoreserviceState::resource_policy`] resolve them for a
+//! resource ARN.
+//!
 //! # The clock, and who materialises it
 //!
 //! Two changes are owed by the passage of time alone, so they are recorded as DUE
@@ -27,6 +41,11 @@
 //! deletes one, so the catalog is SEEDED when this store is first touched
 //! ([`Default`]) and `ListPolicies` reports whatever it then holds. See
 //! [`seeded_policy_catalog`].
+//!
+//! Each catalog entry carries its VERSIONS ([`CatalogPolicy::versions`]), one of which is
+//! the entry's default; `ListPolicyVersions` reports them for the policy its `PolicyArn`
+//! names. A version is as immutable as the policy that owns it — nothing in this model
+//! mints or retires one — so no reader of the catalog writes to it.
 //!
 //! # Authorization
 //!
@@ -105,6 +124,36 @@ pub const MAX_APPROVAL_TEAMS: usize = 1_000;
 /// modelled `range(min: 1, max: 20)` / `default: 20` — the same shape every one of them
 /// binds (`ListApprovalTeams`, `ListPolicies`, …).
 pub const MAX_LIST_PAGE: i32 = 20;
+
+/// Largest number of tags one resource holds.
+///
+/// AWS's tagging limits allow 50 tags per resource, and this service's own model
+/// corroborates that number: `UntagResource`'s `TagKeys` is `length(min: 0, max: 50)`
+/// (`smithy_query(query="shape",shape="TagKeyList")`), so a single untag call can name
+/// every key a resource is able to carry. `TagResource` reports a request that would
+/// take a resource past it with the `TooManyTagsException` (400) the model declares for
+/// exactly that condition.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// Number of tags a resource holding `existing` would hold once `incoming` keys are
+/// merged into it.
+///
+/// Tagging is a per-key upsert, so a key the resource already carries replaces its
+/// value and adds nothing to the count; only keys it does not carry yet do.
+///
+/// The two borrows are independent: `existing` is only read, and only the keys
+/// `incoming` adds are held, so `incoming` may be borrowed from anywhere.
+#[must_use]
+pub fn merged_tag_count<'a, I>(existing: &BTreeMap<String, String>, incoming: I) -> usize
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let added: ::std::collections::BTreeSet<&str> = incoming
+        .into_iter()
+        .filter(|key| !existing.contains_key(*key))
+        .collect();
+    existing.len() + added.len()
+}
 
 /// The pending deletion window `days` names, or `None` when `days` is not a day count
 /// this service can turn into a duration.
@@ -311,6 +360,15 @@ impl ApprovalTeam {
     }
 }
 
+/// Longest category or name segment a policy ARN may carry, from the
+/// `[a-zA-Z0-9_\.-]{1,1023}` segments `UnqualifiedPolicyArn`'s modelled pattern declares.
+const MAX_POLICY_ARN_SEGMENT: usize = 1023;
+
+/// The version segment that stands for "whichever version is this policy's default" —
+/// the alternative `QualifiedPolicyArn`'s pattern allows beside a decimal version id
+/// (`^arn:.{1,63}:mpa:::aws:policy/[a-zA-Z0-9_\.-]{1,1023}/[a-zA-Z0-9_\.-]{1,1023}/(?:[\d]+|\$DEFAULT)$`).
+pub const DEFAULT_POLICY_VERSION: &str = "$DEFAULT";
+
 /// Type of a policy, in the tokens `PolicyType` declares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyType {
@@ -327,9 +385,205 @@ impl PolicyType {
             Self::AwsRam => "AWS_RAM",
         }
     }
+    /// The policy type `token` names, or `None` when `PolicyType` declares no such
+    /// value.
+    #[must_use]
+    pub fn from_wire(token: &str) -> Option<Self> {
+        match token {
+            "AWS_MANAGED" => Some(Self::AwsManaged),
+            "AWS_RAM" => Some(Self::AwsRam),
+            _ => None,
+        }
+    }
 }
 
-/// One policy in the catalog: everything `ListPolicies` reports for it.
+/// Status of one version of a policy, in the tokens `PolicyStatus` declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyStatus {
+    Attachable,
+    Deprecated,
+}
+
+impl PolicyStatus {
+    /// The wire token, as `PolicyStatus` spells it.
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Attachable => "ATTACHABLE",
+            Self::Deprecated => "DEPRECATED",
+        }
+    }
+}
+
+/// The version of a policy a `QualifiedPolicyArn` names: an explicit
+/// `PolicyVersionId`, or the policy's default version — the `$DEFAULT` alternative the
+/// pattern allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyVersionSelector {
+    Default,
+    Id(i32),
+}
+
+/// The policy and version a `QualifiedPolicyArn` names, split into the unqualified ARN
+/// the catalog is keyed by ([`policy_arn`]) and the version it selects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyVersionRef {
+    pub policy_arn: String,
+    pub version: PolicyVersionSelector,
+}
+
+/// Whether `segment` fits the `[a-zA-Z0-9_\.-]{1,1023}` category/name segment
+/// `UnqualifiedPolicyArn`'s pattern declares.
+fn is_policy_arn_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment.len() <= MAX_POLICY_ARN_SEGMENT
+        && segment
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-')
+}
+
+/// Whether `arn` is an unqualified policy ARN in the form `UnqualifiedPolicyArn`'s
+/// pattern fixes — the form [`policy_arn`] mints and the catalog is keyed by:
+/// `arn:<partition>:mpa:::aws:policy/<Category>/<Name>`.
+#[must_use]
+pub fn is_policy_arn(arn: &str) -> bool {
+    // `arn:<partition>:<service>:<region>:<account>:<resource>`, the resource being
+    // `aws:policy/<Category>/<Name>` — which carries a colon of its own, so the ARN
+    // splits into SIX fields and no more.
+    let mut fields = arn.splitn(6, ':');
+    if fields.next() != Some("arn") {
+        return false;
+    }
+    // `.{1,63}` in the pattern's partition position.
+    if !fields
+        .next()
+        .is_some_and(|partition| !partition.is_empty() && partition.len() <= 63)
+    {
+        return false;
+    }
+    if fields.next() != Some(SERVICE_ACTION_PREFIX) {
+        return false;
+    }
+    // A policy is an AWS-owned, global resource: `:::` in the pattern, so its region
+    // and account fields are both empty.
+    if fields.next() != Some("") || fields.next() != Some("") {
+        return false;
+    }
+    let Some(path) = fields.next().and_then(|r| r.strip_prefix("aws:policy/")) else {
+        return false;
+    };
+    let mut segments = path.split('/');
+    let (Some(category), Some(name), None) = (segments.next(), segments.next(), segments.next())
+    else {
+        return false;
+    };
+    is_policy_arn_segment(category) && is_policy_arn_segment(name)
+}
+
+/// The policy and version `arn` names, or `None` when it is not a policy-version ARN in
+/// the grammar `QualifiedPolicyArn`'s pattern fixes (an unqualified policy ARN followed
+/// by `/<PolicyVersionId>` or `/$DEFAULT`).
+///
+/// The inverse of [`policy_version_arn`], so what this service mints it also reads back.
+#[must_use]
+pub fn parse_policy_version_arn(arn: &str) -> Option<PolicyVersionRef> {
+    let (policy_arn, version) = arn.rsplit_once('/')?;
+    if !is_policy_arn(policy_arn) {
+        return None;
+    }
+    let version = if version == DEFAULT_POLICY_VERSION {
+        PolicyVersionSelector::Default
+    } else {
+        // `[\d]+` in the pattern, and `PolicyVersionId` is `range(min: 1)`, so a signed
+        // or out-of-range value names no version.
+        if !version.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let version_id: i32 = version.parse().ok()?;
+        if version_id < FIRST_POLICY_VERSION {
+            return None;
+        }
+        PolicyVersionSelector::Id(version_id)
+    };
+    Some(PolicyVersionRef {
+        policy_arn: policy_arn.to_string(),
+        version,
+    })
+}
+
+/// A policy attached to a resource this store records, as the resource-policy reads
+/// report it. Every member is read off the catalog entry the attachment resolves to, so
+/// a reported resource policy can never disagree with the policy the catalog holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourcePolicy {
+    /// ARN of the resource the policy is attached to.
+    pub resource_arn: String,
+    /// `UnqualifiedPolicyArn` of the policy itself.
+    pub policy_arn: String,
+    /// ARN of the version in effect — the version the attachment RESOLVES to, so an
+    /// attachment of `$DEFAULT` reports the policy's default version by id.
+    pub policy_version_arn: String,
+    /// Id of that version.
+    pub policy_version_id: i32,
+    pub policy_name: String,
+    pub policy_type: PolicyType,
+    /// Document of the version in effect.
+    pub document: String,
+}
+
+/// The document this service reports for version `version_id` of `policy`.
+///
+/// Its identity is read from the catalog: the statement id is built from the policy's
+/// name and the version id, so every version of every policy has a document of its own
+/// and the same version always reports the same one.
+///
+/// The document's CONTENTS are this emulator's and are NOT a claim about the text AWS
+/// serves: AWS does not publish its MPA managed policy documents in this service's
+/// model, and `PolicyDocument` carries no modelled structure beyond
+/// `@length(max: 400000)`. What is reported is a syntactically valid document in the IAM
+/// policy grammar that `PolicyVersion$Status`' own documentation points at, over this
+/// service's own action namespace.
+#[must_use]
+pub fn policy_version_document(policy: &CatalogPolicy, version_id: i32) -> String {
+    // An IAM `Sid` is alphanumeric, so the policy's name contributes only its
+    // alphanumeric characters rather than the `_`, `.` and `-` its own pattern allows.
+    let name: String = policy
+        .name
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    let document = ::serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": format!("{name}v{version_id}"),
+            "Effect": "Allow",
+            "Action": format!("{SERVICE_ACTION_PREFIX}:*"),
+            "Resource": "*",
+        }],
+    });
+    document.to_string()
+}
+
+/// One version of a catalog policy: everything `ListPolicyVersions` reports for it that
+/// is the VERSION's rather than the policy's.
+///
+/// The members a version shares with its policy — the policy ARN, the name and the
+/// `PolicyType` — are not copied here: they live once on the owning
+/// [`CatalogPolicy`], so a reader cannot report a version whose name disagrees with
+/// its policy's.
+#[derive(Debug, Clone)]
+pub struct CatalogPolicyVersion {
+    /// This version's id, as `PolicyVersionSummary$VersionId` reports it. At least
+    /// [`FIRST_POLICY_VERSION`], from `PolicyVersionId`'s modelled `range(min: 1)`.
+    pub version_id: i32,
+    /// Whether this version may still be attached to a team.
+    pub status: PolicyStatus,
+    pub creation_time: SystemTime,
+    pub last_updated_time: SystemTime,
+}
+
+/// One policy in the catalog: everything `ListPolicies` reports for it, plus the
+/// versions `ListPolicyVersions` reports.
 #[derive(Debug, Clone)]
 pub struct CatalogPolicy {
     /// The policy's unqualified ARN, in the form [`policy_arn`] mints.
@@ -338,6 +592,59 @@ pub struct CatalogPolicy {
     pub policy_type: PolicyType,
     /// Version id that is this policy's default, as `Policy$DefaultVersion` reports it.
     pub default_version: i32,
+    /// Every version of this policy, keyed by its version id — the stable, ascending
+    /// ordering `ListPolicyVersions` pages over.
+    pub versions: BTreeMap<i32, CatalogPolicyVersion>,
+}
+
+impl CatalogPolicy {
+    /// A catalog policy holding one version, [`FIRST_POLICY_VERSION`], which is
+    /// therefore also its default: the shape every seeded entry starts in.
+    #[must_use]
+    pub fn with_first_version(
+        category: &str,
+        name: &str,
+        policy_type: PolicyType,
+        created: SystemTime,
+    ) -> Self {
+        let mut policy = Self {
+            arn: policy_arn(category, name),
+            name: name.to_string(),
+            policy_type,
+            default_version: FIRST_POLICY_VERSION,
+            versions: BTreeMap::new(),
+        };
+        policy.insert_version(CatalogPolicyVersion {
+            version_id: FIRST_POLICY_VERSION,
+            status: PolicyStatus::Attachable,
+            creation_time: created,
+            last_updated_time: created,
+        });
+        policy
+    }
+
+    /// Record a version of this policy, replacing any entry under the same id.
+    pub fn insert_version(&mut self, version: CatalogPolicyVersion) {
+        self.versions.insert(version.version_id, version);
+    }
+
+    /// This policy's version with id `version_id`.
+    #[must_use]
+    pub fn version(&self, version_id: i32) -> Option<&CatalogPolicyVersion> {
+        self.versions.get(&version_id)
+    }
+
+    /// Whether `version_id` names the version this policy attaches by default.
+    #[must_use]
+    pub fn is_default_version(&self, version_id: i32) -> bool {
+        version_id == self.default_version
+    }
+
+    /// The qualified ARN of this policy's version `version_id`.
+    #[must_use]
+    pub fn version_arn(&self, version_id: i32) -> String {
+        policy_version_arn(&self.arn, version_id)
+    }
 }
 
 /// Version id a policy's first version carries, from `PolicyVersionId`'s modelled
@@ -355,8 +662,16 @@ pub fn policy_arn(category: &str, name: &str) -> String {
     format!("arn:aws:mpa:::aws:policy/{category}/{name}")
 }
 
+/// ARN of ONE VERSION of a policy, in the form `QualifiedPolicyArn`'s pattern fixes:
+/// the policy's own unqualified ARN followed by the version id
+/// (`arn:aws:mpa:::aws:policy/<category>/<name>/<version id>`).
+#[must_use]
+pub fn policy_version_arn(policy_arn: &str, version_id: i32) -> String {
+    format!("{policy_arn}/{version_id}")
+}
+
 /// The policies this store holds when it is first touched, as
-/// `(category, name, type, default version)`.
+/// `(category, name, type)`.
 ///
 /// The model fixes the SHAPE of an entry, and that is what this emulator computes its
 /// answers from: the ARN form comes from `UnqualifiedPolicyArn`'s pattern (whose two
@@ -364,27 +679,21 @@ pub fn policy_arn(category: &str, name: &str) -> String {
 /// `PolicyType`'s enum, and the version from `PolicyVersionId`'s `range(min: 1)`. The
 /// entries themselves are AWS's own catalog, which no request can change and no model
 /// member enumerates: this seeds the AWS-managed approval-team policy and invents no
-/// others. Nothing is keyed to a particular entry — `ListPolicies` pages over whatever
-/// the store holds, so an entry recorded later is reported exactly like a seeded one.
-const SEEDED_POLICY_CATALOG: &[(&str, &str, PolicyType, i32)] = &[(
-    "IdentityCenter",
-    "MPAApprovalTeamPolicy",
-    PolicyType::AwsManaged,
-    FIRST_POLICY_VERSION,
-)];
+/// others, each with the one version `FIRST_POLICY_VERSION` names. Nothing is keyed to a
+/// particular entry — `ListPolicies` pages over whatever the store holds and
+/// `ListPolicyVersions` over whatever versions an entry holds, so an entry or a version
+/// recorded later is reported exactly like a seeded one.
+const SEEDED_POLICY_CATALOG: &[(&str, &str, PolicyType)] =
+    &[("IdentityCenter", "MPAApprovalTeamPolicy", PolicyType::AwsManaged)];
 
-/// The catalog a fresh store starts with, keyed by ARN.
+/// The catalog a fresh store starts with, keyed by ARN. `created` is the instant the
+/// store came into being, which is when its seeded policies and their versions did.
 #[must_use]
-pub fn seeded_policy_catalog() -> BTreeMap<String, CatalogPolicy> {
+pub fn seeded_policy_catalog(created: SystemTime) -> BTreeMap<String, CatalogPolicy> {
     SEEDED_POLICY_CATALOG
         .iter()
-        .map(|&(category, name, policy_type, default_version)| {
-            let policy = CatalogPolicy {
-                arn: policy_arn(category, name),
-                name: name.to_string(),
-                policy_type,
-                default_version,
-            };
+        .map(|&(category, name, policy_type)| {
+            let policy = CatalogPolicy::with_first_version(category, name, policy_type, created);
             (policy.arn.clone(), policy)
         })
         .collect()
@@ -416,8 +725,9 @@ pub struct ComAmazonawsMpaAwsfluffycoreserviceState {
     /// `ListPolicies` pages over.
     ///
     /// Seeded by [`Default`] from [`seeded_policy_catalog`]: a policy is AWS's, so no
-    /// operation in this model mints or removes one, and every reader answers out of
-    /// this one map.
+    /// operation in this model mints or removes one or one of its versions, and every
+    /// reader — `ListPolicies` and `ListPolicyVersions` alike — answers out of this one
+    /// map.
     pub policies: BTreeMap<String, CatalogPolicy>,
     /// Source of [`ApprovalTeam::seq`].
     next_team_seq: u64,
@@ -435,7 +745,7 @@ impl Default for ComAmazonawsMpaAwsfluffycoreserviceState {
             name_index: BTreeMap::new(),
             idempotency_tokens: BTreeMap::new(),
             organization_management_account_id: None,
-            policies: seeded_policy_catalog(),
+            policies: seeded_policy_catalog(SystemTime::now()),
             next_team_seq: 0,
             next_approver_seq: 0,
         }
@@ -529,6 +839,25 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
         self.approval_teams.get_mut(arn)
     }
 
+    /// The tags of the resource `arn` names, or `None` when this store holds no
+    /// resource under that ARN.
+    ///
+    /// The one place a tagging operation resolves a resource ARN, so `TagResource` and
+    /// `ListTagsForResource` agree on which resources exist and read the same map. The
+    /// approval team is the only resource this service stores, so an ARN naming
+    /// anything else is not found; when another resource is added here, both operations
+    /// pick it up from this one function.
+    #[must_use]
+    pub fn resource_tags(&self, arn: &str) -> Option<&BTreeMap<String, String>> {
+        self.team(arn).map(|team| &team.tags)
+    }
+
+    /// The tags of the resource `arn` names, for update. Same resolution as
+    /// [`ComAmazonawsMpaAwsfluffycoreserviceState::resource_tags`].
+    pub fn resource_tags_mut(&mut self, arn: &str) -> Option<&mut BTreeMap<String, String>> {
+        self.team_mut(arn).map(|team| &mut team.tags)
+    }
+
     /// Every stored team in creation order — the stable ordering
     /// `ListApprovalTeams` pages over.
     #[must_use]
@@ -536,6 +865,73 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
         let mut teams: Vec<&ApprovalTeam> = self.approval_teams.values().collect();
         teams.sort_by_key(|team| team.seq);
         teams
+    }
+
+    /// Every policy attached to the resource `resource_arn` names, in attachment
+    /// order, or `None` when this store records NO resource under that ARN — which is
+    /// what tells a missing resource from a resource with no policy of the name asked
+    /// for.
+    ///
+    /// An approval team is the only resource this store records, and a team's attached
+    /// policies are the `Policies` references it carries, so the resource-policy reads
+    /// and `GetApprovalTeam$Policies` report one and the same attachment list. Each
+    /// reference is resolved through the CATALOG, so every member reported comes from
+    /// the policy record itself; a reference the catalog does not hold names no policy
+    /// and is reported by nothing.
+    #[must_use]
+    pub fn resource_policies(&self, resource_arn: &str) -> Option<Vec<ResourcePolicy>> {
+        let team = self.team(resource_arn)?;
+        Some(
+            team.policies
+                .iter()
+                .filter_map(|attached| self.attached_resource_policy(resource_arn, attached))
+                .collect(),
+        )
+    }
+
+    /// The policy of this name and type attached to the resource `resource_arn` names,
+    /// or `None` when no resource is recorded under that ARN or none of its attached
+    /// policies carries that name and type.
+    #[must_use]
+    pub fn resource_policy(
+        &self,
+        resource_arn: &str,
+        policy_name: &str,
+        policy_type: PolicyType,
+    ) -> Option<ResourcePolicy> {
+        self.resource_policies(resource_arn)?
+            .into_iter()
+            .find(|policy| policy.policy_name == policy_name && policy.policy_type == policy_type)
+    }
+
+    /// The resource policy an attachment of `attached_arn` to `resource_arn` reports,
+    /// or `None` when the attachment names no policy version the catalog holds.
+    ///
+    /// `PolicyReference$PolicyArn` is a `QualifiedPolicyArn`, so an attachment names a
+    /// policy and one of its versions: the version id when it names one, and the
+    /// policy's current default version when it names `$DEFAULT`.
+    #[must_use]
+    pub fn attached_resource_policy(
+        &self,
+        resource_arn: &str,
+        attached_arn: &str,
+    ) -> Option<ResourcePolicy> {
+        let reference = parse_policy_version_arn(attached_arn)?;
+        let policy = self.policy(&reference.policy_arn)?;
+        let version_id = match reference.version {
+            PolicyVersionSelector::Default => policy.default_version,
+            PolicyVersionSelector::Id(version_id) => version_id,
+        };
+        policy.version(version_id)?;
+        Some(ResourcePolicy {
+            resource_arn: resource_arn.to_string(),
+            policy_arn: policy.arn.clone(),
+            policy_version_arn: policy.version_arn(version_id),
+            policy_version_id: version_id,
+            policy_name: policy.name.clone(),
+            policy_type: policy.policy_type,
+            document: policy_version_document(policy, version_id),
+        })
     }
 
     /// The catalog policy with this ARN.
@@ -627,6 +1023,24 @@ pub fn caller_identity_arn() -> String {
 #[must_use]
 pub fn arn_account_id(arn: &str) -> Option<&str> {
     arn.split(':').nth(4)
+}
+
+/// Whether `arn` is a well-formed Amazon Resource Name:
+/// `arn:<partition>:<service>:<region>:<account>:<resource>` — six colon-separated
+/// fields with a non-empty partition, service and resource.
+///
+/// Region and account are empty on a global resource's ARN (an AWS-managed MPA policy,
+/// `arn:aws:mpa:::aws:policy/...`, for one), so neither is required.
+#[must_use]
+pub fn is_well_formed_arn(arn: &str) -> bool {
+    let mut fields = arn.splitn(6, ':');
+    let prefix = fields.next() == Some("arn");
+    let partition = fields.next().is_some_and(|field| !field.is_empty());
+    let service = fields.next().is_some_and(|field| !field.is_empty());
+    let region = fields.next().is_some();
+    let account = fields.next().is_some();
+    let resource = fields.next().is_some_and(|field| !field.is_empty());
+    prefix && partition && service && region && account && resource
 }
 
 /// Whether `arn` names a resource in the caller's own account.

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Applies the members a request names to the stored profile and answers with the STORED
+//! record, so a later `GetProfile` cannot disagree with what the update reported.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A `profileId` that does not resolve is the modelled `ResourceNotFoundException` (404) —
+//! the same verdict `GetProfile` gives, stated with the same wording
+//! ([`crate::state::profile_not_found`]), so a mutation against a deleted profile is
+//! refused rather than recreating it. An omitted member is left as it was stored: the
+//! model marks every member but `profileId` optional, so a request names only what it
+//! changes.
 //!
 //! ## Shape of an operation
 //!
@@ -187,18 +187,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateProfile"))
+        if let Err(denied) = crate::state::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::resource_arn(
+                &crate::state::request_region(ctx.parts()),
+                "profile",
+                &input.profile_id,
+            ),
+        ) {
+            return Err(UpdateProfileErrorModeled::AccessDeniedException(denied).into());
+        }
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateProfileErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STATE_UNAVAILABLE.to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let mut state = store.lock();
+
+        // The resolution verdict comes first: a `profileId` this service does not hold
+        // names no profile to update, which is the modelled 404 — never a create.
+        let Some(profile) = state.profiles.get_mut(&input.profile_id) else {
+            return Err(UpdateProfileErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::profile_not_found(&input.profile_id),
+                },
+            )
+            .into());
+        };
+
+        // Only the members the request names are applied; the rest keep the stored value.
+        // `logging` and `logGroupName` are not among this operation's input members, so a
+        // profile's logging destination is never re-pointed here — the group the create
+        // provisioned stays the one the profile reports.
+        if let Some(name) = input.name {
+            profile.name = name;
+        }
+        if let Some(email) = input.email {
+            profile.email = Some(email);
+        }
+        if let Some(phone) = input.phone {
+            profile.phone = phone;
+        }
+        if let Some(business_name) = input.business_name {
+            profile.business_name = business_name;
+        }
+        profile.modified_at = Some(crate::state::now());
+
+        Ok(UpdateProfileOutput {
+            profile_id: profile.profile_id.clone(),
+            profile_arn: profile.profile_arn.clone(),
+            name: profile.name.clone(),
+            email: profile.email.clone(),
+            phone: profile.phone.clone(),
+            business_name: profile.business_name.clone(),
+            logging: Some(profile.logging.clone()),
+            log_group_name: profile.log_group_name.clone(),
+            created_at: profile.created_at,
+            modified_at: profile.modified_at,
+        })
     }
 }

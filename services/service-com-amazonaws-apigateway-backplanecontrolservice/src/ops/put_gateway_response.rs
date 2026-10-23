@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutGatewayResponse
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutGatewayResponse`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutGatewayResponse::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: stores the customization of one of an API's gateway responses, keyed by
+//! its `responseType`, so a later `GetGatewayResponse` surfaces it instead of the
+//! response API Gateway generates for that type. Answers from the stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -102,6 +96,61 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// Refuse a request whose caller-sized members would grow the store past a bound.
+///
+/// Called BEFORE the store lock is taken, so an over-sized request never reaches the
+/// records at all. The gateway response COUNT per API needs no cap of its own: a
+/// response is keyed by a `responseType` the model declares as an enum, so an API holds
+/// at most one customization per declared value.
+fn bound_input(input: &PutGatewayResponseInput) -> Result<(), String> {
+    use crate::state::{bound_chars, bound_entries, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS};
+
+    for (member, map) in [
+        ("responseParameters", &input.response_parameters),
+        ("responseTemplates", &input.response_templates),
+    ] {
+        let Some(entries) = map else { continue };
+        bound_entries(member, entries.len(), MAX_COLLECTION_ENTRIES)?;
+        for (key, value) in entries {
+            bound_chars(&format!("a {member} key"), key, MAX_STRING_CHARS)?;
+            bound_chars(&format!("a {member} value"), value, MAX_STRING_CHARS)?;
+        }
+    }
+    Ok(())
+}
+
+/// The `GatewayResponse` record `input` asks for, as it must be STORED: the response
+/// type this call customizes, the status code the customization answers with, and the
+/// two caller-supplied maps.
+///
+/// A stored record is a CUSTOMIZATION, so `defaultResponse` is false: that flag reports
+/// whether API Gateway generated the response or a developer wrote it.
+///
+/// `statusCode` is optional on input, and a gateway response always has one where its
+/// type has one: a request that sets none keeps the status code the type's generated
+/// response carries (`crate::state::default_gateway_status_code`), which for
+/// `DEFAULT_4XX` and `DEFAULT_5XX` is none at all. Resolving it here, at write time, is
+/// what makes a read of this record agree with a read of the uncustomized type.
+///
+/// The `responseParameters` keys are mapping expressions and the `responseTemplates`
+/// keys content types; the model types both as a bare `String` and declares no pattern
+/// for either, so each is stored as given rather than refused against a form this
+/// service does not publish.
+fn gateway_response_of(input: &PutGatewayResponseInput) -> GetGatewayResponseOutput {
+    GetGatewayResponseOutput {
+        // The response type is a path label the model constrains to the
+        // `GatewayResponseType` enum, so the boundary validator has already refused
+        // anything outside it.
+        response_type: Some(input.response_type.clone()),
+        status_code: input.status_code.clone().or_else(|| {
+            crate::state::default_gateway_status_code(&input.response_type).map(str::to_string)
+        }),
+        response_parameters: crate::state::non_empty_map(input.response_parameters.clone()),
+        response_templates: crate::state::non_empty_map(input.response_templates.clone()),
+        default_response: false,
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -137,6 +186,23 @@ impl From<PutGatewayResponseErrorModeled> for PutGatewayResponseError {
     fn from(modeled: PutGatewayResponseErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// Refuse a request whose caller-sized members break a store bound; see `bound_input`.
+fn bad_request(message: String) -> PutGatewayResponseError {
+    PutGatewayResponseErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Refuse a request naming a record that does not exist, with the message this service
+/// shares for that identifier.
+fn not_found(message: &str) -> PutGatewayResponseError {
+    PutGatewayResponseErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }
 
 /// The `PutGatewayResponse` operation.
@@ -177,16 +243,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
         // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutGatewayResponse` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutGatewayResponseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutGatewayResponse"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        bound_input(&input).map_err(bad_request)?;
+        let response = gateway_response_of(&input);
+
+        let mut store = state.lock();
+        let api = store
+            .rest_apis
+            .get_mut(&input.rest_api_id)
+            .ok_or_else(|| not_found(&crate::state::no_such_rest_api(&input.rest_api_id)))?;
+
+        // A response type always names a gateway response of the API (the generated one,
+        // until a developer customizes it), so this call REPLACES whatever that type
+        // reported rather than conflicting with an earlier put: the URI
+        // `PUT /restapis/{restApiId}/gatewayresponses/{responseType}` identifies one
+        // record, and a put of it is idempotent.
+        api.gateway_responses
+            .insert(input.response_type.clone(), response.clone());
+
+        Ok(PutGatewayResponseOutput {
+            response_type: response.response_type,
+            status_code: response.status_code,
+            response_parameters: response.response_parameters,
+            response_templates: response.response_templates,
+            default_response: response.default_response,
+        })
     }
 }

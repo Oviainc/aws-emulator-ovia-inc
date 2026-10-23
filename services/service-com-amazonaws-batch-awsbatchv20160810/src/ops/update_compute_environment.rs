@@ -14,8 +14,13 @@
 //! back to `VALID` is owed by the clock ([`crate::state::JOB_PHASE_MILLIS`]), exactly
 //! like the `CREATING` -> `VALID` move a create owes.
 //!
-//! Each refusal below is the modelled `ClientException` (HTTP 400) and comes from a rule
-//! the model documents on the member:
+//! A `computeEnvironment` that resolves to nothing is refused the way every Batch
+//! resource resolver refuses an identifier it cannot resolve: the bare
+//! `<the ARN the identifier resolves to> does not exist`
+//! ([`crate::state::does_not_exist_message`]), with no envelope around it.
+//!
+//! Each other refusal below is the modelled `ClientException` (HTTP 400) and comes from a
+//! rule the model documents on the member:
 //!
 //! * `computeResources` is "details of the compute resources MANAGED by the compute
 //!   environment", so it is accepted only for a `MANAGED` environment;
@@ -151,15 +156,6 @@ pub enum UpdateComputeEnvironmentErrorModeled {
     ServerException(ServerException),
 }
 
-/// The `CRType` values whose compute resources run on Fargate.
-///
-/// The `subnets` and `securityGroupIds` docs single them out: an empty list is "handled
-/// as if this parameter wasn't specified and no change is made" for Fargate compute
-/// resources, and removes the values for Amazon EC2 ones. Source: the model's
-/// `com.amazonaws.batch#CRType` enum (`EC2 | SPOT | FARGATE | FARGATE_SPOT |
-/// ECS_MANAGED_INSTANCES`), of which these two are the Fargate pair.
-const FARGATE_COMPUTE_TYPES: &[&str] = &["FARGATE", "FARGATE_SPOT"];
-
 /// `minvCpus` of a compute resource that names none: the member is optional, and an
 /// environment without one maintains no instances.
 const DEFAULT_MIN_VCPUS: i32 = 0;
@@ -172,9 +168,14 @@ fn refuse(detail: impl AsRef<str>) -> UpdateComputeEnvironmentError {
         .into()
 }
 
-/// Whether a compute resource of this `CRType` runs on Fargate ([`FARGATE_COMPUTE_TYPES`]).
+/// Whether a compute resource of this `CRType` runs on Fargate
+/// ([`crate::state::FARGATE_COMPUTE_TYPES`]).
+///
+/// The `subnets` and `securityGroupIds` docs single the Fargate types out: an empty list
+/// is "handled as if this parameter wasn't specified and no change is made" for Fargate
+/// compute resources, and removes the values for Amazon EC2 ones.
 fn is_fargate(compute_type: &str) -> bool {
-    FARGATE_COMPUTE_TYPES.contains(&compute_type)
+    crate::state::is_fargate_compute_type(compute_type)
 }
 
 /// What a list member (`subnets`, `securityGroupIds`) holds after the update: the stored
@@ -398,13 +399,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as batch;
 
-        let _ = ctx;
         let Some(state) = batch::service_state(&*self.engine) else {
             return Err(UpdateComputeEnvironmentErrorModeled::ServerException(
                 batch::unreachable_state(),
             )
             .into());
         };
+        let region = batch::request_region(ctx);
         let now = batch::now_millis();
         let mut state = state.lock();
         state.materialize_due(now);
@@ -416,10 +417,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_deref()
             .and_then(|name| state.compute_environments.get_mut(name))
         else {
-            return Err(refuse(format!(
-                "Compute environment {} does not exist",
-                input.compute_environment
-            )));
+            // An identifier that resolves to nothing is refused with the ARN it resolved
+            // to and nothing else ([`batch::does_not_exist_message`]): the resource is not
+            // stored, so the ARN is computed from the request.
+            return Err(refuse(batch::does_not_exist_message(&batch::resolved_arn(
+                &input.compute_environment,
+                |name| batch::compute_environment_arn(&region, name),
+            ))));
         };
 
         // A resource whose deletion the clock already owes cannot be updated: the delete

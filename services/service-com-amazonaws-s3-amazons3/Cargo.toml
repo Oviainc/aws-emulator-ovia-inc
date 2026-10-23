@@ -29,6 +29,11 @@ hex = { workspace = true }
 # An object version id is the SHA-256 of the bucket, the key and the store's mint
 # sequence, Base64 encoded (`state::mint_version_id`).
 sha2 = { workspace = true }
+# `encoding-type=url` asks a listing to percent-encode the key-name elements of its
+# response ("non-ASCII characters that are used in an object's key name will be
+# percent-encoded according to UTF-8 code values" — the `EncodingType` enum's own
+# documentation), which is exactly RFC 3986 percent-encoding over a chosen character set.
+percent-encoding = "2"
 # Normalizes the ONE member this service's model marks `@xmlAttribute` between the
 # attribute the API publishes and the element the framework's XML codec binds
 # (`src/service/wire.rs`), rather than editing XML documents as strings.

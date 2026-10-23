@@ -12,6 +12,11 @@
 //!
 //! Every row below addresses a different resource kind through a different operation, so
 //! a message built from the request would differ between rows and fail here.
+//!
+//! Every row is an operation acting on an EXISTING resource, which is what makes the
+//! absent resource a not-found. A CREATE whose input merely REFERENCES a parent that does
+//! not exist is the other half of the rule — a field-validation failure on the referencing
+//! member — and is pinned by `unknown_parent_reference`.
 
 use serde_json::{json, Value};
 
@@ -109,10 +114,6 @@ async fn every_not_found_refusal_carries_the_constant_message_and_identifies_the
     let unknown_network = "global-network-00000000000000099".to_string();
     let unknown_site = "site-00000000000000099".to_string();
     let unknown_link = "link-00000000000000099".to_string();
-    let link_body = json!({
-        "Bandwidth": { "UploadSpeed": 10, "DownloadSpeed": 20 },
-        "SiteId": unknown_site.clone(),
-    });
 
     let rows = vec![
         NotFoundCase {
@@ -146,30 +147,6 @@ async fn every_not_found_refusal_carries_the_constant_message_and_identifies_the
             body: None,
             resource_id: unknown_network.clone(),
             resource_type: GLOBAL_NETWORK,
-        },
-        NotFoundCase {
-            case: "CreateSite in a global network that never existed",
-            method: "POST",
-            uri: format!("/global-networks/{unknown_network}/sites"),
-            body: Some(json!({ "Description": "orphan" })),
-            resource_id: unknown_network.clone(),
-            resource_type: GLOBAL_NETWORK,
-        },
-        NotFoundCase {
-            case: "CreateLink in a global network that never existed",
-            method: "POST",
-            uri: format!("/global-networks/{unknown_network}/links"),
-            body: Some(link_body.clone()),
-            resource_id: unknown_network.clone(),
-            resource_type: GLOBAL_NETWORK,
-        },
-        NotFoundCase {
-            case: "CreateLink on a site that never existed",
-            method: "POST",
-            uri: format!("/global-networks/{live_network}/links"),
-            body: Some(link_body),
-            resource_id: unknown_site.clone(),
-            resource_type: SITE,
         },
         NotFoundCase {
             case: "DeleteSite on a deleted site",

@@ -236,26 +236,53 @@ async fn a_batch_reports_each_statement_it_ran_in_order() {
                 case.label
             );
 
-            // Each statement's rows are fetched through its own `Id`.
-            let fetched = emulator
-                .ok(
-                    "GetStatementResult",
-                    &json!({"Id": format!("{id}:{position}")}),
-                )
-                .await;
-            assert_eq!(
-                fetched["Records"], records[index],
-                "case {}: statement {position} must return {}, got {fetched}",
-                case.label, records[index]
-            );
-            assert_eq!(
-                number(&fetched, "TotalNumRows"),
-                i64::try_from(records[index].as_array().map_or(0, Vec::len)).unwrap_or(0),
-                "case {}: statement {position} must report the rows it returned, got {fetched}",
-                case.label
-            );
+            // Each statement's rows are fetched through its own `Id` — and a
+            // statement that produced no result set has no result to fetch, so
+            // that read is refused rather than answered with an empty page.
+            if has_result_set {
+                let fetched = emulator
+                    .ok(
+                        "GetStatementResult",
+                        &json!({"Id": format!("{id}:{position}")}),
+                    )
+                    .await;
+                assert_eq!(
+                    fetched["Records"], records[index],
+                    "case {}: statement {position} must return {}, got {fetched}",
+                    case.label, records[index]
+                );
+                assert_eq!(
+                    number(&fetched, "TotalNumRows"),
+                    i64::try_from(records[index].as_array().map_or(0, Vec::len)).unwrap_or(0),
+                    "case {}: statement {position} must report the rows it returned, got \
+                     {fetched}",
+                    case.label
+                );
+            } else {
+                let (status, refused) = emulator
+                    .call(
+                        "GetStatementResult",
+                        &json!({"Id": format!("{id}:{position}")}),
+                    )
+                    .await;
+                assert_eq!(
+                    status, 404,
+                    "case {}: statement {position} produced no result set, so it has no result \
+                     to fetch, got {status} {refused}",
+                    case.label
+                );
+                assert_eq!(
+                    error_code(&refused),
+                    "ResourceNotFoundException",
+                    "case {}: statement {position}: expected ResourceNotFoundException, got \
+                     {refused}",
+                    case.label
+                );
+            }
 
-            // And it describes itself through the same `Id`.
+            // And it describes itself through the same `Id`, reporting the
+            // BATCH's `Id` as its own: the `:<n>` suffix is the address that
+            // reaches it, not the identity of the submission it belongs to.
             let described_sub = emulator
                 .ok(
                     "DescribeStatement",
@@ -267,6 +294,12 @@ async fn a_batch_reports_each_statement_it_ran_in_order() {
                 json!(case.sqls[index]),
                 "case {}: statement {position} is readable through its own Id, got \
                  {described_sub}",
+                case.label
+            );
+            assert_eq!(
+                described_sub["Id"],
+                json!(id),
+                "case {}: statement {position} reports the batch's Id, got {described_sub}",
                 case.label
             );
         }
@@ -949,10 +982,10 @@ async fn batch_execute_statement_refuses_a_request_it_cannot_run() {
         "a refused request must store no statement, got {page}"
     );
 
-    // The session-reuse form is a VALID request this slice cannot serve: the
-    // warehouse and database belong to the session, which is not modelled yet.
-    // It is answered with the scaffold's 501, not with a 400 that would blame
-    // the caller.
+    // The session-reuse form carries its connection on the SESSION, so a
+    // `SessionId` that names no live session names no warehouse and no
+    // database either: a missing resource, not a 400 that would blame the
+    // request.
     let (status, response) = emulator
         .call(
             "BatchExecuteStatement",
@@ -963,19 +996,18 @@ async fn batch_execute_statement_refuses_a_request_it_cannot_run() {
         )
         .await;
     assert_eq!(
-        status, 501,
-        "a session-only connection target is not implemented, not invalid: got {status} \
-         {response}"
+        status, 404,
+        "a SessionId naming no live session is a missing resource: got {status} {response}"
     );
     assert_eq!(
         error_code(&response),
-        "NotImplemented",
-        "expected NotImplemented, got {response}"
+        "ResourceNotFoundException",
+        "expected ResourceNotFoundException, got {response}"
     );
     let page = emulator.ok("ListStatements", &json!({})).await;
     assert!(
         list(&page, "Statements").is_empty(),
-        "an unimplemented form must store no statement, got {page}"
+        "a refused request must store no statement, got {page}"
     );
 }
 

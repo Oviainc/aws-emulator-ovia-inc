@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteRumMetricsDestination
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteRumMetricsDestination`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteRumMetricsDestination::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes ONE extended-metrics destination of the app monitor the request names, from
+//! this service's persisted state. A destination is identified by its `Destination` plus
+//! the Evidently experiment ARN that names it ([`crate::state::MetricDestinationKey`]) —
+//! the same identity `PutRumMetricsDestination` creates-or-updates — so this removes
+//! exactly the destination the pair names and leaves the monitor's other destinations in
+//! place. `ListRumMetricsDestinations` reads the same map, so it stops reporting the
+//! removed destination; a pair the monitor holds no record under is the modelled 404.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +150,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteRumMetricsDestination` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteRumMetricsDestinationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteRumMetricsDestination"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteRumMetricsDestinationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::NO_STORE.to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `DestinationArn` is modelled `length 0..2048`, so an empty ARN can reach here;
+        // it names no experiment, so it is the same input as an absent one — exactly as
+        // the put reads it, which is what keeps the two addressing one destination.
+        let destination_arn = input
+            .destination_arn
+            .as_deref()
+            .map(str::trim)
+            .filter(|arn| !arn.is_empty());
+
+        // The one pairing rule the model states in prose only:
+        // `DeleteRumMetricsDestinationRequest$DestinationArn` is "required if Destination
+        // is Evidently. If Destination is CloudWatch, do not use this parameter." The
+        // modelled constraints were refused before this handler ran.
+        if let Some(message) =
+            crate::state::metric_destination_choice_refusal(&input.destination, destination_arn)
+        {
+            return Err(
+                DeleteRumMetricsDestinationErrorModeled::ValidationException(
+                    ValidationException { message },
+                )
+                .into(),
+            );
+        }
+
+        // May this caller change THIS app monitor's metric destinations? Every operation
+        // in this service makes the decision on every call, from the caller's
+        // identity-based policies and the monitor's resource policy
+        // ([`crate::state::authorization`]); the monitor and the policy in force are read
+        // under a SHORT lock, because the decision needs no lock of this service's.
+        let (resource_arn, held_policy) = {
+            let store = state.lock();
+            let Some(record) = store.app_monitors.get(&input.app_monitor_name) else {
+                return Err(
+                    DeleteRumMetricsDestinationErrorModeled::ResourceNotFoundException(
+                        crate::state::app_monitor_not_found(&input.app_monitor_name),
+                    )
+                    .into(),
+                );
+            };
+            (record.arn.clone(), record.resource_policy_document())
+        };
+        if let Err(denial) = crate::state::authorization::authorize(
+            &*self.engine,
+            ctx,
+            crate::state::authorization::DELETE_RUM_METRICS_DESTINATION,
+            &resource_arn,
+            held_policy.as_deref(),
+            &[],
+        ) {
+            return Err(
+                DeleteRumMetricsDestinationErrorModeled::AccessDeniedException(
+                    crate::state::access_denied(&denial),
+                )
+                .into(),
+            );
+        }
+
+        let mut store = state.lock();
+        // Destinations are held ON the app monitor record, so a request naming no stored
+        // monitor has nothing to delete from.
+        let Some(monitor) = store.app_monitors.get_mut(&input.app_monitor_name) else {
+            return Err(
+                DeleteRumMetricsDestinationErrorModeled::ResourceNotFoundException(
+                    crate::state::app_monitor_not_found(&input.app_monitor_name),
+                )
+                .into(),
+            );
+        };
+
+        // The `(Destination, DestinationArn)` pair is a destination's identity, so this
+        // removes exactly the one the request names and leaves the monitor's other
+        // destinations in place. A pair the monitor holds no record under names no
+        // resource, which is the 404 this operation models rather than a silent success.
+        if monitor
+            .remove_metric_destination(&input.destination, destination_arn)
+            .is_none()
+        {
+            return Err(
+                DeleteRumMetricsDestinationErrorModeled::ResourceNotFoundException(
+                    crate::state::metric_destination_not_found(
+                        &input.app_monitor_name,
+                        &input.destination,
+                        destination_arn,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // Removed under the lock this call still holds, so a `ListRumMetricsDestinations`
+        // that follows no longer reports it. The response carries no members.
+        Ok(DeleteRumMetricsDestinationOutput {})
     }
 }

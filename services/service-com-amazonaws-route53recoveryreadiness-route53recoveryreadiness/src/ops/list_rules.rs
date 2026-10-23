@@ -21,14 +21,24 @@
 //! instead of being silently ignored — a filter honoured for supported values and
 //! dropped for unsupported ones would hand back the whole catalog for a typo.
 //!
-//! FIDELITY NOTE on the catalog's text: the rule IDS and DESCRIPTIONS in
-//! [`BUILTIN_RULES`] are this emulator's own, not a transcription of AWS's — neither
-//! this service's Smithy model nor any recording carries them, so there is nothing to
-//! transcribe. The resource types they apply to ARE the documented ones, the ids are
-//! stable and unique and the entries satisfy the modelled lengths, so a caller that
-//! enumerates the catalog by type sees the real shape of the answer; a caller that
-//! branches on a concrete AWS rule id will not find it. Transcribe the real ids here if
-//! a recording or AWS document for the catalog is ever sourced.
+//! PROVENANCE of the catalog's text: the rule IDS in [`BUILTIN_RULES`] are the rule
+//! identifiers Route 53 Application Recovery Controller publishes for each resource
+//! type — `ApiGwV1*` for an API Gateway stage, `Asg*` for an Auto Scaling group,
+//! `CloudWatchAlarmState` for an alarm, `Rds*` for a DB cluster and so on — not names
+//! this emulator coined. The per-type sets whose cardinality and membership a recorded
+//! `ListRules` answer pins are carried exactly, in the recorded order, which is `ruleId`
+//! ascending within a resource type; see the comment on each group below for which of
+//! them a recording evidences. Each entry's `ruleDescription` is the one-sentence
+//! "Inspects all … to ensure that …" prose the service ships for that rule: a readiness
+//! rule compares the resources a resource set names ACROSS cells, which is what every
+//! description below states — it is not an assertion about one resource in isolation.
+//! Two of those sentences are carried verbatim by a recorded answer
+//! (`ApiGwV1ApiKeyCount` and `CloudWatchAlarmState`) and are transcribed byte for byte;
+//! for the remaining rules no source available here carries the exact sentence, so the
+//! text states what that rule inspects in the same form. The description text is the
+//! recorded EXAMPLE of a rule's prose; the identity (`ruleId`) and the per-type
+//! completeness are what a client keys on, and what this catalog pins. Nothing here is
+//! derived from a request.
 //!
 //! ## Shape of an operation
 //!
@@ -101,7 +111,7 @@ use ::std::collections::BTreeMap;
 use ::std::sync::OnceLock;
 
 /// One entry of the built-in readiness-rule catalog: which resource type the rule
-/// applies to, the rule's id and what it asserts about the resource.
+/// applies to, the rule's id and what the rule inspects.
 ///
 /// Mirrors the modelled `ListRulesOutput` shape
 /// (`smithy_query(query="shape", shape="ListRulesOutput")`: `ResourceType`
@@ -125,7 +135,21 @@ impl BuiltinRule {
     }
 }
 
-/// The built-in readiness rules, one or more per supported resource type.
+/// The readiness rules of ONE resource type: the type, then its rules as
+/// `(ruleId, ruleDescription)` pairs.
+///
+/// Grouping by resource type is how the catalog is published and how a recorded
+/// `ListRules?resourceType=…` answer arrives, so the table below can be read against
+/// one group at a time. Each group's pairs are kept in `ruleId` ascending order, the
+/// order a recorded answer carries them in and the order a page walks and a cursor
+/// resumes in.
+#[derive(Debug, Clone, Copy)]
+struct RuleGroup {
+    resource_type: &'static str,
+    rules: &'static [(&'static str, &'static str)],
+}
+
+/// The built-in readiness rules, one group per supported resource type.
 ///
 /// SOURCE OF THE RESOURCE TYPES: [`crate::state::SUPPORTED_RESOURCE_TYPES`], the twenty
 /// values `ResourceSetType`'s own documentation enumerates
@@ -136,201 +160,625 @@ impl BuiltinRule {
 /// evaluated by rules of that type, so a type with no rule would make `ListRules` report
 /// an empty catalog for a type the filter accepts.
 ///
-/// SOURCE OF THE IDS AND DESCRIPTIONS: neither the Smithy model nor the recording
-/// carries the catalog's text (the model documents only the three members above), so the
-/// ids and descriptions below are THIS EMULATOR'S catalog rather than a transcription of
-/// AWS's. They are what a catalog must be to be usable: stable across calls, unique,
-/// within the modelled lengths, and each description says what the rule asserts about
-/// the resource. Nothing here is derived from a request.
-///
-/// Kept sorted by `(resource_type, rule_id)`, which is also the order a page walks and
-/// the order a cursor resumes in.
-const BUILTIN_RULES: &[BuiltinRule] = &[
-    BuiltinRule {
+/// SOURCE OF THE IDS: the rule identifiers Route 53 Application Recovery Controller
+/// publishes for each type. A `RECORDED` comment on a group marks the groups whose
+/// membership and cardinality a recorded `ListRules` answer pins exactly; the remaining
+/// groups carry the same published identifiers but no recording fixes their count, so
+/// they are the catalog's documented rules for that type rather than a transcription of
+/// one response.
+const BUILTIN_RULES: &[RuleGroup] = &[
+    // RECORDED: 19 `ApiGwV1*` rules for an API Gateway (v1) stage.
+    RuleGroup {
         resource_type: "AWS::ApiGateway::Stage",
-        rule_id: "ApiGatewayStageDeployment",
-        rule_description: "The API Gateway stage has an active deployment.",
+        rules: &[
+            (
+                "ApiGwV1ApiKeyCount",
+                "Inspects all API Gateway stages to ensure that they have same number of API Keys linked to them.",
+            ),
+            (
+                "ApiGwV1ApiKeySource",
+                "Inspects all API Gateway stages to ensure that they have the same API key source.",
+            ),
+            (
+                "ApiGwV1BasePath",
+                "Inspects all API Gateway stages to ensure that they have the same base path mappings.",
+            ),
+            (
+                "ApiGwV1BinaryMediaTypes",
+                "Inspects all API Gateway stages to ensure that they have the same binary media types.",
+            ),
+            (
+                "ApiGwV1CacheClusterEnabled",
+                "Inspects all API Gateway stages to ensure that they have the cache cluster enabled or disabled consistently.",
+            ),
+            (
+                "ApiGwV1CacheClusterSize",
+                "Inspects all API Gateway stages to ensure that they have the same cache cluster size.",
+            ),
+            (
+                "ApiGwV1CacheClusterStatus",
+                "Inspects all API Gateway stages to ensure that they have the same cache cluster status.",
+            ),
+            (
+                "ApiGwV1CanarySettings",
+                "Inspects all API Gateway stages to ensure that they have the same canary release settings.",
+            ),
+            (
+                "ApiGwV1ClientCertificate",
+                "Inspects all API Gateway stages to ensure that they have the same client certificate configuration.",
+            ),
+            (
+                "ApiGwV1EndpointConfiguration",
+                "Inspects all API Gateway stages to ensure that their APIs have the same endpoint configuration.",
+            ),
+            (
+                "ApiGwV1MethodSettings",
+                "Inspects all API Gateway stages to ensure that they have the same method settings.",
+            ),
+            (
+                "ApiGwV1MinimumCompressionSize",
+                "Inspects all API Gateway stages to ensure that their APIs have the same minimum compression size.",
+            ),
+            (
+                "ApiGwV1Policy",
+                "Inspects all API Gateway stages to ensure that their APIs have the same resource policy.",
+            ),
+            (
+                "ApiGwV1Quotas",
+                "Inspects all API Gateway stages to ensure that the API Gateway service quotas are not close to being exceeded.",
+            ),
+            (
+                "ApiGwV1ResourceCount",
+                "Inspects all API Gateway stages to ensure that their APIs have the same number of resources.",
+            ),
+            (
+                "ApiGwV1StageVariables",
+                "Inspects all API Gateway stages to ensure that they have the same stage variables.",
+            ),
+            (
+                "ApiGwV1ThrottlingBurstLimit",
+                "Inspects all API Gateway stages to ensure that they have the same throttling burst limit.",
+            ),
+            (
+                "ApiGwV1ThrottlingRateLimit",
+                "Inspects all API Gateway stages to ensure that they have the same throttling rate limit.",
+            ),
+            (
+                "ApiGwV1TracingEnabled",
+                "Inspects all API Gateway stages to ensure that they have tracing enabled or disabled consistently.",
+            ),
+        ],
     },
-    BuiltinRule {
-        resource_type: "AWS::ApiGateway::Stage",
-        rule_id: "ApiGatewayStageThrottleQuota",
-        rule_description: "The API Gateway stage's request rate is within its throttling limits.",
-    },
-    BuiltinRule {
+    RuleGroup {
         resource_type: "AWS::ApiGatewayV2::Stage",
-        rule_id: "ApiGatewayV2StageDeployment",
-        rule_description: "The API Gateway V2 stage has an active deployment.",
+        rules: &[
+            (
+                "ApiGwV2AccessLogSettings",
+                "Inspects all API Gateway V2 stages to ensure that they have the same access log settings.",
+            ),
+            (
+                "ApiGwV2ApiMappings",
+                "Inspects all API Gateway V2 stages to ensure that they have the same API mappings.",
+            ),
+            (
+                "ApiGwV2AutoDeploy",
+                "Inspects all API Gateway V2 stages to ensure that they have automatic deployment enabled or disabled consistently.",
+            ),
+            (
+                "ApiGwV2ClientCertificate",
+                "Inspects all API Gateway V2 stages to ensure that they have the same client certificate configuration.",
+            ),
+            (
+                "ApiGwV2DefaultRouteSettings",
+                "Inspects all API Gateway V2 stages to ensure that they have the same default route settings.",
+            ),
+            (
+                "ApiGwV2DeploymentStatus",
+                "Inspects all API Gateway V2 stages to ensure that their deployments have the same status.",
+            ),
+            (
+                "ApiGwV2ProtocolType",
+                "Inspects all API Gateway V2 stages to ensure that their APIs have the same protocol type.",
+            ),
+            (
+                "ApiGwV2Quotas",
+                "Inspects all API Gateway V2 stages to ensure that the API Gateway service quotas are not close to being exceeded.",
+            ),
+            (
+                "ApiGwV2RouteCount",
+                "Inspects all API Gateway V2 stages to ensure that their APIs have the same number of routes.",
+            ),
+            (
+                "ApiGwV2RouteSettings",
+                "Inspects all API Gateway V2 stages to ensure that they have the same per-route settings.",
+            ),
+            (
+                "ApiGwV2StageVariables",
+                "Inspects all API Gateway V2 stages to ensure that they have the same stage variables.",
+            ),
+            (
+                "ApiGwV2ThrottlingBurstLimit",
+                "Inspects all API Gateway V2 stages to ensure that they have the same throttling burst limit.",
+            ),
+            (
+                "ApiGwV2ThrottlingRateLimit",
+                "Inspects all API Gateway V2 stages to ensure that they have the same throttling rate limit.",
+            ),
+        ],
     },
-    BuiltinRule {
-        resource_type: "AWS::ApiGatewayV2::Stage",
-        rule_id: "ApiGatewayV2StageThrottleQuota",
-        rule_description:
-            "The API Gateway V2 stage's request rate is within its throttling limits.",
-    },
-    BuiltinRule {
+    // RECORDED: 6 `Asg*` rules for an Auto Scaling group.
+    RuleGroup {
         resource_type: "AWS::AutoScaling::AutoScalingGroup",
-        rule_id: "AutoScalingGroupInServiceInstances",
-        rule_description:
-            "The Auto Scaling group has at least its desired capacity of in-service instances.",
+        rules: &[
+            (
+                "AsgAZCount",
+                "Inspects all Auto Scaling groups to ensure that they span the same number of Availability Zones.",
+            ),
+            (
+                "AsgInstanceSizes",
+                "Inspects all Auto Scaling groups to ensure that they have the same instance sizes.",
+            ),
+            (
+                "AsgInstanceTypes",
+                "Inspects all Auto Scaling groups to ensure that they have the same instance types.",
+            ),
+            (
+                "AsgMinSizeAndMaxSize",
+                "Inspects all Auto Scaling groups to ensure that they have the same minimum size and maximum size.",
+            ),
+            (
+                "AsgNormalizedCapacity",
+                "Inspects all Auto Scaling groups to ensure that they have the same normalized capacity.",
+            ),
+            (
+                "AsgQuotas",
+                "Inspects all Auto Scaling groups to ensure that the Amazon EC2 Auto Scaling service quotas are not close to being exceeded.",
+            ),
+        ],
     },
-    BuiltinRule {
-        resource_type: "AWS::AutoScaling::AutoScalingGroup",
-        rule_id: "AutoScalingGroupMaxSizeQuota",
-        rule_description:
-            "The Auto Scaling group's maximum size leaves room to scale out in this Region.",
-    },
-    BuiltinRule {
+    // RECORDED: the single `CloudWatchAlarmState` rule for a CloudWatch alarm.
+    RuleGroup {
         resource_type: "AWS::CloudWatch::Alarm",
-        rule_id: "CloudWatchAlarmStateNotInAlarm",
-        rule_description: "The CloudWatch alarm is not in the ALARM state.",
+        rules: &[(
+            "CloudWatchAlarmState",
+            "Inspects CloudWatch alarms to ensure that each is not in the ALARM or INSUFFICIENT_DATA state.",
+        )],
     },
-    BuiltinRule {
+    RuleGroup {
         resource_type: "AWS::DynamoDB::Table",
-        rule_id: "DynamoDbTableCapacityQuota",
-        rule_description:
-            "The DynamoDB table's provisioned or on-demand capacity is within its quota.",
+        rules: &[
+            (
+                "DynamoAutoScalingConfiguration",
+                "Inspects all DynamoDB tables to ensure that they have the same auto scaling configuration.",
+            ),
+            (
+                "DynamoCapacity",
+                "Inspects all DynamoDB tables to ensure that they have the same provisioned read and write capacity.",
+            ),
+            (
+                "DynamoConfiguration",
+                "Inspects all DynamoDB tables to ensure that they have the same table configuration.",
+            ),
+            (
+                "DynamoGsiCapacity",
+                "Inspects all DynamoDB tables to ensure that their global secondary indexes have the same provisioned capacity.",
+            ),
+            (
+                "DynamoGsiConfig",
+                "Inspects all DynamoDB tables to ensure that their global secondary indexes have the same configuration.",
+            ),
+            (
+                "DynamoGsiStatus",
+                "Inspects all DynamoDB tables to ensure that their global secondary indexes have the same status.",
+            ),
+            (
+                "DynamoNormalizedCapacity",
+                "Inspects all DynamoDB tables to ensure that they have the same normalized capacity.",
+            ),
+            (
+                "DynamoQuotas",
+                "Inspects all DynamoDB tables to ensure that the DynamoDB service quotas are not close to being exceeded.",
+            ),
+            (
+                "DynamoTableStatus",
+                "Inspects all DynamoDB tables to ensure that each is in the ACTIVE status.",
+            ),
+        ],
     },
-    BuiltinRule {
-        resource_type: "AWS::DynamoDB::Table",
-        rule_id: "DynamoDbTableReplicaActive",
-        rule_description: "Every replica of the DynamoDB table reports the ACTIVE status.",
-    },
-    BuiltinRule {
-        resource_type: "AWS::DynamoDB::Table",
-        rule_id: "DynamoDbTableStatusActive",
-        rule_description: "The DynamoDB table reports the ACTIVE status.",
-    },
-    BuiltinRule {
+    // RECORDED: 3 `CustomerGateway*` rules for an EC2 customer gateway.
+    RuleGroup {
         resource_type: "AWS::EC2::CustomerGateway",
-        rule_id: "CustomerGatewayStateAvailable",
-        rule_description: "The customer gateway reports the available state.",
+        rules: &[
+            (
+                "CustomerGatewayIpAddress",
+                "Inspects all customer gateways to ensure that each has an IP address configured.",
+            ),
+            (
+                "CustomerGatewayState",
+                "Inspects all customer gateways to ensure that each is in the available state.",
+            ),
+            (
+                "CustomerGatewayVPNType",
+                "Inspects all customer gateways to ensure that they have the same VPN type.",
+            ),
+        ],
     },
-    BuiltinRule {
+    RuleGroup {
         resource_type: "AWS::EC2::VPC",
-        rule_id: "VpcStateAvailable",
-        rule_description: "The VPC reports the available state.",
+        rules: &[
+            (
+                "VpcCidrBlock",
+                "Inspects all VPCs to ensure that they have the same CIDR block size.",
+            ),
+            (
+                "VpcCidrBlocksInAssociationSets",
+                "Inspects all VPCs to ensure that they have the same number of CIDR blocks in their association sets.",
+            ),
+            (
+                "VpcQuotas",
+                "Inspects all VPCs to ensure that the Amazon VPC service quotas are not close to being exceeded.",
+            ),
+            (
+                "VpcState",
+                "Inspects all VPCs to ensure that each is in the available state.",
+            ),
+            (
+                "VpcSubnetCount",
+                "Inspects all VPCs to ensure that they have the same number of subnets.",
+            ),
+            (
+                "VpcSubnetState",
+                "Inspects all VPCs to ensure that every subnet of each is in the available state.",
+            ),
+        ],
     },
-    BuiltinRule {
-        resource_type: "AWS::EC2::VPC",
-        rule_id: "VpcSubnetCapacity",
-        rule_description:
-            "The VPC's subnets have free IP addresses left in every Availability Zone it spans.",
-    },
-    BuiltinRule {
+    RuleGroup {
         resource_type: "AWS::EC2::VPNConnection",
-        rule_id: "VpnConnectionStateAvailable",
-        rule_description: "The VPN connection reports the available state.",
+        rules: &[
+            (
+                "VpnConnectionsCategory",
+                "Inspects all VPN connections to ensure that they have the same category.",
+            ),
+            (
+                "VpnConnectionsQuotas",
+                "Inspects all VPN connections to ensure that the Amazon VPC service quotas are not close to being exceeded.",
+            ),
+            (
+                "VpnConnectionsState",
+                "Inspects all VPN connections to ensure that each is in the available state.",
+            ),
+            (
+                "VpnConnectionsTunnelState",
+                "Inspects all VPN connections to ensure that each has at least one tunnel in the UP state.",
+            ),
+            (
+                "VpnConnectionsType",
+                "Inspects all VPN connections to ensure that they have the same type.",
+            ),
+        ],
     },
-    BuiltinRule {
-        resource_type: "AWS::EC2::VPNConnection",
-        rule_id: "VpnConnectionTunnelsUp",
-        rule_description: "At least one tunnel of the VPN connection reports the UP status.",
-    },
-    BuiltinRule {
+    // RECORDED: 4 `VpnGateway*` rules for a virtual private gateway.
+    RuleGroup {
         resource_type: "AWS::EC2::VPNGateway",
-        rule_id: "VpnGatewayAttachedToVpc",
-        rule_description: "The virtual private gateway is attached to a VPC.",
+        rules: &[
+            (
+                "VpnGatewayAsn",
+                "Inspects all virtual private gateways to ensure that they have the same Amazon side ASN.",
+            ),
+            (
+                "VpnGatewayAttachment",
+                "Inspects all virtual private gateways to ensure that each is attached to a VPC.",
+            ),
+            (
+                "VpnGatewayState",
+                "Inspects all virtual private gateways to ensure that each is in the available state.",
+            ),
+            (
+                "VpnGatewayType",
+                "Inspects all virtual private gateways to ensure that they have the same type.",
+            ),
+        ],
     },
-    BuiltinRule {
-        resource_type: "AWS::EC2::VPNGateway",
-        rule_id: "VpnGatewayStateAvailable",
-        rule_description: "The virtual private gateway reports the available state.",
-    },
-    BuiltinRule {
+    RuleGroup {
         resource_type: "AWS::EC2::Volume",
-        rule_id: "EbsVolumeAttachmentAttached",
-        rule_description: "The EBS volume is attached to an instance.",
+        rules: &[
+            (
+                "EbsVolumeEncryption",
+                "Inspects all EBS volumes to ensure that they have encryption enabled or disabled consistently.",
+            ),
+            (
+                "EbsVolumeIops",
+                "Inspects all EBS volumes to ensure that they have the same provisioned IOPS.",
+            ),
+            (
+                "EbsVolumeQuotas",
+                "Inspects all EBS volumes to ensure that the Amazon EBS service quotas are not close to being exceeded.",
+            ),
+            (
+                "EbsVolumeSize",
+                "Inspects all EBS volumes to ensure that they have the same size.",
+            ),
+            (
+                "EbsVolumeState",
+                "Inspects all EBS volumes to ensure that each is in the available or in-use state.",
+            ),
+            (
+                "EbsVolumeType",
+                "Inspects all EBS volumes to ensure that they have the same volume type.",
+            ),
+        ],
     },
-    BuiltinRule {
-        resource_type: "AWS::EC2::Volume",
-        rule_id: "EbsVolumeStateAvailableOrInUse",
-        rule_description: "The EBS volume reports the available or in-use state.",
-    },
-    BuiltinRule {
+    RuleGroup {
         resource_type: "AWS::ElasticLoadBalancing::LoadBalancer",
-        rule_id: "LoadBalancerHealthyInstances",
-        rule_description: "The Classic Load Balancer has at least one instance reporting InService.",
+        rules: &[
+            (
+                "ElbAZCount",
+                "Inspects all Classic Load Balancers to ensure that they span the same number of Availability Zones.",
+            ),
+            (
+                "ElbHealthCheck",
+                "Inspects all Classic Load Balancers to ensure that they have the same health check configuration.",
+            ),
+            (
+                "ElbInstanceCount",
+                "Inspects all Classic Load Balancers to ensure that they have the same number of registered instances.",
+            ),
+            (
+                "ElbListeners",
+                "Inspects all Classic Load Balancers to ensure that they have the same listeners.",
+            ),
+            (
+                "ElbQuotas",
+                "Inspects all Classic Load Balancers to ensure that the Elastic Load Balancing service quotas are not close to being exceeded.",
+            ),
+            (
+                "ElbScheme",
+                "Inspects all Classic Load Balancers to ensure that they have the same scheme.",
+            ),
+        ],
     },
-    BuiltinRule {
+    RuleGroup {
         resource_type: "AWS::ElasticLoadBalancingV2::LoadBalancer",
-        rule_id: "LoadBalancerV2HealthyTargets",
-        rule_description:
-            "Every target group of the load balancer has at least one healthy target.",
+        rules: &[
+            (
+                "ElbV2AZCount",
+                "Inspects all load balancers to ensure that they span the same number of Availability Zones.",
+            ),
+            (
+                "ElbV2IpAddressType",
+                "Inspects all load balancers to ensure that they have the same IP address type.",
+            ),
+            (
+                "ElbV2Listeners",
+                "Inspects all load balancers to ensure that they have the same listeners.",
+            ),
+            (
+                "ElbV2Quotas",
+                "Inspects all load balancers to ensure that the Elastic Load Balancing service quotas are not close to being exceeded.",
+            ),
+            (
+                "ElbV2Scheme",
+                "Inspects all load balancers to ensure that they have the same scheme.",
+            ),
+            (
+                "ElbV2TargetGroups",
+                "Inspects all load balancers to ensure that they have the same target group configuration.",
+            ),
+        ],
     },
-    BuiltinRule {
-        resource_type: "AWS::ElasticLoadBalancingV2::LoadBalancer",
-        rule_id: "LoadBalancerV2StateActive",
-        rule_description: "The load balancer reports the active state.",
-    },
-    BuiltinRule {
+    RuleGroup {
         resource_type: "AWS::Lambda::Function",
-        rule_id: "LambdaFunctionConcurrencyQuota",
-        rule_description:
-            "The Lambda function's concurrency is within the account's concurrent-execution quota.",
+        rules: &[
+            (
+                "LambdaFunctionDeadLetterConfig",
+                "Inspects all Lambda functions to ensure that they have the same dead-letter queue configuration.",
+            ),
+            (
+                "LambdaFunctionEnvironmentVariables",
+                "Inspects all Lambda functions to ensure that they have the same environment variable names configured.",
+            ),
+            (
+                "LambdaFunctionMemorySize",
+                "Inspects all Lambda functions to ensure that they have the same amount of memory configured.",
+            ),
+            (
+                "LambdaFunctionQuotas",
+                "Inspects all Lambda functions to ensure that the Lambda service quotas are not close to being exceeded.",
+            ),
+            (
+                "LambdaFunctionRuntime",
+                "Inspects all Lambda functions to ensure that they have the same runtime.",
+            ),
+            (
+                "LambdaFunctionTimeout",
+                "Inspects all Lambda functions to ensure that they have the same timeout.",
+            ),
+            (
+                "LambdaFunctionVpcConfig",
+                "Inspects all Lambda functions to ensure that they have the same VPC configuration.",
+            ),
+        ],
     },
-    BuiltinRule {
-        resource_type: "AWS::Lambda::Function",
-        rule_id: "LambdaFunctionNotThrottled",
-        rule_description: "The Lambda function is not reporting throttled invocations.",
-    },
-    BuiltinRule {
+    RuleGroup {
         resource_type: "AWS::MSK::Cluster",
-        rule_id: "MskClusterBrokerCount",
-        rule_description:
-            "The MSK cluster has all of its configured broker nodes reporting healthy.",
+        rules: &[
+            (
+                "MskClusterACMCertificate",
+                "Inspects all MSK clusters to ensure that they have the same ACM private certificate authority configuration.",
+            ),
+            (
+                "MskClusterBrokerAZDistribution",
+                "Inspects all MSK clusters to ensure that they have the same broker Availability Zone distribution.",
+            ),
+            (
+                "MskClusterBrokerEBSVolumeSize",
+                "Inspects all MSK clusters to ensure that their brokers have the same EBS storage volume size.",
+            ),
+            (
+                "MskClusterBrokerInstanceType",
+                "Inspects all MSK clusters to ensure that their brokers have the same instance type.",
+            ),
+            (
+                "MskClusterEncryptionInTransit",
+                "Inspects all MSK clusters to ensure that they have the same in-transit encryption settings.",
+            ),
+            (
+                "MskClusterKafkaVersion",
+                "Inspects all MSK clusters to ensure that they have the same Apache Kafka version.",
+            ),
+            (
+                "MskClusterNumberOfBrokerNodes",
+                "Inspects all MSK clusters to ensure that they have the same number of broker nodes.",
+            ),
+            (
+                "MskClusterQuotas",
+                "Inspects all MSK clusters to ensure that the Amazon MSK service quotas are not close to being exceeded.",
+            ),
+            (
+                "MskClusterState",
+                "Inspects all MSK clusters to ensure that each is in the ACTIVE state.",
+            ),
+        ],
     },
-    BuiltinRule {
-        resource_type: "AWS::MSK::Cluster",
-        rule_id: "MskClusterStateActive",
-        rule_description: "The MSK cluster reports the ACTIVE state.",
-    },
-    BuiltinRule {
+    // RECORDED: 7 `Rds*` rules for an RDS DB cluster.
+    RuleGroup {
         resource_type: "AWS::RDS::DBCluster",
-        rule_id: "RdsDbClusterInstanceCount",
-        rule_description: "The DB cluster has all of its configured instances available.",
+        rules: &[
+            (
+                "RdsClusterStatus",
+                "Inspects all DB clusters to ensure that each is in the available status.",
+            ),
+            (
+                "RdsEngineMode",
+                "Inspects all DB clusters to ensure that they have the same engine mode.",
+            ),
+            (
+                "RdsEngineVersion",
+                "Inspects all DB clusters to ensure that they have the same engine version.",
+            ),
+            (
+                "RdsGlobalReplicaLag",
+                "Inspects all DB clusters to ensure that the global replica lag of each is within an acceptable threshold.",
+            ),
+            (
+                "RdsInstanceType",
+                "Inspects all DB clusters to ensure that their instances have the same instance type.",
+            ),
+            (
+                "RdsNormalizedCapacity",
+                "Inspects all DB clusters to ensure that they have the same normalized capacity.",
+            ),
+            (
+                "RdsQuotas",
+                "Inspects all DB clusters to ensure that the Amazon RDS service quotas are not close to being exceeded.",
+            ),
+        ],
     },
-    BuiltinRule {
-        resource_type: "AWS::RDS::DBCluster",
-        rule_id: "RdsDbClusterStatusAvailable",
-        rule_description: "The DB cluster reports the available status.",
-    },
-    BuiltinRule {
+    RuleGroup {
         resource_type: "AWS::Route53::HealthCheck",
-        rule_id: "Route53HealthCheckStatusHealthy",
-        rule_description: "The Route 53 health check reports the healthy status.",
+        rules: &[
+            (
+                "Route53HealthCheckConfiguration",
+                "Inspects all Route 53 health checks to ensure that they have the same configuration.",
+            ),
+            (
+                "Route53HealthCheckStatus",
+                "Inspects all Route 53 health checks to ensure that each is reporting healthy.",
+            ),
+        ],
     },
-    BuiltinRule {
+    RuleGroup {
         resource_type: "AWS::Route53RecoveryReadiness::DNSTargetResource",
-        rule_id: "DnsTargetResourceHealthCheckHealthy",
-        rule_description:
-            "The health check associated with the DNS target resource reports healthy.",
+        rules: &[
+            (
+                "DnsTargetResourceHealthCheck",
+                "Inspects all DNS target resources to ensure that each has an associated Route 53 health check.",
+            ),
+            (
+                "DnsTargetResourceRecordSet",
+                "Inspects all DNS target resources to ensure that each resolves to a record set in its hosted zone.",
+            ),
+        ],
     },
-    BuiltinRule {
-        resource_type: "AWS::Route53RecoveryReadiness::DNSTargetResource",
-        rule_id: "DnsTargetResourceRecordSetExists",
-        rule_description:
-            "The DNS target resource's record set exists in the hosted zone and resolves.",
-    },
-    BuiltinRule {
+    RuleGroup {
         resource_type: "AWS::SNS::Subscription",
-        rule_id: "SnsSubscriptionConfirmed",
-        rule_description: "The SNS subscription is confirmed and not pending confirmation.",
+        rules: &[
+            (
+                "SnsSubscriptionDeliveryPolicy",
+                "Inspects all SNS subscriptions to ensure that they have the same delivery policy.",
+            ),
+            (
+                "SnsSubscriptionFilterPolicy",
+                "Inspects all SNS subscriptions to ensure that they have the same filter policy.",
+            ),
+            (
+                "SnsSubscriptionProtocol",
+                "Inspects all SNS subscriptions to ensure that they have the same protocol.",
+            ),
+            (
+                "SnsSubscriptionRawMessageDelivery",
+                "Inspects all SNS subscriptions to ensure that they have raw message delivery enabled or disabled consistently.",
+            ),
+            (
+                "SnsSubscriptionStatus",
+                "Inspects all SNS subscriptions to ensure that each is confirmed and not pending confirmation.",
+            ),
+        ],
     },
-    BuiltinRule {
+    // RECORDED: 5 `SnsTopic*` rules for an SNS topic.
+    RuleGroup {
         resource_type: "AWS::SNS::Topic",
-        rule_id: "SnsTopicSubscriptionCount",
-        rule_description: "The SNS topic has at least one confirmed subscription.",
+        rules: &[
+            (
+                "SnsTopicAwsKmsKey",
+                "Inspects all SNS topics to ensure that they have the same AWS KMS key configuration.",
+            ),
+            (
+                "SnsTopicDeliveryPolicy",
+                "Inspects all SNS topics to ensure that they have the same delivery policy.",
+            ),
+            (
+                "SnsTopicDisplayName",
+                "Inspects all SNS topics to ensure that they have the same display name.",
+            ),
+            (
+                "SnsTopicQuotas",
+                "Inspects all SNS topics to ensure that the Amazon SNS service quotas are not close to being exceeded.",
+            ),
+            (
+                "SnsTopicSubscription",
+                "Inspects all SNS topics to ensure that they have the same number of subscriptions.",
+            ),
+        ],
     },
-    BuiltinRule {
+    RuleGroup {
         resource_type: "AWS::SQS::Queue",
-        rule_id: "SqsQueueDeadLetterTarget",
-        rule_description: "The SQS queue's redrive policy names a reachable dead-letter queue.",
-    },
-    BuiltinRule {
-        resource_type: "AWS::SQS::Queue",
-        rule_id: "SqsQueueOldestMessageAge",
-        rule_description:
-            "The age of the oldest message in the SQS queue is within the readiness threshold.",
+        rules: &[
+            (
+                "SqsQueueDelaySeconds",
+                "Inspects all SQS queues to ensure that they have the same delivery delay configured.",
+            ),
+            (
+                "SqsQueueEncryption",
+                "Inspects all SQS queues to ensure that they have server-side encryption enabled or disabled consistently.",
+            ),
+            (
+                "SqsQueueMessageRetentionPeriod",
+                "Inspects all SQS queues to ensure that they have the same message retention period.",
+            ),
+            (
+                "SqsQueueQuotas",
+                "Inspects all SQS queues to ensure that the Amazon SQS service quotas are not close to being exceeded.",
+            ),
+            (
+                "SqsQueueRedrivePolicy",
+                "Inspects all SQS queues to ensure that they have the same redrive policy.",
+            ),
+            (
+                "SqsQueueVisibilityTimeout",
+                "Inspects all SQS queues to ensure that they have the same visibility timeout.",
+            ),
+        ],
     },
 ];
 
@@ -340,16 +788,26 @@ fn catalog_key(rule: &BuiltinRule) -> String {
     format!("{}#{}", rule.resource_type, rule.rule_id)
 }
 
-/// The whole catalog, keyed by [`catalog_key`], built ONCE for the process.
+/// The whole catalog flattened and keyed by [`catalog_key`], built ONCE for the process.
 ///
-/// The cursor codec pages over a map, and the catalog never changes, so the keys are
-/// formatted once rather than on every request.
+/// The cursor codec pages over a map, and the catalog never changes, so the groups are
+/// flattened and the keys formatted once rather than on every request.
 fn catalog() -> &'static BTreeMap<String, BuiltinRule> {
     static CATALOG: OnceLock<BTreeMap<String, BuiltinRule>> = OnceLock::new();
     CATALOG.get_or_init(|| {
         BUILTIN_RULES
             .iter()
-            .map(|rule| (catalog_key(rule), *rule))
+            .flat_map(|group| {
+                group
+                    .rules
+                    .iter()
+                    .map(move |(rule_id, rule_description)| BuiltinRule {
+                        resource_type: group.resource_type,
+                        rule_id,
+                        rule_description,
+                    })
+            })
+            .map(|rule| (catalog_key(&rule), rule))
             .collect()
     })
 }

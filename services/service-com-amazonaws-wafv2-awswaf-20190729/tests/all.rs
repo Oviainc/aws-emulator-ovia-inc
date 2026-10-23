@@ -13,6 +13,10 @@
 // points it into `tests/all/`.
 #[path = "all/exception_messages.rs"]
 mod exception_messages;
+#[path = "all/ip_set_mutations.rs"]
+mod ip_set_mutations;
+#[path = "all/managed_rule_groups.rs"]
+mod managed_rule_groups;
 #[path = "all/parameter_validation.rs"]
 mod parameter_validation;
 #[path = "all/response_members.rs"]

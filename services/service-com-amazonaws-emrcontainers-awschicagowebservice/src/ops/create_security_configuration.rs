@@ -210,6 +210,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             container_provider: input.container_provider,
             tags: input.tags.unwrap_or_default(),
             client_token: input.client_token.clone(),
+            // The principal this request authenticated as, recorded now so every later
+            // read of the configuration attributes it to the identity that created it.
+            created_by: crate::state::caller_identity_arn(),
         };
         state.insert_security_configuration(record);
 

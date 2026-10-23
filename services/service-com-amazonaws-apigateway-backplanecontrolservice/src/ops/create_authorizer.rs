@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAuthorizer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAuthorizer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAuthorizer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: adds an `Authorizer` to an existing `RestApi`, defaulting the cached
+//! result TTL the way the member documents it, and answers from the stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -166,6 +159,156 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    AuthorizerEntry, DEFAULT_AUTHORIZER_RESULT_TTL_SECONDS, MAX_AUTHORIZER_RESULT_TTL_SECONDS,
+    MIN_AUTHORIZER_RESULT_TTL_SECONDS,
+};
+
+/// The `Authorizer` body for a stored authorizer — the one place this crate renders that
+/// shape, so `CreateAuthorizer` and `GetAuthorizer` cannot report a record differently.
+///
+/// A list the record does not carry is reported absent rather than empty: `providerARNs`
+/// "For a TOKEN or REQUEST authorizer, this is not defined", and that is what an absent
+/// member says on the wire.
+pub fn authorizer_body(entry: &AuthorizerEntry) -> CreateAuthorizerOutput {
+    CreateAuthorizerOutput {
+        id: Some(entry.id.clone()),
+        name: Some(entry.name.clone()),
+        r#type: Some(entry.r#type.clone()),
+        provider_ar_ns: (!entry.provider_arns.is_empty()).then(|| entry.provider_arns.clone()),
+        auth_type: entry.auth_type.clone(),
+        authorizer_uri: entry.authorizer_uri.clone(),
+        authorizer_credentials: entry.authorizer_credentials.clone(),
+        identity_source: entry.identity_source.clone(),
+        identity_validation_expression: entry.identity_validation_expression.clone(),
+        authorizer_result_ttl_in_seconds: Some(entry.authorizer_result_ttl_in_seconds),
+    }
+}
+
+/// Whether a caller set a string member to something that names anything: an absent
+/// member and an empty one are the same claim, that the request supplied no value.
+fn supplied(value: &Option<String>) -> bool {
+    value.as_ref().is_some_and(|value| !value.is_empty())
+}
+
+/// Refuse a request whose caller-sized members would grow the store past a bound.
+///
+/// Called BEFORE the store lock is taken, so an over-sized request never reaches the
+/// records at all.
+fn bound_input(input: &CreateAuthorizerInput) -> Result<(), String> {
+    use crate::state::{bound_chars, bound_entries, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS};
+
+    bound_chars("name", &input.name, MAX_STRING_CHARS)?;
+    for (member, value) in [
+        ("authType", &input.auth_type),
+        ("authorizerUri", &input.authorizer_uri),
+        ("authorizerCredentials", &input.authorizer_credentials),
+        ("identitySource", &input.identity_source),
+        (
+            "identityValidationExpression",
+            &input.identity_validation_expression,
+        ),
+    ] {
+        if let Some(value) = value {
+            bound_chars(member, value, MAX_STRING_CHARS)?;
+        }
+    }
+    if let Some(arns) = &input.provider_ar_ns {
+        bound_entries("providerARNs", arns.len(), MAX_COLLECTION_ENTRIES)?;
+        for arn in arns {
+            bound_chars("a providerARNs entry", arn, MAX_STRING_CHARS)?;
+        }
+    }
+    Ok(())
+}
+
+/// The cached-result TTL an authorizer is stored with, or the reason the requested one is
+/// refused.
+///
+/// From `authorizerResultTtlInSeconds`'s own documentation: "If this field is not set,
+/// the default value is 300", "If it equals 0, authorization caching is disabled" and
+/// "The maximum value is 3600, or 1 hour" — so the member takes a value in `0..=3600`
+/// and the service picks 300 for a request that sets none. Shared so every writer of
+/// that member applies one rule.
+pub fn authorizer_result_ttl(requested: Option<i32>) -> Result<i32, String> {
+    let ttl = requested.unwrap_or(DEFAULT_AUTHORIZER_RESULT_TTL_SECONDS);
+    if !(MIN_AUTHORIZER_RESULT_TTL_SECONDS..=MAX_AUTHORIZER_RESULT_TTL_SECONDS).contains(&ttl) {
+        return Err(format!(
+            "authorizerResultTtlInSeconds must be between \
+             {MIN_AUTHORIZER_RESULT_TTL_SECONDS} and {MAX_AUTHORIZER_RESULT_TTL_SECONDS}, \
+             got {ttl}"
+        ));
+    }
+    Ok(ttl)
+}
+
+/// The `AuthorizerType` value for a Lambda authorizer taking a single token from a
+/// request header; see [`AUTHORIZER_TYPE_VALUES`], the model's own catalog.
+pub const AUTHORIZER_TYPE_TOKEN: &str = "TOKEN";
+
+/// The `AuthorizerType` value for a Lambda authorizer taking the whole request.
+pub const AUTHORIZER_TYPE_REQUEST: &str = "REQUEST";
+
+/// The `AuthorizerType` value for an Amazon Cognito user pool authorizer.
+pub const AUTHORIZER_TYPE_COGNITO_USER_POOLS: &str = "COGNITO_USER_POOLS";
+
+/// Refuse an authorizer whose configuration its own `type` does not admit.
+///
+/// Every clause is the member's own documentation, which makes a member required for
+/// some types and undefined for others:
+///
+/// * `authorizerUri` — "For TOKEN or REQUEST authorizers, this must be a well-formed
+///   Lambda function URI": the Lambda to invoke, so those two types cannot authorize
+///   without it.
+/// * `identitySource` — "For a TOKEN or COGNITO_USER_POOLS authorizer, this is required
+///   …. For the REQUEST authorizer, this is required when authorization caching is
+///   enabled", and caching is enabled exactly when the stored TTL is above zero.
+/// * `providerARNs` — "A list of the Amazon Cognito user pool ARNs for the
+///   COGNITO_USER_POOLS authorizer": the pools whose tokens are accepted, so that type
+///   cannot authorize without at least one.
+///
+/// `ttl` is the STORED TTL from [`authorizer_result_ttl`], not the requested one, because
+/// a request that sets no TTL still enables caching at the default.
+fn require_members_of_type(input: &CreateAuthorizerInput, ttl: i32) -> Result<(), String> {
+    let authorizer_type = input.r#type.as_str();
+    if matches!(
+        authorizer_type,
+        AUTHORIZER_TYPE_TOKEN | AUTHORIZER_TYPE_REQUEST
+    ) && !supplied(&input.authorizer_uri)
+    {
+        return Err(format!(
+            "authorizerUri is required for an authorizer of type {authorizer_type}"
+        ));
+    }
+    let caching_enabled = ttl > MIN_AUTHORIZER_RESULT_TTL_SECONDS;
+    let identity_source_required = match authorizer_type {
+        AUTHORIZER_TYPE_TOKEN | AUTHORIZER_TYPE_COGNITO_USER_POOLS => true,
+        AUTHORIZER_TYPE_REQUEST => caching_enabled,
+        _ => false,
+    };
+    if identity_source_required && !supplied(&input.identity_source) {
+        return Err(if authorizer_type == AUTHORIZER_TYPE_REQUEST {
+            format!(
+                "identitySource is required for an authorizer of type {authorizer_type} \
+                 when authorization caching is enabled"
+            )
+        } else {
+            format!("identitySource is required for an authorizer of type {authorizer_type}")
+        });
+    }
+    if authorizer_type == AUTHORIZER_TYPE_COGNITO_USER_POOLS
+        && input
+            .provider_ar_ns
+            .as_ref()
+            .is_none_or(|arns| arns.is_empty())
+    {
+        return Err(format!(
+            "providerARNs is required for an authorizer of type {authorizer_type}"
+        ));
+    }
+    Ok(())
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -239,18 +382,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAuthorizer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAuthorizerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAuthorizer"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // `type` is a modelled enum and `name` a required member, so the boundary
+        // validator has already refused a value outside the catalog and a missing name.
+        // What is left is what the model cannot state: the sizes, the TTL window, and
+        // the members one `type` needs and another does not. Every check runs before the
+        // store lock is taken, so a refused request never reaches the records.
+        let bad_request = |message: String| {
+            CreateAuthorizerErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+        };
+        if input.name.is_empty() {
+            return Err(bad_request("name must not be empty".to_string()).into());
+        }
+        bound_input(&input).map_err(bad_request)?;
+        let ttl =
+            authorizer_result_ttl(input.authorizer_result_ttl_in_seconds).map_err(bad_request)?;
+        require_members_of_type(&input, ttl).map_err(bad_request)?;
+
+        let mut store = state.lock();
+        {
+            let api = store.rest_apis.get(&input.rest_api_id).ok_or_else(|| {
+                CreateAuthorizerErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
+                })
+            })?;
+            // One authorizer per request, and at most this many per API: the store cannot
+            // grow past the quota however many requests arrive.
+            if api.authorizers.len() >= crate::state::MAX_AUTHORIZERS_PER_API {
+                return Err(CreateAuthorizerErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        retry_after_seconds: None,
+                        message: Some(format!(
+                            "Maximum number of authorizers exceeded for this API: {}",
+                            crate::state::MAX_AUTHORIZERS_PER_API
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let id = store.mint_id();
+        let sequence = store.next_sequence();
+        let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {
+            CreateAuthorizerErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
+            })
+        })?;
+        // A name does not identify an authorizer: two authorizers of one API may carry
+        // the same configuration, and each is its own record under its own minted id.
+        api.authorizers.insert(
+            id.clone(),
+            AuthorizerEntry {
+                id: id.clone(),
+                name: input.name,
+                r#type: input.r#type,
+                provider_arns: input.provider_ar_ns.unwrap_or_default(),
+                auth_type: input.auth_type,
+                authorizer_uri: input.authorizer_uri,
+                authorizer_credentials: input.authorizer_credentials,
+                identity_source: input.identity_source,
+                identity_validation_expression: input.identity_validation_expression,
+                authorizer_result_ttl_in_seconds: ttl,
+                sequence,
+            },
+        );
+        let stored = api.authorizers.get(&id).ok_or_else(|| {
+            CreateAuthorizerErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_AUTHORIZER.to_string()),
+            })
+        })?;
+        Ok(authorizer_body(stored))
     }
 }

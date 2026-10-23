@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateIPSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateIPSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateIPSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the mutable specification of the IPSet named by `(Scope, Name, Id)`
+//! wholesale — `Addresses` as submitted, and `Description` cleared when the call
+//! omits it — and answers the rotated `NextLockToken`. A stale `LockToken` is
+//! `WAFOptimisticLockException`, an unknown triple `WAFNonexistentItemException`,
+//! an address that is not CIDR of the set's own family
+//! `WAFInvalidParameterException` and too many addresses
+//! `WAFLimitsExceededException` (all HTTP 400).
 //!
 //! ## Shape of an operation
 //!
@@ -210,18 +208,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateIPSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateIPSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateIPSet"))
+        // `ctx` carries only request metadata, which this operation does not need: an
+        // update never re-mints the ARN, so it needs no region.
+        let _ = ctx;
+        if !crate::state::is_known_scope(&input.scope) {
+            return Err(UpdateIPSetErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_parameter_exception(
+                    crate::state::FIELD_SCOPE_VALUE,
+                    &input.scope,
+                    "the scope names the namespace the IP set lives in, and is one of CLOUDFRONT or REGIONAL",
+                ),
+            )
+            .into());
+        }
+
+        // WAF's published quota is 10,000 addresses per IP set; past it the real
+        // service answers WAFLimitsExceededException rather than storing the set.
+        if input.addresses.len() > crate::state::MAX_IP_SET_ADDRESSES {
+            return Err(UpdateIPSetErrorModeled::WAFLimitsExceededException(
+                crate::state::limits_exceeded_exception(),
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateIPSetErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        let Some(entry) = state.ip_set(&input.scope, &input.name, &input.id) else {
+            crate::state::audit(
+                "UpdateIPSet",
+                &input.scope,
+                &input.name,
+                &input.id,
+                "WAFNonexistentItemException",
+            );
+            return Err(UpdateIPSetErrorModeled::WAFNonexistentItemException(
+                crate::state::nonexistent_item_exception(),
+            )
+            .into());
+        };
+        // Checked BEFORE anything is written, so a stale token leaves the stored IP
+        // set exactly as it was.
+        if entry.lock_token != input.lock_token {
+            crate::state::audit(
+                "UpdateIPSet",
+                &input.scope,
+                &input.name,
+                &input.id,
+                "WAFOptimisticLockException",
+            );
+            return Err(UpdateIPSetErrorModeled::WAFOptimisticLockException(
+                crate::state::optimistic_lock_exception(),
+            )
+            .into());
+        }
+
+        // `UpdateIPSet` carries no `IPAddressVersion`: "You cannot change the name of
+        // an IPSet after you create it" and the family is fixed the same way, so
+        // every submitted address is checked against the family the STORED set
+        // declares, by the same documented rule `CreateIPSet` applies.
+        let ip_address_version = entry.ip_set.ip_address_version.clone();
+        for address in &input.addresses {
+            if let Err(reason) = crate::state::validate_cidr(address, &ip_address_version) {
+                return Err(UpdateIPSetErrorModeled::WAFInvalidParameterException(
+                    crate::state::invalid_parameter_exception(
+                        crate::state::FIELD_IP_ADDRESS,
+                        address,
+                        &reason,
+                    ),
+                )
+                .into());
+            }
+        }
+
+        // The checks above hold an immutable borrow, so the entry is resolved again —
+        // by the same triple, under the same lock — to write through.
+        let Some(entry) = state.ip_set_mut(&input.scope, &input.name, &input.id) else {
+            return Err(UpdateIPSetErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // "This operation completely replaces the mutable specifications that you
+        // already have for the IP set with the ones that you provide to this call":
+        // `Addresses` becomes exactly the submitted list, in the submitted order, and
+        // `Description` — which the request may omit — is CLEARED rather than kept,
+        // because an update is a whole-resource overwrite and not a merge.
+        // `Name`, `Id`, `ARN` and `IPAddressVersion` are immutable.
+        entry.ip_set.addresses = input.addresses;
+        entry.ip_set.description = crate::state::stored_description(input.description);
+
+        // The token rotates on every successful mutation, so the one the caller just
+        // used stops working.
+        let next_lock_token = crate::state::new_uuid();
+        entry.lock_token = next_lock_token.clone();
+        crate::state::audit(
+            "UpdateIPSet",
+            &input.scope,
+            &input.name,
+            &input.id,
+            "updated",
+        );
+
+        Ok(UpdateIPSetOutput {
+            next_lock_token: Some(next_lock_token),
+        })
     }
 }

@@ -206,19 +206,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.package,
         ) else {
             return Err(not_found(
-                format!(
-                    "Package {} not found in repository {}.",
-                    input.package, input.repository
-                ),
+                crate::state::package_not_found_message(&input.package, &input.repository),
                 &input.package,
                 "package",
             ));
         };
         let Some(version) = package.versions.get(&input.package_version) else {
             return Err(not_found(
-                format!(
-                    "Package version {} {} not found in repository {}.",
-                    input.package, input.package_version, input.repository
+                crate::state::package_version_not_found_message(
+                    &input.package,
+                    &input.package_version,
+                    &input.repository,
                 ),
                 &input.package_version,
                 "package-version",

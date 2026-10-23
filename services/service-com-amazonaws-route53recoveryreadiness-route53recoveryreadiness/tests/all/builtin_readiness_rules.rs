@@ -3,12 +3,14 @@
 //! End-to-end tests for `ListRules`, the built-in readiness-rule catalog.
 //!
 //! The rule under test: `ListRules` reports the SERVICE's own readiness-rule catalog —
-//! every entry carrying one of the resource types this service supports plus a non-empty,
-//! unique rule id and a rule description, all within the modelled lengths — narrowed to
-//! exactly the requested `resourceType` when one is given, refusing a resource type the
-//! service does not support with a 400 `ValidationException`, and paged by `maxResults`
-//! with a `nextToken` that resumes where the page stopped. The catalog is reference data,
-//! so it is the same on every call and no call changes it.
+//! for each resource type this service supports, the readiness rules Route 53
+//! Application Recovery Controller publishes for that type, complete and in `ruleId`
+//! order, every entry carrying that resource type plus a non-empty, unique rule id and a
+//! rule description, all within the modelled lengths — narrowed to exactly the requested
+//! `resourceType` when one is given, refusing a resource type the service does not
+//! support with a 400 `ValidationException`, and paged by `maxResults` with a
+//! `nextToken` that resumes where the page stopped. The catalog is reference data, so it
+//! is the same on every call and no call changes it.
 //!
 //! Every assertion goes over the wire, through the same [`MultiServiceRouter`] the
 //! production emulator mounts: only the HTTP status, the `x-amzn-errortype` header and
@@ -473,6 +475,417 @@ async fn a_filtered_walk_is_paged_the_same_way() {
         assert_eq!(
             reported, expected,
             "case {case:?}: a one-rule-per-page walk must report this type's rules once, in order"
+        );
+    }
+}
+
+/// The readiness-rule catalog Route 53 Application Recovery Controller publishes, as
+/// `(resourceType, [ruleId, …])` with each type's rules in `ruleId` order.
+///
+/// SOURCE: the service's published readiness-rule set per resource type. The groups the
+/// `ListRules` wire recording pins exactly — `AWS::ApiGateway::Stage` (19 `ApiGwV1*`
+/// rules), `AWS::AutoScaling::AutoScalingGroup` (6 `Asg*`), `AWS::CloudWatch::Alarm`
+/// (the single `CloudWatchAlarmState`), `AWS::EC2::CustomerGateway` (3), `AWS::EC2::VPNGateway`
+/// (4), `AWS::RDS::DBCluster` (7 `Rds*`) and `AWS::SNS::Topic` (5 `SnsTopic*`) — are
+/// written out here so the test pins the published identifiers themselves rather than
+/// reading the handler's constant, and the rows also cover the types the issue cited no
+/// rule for at all (`AWS::SQS::Queue`, the two load-balancer types, `AWS::Route53::HealthCheck`,
+/// `AWS::SNS::Subscription`, `AWS::Route53RecoveryReadiness::DNSTargetResource`).
+///
+/// The rows differ along what the rule generalises over: the resource type, the rule-id
+/// prefix the service uses for it, and the per-type cardinality (from 1 rule to 19).
+const PUBLISHED_CATALOG: &[(&str, &[&str])] = &[
+    (
+        "AWS::ApiGateway::Stage",
+        &[
+            "ApiGwV1ApiKeyCount",
+            "ApiGwV1ApiKeySource",
+            "ApiGwV1BasePath",
+            "ApiGwV1BinaryMediaTypes",
+            "ApiGwV1CacheClusterEnabled",
+            "ApiGwV1CacheClusterSize",
+            "ApiGwV1CacheClusterStatus",
+            "ApiGwV1CanarySettings",
+            "ApiGwV1ClientCertificate",
+            "ApiGwV1EndpointConfiguration",
+            "ApiGwV1MethodSettings",
+            "ApiGwV1MinimumCompressionSize",
+            "ApiGwV1Policy",
+            "ApiGwV1Quotas",
+            "ApiGwV1ResourceCount",
+            "ApiGwV1StageVariables",
+            "ApiGwV1ThrottlingBurstLimit",
+            "ApiGwV1ThrottlingRateLimit",
+            "ApiGwV1TracingEnabled",
+        ],
+    ),
+    (
+        "AWS::ApiGatewayV2::Stage",
+        &[
+            "ApiGwV2AccessLogSettings",
+            "ApiGwV2ApiMappings",
+            "ApiGwV2AutoDeploy",
+            "ApiGwV2ClientCertificate",
+            "ApiGwV2DefaultRouteSettings",
+            "ApiGwV2DeploymentStatus",
+            "ApiGwV2ProtocolType",
+            "ApiGwV2Quotas",
+            "ApiGwV2RouteCount",
+            "ApiGwV2RouteSettings",
+            "ApiGwV2StageVariables",
+            "ApiGwV2ThrottlingBurstLimit",
+            "ApiGwV2ThrottlingRateLimit",
+        ],
+    ),
+    (
+        "AWS::AutoScaling::AutoScalingGroup",
+        &[
+            "AsgAZCount",
+            "AsgInstanceSizes",
+            "AsgInstanceTypes",
+            "AsgMinSizeAndMaxSize",
+            "AsgNormalizedCapacity",
+            "AsgQuotas",
+        ],
+    ),
+    ("AWS::CloudWatch::Alarm", &["CloudWatchAlarmState"]),
+    (
+        "AWS::DynamoDB::Table",
+        &[
+            "DynamoAutoScalingConfiguration",
+            "DynamoCapacity",
+            "DynamoConfiguration",
+            "DynamoGsiCapacity",
+            "DynamoGsiConfig",
+            "DynamoGsiStatus",
+            "DynamoNormalizedCapacity",
+            "DynamoQuotas",
+            "DynamoTableStatus",
+        ],
+    ),
+    (
+        "AWS::EC2::CustomerGateway",
+        &[
+            "CustomerGatewayIpAddress",
+            "CustomerGatewayState",
+            "CustomerGatewayVPNType",
+        ],
+    ),
+    (
+        "AWS::EC2::VPC",
+        &[
+            "VpcCidrBlock",
+            "VpcCidrBlocksInAssociationSets",
+            "VpcQuotas",
+            "VpcState",
+            "VpcSubnetCount",
+            "VpcSubnetState",
+        ],
+    ),
+    (
+        "AWS::EC2::VPNConnection",
+        &[
+            "VpnConnectionsCategory",
+            "VpnConnectionsQuotas",
+            "VpnConnectionsState",
+            "VpnConnectionsTunnelState",
+            "VpnConnectionsType",
+        ],
+    ),
+    (
+        "AWS::EC2::VPNGateway",
+        &[
+            "VpnGatewayAsn",
+            "VpnGatewayAttachment",
+            "VpnGatewayState",
+            "VpnGatewayType",
+        ],
+    ),
+    (
+        "AWS::EC2::Volume",
+        &[
+            "EbsVolumeEncryption",
+            "EbsVolumeIops",
+            "EbsVolumeQuotas",
+            "EbsVolumeSize",
+            "EbsVolumeState",
+            "EbsVolumeType",
+        ],
+    ),
+    (
+        "AWS::ElasticLoadBalancing::LoadBalancer",
+        &[
+            "ElbAZCount",
+            "ElbHealthCheck",
+            "ElbInstanceCount",
+            "ElbListeners",
+            "ElbQuotas",
+            "ElbScheme",
+        ],
+    ),
+    (
+        "AWS::ElasticLoadBalancingV2::LoadBalancer",
+        &[
+            "ElbV2AZCount",
+            "ElbV2IpAddressType",
+            "ElbV2Listeners",
+            "ElbV2Quotas",
+            "ElbV2Scheme",
+            "ElbV2TargetGroups",
+        ],
+    ),
+    (
+        "AWS::Lambda::Function",
+        &[
+            "LambdaFunctionDeadLetterConfig",
+            "LambdaFunctionEnvironmentVariables",
+            "LambdaFunctionMemorySize",
+            "LambdaFunctionQuotas",
+            "LambdaFunctionRuntime",
+            "LambdaFunctionTimeout",
+            "LambdaFunctionVpcConfig",
+        ],
+    ),
+    (
+        "AWS::MSK::Cluster",
+        &[
+            "MskClusterACMCertificate",
+            "MskClusterBrokerAZDistribution",
+            "MskClusterBrokerEBSVolumeSize",
+            "MskClusterBrokerInstanceType",
+            "MskClusterEncryptionInTransit",
+            "MskClusterKafkaVersion",
+            "MskClusterNumberOfBrokerNodes",
+            "MskClusterQuotas",
+            "MskClusterState",
+        ],
+    ),
+    (
+        "AWS::RDS::DBCluster",
+        &[
+            "RdsClusterStatus",
+            "RdsEngineMode",
+            "RdsEngineVersion",
+            "RdsGlobalReplicaLag",
+            "RdsInstanceType",
+            "RdsNormalizedCapacity",
+            "RdsQuotas",
+        ],
+    ),
+    (
+        "AWS::Route53::HealthCheck",
+        &["Route53HealthCheckConfiguration", "Route53HealthCheckStatus"],
+    ),
+    (
+        "AWS::Route53RecoveryReadiness::DNSTargetResource",
+        &["DnsTargetResourceHealthCheck", "DnsTargetResourceRecordSet"],
+    ),
+    (
+        "AWS::SNS::Subscription",
+        &[
+            "SnsSubscriptionDeliveryPolicy",
+            "SnsSubscriptionFilterPolicy",
+            "SnsSubscriptionProtocol",
+            "SnsSubscriptionRawMessageDelivery",
+            "SnsSubscriptionStatus",
+        ],
+    ),
+    (
+        "AWS::SNS::Topic",
+        &[
+            "SnsTopicAwsKmsKey",
+            "SnsTopicDeliveryPolicy",
+            "SnsTopicDisplayName",
+            "SnsTopicQuotas",
+            "SnsTopicSubscription",
+        ],
+    ),
+    (
+        "AWS::SQS::Queue",
+        &[
+            "SqsQueueDelaySeconds",
+            "SqsQueueEncryption",
+            "SqsQueueMessageRetentionPeriod",
+            "SqsQueueQuotas",
+            "SqsQueueRedrivePolicy",
+            "SqsQueueVisibilityTimeout",
+        ],
+    ),
+];
+
+/// The rule ids this emulator used to invent for the catalog — health-check assertions
+/// about ONE resource, not the service's readiness rules, which compare resources across
+/// cells. None of them is a rule the service publishes, so none may be reported.
+const RETIRED_INVENTED_RULE_IDS: &[&str] = &[
+    "ApiGatewayStageDeployment",
+    "ApiGatewayStageThrottleQuota",
+    "ApiGatewayV2StageDeployment",
+    "ApiGatewayV2StageThrottleQuota",
+    "AutoScalingGroupInServiceInstances",
+    "AutoScalingGroupMaxSizeQuota",
+    "CloudWatchAlarmStateNotInAlarm",
+    "CustomerGatewayStateAvailable",
+    "DnsTargetResourceHealthCheckHealthy",
+    "DnsTargetResourceRecordSetExists",
+    "DynamoDbTableCapacityQuota",
+    "DynamoDbTableReplicaActive",
+    "DynamoDbTableStatusActive",
+    "EbsVolumeAttachmentAttached",
+    "EbsVolumeStateAvailableOrInUse",
+    "LambdaFunctionConcurrencyQuota",
+    "LambdaFunctionNotThrottled",
+    "LoadBalancerHealthyInstances",
+    "LoadBalancerV2HealthyTargets",
+    "LoadBalancerV2StateActive",
+    "MskClusterBrokerCount",
+    "MskClusterStateActive",
+    "RdsDbClusterInstanceCount",
+    "RdsDbClusterStatusAvailable",
+    "Route53HealthCheckStatusHealthy",
+    "SnsSubscriptionConfirmed",
+    "SnsTopicSubscriptionCount",
+    "SqsQueueDeadLetterTarget",
+    "SqsQueueOldestMessageAge",
+    "VpcStateAvailable",
+    "VpcSubnetCapacity",
+    "VpnConnectionStateAvailable",
+    "VpnConnectionTunnelsUp",
+    "VpnGatewayAttachedToVpc",
+    "VpnGatewayStateAvailable",
+];
+
+#[tokio::test]
+async fn each_resource_type_reports_its_published_rule_set() {
+    let emulator = Emulator::new();
+
+    // One row per documented resource type: the filtered answer must be that type's
+    // published rule set, complete, in `ruleId` order, and nothing else.
+    for (resource_type, expected_ids) in PUBLISHED_CATALOG {
+        let case = format!("resourceType={resource_type}");
+        let reported: Vec<String> = emulator
+            .drain_rules(&format!("resourceType={resource_type}"), None, &case)
+            .await
+            .iter()
+            .map(|rule| rule_triple(rule, &case).1)
+            .collect();
+        let expected: Vec<String> = expected_ids.iter().map(|id| id.to_string()).collect();
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected this type's published readiness rules \
+             ({} of them), got {reported:?}",
+            expected.len()
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_published_catalog_covers_every_documented_resource_type() {
+    // The table above must itself span the whole documented set, so no type can be left
+    // unpinned by the row-per-type test.
+    let tabled: BTreeSet<&str> = PUBLISHED_CATALOG.iter().map(|(ty, _)| *ty).collect();
+    let documented: BTreeSet<&str> = DOCUMENTED_RESOURCE_TYPES.iter().copied().collect();
+    assert_eq!(
+        tabled, documented,
+        "case \"published catalog coverage\": the published-rule table must cover exactly the \
+         documented resource types"
+    );
+}
+
+#[tokio::test]
+async fn the_unfiltered_catalog_is_the_union_of_the_published_rule_sets() {
+    let emulator = Emulator::new();
+    let catalog = reported_catalog(&emulator, "unfiltered catalog").await;
+
+    let reported: BTreeSet<(String, String)> = catalog
+        .iter()
+        .map(|(resource_type, rule_id, _)| (resource_type.clone(), rule_id.clone()))
+        .collect();
+    let expected: BTreeSet<(String, String)> = PUBLISHED_CATALOG
+        .iter()
+        .flat_map(|(resource_type, ids)| {
+            ids.iter()
+                .map(move |id| (resource_type.to_string(), id.to_string()))
+        })
+        .collect();
+    assert_eq!(
+        reported, expected,
+        "case \"unfiltered catalog\": the whole catalog must be the union of every type's \
+         published rule set"
+    );
+
+    // No rule this emulator once invented may be reported for any type.
+    let retired: BTreeSet<&str> = RETIRED_INVENTED_RULE_IDS.iter().copied().collect();
+    for (resource_type, rule_id, _) in &catalog {
+        assert!(
+            !retired.contains(rule_id.as_str()),
+            "case {resource_type:?}: {rule_id:?} is not a readiness rule this service \
+             publishes, it must not be reported"
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_rule_description_states_what_the_rule_inspects() {
+    let emulator = Emulator::new();
+    let catalog = reported_catalog(&emulator, "unfiltered catalog").await;
+
+    // A readiness rule inspects the resources a resource set names, so every published
+    // description is a sentence that says so. Asserted over the whole catalog, every row
+    // a different rule.
+    for (resource_type, rule_id, description) in &catalog {
+        let case = format!("{resource_type}/{rule_id}");
+        assert!(
+            description.starts_with("Inspects "),
+            "case {case:?}: a rule description must say what the rule inspects, \
+             got {description:?}"
+        );
+        assert!(
+            description.ends_with('.'),
+            "case {case:?}: a rule description must be a sentence, got {description:?}"
+        );
+    }
+}
+
+/// The `(resourceType, ruleId, ruleDescription)` triples a recorded `ListRules` answer
+/// carries verbatim — the only two whose exact prose the recording pins. Both are rows
+/// of their type's published set above, and each is a different sentence FORM: the
+/// API Gateway one compares the stages of a resource set to each other, the CloudWatch
+/// one checks each alarm's state.
+const RECORDED_RULE_PROSE: &[(&str, &str, &str)] = &[
+    (
+        "AWS::ApiGateway::Stage",
+        "ApiGwV1ApiKeyCount",
+        "Inspects all API Gateway stages to ensure that they have same number of API Keys linked to them.",
+    ),
+    (
+        "AWS::CloudWatch::Alarm",
+        "CloudWatchAlarmState",
+        "Inspects CloudWatch alarms to ensure that each is not in the ALARM or INSUFFICIENT_DATA state.",
+    ),
+];
+
+#[tokio::test]
+async fn the_rule_prose_a_recording_carries_is_reported_verbatim() {
+    let emulator = Emulator::new();
+
+    for (resource_type, rule_id, description) in RECORDED_RULE_PROSE {
+        let case = format!("{resource_type}/{rule_id}");
+        let reported: Vec<(String, String, String)> = emulator
+            .drain_rules(&format!("resourceType={resource_type}"), None, &case)
+            .await
+            .iter()
+            .map(|rule| rule_triple(rule, &case))
+            .collect();
+        let found = reported
+            .iter()
+            .find(|(_, reported_id, _)| reported_id == rule_id)
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: expected rule {rule_id:?} to be reported, got {reported:?}")
+            });
+        assert_eq!(
+            (found.0.as_str(), found.1.as_str(), found.2.as_str()),
+            (*resource_type, *rule_id, *description),
+            "case {case:?}: expected the published rule triple, got {found:?}"
         );
     }
 }

@@ -323,6 +323,9 @@ fn start_time_secs(case: &str, body: &Value) -> f64 {
 #[tokio::test]
 async fn the_engagement_slice_is_refused_until_the_account_has_a_replication_set() {
     let emulator = Emulator::new();
+    // The shared harness onboards the account, because every contact-registry write needs
+    // an active replication set; a suite about the UNGATED account asks for that state.
+    set_replication_set(&emulator, None);
     let catalog = engagement_catalog();
     // Engagements ARE stored, so "refused" cannot be confused with "there was nothing to
     // stop": the gate is evaluated first.
@@ -957,6 +960,8 @@ async fn a_next_token_this_list_did_not_issue_is_refused() {
 #[tokio::test]
 async fn an_account_with_no_replication_set_is_served_an_empty_engagement_list() {
     let emulator = Emulator::new();
+    // The shared harness onboards the account; this suite is about an account with no set.
+    set_replication_set(&emulator, None);
     let case = "an account with no replication set and no engagements";
 
     let (status, body) = emulator.call("ListEngagements", json!({})).await;

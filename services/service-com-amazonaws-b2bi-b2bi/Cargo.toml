@@ -28,10 +28,20 @@ bumpalo = "=3.20.3"
 # group with, over the in-process callback into this same emulator (no network client
 # feature is enabled: the transport is the emulator's own).
 aws-sdk-cloudwatchlogs = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
-# The Amazon S3 client TestParsing reads the EDI document at `inputFile` with, over the
-# in-process callback into this same emulator (no network client feature is enabled: the
-# transport is the emulator's own).
+# The Amazon S3 client this service reads an EDI input/sample object through and writes
+# a transformer job's output file with, over the in-process callback into this same
+# emulator (no network client feature is enabled: the transport is the emulator's own).
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# The STS session store, so a b2bi request's calling principal is the identity
+# `sts:GetCallerIdentity` answers for the access key it signed with.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# The IAM store, which holds the identity policies attached to that principal's role —
+# the documents a b2bi request is authorized against.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# `iam_authorization`: the shared evaluation of those documents against
+# (action, resource, principal), so b2bi and every other service handed the same document
+# decide alike. Declared as a path dependency, the way the other consumers do.
+service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
@@ -41,7 +51,8 @@ emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
 # `sync` and `time`: the evaluation permit and the evaluation deadline that bound the
-# caller-supplied mapping template in `src/ops/test_mapping.rs`.
+# caller-supplied mapping template in `src/ops/test_mapping.rs`, and the same pair for the
+# mapping a transformer job evaluates in `src/ops/start_transformer_job.rs`.
 tokio = { workspace = true, features = ["sync", "time"] }
 bytes = { workspace = true }
 http = { workspace = true }
@@ -68,8 +79,8 @@ hex = { workspace = true }
 # The b2bi tests mount the CloudWatch Logs service beside b2bi on one engine, because
 # CreateProfile provisions a logging-ENABLED profile's log group by calling it.
 service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
-# The TestParsing suite mounts the S3 service beside b2bi on one engine, because
-# TestParsing reads the EDI document it parses from the S3 object `inputFile` names.
+# …and the S3 service, because TestParsing, CreateStarterMappingTemplate and
+# StartTransformerJob read their EDI objects from it (and the job writes its output back).
 service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]

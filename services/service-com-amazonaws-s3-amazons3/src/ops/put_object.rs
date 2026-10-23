@@ -3,7 +3,10 @@
 //! @op PutObject
 //! Adds an object to a general purpose bucket, replacing any object already at that key —
 //! or, on a bucket whose versioning status is `Enabled`, storing it as a new version with
-//! a minted version id that this operation reports.
+//! a minted version id that this operation reports. A write that names a server-side
+//! encryption configuration (`x-amz-server-side-encryption` and the members that qualify
+//! it) is recorded under it and reports it back, as does every later read of the object;
+//! SSE-C is refused, because S3 keeps no customer-provided key for a later read to use.
 //! Implemented here — this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -356,26 +359,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //   answers when the condition fails are HTTP 412 `PreconditionFailed` and 409
         //   `ConditionalRequestConflict` — neither is a shape in this model, and an
         //   operation renders one success status, so the condition has no faithful answer.
-        // * the server-side-encryption members choose how the object is encrypted at
-        //   rest; this emulator stores the bytes as given and keeps no keys, so it can
-        //   neither honour nor report them (and SSE-C would make the object
-        //   unretrievable without the key it is not storing).
+        // * the SSE-C members carry a customer-provided KEY. S3 "doesn't store the
+        //   encryption key you provide", and every later read of the object has to carry
+        //   it again for S3 to decrypt — so serving them would mean either keeping a key
+        //   S3 does not keep, or answering reads of an object whose key was never checked.
+        //   `GetObject` refuses them for the same reason, so no object here is addressed
+        //   by one.
         // * the Object Lock members decide whether a later delete is allowed; no
         //   retention or hold is emulated.
         //
         // `x-amz-tagging` is NOT in this list: it carries a tag set this emulator stores
         // on the object it writes (see below), exactly as `PutObjectTagging` would.
         //
-        // The checksum members are NOT in this list: a checksum this handler neither
-        // computes nor verifies is simply not reported back, so nothing is claimed about
-        // it, and refusing the request would break every SDK that sends one by default.
+        // The SSE / SSE-KMS members (`x-amz-server-side-encryption` and the three that
+        // qualify it) are NOT in this list: they name the encryption CONFIGURATION the
+        // object is stored under, which is recorded with the object below and reported
+        // back by this write and by every later read of it — see
+        // `crate::state::ObjectEncryption`.
+        //
+        // The checksum members are NOT in this list either: a checksum this handler
+        // neither computes nor verifies is simply not reported back, so nothing is claimed
+        // about it, and refusing the request would break every SDK that sends one by
+        // default.
         for (member, present) in [
             ("If-Match", input.if_match.is_some()),
             ("If-None-Match", input.if_none_match.is_some()),
-            (
-                "x-amz-server-side-encryption",
-                input.server_side_encryption.is_some(),
-            ),
             (
                 "x-amz-server-side-encryption-customer-algorithm",
                 input.sse_customer_algorithm.is_some(),
@@ -383,18 +391,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (
                 "x-amz-server-side-encryption-customer-key",
                 input.sse_customer_key.is_some(),
-            ),
-            (
-                "x-amz-server-side-encryption-aws-kms-key-id",
-                input.ssekms_key_id.is_some(),
-            ),
-            (
-                "x-amz-server-side-encryption-context",
-                input.ssekms_encryption_context.is_some(),
-            ),
-            (
-                "x-amz-server-side-encryption-bucket-key-enabled",
-                input.bucket_key_enabled.is_some(),
             ),
             ("x-amz-object-lock-mode", input.object_lock_mode.is_some()),
             (
@@ -475,6 +471,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => Vec::new(),
         };
 
+        // `ServerSideEncryption` is an enum member, so the boundary refuses a value outside
+        // the published set before this handler runs; this guard is what keeps a STORED
+        // algorithm inside that set if a request ever parses to something else — an
+        // algorithm this emulator recorded and reported back without S3 knowing it would be
+        // a value no later reader could make sense of. "The value of the parameter is not
+        // valid" is `InvalidArgument` (400), the same channel the KMS-only check below
+        // answers through, and `PutBucketEncryption` holds a default rule's `SSEAlgorithm`
+        // to the same published set.
+        if let Some(algorithm) = input.server_side_encryption.as_deref() {
+            if !SERVER_SIDE_ENCRYPTION_VALUES.contains(&algorithm) {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_ARGUMENT_CODE,
+                    crate::state::INVALID_ARGUMENT_STATUS,
+                    format!(
+                        "x-amz-server-side-encryption must be one of \
+                         {SERVER_SIDE_ENCRYPTION_VALUES:?}, got {algorithm:?}"
+                    ),
+                ));
+            }
+        }
+
+        // The encryption configuration this write stores the object under, taken from the
+        // modelled members the request carried: `ServerSideEncryption` and the three that
+        // qualify it. What is recorded is the CONFIGURATION, not a key and not a
+        // ciphertext — this emulator holds the bytes in this process's memory and performs
+        // no cryptography — and it is exactly what `PutObject`, `GetObject` and
+        // `HeadObject` report back as `x-amz-server-side-encryption` and its companions.
+        let encryption = crate::state::ObjectEncryption {
+            sse_algorithm: input.server_side_encryption.clone(),
+            kms_key_id: input.ssekms_key_id.clone(),
+            kms_encryption_context: input.ssekms_encryption_context.clone(),
+            bucket_key_enabled: input.bucket_key_enabled,
+        };
+        // "This parameter is allowed if and only if SSEAlgorithm is set to aws:kms or
+        // aws:kms:dsse" (`ApplyServerSideEncryptionByDefault$KMSMasterKeyID`), and the
+        // encryption context "is stored as object metadata and automatically gets passed
+        // on to Amazon Web Services KMS" (`PutObjectOutput$SSEKMSEncryptionContext`) —
+        // each of the three names something only SSE-KMS has. One of them beside another
+        // algorithm, or beside none at all, is a parameter that is not valid for this
+        // request, which S3 answers with `InvalidArgument` (400); the alternative would be
+        // storing a key id the object's encryption does not use.
+        if !encryption.uses_kms() {
+            if let Some(member) = encryption.kms_only_member() {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_ARGUMENT_CODE,
+                    crate::state::INVALID_ARGUMENT_STATUS,
+                    format!(
+                        "{member} is only valid with a server-side encryption algorithm \
+                         of {}",
+                        crate::state::KMS_SSE_ALGORITHMS.join(" or ")
+                    ),
+                ));
+            }
+        }
+
         let etag = crate::state::object_etag(&input.body);
         let object = crate::state::Object {
             etag: etag.clone(),
@@ -505,6 +556,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Minted by the store, which is the only place that sees the bucket's
             // versioning state: this write carries no id of its own.
             version_id: None,
+            encryption: encryption.clone(),
             body: input.body,
         };
 
@@ -588,11 +640,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `Enabled`. It is read back off the STORED object rather than re-derived, so
             // the caller is told the id the object is addressable by and nothing else.
             version_id: version_id_of(&store, &input.bucket, &input.key),
+            // The encryption the object was stored under, reported back the way every
+            // reader of that object reports it. These are the stored values, so a write
+            // that named no encryption reports none rather than a default nothing applied.
+            server_side_encryption: encryption.sse_algorithm.clone(),
+            ssekms_key_id: encryption.kms_key_id.clone(),
+            ssekms_encryption_context: encryption.kms_encryption_context.clone(),
+            bucket_key_enabled: encryption.bucket_key_enabled,
             // Everything else this output can carry describes a feature no stored object
             // here has, so none of it is reported rather than being invented:
             // `Expiration` needs a lifecycle configuration (none is recorded for any
             // bucket), the checksum members need a checksum this handler did not compute,
-            // the encryption members are refused above, `Size` is for appends in directory
+            // the SSE-C members are refused above, `Size` is for appends in directory
             // buckets, and `RequestCharged` reports a Requester Pays charge this emulator
             // does not model.
             ..PutObjectOutput::default()

@@ -62,21 +62,23 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::{DeployedResource, StoredStack, DRIFT_STATUS_NOT_CHECKED};
+use crate::state::{DeployedResource, StoredStack};
 
 /// One deployed resource as the modelled `StackResourceDetail` shape.
 ///
 /// Every member is read back from what the stack operation that deployed it persisted:
-/// the logical id and type the template declared, the physical id CloudFormation's
-/// documented naming rules gave it, the `Metadata` resource attribute the declaration
-/// carried, and the resource-level status that operation left the resource in with the
-/// instant it reached that status (`LastUpdatedTimestamp`: "Time the status was
+/// the logical id and type the template declared, the physical id the resource carries —
+/// the one the service that owns it minted, or the one CloudFormation's documented naming
+/// rules gave it, read through the same `crate::state::physical_resource_id` the sibling
+/// reader uses so the two cannot report it differently — the `Metadata` resource attribute
+/// the declaration carried, and the resource-level status that operation left the resource
+/// in with the instant it reached that status (`LastUpdatedTimestamp`: "Time the status was
 /// updated").
 ///
 /// `StackResourceDetail` is `StackResource` plus `Metadata` — the same resource, read
 /// through a second shape — so the members this emulator has nothing to report for
 /// (`ResourceStatusReason`, `Description`, `ModuleInfo`) are absent, and
-/// `DriftInformation` is `NOT_CHECKED`, for exactly the reasons
+/// `DriftInformation` is the resource's own drift result, for exactly the reasons
 /// `ops::describe_stack_resources`'s `stack_resource_view` states once and in full. They
 /// are stated there rather than repeated here so the two readers cannot drift apart.
 fn stack_resource_detail(stack: &StoredStack, deployed: &DeployedResource) -> StackResourceDetail {
@@ -84,17 +86,14 @@ fn stack_resource_detail(stack: &StoredStack, deployed: &DeployedResource) -> St
         stack_name: Some(stack.stack_name.clone()),
         stack_id: Some(stack.stack_id.clone()),
         logical_resource_id: deployed.resource.logical_id.clone(),
-        physical_resource_id: Some(deployed.resource.physical_resource_id.clone()),
+        physical_resource_id: crate::state::physical_resource_id(&deployed.resource),
         resource_type: deployed.resource.resource_type.clone(),
         last_updated_timestamp: crate::state::timestamp(deployed.status_timestamp),
         resource_status: deployed.status.clone(),
         resource_status_reason: None,
         description: None,
         metadata: deployed.resource.metadata.clone(),
-        drift_information: Some(StackResourceDriftInformation {
-            stack_resource_drift_status: DRIFT_STATUS_NOT_CHECKED.to_string(),
-            last_check_timestamp: None,
-        }),
+        drift_information: crate::state::resource_drift_information(deployed),
         module_info: None,
     }
 }

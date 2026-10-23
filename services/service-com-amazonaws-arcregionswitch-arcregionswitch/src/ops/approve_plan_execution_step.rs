@@ -16,12 +16,10 @@
 //! [`crate::state::ComAmazonawsArcregionswitchArcregionswitchState::apply_approval`], so
 //! this handler and the clock's own progression cannot disagree about it.
 //!
-//! ## Shape of an operation
-//!
-//! Each operation is a struct that owns the shared engine and implements
-//! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
-//! `ApprovePlanExecutionStep::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! A plan that holds no ongoing execution at all has nothing to decide: that is the
+//! modelled `ResourceNotFoundException` too, and its message names the plan the request
+//! named — the same shape as the ongoing-execution refusals `StartPlanExecution` and
+//! `DeletePlan` answer with.
 //!
 //! ## Reaching this service's state
 //!
@@ -174,6 +172,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let approved = input.approval == APPROVE;
         match store.apply_approval(&key, &input.step_name, approved, input.comment, now) {
             crate::state::ApprovalOutcome::Applied => Ok(ApprovePlanExecutionStepOutput {}),
+            crate::state::ApprovalOutcome::NoSuchPlan => Err(
+                ApprovePlanExecutionStepErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("Plan not found for ARN: {}", input.plan_arn),
+                    },
+                )
+                .into(),
+            ),
+            crate::state::ApprovalOutcome::NoOngoingExecution => Err(
+                ApprovePlanExecutionStepErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "There is no active execution ongoing for plan {}",
+                            input.plan_arn
+                        ),
+                    },
+                )
+                .into(),
+            ),
             crate::state::ApprovalOutcome::NoSuchExecution => Err(
                 ApprovePlanExecutionStepErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {

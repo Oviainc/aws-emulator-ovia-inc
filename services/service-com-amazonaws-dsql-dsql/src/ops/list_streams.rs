@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListStreams
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListStreams`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListStreams::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! One page of the change data capture (CDC) streams a cluster holds, read out of
+//! this service's store: the streams are kept ON their cluster's record
+//! ([`crate::state::Cluster::streams`], a `BTreeMap` keyed by `StreamId`), so the
+//! page is a window over that identifier order and the `nextToken` cursor resumes
+//! at the first identifier after the one the previous page stopped on. A cluster
+//! this service does not hold is a 404 rather than an empty list.
 //!
 //! ## Shape of an operation
 //!
@@ -87,10 +85,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-dsql-dsql.json");
 // here — hence the `ListStreamsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.dsql#ListStreams")]
+// The operation's MODELED errors, plus the service-common `InternalServerException`
+// widened in with `extra_errors`: the service declares it for every operation (its
+// `common_errors` are AccessDenied / InternalServer / Throttling / Validation), but the
+// per-operation list the macro checks against does not repeat it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.dsql#ListStreams",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ListStreamsErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -144,18 +150,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListStreams` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListStreamsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListStreams"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListStreamsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the dsql cluster store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // The cursor names the last stream identifier the previous page returned;
+        // this page starts at the first identifier after it.
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(crate::state::decode_pagination_cursor(token).ok_or_else(
+                || {
+                    crate::scaffolded::Scaffolded::validation(format!(
+                        "nextToken is not a cursor this service issued: {token}"
+                    ))
+                },
+            )?),
+            None => None,
+        };
+
+        // `maxResults` carries `@default: 10` and `@range(1..100)`, both enforced
+        // before this handler runs. The conversion and clamp cover only a caller that
+        // reached the handler some other way (an in-process call that built the input
+        // directly): a negative value falls back to the modelled default, and anything
+        // outside the modelled range is pulled back into it.
+        let page_size = usize::try_from(input.max_results)
+            .unwrap_or(MAX_RESULTS_DEFAULT)
+            .clamp(MAX_RESULTS_MIN, MAX_RESULTS_MAX);
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+        state.settle(std::time::SystemTime::now());
+
+        // A stream is addressed under its cluster, so a cluster this service does
+        // not hold reports the cluster's own "no such resource" rather than a page
+        // of no streams.
+        let Some(cluster) = state.clusters.get(&input.cluster_identifier) else {
+            return Err(ListStreamsErrorModeled::ResourceNotFoundException(
+                crate::state::cluster_not_found(&region, &input.cluster_identifier),
+            )
+            .into());
+        };
+
+        let mut page: Vec<StreamSummary> = cluster
+            .streams
+            .iter()
+            .filter(|(identifier, _)| {
+                resume_after
+                    .as_ref()
+                    .is_none_or(|cursor| *identifier > cursor)
+            })
+            // One past the page, so the token is emitted only when something remains.
+            .take(page_size + 1)
+            .map(|(_, stream)| StreamSummary {
+                cluster_identifier: cluster.identifier.clone(),
+                stream_identifier: stream.stream_identifier.clone(),
+                arn: stream.arn.clone(),
+                creation_time: ::aws_smithy_types::DateTime::from(stream.creation_time),
+                status: stream.status.clone(),
+            })
+            .collect();
+
+        let next_token = (page.len() > page_size).then(|| {
+            page.truncate(page_size);
+            crate::state::encode_pagination_cursor(&page[page_size - 1].stream_identifier)
+        });
+
+        Ok(ListStreamsOutput {
+            next_token,
+            streams: page,
+        })
     }
 }
+
+/// `maxResults`' modelled default and `@range` bounds, from
+/// `smithy_query(query="operation", operation="ListStreams")`: `@default: 10`,
+/// `@range(min: 1, max: 100)`.
+const MAX_RESULTS_DEFAULT: usize = 10;
+/// See [`MAX_RESULTS_DEFAULT`].
+const MAX_RESULTS_MIN: usize = 1;
+/// See [`MAX_RESULTS_DEFAULT`].
+const MAX_RESULTS_MAX: usize = 100;

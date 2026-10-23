@@ -5,8 +5,11 @@
 //! Updates the stored dashboard in place: `name` (required) and `description` are
 //! replaced, `widgets` are replaced wholesale when the member is present and left
 //! untouched when it is absent, and `updatedAt` is set to the moment of the call while
-//! `createdAt` is preserved. An ARN no dashboard is stored under answers
-//! `ResourceNotFoundException` (404).
+//! `createdAt` is preserved. An ARN no dashboard is stored under answers the service's
+//! not-found refusal — HTTP 400 with the error code `ResourceNotFoundException` and a
+//! `resourceId` member carrying the requested ARN, as
+//! `crate::scaffolded::Scaffolded::resource_not_found` renders it (the model's `@httpError`
+//! for that shape is 404, which is not what the recorded service answers).
 //!
 //! Being state-changing, it emits the audit record `crate::state::record_state_change`
 //! writes (timestamp, source, presented access key id, operation, resource, outcome) on
@@ -169,9 +172,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let arn = input.arn;
         let not_found = || {
-            UpdateDashboardErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!("No dashboard found for arn {arn}"),
-            })
+            // The request-derived template the recorded service words THIS operation's
+            // refusal with (each operation has its own); the ARN is the request's.
+            crate::scaffolded::Scaffolded::resource_not_found(
+                &arn,
+                format!("Dashboard not found: {arn}"),
+            )
         };
         // Resolve the record FIRST, so a request that names no dashboard mints no widget
         // id and leaves the id counter where it was.
@@ -182,7 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &arn,
                 "ResourceNotFoundException",
             );
-            return Err(not_found().into());
+            return Err(not_found());
         }
 
         // Minting an id for a widget that arrived without one needs the state's own
@@ -191,7 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let Some(dashboard) = state.dashboards.get_mut(&arn) else {
             // Unreachable: the key was present a moment ago under this same lock.
-            return Err(not_found().into());
+            return Err(not_found());
         };
 
         // `name` is @required on every UpdateDashboard call and documented as "The new

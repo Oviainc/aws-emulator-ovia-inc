@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetDeploymentTargets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetDeploymentTargets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Answers one `DeploymentTarget` per target id the request names, in that
+//! order, from the deployment's own record.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetDeploymentTargets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The targets are the SNAPSHOT its deployment group resolved when the
+//! deployment was created ([`crate::state::deployment_targets`]), and each one
+//! is projected by the crate's single target builder
+//! ([`crate::state::deployment_target_view`]), so this batch reader and the
+//! single-target reader `GetDeploymentTarget` cannot report the same target
+//! differently. A deployment the clock has not started yet has no target state
+//! to report, which is its `DeploymentNotStartedException`.
+//!
+//! Every id the request names has to BE a target of that deployment: unlike the
+//! other batch readers of this service, this one models
+//! `DeploymentTargetDoesNotExistException` ("The provided target ID does not
+//! belong to the attempted deployment"), so an id the deployment does not hold
+//! is refused rather than dropped from the answer. An id outside the FORM a
+//! target of the deployment's compute platform is reported under names no
+//! target anywhere, which is `InvalidDeploymentTargetIdException`; see
+//! [`crate::state::check_deployment_target_id`].
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -105,6 +117,26 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// How many target ids one call may name, from this operation's own
+/// documentation: "The maximum number of targets that can be returned is 25",
+/// which its `targetIds` member repeats ("The maximum number of deployment
+/// target IDs you can specify is 25",
+/// `smithy_query(query="doc",shape="BatchGetDeploymentTargetsInput",member="targetIds")`).
+/// CodeDeploy's own published bound for THIS operation, not a chosen one.
+const MAX_BATCH_TARGET_IDS: usize = 25;
+
+/// The compute platforms whose deployment has exactly ONE target, so a call
+/// against one of them may name exactly one target id. From
+/// `DeploymentTargetListSizeExceededException`'s own sentence: "The maximum
+/// number of targets that can be associated with an Amazon ECS or Lambda
+/// deployment was exceeded. The target list of both types of deployments must
+/// have exactly one item. This exception does not apply to EC2/On-premises
+/// deployments." (`smithy_query(query="doc",shape="DeploymentTargetListSizeExceededException")`),
+/// which is also why an EC2/on-premises deployment is bounded only by
+/// [`MAX_BATCH_TARGET_IDS`]. The values are members of `ComputePlatform`
+/// (`smithy_query(query="shape",shape="ComputePlatform")`: Server | Lambda | ECS).
+const ONE_TARGET_PLATFORMS: &[&str] = &["Lambda", "ECS"];
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -181,18 +213,164 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetDeploymentTargets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetDeploymentTargetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetDeploymentTargets"))
+        let _ = ctx;
+        let deployment_id = input.deployment_id;
+        let target_ids = input.target_ids;
+
+        // The id's FORMAT is gated before the deployment is looked up, so "that
+        // is not an id" and "no deployment has that id" stay two different
+        // answers, as they are everywhere else in this service.
+        if deployment_id.trim().is_empty() {
+            return Err(
+                BatchGetDeploymentTargetsErrorModeled::DeploymentIdRequiredException(
+                    DeploymentIdRequiredException {
+                        message: Some(crate::state::DEPLOYMENT_ID_MISSING.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+        if !crate::state::deployment_id_is_well_formed(&deployment_id) {
+            return Err(
+                BatchGetDeploymentTargetsErrorModeled::InvalidDeploymentIdException(
+                    InvalidDeploymentIdException {
+                        message: Some(crate::state::malformed_deployment_id_message(
+                            &deployment_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The batch bound is a property of the REQUEST as a whole, so it is
+        // answered before any id in it is examined: a caller that sent too many
+        // ids learns that, rather than learning that one of them is malformed.
+        if target_ids.len() > MAX_BATCH_TARGET_IDS {
+            return Err(
+                BatchGetDeploymentTargetsErrorModeled::DeploymentTargetListSizeExceededException(
+                    DeploymentTargetListSizeExceededException {
+                        message: Some(format!(
+                            "The maximum number of deployment target IDs you can specify is \
+                             {MAX_BATCH_TARGET_IDS}, but {} were specified",
+                            target_ids.len()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `targetIds` is @required but carries no modelled length, so an empty
+        // list — and an empty id inside a non-empty list — both reach the
+        // handler, and both are "you did not give me this target id", which is
+        // what `DeploymentTargetIdRequiredException` is for.
+        if target_ids.is_empty() || target_ids.iter().any(|id| id.trim().is_empty()) {
+            return Err(
+                BatchGetDeploymentTargetsErrorModeled::DeploymentTargetIdRequiredException(
+                    DeploymentTargetIdRequiredException {
+                        message: Some(crate::state::DEPLOYMENT_TARGET_ID_MISSING.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The targets come from the deployment's own record — the snapshot its
+        // deployment group resolved when it was created — and their status from
+        // how far that deployment has got, which `with_state` has already
+        // brought up to the instants the clock owed it.
+        let outcome = crate::state::with_state(&*self.engine, |state| {
+            let Some(deployment) = state.deployments.get(&deployment_id) else {
+                return Err(
+                    BatchGetDeploymentTargetsErrorModeled::DeploymentDoesNotExistException(
+                        DeploymentDoesNotExistException {
+                            message: Some(crate::state::deployment_not_found(&deployment_id)),
+                        },
+                    ),
+                );
+            };
+            // A deployment that has not started has deployed to nothing, so it
+            // has no target state to report: that is this operation's
+            // `DeploymentNotStartedException`.
+            if !deployment.is_started() {
+                return Err(
+                    BatchGetDeploymentTargetsErrorModeled::DeploymentNotStartedException(
+                        DeploymentNotStartedException {
+                            message: Some(crate::state::deployment_not_started(&deployment_id)),
+                        },
+                    ),
+                );
+            }
+            // How many targets a call may name depends on the deployment it is
+            // against, so this bound is answered once the deployment is
+            // resolved, after the request-wide one above.
+            if ONE_TARGET_PLATFORMS.contains(&deployment.compute_platform.as_str())
+                && target_ids.len() > 1
+            {
+                return Err(
+                    BatchGetDeploymentTargetsErrorModeled::DeploymentTargetListSizeExceededException(
+                        DeploymentTargetListSizeExceededException {
+                            message: Some(format!(
+                                "The target list of an {} or {} deployment must have exactly one \
+                                 item, but {} were specified for the deployment {deployment_id}",
+                                ONE_TARGET_PLATFORMS[1],
+                                ONE_TARGET_PLATFORMS[0],
+                                target_ids.len()
+                            )),
+                        },
+                    ),
+                );
+            }
+            // One entry per id the request named, in that order. Unlike the
+            // other batch readers of this service, this one MODELS a
+            // does-not-exist error for its ids, so an id the deployment does
+            // not hold is refused rather than left out of the answer.
+            let mut targets = Vec::with_capacity(target_ids.len());
+            for target_id in &target_ids {
+                if crate::state::check_deployment_target_id(
+                    &deployment.compute_platform,
+                    target_id,
+                )
+                .is_err()
+                {
+                    return Err(
+                        BatchGetDeploymentTargetsErrorModeled::InvalidDeploymentTargetIdException(
+                            InvalidDeploymentTargetIdException {
+                                message: Some(crate::state::malformed_target_id_message(
+                                    target_id,
+                                )),
+                            },
+                        ),
+                    );
+                }
+                let Some(target) = crate::state::find_deployment_target(deployment, target_id)
+                else {
+                    return Err(
+                        BatchGetDeploymentTargetsErrorModeled::DeploymentTargetDoesNotExistException(
+                            DeploymentTargetDoesNotExistException {
+                                message: Some(crate::state::deployment_target_not_found(
+                                    &deployment_id,
+                                    target_id,
+                                )),
+                            },
+                        ),
+                    );
+                };
+                targets.push(crate::state::deployment_target_view(
+                    state,
+                    deployment,
+                    target,
+                ));
+            }
+            Ok(targets)
+        })
+        .ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        Ok(BatchGetDeploymentTargetsOutput {
+            deployment_targets: Some(outcome?),
+        })
     }
 }

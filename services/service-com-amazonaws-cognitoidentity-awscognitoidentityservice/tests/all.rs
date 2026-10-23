@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/identity_pool_flow.rs"]
 mod identity_pool_flow;
+#[path = "all/identity_pool_roles.rs"]
+mod identity_pool_roles;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

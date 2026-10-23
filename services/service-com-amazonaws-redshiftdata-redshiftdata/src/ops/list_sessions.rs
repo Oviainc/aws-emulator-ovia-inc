@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSessions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSessions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSessions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the sessions a caller's statements opened: `ExecuteStatement` and
+//! `BatchExecuteStatement` open one when they are asked to keep a session
+//! alive, and this reports each one's status, compute target, database
+//! connection and lifecycle timestamps. A reporting operation, so the only
+//! thing it writes is nothing at all: a session's CLOSED status is derived from
+//! the `SessionTtl` the clock has passed.
 //!
 //! ## Shape of an operation
 //!
@@ -112,6 +109,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{
+    decode_cursor, encode_cursor, non_empty, to_timestamp, Session, SessionStatus,
+    CURSOR_SESSIONS, DEFAULT_LIST_PAGE_SIZE,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -183,18 +184,164 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSessions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSessionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSessions"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListSessionsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Redshift Data API state store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let session_id = non_empty(input.session_id.as_ref());
+        let status = non_empty(input.status.as_ref());
+        let cluster_identifier = non_empty(input.cluster_identifier.as_ref());
+        let workgroup_name = non_empty(input.workgroup_name.as_ref());
+        let database = non_empty(input.database.as_ref());
+
+        // "When you provide SessionId, you can't specify Status,
+        // ClusterIdentifier, WorkgroupName, or Database": `SessionId` asks for
+        // the metadata of ONE session, so combining it with a filter over a set
+        // of sessions names two different requests.
+        if session_id.is_some()
+            && (status.is_some()
+                || cluster_identifier.is_some()
+                || workgroup_name.is_some()
+                || database.is_some())
+        {
+            return Err(validation(
+                "SessionId cannot be specified with other filter parameters.",
+            ));
+        }
+
+        // "When providing ClusterIdentifier, then WorkgroupName can't be
+        // specified": a session runs on one data warehouse.
+        if cluster_identifier.is_some() && workgroup_name.is_some() {
+            return Err(validation(
+                "ClusterIdentifier and WorkgroupName cannot both be supplied: a session runs on \
+                 either a provisioned cluster or a serverless workgroup",
+            ));
+        }
+
+        // A `Status` outside the modelled set names no session status, so it is
+        // refused rather than silently matching nothing.
+        if let Some(status) = status.as_deref() {
+            if !SESSION_STATUS_STRING_VALUES.contains(&status) {
+                return Err(validation(&format!(
+                    "Status must be one of {}",
+                    SESSION_STATUS_STRING_VALUES.join(", ")
+                )));
+            }
+        }
+
+        // The cursor is the sequence number the previous page stopped at; the
+        // next page continues strictly before it, so a session opened between
+        // two pages cannot shift the boundary.
+        let cursor = match input.next_token.as_deref() {
+            None => u64::MAX,
+            Some(token) => match decode_cursor(CURSOR_SESSIONS, token) {
+                Some(cursor) => cursor,
+                None => {
+                    return Err(validation(
+                        "NextToken is not a continuation token this operation issued",
+                    ))
+                }
+            },
+        };
+
+        // `MaxResults` is modelled with a default of 0, which names no page
+        // size; the page then holds as much as the modelled maximum allows.
+        let page_size = usize::try_from(input.max_results)
+            .ok()
+            .filter(|size| *size > 0)
+            .unwrap_or(DEFAULT_LIST_PAGE_SIZE);
+
+        // `RoleLevel` chooses between every session created by the caller's IAM
+        // role and only those created in the current IAM session. This emulator
+        // serves one caller in one session, so both selections are the same
+        // non-empty set and the member changes nothing it could change.
+        let _ = input.role_level;
+
+        let mut store = state.lock();
+        // A session's status is derived from the statements that ran in it, so
+        // the transitions the clock already owes are materialised first.
+        store.materialise_due_transitions();
+
+        let mut page: Vec<SessionData> = Vec::new();
+        let mut remaining = 0_usize;
+        let mut last_seq = 0_u64;
+        for session in store.sessions_newest_first() {
+            if session.seq >= cursor {
+                continue;
+            }
+            let (session_status, current_statement) = store.session_activity(session);
+            // "To retrieve the metadata for a single session, provide the
+            // SessionId parameter", and otherwise "if no status is specified,
+            // sessions with a status of AVAILABLE or BUSY are returned" — a
+            // closed session is reported only when it is asked for.
+            let selected = match (session_id.as_deref(), status.as_deref()) {
+                (Some(wanted), _) => session.id == wanted,
+                (None, Some(wanted)) => session_status.as_str() == wanted,
+                (None, None) => session_status != SessionStatus::Closed,
+            };
+            let on_this_warehouse = cluster_identifier.as_deref().is_none_or(|cluster| {
+                session.target.cluster_identifier().as_deref() == Some(cluster)
+            })
+                && workgroup_name.as_deref().is_none_or(|workgroup| {
+                    session.target.workgroup_name().as_deref() == Some(workgroup)
+                });
+            let on_this_database = database
+                .as_deref()
+                .is_none_or(|database| session.database == database);
+            if !(selected && on_this_warehouse && on_this_database) {
+                continue;
+            }
+            if page.len() < page_size {
+                last_seq = session.seq;
+                page.push(session_data(session, session_status, current_statement));
+            } else {
+                remaining += 1;
+            }
+        }
+
+        Ok(ListSessionsOutput {
+            sessions: page,
+            // A token only when the filtered set holds more sessions than this
+            // page returned, pointing at the last one returned so the next page
+            // resumes exactly where this one stopped.
+            next_token: (remaining > 0).then(|| encode_cursor(CURSOR_SESSIONS, last_seq)),
+        })
     }
+}
+
+/// One entry of `Sessions`, assembled from the stored session and the status it
+/// reports now.
+fn session_data(
+    session: &Session,
+    status: SessionStatus,
+    current_statement_id: Option<String>,
+) -> SessionData {
+    SessionData {
+        session_id: session.id.clone(),
+        status: status.as_str().to_string(),
+        created_at: to_timestamp(session.created_at),
+        updated_at: Some(to_timestamp(session.updated_at)),
+        database: Some(session.database.clone()),
+        db_user: session.db_user.clone(),
+        cluster_identifier: session.target.cluster_identifier(),
+        workgroup_name: session.target.workgroup_name(),
+        session_alive_seconds: Some(session.keep_alive_seconds),
+        session_ttl: Some(to_timestamp(session.expires_at)),
+        current_statement_id,
+    }
+}
+
+/// Refuse the request as invalid, with the `ValidationException` this operation
+/// models.
+fn validation(message: &str) -> ListSessionsError {
+    ListSessionsErrorModeled::ValidationException(ValidationException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

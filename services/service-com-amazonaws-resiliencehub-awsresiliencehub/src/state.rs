@@ -2,7 +2,7 @@
 
 //! Engine state for the com-amazonaws-resiliencehub-awsresiliencehub service.
 
-use crate::ops::types::{App, AppComponent, ResiliencyPolicy};
+use crate::ops::types::{App, AppComponent, LogicalResourceId, PhysicalResource, ResiliencyPolicy};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 /// The region every minted ARN falls back to when the request carries no usable
@@ -50,6 +50,15 @@ pub const MAX_PUBLISHED_APP_VERSIONS_PER_APP: usize = 200;
 /// resource cannot be created because a limit is reached.
 pub const MAX_APP_COMPONENTS_PER_APP_VERSION: usize = 200;
 
+/// The most physical resources this emulator stores in ONE app version.
+///
+/// A MEMORY BOUND, not an AWS quota, for the same reason as [`MAX_APPS`]:
+/// `CreateAppVersionResource` is reachable by any caller and stores a
+/// caller-sized record per call. Past it the operation answers its own modelled
+/// `ServiceQuotaExceededException` (HTTP 402) — the channel AWS uses when a
+/// resource cannot be created because a limit is reached.
+pub const MAX_RESOURCES_PER_APP_VERSION: usize = 200;
+
 /// The modelled `@length` of `AdditionalInfoValueList` — the value list of every
 /// `AdditionalInfoMap` entry — transcribed from the model (`smithy_query
 /// query="shape" shape="AdditionalInfoMap"`: `value` targets
@@ -83,6 +92,14 @@ pub struct AppVersionContents {
     /// built on it) needs one stable order across calls. At most
     /// [`MAX_APP_COMPONENTS_PER_APP_VERSION`] entries.
     pub app_components: BTreeMap<String, AppComponent>,
+    /// The version's physical resources, keyed by [`logical_resource_key`] of the
+    /// `logicalResourceId` they were created with — the member the model makes
+    /// REQUIRED on both `CreateAppVersionResource`'s input and `PhysicalResource`,
+    /// and so the one that identifies a resource within one app version. A
+    /// `BTreeMap` for the same reason `app_components` is one: a reader needs one
+    /// stable order across calls. At most [`MAX_RESOURCES_PER_APP_VERSION`]
+    /// entries.
+    pub resources: BTreeMap<String, PhysicalResource>,
     /// The `versionName` the `PublishAppVersion` call that minted this version
     /// carried, when it named one — the modelled `AppVersionSummary$versionName`.
     /// Always `None` for the draft, which nobody names.
@@ -106,7 +123,49 @@ impl AppVersionContents {
     /// resource, an app template body) means adding it to this test rather than
     /// to each caller of it.
     pub fn is_empty(&self) -> bool {
-        self.app_components.is_empty()
+        self.app_components.is_empty() && self.resources.is_empty()
+    }
+
+    /// The resource this version holds under `logical` — the exact
+    /// `logicalResourceId` it was created with.
+    pub fn resource_by_logical_id(&self, logical: &LogicalResourceId) -> Option<&PhysicalResource> {
+        self.resources.get(&logical_resource_key(logical))
+    }
+
+    /// The resource this version holds under the name `resource_name`, in the
+    /// map's stable order.
+    pub fn resource_by_name(&self, resource_name: &str) -> Option<&PhysicalResource> {
+        self.resources
+            .values()
+            .find(|resource| resource.resource_name.as_deref() == Some(resource_name))
+    }
+
+    /// The resource this version holds for the physical identifier `identifier`,
+    /// narrowed to `aws_region` and `aws_account_id` when the caller named them —
+    /// the three members `DescribeAppVersionResource` addresses a resource by its
+    /// physical id with.
+    pub fn resource_by_physical_id(
+        &self,
+        identifier: &str,
+        aws_region: Option<&str>,
+        aws_account_id: Option<&str>,
+    ) -> Option<&PhysicalResource> {
+        self.resources.values().find(|resource| {
+            let physical = &resource.physical_resource_id;
+            physical.identifier == identifier
+                && aws_region.is_none_or(|region| physical.aws_region.as_deref() == Some(region))
+                && aws_account_id
+                    .is_none_or(|account| physical.aws_account_id.as_deref() == Some(account))
+        })
+    }
+
+    /// The Application Component of this version the caller names, by the `name`
+    /// the model gives `AppComponentNameList`'s members or by the `id` it is
+    /// stored under.
+    pub fn app_component_named(&self, name: &str) -> Option<&AppComponent> {
+        self.app_components
+            .values()
+            .find(|component| component.name == name || component.id.as_deref() == Some(name))
     }
 }
 
@@ -303,6 +362,54 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsResiliencehubAwsresiliencehubState>)
+}
+
+/// The key [`AppVersionContents::resources`] stores a physical resource under: its
+/// whole `logicalResourceId`, which is what addresses one resource within one app
+/// version.
+///
+/// EVERY member of the logical id takes part, each length-prefixed, so two logical
+/// ids that differ only in where text falls across members (`identifier` `a/b` with
+/// no stack vs `identifier` `a` in stack `b`) cannot collide on one key. A member the
+/// caller left out is a distinct `-`, so an absent member and an empty one are not
+/// the same key either.
+pub fn logical_resource_key(logical: &LogicalResourceId) -> String {
+    [
+        Some(logical.identifier.as_str()),
+        logical.logical_stack_name.as_deref(),
+        logical.resource_group_name.as_deref(),
+        logical.terraform_source_name.as_deref(),
+        logical.eks_source_name.as_deref(),
+    ]
+    .iter()
+    .map(|member| match member {
+        Some(member) => format!("{}:{member}", member.len()),
+        None => "-".to_string(),
+    })
+    .collect::<Vec<_>>()
+    .join("/")
+}
+
+/// The REGION and ACCOUNT an ARN names, each `None` when the ARN carries none
+/// (a global service's ARN leaves the region empty), when `arn` is not an ARN at
+/// all, or when the segment would not satisfy the model's own `AwsRegion` /
+/// `CustomerId` pattern — the patterns the two members this feeds
+/// (`PhysicalResourceId$awsRegion`, `$awsAccountId`) are constrained by.
+pub fn arn_region_and_account(arn: &str) -> (Option<&str>, Option<&str>) {
+    let mut segments = arn.split(':');
+    if segments.next() != Some("arn") {
+        return (None, None);
+    }
+    // partition, then service.
+    let (_, _) = (segments.next(), segments.next());
+    let region = segments
+        .next()
+        .filter(|region| region_matches_modeled_arn(region));
+    let account = segments.next().filter(|account| {
+        // `CustomerId`'s modelled pattern, `^[0-9]{12}$`.
+        account.len() == 12 && account.bytes().all(|byte| byte.is_ascii_digit())
+    });
+    (region, account)
 }
 
 /// The idempotency-map key for `operation`'s `client_token`.

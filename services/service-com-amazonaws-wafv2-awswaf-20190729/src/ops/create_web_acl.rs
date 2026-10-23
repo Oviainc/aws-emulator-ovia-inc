@@ -292,18 +292,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A rule group can only be referenced by a rule's own top-level statement,
-        // which is judged before any reference is resolved.
-        if let Some(reason) = crate::state::misplaced_rule_group_reference(
+        // A rule group — managed or customer-owned — can only be run by a rule's own
+        // top-level statement, which is judged before any reference is resolved.
+        if let Some((field, reason)) = crate::state::misplaced_rule_group_statement(
             input.rules.as_deref().unwrap_or_default(),
             true,
         ) {
             return Err(CreateWebACLErrorModeled::WAFInvalidParameterException(
-                crate::state::invalid_parameter_exception(
-                    crate::state::FIELD_RULE_GROUP_REFERENCE_STATEMENT,
-                    "Rules",
-                    &reason,
-                ),
+                crate::state::invalid_parameter_exception(field, "Rules", &reason),
             )
             .into());
         }

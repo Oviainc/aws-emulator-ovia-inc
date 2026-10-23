@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op InvokeAsync
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `InvokeAsync`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`InvokeAsync::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Invokes a function asynchronously: the event is validated against the function this
+//! store holds and queued against the version it was addressed to, and the call answers
+//! the documented "202 Accepted", which "indicates that the request is queued for
+//! invocation" (the model's own `InvokeAsyncResponse` documentation) and says nothing
+//! about the run. The queued event is persisted on the function record; this emulator
+//! has no in-process runtime for a deployment package, so the queue entry settles into
+//! its failed outcome once its delivery attempt is due, carrying the reason it never
+//! ran, and no result, log tail or duration is ever reported for it.
 //!
 //! ## Shape of an operation
 //!
@@ -240,18 +239,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `InvokeAsync` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(InvokeAsyncErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("InvokeAsync"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(InvokeAsyncErrorModeled::ServiceException(ServiceException {
+                r#type: None,
+                message: Some("Lambda state is not reachable on this engine".to_string()),
+            })
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // `InvokeAsync` carries no `Qualifier` parameter of its own, so the only
+        // qualifier it can name is the one its `FunctionName` carries, exactly as the
+        // member's pattern allows.
+        let (record, version) =
+            crate::state::resolve_function(&mut store, &input.function_name, None, &region, now)
+                .map_err(|failure| match failure {
+                    // A `FunctionName` the model's pattern admits but that names no
+                    // documented resource form is a bad request this operation models no
+                    // error for, so it is refused as a 400 `ValidationException` rather
+                    // than with a 501.
+                    crate::state::ResolveFailure::Malformed(message) => {
+                        crate::scaffolded::Scaffolded::validation(message)
+                    }
+                    crate::state::ResolveFailure::NotFound(message) => {
+                        InvokeAsyncErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException {
+                                r#type: None,
+                                message: Some(message),
+                            },
+                        )
+                        .into()
+                    }
+                })?;
+
+        // The model documents the provisioning window on `CreateFunction` ("During this
+        // time, you can't invoke or modify the function") and on `StateReasonCode`
+        // ("When the code is Creating, you can't invoke or modify the function"), so an
+        // invocation that arrives inside it is refused rather than queued.
+        if record.state != crate::state::STATE_ACTIVE {
+            return Err(InvokeAsyncErrorModeled::ResourceConflictException(
+                ResourceConflictException {
+                    r#type: None,
+                    message: Some(format!(
+                        "The operation cannot be performed at this time. The function is \
+                         currently in the following state: {}",
+                        record.state
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "The payload limit is 256KB. For larger payloads, for up to 1MB, use Invoke."
+        // `RequestTooLargeException` is not among this operation's modelled errors, and
+        // the invocation payload ceiling is a published Lambda quota, so the request
+        // that would exceed it is refused with the modelled "request would exceed a
+        // service quota".
+        if input.invoke_args.len() > MAX_INVOKE_ASYNC_PAYLOAD_BYTES {
+            return Err(InvokeAsyncErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    r#type: None,
+                    message: Some(format!(
+                        "InvokeArgs must be smaller than {MAX_INVOKE_ASYNC_PAYLOAD_BYTES} \
+                         bytes for InvokeAsync; use Invoke for a larger payload"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "The JSON that you want to provide to your Lambda function as input": a body
+        // that is not JSON is refused with the modelled 400, and an empty one is the
+        // no-event invocation, exactly as `Invoke` treats its own payload.
+        if !input.invoke_args.is_empty()
+            && ::serde_json::from_slice::<::serde_json::Value>(&input.invoke_args).is_err()
+        {
+            return Err(InvokeAsyncErrorModeled::InvalidRequestContentException(
+                InvalidRequestContentException {
+                    r#type: None,
+                    message: Some("Could not parse request body into json".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Queueing the event is the whole of what this call promises, and it is what is
+        // persisted: "A success response (202 Accepted) indicates that the request is
+        // queued for invocation." Nothing about the run is reported, because nothing has
+        // run — the queue entry records that outcome itself once its delivery attempt
+        // comes due (see `FunctionRecord::materialize`).
+        record.queue_async_invocation(&version, input.invoke_args, now);
+
+        Ok(InvokeAsyncOutput {
+            status: ACCEPTED_STATUS,
+        })
     }
 }
+
+/// The `Status` an accepted asynchronous invocation answers with, which the model's own
+/// `InvokeAsyncResponse` documentation states: "A success response (202 Accepted)
+/// indicates that the request is queued for invocation." It is also the operation's
+/// `@http(code: 202)`, so the bound `Status` member and the HTTP status agree.
+const ACCEPTED_STATUS: i32 = 202;
+
+/// "The payload limit is 256KB" (the model's own `InvokeAsync` documentation).
+const MAX_INVOKE_ASYNC_PAYLOAD_BYTES: usize = 256 * 1024;

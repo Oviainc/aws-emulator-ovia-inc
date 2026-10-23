@@ -334,40 +334,75 @@ pub fn artifact_store(
 }
 
 /// `#{namespace.key}` placeholders resolved against the variables an execution has
-/// already produced.
+/// already produced, up to [`super::MAX_RESOLVED_CONFIGURATION_VALUE_BYTES`].
 ///
 /// CodePipeline's variable syntax is `#{<namespace>.<key>}`, with the pipeline-level
 /// variables under the `variables` namespace and an action's output variables under the
 /// namespace that action declares. A placeholder naming a variable the execution does
 /// not carry is left exactly as written, so the action sees (and can fail on) the
 /// unresolved reference rather than an empty string.
+///
+/// The resolved text is accumulated against the SAME byte budget the stored-record
+/// reader applies ([`super::MAX_RESOLVED_CONFIGURATION_VALUE_BYTES`]), checked as the
+/// text is built: a value whose resolution would pass it is answered UNRESOLVED (the
+/// stored text, verbatim) rather than allocated, so the allocation one request can drive
+/// is bounded by a stated figure however many placeholders a configuration value carries
+/// and however long a reported variable is. A replacement is never re-scanned either, so
+/// no chain of references can amplify one request.
 pub fn resolve_placeholders(value: &str, variables: &BTreeMap<String, String>) -> String {
+    let budget = super::MAX_RESOLVED_CONFIGURATION_VALUE_BYTES;
     let mut resolved = String::with_capacity(value.len());
     let mut rest = value;
     while let Some(start) = rest.find("#{") {
-        resolved.push_str(&rest[..start]);
+        let before = &rest[..start];
         let after = &rest[start + 2..];
-        match after.find('}') {
-            Some(end) => {
-                let name = &after[..end];
-                match variables.get(name) {
-                    Some(replacement) => resolved.push_str(replacement),
-                    None => {
-                        resolved.push_str("#{");
-                        resolved.push_str(name);
-                        resolved.push('}');
-                    }
-                }
-                rest = &after[end + 1..];
-            }
+        let Some(end) = after.find('}') else {
+            // An unterminated `#{`: the rest of the value is literal text.
+            break;
+        };
+        let name = &after[..end];
+        let substitution = variables.get(name).map(String::as_str);
+        // A placeholder the execution has no value for keeps its own text, which is what
+        // the budget then has to account for.
+        let substituted = substitution.map_or(name.len() + 3, str::len);
+        if resolved.len() + before.len() + substituted > budget {
+            return value.to_string();
+        }
+        resolved.push_str(before);
+        match substitution {
+            Some(replacement) => resolved.push_str(replacement),
             None => {
-                resolved.push_str(&rest[start..]);
-                rest = "";
+                resolved.push_str("#{");
+                resolved.push_str(name);
+                resolved.push('}');
             }
         }
+        rest = &after[end + 1..];
+    }
+    if resolved.len() + rest.len() > budget {
+        return value.to_string();
     }
     resolved.push_str(rest);
     resolved
+}
+
+/// One declared action's configuration as an execution RESOLVED it: every
+/// `#{namespace.key}` placeholder replaced by the value that execution carries for it.
+///
+/// One helper for both readers of a configuration — the engine that runs the action
+/// ([`super::driver`]) and the job worker that is served it ([`super::jobs`]) — so the
+/// configuration the worker reads and the one the engine runs with cannot drift.
+pub fn resolved_configuration(
+    action: &ActionDeclaration,
+    variables: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    action
+        .configuration
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(key, value)| (key, resolve_placeholders(&value, variables)))
+        .collect()
 }
 
 /// The `StageState` list `GetPipelineState` reports for one pipeline.

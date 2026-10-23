@@ -240,18 +240,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "You cannot use a rule group reference statement inside another rule
-        // group" (`RuleGroupReferenceStatement`'s own doc), so no rule of THIS rule
-        // group may carry one, nested or not.
-        if let Some(reason) = crate::state::misplaced_rule_group_reference(
+        // group" (`RuleGroupReferenceStatement`'s own doc), and "you cannot use a
+        // managed rule group inside another rule group" (`ManagedRuleGroupStatement`'s),
+        // so no rule of THIS rule group may carry either, nested or not.
+        if let Some((field, reason)) = crate::state::misplaced_rule_group_statement(
             input.rules.as_deref().unwrap_or_default(),
             false,
         ) {
             return Err(CreateRuleGroupErrorModeled::WAFInvalidParameterException(
-                crate::state::invalid_parameter_exception(
-                    crate::state::FIELD_RULE_GROUP_REFERENCE_STATEMENT,
-                    "Rules",
-                    &reason,
-                ),
+                crate::state::invalid_parameter_exception(field, "Rules", &reason),
             )
             .into());
         }

@@ -16,7 +16,7 @@
 
 use serde_json::{json, Value};
 
-use crate::comprehend_client::{error_code, error_message, Comprehend};
+use crate::comprehend_client::{error_code, error_message, Comprehend, ACCOUNT_ID, REGION};
 
 /// The error code every refusal in this file answers with.
 const VALIDATION_EXCEPTION: &str = "ValidationException";
@@ -132,8 +132,13 @@ async fn a_value_inside_a_published_range_bound_is_not_refused() {
     // Each published bound of each `@range` member, and a value between them: a
     // bound is INCLUSIVE, so none of these is a validation error. Each row states
     // the status it must get instead: `ListSentimentDetectionJobs` is implemented
-    // and answers 200, while `CreateEndpoint` is still scaffolded and answers 501
-    // `NotImplemented` — either way the request was not refused as invalid.
+    // and answers 200, while `CreateEndpoint` gets past validation and is then
+    // refused for the model it names — a classifier this store does not hold — with
+    // 404 `ResourceNotFoundException`. Either way the request was not refused as
+    // invalid.
+    let absent_model = format!(
+        "arn:aws:comprehend:{REGION}:{ACCOUNT_ID}:document-classifier/absent-classifier"
+    );
     for (case, operation, body, expected_status, expected_code) in [
         (
             "MaxResults at the minimum",
@@ -159,16 +164,24 @@ async fn a_value_inside_a_published_range_bound_is_not_refused() {
         (
             "DesiredInferenceUnits at the minimum",
             "CreateEndpoint",
-            json!({ "EndpointName": "endpoint", "DesiredInferenceUnits": 1 }),
-            501,
-            Some("NotImplemented"),
+            json!({
+                "EndpointName": "endpoint",
+                "ModelArn": absent_model.clone(),
+                "DesiredInferenceUnits": 1,
+            }),
+            404,
+            Some("ResourceNotFoundException"),
         ),
         (
             "DesiredInferenceUnits far above the minimum",
             "CreateEndpoint",
-            json!({ "EndpointName": "endpoint", "DesiredInferenceUnits": 4096 }),
-            501,
-            Some("NotImplemented"),
+            json!({
+                "EndpointName": "endpoint",
+                "ModelArn": absent_model.clone(),
+                "DesiredInferenceUnits": 4096,
+            }),
+            404,
+            Some("ResourceNotFoundException"),
         ),
     ] {
         let (status, response) = comprehend.call(operation, &body).await;

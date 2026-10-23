@@ -172,6 +172,22 @@ impl Emulator {
         .await
     }
 
+    /// `UpdateComponentType`: PUT on the component type's own path, with the
+    /// members the patch names in the body.
+    pub(crate) async fn update_component_type(
+        &self,
+        workspace_id: &str,
+        component_type_id: &str,
+        body: Value,
+    ) -> Resp {
+        self.call(
+            "PUT",
+            &format!("/workspaces/{workspace_id}/component-types/{component_type_id}"),
+            Some(body),
+        )
+        .await
+    }
+
     pub(crate) async fn get_component_type(
         &self,
         workspace_id: &str,

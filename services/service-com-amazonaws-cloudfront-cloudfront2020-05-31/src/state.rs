@@ -10,6 +10,11 @@
 //! created under it — so a create or update followed by a get, a list, a tag read or a
 //! delete answers from the one record rather than from the request that is being served.
 //!
+//! The same holds for every other resource kind this store carries — a key value store, a
+//! response headers policy: each record is put there by the call that creates it and is
+//! what every later read of that resource answers from. A response headers policy has no
+//! status member and no propagation deadline, so nothing about one is owed by the clock.
+//!
 //! Two things in here are owed by the CLOCK rather than by a call:
 //!
 //! * a distribution CloudFront has just created or reconfigured is `InProgress` until
@@ -34,13 +39,17 @@ use std::time::{Duration, SystemTime};
 // this list, which every operation added to this service edits.
 use crate::ops::types::{
     ActiveTrustedKeyGroups, ActiveTrustedSigners, AllowedMethods, CacheBehavior, CacheBehaviors,
-    CachedMethods, CustomErrorResponse, CustomErrorResponses, CustomOriginConfig,
+    CachedMethods, CloudFrontOriginAccessIdentity, CloudFrontOriginAccessIdentityConfig,
+    CustomErrorResponse, CustomErrorResponses, CustomOriginConfig,
     DefaultCacheBehavior, Distribution, DistributionConfig, DistributionSummary,
     EntityAlreadyExists, EntityNotFound, ForwardedValues, FunctionAssociations, GeoRestriction,
-    Invalidation, InvalidationBatch, InvalidTagging, KGKeyPairIds, KeyPairIds, KeyValueStore,
-    LambdaFunctionAssociations, LoggingConfig, NoSuchDistribution, NoSuchInvalidation,
-    NoSuchResource, Origin, OriginSslProtocols, Paths, Restrictions, Signer, Tag, Tags,
-    TrustedKeyGroups, TrustedSigners, ViewerCertificate,
+    Invalidation, InvalidationBatch, InvalidationSummary, InvalidTagging, KGKeyPairIds, KeyPairIds,
+    KeyValueStore,
+    LambdaFunctionAssociations, LoggingConfig, NoSuchCloudFrontOriginAccessIdentity,
+    NoSuchDistribution, NoSuchInvalidation,
+    NoSuchResource, NoSuchResponseHeadersPolicy, Origin, OriginSslProtocols, Paths,
+    ResponseHeadersPolicy, ResponseHeadersPolicyAlreadyExists, ResponseHeadersPolicyConfig,
+    Restrictions, Signer, Tag, Tags, TrustedKeyGroups, TrustedSigners, ViewerCertificate,
 };
 
 /// `Distribution$Status` while a configuration is still propagating to the edge
@@ -190,6 +199,36 @@ pub const KVS_PROVISIONING_DELAY: Duration = Duration::from_millis(500);
 /// plane's own ceiling on distinct stores, so a store this service accepts is one that
 /// service can also hold.
 pub const MAX_KEY_VALUE_STORES: usize = 1_000;
+
+/// The most origin access identities this emulator holds.
+///
+/// CloudFront's published quota is 100 origin access identities per account, and the
+/// operation models `TooManyCloudFrontOriginAccessIdentities` — "Processing your request
+/// would cause you to exceed the maximum number of origin access identities allowed" —
+/// for a create that would exceed it. An identity record is what a later read answers
+/// from, so it cannot be evicted: the create path is refused at this entry count rather
+/// than growing further.
+pub const MAX_ORIGIN_ACCESS_IDENTITIES: usize = 100;
+
+/// How many lowercase-hex characters an Amazon S3 canonical user id is written in.
+///
+/// `CloudFrontOriginAccessIdentity$S3CanonicalUserId` is "The Amazon S3 canonical user ID
+/// for the origin access identity, used when giving the origin access identity read
+/// permission to an object in Amazon S3", and S3 writes a canonical user id as 64
+/// lowercase hex characters — the form a bucket ACL grantee takes, which is what makes
+/// the shape part of the contract rather than cosmetic.
+pub const S3_CANONICAL_USER_ID_LEN: usize = 64;
+
+/// The most response headers policies this emulator holds.
+///
+/// CHOSEN by this emulator, for the same reason as [`MAX_KEY_VALUE_STORES`]: a policy
+/// record is what a later read answers from, so it cannot be evicted, and the create path
+/// is refused at this entry count with the modelled `TooManyResponseHeadersPolicies`
+/// ("You have reached the maximum number of response headers policies for this Amazon Web
+/// Services account") instead of growing further. CloudFront's own ceiling is an account
+/// quota that can be raised and the model states no number, so this bound is the
+/// emulator's rather than a claim about the service.
+pub const MAX_RESPONSE_HEADERS_POLICIES: usize = 1_000;
 
 /// The `PriceClass` reported for a distribution whose stored configuration names none:
 /// the class that covers every CloudFront edge location, which is what
@@ -435,6 +474,34 @@ pub fn tags_projection(tags: &TagSet) -> Tags {
     }
 }
 
+/// Add `added` to the tag set `into`, or report the REASON the resulting tag set is one
+/// no resource can carry.
+///
+/// The ADD rule for every resource kind this service tags: a tagging call associates the
+/// tags it names with the resource, so a key the resource already carries takes the value
+/// the call names and every other key the resource carries is left exactly as it was —
+/// adding tags is not replacing the tag set. The resulting set is still bounded by
+/// [`MAX_TAGS_PER_RESOURCE`], counted over the UNION of the keys (a call that only
+/// changes the values of keys the resource already carries adds nothing to the count).
+///
+/// All-or-nothing: the bound is decided before anything is written, so a refused add
+/// leaves `into` exactly as it was. The reason carries no error wording of its own, for
+/// the same reason [`tag_set`]'s does not: each caller prefixes it with the wording of
+/// whichever refusal its own model declares.
+pub fn merge_tags(into: &mut TagSet, added: TagSet) -> Result<(), String> {
+    // The keys `added` contributes are the ones the resource does not carry yet, so the
+    // union is counted without building a second set of every key.
+    let resulting = into.len() + added.keys().filter(|key| !into.contains_key(*key)).count();
+    if resulting > MAX_TAGS_PER_RESOURCE {
+        return Err(format!(
+            "a CloudFront resource carries at most {MAX_TAGS_PER_RESOURCE} tags but the \
+             request would leave it carrying {resulting}"
+        ));
+    }
+    into.extend(added);
+    Ok(())
+}
+
 /// The modelled `InvalidTagging` for a tag set no resource can carry, wording `reason`
 /// as that error documents itself — "The tagging specified is not valid."
 pub fn invalid_tagging(reason: String) -> InvalidTagging {
@@ -478,6 +545,18 @@ impl StoredInvalidation {
             status: self.status.clone(),
             create_time: ::aws_smithy_types::DateTime::from(self.create_time),
             invalidation_batch: self.batch.clone(),
+        }
+    }
+
+    /// The `InvalidationSummary` projection a list page carries — "a summary of an
+    /// invalidation request" — read from the SAME stored record
+    /// [`StoredInvalidation::to_invalidation`] reports, so a summary and a read of the
+    /// same invalidation can never disagree about its status or its creation time.
+    pub fn to_summary(&self) -> InvalidationSummary {
+        InvalidationSummary {
+            id: self.id.clone(),
+            create_time: ::aws_smithy_types::DateTime::from(self.create_time),
+            status: self.status.clone(),
         }
     }
 }
@@ -528,6 +607,29 @@ impl StoredDistribution {
                 invalidation.status = STATUS_COMPLETED.to_string();
             }
         }
+    }
+
+    /// This distribution's invalidations in the order a list serves them.
+    ///
+    /// CloudFront documents the order on `ListInvalidations`'s `Marker`: "the results are
+    /// returned in decreasing order from most recent to oldest, [so] the most recent
+    /// results are on the first page". Two invalidations stamped with the SAME instant are
+    /// ordered by id, which makes this a stable TOTAL order rather than merely a sorted
+    /// one — and that is what lets a `Marker` naming one of them resume at exactly one
+    /// position.
+    ///
+    /// Reads [`StoredInvalidation::status`] nowhere, so the caller decides whether to
+    /// settle the clock first; every list handler does, because the summaries it builds
+    /// from these records report that status.
+    pub fn invalidations_most_recent_first(&self) -> Vec<&StoredInvalidation> {
+        let mut ordered: Vec<&StoredInvalidation> = self.invalidations.values().collect();
+        ordered.sort_by(|left, right| {
+            right
+                .create_time
+                .cmp(&left.create_time)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        ordered
     }
 
     /// "The number of invalidation batches currently in progress" — counted from the
@@ -818,6 +920,85 @@ impl StoredKeyValueStore {
     }
 }
 
+/// One CloudFront origin access identity, as this emulator persists it.
+///
+/// The record is the single source of truth for the identity's id, its S3 canonical user
+/// id, its version token and its configuration as submitted, so the create, a later
+/// `GetCloudFrontOriginAccessIdentity` and a later `GetCloudFrontOriginAccessIdentityConfig`
+/// all answer from it rather than from the request being served.
+///
+/// An identity carries NO status: CloudFront answers a create with the identity ready to
+/// be named in a bucket policy, so there is no transition the clock owes one and nothing
+/// here for [`ComAmazonawsCloudfrontCloudfront20200531State::settle`] to materialise.
+#[derive(Debug, Clone)]
+pub struct StoredOriginAccessIdentity {
+    /// `CloudFrontOriginAccessIdentity$Id` — "The ID for the origin access identity":
+    /// the token minted at creation, which is also the key this record is held under and
+    /// the path segment its `Location` names.
+    pub id: String,
+    /// `CloudFrontOriginAccessIdentity$S3CanonicalUserId` — the canonical user id a
+    /// bucket policy or ACL names to grant this identity read access, minted with the
+    /// identity and fixed for its whole life.
+    pub s3_canonical_user_id: String,
+    /// The version token the last mutation handed back, and the single source of truth
+    /// for every `If-Match` check against this identity.
+    pub etag: String,
+    /// The configuration as submitted. Both of its members are required on the wire, so
+    /// there is nothing for the service to resolve into it: a later read answers with
+    /// what was stored.
+    pub config: CloudFrontOriginAccessIdentityConfig,
+}
+
+impl StoredOriginAccessIdentity {
+    /// The `CloudFrontOriginAccessIdentity` projection every identity operation returns,
+    /// read from the one stored record.
+    pub fn to_identity(&self) -> CloudFrontOriginAccessIdentity {
+        CloudFrontOriginAccessIdentity {
+            id: self.id.clone(),
+            s3_canonical_user_id: self.s3_canonical_user_id.clone(),
+            cloud_front_origin_access_identity_config: Some(self.config.clone()),
+        }
+    }
+}
+
+/// One CloudFront response headers policy, as this emulator persists it.
+///
+/// The record is the single source of truth for the policy's id, the configuration it
+/// was created with, its `LastModifiedTime` and its version token, so the create and
+/// every later read answer from it rather than from the request being served.
+///
+/// Nothing in here is owed by the CLOCK: the model's `ResponseHeadersPolicy` is `Id`,
+/// `LastModifiedTime` and `ResponseHeadersPolicyConfig` only — a policy carries no status
+/// and no propagation deadline, so a policy this service accepts is immediately complete.
+#[derive(Debug, Clone)]
+pub struct StoredResponseHeadersPolicy {
+    /// `ResponseHeadersPolicy$Id` — the identifier minted when the policy was created,
+    /// and the key the policy is held under.
+    pub id: String,
+    /// The configuration as submitted — "Contains metadata about the response headers
+    /// policy, and a set of configurations that specify the HTTP headers." Stored whole,
+    /// so a read reports what was stored rather than re-deriving anything from a request.
+    pub config: ResponseHeadersPolicyConfig,
+    /// `ResponseHeadersPolicy$LastModifiedTime` — "The date and time when the response
+    /// headers policy was last modified."
+    pub last_modified_time: SystemTime,
+    /// The version token the last mutation handed back, and the single source of truth
+    /// for every `If-Match` check against this policy.
+    pub etag: String,
+}
+
+impl StoredResponseHeadersPolicy {
+    /// The `ResponseHeadersPolicy` projection every response headers policy operation
+    /// returns, read from the one stored record.
+    pub fn to_response_headers_policy(&self) -> ResponseHeadersPolicy {
+        ResponseHeadersPolicy {
+            id: self.id.clone(),
+            last_modified_time: ::aws_smithy_types::DateTime::from(self.last_modified_time),
+            response_headers_policy_config: self.config.clone(),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-cloudfront-cloudfront2020-05-31. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCloudfrontCloudfront20200531State {
@@ -835,6 +1016,15 @@ pub struct ComAmazonawsCloudfrontCloudfront20200531State {
     /// and a repeated name an `EntityAlreadyExists`. A `BTreeMap` for the same reason as
     /// `distributions`: one stable total order for a listing to page through.
     pub key_value_stores: BTreeMap<String, StoredKeyValueStore>,
+    /// Every origin access identity this emulator holds, keyed by its id. A `BTreeMap`
+    /// for the same reason as `distributions`: one stable total order for a listing to
+    /// page through.
+    pub origin_access_identities: BTreeMap<String, StoredOriginAccessIdentity>,
+    /// Every response headers policy this emulator holds, keyed by its minted id — the
+    /// identifier every response headers policy operation addresses one by. A `BTreeMap`
+    /// for the same reason as `distributions`: one stable total order for a listing to
+    /// page through.
+    pub response_headers_policies: BTreeMap<String, StoredResponseHeadersPolicy>,
 }
 
 impl ComAmazonawsCloudfrontCloudfront20200531State {
@@ -853,9 +1043,50 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         self.key_value_stores.get(name)
     }
 
+    /// The origin access identity `id` names, or `None` when the store holds none.
+    pub fn origin_access_identity(&self, id: &str) -> Option<&StoredOriginAccessIdentity> {
+        self.origin_access_identities.get(id)
+    }
+
+    /// The origin access identity created under `caller_reference`, or `None` when no
+    /// identity was.
+    ///
+    /// A scan over the identities rather than a second index beside them: the stored
+    /// records are the single source of truth for which references are taken, so a scan
+    /// cannot drift out of step with them, and the collection is bounded by
+    /// [`MAX_ORIGIN_ACCESS_IDENTITIES`].
+    pub fn origin_access_identity_by_caller_reference(
+        &self,
+        caller_reference: &str,
+    ) -> Option<&StoredOriginAccessIdentity> {
+        self.origin_access_identities
+            .values()
+            .find(|identity| identity.config.caller_reference == caller_reference)
+    }
+
     /// The distribution `id` names, or `None` when the store holds none.
     pub fn distribution(&self, id: &str) -> Option<&StoredDistribution> {
         self.distributions.get(id)
+    }
+
+    /// The response headers policy `id` names, or `None` when the store holds none.
+    pub fn response_headers_policy(&self, id: &str) -> Option<&StoredResponseHeadersPolicy> {
+        self.response_headers_policies.get(id)
+    }
+
+    /// The response headers policy whose STORED configuration carries `name`, or `None`.
+    ///
+    /// `ResponseHeadersPolicyConfig$Name`: "The name must be unique for response headers
+    /// policies in this Amazon Web Services account" — so at most one policy answers,
+    /// and this is what makes a repeated name a conflict rather than a second policy.
+    /// The comparison is against the stored configuration, never against a request.
+    pub fn response_headers_policy_named(
+        &self,
+        name: &str,
+    ) -> Option<&StoredResponseHeadersPolicy> {
+        self.response_headers_policies
+            .values()
+            .find(|policy| policy.config.name == name)
     }
 
     /// The tag set of the resource `arn` names, across every resource kind this store
@@ -878,6 +1109,27 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             .values()
             .find(|store| store.arn == arn)
             .map(|store| &store.tags)
+    }
+
+    /// The tag set of the resource `arn` names, MUTABLY, so a tagging call writes the
+    /// very set a tag read reports rather than a second copy of it.
+    ///
+    /// Resolves the ARN exactly as [`ComAmazonawsCloudfrontCloudfront20200531State::tags_for_resource`]
+    /// does — across every resource kind this store holds, comparing against the STORED
+    /// ARN — so a tagging call and a tag read can never disagree about which resource an
+    /// ARN names. `None` is an ARN this emulator holds no resource for.
+    pub fn tags_for_resource_mut(&mut self, arn: &str) -> Option<&mut TagSet> {
+        if let Some(distribution) = self
+            .distributions
+            .values_mut()
+            .find(|distribution| distribution.arn == arn)
+        {
+            return Some(&mut distribution.tags);
+        }
+        self.key_value_stores
+            .values_mut()
+            .find(|store| store.arn == arn)
+            .map(|store| &mut store.tags)
     }
 
     /// Persist a new distribution carrying `config` and `tags`, and report the record
@@ -1028,17 +1280,7 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     /// render distinctly, so the mint never repeats an id.
     pub fn allocate_key_value_store_id(&mut self) -> String {
         loop {
-            let high = self.mint_u64();
-            let low = self.mint_u64();
-            let hex = format!("{high:016x}{low:016x}");
-            let candidate = format!(
-                "{}-{}-{}-{}-{}",
-                &hex[..8],
-                &hex[8..12],
-                &hex[12..16],
-                &hex[16..20],
-                &hex[20..32]
-            );
+            let candidate = self.mint_uuid();
             if !self
                 .key_value_stores
                 .values()
@@ -1047,6 +1289,76 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
                 break candidate;
             }
         }
+    }
+
+    /// Allocate an origin access identity id no stored identity holds.
+    ///
+    /// `CloudFrontOriginAccessIdentity$Id` is "The ID for the origin access identity, for
+    /// example, `E74FTE3AJFJ256A`": the same shape a distribution id and a version token
+    /// take (`E` + [`ID_BODY_LEN`] uppercase alphanumerics), drawn from the same mint, so
+    /// no two identities are minted the same id.
+    pub fn allocate_origin_access_identity_id(&mut self) -> String {
+        loop {
+            let candidate = format!("E{}", self.mint(ID_BODY_LEN));
+            if !self.origin_access_identities.contains_key(&candidate) {
+                break candidate;
+            }
+        }
+    }
+
+    /// Allocate a response headers policy id no stored policy holds.
+    ///
+    /// `ResponseHeadersPolicy$Id` is the identifier every response headers policy
+    /// operation addresses one by, and CloudFront mints a UUID for one (the same shape
+    /// its cache and origin request policy ids take), so this renders one draw of
+    /// [`ComAmazonawsCloudfrontCloudfront20200531State::mint_uuid`] — distinct draws
+    /// render distinctly, so the mint never repeats an id.
+    pub fn allocate_response_headers_policy_id(&mut self) -> String {
+        loop {
+            let candidate = self.mint_uuid();
+            if !self.response_headers_policies.contains_key(&candidate) {
+                break candidate;
+            }
+        }
+    }
+
+    /// Allocate the Amazon S3 canonical user id of an origin access identity, in the
+    /// [`S3_CANONICAL_USER_ID_LEN`] lowercase hex characters S3 writes one in.
+    ///
+    /// Drawn from the same mint as every other generated value here (four draws, 256
+    /// bits, rendered as hex), and checked against the stored identities so no two
+    /// identities share the canonical user id a bucket policy names them by.
+    pub fn allocate_s3_canonical_user_id(&mut self) -> String {
+        loop {
+            let mut candidate = String::with_capacity(S3_CANONICAL_USER_ID_LEN);
+            while candidate.len() < S3_CANONICAL_USER_ID_LEN {
+                candidate.push_str(&format!("{:016x}", self.mint_u64()));
+            }
+            if !self
+                .origin_access_identities
+                .values()
+                .any(|identity| identity.s3_canonical_user_id == candidate)
+            {
+                break candidate;
+            }
+        }
+    }
+
+    /// One fresh UUID from the mint: two draws (128 bits) rendered as the 8-4-4-4-12
+    /// lowercase hex a UUID takes. ONE rendering for every resource CloudFront identifies
+    /// by UUID, so no two of them mint ids in different shapes.
+    fn mint_uuid(&mut self) -> String {
+        let high = self.mint_u64();
+        let low = self.mint_u64();
+        let hex = format!("{high:016x}{low:016x}");
+        format!(
+            "{}-{}-{}-{}-{}",
+            &hex[..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..32]
+        )
     }
 
     /// Allocate the domain name a distribution is served on: a generated label under
@@ -1254,6 +1566,19 @@ pub fn key_value_store_path(name: &str) -> String {
     format!("/2020-05-31/key-value-store/{name}")
 }
 
+/// The path of one origin access identity under this service's API version — the route
+/// `GetCloudFrontOriginAccessIdentity` serves (`/origin-access-identity/cloudfront/{Id}`),
+/// which is therefore the resource the create's `Location` names.
+pub fn origin_access_identity_path(id: &str) -> String {
+    format!("/2020-05-31/origin-access-identity/cloudfront/{id}")
+}
+
+/// The path of a response headers policy resource under this service's API version. The
+/// resource is addressed by ID, as `GetResponseHeadersPolicy`'s `{Id}` label is.
+pub fn response_headers_policy_path(id: &str) -> String {
+    format!("/2020-05-31/response-headers-policy/{id}")
+}
+
 /// The fully qualified URI a `Location` header reports for `path`.
 ///
 /// CloudFront's control API is GLOBAL and served on one endpoint
@@ -1365,6 +1690,22 @@ pub fn same_batch(left: &InvalidationBatch, right: &InvalidationBatch) -> bool {
 /// rendering that hid or truncated a member would make two configurations differing in it
 /// compare equal, and that test fails the moment it does.
 pub fn same_config(left: &DistributionConfig, right: &DistributionConfig) -> bool {
+    format!("{left:?}") == format!("{right:?}")
+}
+
+/// Whether two origin access identity configurations ask for the same thing, which is
+/// what decides whether a repeated `CallerReference` is the same create again or a second
+/// identity under a reference that is already taken.
+///
+/// The same comparison [`same_config`] makes, for the same reasons: every member a caller
+/// can submit takes part, and comparing the DESERIALIZED configurations is what makes it
+/// insensitive to the request document's whitespace and member order — "the content of the
+/// `CloudFrontOriginAccessIdentityConfig` is identical to the original request (ignoring
+/// white space)".
+pub fn same_origin_access_identity_config(
+    left: &CloudFrontOriginAccessIdentityConfig,
+    right: &CloudFrontOriginAccessIdentityConfig,
+) -> bool {
     format!("{left:?}") == format!("{right:?}")
 }
 
@@ -1979,6 +2320,68 @@ pub fn config_quantity_mismatch(config: &DistributionConfig) -> Option<String> {
         .find_map(|(label, quantity, len)| quantity_disagreement(label, *quantity, *len))
 }
 
+/// The modelled `InconsistentQuantities` message for the first list wrapper in a
+/// response headers policy configuration whose `Quantity` disagrees with the length of
+/// its `Items`, or `None` when every wrapper agrees.
+///
+/// The SAME rule [`config_quantity_mismatch`] applies to a distribution configuration:
+/// every CloudFront list travels in a wrapper stating its own length beside the list
+/// itself, and the service refuses a request where the two disagree. This walks all of
+/// the wrappers a `ResponseHeadersPolicyConfig` reaches — the three CORS lists that are
+/// required when `CorsConfig` is named, the optional exposed-headers list, and the
+/// custom-header and remove-header lists.
+pub fn response_headers_policy_quantity_mismatch(
+    config: &ResponseHeadersPolicyConfig,
+) -> Option<String> {
+    let mut counts: Vec<(&'static str, i32, usize)> = Vec::new();
+
+    if let Some(cors) = &config.cors_config {
+        let origins = &cors.access_control_allow_origins;
+        counts.push((
+            "CorsConfig.AccessControlAllowOrigins",
+            origins.quantity,
+            origins.items.len(),
+        ));
+        let headers = &cors.access_control_allow_headers;
+        counts.push((
+            "CorsConfig.AccessControlAllowHeaders",
+            headers.quantity,
+            headers.items.len(),
+        ));
+        let methods = &cors.access_control_allow_methods;
+        counts.push((
+            "CorsConfig.AccessControlAllowMethods",
+            methods.quantity,
+            methods.items.len(),
+        ));
+        if let Some(exposed) = &cors.access_control_expose_headers {
+            counts.push((
+                "CorsConfig.AccessControlExposeHeaders",
+                exposed.quantity,
+                items_len(&exposed.items),
+            ));
+        }
+    }
+    if let Some(custom) = &config.custom_headers_config {
+        counts.push((
+            "CustomHeadersConfig",
+            custom.quantity,
+            items_len(&custom.items),
+        ));
+    }
+    if let Some(remove) = &config.remove_headers_config {
+        counts.push((
+            "RemoveHeadersConfig",
+            remove.quantity,
+            items_len(&remove.items),
+        ));
+    }
+
+    counts
+        .iter()
+        .find_map(|(label, quantity, len)| quantity_disagreement(label, *quantity, *len))
+}
+
 /// The modelled `InconsistentQuantities` message for an invalidation batch whose
 /// `Paths.Quantity` disagrees with the number of paths it carries, or `None`.
 pub fn batch_quantity_mismatch(batch: &InvalidationBatch) -> Option<String> {
@@ -2088,6 +2491,87 @@ pub fn key_value_store_already_exists(name: &str) -> EntityAlreadyExists {
     EntityAlreadyExists {
         message: Some(format!(
             "A key value store with the name {name} already exists in this account"
+        )),
+    }
+}
+
+/// `NoSuchCloudFrontOriginAccessIdentity`'s message: the sentence the model states on the
+/// shape itself, "The specified origin access identity does not exist."
+pub const NO_SUCH_ORIGIN_ACCESS_IDENTITY_MESSAGE: &str =
+    "The specified origin access identity does not exist.";
+
+/// The modelled `NoSuchCloudFrontOriginAccessIdentity` (HTTP 404) for an identity id the
+/// store does not hold.
+///
+/// The id is NOT in the message, for the same reason it is not in
+/// [`no_such_distribution`]'s: the sentence is fixed service text, and the caller already
+/// knows which identity it asked for.
+pub fn no_such_origin_access_identity() -> NoSuchCloudFrontOriginAccessIdentity {
+    NoSuchCloudFrontOriginAccessIdentity {
+        message: Some(NO_SUCH_ORIGIN_ACCESS_IDENTITY_MESSAGE.to_string()),
+    }
+}
+
+/// The sentence `CloudFrontOriginAccessIdentityAlreadyExists` carries, up to the identity
+/// the caller reference is already associated with, which is named at the end — the one
+/// piece of request-derived detail in it, and the one a caller cannot work out for
+/// itself. The same shape [`distribution_already_exists_message`] takes, for the same
+/// rule applied to the other resource.
+pub fn origin_access_identity_already_exists_message(existing_id: &str) -> String {
+    format!(
+        "The caller reference that you are using to create an origin access identity is \
+         associated with another identity. Already exists: {existing_id}"
+    )
+}
+
+/// The longest comment an origin access identity carries.
+///
+/// `CloudFrontOriginAccessIdentityConfig$Comment`: "A comment to describe the origin
+/// access identity. The comment cannot be longer than 128 characters." The member carries
+/// no `@length` in the model, so the bound is not refused before a handler runs and the
+/// create path checks it itself.
+pub const MAX_ORIGIN_ACCESS_IDENTITY_COMMENT: usize = 128;
+
+/// The modelled `InvalidArgument` for an origin access identity comment past
+/// [`MAX_ORIGIN_ACCESS_IDENTITY_COMMENT`].
+///
+/// The message states the CONSTRAINT the request broke and the length it submitted, which
+/// is the rule the refusal is built from rather than text echoed out of the request.
+pub fn comment_too_long(length: usize) -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(format!(
+            "An argument is invalid: the comment cannot be longer than \
+             {MAX_ORIGIN_ACCESS_IDENTITY_COMMENT} characters but the request submits {length}"
+        )),
+    }
+}
+
+/// The modelled `NoSuchResponseHeadersPolicy` (HTTP 404) for a response headers policy
+/// id the store does not hold.
+///
+/// The sentence is the one the model states on the shape itself — "The response headers
+/// policy does not exist." — a property of the store rather than of the request, so
+/// nothing from the request belongs in the text.
+pub fn no_such_response_headers_policy() -> NoSuchResponseHeadersPolicy {
+    NoSuchResponseHeadersPolicy {
+        message: Some(NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE.to_string()),
+    }
+}
+
+/// `NoSuchResponseHeadersPolicy`'s message, as the model documents the shape.
+pub const NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE: &str =
+    "The response headers policy does not exist.";
+
+/// The modelled `ResponseHeadersPolicyAlreadyExists` (HTTP 409) for a policy name that is
+/// already taken — "A response headers policy with this name already exists. You must
+/// provide a unique name. To modify an existing response headers policy, use
+/// UpdateResponseHeadersPolicy."
+pub fn response_headers_policy_already_exists(name: &str) -> ResponseHeadersPolicyAlreadyExists {
+    ResponseHeadersPolicyAlreadyExists {
+        message: Some(format!(
+            "A response headers policy with the name {name} already exists in this account. You \
+             must provide a unique name. To modify an existing response headers policy, use \
+             UpdateResponseHeadersPolicy."
         )),
     }
 }

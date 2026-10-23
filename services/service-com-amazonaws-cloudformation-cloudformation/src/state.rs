@@ -62,7 +62,10 @@
 //! evaluated over them (see [`template`]) — rides on that same clock: the call computes
 //! the deployment ([`StoredStack::deploy_template`]) and `settle` installs it with the
 //! terminal status, so a stack always reports the resources and outputs of the template
-//! that finished deploying.
+//! that finished deploying. An operation that could NOT create a resource it declares
+//! reaches a FAILED terminal status instead ([`StoredStack::fail_transition`]), on the same
+//! clock: a failed create resolves no outputs and reports no identifier for what was never
+//! created, and a failed update leaves the template in force alone.
 //!
 //! CREATING those resources in the services that own them is [`provisioning`], which the
 //! deploying operation drives with no lock held — and which leaves the stack
@@ -76,6 +79,19 @@
 //! activated, and the versions of each (see [`registry`]). It is a store of its own, not a
 //! stack's: nothing in a registry record settles on the stack clock, and `DescribeType`
 //! reads it the way `DescribeStacks` reads the stacks.
+//!
+//! ## Drift detection
+//!
+//! It also holds every DRIFT DETECTION a caller has started ([`StoredDriftDetection`]):
+//! `DetectStackDrift` records one and hands back its id, [`drift`] is what compares each
+//! covered resource against the service that owns it, and
+//! `DescribeStackDriftDetectionStatus` reads the detection's own status back. That status
+//! rides the stack clock — answered `DETECTION_IN_PROGRESS` and concluded
+//! [`DRIFT_DETECTION_DELAY`] later, the way AWS answers a detection that is still running
+//! — while what the check FOUND is recorded as of the check
+//! ([`ComAmazonawsCloudformationCloudformationState::apply_drift_result`]) onto the stack
+//! (`Stack$DriftInformation`) and each resource it covered
+//! (`StackResource$DriftInformation`), where every stack read reports it.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -90,6 +106,14 @@ pub mod template;
 /// One entry per resource type this emulator really creates: which service owns it, and
 /// the create and delete calls that make its resources exist.
 mod provisioner;
+
+/// Detecting whether a stack's resources still match the configuration its template
+/// declared, by reading each one from the service that owns it.
+pub mod drift;
+
+/// Which resource TYPES a template may declare at all: the catalogue CloudFormation
+/// publishes, and the refusal a template declaring anything else is held to.
+pub mod resource_types;
 
 /// The extension registry: the registered and activated extensions this account and
 /// Region holds, and the versions of each.
@@ -113,9 +137,71 @@ pub const ARN_NAMESPACE: &str = "cloudformation";
 /// The resource type CloudFormation reports on a stack-level event.
 pub const STACK_RESOURCE_TYPE: &str = "AWS::CloudFormation::Stack";
 
-/// `StackDriftStatus` for a stack that has never been checked for drift — every stack
-/// here, since drift detection is not implemented.
+/// `StackDriftStatus` for a stack no drift detection has run against yet:
+/// "CloudFormation hasn't checked if the stack differs from its expected template
+/// configuration."
 pub const DRIFT_STATUS_NOT_CHECKED: &str = "NOT_CHECKED";
+
+/// `StackDriftStatus` for a stack whose "actual configuration matches its expected
+/// template configuration".
+pub const DRIFT_STATUS_IN_SYNC: &str = "IN_SYNC";
+
+/// `StackDriftStatus` for a stack that "differs from its expected template
+/// configuration".
+pub const DRIFT_STATUS_DRIFTED: &str = "DRIFTED";
+
+/// `StackDriftStatus` for a stack CloudFormation "could not run drift detection for a
+/// resource in".
+pub const DRIFT_STATUS_UNKNOWN: &str = "UNKNOWN";
+
+/// The `StackResourceDriftStatus` values this service leaves a resource's drift result in
+/// (all from the model's `StackResourceDriftStatus` enum, documented member by member on
+/// `StackResourceDriftInformation$StackResourceDriftStatus`).
+pub mod resource_drift_status {
+    /// "The resource's actual configuration matches its expected configuration."
+    pub const IN_SYNC: &str = "IN_SYNC";
+    /// "The resource differs from its expected configuration."
+    pub const MODIFIED: &str = "MODIFIED";
+    /// "The resource differs from its expected configuration in that it has been
+    /// deleted."
+    pub const DELETED: &str = "DELETED";
+    /// "CloudFormation has not checked if the resource differs from its expected
+    /// configuration. Any resources that do not currently support drift detection have a
+    /// status of NOT_CHECKED."
+    pub const NOT_CHECKED: &str = "NOT_CHECKED";
+    /// The resource's check could not be run at all.
+    pub const UNKNOWN: &str = "UNKNOWN";
+}
+
+/// The model's `StackDriftDetectionStatus`: the status of one drift-detection operation.
+pub mod drift_detection_status {
+    /// "The stack drift detection operation has not yet concluded."
+    pub const DETECTION_IN_PROGRESS: &str = "DETECTION_IN_PROGRESS";
+    /// "The stack drift detection operation has successfully completed for all resources
+    /// in the stack that support drift detection."
+    pub const DETECTION_COMPLETE: &str = "DETECTION_COMPLETE";
+    /// "The stack drift detection operation has failed for at least one resource in the
+    /// stack."
+    pub const DETECTION_FAILED: &str = "DETECTION_FAILED";
+}
+
+/// How long after `DetectStackDrift` the detection's own completion becomes due.
+///
+/// Chosen ("DetectStackDrift can take up to several minutes, depending on the number of
+/// resources contained within the stack", so there is no documented value to honour):
+/// non-zero, so a caller polling `DescribeStackDriftDetectionStatus` straight after the
+/// call still observes `DETECTION_IN_PROGRESS`, and short enough that the poll after it
+/// sees the result.
+pub const DRIFT_DETECTION_DELAY: Duration = Duration::from_millis(250);
+
+/// The most drift-detection results this service retains, oldest reclaimed first.
+///
+/// `DetectStackDrift`: "CloudFormation generates new results, with a new drift detection
+/// ID, each time this operation is run. However, the number of drift results
+/// CloudFormation retains for any given stack, and for how long, may vary." A caller
+/// chooses how many detections it runs, so the store bounds them by count. Chosen, far
+/// above any client workflow.
+pub const MAX_DRIFT_DETECTIONS: usize = 200;
 
 /// `DeploymentConfig$Mode` for a stack operation that did not state one.
 ///
@@ -188,6 +274,20 @@ pub fn validate_template_body(template_body: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// `Err(message)` for a template body declaring a resource type CloudFormation does not
+/// recognise — the rule every operation that SUBMITS a template is held to, before
+/// anything is created ([`resource_types`] is where the recognised set lives).
+///
+/// `Ok(())` for a body this service's reader will not read at all: a body that is neither
+/// JSON nor YAML, or one past a documented per-template quota, declares no resource to
+/// hold to the catalogue and is answered by the template-format rules instead.
+pub fn validate_resource_types(template_body: &str) -> Result<(), String> {
+    match template::parse(template_body) {
+        Some(template) => resource_types::refuse_unrecognized(&template),
+        None => Ok(()),
+    }
+}
+
 /// `StackStatus` values this service puts a stack into (all from the model's
 /// `StackStatus` enum).
 pub mod status {
@@ -211,9 +311,11 @@ pub mod status {
 /// `ResourceStatus` values this service leaves a stack's resource in (all from the
 /// model's `ResourceStatus` enum).
 ///
-/// A stack operation of this service deploys a whole template at once and never fails
-/// part-way, so the only statuses a resource reaches here are the completions of the
-/// operation that created, updated or deleted it.
+/// A stack operation of this service deploys a whole template at once, so the statuses a
+/// resource reaches here are the completions of the operation that created, updated or
+/// deleted it; a deployment that could not provision a resource is reported on the STACK
+/// (`StoredStack::fail_transition`), which does not install that template's resources at
+/// all.
 pub mod resource_status {
     pub const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
     pub const UPDATE_COMPLETE: &str = "UPDATE_COMPLETE";
@@ -313,8 +415,11 @@ pub struct StoredParameter {
 /// One resource a stack's template declares, as this emulator records it.
 ///
 /// The physical resource id and the attributes are what CloudFormation's documented
-/// return values for that resource type give it (see [`template::provision`]); they are
-/// what `Ref` and `Fn::GetAtt` resolve to when the stack's outputs are evaluated.
+/// return values for that resource type give it (see [`template::provision`]), unless the
+/// resource was really CREATED in the service that owns it
+/// ([`provisioning`](crate::state::provisioning)) — then they are what that service
+/// answered and `materialised` records it. They are what `Ref` and `Fn::GetAtt` resolve to
+/// when the stack's outputs are evaluated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredResource {
     pub logical_id: String,
@@ -360,6 +465,31 @@ pub struct DeployedResource {
     /// `StackResource$Timestamp`: "Time the status was updated" — the instant the stack
     /// operation that left this resource in `status` completed.
     pub status_timestamp: SystemTime,
+    /// `StackResourceDriftInformation$StackResourceDriftStatus`: this resource's own drift
+    /// result, as the last drift detection that COMPLETED over it left it
+    /// ([`drift`]). [`resource_drift_status::NOT_CHECKED`] until one has.
+    ///
+    /// A deployment that re-created or changed the resource leaves a new record, so the
+    /// result belongs to the resource as it is now; one a deployment left untouched keeps
+    /// the result it already carried.
+    pub drift_status: String,
+    /// `StackResourceDriftInformation$LastCheckTimestamp`: "when CloudFormation last
+    /// checked if the resource had drifted from its expected configuration".
+    pub drift_checked_at: Option<SystemTime>,
+}
+
+impl DeployedResource {
+    /// A resource record as a stack operation installs it: with the status that operation
+    /// left it in, and no drift result, since nothing has checked it for drift.
+    pub fn new(resource: StoredResource, status: &str, at: SystemTime) -> Self {
+        Self {
+            resource,
+            status: status.to_string(),
+            status_timestamp: at,
+            drift_status: resource_drift_status::NOT_CHECKED.to_string(),
+            drift_checked_at: None,
+        }
+    }
 }
 
 /// One evaluated stack output: an `Outputs` entry of the stack's template with its
@@ -384,7 +514,6 @@ pub struct StoredOperation {
     pub operation_id: String,
     pub operation_type: String,
 }
-
 
 /// A stack tag.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -435,7 +564,8 @@ pub struct StoredEvent {
 pub struct PendingStatus {
     pub status: String,
     /// The `StackStatusReason` that status carries, for an operation that is headed for a
-    /// FAILED one: a failure has to say what failed, and a success states no reason.
+    /// FAILED one: a failure has to say what failed, and a success states no reason
+    /// (`StoredStack::fail_transition`).
     pub status_reason: Option<String>,
     pub due_at: SystemTime,
     pub operation_id: Option<String>,
@@ -521,6 +651,15 @@ pub struct StoredStack {
     pub deletion_time: Option<SystemTime>,
     pub client_request_token: Option<String>,
     pub events: ::std::collections::VecDeque<StoredEvent>,
+    /// `Stack$DriftInformation`'s `StackDriftStatus`: the stack-level result the last
+    /// drift detection that COMPLETED against this stack left ([`drift`]).
+    /// [`DRIFT_STATUS_NOT_CHECKED`] until one has, since "NOT_CHECKED: CloudFormation
+    /// hasn't checked if the stack differs from its expected template configuration".
+    pub drift_status: String,
+    /// `StackDriftInformation$LastCheckTimestamp`: "most recent time when a drift
+    /// detection operation was INITIATED on the stack", so it is set by the call that
+    /// starts one rather than by the result landing.
+    pub drift_last_check: Option<SystemTime>,
 }
 
 impl StoredStack {
@@ -566,6 +705,8 @@ impl StoredStack {
             deletion_time: None,
             client_request_token: None,
             events: ::std::collections::VecDeque::new(),
+            drift_status: DRIFT_STATUS_NOT_CHECKED.to_string(),
+            drift_last_check: None,
         }
     }
 
@@ -596,24 +737,13 @@ impl StoredStack {
     /// own them is [`provisioning::reconcile`](provisioning::reconcile), which the
     /// deploying operation calls with these records once the store is unlocked.
     pub fn deploy_template(&mut self) {
-        let Some(declared) = self
-            .template_body
-            .as_deref()
-            .and_then(template::parse)
-        else {
+        let Some((declared, parameters)) = self.template_scope() else {
             // No template at all (a stack a CREATE change set created and nothing has
             // executed yet), or one this service will not read: either way the stack is
             // left with no resources and no outputs rather than with invented ones.
             self.pending_deployment = Some(PendingDeployment::default());
             return;
         };
-        // "Default: A value of the appropriate type for the template to use if no value
-        // is specified when a stack is created" — the request's values win over the
-        // template's declared defaults.
-        let mut parameters = declared.parameter_defaults();
-        for parameter in &self.parameters {
-            parameters.insert(parameter.key.clone(), parameter.value.clone());
-        }
         let stack = template::StackScope {
             region: &self.region,
             stack_name: &self.stack_name,
@@ -659,9 +789,27 @@ impl StoredStack {
         // operation calls with these records.
         let already_created = self.current_resources();
         for resource in &mut resources {
-            if let Some(existing) = already_created.iter().find(|existing| {
-                existing.materialised && provisioning::is_same_resource(existing, resource)
-            }) {
+            // The record of the same resource this stack already created. Judged by
+            // identity first; for a type whose id the OWNING SERVICE assigns, a record
+            // under the same logical id and type IS that resource, because nothing here
+            // can recompute the id it was created with.
+            let existing = already_created
+                .iter()
+                .find(|existing| {
+                    existing.materialised && provisioning::is_same_resource(existing, resource)
+                })
+                .or_else(|| {
+                    template::identity_is_service_assigned(&resource.resource_type)
+                        .then(|| {
+                            already_created.iter().find(|existing| {
+                                existing.materialised
+                                    && existing.logical_id == resource.logical_id
+                                    && existing.resource_type == resource.resource_type
+                            })
+                        })
+                        .flatten()
+                });
+            if let Some(existing) = existing {
                 // Deliberately NOT `provisioning::carry_forward`: that one also carries
                 // the properties the resource was created with, and this record's
                 // properties are what `reconcile` compares against them to see whether
@@ -669,13 +817,107 @@ impl StoredStack {
                 // already exists. Only the fact that it exists, and what the owning
                 // service reported about it, carry forward here.
                 resource.materialised = true;
+                if template::identity_is_service_assigned(&resource.resource_type) {
+                    // The identifier in force is the one that service minted, so the
+                    // record keeps it: an output naming the resource reports the id a
+                    // client can call that service with, and `reconcile` sees the resource
+                    // the stack already has rather than one to create again.
+                    resource.physical_resource_id = existing.physical_resource_id.clone();
+                }
                 for (name, value) in &existing.attributes {
                     resource.attributes.insert(name.clone(), value.clone());
                 }
             }
         }
-        let outputs = template::evaluate_outputs(&declared, &resolved, &mut budget);
+        // The outputs are evaluated against the identities now in force, which is why this
+        // is after the carry-forward above: a resource whose id the owning service assigned
+        // carries the one it minted, and an output naming that resource must report THAT.
+        let outputs = self.evaluated_outputs(&declared, scope, &resources, &mut budget);
         self.pending_deployment = Some(PendingDeployment { resources, outputs });
+    }
+
+    /// The stack's declared outputs, evaluated against `resources`.
+    ///
+    /// An output's value is a function of the template, the parameters in force and the
+    /// resources' IDENTITIES, so it is evaluated wherever one of those is settled: by
+    /// [`Self::deploy_template`] when the template is deployed, and again by
+    /// [`Self::record_materialised_resources`] once the services that own the resources
+    /// have reported the identifiers they minted.
+    fn evaluated_outputs(
+        &self,
+        declared: &template::Template,
+        scope: template::Scope<'_>,
+        resources: &[StoredResource],
+        budget: &mut template::Budget,
+    ) -> Vec<StoredOutput> {
+        let identities: BTreeMap<String, StoredResource> = resources
+            .iter()
+            .map(|resource| (resource.logical_id.clone(), resource.clone()))
+            .collect();
+        template::evaluate_outputs(
+            declared,
+            &template::Scope {
+                resources: &identities,
+                ..scope
+            },
+            budget,
+        )
+    }
+
+    /// The template this stack carries and the parameter values in force on it.
+    ///
+    /// "Default: A value of the appropriate type for the template to use if no value is
+    /// specified when a stack is created" — the request's values win over the template's
+    /// declared defaults, which is what this merge is.
+    ///
+    /// `None` for a stack with no template, or one this service cannot read: there is
+    /// nothing to evaluate then.
+    fn template_scope(&self) -> Option<(template::Template, BTreeMap<String, String>)> {
+        let declared = self.template_body.as_deref().and_then(template::parse)?;
+        let mut parameters = declared.parameter_defaults();
+        for parameter in &self.parameters {
+            parameters.insert(parameter.key.clone(), parameter.value.clone());
+        }
+        Some((declared, parameters))
+    }
+
+    /// Re-evaluate the stack's outputs over the resource records now in force.
+    ///
+    /// Called where the identities those records carry have CHANGED since the template was
+    /// deployed — which is what provisioning does for a type whose physical id the owning
+    /// service assigns ([`template::identity_is_service_assigned`]): the output of such a
+    /// resource must report the identifier that service minted, since that is the one a
+    /// client calls it with. Nothing else about the evaluation differs, so the stack's
+    /// outputs stay a function of its template, its parameters and its resources.
+    fn reevaluate_outputs(&mut self) {
+        let Some((declared, parameters)) = self.template_scope() else {
+            return;
+        };
+        let resources = self.current_resources();
+        let parameter_types = declared.parameter_types();
+        let no_resources = BTreeMap::new();
+        let mut budget = template::Budget::new();
+        let outputs = self.evaluated_outputs(
+            &declared,
+            template::Scope {
+                stack: template::StackScope {
+                    region: &self.region,
+                    stack_name: &self.stack_name,
+                    stack_id: &self.stack_id,
+                },
+                parameters: &parameters,
+                parameter_types: &parameter_types,
+                resources: &no_resources,
+                mappings: &declared.mappings,
+                conditions: &declared.conditions,
+            },
+            &resources,
+            &mut budget,
+        );
+        match &mut self.pending_deployment {
+            Some(deployment) => deployment.outputs = outputs,
+            None => self.outputs = outputs,
+        }
     }
 
     /// Whether this stack is still part of the live set — the set addressable by stack
@@ -763,7 +1005,8 @@ impl StoredStack {
         } else if let Some(deployed) = self.pending_deployment.take() {
             // The create or update completed: the template it deployed is what the stack
             // reports resources and outputs for from here on.
-            self.resources = installed_resources(&self.resources, deployed.resources, pending.due_at);
+            self.resources =
+                installed_resources(&self.resources, deployed.resources, pending.due_at);
             self.outputs = deployed.outputs;
         }
         let status = self.status.clone();
@@ -810,6 +1053,8 @@ impl StoredStack {
         );
         self.pending = Some(PendingStatus {
             status: settles_to.to_string(),
+            // A completion carries no reason, and nothing has failed yet:
+            // `Self::fail_transition` is what records a failure of this operation.
             status_reason: None,
             due_at: now + STATUS_TRANSITION_DELAY,
             operation_id,
@@ -832,8 +1077,8 @@ impl StoredStack {
     }
 
     /// Replace the resources of [`Self::current_resources`] with what the services that
-    /// own them answered — the attributes they reported, and whether each one was really
-    /// created there.
+    /// own them answered — the identifier each one minted, the attributes they reported,
+    /// and whether each resource was really created there.
     ///
     /// For an operation still in flight that is the pending deployment, which
     /// [`Self::settle`] installs when the operation completes. For one that has already
@@ -841,9 +1086,16 @@ impl StoredStack {
     /// records are rewritten in place, each keeping the resource STATUS and timestamp its
     /// deployment gave it: nothing about a resource's status changed because its
     /// provisioning record did.
+    ///
+    /// The stack's outputs are evaluated again over the recorded set
+    /// ([`Self::reevaluate_outputs`]): for a type whose physical id the owning service
+    /// ASSIGNS, the identity in these records is the one it minted rather than the one the
+    /// naming rules computed, and an output naming that resource reports what a client can
+    /// call that service with.
     pub fn record_materialised_resources(&mut self, resources: Vec<StoredResource>) {
         if let Some(deployment) = &mut self.pending_deployment {
             deployment.resources = resources;
+            self.reevaluate_outputs();
             return;
         }
         for resource in resources {
@@ -855,13 +1107,14 @@ impl StoredStack {
                 Some(deployed) => deployed.resource = resource,
                 // A resource the stack did not have installed under that logical id: it
                 // takes the status of the operation that recorded it.
-                None => self.resources.push(DeployedResource {
+                None => self.resources.push(DeployedResource::new(
                     resource,
-                    status: resource_status::CREATE_COMPLETE.to_string(),
-                    status_timestamp: SystemTime::now(),
-                }),
+                    resource_status::CREATE_COMPLETE,
+                    SystemTime::now(),
+                )),
             }
         }
+        self.reevaluate_outputs();
     }
 
     /// Record that the operation in flight could not be carried out: the stack takes the
@@ -910,17 +1163,9 @@ fn installed_resources(
                 Some(before) if before.resource == resource => before.clone(),
                 // Deployed before under this logical id and now different: the operation
                 // updated it.
-                Some(_) => DeployedResource {
-                    resource,
-                    status: resource_status::UPDATE_COMPLETE.to_string(),
-                    status_timestamp: at,
-                },
+                Some(_) => DeployedResource::new(resource, resource_status::UPDATE_COMPLETE, at),
                 // Not deployed before: the operation created it.
-                None => DeployedResource {
-                    resource,
-                    status: resource_status::CREATE_COMPLETE.to_string(),
-                    status_timestamp: at,
-                },
+                None => DeployedResource::new(resource, resource_status::CREATE_COMPLETE, at),
             }
         })
         .collect()
@@ -1001,6 +1246,10 @@ pub struct StoredChangeSet {
     pub status_reason: Option<String>,
     /// The model's `ExecutionStatus`.
     pub execution_status: String,
+    /// `DescribeChangeSetOutput$StackDriftStatus`: "the drift status of the stack WHEN THE
+    /// CHANGE SET WAS CREATED" — so it is captured off the stack here, at creation, and
+    /// never re-read later.
+    pub stack_drift_status: String,
     pub pending: Option<PendingChangeSetStatus>,
     pub changes: Vec<StoredResourceChange>,
 }
@@ -1034,6 +1283,48 @@ impl StoredChangeSet {
     }
 }
 
+/// One drift-detection operation on one stack: what `DetectStackDrift` started and
+/// `DescribeStackDriftDetectionStatus` reads back.
+///
+/// The detection's own outcome is asynchronous ("DetectStackDrift can take up to several
+/// minutes"), so a record is answered `DETECTION_IN_PROGRESS` and carries the outcome the
+/// clock owes in [`Self::pending`]; [`ComAmazonawsCloudformationCloudformationState::settle`]
+/// is what materialises it, onto this record and onto the stack and resources it describes.
+#[derive(Debug, Clone)]
+pub struct StoredDriftDetection {
+    /// `StackDriftDetectionId`, the id the call handed back.
+    pub detection_id: String,
+    /// The stack the detection ran against, by stack id: "the ID of the stack".
+    pub stack_id: String,
+    /// `Timestamp`: "time at which the stack drift detection operation was initiated".
+    pub initiated_at: SystemTime,
+    /// [`drift_detection_status`].
+    pub detection_status: String,
+    pub detection_status_reason: Option<String>,
+    /// The stack-level `StackDriftStatus` the detection found, once it has completed.
+    /// `None` while it is in progress: "this value will be NULL for any stack drift
+    /// detection operation that has not yet concluded".
+    pub stack_drift_status: Option<String>,
+    /// `DriftedStackResourceCount`: "this is NULL until the drift detection operation
+    /// reaches a status of DETECTION_COMPLETE".
+    pub drifted_resource_count: Option<i32>,
+    /// The outcome computed for this detection, and the instant reporting it is due.
+    pub pending: Option<PendingDriftOutcome>,
+}
+
+/// What a drift detection found, held until the clock makes reporting the detection's own
+/// conclusion due.
+#[derive(Debug, Clone)]
+pub struct PendingDriftOutcome {
+    /// [`drift_detection_status`]: `DETECTION_COMPLETE`, or `DETECTION_FAILED` where an
+    /// owning service's refusal left a resource unchecked.
+    pub detection_status: String,
+    pub detection_status_reason: Option<String>,
+    pub stack_drift_status: String,
+    pub drifted_resource_count: i32,
+    pub due_at: SystemTime,
+}
+
 /// Per-service state for com-amazonaws-cloudformation-cloudformation. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCloudformationCloudformationState {
@@ -1050,6 +1341,11 @@ pub struct ComAmazonawsCloudformationCloudformationState {
     /// [`registry`]). A registry record has nothing to do with a stack's lifecycle, so it
     /// is neither settled nor reclaimed with one.
     pub extensions: Vec<registry::StoredExtension>,
+    /// Every drift-detection operation this service has run, in the order they were
+    /// started, so `DescribeStackDriftDetectionStatus` reads back the result of the id
+    /// `DetectStackDrift` handed out. Bounded at [`MAX_DRIFT_DETECTIONS`], oldest
+    /// reclaimed first.
+    pub drift_detections: Vec<StoredDriftDetection>,
 }
 
 impl ComAmazonawsCloudformationCloudformationState {
@@ -1064,8 +1360,109 @@ impl ComAmazonawsCloudformationCloudformationState {
         for change_set in &mut self.change_sets {
             change_set.settle(now);
         }
+        self.settle_drift_detections(now);
         self.reclaim_retired_stacks();
         self.reclaim_orphaned_change_sets();
+    }
+
+    /// Materialise every drift-detection STATUS whose due instant has passed.
+    ///
+    /// What the clock owes here is the detection operation's own status: AWS answers
+    /// `DetectStackDrift` while the detection is still running
+    /// ("DetectStackDrift can take up to several minutes"), so
+    /// `DescribeStackDriftDetectionStatus` answers `DETECTION_IN_PROGRESS` with no result
+    /// until this makes the conclusion due — and only ever an outcome already computed, so
+    /// nothing is advanced because it was polled.
+    ///
+    /// The RESULT itself is not owed by the clock: the comparison against each owning
+    /// service is what `DetectStackDrift` performs, and
+    /// [`Self::apply_drift_result`] records what it found on the stack and its resources
+    /// as of that check.
+    fn settle_drift_detections(&mut self, now: SystemTime) {
+        for detection in &mut self.drift_detections {
+            if detection
+                .pending
+                .as_ref()
+                .is_none_or(|pending| pending.due_at > now)
+            {
+                continue;
+            }
+            let pending = detection.pending.take().expect("checked just above");
+            detection.detection_status = pending.detection_status;
+            detection.detection_status_reason = pending.detection_status_reason;
+            detection.stack_drift_status = Some(pending.stack_drift_status);
+            detection.drifted_resource_count = Some(pending.drifted_resource_count);
+        }
+    }
+
+    /// Record what a drift detection FOUND on the stack it ran against and on each
+    /// resource it covered.
+    ///
+    /// `Stack$DriftInformation` is a statement about the stack as of its last check —
+    /// "status of the stack's actual configuration compared to its expected template
+    /// configuration" — not the status of a detection operation, so it carries the result
+    /// of the check that ran rather than waiting on the detection record's own conclusion.
+    /// `checked_at` is the instant the detection was initiated, which is what both
+    /// `LastCheckTimestamp` members report.
+    ///
+    /// A resource of the stack the detection did NOT cover keeps the result it already
+    /// carried: a filtered detection reports on what it checked and says nothing about the
+    /// rest.
+    pub fn apply_drift_result(
+        &mut self,
+        stack_id: &str,
+        checked_at: SystemTime,
+        stack_drift_status: &str,
+        results: &[drift::ResourceDrift],
+    ) {
+        let Some(stack) = self
+            .stacks
+            .iter_mut()
+            .find(|stack| stack.stack_id == stack_id)
+        else {
+            // The stack was deleted while its detection was running: there is nothing left
+            // to report the result on, and the detection record keeps it.
+            return;
+        };
+        stack.drift_status = stack_drift_status.to_string();
+        stack.drift_last_check = Some(checked_at);
+        for result in results {
+            if let Some(deployed) = stack
+                .resources
+                .iter_mut()
+                .find(|deployed| deployed.resource.logical_id == result.logical_id)
+            {
+                deployed.drift_status = result.status.clone();
+                deployed.drift_checked_at = Some(checked_at);
+            }
+        }
+    }
+
+    /// Record a drift detection that has just been started, and hand back nothing: the
+    /// caller already minted the id it answers with. The oldest record is reclaimed past
+    /// [`MAX_DRIFT_DETECTIONS`], so a caller cannot grow this store without limit.
+    pub fn record_drift_detection(&mut self, detection: StoredDriftDetection) {
+        while self.drift_detections.len() >= MAX_DRIFT_DETECTIONS {
+            self.drift_detections.remove(0);
+        }
+        self.drift_detections.push(detection);
+    }
+
+    /// The drift detection with this `StackDriftDetectionId`, if this store still holds it.
+    pub fn drift_detection(&self, detection_id: &str) -> Option<&StoredDriftDetection> {
+        self.drift_detections
+            .iter()
+            .find(|detection| detection.detection_id == detection_id)
+    }
+
+    /// The same record, for the call that fills in the outcome it computed.
+    pub fn drift_detection_mut(
+        &mut self,
+        detection_id: &str,
+    ) -> Option<&mut StoredDriftDetection> {
+        self.drift_detections
+            .iter_mut()
+            .find(|detection| detection.detection_id == detection_id)
     }
 
     /// Drop the change sets whose stack is no longer live.
@@ -1214,6 +1611,12 @@ impl ComAmazonawsCloudformationCloudformationState {
     /// the id wins, and this emulator derives a generated physical id from the stack id, so
     /// two stacks collide only where their templates NAME the same resource.
     pub fn stack_of_physical_resource(&self, physical_resource_id: &str) -> Option<&StoredStack> {
+        if physical_resource_id.is_empty() {
+            // A resource that was never created carries no physical id, so nothing is
+            // addressable by one: the empty string must not resolve to the first stack
+            // holding such a resource.
+            return None;
+        }
         self.stacks.iter().find(|stack| {
             stack
                 .resources
@@ -1259,6 +1662,16 @@ impl ComAmazonawsCloudformationCloudformationState {
                     .position(|stack| stack.stack_name == name_or_id && stack.is_live())
             })
     }
+}
+
+/// A resource's `PhysicalResourceId`, which a resource that was never CREATED does not
+/// have.
+///
+/// A resource whose create the service that owns it refused carries no identifier at all,
+/// and `StackResource$PhysicalResourceId` is optional, so it is reported ABSENT — an id
+/// nothing minted is what a client must never be handed.
+pub fn physical_resource_id(resource: &StoredResource) -> Option<String> {
+    (!resource.physical_resource_id.is_empty()).then(|| resource.physical_resource_id.clone())
 }
 
 /// Stored outputs as the modelled `Outputs` member.
@@ -1568,6 +1981,14 @@ pub fn new_operation_id() -> String {
     new_identifier("operation")
 }
 
+/// Mint an id for one drift-detection operation (`DetectStackDriftOutput`'s
+/// `StackDriftDetectionId`, which `DescribeStackDriftDetectionStatus` reads a result back
+/// by): the same 8-4-4-4-12 form as every other identifier this service mints, which is 36
+/// characters and so satisfies the modelled `StackDriftDetectionId` length (1..36).
+pub fn new_drift_detection_id() -> String {
+    new_identifier("drift")
+}
+
 /// Mint a change set id: `arn:aws:cloudformation:<region>:<account>:changeSet/<name>/<uuid>`,
 /// the form CloudFormation gives a change set (`ChangeSetId` is modelled
 /// `@pattern("^arn:[-a-zA-Z0-9:/]*$")`).
@@ -1652,6 +2073,15 @@ pub fn extension_does_not_exist(identifier: &str) -> String {
     format!("Extension with identifier {identifier} does not exist")
 }
 
+/// The message answered when a request names a `StackDriftDetectionId` this account has
+/// not run a drift detection under — an id nothing issued, or one whose result this store
+/// no longer retains ("the number of drift results CloudFormation retains for any given
+/// stack, and for how long, may vary"). Built from what the request named, the way
+/// [`stack_does_not_exist`] is.
+pub fn drift_detection_does_not_exist(detection_id: &str) -> String {
+    format!("Drift detection with id {detection_id} does not exist")
+}
+
 /// The message CloudFormation answers when a request names a `PhysicalResourceId` no
 /// stack has deployed: such a request names its stack only through that resource, so what
 /// is not addressable is the stack the resource would belong to.
@@ -1676,6 +2106,8 @@ pub enum PageOf {
     StackSummaries,
     /// `DescribeStackEvents`'s `StackEvents`.
     StackEvents,
+    /// `ListStackResources`'s `StackResourceSummaries`.
+    StackResourceSummaries,
     /// `DescribeChangeSet`'s `Changes`.
     Changes,
 }
@@ -1687,6 +2119,7 @@ impl PageOf {
             Self::Stacks => "stacks",
             Self::StackSummaries => "summaries",
             Self::StackEvents => "events",
+            Self::StackResourceSummaries => "resources",
             Self::Changes => "changes",
         }
     }
@@ -1927,6 +2360,70 @@ pub fn deployment_config_view(
                 .unwrap_or(disable_rollback),
         ),
     })
+}
+
+/// A stack's drift result as the modelled `Stack$DriftInformation`.
+///
+/// CloudFormation reports `DriftInformation` on every stack — a stack nothing has checked
+/// reports `NOT_CHECKED`, which is a result in its own right — so this is always present.
+/// `LastCheckTimestamp` is the instant the most recent detection on the stack was
+/// INITIATED, and is absent exactly while no detection has been.
+pub fn stack_drift_information(
+    stack: &StoredStack,
+) -> Option<crate::ops::types::StackDriftInformation> {
+    Some(crate::ops::types::StackDriftInformation {
+        stack_drift_status: stack.drift_status.clone(),
+        last_check_timestamp: stack.drift_last_check.map(timestamp),
+    })
+}
+
+/// The same result as `StackSummary$DriftInformation`, the SUMMARY spelling of the same
+/// two members — so `ListStacks` and `DescribeStacks` cannot disagree about one stack's
+/// drift result.
+pub fn stack_drift_information_summary(
+    stack: &StoredStack,
+) -> Option<crate::ops::types::StackDriftInformationSummary> {
+    Some(crate::ops::types::StackDriftInformationSummary {
+        stack_drift_status: stack.drift_status.clone(),
+        last_check_timestamp: stack.drift_last_check.map(timestamp),
+    })
+}
+
+/// One resource's drift result as the modelled `StackResource$DriftInformation` /
+/// `StackResourceDetail$DriftInformation`, reported on every resource for the same reason.
+pub fn resource_drift_information(
+    deployed: &DeployedResource,
+) -> Option<crate::ops::types::StackResourceDriftInformation> {
+    Some(crate::ops::types::StackResourceDriftInformation {
+        stack_resource_drift_status: deployed.drift_status.clone(),
+        last_check_timestamp: deployed.drift_checked_at.map(timestamp),
+    })
+}
+
+/// The same result as `StackResourceSummary$DriftInformation`, the SUMMARY spelling of the
+/// same two members.
+pub fn resource_drift_information_summary(
+    deployed: &DeployedResource,
+) -> Option<crate::ops::types::StackResourceDriftInformationSummary> {
+    Some(crate::ops::types::StackResourceDriftInformationSummary {
+        stack_resource_drift_status: deployed.drift_status.clone(),
+        last_check_timestamp: deployed.drift_checked_at.map(timestamp),
+    })
+}
+
+/// One JSON scalar as the single text an API member takes it as, or `None` for a
+/// composite.
+///
+/// The three scalars a template property can carry each have exactly one textual
+/// spelling, and that spelling is what a stack's provisioning sends and what a drift
+/// comparison reads back ([`drift`]), so both sides are held to this one function.
+pub fn scalar_text(value: &::serde_json::Value) -> Option<String> {
+    match value {
+        ::serde_json::Value::String(text) => Some(text.clone()),
+        ::serde_json::Value::Number(number) => Some(number.to_string()),
+        ::serde_json::Value::Bool(flag) => Some(flag.to_string()),
+        _ => None,
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

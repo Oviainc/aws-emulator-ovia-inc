@@ -20,10 +20,24 @@
 //!
 //! "Data Exports only supports a limited subset of the SQL syntax": the subset the data
 //! query documentation publishes is a SELECT over the catalog's tables (a column list,
-//! `FROM`, `WHERE`, and the joins between published tables), so every relation a statement
-//! names has to BE a published table. A common table expression is therefore outside the
-//! subset: `WITH t AS (…) SELECT * FROM t` names `t`, the catalog publishes no `t`, and the
-//! statement is refused like any other naming an unpublished table (a row of
+//! `FROM`, `WHERE`, and the joins between published tables), so a `QueryStatement` has to
+//! be ONE statement, that statement a query, and every relation it names a published
+//! table. That is checked against the PARSED statement in [`query_tables`], which is why
+//! all three refusals below say the same thing about a statement this service cannot read
+//! as a data query — text the parser cannot read at all, a statement that is not a query
+//! (`DELETE`, `DROP`, `INSERT`, `EXPLAIN`, …), more than one statement, and a query that
+//! reads no table — and none of them is decided from the statement's text.
+//!
+//! The direction matters: the generic dialect this parse uses is WIDER than the published
+//! subset, so what it cannot read as a single query is outside the subset too and is
+//! refused, while a shape it reads and the subset does not mention (a set operation, a
+//! `GROUP BY`) is served as long as every relation it names is published — this service
+//! refuses what no data export could deliver, not everything the documentation does not
+//! spell out.
+//!
+//! A common table expression is outside the subset for the relation rule rather than the
+//! statement rule: `WITH t AS (…) SELECT * FROM t` names `t`, the catalog publishes no
+//! `t`, and the statement is refused like any other naming an unpublished table (a row of
 //! `tests/all/export_definition_validation.rs` pins that). If a recording ever shows AWS
 //! accepting a CTE, the fix is to register each `WITH` alias as a relation this walk does
 //! not resolve — not to accept unresolved relation names generally.
@@ -52,10 +66,10 @@
 //! Beside them, [`MAX_QUERY_RELATIONS`] bounds the catalog work the resolved relations
 //! cause.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::ops::ControlFlow;
 
-use sqlparser::ast::visit_relations;
+use sqlparser::ast::{visit_relations, Statement};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
@@ -212,11 +226,11 @@ fn nesting_depth(statement: &str) -> usize {
 /// `Err` is [`QueryRefusal::Invalid`] — the modelled 400 — for a statement past one of the
 /// structural bounds (its bracketing deeper than [`MAX_QUERY_NESTING_DEPTH`] or its token
 /// count past [`MAX_QUERY_TOKENS`], both refused BEFORE the parser is entered), for one
-/// that is not SQL this service can read — a query it cannot parse names no table, so
-/// there is nothing to resolve against the catalog and nothing it could ever deliver — and
-/// for one naming more distinct relations than [`MAX_QUERY_RELATIONS`]; and
-/// [`QueryRefusal::Internal`] — the modelled 500 — when this process could not run the
-/// parse at all.
+/// this service cannot read AS A DATA QUERY — text that does not parse, a statement that
+/// is not a query, more than one statement, or a query reading no table at all, none of
+/// which selects rows this service could ever deliver — and for one naming more distinct
+/// relations than [`MAX_QUERY_RELATIONS`]; and [`QueryRefusal::Internal`] — the modelled
+/// 500 — when this process could not run the parse at all.
 pub fn query_tables(statement: &str) -> Result<Vec<String>, QueryRefusal> {
     // Both structural bounds are applied to the TEXT, so no descent over this statement
     // has begun when it is refused.
@@ -264,37 +278,51 @@ pub fn query_tables(statement: &str) -> Result<Vec<String>, QueryRefusal> {
 fn relations_of(statement: &str) -> Result<Vec<String>, QueryRefusal> {
     let parsed = Parser::parse_sql(&GenericDialect {}, statement)
         .map_err(|_| unreadable_query(statement))?;
+    // THE PUBLISHED SUBSET, checked on the parsed statement: a data query says which rows
+    // of the catalog's tables an export delivers, so it is ONE statement and that
+    // statement is a query. Anything else the generic dialect happens to read — a `DELETE`
+    // or `DROP` naming a published table, an `INSERT`, an `EXPLAIN`, two statements
+    // separated by a semicolon — selects nothing this service can export (and the first
+    // two ask it to CHANGE the catalog, which no data export does), so it is refused here
+    // rather than persisted.
+    let [Statement::Query(query)] = parsed.as_slice() else {
+        return Err(not_a_single_query(statement).into());
+    };
     let mut tables: Vec<String> = Vec::new();
     // Membership is a set lookup rather than a scan of `tables`, so de-duplicating the
     // relations costs O(relations log relations) and not O(relations^2).
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    for one in &parsed {
-        // The walk reports every relation of the statement — `FROM`, each join, and each
-        // sub-query's own `FROM` — so nothing is read out of the statement's text. It
-        // stops at the relation bound, and the statement is then refused.
-        let walked: ControlFlow<()> = visit_relations(one, |relation| {
-            // A relation's name is its single identifier's VALUE, so a quoted name
-            // (`"COST_AND_USAGE_REPORT"`) resolves like a bare one. A QUALIFIED name
-            // (`other_db.COST_AND_USAGE_REPORT`) keeps every part, so it does not resolve
-            // to the published table its last part happens to spell: data exports
-            // publishes one catalog, not a schema a caller can qualify into.
-            let named = match relation.0.as_slice() {
-                [single] => single
-                    .as_ident()
-                    .map_or_else(|| single.to_string(), |ident| ident.value.clone()),
-                _ => relation.to_string(),
-            };
-            if seen.insert(named.clone()) {
-                if tables.len() >= MAX_QUERY_RELATIONS {
-                    return ControlFlow::Break(());
-                }
-                tables.push(named);
+    // The walk reports every relation of the statement — `FROM`, each join, and each
+    // sub-query's own `FROM` — so nothing is read out of the statement's text. It
+    // stops at the relation bound, and the statement is then refused.
+    let walked: ControlFlow<()> = visit_relations(query.as_ref(), |relation| {
+        // A relation's name is its single identifier's VALUE, so a quoted name
+        // (`"COST_AND_USAGE_REPORT"`) resolves like a bare one. A QUALIFIED name
+        // (`other_db.COST_AND_USAGE_REPORT`) keeps every part, so it does not resolve
+        // to the published table its last part happens to spell: data exports
+        // publishes one catalog, not a schema a caller can qualify into.
+        let named = match relation.0.as_slice() {
+            [single] => single
+                .as_ident()
+                .map_or_else(|| single.to_string(), |ident| ident.value.clone()),
+            _ => relation.to_string(),
+        };
+        if seen.insert(named.clone()) {
+            if tables.len() >= MAX_QUERY_RELATIONS {
+                return ControlFlow::Break(());
             }
-            ControlFlow::Continue(())
-        });
-        if walked.is_break() {
-            return Err(too_many_relations().into());
+            tables.push(named);
         }
+        ControlFlow::Continue(())
+    });
+    if walked.is_break() {
+        return Err(too_many_relations().into());
+    }
+    // A query reading NO relation (`SELECT 1`, `VALUES (1)`) is a query over the request's
+    // own literals, not over the catalog: there is no table for the export to deliver, so
+    // it is outside the subset too.
+    if tables.is_empty() {
+        return Err(reads_no_table(statement).into());
     }
     Ok(tables)
 }
@@ -327,20 +355,104 @@ pub fn validate_data_query(
     Ok(())
 }
 
-/// The modelled 400 for a `QueryStatement` that is not readable SQL.
-fn unreadable_query(statement: &str) -> ValidationException {
+/// The modelled `TableConfigurations` map: for each table name, that table's properties
+/// by name — the shape `DataQuery$TableConfigurations` carries (smithy_query shape
+/// `DataQuery`, member `TableConfigurations`).
+pub type TableConfigurations = HashMap<String, HashMap<String, String>>;
+
+/// The `TableConfigurations` an export definition is STORED with: for every table the
+/// query names, and every table the request configures, each table property that table
+/// publishes — at the requested value where the request names it and at the published
+/// default otherwise.
+///
+/// RECORDED AWS behaviour: a reader gets the export's EFFECTIVE table configuration. The
+/// recorded `GetExport` for a created export reports the queried table's property set
+/// filled in, not only the properties the create happened to name — the same rule
+/// `GetTable` already applies to a table request ("Each table property has a default
+/// value that it assumes if not specified" — the modelled doc for
+/// `GetTableRequest$TableProperties`). The effective configuration is therefore what the
+/// definition is STORED with, so every later reader reports it and a definition read back
+/// through `GetExport` and handed straight to `UpdateExport` keeps those properties
+/// (which is also what satisfies [`validate_data_query`]'s restatement rule for such a
+/// round trip).
+///
+/// `None` when no table the definition names publishes any property — there is no
+/// configuration to report then ("tables are not required to have any TableProperties" —
+/// the modelled doc for `CreateExport`).
+///
+/// Called AFTER [`validate_data_query`], whose refusals it repeats rather than hides: a
+/// table outside the catalog, a property the table does not publish, or a value outside
+/// the property's published values is the modelled 400 either way.
+pub fn effective_table_configurations(
+    query: &DataQuery,
+) -> Result<Option<TableConfigurations>, QueryRefusal> {
+    let requested = query.table_configurations.as_ref();
+    // The tables the statement reads, plus any table the request configures on its own:
+    // a configuration for a table the statement does not name is still the caller's, and
+    // its table and properties are still checked and reported.
+    let mut tables: BTreeSet<String> = query_tables(&query.query_statement)?
+        .into_iter()
+        .collect();
+    for table in requested.into_iter().flatten().map(|(name, _)| name) {
+        tables.insert(table.clone());
+    }
+
+    let mut effective: TableConfigurations = HashMap::new();
+    for table in &tables {
+        let spec = table_spec(table).ok_or_else(|| invalid_query_table(table))?;
+        let properties =
+            spec.effective_properties(requested.and_then(|configured| configured.get(table)))?;
+        if properties.is_empty() {
+            continue;
+        }
+        effective.insert(table.clone(), properties.into_iter().collect());
+    }
+    Ok((!effective.is_empty()).then_some(effective))
+}
+
+/// The modelled 400 for a `QueryStatement` this service cannot read as a data query,
+/// naming `Export.DataQuery.QueryStatement` and what that member must carry.
+///
+/// The sentence is built from the request — it echoes the statement, clipped to the
+/// message's own modelled bound — because the statement is the only part of the request
+/// the caller has to change. RECORDED AWS wording for the same class of refusal, from the
+/// unpublished-table rule next door: `Table name <name> is invalid`.
+fn invalid_query_statement(statement: &str, requirement: &str) -> ValidationException {
     ValidationException {
-        message: format!(
-            "QueryStatement {} is invalid",
-            clip_for_message(statement)
-        ),
+        message: format!("QueryStatement {} is invalid", clip_for_message(statement)),
         reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
         fields: Some(vec![ValidationExceptionField {
             name: QUERY_STATEMENT_FIELD.to_string(),
-            message: "Must be an SQL statement over the tables data exports publishes."
-                .to_string(),
+            message: requirement.to_string(),
         }]),
     }
+}
+
+/// The modelled 400 for a `QueryStatement` that is not readable SQL.
+fn unreadable_query(statement: &str) -> ValidationException {
+    invalid_query_statement(
+        statement,
+        "Must be an SQL statement over the tables data exports publishes.",
+    )
+}
+
+/// The modelled 400 for a `QueryStatement` that parses but is not ONE query: a statement
+/// of another kind (`DELETE`, `DROP`, `INSERT`, `EXPLAIN`, …), several statements, or no
+/// statement at all.
+fn not_a_single_query(statement: &str) -> ValidationException {
+    invalid_query_statement(
+        statement,
+        "Must be a single SELECT statement over the tables data exports publishes.",
+    )
+}
+
+/// The modelled 400 for a query that reads no relation, so it names no table of the
+/// catalog for the export to deliver.
+fn reads_no_table(statement: &str) -> ValidationException {
+    invalid_query_statement(
+        statement,
+        "Must select from at least one table data exports publishes; call ListTables for them.",
+    )
 }
 
 /// The modelled 400 for a `QueryStatement` nested deeper than this service reads.
@@ -390,11 +502,13 @@ fn too_many_relations() -> ValidationException {
 
 /// The modelled 400 for a `QueryStatement` naming a table outside the catalog.
 ///
-/// The sentence names the offending table, which is the only part of the request the
-/// caller has to change; the table it must be one of is what `ListTables` reports.
+/// The sentence is built from the request and names the offending table, which is the
+/// only part of the request the caller has to change; the table it must be one of is what
+/// `ListTables` reports. RECORDED AWS wording for that rule: `Table name <name> is
+/// invalid`.
 fn invalid_query_table(table: &str) -> ValidationException {
     ValidationException {
-        message: format!("Table {} is invalid", clip_for_message(table)),
+        message: format!("Table name {} is invalid", clip_for_message(table)),
         reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
         fields: Some(vec![ValidationExceptionField {
             name: QUERY_STATEMENT_FIELD.to_string(),

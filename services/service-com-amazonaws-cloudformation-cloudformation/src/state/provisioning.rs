@@ -15,22 +15,28 @@
 //! The call is made in-process through the handler's own callback into this emulator
 //! ([`smithy_server_runtime::OperationContext::callback`]), signed with the emulator's
 //! credentials: the resource is created by the SAME code path a client's own
-//! `CreateDeliveryStream` goes through, so a stack cannot create a resource that differs
-//! from one the service would have created itself, and this crate names no other service's
-//! crate.
+//! `CreateDeliveryStream` or `CreateBucket` goes through, so a stack cannot create a
+//! resource that differs from one the service would have created itself.
 //!
-//! The call is written on the owning service's WIRE PROTOCOL rather than through its AWS
-//! SDK client (the shape
-//! `services/service-com-amazonaws-scheduler-awschronosservice/src/state.rs` uses to ask
-//! IAM a question) because of what a stack's resource properties are: CloudFormation's
-//! `AWS::KinesisFirehose::DeliveryStream` properties ARE the `CreateDeliveryStream`
-//! request's own members, so the evaluated property DOCUMENT is passed through verbatim.
-//! A typed SDK builder cannot carry a document through — it would need every member of
-//! every destination configuration mapped by hand here, which is precisely the mapping
-//! that would drift from the model as the service grows. The one thing CloudFormation
-//! itself decides, the resource's name, is the one member set on the way out. It also
-//! keeps this crate naming no other service's crate: every call goes out on the wire the
-//! router already serves.
+//! There are TWO shapes that call takes, and which one a type uses follows from what its
+//! properties are:
+//!
+//! * on the owning service's WIRE PROTOCOL, through [`call_json_rpc`] here — for a type
+//!   whose properties ARE the create request's own members, like
+//!   `AWS::KinesisFirehose::DeliveryStream`, where the evaluated property DOCUMENT is
+//!   passed through verbatim with only the name CloudFormation decides set on the way out.
+//!   A typed SDK builder cannot carry a document through: it would need every member of
+//!   every destination configuration mapped by hand, which is precisely the mapping that
+//!   would drift from the model as the service grows;
+//! * through the owning service's official AWS SDK client over this same in-process
+//!   callback — for a type whose properties are NOT the create's members and whose service
+//!   speaks a protocol other than awsJson (`AWS::S3::Bucket` on restXml through
+//!   `aws-sdk-s3`, `AWS::IAM::Role` on awsQuery through `aws-sdk-iam`), where the members
+//!   the create takes are named one by one anyway, so the typed builder costs nothing and
+//!   the protocol's serialization is the SDK's rather than this crate's.
+//!
+//! Both shapes ride the one signed, in-process transport below ([`dispatch`]), so neither
+//! reaches the network and both are served by the router that serves a client's own call.
 //!
 //! ## What this module owns, and what [`super::provisioner`] owns
 //!
@@ -117,14 +123,22 @@
 //!
 //! What this module does keep apart is one STACK's resources from another's: a stack's
 //! deletion deletes the resources ITS OWN records say it created
-//! ([`StoredResource::materialised`]), never everything an owning service happens to hold,
-//! and a resource another stack (or a client) already created is not adopted — the owning
-//! service answers the create with its own uniqueness rule (Firehose: "This name must be
-//! unique per Amazon Web Services account in the same Amazon Web Services Region"), which
-//! leaves the second stack `CREATE_FAILED` with that refusal and the existing resource
-//! untouched. Both are held to that by
-//! `core/router/tests/all/cloudformation_provisions_stack_resources.rs`.
+//! ([`StoredResource::materialised`]), never everything an owning service happens to hold.
+//! Whether a resource another stack (or a client) already created can be deployed over is
+//! the OWNING service's answer, not this module's: Firehose refuses the create with its own
+//! uniqueness rule ("This name must be unique per Amazon Web Services account in the same
+//! Amazon Web Services Region"), which leaves the second stack `CREATE_FAILED` with that
+//! refusal and the existing stream untouched, while S3 answers a re-create of a bucket the
+//! caller already owns with 200 in us-east-1 ("for legacy compatibility, if you re-create
+//! an existing bucket that you already own…"), so that create is accepted and the bucket
+//! is left exactly as it was — nothing is re-created and nothing in it is cleared. The
+//! stack's own deletion then deletes what ITS records say it created, so a bucket it
+//! deployed over is deleted by the stack that recorded it, and one that still holds objects
+//! is refused by S3 and reported as `DELETE_FAILED`. Both answers are held to by
+//! `core/router/tests/all/cloudformation_provisions_stack_resources.rs` and by
+//! `tests/all/stack_resource_provisioning.rs`.
 
+use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use serde_json::Value;
@@ -138,6 +152,35 @@ use super::StoredResource;
 /// publishes.
 pub(super) const AWS_JSON_1_0: &str = "application/x-amz-json-1.0";
 pub(super) const AWS_JSON_1_1: &str = "application/x-amz-json-1.1";
+
+/// The media type a REST-JSON service's requests and answers carry
+/// ([`call_rest_json`]): a `restJson1` service publishes `application/json`, not one of
+/// the awsJson versions above.
+pub(super) const REST_JSON: &str = "application/json";
+
+/// What the service that owns a resource answered when it created it.
+///
+/// `physical_resource_id` is set only by a type whose id that service ASSIGNS (an FIS
+/// experiment template's `EXT…`), which no naming rule could have computed: it replaces
+/// the computed id, because it is what `Ref` resolves to and what a client calls the
+/// service with. For every other type the computed id IS the one the resource was created
+/// under (a queue's name, a cluster's name), so the arm leaves it alone.
+#[derive(Debug, Clone, Default)]
+pub(super) struct Created {
+    pub(super) physical_resource_id: Option<String>,
+    pub(super) attributes: BTreeMap<String, String>,
+}
+
+impl Created {
+    /// What a create that reported only ATTRIBUTES answered: the resource keeps the
+    /// physical id the naming rules computed.
+    pub(super) fn attributes(attributes: BTreeMap<String, String>) -> Self {
+        Self {
+            physical_resource_id: None,
+            attributes,
+        }
+    }
+}
 
 // The stack whose resources are being created or deleted is identified by its Region
 // alone — what the credential scope of every call this module makes names.
@@ -218,9 +261,14 @@ pub async fn reconcile(
         };
         match created {
             // The owning service created it, and what IT answered wins over the computed
-            // value: that is the resource's real identity.
-            Ok(reported) => {
-                resource.attributes.extend(reported);
+            // value: that is the resource's real identity — including the physical id
+            // itself, where that service ASSIGNS the id rather than taking it from a name
+            // the template or CloudFormation decided.
+            Ok(created) => {
+                if let Some(id) = created.physical_resource_id {
+                    resource.physical_resource_id = id;
+                }
+                resource.attributes.extend(created.attributes);
                 resource.materialised = true;
             }
             Err(refusal) => {
@@ -422,13 +470,51 @@ pub(super) async fn call_json_rpc(
         ("content-type", content_type.to_string()),
         ("x-amz-target", target.to_string()),
     ];
-    let (status, payload) = dispatch(ctx, signing_name, region, headers, body)
+    let (status, payload) = dispatch(ctx, signing_name, region, "POST", "/", headers, body)
         .await
         .map_err(|message| Refusal {
             code: "InternalFailure".to_string(),
             message,
         })?;
     let document: Value = serde_json::from_slice(&payload).unwrap_or(Value::Null);
+    if (200..300).contains(&status) {
+        return Ok(document);
+    }
+    Err(refusal_of(status, &document))
+}
+
+/// Call one REST-JSON operation of another emulated service in-process and read its answer
+/// document. `Err(refusal)` is that service's own refusal, exactly as for
+/// [`call_json_rpc`].
+///
+/// A `restJson1` service binds each operation to an HTTP method and a URI rather than to an
+/// `X-Amz-Target` header (AWS FIS: `POST /experimentTemplates`,
+/// `DELETE /experimentTemplates/{id}`), so the caller passes the binding the called
+/// operation's model declares and this writes the request on it. `body` is `None` for an
+/// operation whose input is entirely in the URI.
+pub(super) async fn call_rest_json(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    signing_name: &str,
+    region: &str,
+    method: &'static str,
+    uri: &str,
+    body: Option<&Value>,
+) -> Result<Value, Refusal> {
+    let payload = match body {
+        Some(document) => serde_json::to_vec(document).map_err(|error| Refusal {
+            code: "SerializationException".to_string(),
+            message: error.to_string(),
+        })?,
+        None => Vec::new(),
+    };
+    let headers = vec![("content-type", REST_JSON.to_string())];
+    let (status, answer) = dispatch(ctx, signing_name, region, method, uri, headers, payload)
+        .await
+        .map_err(|message| Refusal {
+            code: "InternalFailure".to_string(),
+            message,
+        })?;
+    let document: Value = serde_json::from_slice(&answer).unwrap_or(Value::Null);
     if (200..300).contains(&status) {
         return Ok(document);
     }
@@ -462,17 +548,23 @@ fn refusal_of(status: u16, document: &Value) -> Refusal {
 /// The request is signed because the emulator verifies every request signature when
 /// authentication is on; the credential scope is also what routes it, so the service that
 /// owns the resource is the one that serves the call.
+///
+/// `method` and `uri` are the called operation's own HTTP binding: an RPC protocol binds
+/// every operation to `POST /` and names what it acts on in its document, while a REST
+/// protocol binds each operation to its own method and path.
 async fn dispatch(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     signing_name: &str,
     region: &str,
+    method: &'static str,
+    uri: &str,
     headers: Vec<(&'static str, String)>,
     body: Vec<u8>,
 ) -> Result<(u16, Vec<u8>), String> {
     let host = format!("{signing_name}.{region}.amazonaws.com");
     let mut request = ::http::Request::builder()
-        .method("POST")
-        .uri("/")
+        .method(method)
+        .uri(uri)
         .header("host", host);
     for (name, value) in &headers {
         request = request.header(*name, value);

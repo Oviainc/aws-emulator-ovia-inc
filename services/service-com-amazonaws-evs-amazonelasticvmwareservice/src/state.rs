@@ -17,10 +17,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
-    Check, ConnectivityInfo, Connector, ConnectorCheck, EipAssociation, Environment,
-    EnvironmentSummary, LicenseInfo, ResourceNotFoundException, ServiceAccessSecurityGroups,
-    ValidationException, VcfHostnames, Vlan, VmEntitlement,
+    AccountSetting, Check, ConnectivityInfo, Connector, ConnectorCheck, EipAssociation, Environment,
+    EnvironmentSummary, Host, LicenseInfo, ResourceNotFoundException,
+    ServiceAccessSecurityGroups, ValidationException, VcfHostnames, Vlan, VmEntitlement,
 };
+
+/// Whether IAM lets a request to this service perform the action it asks for — the
+/// authorization step every implemented operation of this service runs first.
+pub mod authorization;
+
+/// What the account's own Amazon EC2 store says about the VPC, subnet and Elastic IP
+/// resources an Amazon EVS request names.
+pub mod ec2_resources;
 
 /// The `EnvironmentState` / `VlanState` values this service moves a resource through.
 /// Both enums carry the same five values (`smithy_query(query="shape",
@@ -40,6 +48,16 @@ pub const CHECK_UNKNOWN: &str = "UNKNOWN";
 /// See [`CHECK_PASSED`].
 pub const CHECK_FAILED: &str = "FAILED";
 
+/// The `HostState` values a stored host moves through.
+///
+/// The model declares `CREATING | CREATED | UPDATING | DELETING | DELETED |
+/// CREATE_FAILED | UPDATE_FAILED` (`smithy_query(query="shape", shape="HostState")`). The
+/// two named here are the ones `CreateEnvironmentHost` produces: a host is `CREATING`
+/// while the ESX host is built and `CREATED` once it has joined the environment.
+pub const HOST_CREATING: &str = "CREATING";
+/// See [`HOST_CREATING`].
+pub const HOST_CREATED: &str = "CREATED";
+
 /// The `ValidationExceptionReason` values this service refuses with.
 pub const REASON_FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
 /// See [`REASON_FIELD_VALIDATION_FAILED`].
@@ -48,6 +66,18 @@ pub const REASON_OTHER: &str = "other";
 /// The resource type `ResourceNotFoundException` reports for an environment: the
 /// `EnvironmentResource` the model binds these operations to.
 pub const RESOURCE_TYPE_ENVIRONMENT: &str = "environment";
+
+/// The `functionName` of the VLAN that carries ESX host management traffic — the
+/// `initialVlans.vmkManagement` member's own name, which is the form the `Vlan` doc
+/// gives ("a VLAN with a `functionName` of `hcx`"). It is the subnet a host's
+/// management IP comes out of ([`StoredEnvironment::next_host_ip`]).
+pub const VMK_MANAGEMENT_FUNCTION: &str = "vmkManagement";
+
+/// The `functionName` of the VLAN that carries VMware HCX traffic, and the ONE value
+/// `AssociateEipToVlan` / `DisassociateEipFromVlan` accept as a `vlanName`: "hcx is the
+/// only accepted VLAN name at this time" (`vlanName` doc), and those operations are
+/// "only allowed for public HCX VLANs at this time" (their own docs).
+pub const HCX_FUNCTION: &str = "hcx";
 
 /// The resource type `ResourceNotFoundException` reports for a connector — the other
 /// resource these operations address by id (`Connector`, "An object that represents a
@@ -159,6 +189,36 @@ pub fn field_validation_error(member: &str, problem: &str) -> ValidationExceptio
     aggregate_validation_error(vec![field_failure(member, problem)])
 }
 
+/// One `fieldList` entry whose sentence is given IN FULL rather than built by
+/// prefixing the member's name: the entry for a check whose own wording already names
+/// the member and the value it refuses (the VPC clause below names the `vpcId` it was
+/// given). The `name` still carries the member, so a client that reads `fieldList`
+/// groups the failure under the member whatever the sentence spells.
+pub fn field_failure_stated(
+    member: &str,
+    message: impl Into<String>,
+) -> crate::ops::types::ValidationExceptionField {
+    crate::ops::types::ValidationExceptionField {
+        name: member.to_string(),
+        message: message.into(),
+    }
+}
+
+/// The failure of the precondition that a host object names at most one placement
+/// mechanism: "You cannot use the `dedicatedHostId` and `placementGroupId` parameters
+/// together in the same `HostInfoForCreate` object. This results in a
+/// `ValidationException` response." (`HostInfoForCreate` doc.)
+///
+/// The rule is the SHAPE's, not one operation's, so every operation that accepts a
+/// `HostInfoForCreate` refuses the pair through this one helper: `CreateEnvironment`
+/// (per `hosts` entry) and `CreateEnvironmentHost` (for its single `host`).
+pub fn placement_conflict_failure(member: &str) -> crate::ops::types::ValidationExceptionField {
+    field_failure(
+        member,
+        "cannot use dedicatedHostId and placementGroupId together in the same request",
+    )
+}
+
 /// A `ValidationException` refusing a request that no single member explains.
 pub fn request_validation_error(message: impl Into<String>) -> ValidationException {
     ValidationException {
@@ -179,6 +239,25 @@ pub fn environment_not_found(resource_id: &str) -> ResourceNotFoundException {
         message: format!("Environment {resource_id} was not found"),
         resource_id: resource_id.to_string(),
         resource_type: RESOURCE_TYPE_ENVIRONMENT.to_string(),
+    }
+}
+
+/// The refusal an operation that models NO `ResourceNotFoundException` answers for an
+/// environment id this service holds no record of.
+///
+/// `CreateEnvironmentHost`'s error contract is `ThrottlingException` and
+/// `ValidationException` only (`smithy_query(query="operation",
+/// operation="CreateEnvironmentHost")`), so a well-formed id that names no environment
+/// is carried by the only client-input error it declares. The sentence is built from the
+/// request — it names the id the caller asked for and nothing from the store — and the
+/// `fieldList` entry names the member that carried it, so a client learns WHICH member
+/// was not resolvable.
+pub fn environment_not_found_validation(environment_id: &str) -> ValidationException {
+    let message = format!("{environment_id} was not found");
+    ValidationException {
+        message: message.clone(),
+        reason: REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: Some(vec![field_failure_stated("environmentId", message)]),
     }
 }
 
@@ -224,25 +303,26 @@ impl PendingTransition {
     }
 }
 
-/// The status change the clock owes a stored entitlement: the instant it becomes
-/// due, the wall-clock time the change is owed at, and the `EntitlementStatus` the
-/// entitlement moves to.
+/// The status change the clock owes a stored record of an environment — an
+/// entitlement, a connector or a host: the instant it becomes due, the wall-clock time
+/// the change is owed at, and the status the record moves to.
 ///
-/// Separate from [`PendingTransition`] because an entitlement runs on its own clock:
-/// one created long after its environment settled still owes the asynchronous
-/// validation `CreateEntitlement` documents.
+/// Separate from [`PendingTransition`] because each of those records runs on its own
+/// clock: one created long after its environment settled still owes the change the call
+/// that created it started.
 #[derive(Debug, Clone)]
-pub struct PendingEntitlementStatus {
+pub struct PendingStatus {
     /// When the change becomes due. Compared against `Instant::now()`; never slept on.
     pub due_at: Instant,
     /// The wall-clock instant, in epoch milliseconds, the change is owed at.
     pub due_at_ms: i64,
-    /// The `EntitlementStatus` the entitlement moves to.
+    /// The status the record moves to — an `EntitlementStatus`, a `ConnectorState` or a
+    /// `HostState`, according to the record that carries it.
     pub status: &'static str,
 }
 
-impl PendingEntitlementStatus {
-    /// The change `CreateEntitlement` starts, due [`TRANSITION_DELAY`] after the call.
+impl PendingStatus {
+    /// The change a create starts, due [`TRANSITION_DELAY`] after the call.
     pub fn starting_now(status: &'static str) -> Self {
         Self {
             due_at: Instant::now() + TRANSITION_DELAY,
@@ -430,7 +510,7 @@ pub struct StoredEntitlement {
     /// `CREATED`, and absent while the virtual machine is still being validated.
     pub started_at_ms: Option<i64>,
     /// The status change the clock owes this entitlement, if any.
-    pub pending: Option<PendingEntitlementStatus>,
+    pub pending: Option<PendingStatus>,
 }
 
 impl StoredEntitlement {
@@ -441,7 +521,7 @@ impl StoredEntitlement {
         vm_id: &str,
         entitlement_type: &str,
         created_at_ms: i64,
-        pending: PendingEntitlementStatus,
+        pending: PendingStatus,
     ) -> Self {
         Self {
             vm_id: vm_id.to_string(),
@@ -498,6 +578,165 @@ impl StoredEntitlement {
             stopped_at: None,
             error_detail: None,
         }
+    }
+}
+
+/// One ESX host of an environment, as `CreateEnvironmentHost` stored it.
+#[derive(Debug, Clone)]
+pub struct StoredHost {
+    /// The DNS hostname the request gave the host, unique across environments.
+    pub host_name: String,
+    /// The management IP address the host took out of the environment's
+    /// `vmkManagement` VLAN subnet ([`StoredEnvironment::next_host_ip`]).
+    pub ip_address: String,
+    /// The SSH key the host is reached with.
+    pub key_name: String,
+    /// The EC2 bare metal instance type the host runs on.
+    pub instance_type: String,
+    /// The placement group the host was placed in, when the request named one.
+    pub placement_group_id: Option<String>,
+    /// The EC2 Dedicated Host the host was placed on, when the request named one.
+    pub dedicated_host_id: Option<String>,
+    /// The ESX version the request asked for, when it named one.
+    ///
+    /// Kept as supplied so caller input is not discarded, and reported by nothing: the
+    /// modelled `Host` shape carries no ESX version member, and the catalogue that
+    /// would resolve the default version for an environment's VCF version is
+    /// `GetVersions`, which still answers 501.
+    pub esx_version: Option<String>,
+    /// The `HostState` the host is in.
+    pub state: String,
+    /// Epoch milliseconds the host was created at.
+    pub created_at_ms: i64,
+    /// Epoch milliseconds the host was last modified at.
+    pub modified_at_ms: i64,
+    /// The state change the clock owes this host, if any.
+    pub pending: Option<PendingStatus>,
+}
+
+impl StoredHost {
+    /// A new host, as `CreateEnvironmentHost` mints one: `CREATING` until the build the
+    /// clock owes it comes due.
+    pub fn creating(
+        host: &crate::ops::types::HostInfoForCreate,
+        ip_address: String,
+        esx_version: Option<String>,
+        created_at_ms: i64,
+        pending: PendingStatus,
+    ) -> Self {
+        Self {
+            host_name: host.host_name.clone(),
+            ip_address,
+            key_name: host.key_name.clone(),
+            instance_type: host.instance_type.clone(),
+            placement_group_id: host.placement_group_id.clone(),
+            dedicated_host_id: host.dedicated_host_id.clone(),
+            esx_version,
+            state: HOST_CREATING.to_string(),
+            created_at_ms,
+            modified_at_ms: created_at_ms,
+            pending: Some(pending),
+        }
+    }
+
+    /// Apply the owed state change if `now` has reached its due instant — the host
+    /// counterpart of [`StoredConnector::materialise_due_transition`], and owed on the
+    /// same terms.
+    pub fn materialise_due_transition(&mut self, now: Instant) {
+        let Some(pending) = self.pending.clone().filter(|pending| now >= pending.due_at) else {
+            return;
+        };
+        self.state = pending.status.to_string();
+        self.modified_at_ms = pending.due_at_ms;
+        self.pending = None;
+    }
+
+    /// This host as the modelled `Host` shape.
+    ///
+    /// Two members are deliberately absent, because nothing in this emulator produces a
+    /// value for them: `ec2InstanceId` and `networkInterfaces` name the EC2 instance and
+    /// the elastic network interfaces Amazon EVS launches for the host, and this service
+    /// launches none — reporting an instance id no EC2 store holds would name a
+    /// resource that does not exist.
+    pub fn to_wire(&self) -> Host {
+        Host {
+            host_name: Some(self.host_name.clone()),
+            ip_address: Some(self.ip_address.clone()),
+            key_name: Some(self.key_name.clone()),
+            instance_type: Some(self.instance_type.clone()),
+            placement_group_id: self.placement_group_id.clone(),
+            dedicated_host_id: self.dedicated_host_id.clone(),
+            created_at: Some(timestamp(self.created_at_ms)),
+            modified_at: Some(timestamp(self.modified_at_ms)),
+            host_state: Some(self.state.clone()),
+            state_details: None,
+            ec2_instance_id: None,
+            network_interfaces: None,
+        }
+    }
+}
+
+/// One IPv4 CIDR block, reduced to the inclusive address range it covers.
+///
+/// Hand-written rather than taken from `ipnet`, which the workspace already resolves:
+/// the three rules this service needs are a mask, a range comparison and an offset into
+/// the block, and the offset — the addresses AWS leaves usable in a subnet — is not
+/// something a general CIDR crate expresses. Switching the parse and the overlap onto
+/// `ipnet::Ipv4Net` is a behaviour-neutral follow-up.
+#[derive(Debug, Clone, Copy)]
+pub struct Ipv4Cidr {
+    /// The first address of the block (the network address).
+    pub first: u32,
+    /// The last address of the block (the broadcast address).
+    pub last: u32,
+    /// The block's prefix length, in bits.
+    pub prefix_len: u8,
+}
+
+impl Ipv4Cidr {
+    /// Parse `a.b.c.d/<prefix length>`; `None` for anything that is not an IPv4 CIDR
+    /// block.
+    pub fn parse(cidr: &str) -> Option<Self> {
+        let (address, prefix_len) = cidr.split_once('/')?;
+        let address: ::std::net::Ipv4Addr = address.parse().ok()?;
+        let prefix_len: u8 = prefix_len.parse().ok()?;
+        if prefix_len > 32 {
+            return None;
+        }
+        // The host bits below the prefix are what the block spans: clearing them gives
+        // its first address, setting them its last.
+        let host_bits = 32 - u32::from(prefix_len);
+        let mask = if host_bits == 32 { 0 } else { u32::MAX << host_bits };
+        let first = u32::from(address) & mask;
+        Some(Self {
+            first,
+            last: first | !mask,
+            prefix_len,
+        })
+    }
+
+    /// Whether the two blocks share any address.
+    pub fn overlaps(&self, other: &Self) -> bool {
+        self.first <= other.last && other.first <= self.last
+    }
+
+    /// Every address of the block a workload may take, in order.
+    ///
+    /// "The first four IP addresses and the last IP address in each subnet CIDR block
+    /// are not available for you to use" (Amazon VPC User Guide, subnet sizing), so the
+    /// usable range starts four addresses into the block and stops one short of its end.
+    /// Empty for a block too small to hold any.
+    pub fn usable_addresses(&self) -> impl Iterator<Item = ::std::net::Ipv4Addr> {
+        const RESERVED_AT_START: u32 = 4;
+        let first = self.first.saturating_add(RESERVED_AT_START);
+        let last = self.last.saturating_sub(1);
+        // A block too small to hold a usable address yields nothing: the count is taken
+        // first, so the range is never walked backwards.
+        let count = last.saturating_sub(first).saturating_add(1) as usize;
+        let count = if first <= last { count } else { 0 };
+        (first..)
+            .take(count)
+            .map(::std::net::Ipv4Addr::from)
     }
 }
 
@@ -616,6 +855,12 @@ pub struct StoredEnvironment {
     /// `CreateEnvironmentConnector` doc), so the map holds at most as many live
     /// records as the model declares types.
     pub connectors: BTreeMap<String, StoredConnector>,
+    /// The ESX hosts added to this environment, keyed by `hostName` — the handle a host
+    /// is addressed by, and unique across environments. A `BTreeMap` so
+    /// `ListEnvironmentHosts` has one stable order to page over; bounded by the usable
+    /// addresses of the environment's own `vmkManagement` VLAN subnet
+    /// ([`Self::next_host_ip`]).
+    pub hosts: BTreeMap<String, StoredHost>,
     /// The lifecycle transition the clock owes this environment, if any.
     pub pending: Option<PendingTransition>,
 }
@@ -637,19 +882,22 @@ impl StoredEnvironment {
             }
             self.pending = None;
         }
-        // Each entitlement runs on its own clock: one created after the environment
-        // settled has no environment transition left to ride on.
+        // Each entitlement, connector and host runs on its own clock: one created after
+        // the environment settled has no environment transition left to ride on.
         for entitlement in self.entitlements.values_mut() {
             entitlement.materialise_due_transition(now);
         }
-        // A connector runs on its own clock for the same reason.
+        // A connector and a host each run on their own clock for the same reason.
         for connector in self.connectors.values_mut() {
             connector.materialise_due_transition(now);
         }
+        for host in self.hosts.values_mut() {
+            host.materialise_due_transition(now);
+        }
     }
 
-    /// The earliest instant at which this environment, or one of its entitlements or
-    /// connectors, still owes a change — `None` when nothing is owed.
+    /// The earliest instant at which this environment, or one of its entitlements,
+    /// connectors or hosts, still owes a change — `None` when nothing is owed.
     pub fn next_transition_at(&self) -> Option<Instant> {
         self.pending
             .iter()
@@ -666,7 +914,39 @@ impl StoredEnvironment {
                     .filter_map(|connector| connector.pending.as_ref())
                     .map(|pending| pending.due_at),
             )
+            .chain(
+                self.hosts
+                    .values()
+                    .filter_map(|host| host.pending.as_ref())
+                    .map(|pending| pending.due_at),
+            )
             .min()
+    }
+
+    /// The management IP address the next host of this environment takes: the lowest
+    /// usable address of the `vmkManagement` VLAN subnet that no host of this
+    /// environment already holds.
+    ///
+    /// An ESX host's management interface lives on the `vmkManagement` VLAN — that is
+    /// the traffic type the VLAN carries (`Vlan$functionName` doc) — so the address is
+    /// COMPUTED from the environment's own VLAN plan rather than invented, and the
+    /// subnet's usable range is therefore also what bounds how many hosts one
+    /// environment can hold: `None` means the subnet is full and a further host cannot
+    /// be addressed.
+    pub fn next_host_ip(&self) -> Option<String> {
+        let vmk = self
+            .vlans
+            .iter()
+            .find(|vlan| vlan.function_name == VMK_MANAGEMENT_FUNCTION)?;
+        let taken: Vec<&str> = self
+            .hosts
+            .values()
+            .map(|host| host.ip_address.as_str())
+            .collect();
+        Ipv4Cidr::parse(&vmk.cidr)?
+            .usable_addresses()
+            .map(|address| address.to_string())
+            .find(|address| !taken.contains(&address.as_str()))
     }
 
     /// `environmentStatus`: the roll-up of the environment's `checks`, which
@@ -771,6 +1051,144 @@ pub const MAX_ENVIRONMENTS: usize = 256;
 /// ordinary workflow.
 pub const MAX_ENTITLEMENTS_PER_ENVIRONMENT: usize = 1024;
 
+/// The most Elastic IP associations one VLAN subnet holds — the cap that bounds
+/// caller-driven growth of a VLAN's association list.
+///
+/// `AssociateEipToVlan` is the only thing that adds one and the CALLER chooses the
+/// `allocationId`, so distinct ids would otherwise grow the list without limit, and
+/// every response that reports the VLAN clones the whole list back out. Past this cap
+/// an associate is refused with the operation's modelled `ValidationException`, never by
+/// dropping an association the caller still holds — `DisassociateEipFromVlan` is what
+/// removes one.
+///
+/// The number is the emulator's own bound, not a contract: Amazon EVS publishes no
+/// per-VLAN Elastic IP quota, and an account's own Elastic IP quota (five per Region by
+/// default, adjustable) is far below it.
+pub const MAX_EIP_ASSOCIATIONS_PER_VLAN: usize = 64;
+
+/// The most account-level EVS settings one Region holds.
+///
+/// Not a cap this service enforces as a count: a Region holds at most one value per
+/// setting NAME, and the names are the ones [`ACCOUNT_SETTINGS`] lists, so the reported
+/// list is bounded by that catalog's length — which is what has to stay inside the
+/// `@length(0..100)` of `AccountSettingList`, the shape `GetAccountSettings` reports the
+/// Region's settings as (`smithy_query(query="shape", shape="AccountSettingList")`).
+const _: () = assert!(
+    ACCOUNT_SETTINGS.len() <= 100,
+    "a Region's settings are reported as an AccountSettingList, whose @length is 0..100"
+);
+
+/// The most Regions this service holds account settings for — the cap that bounds
+/// caller-driven growth of [`ComAmazonawsEvsAmazonelasticvmwareserviceState::account_settings`].
+///
+/// The Region a setting is written under comes from the REQUEST (the SigV4 credential
+/// scope), so without a cap a caller could open a fresh per-Region bucket per call even
+/// though each bucket is itself bounded by [`ACCOUNT_SETTINGS`]. Past this many Regions,
+/// a put for a Region the store holds no settings for is refused with
+/// `PutAccountSettings`'s modelled `ValidationException`, never by discarding settings a
+/// caller already set; a put for a Region already in the store is unaffected.
+///
+/// The number is the emulator's own bound, not a contract: it is far above the number of
+/// Regions Amazon EVS is available in.
+pub const MAX_ACCOUNT_SETTING_REGIONS: usize = 64;
+
+/// One account-level EVS setting this service accepts: its name, and the domain its own
+/// documentation gives its value.
+#[derive(Debug, Clone, Copy)]
+pub struct AccountSettingSpec {
+    /// The setting's name, as `AccountSetting$name` spells it.
+    pub name: &'static str,
+    /// The largest value the setting takes.
+    pub maximum: u64,
+}
+
+/// Every account-level EVS setting `PutAccountSettings` accepts.
+///
+/// `AccountSetting$name` states the whole set, and each entry's TYPE and RANGE
+/// (`smithy_query(query="doc", shape="AccountSetting", member="name")`):
+///
+/// > The name of the EVS setting. Valid values are: `vcfPortedCoreCount` (type: numeric
+/// > string) — The total number of VCF license cores ported to Amazon EVS for the
+/// > account in that Region. The maximum value is 1,000,000 cores.
+///
+/// So the modelled `@length(1..128)` and `@pattern ^[a-zA-Z0-9]+$` on the two members are
+/// the SHAPE of a setting, not the domain of one: a name outside this list, a value that
+/// is not a numeric string, and a value past the named setting's maximum are each inside
+/// that shape and outside the documented domain, and are refused with
+/// `PutAccountSettings`'s modelled `ValidationException`
+/// ([`account_setting_failures`]). Add a row here when the model documents another
+/// setting; nothing else needs to change.
+pub const ACCOUNT_SETTINGS: &[AccountSettingSpec] = &[AccountSettingSpec {
+    name: "vcfPortedCoreCount",
+    maximum: 1_000_000,
+}];
+
+/// The setting `name` names, if it is one this service accepts.
+pub fn account_setting_spec(name: &str) -> Option<&'static AccountSettingSpec> {
+    ACCOUNT_SETTINGS.iter().find(|spec| spec.name == name)
+}
+
+/// Whether a run of ASCII digits denotes a number greater than `maximum`.
+///
+/// Compared digit-wise rather than parsed: a setting value may carry up to 128 digits
+/// (its modelled `@length`), which is past every integer type, so a value that is far
+/// too large has to be recognised as too large rather than as unparseable.
+fn exceeds(digits: &str, maximum: u64) -> bool {
+    let value = digits.trim_start_matches('0');
+    let ceiling = maximum.to_string();
+    value.len() > ceiling.len() || (value.len() == ceiling.len() && value > ceiling.as_str())
+}
+
+/// Every way the settings a `PutAccountSettings` request carries fall outside the domain
+/// [`ACCOUNT_SETTINGS`] documents, as `fieldList` entries — empty for a request this
+/// service accepts.
+///
+/// Each entry names the member path the boundary validator names a list element's member
+/// by (`settings.<1-based index>.member.<member>`), so a caller reads one member path
+/// whether the setting was refused for its SHAPE or for its DOMAIN, and states the
+/// requirement without quoting the rejected value back (the rule
+/// [`constraint_violation_message`] keeps for the modelled constraints). Every failure is
+/// reported, not just the first, exactly as [`aggregate_validation_error`] does.
+pub fn account_setting_failures(
+    settings: &[AccountSetting],
+) -> Vec<crate::ops::types::ValidationExceptionField> {
+    let supported = ACCOUNT_SETTINGS
+        .iter()
+        .map(|spec| spec.name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut failures = Vec::new();
+    for (index, setting) in settings.iter().enumerate() {
+        // The element's path, as the framework builds it: 1-based index, then the step
+        // into the element.
+        let element = format!("settings.{}.{COLLECTION_STEP}", index + 1);
+        let Some(spec) = account_setting_spec(&setting.name) else {
+            // An unrecognised name has no documented domain, so nothing is said about
+            // its value: the name is the failure.
+            failures.push(field_failure(
+                &format!("{element}.name"),
+                &format!("must name a supported EVS account setting: {supported}"),
+            ));
+            continue;
+        };
+        if setting.value.is_empty() || !setting.value.bytes().all(|byte| byte.is_ascii_digit()) {
+            failures.push(field_failure(
+                &format!("{element}.value"),
+                &format!("must be a numeric string, the type of the {} setting", spec.name),
+            ));
+        } else if exceeds(&setting.value, spec.maximum) {
+            failures.push(field_failure(
+                &format!("{element}.value"),
+                &format!(
+                    "must be at most {}, the maximum value of the {} setting",
+                    spec.maximum, spec.name
+                ),
+            ));
+        }
+    }
+    failures
+}
+
 /// Per-service state for com-amazonaws-evs-amazonelasticvmwareservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsEvsAmazonelasticvmwareserviceState {
@@ -778,6 +1196,19 @@ pub struct ComAmazonawsEvsAmazonelasticvmwareserviceState {
     /// so `ListEnvironments` has one stable order to page over. Bounded by
     /// [`MAX_ENVIRONMENTS`], which counts every record, `DELETED` ones included.
     pub environments: BTreeMap<String, StoredEnvironment>,
+    /// The account-level EVS settings that have been EXPLICITLY SET, as `<region> ->
+    /// <setting name> -> value`.
+    ///
+    /// Account settings are regional ("for your Amazon Web Services account in the
+    /// specified Amazon Web Services Region", `Get`/`PutAccountSettings` docs), so the
+    /// outer key is the Region the caller addressed and a setting set at one endpoint is
+    /// not reported at another. A name is absent from the inner map until a
+    /// `PutAccountSettings` names it: "EVS settings that have never been explicitly set
+    /// are omitted from the response" (`GetAccountSettings$settings` doc). A `BTreeMap`
+    /// so the reported list has one stable order; one Region's settings are bounded by
+    /// the names [`ACCOUNT_SETTINGS`] documents, and the number of Regions by
+    /// [`MAX_ACCOUNT_SETTING_REGIONS`].
+    pub account_settings: BTreeMap<String, BTreeMap<String, String>>,
     /// The earliest instant at which any stored environment has a transition due, or
     /// `None` when none has. [`Self::materialise_due_transitions`] returns without
     /// looking at a single record until that instant arrives, so a request pays O(1)
@@ -826,6 +1257,14 @@ impl ComAmazonawsEvsAmazonelasticvmwareserviceState {
         let seed = u128::from(self.next_seed());
         let value = ((u128::from(self.id_salt) << 4) ^ seed) & ((1u128 << 68) - 1);
         format!("subnet-{value:017x}")
+    }
+
+    /// Mint an Elastic IP association id: `eipassoc-` + 17 lowercase hex characters,
+    /// which satisfies the modelled `^eipassoc-[a-zA-Z0-9_-]+$` within its 9..26 length.
+    pub fn mint_eip_association_id(&mut self) -> String {
+        let seed = u128::from(self.next_seed());
+        let value = ((u128::from(self.id_salt) << 4) ^ seed) & ((1u128 << 68) - 1);
+        format!("eipassoc-{value:017x}")
     }
 
     /// Apply every lifecycle transition the clock has made due, so a reporting
@@ -960,6 +1399,85 @@ impl ComAmazonawsEvsAmazonelasticvmwareserviceState {
                 && environment.vpc_id == vpc_id
                 && environment.state != STATE_DELETED
         })
+    }
+
+    /// Whether some host of some environment this service holds already carries
+    /// `host_name`: "DNS hostnames for hosts must be unique across Amazon EVS
+    /// environments and within VCF" (`HostInfoForCreate$hostName` doc), so the scope is
+    /// every environment and not one — and not one Region either, since the uniqueness
+    /// the doc states is within VCF rather than within an endpoint.
+    pub fn host_name_is_taken(&self, host_name: &str) -> bool {
+        self.environments.values().any(|environment| {
+            environment.state != STATE_DELETED && environment.hosts.contains_key(host_name)
+        })
+    }
+
+    /// The account-level settings `region` holds, as the wire list `GetAccountSettings`
+    /// reports: one entry per setting EXPLICITLY SET at that endpoint and nothing else,
+    /// so a Region nobody has written to reports the empty list ("If no settings have
+    /// been set, an empty list is returned", `GetAccountSettings` doc).
+    ///
+    /// Ordered by setting name, the stored order, so two reads of an unchanged store
+    /// report the same list.
+    pub fn account_settings_in_region(&self, region: &str) -> Vec<AccountSetting> {
+        self.account_settings
+            .get(region)
+            .map(|held| {
+                held.iter()
+                    .map(|(name, value)| AccountSetting {
+                        name: name.clone(),
+                        value: value.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether this store has room to hold account settings for `region`: a Region it
+    /// already holds settings for always has, and one it does not only while the store
+    /// is below [`MAX_ACCOUNT_SETTING_REGIONS`].
+    pub fn has_room_for_account_settings(&self, region: &str) -> bool {
+        self.account_settings.contains_key(region)
+            || self.account_settings.len() < MAX_ACCOUNT_SETTING_REGIONS
+    }
+
+    /// Create or overwrite exactly the settings `requested` names in `region`, and
+    /// report them as stored.
+    ///
+    /// "EVS settings included in the request are created or overwritten. Settings
+    /// omitted from the request retain their current values." (`PutAccountSettings`
+    /// doc.) The answer is "the settings … that were modified in this request"
+    /// (`PutAccountSettingsResponse$settings` doc): one entry per name the request
+    /// carried, in the order the request first named it, carrying the value now stored —
+    /// which for a name given twice in one request is the LAST value given, since that
+    /// is the one the overwrite left behind.
+    pub fn put_account_settings(
+        &mut self,
+        region: &str,
+        requested: &[AccountSetting],
+    ) -> Vec<AccountSetting> {
+        if requested.is_empty() {
+            // Nothing is modified, so nothing is written: a put that names no setting
+            // does not even bring this Region's map into existence.
+            return Vec::new();
+        }
+        let held = self.account_settings.entry(region.to_string()).or_default();
+        for setting in requested {
+            held.insert(setting.name.clone(), setting.value.clone());
+        }
+        let mut reported: Vec<AccountSetting> = Vec::with_capacity(requested.len());
+        for setting in requested {
+            if reported.iter().any(|already| already.name == setting.name) {
+                continue;
+            }
+            if let Some(value) = held.get(&setting.name) {
+                reported.push(AccountSetting {
+                    name: setting.name.clone(),
+                    value: value.clone(),
+                });
+            }
+        }
+        reported
     }
 }
 

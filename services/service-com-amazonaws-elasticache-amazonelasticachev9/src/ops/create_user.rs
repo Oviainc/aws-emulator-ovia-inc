@@ -213,9 +213,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // How the user authenticates, from the three mutually exclusive members
-        // that can say so. Resolved before the store is locked, so a refused
-        // request leaves no trace; the helper is shared with `ModifyUser`, which
-        // takes the same members.
+        // that can say so, with the published password rules (16-128 characters,
+        // at most two) enforced inside it. Resolved before the store is locked,
+        // so a refused request leaves no trace; the helper is shared with
+        // `ModifyUser`, which takes the same members.
         let authentication = match crate::state::authentication_from_request(
             input.passwords.as_deref(),
             input.no_password_required,
@@ -338,14 +339,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.users.insert(user_id.clone(), record);
 
         // Read back out of the store, so the response is the persisted user
-        // rather than the request echoed.
+        // rather than the request echoed. A new user belongs to no group yet,
+        // and `User$UserGroupIds` is derived from the groups that list it.
+        let user_group_ids = store.user_group_ids_of(&user_id);
         let Some(stored) = store.users.get(&user_id) else {
             // Unreachable: the insert above holds the same lock as this read.
             return Err(crate::scaffolded::Scaffolded::validation(
                 crate::state::STORE_UNAVAILABLE,
             ));
         };
-        let user = stored.to_modeled();
+        let user = stored.to_modeled_in(user_group_ids);
         // Creating a user is one of the events this service records; see
         // `crate::state::EventRecord`.
         store.record_event(

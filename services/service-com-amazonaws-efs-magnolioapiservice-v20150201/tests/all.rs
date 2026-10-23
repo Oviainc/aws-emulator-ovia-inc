@@ -25,6 +25,8 @@ mod file_system_lifecycle;
 mod harness;
 #[path = "all/lifecycle_configuration.rs"]
 mod lifecycle_configuration;
+#[path = "all/mutation_results.rs"]
+mod mutation_results;
 #[path = "all/replication_configuration.rs"]
 mod replication_configuration;
 #[path = "all/resource_tags.rs"]

@@ -21,9 +21,17 @@ mod distribution_lifecycle;
 mod distribution_tags;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
+#[path = "all/invalidation_list.rs"]
+mod invalidation_list;
 #[path = "all/key_value_store_lifecycle.rs"]
 mod key_value_store_lifecycle;
+#[path = "all/origin_access_identity_lifecycle.rs"]
+mod origin_access_identity_lifecycle;
+#[path = "all/response_headers_policy_lifecycle.rs"]
+mod response_headers_policy_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_resource.rs"]
+mod tag_resource;
 #[path = "all/tenant_distribution_and_method_order.rs"]
 mod tenant_distribution_and_method_order;

@@ -169,6 +169,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // A submission has to say WHAT to extract, in exactly one of two members: a
+        // data-automation project or an inline `blueprints` list. The model marks both
+        // optional and expresses no "exactly one of", so the rule is enforced here with
+        // the operation's own modelled `ValidationException` (HTTP 400) — before
+        // anything is minted or persisted, so a refused submission leaves no record
+        // behind. See `crate::state::extraction_target_refusal`, which the synchronous
+        // `InvokeDataAutomation` calls too.
+        if let Some(message) = crate::state::extraction_target_refusal(
+            input.data_automation_configuration.as_ref(),
+            input.blueprints.as_deref(),
+        ) {
+            return Err(InvokeDataAutomationAsyncErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Every tag key must satisfy the modelled `TagKey` pattern, which the boundary
+        // walk cannot enforce (see `crate::state::tag_key_is_well_formed`). Checked
+        // before anything is minted, so a refused submission leaves no record.
+        if input
+            .tags
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|tag| !crate::state::tag_key_is_well_formed(&tag.key))
+        {
+            return Err(InvokeDataAutomationAsyncErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::malformed_tag_key_message(
+                        "tags.member.key",
+                    )),
+                },
+            )
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(InvokeDataAutomationAsyncErrorModeled::InternalServerException(
                 InternalServerException {

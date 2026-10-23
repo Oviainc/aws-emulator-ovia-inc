@@ -182,7 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut state = store.lock();
             // The account-class gate, applied before the merge: a refused write must
             // leave the stored record untouched.
-            if let Some(refusal) = state.member_account_refusal(Self::NAME) {
+            if let Some(refusal) = state.member_account_refusal() {
                 return Err(UpdatePreferencesErrorModeled::ValidationException(refusal).into());
             }
             state.preferences.merge(

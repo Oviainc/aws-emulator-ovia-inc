@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableAllowedImagesSettings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableAllowedImagesSettings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableAllowedImagesSettings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Moves the account's Allowed AMIs setting in the Region the request was signed for to the
+//! state it names, in [`crate::state`]. A MUTATION: this call is what applies the setting.
+//!
+//! It moves the STATE only — the criteria stored beside it are untouched, because "the image
+//! criteria in your Allowed AMIs settings are applied" is what enabling does TO those
+//! criteria, and `ReplaceImageCriteriaInAllowedImagesSettings` is what sets them. The move
+//! is immediate rather than clock-owed: `AllowedImagesSettingsEnabledState` has no
+//! transient member, so the state this call answers with is the state it reached.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +151,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableAllowedImagesSettings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableAllowedImagesSettingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableAllowedImagesSettings"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            allowed_images_settings_full, invalid_parameter_value, request_region,
+            require_service_state,
+        };
+
+        // "Specify `enabled` to apply the image criteria specified by the Allowed AMIs
+        // settings. Specify `audit-mode` so that you can check which AMIs will be allowed
+        // or not allowed by the image criteria": the two members of
+        // `AllowedImagesSettingsEnabledState`, read off the generated catalog of that enum
+        // rather than spelled again here. `disabled` is NOT one of them — that state is
+        // reached through `DisableAllowedImagesSettings`.
+        let requested = input.allowed_images_settings_state;
+        if !ALLOWED_IMAGES_SETTINGS_ENABLED_STATE_VALUES.contains(&requested.as_str()) {
+            return Err(invalid_parameter_value(format!(
+                "Invalid value '{requested}' for AllowedImagesSettingsState. Valid values: {}",
+                ALLOWED_IMAGES_SETTINGS_ENABLED_STATE_VALUES.join(", ")
+            )));
+        }
+
+        // DryRun sits AFTER the requested state has been validated and BEFORE the write:
+        // the flag asks whether the request WOULD have succeeded, so one that would have
+        // been refused is refused with that reason instead, and one that would have
+        // succeeded leaves the settings untouched. Of the member's two documented outcomes
+        // only `DryRunOperation` ("if you have the required permissions") can be answered
+        // here: this emulator models no principal permissions, so there is no caller for
+        // `UnauthorizedOperation` to describe.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // "Enables Allowed AMIs for your account in the specified Amazon Web Services
+        // Region": the Region this request was signed for is the one being enabled.
+        let region = request_region(ctx.parts());
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        store
+            .set_allowed_images_settings_state(&region, &requested)
+            .map_err(|full| allowed_images_settings_full(&region, full))?;
+
+        // "Returns `enabled` or `audit-mode` if the request succeeds": the state the
+        // setting now holds, which is the one the request asked for.
+        Ok(EnableAllowedImagesSettingsOutput {
+            allowed_images_settings_state: Some(requested),
+        })
     }
 }

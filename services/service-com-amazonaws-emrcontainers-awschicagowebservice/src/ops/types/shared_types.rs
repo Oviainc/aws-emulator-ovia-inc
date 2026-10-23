@@ -250,7 +250,10 @@ pub struct SchedulerConfiguration {
     pub max_concurrent_job_runs: Option<i32>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.emrcontainers#JobRun")]
+/// `createdAt`/`finishedAt` target `Date` (`@timestampFormat("date-time")`), so this
+/// shape's schema comes from `emrc_schema_and_codec!` — see `types/date_time_wire.rs`.
+/// Member set, order and requiredness from
+/// `smithy_query(query="shape", shape="com.amazonaws.emrcontainers#JobRun")`.
 #[derive(Debug, Clone, Default)]
 pub struct JobRun {
     pub id: Option<String>,
@@ -273,6 +276,95 @@ pub struct JobRun {
     pub retry_policy_execution: Option<RetryPolicyExecution>,
 }
 
+emrc_schema_and_codec!(
+    JobRun,
+    JOB_RUN_SCHEMA,
+    "com.amazonaws.emrcontainers#JobRun",
+    "com.amazonaws.emrcontainers",
+    "JobRun",
+    (M_ID, id, "id", 0, opt, string),
+    (M_NAME, name, "name", 1, opt, string),
+    (
+        M_VIRTUAL_CLUSTER_ID,
+        virtual_cluster_id,
+        "virtualClusterId",
+        2,
+        opt,
+        string
+    ),
+    (M_ARN, arn, "arn", 3, opt, string),
+    (M_STATE, state, "state", 4, opt, string),
+    (M_CLIENT_TOKEN, client_token, "clientToken", 5, opt, string),
+    (
+        M_EXECUTION_ROLE_ARN,
+        execution_role_arn,
+        "executionRoleArn",
+        6,
+        opt,
+        string
+    ),
+    (
+        M_RELEASE_LABEL,
+        release_label,
+        "releaseLabel",
+        7,
+        opt,
+        string
+    ),
+    (
+        M_CONFIGURATION_OVERRIDES,
+        configuration_overrides,
+        "configurationOverrides",
+        8,
+        opt,
+        struct_of(ConfigurationOverrides)
+    ),
+    (
+        M_JOB_DRIVER,
+        job_driver,
+        "jobDriver",
+        9,
+        opt,
+        struct_of(JobDriver)
+    ),
+    (M_CREATED_AT, created_at, "createdAt", 10, opt, date_time),
+    (M_CREATED_BY, created_by, "createdBy", 11, opt, string),
+    (M_FINISHED_AT, finished_at, "finishedAt", 12, opt, date_time),
+    (
+        M_STATE_DETAILS,
+        state_details,
+        "stateDetails",
+        13,
+        opt,
+        string
+    ),
+    (
+        M_FAILURE_REASON,
+        failure_reason,
+        "failureReason",
+        14,
+        opt,
+        string
+    ),
+    (M_TAGS, tags, "tags", 15, opt, map_of_string),
+    (
+        M_RETRY_POLICY_CONFIGURATION,
+        retry_policy_configuration,
+        "retryPolicyConfiguration",
+        16,
+        opt,
+        struct_of(RetryPolicyConfiguration)
+    ),
+    (
+        M_RETRY_POLICY_EXECUTION,
+        retry_policy_execution,
+        "retryPolicyExecution",
+        17,
+        opt,
+        struct_of(RetryPolicyExecution)
+    ),
+);
+
 #[smithy_macros::smithy(shape = "com.amazonaws.emrcontainers#RetryPolicyConfiguration")]
 #[derive(Debug, Clone, Default)]
 pub struct RetryPolicyConfiguration {
@@ -285,7 +377,10 @@ pub struct RetryPolicyExecution {
     pub current_attempt_count: i32,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.emrcontainers#JobTemplate")]
+/// `createdAt` targets `Date` (`@timestampFormat("date-time")`), so this shape's schema
+/// comes from `emrc_schema_and_codec!` — see `types/date_time_wire.rs`. Member set, order
+/// and requiredness from
+/// `smithy_query(query="shape", shape="com.amazonaws.emrcontainers#JobTemplate")`.
 #[derive(Debug, Clone, Default)]
 pub struct JobTemplate {
     pub name: Option<String>,
@@ -298,6 +393,37 @@ pub struct JobTemplate {
     pub kms_key_arn: Option<String>,
     pub decryption_error: Option<String>,
 }
+
+emrc_schema_and_codec!(
+    JobTemplate,
+    JOB_TEMPLATE_SCHEMA,
+    "com.amazonaws.emrcontainers#JobTemplate",
+    "com.amazonaws.emrcontainers",
+    "JobTemplate",
+    (M_NAME, name, "name", 0, opt, string),
+    (M_ID, id, "id", 1, opt, string),
+    (M_ARN, arn, "arn", 2, opt, string),
+    (M_CREATED_AT, created_at, "createdAt", 3, opt, date_time),
+    (M_CREATED_BY, created_by, "createdBy", 4, opt, string),
+    (M_TAGS, tags, "tags", 5, opt, map_of_string),
+    (
+        M_JOB_TEMPLATE_DATA,
+        job_template_data,
+        "jobTemplateData",
+        6,
+        req,
+        struct_of(JobTemplateData)
+    ),
+    (M_KMS_KEY_ARN, kms_key_arn, "kmsKeyArn", 7, opt, string),
+    (
+        M_DECRYPTION_ERROR,
+        decryption_error,
+        "decryptionError",
+        8,
+        opt,
+        string
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.emrcontainers#Endpoint")]
 #[derive(Debug, Clone, Default)]
@@ -330,7 +456,20 @@ pub struct Certificate {
     pub certificate_data: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.emrcontainers#SecurityConfiguration")]
+/// `createdAt` targets `Date` (`@timestampFormat("date-time")`), so this shape's schema
+/// comes from `emrc_schema_and_codec!` — see `types/date_time_wire.rs`. Member set, order
+/// and requiredness from
+/// `smithy_query(query="shape", shape="com.amazonaws.emrcontainers#SecurityConfiguration")`,
+/// plus `containerProvider`.
+///
+/// `containerProvider` is RECORDED BEHAVIOUR, not modelled: the on-disk model declares
+/// only `id`/`name`/`arn`/`createdAt`/`createdBy`/`securityConfigurationData`/`tags`,
+/// while `CreateSecurityConfiguration`'s input DOES accept a `containerProvider` and AWS
+/// echoes it back on every read of the configuration (the recorded
+/// `DescribeSecurityConfiguration` response carries
+/// `{type, id, info: {eksInfo: {namespace}}}`). The model evidently predates the member,
+/// so it is appended LAST — the model's own members keep the indices the model gives them,
+/// and a later model refresh that adds `containerProvider` only has to move it into place.
 #[derive(Debug, Clone, Default)]
 pub struct SecurityConfiguration {
     pub id: Option<String>,
@@ -340,9 +479,43 @@ pub struct SecurityConfiguration {
     pub created_by: Option<String>,
     pub security_configuration_data: Option<SecurityConfigurationData>,
     pub tags: Option<std::collections::HashMap<String, String>>,
+    pub container_provider: Option<ContainerProvider>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.emrcontainers#VirtualCluster")]
+emrc_schema_and_codec!(
+    SecurityConfiguration,
+    SECURITY_CONFIGURATION_SCHEMA,
+    "com.amazonaws.emrcontainers#SecurityConfiguration",
+    "com.amazonaws.emrcontainers",
+    "SecurityConfiguration",
+    (M_ID, id, "id", 0, opt, string),
+    (M_NAME, name, "name", 1, opt, string),
+    (M_ARN, arn, "arn", 2, opt, string),
+    (M_CREATED_AT, created_at, "createdAt", 3, opt, date_time),
+    (M_CREATED_BY, created_by, "createdBy", 4, opt, string),
+    (
+        M_SECURITY_CONFIGURATION_DATA,
+        security_configuration_data,
+        "securityConfigurationData",
+        5,
+        opt,
+        struct_of(SecurityConfigurationData)
+    ),
+    (M_TAGS, tags, "tags", 6, opt, map_of_string),
+    (
+        M_CONTAINER_PROVIDER,
+        container_provider,
+        "containerProvider",
+        7,
+        opt,
+        struct_of(ContainerProvider)
+    ),
+);
+
+/// `createdAt` targets `Date` (`@timestampFormat("date-time")`), so this shape's schema
+/// comes from `emrc_schema_and_codec!` — see `types/date_time_wire.rs`. Member set, order
+/// and requiredness from
+/// `smithy_query(query="shape", shape="com.amazonaws.emrcontainers#VirtualCluster")`.
 #[derive(Debug, Clone, Default)]
 pub struct VirtualCluster {
     pub id: Option<String>,
@@ -357,6 +530,60 @@ pub struct VirtualCluster {
     pub scheduler_configuration: Option<SchedulerConfiguration>,
     pub scheduler_status: Option<SchedulerStatus>,
 }
+
+emrc_schema_and_codec!(
+    VirtualCluster,
+    VIRTUAL_CLUSTER_SCHEMA,
+    "com.amazonaws.emrcontainers#VirtualCluster",
+    "com.amazonaws.emrcontainers",
+    "VirtualCluster",
+    (M_ID, id, "id", 0, opt, string),
+    (M_NAME, name, "name", 1, opt, string),
+    (M_ARN, arn, "arn", 2, opt, string),
+    (M_STATE, state, "state", 3, opt, string),
+    (
+        M_CONTAINER_PROVIDER,
+        container_provider,
+        "containerProvider",
+        4,
+        opt,
+        struct_of(ContainerProvider)
+    ),
+    (M_CREATED_AT, created_at, "createdAt", 5, opt, date_time),
+    (M_TAGS, tags, "tags", 6, opt, map_of_string),
+    (
+        M_SECURITY_CONFIGURATION_ID,
+        security_configuration_id,
+        "securityConfigurationId",
+        7,
+        opt,
+        string
+    ),
+    (
+        M_SESSION_ENABLED,
+        session_enabled,
+        "sessionEnabled",
+        8,
+        opt,
+        boolean
+    ),
+    (
+        M_SCHEDULER_CONFIGURATION,
+        scheduler_configuration,
+        "schedulerConfiguration",
+        9,
+        opt,
+        struct_of(SchedulerConfiguration)
+    ),
+    (
+        M_SCHEDULER_STATUS,
+        scheduler_status,
+        "schedulerStatus",
+        10,
+        opt,
+        struct_of(SchedulerStatus)
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.emrcontainers#SchedulerStatus")]
 #[derive(Debug, Clone, Default)]

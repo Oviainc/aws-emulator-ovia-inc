@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRouteResponse
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRouteResponse`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRouteResponse::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a `RouteResponseId` and persists a
+//! [`crate::state::RouteResponse`] record under the route that owns it. This is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +152,128 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRouteResponse` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRouteResponseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRouteResponse"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateRouteResponse",
+            ));
+        };
+        let mut store = state.lock();
+
+        let Some(api) = store.apis.get_mut(&input.api_id) else {
+            return Err(CreateRouteResponseErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!(
+                        "Invalid API identifier specified {}:{}",
+                        ::engine::emulator_account_id(),
+                        input.api_id
+                    )),
+                    resource_type: ::std::option::Option::None,
+                },
+            )
+            .into());
+        };
+
+        // A route response belongs to the WebSocket two-way communication model:
+        // `RouteResponse$ModelSelectionExpression` is "Supported only for WebSocket
+        // APIs", and an HTTP api has no route-response resource to create.
+        if api.protocol_type != crate::state::WEBSOCKET_PROTOCOL_TYPE {
+            return Err(bad_request(&format!(
+                "Route responses are not supported for {} APIs.",
+                api.protocol_type
+            )));
+        }
+
+        let Some(route) = api.routes.get_mut(&input.route_id) else {
+            return Err(CreateRouteResponseErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!(
+                        "Invalid Route identifier specified {}:{}",
+                        ::engine::emulator_account_id(),
+                        input.route_id
+                    )),
+                    resource_type: ::std::option::Option::None,
+                },
+            )
+            .into());
+        };
+
+        // The route response key is what a route response is SELECTED by ("the result
+        // is compared against one or more selection keys to find a matching key",
+        // `SelectionKey`), so one route cannot carry two responses under one key.
+        if route
+            .route_responses
+            .values()
+            .any(|response| response.route_response_key == input.route_response_key)
+        {
+            return Err(CreateRouteResponseErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "Route response with key {} already exists for this route.",
+                        input.route_response_key
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Bound the growth a caller drives: a route holds at most
+        // `MAX_ROUTE_RESPONSES_PER_ROUTE` route responses, and
+        // `TooManyRequestsException` is the modelled error for "a limit has been
+        // exceeded" (it carries the limit's name in `LimitType`). The key check above
+        // refuses a DUPLICATE key; this bounds the number of distinct ones, and with it
+        // the cost of that scan.
+        if route.route_responses.len() >= crate::state::MAX_ROUTE_RESPONSES_PER_ROUTE {
+            return Err(CreateRouteResponseErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    limit_type: Some("RouteResponse".to_string()),
+                    message: Some(format!(
+                        "The maximum number of route responses ({}) for this route has been reached.",
+                        crate::state::MAX_ROUTE_RESPONSES_PER_ROUTE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let route_response_id = route.mint_route_response_id();
+        let record = crate::state::RouteResponse {
+            route_response_id: route_response_id.clone(),
+            route_response_key: input.route_response_key,
+            model_selection_expression: input.model_selection_expression,
+            response_models: input.response_models.unwrap_or_default().into_iter().collect(),
+            response_parameters: input
+                .response_parameters
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+        };
+
+        // Read the response back out of the STORE, so what the caller gets is what a
+        // later GetRouteResponse will report. `route_response_id` comes from this
+        // route's own id bijection, so it names no existing response and this inserts.
+        let stored = route
+            .route_responses
+            .entry(route_response_id)
+            .or_insert(record)
+            .to_wire();
+        Ok(CreateRouteResponseOutput {
+            model_selection_expression: stored.model_selection_expression,
+            response_models: stored.response_models,
+            response_parameters: stored.response_parameters,
+            route_response_id: stored.route_response_id,
+            route_response_key: Some(stored.route_response_key),
+        })
     }
+}
+
+/// This operation's refusal of a request it models no more specific error for: the
+/// modelled `BadRequestException` ("The request is not valid, for example, the input is
+/// incomplete or incorrect"), whose message names what the request asked for.
+fn bad_request(message: &str) -> CreateRouteResponseError {
+    CreateRouteResponseErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

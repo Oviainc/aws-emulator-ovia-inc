@@ -13,8 +13,12 @@
 // points it into `tests/all/`.
 #[path = "all/app_version_app_components.rs"]
 mod app_version_app_components;
+#[path = "all/app_version_resources.rs"]
+mod app_version_resources;
 #[path = "all/application_lifecycle.rs"]
 mod application_lifecycle;
+#[path = "all/list_app_versions.rs"]
+mod list_app_versions;
 #[path = "all/publish_app_version.rs"]
 mod publish_app_version;
 #[path = "all/resiliency_policy_deletion.rs"]

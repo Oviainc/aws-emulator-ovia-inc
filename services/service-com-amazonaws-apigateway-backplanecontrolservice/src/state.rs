@@ -4,7 +4,8 @@
 //!
 //! This holds the REST API resource tree the control plane persists — a `RestApi`, the
 //! `Resource`s under it (including the implicit root resource every API is created
-//! with), the `Method`s put on those resources and the API's `Stage`s — beside the
+//! with), the `Method`s put on those resources, the API's `Stage`s and the gateway
+//! responses a developer has customized on it — beside the
 //! account's `ApiKey` records. Every handler in `src/ops/` computes
 //! its response from these records; nothing is synthesised per request.
 //!
@@ -16,8 +17,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ops::types::{
-    CanarySettings, EndpointConfiguration, GetIntegrationOutput, GetMethodResponseOutput,
-    MethodSetting, MethodSnapshot,
+    CanarySettings, DocumentationPartLocation, EndpointConfiguration, GetGatewayResponseOutput,
+    GetIntegrationOutput, GetMethodResponseOutput, MethodSetting, MethodSnapshot,
 };
 
 /// Per-service state for com-amazonaws-apigateway-backplanecontrolservice. A handler reaches it through [`service_state`].
@@ -71,6 +72,22 @@ pub struct RestApiEntry {
     pub stages: BTreeMap<String, StageEntry>,
     /// Every `Deployment` of this API, keyed by deployment id: what a stage points at.
     pub deployments: BTreeMap<String, DeploymentEntry>,
+    /// The gateway responses a developer has CUSTOMIZED on this API, keyed by their
+    /// `responseType`; written by `PutGatewayResponse` and reported by
+    /// `GetGatewayResponse`.
+    ///
+    /// A type with no entry here is not missing: the API still has a gateway response
+    /// for it, the one API Gateway generates itself, which
+    /// [`default_gateway_response`] builds. So this map holds only the customizations,
+    /// and a stored record is always reported with `defaultResponse: false`.
+    pub gateway_responses: BTreeMap<String, GetGatewayResponseOutput>,
+    /// Every `DocumentationPart` of this API, keyed by documentation part id: the
+    /// records `CreateDocumentationPart` and `ImportDocumentationParts` write and
+    /// `GetDocumentationPart` / `GetDocumentationParts` report.
+    pub documentation_parts: BTreeMap<String, DocumentationPartEntry>,
+    /// Every `Authorizer` of this API, keyed by authorizer id — the identifier a
+    /// `Method`'s `authorizerId` names and `GetAuthorizer` takes in its path label.
+    pub authorizers: BTreeMap<String, AuthorizerEntry>,
     /// This API's creation rank, from [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`].
     pub sequence: u64,
 }
@@ -114,6 +131,14 @@ impl RestApiEntry {
             }
         }
         found.into_iter().collect()
+    }
+
+    /// This API's documentation parts in creation order — the stable sequence
+    /// [`page_of`] cuts a `GetDocumentationParts` page out of.
+    pub fn documentation_parts_in_creation_order(&self) -> Vec<&DocumentationPartEntry> {
+        let mut ordered: Vec<&DocumentationPartEntry> = self.documentation_parts.values().collect();
+        ordered.sort_by_key(|part| (part.sequence, part.id.clone()));
+        ordered
     }
 }
 
@@ -197,6 +222,26 @@ pub struct DeploymentEntry {
     pub sequence: u64,
 }
 
+/// One stored `DocumentationPart`: the API entity the documentation applies to, and the
+/// content map describing it.
+///
+/// `location` is kept as the modelled [`DocumentationPartLocation`] rather than a second
+/// hand-written mirror of its five members, for the reason the module docs give — and it
+/// is stored COMPLETED (the members the entity type makes valid, defaulted where the
+/// model documents a default), so every read of the part reports the same location.
+#[derive(Debug, Clone, Default)]
+pub struct DocumentationPartEntry {
+    pub id: String,
+    pub location: DocumentationPartLocation,
+    /// The content map, as the JSON text the request supplied: "The map must be encoded
+    /// as a JSON string" (`DocumentationPart$properties`).
+    pub properties: String,
+    /// This part's creation rank, from
+    /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`], so a
+    /// listing reports creation order rather than id order.
+    pub sequence: u64,
+}
+
 /// One stored `Method` on a resource.
 #[derive(Debug, Clone, Default)]
 pub struct MethodEntry {
@@ -216,6 +261,35 @@ pub struct MethodEntry {
     /// Written by `PutIntegration` and reported by `GetIntegration` and a `Method`
     /// body's `methodIntegration`; absent until an integration is put on the method.
     pub integration: Option<GetIntegrationOutput>,
+}
+
+/// One stored `Authorizer` of an API: the custom authorization an API's methods may
+/// name in their `authorizerId`.
+///
+/// `authorizer_result_ttl_in_seconds` is NOT optional here even though the request
+/// member is: the service picks [`DEFAULT_AUTHORIZER_RESULT_TTL_SECONDS`] when the
+/// request sets nothing, so a stored authorizer always has a TTL. Everything else is
+/// kept exactly as the request set it, so a reader reports what was stored rather than a
+/// value invented per read.
+#[derive(Debug, Clone, Default)]
+pub struct AuthorizerEntry {
+    pub id: String,
+    pub name: String,
+    /// One of [`crate::ops::types::AUTHORIZER_TYPE_VALUES`]; the boundary validator
+    /// refuses anything else before a handler runs.
+    pub r#type: String,
+    pub provider_arns: Vec<String>,
+    pub auth_type: Option<String>,
+    pub authorizer_uri: Option<String>,
+    pub authorizer_credentials: Option<String>,
+    pub identity_source: Option<String>,
+    pub identity_validation_expression: Option<String>,
+    /// The TTL in seconds of cached authorizer results; `0` disables caching.
+    pub authorizer_result_ttl_in_seconds: i32,
+    /// This authorizer's creation rank, from
+    /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`], so a
+    /// listing can report creation order rather than id order.
+    pub sequence: u64,
 }
 
 /// One stored `ApiKey`: the identifier the control plane assigns, the key value a
@@ -317,6 +391,79 @@ pub fn defaulted_endpoint_configuration(
     configuration
 }
 
+// ---------------------------------------------------------------------------
+// Gateway responses
+//
+// Every API has a gateway response for EVERY modelled `GatewayResponseType` from the
+// moment it is created: until a developer customizes one, it is the response API
+// Gateway generates itself, reported with `defaultResponse: true`. Only the
+// customizations are stored (`RestApiEntry::gateway_responses`); the generated ones are
+// derived from the catalog below, so a read of an uncustomized type and a read of a
+// customized one answer from one rule.
+// ---------------------------------------------------------------------------
+
+/// The HTTP status code the gateway response API Gateway GENERATES carries, per
+/// `GatewayResponseType`.
+///
+/// Hand-written because the model carries the type's values and nothing else:
+/// `smithy_query(query="shape", shape="com.amazonaws.apigateway#GatewayResponseType")`
+/// lists the 21 values with no status code attached, and `GatewayResponse$statusCode`
+/// documents only the member. Source: the API Gateway Developer Guide's gateway
+/// response table ("Setting up gateway responses to customize error responses"), which
+/// lists each response type beside the status code of the response API Gateway returns
+/// for it. `DEFAULT_4XX` and `DEFAULT_5XX` are the two rows that carry NO status code of
+/// their own — each is a fallback for a whole class of responses, which keep their own
+/// code — so they are absent here, which is why [`default_gateway_status_code`] answers
+/// an `Option`.
+const DEFAULT_GATEWAY_STATUS_CODES: &[(&str, &str)] = &[
+    ("ACCESS_DENIED", "403"),
+    ("API_CONFIGURATION_ERROR", "500"),
+    ("AUTHORIZER_CONFIGURATION_ERROR", "500"),
+    ("AUTHORIZER_FAILURE", "500"),
+    ("BAD_REQUEST_BODY", "400"),
+    ("BAD_REQUEST_PARAMETERS", "400"),
+    ("EXPIRED_TOKEN", "403"),
+    ("INTEGRATION_FAILURE", "504"),
+    ("INTEGRATION_TIMEOUT", "504"),
+    ("INVALID_API_KEY", "403"),
+    ("INVALID_SIGNATURE", "403"),
+    ("MISSING_AUTHENTICATION_TOKEN", "403"),
+    ("QUOTA_EXCEEDED", "429"),
+    ("REQUEST_TOO_LARGE", "413"),
+    ("RESOURCE_NOT_FOUND", "404"),
+    ("THROTTLED", "429"),
+    ("UNAUTHORIZED", "401"),
+    ("UNSUPPORTED_MEDIA_TYPE", "415"),
+    ("WAF_FILTERED", "403"),
+];
+
+/// The status code [`DEFAULT_GATEWAY_STATUS_CODES`] gives `response_type`, or `None` for
+/// a type that has none (`DEFAULT_4XX`, `DEFAULT_5XX`) and for a value the catalog does
+/// not name.
+///
+/// Shared by the operations that write and read a gateway response, so the status code a
+/// `PutGatewayResponse` that set none stores is the one a read of the uncustomized type
+/// would have reported.
+pub fn default_gateway_status_code(response_type: &str) -> Option<&'static str> {
+    DEFAULT_GATEWAY_STATUS_CODES
+        .iter()
+        .find(|(kind, _)| *kind == response_type)
+        .map(|(_, status)| *status)
+}
+
+/// The gateway response an API reports for `response_type` while no customization is
+/// stored for it: the one API Gateway generates, so `defaultResponse` is `true`, the
+/// status code is the type's own, and neither caller-supplied map is set.
+pub fn default_gateway_response(response_type: &str) -> GetGatewayResponseOutput {
+    GetGatewayResponseOutput {
+        response_type: Some(response_type.to_string()),
+        status_code: default_gateway_status_code(response_type).map(str::to_string),
+        response_parameters: None,
+        response_templates: None,
+        default_response: true,
+    }
+}
+
 /// The characters an API Gateway id is built from: lowercase alphanumerics.
 const ID_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
 
@@ -366,8 +513,14 @@ pub const MAX_API_KEYS: usize = 10_000;
 /// API Gateway's default quota "Resources per API: 300".
 pub const MAX_RESOURCES_PER_API: usize = 300;
 
+/// API Gateway's default quota "Documentation parts: 2000 per API".
+pub const MAX_DOCUMENTATION_PARTS_PER_API: usize = 2_000;
+
 /// API Gateway's default quota "Stages per API: 10".
 pub const MAX_STAGES_PER_API: usize = 10;
+
+/// API Gateway's default quota "Authorizers per API: 10".
+pub const MAX_AUTHORIZERS_PER_API: usize = 10;
 
 /// Emulator resource guard, NOT an AWS quota: the most deployments this emulator keeps
 /// for one API. API Gateway publishes no deployment quota.
@@ -394,6 +547,18 @@ pub const CACHE_CLUSTER_CREATE_IN_PROGRESS: &str = "CREATE_IN_PROGRESS";
 /// The `cacheClusterStatus` of a cache cluster that is up.
 pub const CACHE_CLUSTER_AVAILABLE: &str = "AVAILABLE";
 
+/// From `Authorizer$authorizerResultTtlInSeconds`'s own documentation: "If this field
+/// is not set, the default value is 300."
+pub const DEFAULT_AUTHORIZER_RESULT_TTL_SECONDS: i32 = 300;
+
+/// From `Authorizer$authorizerResultTtlInSeconds`'s own documentation: "If it equals 0,
+/// authorization caching is disabled" — so 0 is the lowest value it takes.
+pub const MIN_AUTHORIZER_RESULT_TTL_SECONDS: i32 = 0;
+
+/// From `Authorizer$authorizerResultTtlInSeconds`'s own documentation: "The maximum
+/// value is 3600, or 1 hour."
+pub const MAX_AUTHORIZER_RESULT_TTL_SECONDS: i32 = 3600;
+
 /// API Gateway's documented resource-policy document size: 8192 characters.
 pub const MAX_POLICY_CHARS: usize = 8192;
 
@@ -407,6 +572,110 @@ pub const MAX_TAG_KEY_CHARS: usize = 128;
 /// From the `tags` member's own documentation: "The tag value can be up to 256
 /// characters."
 pub const MAX_TAG_VALUE_CHARS: usize = 256;
+
+// ---------------------------------------------------------------------------
+// Taggable resources, addressed by ARN
+//
+// `GetTags`, `TagResource` and `UntagResource` name their target by ARN rather than by
+// the path labels every other operation of this service takes, so reading an ARN into
+// the record it names lives HERE, in one place all three share: the same string must
+// resolve to the same record, and be refused the same way, whichever of them took it.
+//
+// WHICH resources are taggable comes from the model: a resource of this service is
+// taggable exactly when the shape declared for it carries a `tags` member
+// (`smithy_query(query="shape", shape="RestApi,Stage,ApiKey,UsagePlan,DomainName,\
+// ClientCertificate,VpcLink,DomainNameAccessAssociation")` — all eight do), and the
+// resource portion of such a resource's ARN is the URI of the operation that reads it
+// (`smithy_query(query="operation", operation="GetRestApi,GetStage,GetApiKey,\
+// GetUsagePlan,GetDomainName,GetClientCertificate,GetVpcLink")`: `/restapis/{restApiId}`,
+// `/restapis/{restApiId}/stages/{stageName}`, `/apikeys/{apiKey}`, and so on).
+// ---------------------------------------------------------------------------
+
+/// The vendor field an ARN of one of this service's resources carries: this service's
+/// own `aws.api#service$arnNamespace` (`smithy_query(query="service_info")`:
+/// `arnNamespace: apigateway`), which is what says an ARN names a resource this API can
+/// address at all.
+const ARN_SERVICE: &str = "apigateway";
+
+/// The leading resource-portion segment of each taggable resource kind whose records
+/// this emulator does not keep: the operations that create a usage plan, a domain name,
+/// a client certificate, a VPC link or a domain name access association are still
+/// scaffolds, so nothing can answer to one of these ARNs — while the ARN itself is a
+/// well-formed ARN of a taggable API Gateway resource and so is not a malformed request.
+///
+/// The segments are the first path segment of each kind's read URI; see the section
+/// comment above for the `smithy_query` calls they come from.
+const UNSTORED_TAGGABLE_KINDS: &[&str] = &[
+    "usageplans",
+    "domainnames",
+    "clientcertificates",
+    "vpclinks",
+    "domainnameaccessassociations",
+];
+
+/// The resource one `resourceArn` names: the stored record a tag collection hangs off,
+/// as [`parse_tagged_resource`] read it out of the ARN.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggedResource {
+    /// `/restapis/{restApiId}` — a [`RestApiEntry`]'s tags.
+    RestApi { rest_api_id: String },
+    /// `/restapis/{restApiId}/stages/{stageName}` — a [`StageEntry`]'s tags.
+    Stage {
+        rest_api_id: String,
+        stage_name: String,
+    },
+    /// `/apikeys/{apiKey}` — an [`ApiKeyEntry`]'s tags.
+    ApiKey { api_key_id: String },
+    /// A taggable kind this emulator keeps no records of; see
+    /// [`UNSTORED_TAGGABLE_KINDS`]. `kind` is that list's entry and `id` the identifier
+    /// the ARN carried, so the refusal can name what it could not resolve.
+    Unstored { kind: &'static str, id: String },
+}
+
+/// Read `resource_arn` as the ARN of a taggable resource of this service.
+///
+/// The six ARN fields come from [`::service_common::arn::parse_of`], the ONE parse of a
+/// caller-supplied ARN, narrowed to this service's vendor namespace — so what counts as
+/// an ARN, and whose resource it names, is what every other service of this emulator
+/// says. Only the resource PORTION is read here, because its shape is this service's
+/// own.
+///
+/// `None` for anything that is not the ARN of a taggable resource — a string that is not
+/// an ARN, an ARN of another service, or an API Gateway ARN whose resource portion names
+/// something this service does not tag (a resource or a deployment of an API, a usage
+/// plan key) — which the caller is told is a bad request rather than a missing resource.
+///
+/// The region and account fields are not matched further: this emulator serves one
+/// account, and nothing it stores is keyed by partition or region, so what selects a
+/// record is the resource portion.
+pub fn parse_tagged_resource(resource_arn: &str) -> Option<TaggedResource> {
+    let arn = ::service_common::arn::parse_of(resource_arn, ARN_SERVICE)?;
+    let path: Vec<&str> = arn.resource.strip_prefix('/')?.split('/').collect();
+    if path.iter().any(|segment| segment.is_empty()) {
+        return None;
+    }
+    match path.as_slice() {
+        ["restapis", rest_api_id] => Some(TaggedResource::RestApi {
+            rest_api_id: (*rest_api_id).to_string(),
+        }),
+        ["restapis", rest_api_id, "stages", stage_name] => Some(TaggedResource::Stage {
+            rest_api_id: (*rest_api_id).to_string(),
+            stage_name: (*stage_name).to_string(),
+        }),
+        ["apikeys", api_key_id] => Some(TaggedResource::ApiKey {
+            api_key_id: (*api_key_id).to_string(),
+        }),
+        [kind, id] => UNSTORED_TAGGABLE_KINDS
+            .iter()
+            .copied()
+            .find(|known| known == kind)
+            .map(|known| TaggedResource::Unstored {
+                kind: known,
+                id: (*id).to_string(),
+            }),
+        _ => None,
+    }
+}
 
 /// Emulator resource guard, NOT an AWS quota: the most entries this emulator will store
 /// for a caller-sized list or map whose size the service publishes no limit for.
@@ -999,6 +1268,41 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
         ordered.sort_by_key(|api| (api.sequence, api.id.clone()));
         ordered.into_iter().map(|api| api.id.clone()).collect()
     }
+
+    /// The tag collection stored on the resource a `resourceArn` named, as
+    /// [`parse_tagged_resource`] read it.
+    ///
+    /// One lookup for every tag operation, so what a tag read reports and what a tag
+    /// write edits can never be two different records. `Err` carries the
+    /// `NotFoundException` message for an ARN that is well formed and that no stored
+    /// record answers to, in the wording this service already uses for the same
+    /// unresolvable identifier.
+    pub fn tags_of(&self, resource: &TaggedResource) -> Result<&BTreeMap<String, String>, String> {
+        match resource {
+            TaggedResource::RestApi { rest_api_id } => self
+                .rest_apis
+                .get(rest_api_id)
+                .map(|api| &api.tags)
+                .ok_or_else(|| no_such_rest_api(rest_api_id)),
+            TaggedResource::Stage {
+                rest_api_id,
+                stage_name,
+            } => self
+                .rest_apis
+                .get(rest_api_id)
+                .ok_or_else(|| no_such_rest_api(rest_api_id))?
+                .stages
+                .get(stage_name)
+                .map(|stage| &stage.tags)
+                .ok_or_else(|| NO_SUCH_STAGE.to_string()),
+            TaggedResource::ApiKey { api_key_id } => self
+                .api_keys
+                .get(api_key_id)
+                .map(|key| &key.tags)
+                .ok_or_else(|| NO_SUCH_API_KEY.to_string()),
+            TaggedResource::Unstored { kind, id } => Err(no_such_tagged_resource(kind, id)),
+        }
+    }
 }
 
 /// The `NotFoundException` message for a `restApiId` that names no stored API.
@@ -1037,6 +1341,36 @@ pub const NO_SUCH_DEPLOYMENT: &str = "Invalid deployment identifier specified";
 
 /// The `NotFoundException` message for an `apiKey` that names no stored API key.
 pub const NO_SUCH_API_KEY: &str = "Invalid API Key identifier specified";
+
+/// The `NotFoundException` message for a well-formed ARN of a taggable resource kind
+/// this emulator keeps no records of (see [`UNSTORED_TAGGABLE_KINDS`]): nothing answers
+/// to it, which is a missing resource and not a malformed request.
+///
+/// AWS states no fixed sentence here either, so the message is BUILT FROM THE REQUEST —
+/// it names the resource portion the lookup could not resolve, qualified by the account
+/// the lookup ran in, the way [`no_such_rest_api`] does.
+pub fn no_such_tagged_resource(kind: &str, id: &str) -> String {
+    format!(
+        "Invalid resource identifier specified {}:/{kind}/{id}",
+        ::emulator_server::emulator_account_id()
+    )
+}
+
+/// The `BadRequestException` message for a `resourceArn` that is not the ARN of a
+/// taggable resource of this service — the refusal [`parse_tagged_resource`]'s `None`
+/// earns. BUILT FROM THE REQUEST: it names the value that could not be read as such an
+/// ARN, so the caller can see which argument to fix.
+pub fn invalid_tagged_resource_arn(resource_arn: &str) -> String {
+    format!("Invalid ARN specified in the request {resource_arn}")
+}
+
+/// The `NotFoundException` message for a `documentationPartId` that names no stored
+/// documentation part of the API.
+pub const NO_SUCH_DOCUMENTATION_PART: &str = "Invalid Documentation part identifier specified";
+
+/// The `NotFoundException` message for an `authorizerId` that names no stored authorizer
+/// of the API.
+pub const NO_SUCH_AUTHORIZER: &str = "Invalid Authorizer identifier specified";
 
 /// The `target` every audit record this service emits carries, so a consumer can select
 /// the access trail without reading the rest of the emulator's traces.

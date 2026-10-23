@@ -274,20 +274,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .skip(offset)
             .take(page_size)
-            .map(|(subscription_key, record)| StandardsSubscription {
-                standards_subscription_arn: record.standards_subscription_arn.clone(),
-                standards_arn: subscription_key.standards_arn.clone(),
-                standards_input: record.standards_input.clone(),
-                standards_status: record.standards_status.clone(),
-                standards_controls_updatable: Some(
-                    crate::state::standards_controls_updatable(&record.standards_status)
-                        .to_string(),
-                ),
-                // `StandardsStatusReason` reports why a standard could not be
-                // enabled or disabled; a subscription that is enabling or enabled
-                // has no reason to report.
-                standards_status_reason: None,
-                provider: Some(record.provider.clone()),
+            // The one definition of how a stored subscription is reported, shared
+            // with every other operation that answers with a
+            // `StandardsSubscription`.
+            .map(|(subscription_key, record)| {
+                crate::state::standards_subscription_view(subscription_key, record)
             })
             .collect();
         let next_offset = offset + page.len();

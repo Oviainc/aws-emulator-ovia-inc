@@ -45,6 +45,35 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+pub mod git_http;
+pub mod git_pack;
+
+/// The first label of the public CodeCommit git host
+/// (`git-codecommit.<region>.amazonaws.com`), which is what the framework
+/// resolves as a route key for a client that was handed that host and had it
+/// pointed at this emulator. It names no emulated service — CodeCommit's own
+/// signing name is `codecommit` — so a git request carrying it is this service's
+/// to claim.
+const GIT_HOST_LABEL: &str = "git-codecommit";
+
+/// Run `work` without occupying an async worker.
+///
+/// The git transport's work is CPU-bound and holds this service's store lock, and
+/// it is driven from a SYNCHRONOUS hook (`override_routing_error`), so it cannot
+/// be handed to `spawn_blocking(..).await` the way an async handler elsewhere in
+/// this workspace hands its interpreter work. `block_in_place` is the construct
+/// for that case: it moves the current task off the worker thread so the runtime
+/// keeps serving every other request while this one runs. It is available only on
+/// a multi-thread runtime — the one the emulator boots — so on a current-thread
+/// runtime (a `#[tokio::test]`, or a caller driving the router in-process) the work
+/// runs inline, where there is no other worker to protect.
+fn off_the_async_worker<T>(work: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(work),
+        _ => work(),
+    }
+}
+
 /// The `com-amazonaws-codecommit-codecommit-20150413` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -52,6 +81,14 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The same shared engine the generated entry constructs each operation from.
+    ///
+    /// The git smart-HTTP transport ([`git_http`]) is not a modeled operation —
+    /// git's wire protocol is not in the Smithy model at all — so it is served
+    /// from `override_routing_error` below, which is handed the request but no
+    /// operation. It reaches this service's store through this handle, exactly as
+    /// a handler reaches it through its own `self.engine`.
+    engine: Arc<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -60,7 +97,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            engine,
         }
     }
 }
@@ -290,10 +328,32 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // Claim a request whose resolved route key is this service's signing
         // name. Edit this for anything the model does not express — a signing
         // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
+        let route_key = smithy_server_runtime::resolve_route_key(parts);
+        if route_key
+            .as_deref()
+            .is_some_and(|key| key == self.entry.identity().signing_name())
+        {
+            return true;
         }
+        // And a request to the git smart-HTTP transport, which is claimed by PATH
+        // because that is the only thing that identifies it: a git client sends no
+        // SigV4 credential and no `X-Amz-Target`, and addresses whatever host the
+        // clone URL named — the emulator's own endpoint (an IP literal or
+        // `localhost`, which name no service) or the public CodeCommit git host,
+        // whose label names no service either. Without this the router answers
+        // `UnknownService` for a URL this service handed out.
+        //
+        // A request that DOES name another service is left to it: a second
+        // claimant would only make the router refuse both as `AmbiguousService`.
+        if route_key
+            .as_deref()
+            .is_some_and(|key| key != GIT_HOST_LABEL)
+        {
+            return false;
+        }
+        // `http::Uri::path` already strips the scheme, the authority and the
+        // query, for an origin-form request line and an absolute-form one alike.
+        git_http::route(parts.method.as_str(), parts.uri.path(), parts.uri.query()).is_some()
     }
 
     fn override_operation(
@@ -332,10 +392,68 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // modeled operation — neither `override_operation` nor the generated
         // routing table resolved it. Returning `None` renders the protocol-correct
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501).
+        //
+        // A git smart-HTTP request is exactly such a request and is served here:
+        // git's transport is not in the Smithy model, so it names no modeled
+        // operation and no routing key, and it carries no SigV4 signature for the
+        // framework to verify (a git client authenticates with HTTPS git
+        // credentials, which this emulator does not mint). It is answered in git's
+        // own wire protocol rather than in an AWS error envelope, because a git
+        // client is what reads it.
+        let (path, query) = git_http::split_uri(req.uri());
+        let request = git_http::route(req.method(), &path, query.as_deref())?;
+        // A body that is not in memory is a body this service never read: it must
+        // not be served as an EMPTY one, which a push would answer as a no-op
+        // success. The router buffers every request body, so this is the
+        // can't-happen arm, refused the same way an unreachable store is.
+        let unreadable = || git_http::Response {
+            status: 500,
+            content_type: "text/plain; charset=utf-8".to_string(),
+            body: b"the request body could not be read\n".to_vec(),
+        };
+        let response = match (
+            crate::state::service_state(&*self.engine),
+            req.body().bytes(),
+        ) {
+            (Some(state), Some(body)) => {
+                let content_encoding = req.headers().get("content-encoding");
+                // OFF THE ASYNC WORKER. Reading a pack (inflate, delta
+                // resolution) and projecting a push are CPU-bound, and they hold
+                // this service's store lock for their whole span, so they must not
+                // occupy a runtime worker: `block_in_place` hands the current task
+                // its own thread and lets the runtime keep serving every other
+                // request while this one runs. This hook is synchronous — the
+                // vendored router calls it from `dispatch` — so there is no
+                // `spawn_blocking(..).await` to use instead; `block_in_place` is
+                // the construct for exactly that case. It exists only on a
+                // multi-thread runtime, which is the one the emulator boots, so a
+                // current-thread runtime (a `#[tokio::test]`, say) runs the work
+                // inline, where there is no other worker to protect.
+                off_the_async_worker(|| {
+                    git_http::serve(&mut state.lock(), &request, content_encoding, body)
+                })
+            }
+            (None, _) => git_http::Response {
+                status: 500,
+                content_type: "text/plain; charset=utf-8".to_string(),
+                body: b"the repository store is unavailable\n".to_vec(),
+            },
+            (_, None) => unreadable(),
+        };
+        let mut rendered = aws_smithy_runtime_api::http::Response::new(
+            aws_smithy_runtime_api::http::StatusCode::try_from(response.status)
+                .unwrap_or_else(|_| aws_smithy_runtime_api::http::StatusCode::try_from(500u16).expect("500 is a status")),
+            aws_smithy_types::body::SdkBody::from(response.body),
+        );
+        rendered
+            .headers_mut()
+            .insert("content-type", response.content_type);
+        // A git client must never serve a ref advertisement or a packfile from a
+        // cache: both are a snapshot of refs that the next request may move.
+        rendered.headers_mut().insert("cache-control", "no-cache");
+        rendered.headers_mut().insert("pragma", "no-cache");
+        Some(rendered)
     }
 
     fn override_framework_error(

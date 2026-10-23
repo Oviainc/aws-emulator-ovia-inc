@@ -4,14 +4,15 @@
 //!
 //! The rule these suites assert: `GetResourceSyncStatus` resolves the
 //! `(SyncType, ResourceName)` pair its input names against this service's store and
-//! reports only sync attempts the service really recorded. A resource the store holds no
-//! sync configuration for names a sync target that does not exist, so the read is
-//! refused with the modeled `InvalidInputException` (400) — the code this API uses for
-//! an unresolvable sync reference; a resource that IS configured still has no attempt,
-//! because nothing in this emulator performs a Git sync, so the read is refused with the
-//! modeled `ResourceNotFoundException` (404). Neither answer is the unmodeled 501
-//! `NotImplemented`, and neither carries a synthesised status; and, being a report, the
-//! call leaves the store exactly as a later caller finds it.
+//! reports only sync state the service really recorded. A pair it has recorded no sync
+//! state for — whether or not the resource has a sync configuration — SUCCEEDS with a
+//! payload carrying none of `DesiredState`, `LatestSync` and `LatestSuccessfulSync`,
+//! rather than being refused: a client polling before it has configured the resource
+//! must be able to tell "never synced" from "bad request". Nothing in this emulator
+//! performs a Git sync, so no attempt is ever recorded by the API alone and no status is
+//! synthesised; and, being a report, the call leaves the store exactly as a later caller
+//! finds it. `absent_resource_answers.rs` carries the other half of the rule: a sync
+//! state seeded into the store IS reported, member for member.
 //!
 //! The table spans the class the rule generalises over: resource-name form and length
 //! (each published bound of the modeled `ResourceName` `length 1..100`,
@@ -141,24 +142,18 @@ async fn configure_sync(
     link_id
 }
 
-/// Assert one `GetResourceSyncStatus` answer is the modeled refusal `expected_code`
-/// carries at `expected_status`, with no synthesised sync attempt: no `LatestSync`, no
-/// `LatestSuccessfulSync`, no `DesiredState`.
-fn assert_no_sync_status(
-    case: &str,
-    expected_status: u16,
-    expected_code: &str,
-    status: u16,
-    body: &serde_json::Value,
-) {
+/// Assert one `GetResourceSyncStatus` answer is the empty success: HTTP 200, no error
+/// code, and no synthesised sync state — no `LatestSync`, no `LatestSuccessfulSync`, no
+/// `DesiredState`.
+fn assert_no_sync_status(case: &str, status: u16, body: &serde_json::Value) {
     assert_eq!(
-        status, expected_status,
-        "case {case}: expected {expected_status} from GetResourceSyncStatus, got {status} {body}"
+        status, 200,
+        "case {case}: expected 200 from GetResourceSyncStatus, got {status} {body}"
     );
     assert_eq!(
         error_code(body),
-        expected_code,
-        "case {case}: expected {expected_code}, got {body}"
+        "",
+        "case {case}: expected no error code, got {body}"
     );
     for member in ["LatestSync", "LatestSuccessfulSync", "DesiredState"] {
         assert!(
@@ -166,20 +161,14 @@ fn assert_no_sync_status(
             "case {case}: no {member} may be reported for a sync nothing ran, got {body}"
         );
     }
-    assert!(
-        body["Message"]
-            .as_str()
-            .is_some_and(|message| !message.is_empty()),
-        "case {case}: the refusal must carry a message, got {body}"
-    );
 }
 
-/// A resource with no sync configuration names a sync target that does not exist, so
-/// the read is refused with the modeled `InvalidInputException` (400) for every row —
-/// the code this API uses for an unresolvable sync reference — and never with the
-/// unmodeled 501 `NotImplemented`.
+/// A resource with no sync configuration has no recorded sync state either, so the read
+/// SUCCEEDS with an empty payload for every row — never the 400 that would make "never
+/// synced" indistinguishable from "bad request", and never the unmodeled 501
+/// `NotImplemented`.
 #[tokio::test]
-async fn an_unconfigured_resource_is_refused_as_invalid_input() {
+async fn an_unconfigured_resource_reports_an_empty_status() {
     let router = router();
 
     // A configuration that IS there, so "unconfigured" can never mean "the store is
@@ -193,21 +182,14 @@ async fn an_unconfigured_resource_is_refused_as_invalid_input() {
             status_body(&case.resource_name),
         )
         .await;
-        assert_no_sync_status(case.label, 400, "InvalidInputException", status, &body);
-        assert!(
-            body["Message"]
-                .as_str()
-                .is_some_and(|message| message.contains(&case.resource_name)),
-            "case {}: the refusal must name the resource that resolved to nothing, got {body}",
-            case.label
-        );
+        assert_no_sync_status(case.label, status, &body);
     }
 }
 
-/// A resource that IS configured for Git sync still reports no sync attempt: nothing in
+/// A resource that IS configured for Git sync still reports no sync state: nothing in
 /// this emulator fetches a remote repository's commits, so there is no revision, no
-/// commit sha and no event list to report, and the modeled `ResourceNotFoundException`
-/// (404) is the answer rather than a synthesised status.
+/// commit sha and no event list to report — and the answer is the same empty success as
+/// for an unconfigured resource, not a synthesised status.
 #[tokio::test]
 async fn a_configured_resource_reports_no_attempt_because_nothing_syncs() {
     let router = router();
@@ -234,7 +216,7 @@ async fn a_configured_resource_reports_no_attempt_because_nothing_syncs() {
             status_body(&case.resource_name),
         )
         .await;
-        assert_no_sync_status(case.label, 404, "ResourceNotFoundException", status, &body);
+        assert_no_sync_status(case.label, status, &body);
     }
 }
 
@@ -311,8 +293,8 @@ async fn reading_the_sync_status_leaves_the_store_as_it_found_it() {
 
 /// The boundary of the modeled `ResourceName` constraint: a name one character past the
 /// published maximum, and one breaking the published pattern, are refused with HTTP 400
-/// `ValidationException` before the handler runs — so the 404 above is the handler's
-/// answer for a well-formed name, not a blanket refusal.
+/// `ValidationException` before the handler runs — so the empty 200 above is the
+/// handler's answer for a well-formed name, not a blanket success.
 #[tokio::test]
 async fn a_resource_name_outside_the_modeled_constraint_is_refused() {
     let router = router();

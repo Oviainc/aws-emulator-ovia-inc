@@ -160,11 +160,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The cursor names the last identifier the previous page returned; this page
         // starts at the first identifier after it.
         let resume_after = match input.next_token.as_deref() {
-            Some(token) => Some(decode_next_token(token).ok_or_else(|| {
-                crate::scaffolded::Scaffolded::validation(format!(
-                    "nextToken is not a cursor this service issued: {token}"
-                ))
-            })?),
+            Some(token) => Some(crate::state::decode_pagination_cursor(token).ok_or_else(
+                || {
+                    crate::scaffolded::Scaffolded::validation(format!(
+                        "nextToken is not a cursor this service issued: {token}"
+                    ))
+                },
+            )?),
             None => None,
         };
 
@@ -198,7 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let next_token = (page.len() > page_size).then(|| {
             page.truncate(page_size);
-            encode_next_token(&page[page_size - 1].identifier)
+            crate::state::encode_pagination_cursor(&page[page_size - 1].identifier)
         });
 
         Ok(ListClustersOutput {
@@ -217,27 +219,6 @@ const MAX_RESULTS_MIN: usize = 1;
 /// See [`MAX_RESULTS_DEFAULT`].
 const MAX_RESULTS_MAX: usize = 100;
 
-/// The length `ClusterId`'s `^[a-z0-9]{26}$` fixes.
-const CLUSTER_ID_LEN: usize = 26;
-
-/// Encode a pagination cursor: the last identifier the page returned, hex-encoded so
-/// the token a client round-trips is opaque rather than a resource name.
-fn encode_next_token(last_identifier: &str) -> String {
-    ::hex::encode(last_identifier.as_bytes())
-}
-
-/// Decode a cursor produced by [`encode_next_token`]: a hex-encoded `ClusterId`.
-///
-/// `None` for anything this service did not issue — not only a token that is not
-/// hex, but also one that decodes to anything other than a value `ClusterId`'s
-/// `^[a-z0-9]{26}$` accepts, so a fabricated cursor is refused rather than served
-/// as a page starting after some arbitrary key.
-fn decode_next_token(token: &str) -> Option<String> {
-    let decoded = ::hex::decode(token).ok()?;
-    let cursor = String::from_utf8(decoded).ok()?;
-    let is_cluster_id = cursor.len() == CLUSTER_ID_LEN
-        && cursor
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
-    is_cluster_id.then_some(cursor)
-}
+// The pagination cursor this handler issues and reads back is the one every
+// paginated reader of this service shares:
+// `crate::state::encode_pagination_cursor` / `crate::state::decode_pagination_cursor`.

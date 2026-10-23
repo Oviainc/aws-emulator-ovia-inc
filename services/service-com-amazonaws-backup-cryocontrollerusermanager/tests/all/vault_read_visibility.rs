@@ -15,6 +15,12 @@
 //! invisible, several vault-name spellings and several account ids, plus the polled
 //! form (a client that waits for the terminal refusal) and the positive control
 //! (a visible vault still answers 200).
+//!
+//! The harness below (the router, the one-request `call` that also returns the
+//! `x-amzn-errortype` header, the setup ladder and `assert_denied`) is
+//! `pub(crate)`, so the sibling suite covering the same access-before-existence
+//! rule for the vault-LOCK actions (`vault_lock_refusal_order.rs`) drives the same
+//! wire path instead of growing a second copy of it.
 
 use std::sync::Arc;
 
@@ -33,7 +39,7 @@ const ACCOUNT: &str = "000000000000";
 /// The message AWS Backup answers an authorization refusal with. A FIXED service
 /// string, built from nothing in the request — which is why it can be asserted
 /// verbatim and why it leaks nothing.
-const DENIED_MESSAGE: &str = "Insufficient privileges to perform this action.";
+pub(crate) const DENIED_MESSAGE: &str = "Insufficient privileges to perform this action.";
 
 /// The vault-scoped reads: the operation name and the path suffix that reaches it.
 ///
@@ -51,7 +57,7 @@ const VAULT_READS: &[(&str, &str)] = &[
 
 /// What the store must hold before the read under test runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Setup {
+pub(crate) enum Setup {
     /// Nothing: the vault was never created.
     Absent,
     /// The vault exists (so only the account scoping can make it invisible).
@@ -60,7 +66,7 @@ enum Setup {
     Deleted,
 }
 
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -72,13 +78,13 @@ fn router() -> MultiServiceRouter {
 
 /// One request's status, `x-amzn-errortype` header and parsed JSON body.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Answer {
-    status: u16,
-    error_type: Option<String>,
-    body: Value,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) error_type: Option<String>,
+    pub(crate) body: Value,
 }
 
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     path: &str,
@@ -116,14 +122,14 @@ async fn call(
 }
 
 /// The wire error code in the body (`__type`), or `"<none>"`.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or("<none>")
         .to_string()
 }
 
-fn message(body: &Value) -> String {
+pub(crate) fn message(body: &Value) -> String {
     body.get("Message")
         .and_then(Value::as_str)
         .unwrap_or("<none>")
@@ -142,7 +148,7 @@ fn read_path(suffix: &str, vault: &str, account: Option<&str>) -> String {
 }
 
 /// Put the store into `setup` for `vault`.
-async fn prepare(router: &MultiServiceRouter, setup: Setup, vault: &str) {
+pub(crate) async fn prepare(router: &MultiServiceRouter, setup: Setup, vault: &str) {
     if setup == Setup::Absent {
         return;
     }
@@ -161,7 +167,7 @@ async fn prepare(router: &MultiServiceRouter, setup: Setup, vault: &str) {
 }
 
 /// Assert one answer is the authorization refusal, and that it discloses nothing.
-fn assert_denied(case: &str, answer: &Answer, vault: &str) {
+pub(crate) fn assert_denied(case: &str, answer: &Answer, vault: &str) {
     assert_eq!(
         answer.status, 403,
         "case {case:?}: expected HTTP 403, got {} {answer:?}",

@@ -1,15 +1,38 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeRegions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeRegions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeRegions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the Regions of the partition the request was signed for.
+//!
+//! A Region is a fact of that partition, not a resource a caller creates — no EC2
+//! operation creates a Region, and opting one in or out is the Account API's
+//! `EnableRegion`/`DisableRegion` — so the Regions come from
+//! [`crate::state::regions_for_request`] and this handler writes NOTHING: the describe is
+//! a pure read, and two calls signed for the same Region answer the same Regions.
+//!
+//! What the request chooses is which of those Regions are reported:
+//!
+//! * `RegionNames` names Regions to report; "you can specify any Regions, whether they
+//!   are enabled and disabled for your account", so a named Region is reported whatever
+//!   its opt-in status, and a name that is no Region of the partition is refused with
+//!   `InvalidParameterValue` rather than answered with an empty list.
+//! * `AllRegions` includes "Regions that are disabled for your account" — the ones whose
+//!   opt-in status is `not-opted-in`, which are otherwise left out of a listing that
+//!   names no Region.
+//! * `Filters` are ANDed with each other and ORed over each filter's values, with EC2's
+//!   `*` / `?` wildcards; a filter this operation does not document is refused with
+//!   `InvalidParameterValue`, and a documented filter carrying no value at all matches
+//!   nothing, there being no value for the attribute to match.
+//! * `DryRun` performs nothing and answers 412 `DryRunOperation`, the answer the real
+//!   service gives a caller that holds the action's permissions.
+//!
+//! The model bounds neither `RegionNames`'s length nor the number of filters, their
+//! values or those values' size, so each is capped here before any matching runs, and
+//! every comparison — including one per Region scanned — is charged to a single
+//! [`crate::state::MatchBudget`]: the PRODUCT of Regions, filters, values and value
+//! length is what no per-factor cap can bound. An over-sized list is refused with
+//! `InvalidParameterValue`; filtering that would outrun the budget is refused with 503
+//! `RequestLimitExceeded` rather than answered with a silently truncated list.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +169,157 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeRegions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeRegionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeRegions"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            matches_every_filter, CompiledFilter, MatchBudget, MAX_FILTERS,
+            MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES, MAX_RESOURCE_IDS,
+            REGION_FILTERS,
+        };
+
+        // This operation reports the Regions of a partition and persists nothing, so it
+        // never reaches the engine on `self` — the same as `DescribeAvailabilityZones`
+        // beside it.
+        let _ = &self.engine;
+
+        // "Checks whether you have the required permissions for the action, without
+        // actually making the request... If you have the required permissions, the
+        // error response is DryRunOperation." Every caller of this emulator holds
+        // them, so the describe below does not run at all.
+        if input.dry_run.unwrap_or(false) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // EC2 is a regional service reached through a regional endpoint, so the Region
+        // the caller signed for is the one whose partition it is asking about — and the
+        // one opt-in the request itself evidences.
+        let signed_region = crate::state::request_region(ctx.parts());
+        let regions = crate::state::regions_for_request(&signed_region);
+
+        // `RegionNames` holds "the names of the Regions", and the model bounds its length
+        // nowhere, so the one caller-sized list this request carries is bounded before any
+        // work proportional to it is done — the same ceiling the sibling describes hold
+        // their id lists to.
+        let named = input.region_names.as_deref().unwrap_or_default();
+        if named.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "RegionNames carries {} entries, above the maximum of {MAX_RESOURCE_IDS}",
+                named.len()
+            )));
+        }
+
+        // Each name has to name a Region of this partition; one that does not is the
+        // caller's mistake, not an empty result.
+        for region_name in named {
+            if !regions
+                .iter()
+                .any(|region| &region.region_name == region_name)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid region: [{region_name}]"
+                )));
+            }
+        }
+
+        // "You can specify any Regions, whether they are enabled and disabled for your
+        // account" (`RegionNames`), so a Region the request NAMES is reported whatever
+        // its opt-in status. Where the request names none, `AllRegions` is what decides
+        // whether the Regions that are disabled for the account are listed too.
+        let all_regions = input.all_regions.unwrap_or(false);
+        let selected = |region: &crate::state::RegionRecord| {
+            if named.is_empty() {
+                all_regions || region.is_enabled()
+            } else {
+                named.contains(&region.region_name)
+            }
+        };
+
+        // Matching cost is filters x values x value length x candidate Regions and the
+        // model bounds none of the three the REQUEST carries, so each is capped here and
+        // their PRODUCT is charged to one [`MatchBudget`] below.
+        let supplied_filters = input.filters.as_ref().map_or(0, Vec::len);
+        if supplied_filters > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {supplied_filters} filters, above the maximum \
+                 of {MAX_FILTERS}"
+            )));
+        }
+
+        // "If you specify multiple filters, the filters are joined with an AND"; and
+        // within one filter, "If you specify multiple values for a filter, the values
+        // are joined with an OR" (the `Filter` shape's own doc). A filter whose name
+        // this operation does not document is refused rather than ignored, so a
+        // misspelled filter cannot read as "everything matched"; and each value is
+        // compiled into its pattern ONCE here rather than once per Region compared.
+        let filters = input.filters.as_deref().unwrap_or_default();
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !REGION_FILTERS.contains(&name) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // Every comparison — and every candidate scanned — is charged to ONE budget, so
+        // the PRODUCT of Regions, filters, values and value length is bounded however the
+        // caller combines them.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut reported: Vec<Region> = Vec::new();
+        for region in &regions {
+            if budget.exhausted() {
+                break;
+            }
+            if !selected(region) {
+                continue;
+            }
+            let values_of = |name: &str| {
+                region
+                    .filter_values(name)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(::std::borrow::Cow::Borrowed)
+                    .collect()
+            };
+            if matches_every_filter(&selectors, &mut budget, &values_of) {
+                reported.push(region.to_region());
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report
+        // as a result: the request asked for more filtering than one call will do, and is
+        // told so rather than given a silently truncated answer. `DescribeRegions` models
+        // no page size or token at all, so there is no page to continue from.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them"
+            )));
+        }
+
+        Ok(DescribeRegionsOutput {
+            regions: Some(reported),
+        })
     }
 }

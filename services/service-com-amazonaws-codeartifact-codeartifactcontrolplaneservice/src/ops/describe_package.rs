@@ -207,9 +207,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(package) = repository.packages.get(&key) else {
             return Err(DescribePackageErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "Package {} not found in repository {}.",
-                        input.package, input.repository
+                    message: crate::state::package_not_found_message(
+                        &input.package,
+                        &input.repository,
                     ),
                     resource_id: Some(input.package.clone()),
                     resource_type: Some("package".to_string()),

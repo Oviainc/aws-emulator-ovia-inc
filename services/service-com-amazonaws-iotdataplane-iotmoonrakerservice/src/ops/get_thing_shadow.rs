@@ -163,8 +163,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key = crate::state::shadow_key(&input.thing_name, input.shadow_name.as_deref());
         let guard = state.lock();
         // Reporting only: the document is rendered from what is stored, and nothing
-        // about the stored shadow changes because it was read.
-        let shadow = guard.shadows.get(&key).ok_or_else(|| {
+        // about the stored shadow changes because it was read. A shadow name whose
+        // document was deleted stores none, so it reads back as not found even though
+        // its version counter is still there.
+        let (shadow, version) = guard.stored_shadow(&key).ok_or_else(|| {
             GetThingShadowErrorModeled::ResourceNotFoundException(ResourceNotFoundException::new(
                 crate::state::no_shadow_exists(crate::state::addressed_shadow_name(
                     &input.thing_name,
@@ -175,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(GetThingShadowOutput {
             payload: Some(
-                ::serde_json::to_vec(&shadow.document())
+                ::serde_json::to_vec(&shadow.document(version))
                     .expect("a shadow document serializes to JSON"),
             ),
         })

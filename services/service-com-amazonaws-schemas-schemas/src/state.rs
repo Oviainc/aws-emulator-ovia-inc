@@ -137,19 +137,487 @@ pub struct ResourcePolicy {
 /// point `tests/all/resource_policy.rs` pins holds for every form a policy actually
 /// carries).
 ///
-/// `Err` carries what made the value unreadable, for a value that is not JSON at all.
+/// `Err` carries what made the value unreadable, for a value that is not JSON at
+/// all — the service's own diagnostic for an unreadable body, as
+/// [`json_parse_detail`] builds it.
 pub fn canonical_json(document: &str) -> Result<String, String> {
     let mut encoded: Vec<u8> = Vec::with_capacity(document.len());
     let mut reader = ::serde_json::Deserializer::from_str(document);
     {
         let mut writer = ::serde_json::Serializer::new(&mut encoded);
         ::serde_transcode::transcode(&mut reader, &mut writer)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| json_parse_detail(document, &error))?;
     }
     // One document, not a stream of them: anything after the first value makes the
     // value unreadable rather than being silently dropped.
-    reader.end().map_err(|error| error.to_string())?;
+    reader
+        .end()
+        .map_err(|error| json_parse_detail(document, &error))?;
     String::from_utf8(encoded).map_err(|error| error.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Where a JSON body stops being JSON
+//
+// Every refusal this service gives for a body it could not read — `CreateSchema`'s
+// and `UpdateSchema`'s `Content`, `PutResourcePolicy`'s `Policy` — says WHERE the
+// body stopped being JSON, and says it the way the service does: by naming the
+// OFFENDING CHARACTER, what was being read when the parser reached it, and that
+// character's BYTE OFFSET into the body the caller sent
+// (`invalid character 'o' in literal null (expecting 'u') at offset 2`).
+//
+// The OFFSET is the count of bytes the parser had consumed when it reached the
+// offending character — so the 1-based byte position of that character, which is what
+// the recorded refusals report: the instance above names the second byte of its body
+// as `offset 2`.
+//
+// The offset is the only part of such a refusal that tells a client WHERE in its own
+// document the defect is, and a byte position in the submitted bytes stays meaningful
+// whatever shape the document has — one line or a thousand. `serde_json`, the parser
+// this emulator reads JSON with, reports a LINE and COLUMN in its own vocabulary
+// instead (`expected ident at line 1 column 2`): a different coordinate system,
+// naming a different place in any multi-line document, in words no client of this API
+// is written against. So `serde_json` stays what decides whether a body is VALID
+// JSON, and the position and wording a refusal carries are produced here.
+//
+// The scan below walks the bytes with an explicit stack rather than by recursion: a
+// body is bounded (`Content` is modelled at most 100000 bytes) but its NESTING is
+// not, and a hundred thousand open brackets must not be able to exhaust the stack.
+// ---------------------------------------------------------------------------
+
+/// Where a JSON document stops being JSON, as a refusal reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonFault {
+    /// The offset the refusal reports: the number of bytes read when the offending
+    /// character was reached, which is that character's 1-based byte position in the
+    /// document. `None` where the document simply ran out: then there is no character
+    /// to point a client at.
+    pub offset: Option<usize>,
+    /// What was wrong there: the offending character and what was being read.
+    pub detail: String,
+}
+
+impl ::std::fmt::Display for JsonFault {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        match self.offset {
+            Some(offset) => write!(f, "{} at offset {offset}", self.detail),
+            None => write!(f, "{}", self.detail),
+        }
+    }
+}
+
+/// What this service says about a body `serde_json` refused: the offending character
+/// and its byte offset, as [`json_fault`] finds them.
+///
+/// `serde_json` decides VALIDITY; this decides the wording. Where the scan finds no
+/// fault at all the document is one well-formed JSON value that `serde_json` still
+/// refused — it holds itself to a nesting limit this scan does not — so the position
+/// `serde_json` names is converted to a byte offset in the same coordinates and
+/// reported without its line/column vocabulary.
+pub fn json_parse_detail(document: &str, error: &::serde_json::Error) -> String {
+    match json_fault(document) {
+        Some(fault) => fault.to_string(),
+        None => format!(
+            "invalid JSON at offset {}",
+            byte_offset_of(document, error.line(), error.column()).saturating_add(1)
+        ),
+    }
+}
+
+/// The 0-based byte index a `serde_json` position names: its `line` is counted from 1
+/// and its `column` is the 1-based position within that line.
+fn byte_offset_of(document: &str, line: usize, column: usize) -> usize {
+    let mut offset = 0usize;
+    for (number, text) in document.split_inclusive('\n').enumerate() {
+        if number + 1 == line {
+            return (offset + column.saturating_sub(1)).min(document.len());
+        }
+        offset += text.len();
+    }
+    document.len()
+}
+
+/// Scan `document` as ONE JSON value and report where it stops being JSON, or `None`
+/// where it is a well-formed JSON document with nothing after it.
+///
+/// The grammar is RFC 8259's: one value, with insignificant whitespace around it and
+/// nothing following it. What this reports about a document it refuses is the
+/// offending character, what was being read, and the character's byte offset.
+pub fn json_fault(document: &str) -> Option<JsonFault> {
+    JsonScan {
+        bytes: document.as_bytes(),
+        at: 0,
+    }
+    .fault()
+}
+
+/// Which container the scan is inside, so the character that may follow a value is
+/// known: a `,` and the container's own closing bracket, and after a `,` in an object
+/// another member.
+#[derive(Debug, Clone, Copy)]
+enum JsonFrame {
+    Array,
+    Object,
+}
+
+/// The scan: a cursor over the document's bytes.
+///
+/// Bytes, not characters: a refusal names the offending BYTE's offset, and a
+/// multi-byte character that cannot start a JSON value is reported by its leading
+/// byte the same way a parser reading octets reports it.
+struct JsonScan<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl JsonScan<'_> {
+    /// The byte at the cursor, without consuming it.
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.at).copied()
+    }
+
+    /// Consume the byte at the cursor.
+    fn bump(&mut self) -> Option<u8> {
+        let byte = self.peek();
+        if byte.is_some() {
+            self.at += 1;
+        }
+        byte
+    }
+
+    /// Skip the whitespace JSON allows between tokens: space, tab, newline, carriage
+    /// return (RFC 8259, section 2).
+    fn skip_whitespace(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            self.at += 1;
+        }
+    }
+
+    /// A document that ran out before its value was complete. There is no offending
+    /// character, so no offset is reported.
+    fn truncated() -> JsonFault {
+        JsonFault {
+            offset: None,
+            detail: "unexpected end of JSON input".to_string(),
+        }
+    }
+
+    /// The character at byte index `index` cannot appear where the scan is: `reading`
+    /// says what was being read there.
+    ///
+    /// The offset the refusal reports is the number of bytes read to reach that
+    /// character — `index + 1` — which is the coordinate the service's refusals are
+    /// recorded in.
+    fn invalid(index: usize, byte: u8, reading: &str) -> JsonFault {
+        JsonFault {
+            offset: Some(index.saturating_add(1)),
+            detail: format!("invalid character {} {reading}", quoted_byte(byte)),
+        }
+    }
+
+    /// Walk the whole document; `None` when it is one well-formed JSON value.
+    fn fault(&mut self) -> Option<JsonFault> {
+        let mut stack: Vec<JsonFrame> = Vec::new();
+        'value: loop {
+            // A value is expected here: the start of the document, an element after a
+            // `,` in an array, or a member's value after a `:` in an object.
+            self.skip_whitespace();
+            let offset = self.at;
+            // Nothing where a value must be: the document ran out (or holds only
+            // whitespace), which is not a JSON document.
+            let Some(byte) = self.peek() else {
+                return Some(Self::truncated());
+            };
+            match byte {
+                b'{' => {
+                    self.at += 1;
+                    self.skip_whitespace();
+                    if self.peek() == Some(b'}') {
+                        // The empty object: complete, with no member to read.
+                        self.at += 1;
+                    } else {
+                        stack.push(JsonFrame::Object);
+                        if let Some(fault) = self.member_name() {
+                            return Some(fault);
+                        }
+                        continue 'value;
+                    }
+                }
+                b'[' => {
+                    self.at += 1;
+                    self.skip_whitespace();
+                    if self.peek() == Some(b']') {
+                        self.at += 1;
+                    } else {
+                        stack.push(JsonFrame::Array);
+                        continue 'value;
+                    }
+                }
+                b'"' => {
+                    if let Some(fault) = self.string() {
+                        return Some(fault);
+                    }
+                }
+                b't' => {
+                    if let Some(fault) = self.literal("true") {
+                        return Some(fault);
+                    }
+                }
+                b'f' => {
+                    if let Some(fault) = self.literal("false") {
+                        return Some(fault);
+                    }
+                }
+                b'n' => {
+                    if let Some(fault) = self.literal("null") {
+                        return Some(fault);
+                    }
+                }
+                b'-' | b'0'..=b'9' => {
+                    if let Some(fault) = self.number() {
+                        return Some(fault);
+                    }
+                }
+                other => {
+                    return Some(Self::invalid(
+                        offset,
+                        other,
+                        "looking for beginning of value",
+                    ))
+                }
+            }
+
+            // One value is complete. What may follow it depends on what encloses it,
+            // and a closing bracket completes the enclosing value in turn.
+            loop {
+                match stack.last().copied() {
+                    None => {
+                        // The document's one value is complete: only whitespace may
+                        // follow it.
+                        self.skip_whitespace();
+                        let offset = self.at;
+                        return self
+                            .peek()
+                            .map(|byte| Self::invalid(offset, byte, "after top-level value"));
+                    }
+                    Some(JsonFrame::Array) => {
+                        self.skip_whitespace();
+                        let offset = self.at;
+                        match self.bump() {
+                            None => return Some(Self::truncated()),
+                            Some(b',') => continue 'value,
+                            Some(b']') => {
+                                stack.pop();
+                            }
+                            Some(byte) => {
+                                return Some(Self::invalid(offset, byte, "after array element"))
+                            }
+                        }
+                    }
+                    Some(JsonFrame::Object) => {
+                        self.skip_whitespace();
+                        let offset = self.at;
+                        match self.bump() {
+                            None => return Some(Self::truncated()),
+                            Some(b',') => {
+                                if let Some(fault) = self.member_name() {
+                                    return Some(fault);
+                                }
+                                continue 'value;
+                            }
+                            Some(b'}') => {
+                                stack.pop();
+                            }
+                            Some(byte) => {
+                                return Some(Self::invalid(
+                                    offset,
+                                    byte,
+                                    "after object key:value pair",
+                                ))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// An object member's name and the `:` that separates it from its value.
+    fn member_name(&mut self) -> Option<JsonFault> {
+        self.skip_whitespace();
+        let offset = self.at;
+        match self.peek() {
+            None => return Some(Self::truncated()),
+            Some(b'"') => {
+                if let Some(fault) = self.string() {
+                    return Some(fault);
+                }
+            }
+            Some(byte) => {
+                return Some(Self::invalid(
+                    offset,
+                    byte,
+                    "looking for beginning of object key string",
+                ))
+            }
+        }
+        self.skip_whitespace();
+        let offset = self.at;
+        match self.bump() {
+            None => Some(Self::truncated()),
+            Some(b':') => None,
+            Some(byte) => Some(Self::invalid(offset, byte, "after object key")),
+        }
+    }
+
+    /// A string, from the opening quote at the cursor to its closing quote, including
+    /// the escapes RFC 8259 section 7 allows.
+    fn string(&mut self) -> Option<JsonFault> {
+        // The opening quote is what selected this scan.
+        self.at += 1;
+        loop {
+            let offset = self.at;
+            match self.bump() {
+                None => return Some(Self::truncated()),
+                Some(b'"') => return None,
+                Some(b'\\') => {
+                    let offset = self.at;
+                    match self.bump() {
+                        None => return Some(Self::truncated()),
+                        Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => {}
+                        Some(b'u') => {
+                            // `\uXXXX`: exactly four hexadecimal digits.
+                            for _ in 0..4 {
+                                let offset = self.at;
+                                match self.bump() {
+                                    None => return Some(Self::truncated()),
+                                    Some(byte) if byte.is_ascii_hexdigit() => {}
+                                    Some(byte) => {
+                                        return Some(Self::invalid(
+                                            offset,
+                                            byte,
+                                            "in \\u hexadecimal character escape",
+                                        ))
+                                    }
+                                }
+                            }
+                        }
+                        Some(byte) => {
+                            return Some(Self::invalid(offset, byte, "in string escape code"))
+                        }
+                    }
+                }
+                // A control character has to be escaped to appear in a string.
+                Some(byte) if byte < 0x20 => {
+                    return Some(Self::invalid(offset, byte, "in string literal"))
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
+    /// One of the three literals, whose first byte the cursor is on: the rest of it
+    /// must follow exactly.
+    fn literal(&mut self, literal: &str) -> Option<JsonFault> {
+        self.at += 1;
+        for expected in &literal.as_bytes()[1..] {
+            let offset = self.at;
+            match self.bump() {
+                None => return Some(Self::truncated()),
+                Some(byte) if byte == *expected => {}
+                Some(byte) => {
+                    return Some(Self::invalid(
+                        offset,
+                        byte,
+                        &format!("in literal {literal} (expecting '{}')", *expected as char),
+                    ))
+                }
+            }
+        }
+        None
+    }
+
+    /// A number: an optional `-`, an integer part, an optional fraction and an
+    /// optional exponent (RFC 8259, section 6).
+    ///
+    /// A number ENDS at the first byte that cannot continue it, which is not an error
+    /// here: whether that byte may follow a value is decided by what encloses the
+    /// number, so `01` at the top level is reported as a character after a complete
+    /// value rather than as a bad number.
+    fn number(&mut self) -> Option<JsonFault> {
+        if self.peek() == Some(b'-') {
+            self.at += 1;
+        }
+        let offset = self.at;
+        match self.bump() {
+            None => return Some(Self::truncated()),
+            // A leading zero is the whole integer part: `01` is not a JSON number.
+            Some(b'0') => {}
+            Some(byte) if byte.is_ascii_digit() => self.skip_digits(),
+            Some(byte) => return Some(Self::invalid(offset, byte, "in numeric literal")),
+        }
+        if self.peek() == Some(b'.') {
+            self.at += 1;
+            let offset = self.at;
+            match self.bump() {
+                None => return Some(Self::truncated()),
+                Some(byte) if byte.is_ascii_digit() => self.skip_digits(),
+                Some(byte) => {
+                    return Some(Self::invalid(
+                        offset,
+                        byte,
+                        "after decimal point in numeric literal",
+                    ))
+                }
+            }
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.at += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.at += 1;
+            }
+            let offset = self.at;
+            match self.bump() {
+                None => return Some(Self::truncated()),
+                Some(byte) if byte.is_ascii_digit() => self.skip_digits(),
+                Some(byte) => {
+                    return Some(Self::invalid(
+                        offset,
+                        byte,
+                        "in exponent of numeric literal",
+                    ))
+                }
+            }
+        }
+        None
+    }
+
+    /// Consume the digits that continue a number.
+    fn skip_digits(&mut self) {
+        while self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+            self.at += 1;
+        }
+    }
+}
+
+/// One byte as a refusal names it: printable ASCII as itself, and anything else by
+/// the escape that stands for it, so a refusal stays one line of text whatever byte
+/// it is about.
+fn quoted_byte(byte: u8) -> String {
+    let escaped = match byte {
+        b'\'' => "\\'",
+        b'\\' => "\\\\",
+        0x07 => "\\a",
+        0x08 => "\\b",
+        0x09 => "\\t",
+        0x0a => "\\n",
+        0x0b => "\\v",
+        0x0c => "\\f",
+        0x0d => "\\r",
+        0x20..=0x7e => return format!("'{}'", byte as char),
+        _ => return format!("'\\x{byte:02x}'"),
+    };
+    format!("'{escaped}'")
 }
 
 impl Registry {
@@ -1577,13 +2045,18 @@ pub fn registry_name_required() -> BadRequestException {
 }
 
 /// Refuse a write whose `RevisionId` precondition is not the revision the stored
-/// policy is at. Echoes the revision the CALLER sent, never the stored one: the
-/// caller already holds what it sent, and a refusal is not a read of the resource.
-pub fn stale_policy_revision(requested: &str) -> PreconditionFailedException {
-    precondition_failed(format!(
-        "RevisionId {requested} is not the current revision of this resource-based \
-         policy; read the policy again and retry with the revision it reports."
-    ))
+/// policy is at.
+///
+/// The service's sentence for this refusal is a CONSTANT: it names neither the
+/// revision the caller sent nor the one the store holds. Nothing request-derived or
+/// environment-derived belongs in it — the caller already holds what it sent, a
+/// refusal is not a read of the resource (which is what tells the caller the current
+/// revision), and a message carrying a minted id would differ from run to run for a
+/// client or test that compares one.
+pub fn stale_policy_revision() -> PreconditionFailedException {
+    precondition_failed(
+        "The RevisionId provided does not match the latest RevisionId for the registry policy.",
+    )
 }
 
 /// Refuse a `Policy` larger than the store will retain for one registry. Names the
@@ -1743,10 +2216,15 @@ pub fn json_type_name(value: &::serde_json::Value) -> &'static str {
 pub fn validate_content(content: &str, schema_type: &str) -> Result<(), BadRequestException> {
     let document: ::serde_json::Value = ::serde_json::from_str(content).map_err(|error| {
         // AWS's own template for a body it cannot read as JSON, built from the
-        // request: the member, then what the parser objected to and where. The words
-        // of the objection are whichever parser read the body — the rule is that the
-        // refusal names the member and the failure, not any one parser's phrasing.
-        bad_request(format!("Content is not valid JSON: {error}"))
+        // request: the member, then the character the body stops being JSON at, what
+        // was being read there and that character's byte offset into `Content` — see
+        // [`json_parse_detail`], which is where every refusal of an unreadable body in
+        // this service gets its wording, so no two of them can point a client at two
+        // different coordinate systems.
+        bad_request(format!(
+            "Content is not valid JSON: {}",
+            json_parse_detail(content, &error)
+        ))
     })?;
     if document.is_object() {
         return Ok(());

@@ -14,7 +14,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::support::{member, reported_tags, timestamp};
+use crate::support::{epoch_seconds, member, reported_tags, timestamp};
 use crate::wire::{call_in_region, error_code, medialive, ACCOUNT, DEFAULT_REGION};
 
 /// `CreateEventBridgeRuleTemplate` / `ListEventBridgeRuleTemplates` URI, and the
@@ -91,6 +91,45 @@ async fn get(router: &MultiServiceRouter, region: &str, identifier: &str) -> (u1
         region,
         "GET",
         &format!("{TEMPLATES}/{identifier}"),
+        None,
+    )
+    .await
+}
+
+/// `UpdateEventBridgeRuleTemplate` on `identifier`, signed for `region`
+/// (`smithy_query(query="operation",
+/// operation="UpdateEventBridgeRuleTemplate")`: PATCH
+/// /prod/eventbridge-rule-templates/{Identifier}).
+async fn update(
+    router: &MultiServiceRouter,
+    region: &str,
+    identifier: &str,
+    body: Value,
+) -> (u16, Value) {
+    call_in_region(
+        router,
+        region,
+        "PATCH",
+        &format!("{TEMPLATES}/{identifier}"),
+        Some(body),
+    )
+    .await
+}
+
+/// `DeleteEventBridgeRuleTemplateGroup` on `identifier`, signed for `region`,
+/// which is refused with `ConflictException` while the group still holds
+/// templates — the reader the update suite uses to ask WHICH group holds a
+/// template.
+async fn delete_group(
+    router: &MultiServiceRouter,
+    region: &str,
+    identifier: &str,
+) -> (u16, Value) {
+    call_in_region(
+        router,
+        region,
+        "DELETE",
+        &format!("{GROUPS}/{identifier}"),
         None,
     )
     .await
@@ -838,6 +877,665 @@ async fn a_member_outside_the_constraint_its_model_carries_is_refused() {
         assert!(
             code == "BadRequestException" || code == "ValidationException",
             "case {event_type:?}: expected a client error, got {code} ({body})"
+        );
+    }
+}
+
+// --------------------------------------------------------------------------
+// `UpdateEventBridgeRuleTemplate`
+// --------------------------------------------------------------------------
+
+/// The two groups every update row below starts with, so a row can move the
+/// template out of the one that holds it.
+const FIRST_GROUP: &str = "first-group";
+const SECOND_GROUP: &str = "second-group";
+
+/// Which of the two forms an identifier takes in a row: `Identifier` and
+/// `GroupIdentifier` are both documented "Can be either be its id or current
+/// name", so every identifier the rows below use is a COLUMN of this type.
+#[derive(Clone, Copy, Debug)]
+enum By {
+    Id,
+    Name,
+}
+
+/// The create request the update rows start from: every optional member
+/// supplied, so a row that omits a member asserts the STORED value survives
+/// rather than asserting against a null.
+fn original_request(group_identifier: &str) -> Value {
+    json!({
+        "name": "original-name",
+        "eventType": EVENT_TYPES[2],
+        "groupIdentifier": group_identifier,
+        "description": "the original description",
+        "eventTargets": [{ "arn": format!("arn:aws:sns:{DEFAULT_REGION}:{ACCOUNT}:original") }],
+        "tags": { "env": "test", "team": "video" },
+    })
+}
+
+/// Two groups in `region` and one fully-populated template in the first of
+/// them: the state every update row starts from. Answers the second group's id
+/// and the stored template the create reported.
+async fn populated(router: &MultiServiceRouter, region: &str) -> (String, Value) {
+    create_group(router, region, FIRST_GROUP).await;
+    let second = create_group(router, region, SECOND_GROUP).await;
+    let (status, created) = create(router, region, original_request(FIRST_GROUP)).await;
+    assert_eq!(
+        status, 201,
+        "setup: expected the template to be created in {region}, got {status}: {created}"
+    );
+    (
+        second["id"].as_str().unwrap_or_default().to_string(),
+        created,
+    )
+}
+
+/// The record an update carrying `patch` must leave, computed from the stored
+/// record the create reported.
+///
+/// A member the patch carries replaces the stored one; `groupIdentifier`
+/// replaces the stored `groupId` with the id of the group it names
+/// (`resolved_group_id`), because the response reports the group out of state
+/// rather than echoing the identifier; and every member the patch omits is
+/// untouched. `EventTargets` is the one member a patch can CLEAR: an empty list
+/// leaves the template with no targets, which the response omits rather than
+/// reporting as an empty list.
+fn expected_after(created: &Value, patch: &Value, resolved_group_id: &str) -> Value {
+    let mut expected = created.clone();
+    for (name, value) in patch.as_object().expect("the patch is a JSON object") {
+        match name.as_str() {
+            "groupIdentifier" => expected["groupId"] = json!(resolved_group_id),
+            "eventTargets" if value.as_array().is_some_and(|targets| targets.is_empty()) => {
+                expected
+                    .as_object_mut()
+                    .expect("the response is a JSON object")
+                    .remove("eventTargets");
+            }
+            member => expected[member] = value.clone(),
+        }
+    }
+    expected
+}
+
+/// Rule: an update is a PARTIAL write of the resource the request's identifier
+/// names — every member the request carries replaces the stored one, every
+/// member it omits keeps the value it had, the resource's identity (its id, its
+/// ARN and its creation instant) is never rewritten, `ModifiedAt` never moves
+/// backwards, and the reporting operation answers that one stored record
+/// afterwards.
+///
+/// The rows differ along WHICH members the request carries and how many, along
+/// their type (string, list, parent identifier), along the number of list
+/// entries — zero, one and the bound the model's `EventTargetCount` names —
+/// along the value of the closed enum, and along the form of both identifiers
+/// ("Can be either be its id or current name"), because that is what the rule
+/// generalises over.
+#[tokio::test]
+async fn an_update_writes_the_members_it_carries_and_keeps_the_rest() {
+    let longest_name = "n".repeat(MAX_NAME);
+    let longest_description = "d".repeat(MAX_DESCRIPTION);
+    let five_targets: Vec<Value> = (0..MAX_TARGETS)
+        .map(|index| json!({ "arn": format!("arn:aws:sns:{DEFAULT_REGION}:{ACCOUNT}:moved-{index}") }))
+        .collect();
+
+    // (case, how the template is named, how the group it moves to is named —
+    // `None` when the row does not move it, the request's other members)
+    let rows: [(&str, By, Option<By>, Value); 12] = [
+        ("nothing to change", By::Id, None, json!({})),
+        ("name only", By::Id, None, json!({ "name": "renamed" })),
+        (
+            "name at the published maximum, template named by its name",
+            By::Name,
+            None,
+            json!({ "name": longest_name }),
+        ),
+        (
+            "description only",
+            By::Name,
+            None,
+            json!({ "description": "a new description" }),
+        ),
+        (
+            "description emptied",
+            By::Id,
+            None,
+            json!({ "description": "" }),
+        ),
+        (
+            "description at the published maximum",
+            By::Id,
+            None,
+            json!({ "description": longest_description }),
+        ),
+        (
+            "event type only",
+            By::Id,
+            None,
+            json!({ "eventType": EVENT_TYPES[7] }),
+        ),
+        (
+            "targets replaced by the most the model counts",
+            By::Id,
+            None,
+            json!({ "eventTargets": five_targets }),
+        ),
+        (
+            "targets replaced by a log group",
+            By::Name,
+            None,
+            json!({
+                "eventTargets": [{ "arn": format!("arn:aws:logs:{DEFAULT_REGION}:{ACCOUNT}:log-group:/aws/medialive") }],
+            }),
+        ),
+        ("targets cleared", By::Id, None, json!({ "eventTargets": [] })),
+        (
+            "moved to another group, named by that group's id",
+            By::Id,
+            Some(By::Id),
+            json!({}),
+        ),
+        (
+            "every member at once, both identifiers by name",
+            By::Name,
+            Some(By::Name),
+            json!({
+                "name": "everything-changed",
+                "description": "changed too",
+                "eventType": EVENT_TYPES[11],
+                "eventTargets": [{ "arn": format!("arn:aws:sns:{DEFAULT_REGION}:{ACCOUNT}:everything") }],
+            }),
+        ),
+    ];
+
+    for (case, template_by, group_by, members) in rows {
+        let router = medialive();
+        let region = DEFAULT_REGION;
+        let (second_group_id, created) = populated(&router, region).await;
+        let id = created["id"].as_str().unwrap_or_default().to_string();
+        let stored_name = created["name"].as_str().unwrap_or_default().to_string();
+
+        let mut patch = members.clone();
+        if let Some(form) = group_by {
+            patch["groupIdentifier"] = match form {
+                By::Id => json!(second_group_id),
+                By::Name => json!(SECOND_GROUP),
+            };
+        }
+        let identifier = match template_by {
+            By::Id => id.clone(),
+            By::Name => stored_name.clone(),
+        };
+
+        let (status, updated) = update(&router, region, &identifier, patch.clone()).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from UpdateEventBridgeRuleTemplate, got {status}: {updated}"
+        );
+
+        // Everything but `ModifiedAt` is the stored record with the patch
+        // applied — which pins both halves of the rule at once: the members the
+        // request carried were written, and no other member moved.
+        let mut without_clock = updated.clone();
+        without_clock["modifiedAt"] = created["modifiedAt"].clone();
+        assert_eq!(
+            without_clock,
+            expected_after(&created, &patch, &second_group_id),
+            "case {case:?}: expected the stored record with only the request's members written, got {updated}"
+        );
+
+        // `ModifiedAt` is the one member the call itself moves, and it never
+        // moves backwards: at or after both the creation instant and the
+        // modification instant the create reported.
+        let created_at = epoch_seconds(timestamp(case, "createdAt", &updated));
+        let modified_at = epoch_seconds(timestamp(case, "modifiedAt", &updated));
+        let modified_before = epoch_seconds(timestamp(case, "modifiedAt", &created));
+        assert!(
+            modified_at >= created_at,
+            "case {case:?}: expected modifiedAt at or after createdAt, got {modified_at} before {created_at}"
+        );
+        assert!(
+            modified_at >= modified_before,
+            "case {case:?}: expected modifiedAt never to move backwards, got {modified_at} before {modified_before}"
+        );
+
+        // The round trip: the reporting operation answers the record the update
+        // reported, for the identifiers the resource has NOW.
+        let new_name = updated["name"].as_str().unwrap_or_default().to_string();
+        for identifier in [id.as_str(), new_name.as_str()] {
+            let (status, read) = get(&router, region, identifier).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected 200 reading {identifier:?} back, got {status}: {read}"
+            );
+            assert_eq!(
+                read, updated,
+                "case {case:?}: expected the update to be what {identifier:?} reports, got {read}"
+            );
+        }
+
+        // A rename frees the old name: it names nothing once the write landed.
+        if new_name != stored_name {
+            let (status, read) = get(&router, region, &stored_name).await;
+            assert_eq!(
+                status, 404,
+                "case {case:?}: expected the old name {stored_name:?} to name nothing, got {status}: {read}"
+            );
+        }
+    }
+}
+
+/// Rule: a resource's name is unique "within the scope of a resource type in a
+/// specific region" (the `Name` member's documentation), so an update renaming a
+/// resource to a name ANOTHER resource of its type holds in that region is
+/// refused with the operation's modelled `ConflictException` and writes nothing,
+/// while the same name in another region names a different resource.
+///
+/// The rows differ along the form of the name, along whether the two templates
+/// live in the same GROUP — the documented scope is the resource type in the
+/// region, not one group of it — and along the region pair, which is the scope
+/// the rule names.
+#[tokio::test]
+async fn a_rename_to_a_name_the_region_already_holds_is_refused() {
+    // (case, the name both templates ask for, the holder's region, the renamed
+    // template's region, the renamed template's group)
+    let rows: [(&str, &str, &str, &str, &str); 5] = [
+        ("plain name, same group", "taken", "us-west-2", "us-west-2", FIRST_GROUP),
+        ("plain name, other group", "taken", "us-west-2", "us-west-2", SECOND_GROUP),
+        ("dotted name, same group", "taken.name-1", "eu-west-1", "eu-west-1", FIRST_GROUP),
+        ("plain name, other region", "taken", "us-west-2", "eu-west-1", FIRST_GROUP),
+        ("dotted name, other region", "taken.name-1", "ap-south-1", "us-east-1", FIRST_GROUP),
+    ];
+
+    for (case, name, holder_region, renamed_region, renamed_group) in rows {
+        let router = medialive();
+        let regions: Vec<&str> = if holder_region == renamed_region {
+            vec![holder_region]
+        } else {
+            vec![holder_region, renamed_region]
+        };
+        for region in regions {
+            create_group(&router, region, FIRST_GROUP).await;
+            create_group(&router, region, SECOND_GROUP).await;
+        }
+
+        let (status, holder) = create(
+            &router,
+            holder_region,
+            json!({ "name": name, "eventType": EVENT_TYPES[4], "groupIdentifier": FIRST_GROUP }),
+        )
+        .await;
+        assert_eq!(
+            status, 201,
+            "case {case:?}: expected the holder of the name to be created, got {status}: {holder}"
+        );
+
+        let (status, renamed) = create(
+            &router,
+            renamed_region,
+            json!({
+                "name": "to-be-renamed",
+                "eventType": EVENT_TYPES[4],
+                "groupIdentifier": renamed_group,
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 201,
+            "case {case:?}: expected the template to rename to be created, got {status}: {renamed}"
+        );
+        let renamed_id = renamed["id"].as_str().unwrap_or_default().to_string();
+
+        let (status, body) = update(
+            &router,
+            renamed_region,
+            &renamed_id,
+            json!({ "name": name, "description": "written only if the rename is accepted" }),
+        )
+        .await;
+
+        if holder_region == renamed_region {
+            assert_eq!(
+                status, 409,
+                "case {case:?}: expected a name {holder_region} already holds to conflict, got {status}: {body}"
+            );
+            assert_eq!(
+                error_code(status, &body),
+                "ConflictException",
+                "case {case:?}: expected ConflictException, got {body}"
+            );
+            // The refusal wrote NOTHING: not the name, and not the member the
+            // same request carried beside it.
+            let (status, read) = get(&router, renamed_region, &renamed_id).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the template to survive the refusal, got {status}: {read}"
+            );
+            assert_eq!(
+                read, renamed,
+                "case {case:?}: expected the refused update to leave the template as it was, got {read}"
+            );
+            // And the name still names its holder.
+            let (status, by_name) = get(&router, holder_region, name).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the holder to keep the name, got {status}: {by_name}"
+            );
+            assert_eq!(
+                by_name["id"], holder["id"],
+                "case {case:?}: expected {name:?} to still name the holder, got {:?}",
+                by_name["id"]
+            );
+        } else {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the name to be free in {renamed_region}, got {status}: {body}"
+            );
+            assert_eq!(
+                body["name"],
+                json!(name),
+                "case {case:?}: expected the rename to be written, got {:?}",
+                body["name"]
+            );
+            // Each region's name names its own template.
+            for (region, expected) in [
+                (holder_region, &holder["id"]),
+                (renamed_region, &body["id"]),
+            ] {
+                let (status, by_name) = get(&router, region, name).await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected {region} to hold a template named {name:?}, got {status}: {by_name}"
+                );
+                assert_eq!(
+                    &by_name["id"], expected,
+                    "case {case:?}: expected {region} to report its own template, got {:?}",
+                    by_name["id"]
+                );
+            }
+        }
+    }
+}
+
+/// Rule: an update whose identifier names no resource of its type in the
+/// request's region is refused with the operation's modelled
+/// `NotFoundException` and writes nothing — for the resource's own identifier
+/// and for the parent identifier alike, since neither leaves anything to write.
+///
+/// The rows differ along WHICH identifier misses and along the FORM of the miss:
+/// an id nothing minted, a name nothing uses, an identifier of another resource
+/// type, and the id and the name of a resource that exists in a DIFFERENT
+/// region.
+#[tokio::test]
+async fn an_update_whose_identifier_names_nothing_in_the_region_is_not_found() {
+    let router = medialive();
+    let region = DEFAULT_REGION;
+    let (second_group_id, created) = populated(&router, region).await;
+    let id = created["id"].as_str().unwrap_or_default().to_string();
+
+    // A hierarchy of its own in another region, under names this region uses
+    // for nothing, which this region's requests must not reach.
+    let elsewhere = "eu-west-1";
+    let far_group = create_group(&router, elsewhere, "far-away-group").await;
+    let far_group_id = far_group["id"].as_str().unwrap_or_default().to_string();
+    let (status, far_template) = create(
+        &router,
+        elsewhere,
+        json!({
+            "name": "far-away-template",
+            "eventType": EVENT_TYPES[11],
+            "groupIdentifier": far_group_id,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "setup: expected the {elsewhere} template to be created, got {status}: {far_template}"
+    );
+    let far_id = far_template["id"].as_str().unwrap_or_default().to_string();
+
+    // (case, the template identifier, the group identifier the request carries)
+    let rows: [(&str, &str, Option<&str>); 9] = [
+        ("unminted template id", "9999999", None),
+        ("unused template name", "no-such-template", None),
+        ("another resource type's id", second_group_id.as_str(), None),
+        ("other region's template id", far_id.as_str(), None),
+        ("other region's template name", "far-away-template", None),
+        ("unminted group id", id.as_str(), Some("9999999")),
+        ("unused group name", id.as_str(), Some("no-such-group")),
+        ("other region's group id", id.as_str(), Some(far_group_id.as_str())),
+        ("other region's group name", id.as_str(), Some("far-away-group")),
+    ];
+
+    for (case, identifier, group_identifier) in rows {
+        let mut patch = json!({ "name": "never-written", "description": "never written either" });
+        if let Some(group_identifier) = group_identifier {
+            patch["groupIdentifier"] = json!(group_identifier);
+        }
+
+        let (status, body) = update(&router, region, identifier, patch).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected 404 for identifier {identifier:?}, got {status}: {body}"
+        );
+        assert_eq!(
+            error_code(status, &body),
+            "NotFoundException",
+            "case {case:?}: expected NotFoundException, got {body}"
+        );
+
+        // The refusal wrote nothing: the template this region holds is exactly
+        // as it was created, and the name the request asked for is still free.
+        let (status, read) = get(&router, region, &id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the template to survive, got {status}: {read}"
+        );
+        assert_eq!(
+            read, created,
+            "case {case:?}: expected the refused update to write nothing, got {read}"
+        );
+        let (status, by_new_name) = get(&router, region, "never-written").await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected the refused name to be free, got {status}: {by_new_name}"
+        );
+    }
+
+    // The other region's template is untouched too.
+    let (status, far_read) = get(&router, elsewhere, &far_id).await;
+    assert_eq!(
+        status, 200,
+        "expected {elsewhere} to keep its template, got {status}: {far_read}"
+    );
+    assert_eq!(
+        far_read, far_template,
+        "expected {elsewhere}'s template to be untouched, got {far_read}"
+    );
+}
+
+/// Rule: a member outside the constraint its model carries — a length bound, the
+/// closed set of an enum, the number of targets the service can count, or the
+/// kind of ARN a target may name — is refused as a client error and writes
+/// nothing; a member AT a published bound is accepted.
+///
+/// The rows walk each published bound and one past it: `Name` is
+/// `__stringMin1Max255PatternS`, `Description` is `__stringMin0Max1024`, an
+/// `EventTargets` entry's `Arn` is `__stringMin1Max2048PatternArn`,
+/// `EventTargetCount` is `__integerMax5` and `EventType` is the
+/// `EventBridgeRuleTemplateEventType` enum.
+#[tokio::test]
+async fn an_update_member_outside_the_constraint_its_model_carries_is_refused() {
+    let at_name_bound = "n".repeat(MAX_NAME);
+    let past_name_bound = "n".repeat(MAX_NAME + 1);
+    let at_description_bound = "d".repeat(MAX_DESCRIPTION);
+    let past_description_bound = "d".repeat(MAX_DESCRIPTION + 1);
+    let at_arn_bound = sns_arn(MAX_TARGET_ARN);
+    let past_arn_bound = sns_arn(MAX_TARGET_ARN + 1);
+    let five_targets: Vec<Value> = (0..MAX_TARGETS)
+        .map(|index| json!({ "arn": format!("arn:aws:sns:{DEFAULT_REGION}:{ACCOUNT}:topic-{index}") }))
+        .collect();
+    let six_targets: Vec<Value> = (0..=MAX_TARGETS)
+        .map(|index| json!({ "arn": format!("arn:aws:sns:{DEFAULT_REGION}:{ACCOUNT}:topic-{index}") }))
+        .collect();
+
+    // (case, the request's members, expected status)
+    let rows: [(&str, Value, u16); 15] = [
+        ("name below the minimum", json!({ "name": "" }), 400),
+        ("name at the minimum", json!({ "name": "n" }), 200),
+        ("name at the maximum", json!({ "name": at_name_bound }), 200),
+        ("name past the maximum", json!({ "name": past_name_bound }), 400),
+        (
+            "description at the maximum",
+            json!({ "description": at_description_bound }),
+            200,
+        ),
+        (
+            "description past the maximum",
+            json!({ "description": past_description_bound }),
+            400,
+        ),
+        (
+            "target arn at the maximum",
+            json!({ "eventTargets": [{ "arn": at_arn_bound }] }),
+            200,
+        ),
+        (
+            "target arn past the maximum",
+            json!({ "eventTargets": [{ "arn": past_arn_bound }] }),
+            400,
+        ),
+        (
+            "as many targets as the model counts",
+            json!({ "eventTargets": five_targets }),
+            200,
+        ),
+        (
+            "one target past what the model counts",
+            json!({ "eventTargets": six_targets }),
+            400,
+        ),
+        (
+            "a target that is neither an SNS topic nor a log group",
+            json!({ "eventTargets": [{ "arn": format!("arn:aws:s3:::bucket-{ACCOUNT}") }] }),
+            400,
+        ),
+        (
+            "a modelled event type",
+            json!({ "eventType": EVENT_TYPES[9] }),
+            200,
+        ),
+        ("the empty event type", json!({ "eventType": "" }), 400),
+        (
+            "an event type in the wrong case",
+            json!({ "eventType": "medialive_channel_alert" }),
+            400,
+        ),
+        (
+            "an event type the enum does not declare",
+            json!({ "eventType": "NOT_AN_EVENT_TYPE" }),
+            400,
+        ),
+    ];
+
+    for (case, patch, expected) in rows {
+        let router = medialive();
+        let region = DEFAULT_REGION;
+        let (_second_group_id, created) = populated(&router, region).await;
+        let id = created["id"].as_str().unwrap_or_default().to_string();
+
+        let (status, body) = update(&router, region, &id, patch).await;
+        assert_eq!(
+            status, expected,
+            "case {case:?}: expected {expected}, got {status}: {body}"
+        );
+
+        if expected == 400 {
+            let code = error_code(status, &body);
+            assert!(
+                code == "BadRequestException" || code == "ValidationException",
+                "case {case:?}: expected the request to be refused as a client error, got {code} ({body})"
+            );
+            let (status, read) = get(&router, region, &id).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the template to survive the refusal, got {status}: {read}"
+            );
+            assert_eq!(
+                read, created,
+                "case {case:?}: expected the refused update to write nothing, got {read}"
+            );
+        }
+    }
+}
+
+/// Rule: an update that moves a resource to another parent changes which parent
+/// HOLDS it, as every operation that derives its answer from that membership
+/// reports — here the parent delete, which is refused while the parent still
+/// holds a child and accepted once it holds none.
+///
+/// The rows are the two forms `GroupIdentifier` takes ("Can be either be its id
+/// or current name"), because that is what the rule generalises over.
+#[tokio::test]
+async fn moving_a_template_changes_which_group_holds_it() {
+    for form in [By::Id, By::Name] {
+        let router = medialive();
+        let region = DEFAULT_REGION;
+        let (second_group_id, created) = populated(&router, region).await;
+        let id = created["id"].as_str().unwrap_or_default().to_string();
+        let case = format!("group named by {form:?}");
+
+        // Before the move the FIRST group holds it, so its delete is refused.
+        let (status, refused) = delete_group(&router, region, FIRST_GROUP).await;
+        assert_eq!(
+            status, 409,
+            "case {case:?}: expected the holding group's delete to be refused, got {status}: {refused}"
+        );
+
+        let group_identifier = match form {
+            By::Id => second_group_id.clone(),
+            By::Name => SECOND_GROUP.to_string(),
+        };
+        let (status, moved) = update(
+            &router,
+            region,
+            &id,
+            json!({ "groupIdentifier": group_identifier }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the move to be accepted, got {status}: {moved}"
+        );
+        assert_eq!(
+            moved["groupId"],
+            json!(second_group_id),
+            "case {case:?}: expected the id of the group the identifier {group_identifier:?} names, got {:?}",
+            moved["groupId"]
+        );
+
+        // After the move the FIRST group holds nothing and goes, while the
+        // SECOND holds the template and is refused.
+        let (status, deleted) = delete_group(&router, region, FIRST_GROUP).await;
+        assert_eq!(
+            status, 204,
+            "case {case:?}: expected the emptied group to be deleted, got {status}: {deleted}"
+        );
+        let (status, refused) = delete_group(&router, region, &second_group_id).await;
+        assert_eq!(
+            status, 409,
+            "case {case:?}: expected the new holder's delete to be refused, got {status}: {refused}"
+        );
+
+        // The template itself survived its old group's delete and still reports
+        // the group it was moved into.
+        let (status, read) = get(&router, region, &id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the moved template to survive, got {status}: {read}"
+        );
+        assert_eq!(
+            read, moved,
+            "case {case:?}: expected the stored template to be what the move reported, got {read}"
         );
     }
 }

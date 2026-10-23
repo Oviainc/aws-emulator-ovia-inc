@@ -11,6 +11,8 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/arn_addressed_tag_refusals.rs"]
+mod arn_addressed_tag_refusals;
 #[path = "all/emulator.rs"]
 mod emulator;
 #[path = "all/global_secondary_indexes.rs"]
@@ -21,6 +23,8 @@ mod index_capacity_and_item_collections;
 mod key_schema_element_refusals;
 #[path = "all/number_canonicalization.rs"]
 mod number_canonicalization;
+#[path = "all/region_from_the_request_endpoint.rs"]
+mod region_from_the_request_endpoint;
 #[path = "all/regions_indexes_and_capacity.rs"]
 mod regions_indexes_and_capacity;
 

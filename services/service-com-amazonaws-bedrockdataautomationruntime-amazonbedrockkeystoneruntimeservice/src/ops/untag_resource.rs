@@ -151,6 +151,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+
+        // Every tag key must satisfy the modelled `TagKey` pattern, which the boundary
+        // walk cannot enforce (see `crate::state::tag_key_is_well_formed`). A malformed
+        // key is refused before the resource is resolved, so nothing is removed.
+        if input
+            .tag_keys
+            .iter()
+            .any(|key| !crate::state::tag_key_is_well_formed(key))
+        {
+            return Err(UntagResourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::malformed_tag_key_message(
+                        "tagKeys.member",
+                    )),
+                },
+            )
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UntagResourceErrorModeled::InternalServerException(
                 InternalServerException {
@@ -164,15 +183,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         let Some(invocation) = store.invocation_mut(&input.resource_arn) else {
-            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "No data automation invocation found for {}",
-                        input.resource_arn
-                    )),
-                },
-            )
-            .into());
+            // 400, not the 404 the shape's advisory `@httpError` declares: see
+            // `crate::scaffolded::Scaffolded::ClientError`.
+            return Err(crate::scaffolded::Scaffolded::client_error(
+                UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(crate::state::INVOCATION_NOT_FOUND_MESSAGE.to_string()),
+                }),
+            ));
         };
 
         for key in &input.tag_keys {

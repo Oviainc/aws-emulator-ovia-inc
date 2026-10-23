@@ -234,8 +234,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::require_state(&*self.engine)?;
+
+        // The action executions this reader reports are the ones as they stand at the
+        // instant of the call, so every step the clock had already made due by then is
+        // materialised first (see `state::driver`).
+        crate::state::advance(&*self.engine, ctx, &input.pipeline_name).await;
         let state = state.lock();
 
         // The pipeline the required member names is resolved first: there is nothing

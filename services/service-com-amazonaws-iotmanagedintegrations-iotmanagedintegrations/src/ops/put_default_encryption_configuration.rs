@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutDefaultEncryptionConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutDefaultEncryptionConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutDefaultEncryptionConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets this account's default encryption configuration for the region the request was
+//! signed for, in `crate::state`'s `default_encryption` store, and answers with the
+//! configuration as stored. `KmsKeyArn` belongs to `CUSTOMER_KEY_ENCRYPTION`, so the two
+//! members hold together one way only: that type needs the key and the service-owned type
+//! takes none — either mismatch is refused with the modelled `ValidationException` (400)
+//! and stores nothing. A put that CHANGES the configuration starts the switch the clock
+//! completes, so it answers `UPDATE_IN_PROGRESS` until that is due; one that asks for the
+//! configuration already in force starts nothing and stays `ENABLED`.
+//!
+//! The configuration is keyed by the region the request was SIGNED for, which comes from
+//! the caller, so the key is checked for shape (an EMULATOR-ONLY guard; the real service
+//! resolves an endpoint instead and never refuses over that spelling) and the store keeps
+//! configurations for at most [`crate::state::MAX_CONFIGURED_REGIONS`] regions: a put for a
+//! further region is refused with the modelled `ThrottlingException` rather than grown
+//! into. A put that changes nothing in a region holding no record stores nothing at all.
+//!
+//! IAM authorization is NOT modelled in this emulator — the request pipeline verifies the
+//! signature and no handler evaluates permissions — so this operation's modelled
+//! `AccessDeniedException` / `UnauthorizedException` are deliberately unreachable here.
+//! Each call is still attributable: see `audit` at the bottom of this file.
+//!
+//! `GetDefaultEncryptionConfiguration` reads the same record back.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +174,161 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutDefaultEncryptionConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutDefaultEncryptionConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The configuration is an account-and-region setting, so this put configures the
+        // region the request was signed for and leaves every other region alone. The
+        // credential scope's access key id is read only to ATTRIBUTE the change ([`audit`]).
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx.parts());
+        let asked_for = input.encryption_type.clone();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            audit(&akid, &region, &asked_for, "unavailable");
+            PutDefaultEncryptionConfigurationErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the encryption-configuration store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // `encryptionType` is a modelled enum, so a value outside
+        // `crate::state::ENCRYPTION_TYPE_VALUES` is already refused by the boundary
+        // validator before this handler runs: reaching here means it is one of them.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutDefaultEncryptionConfiguration"))
+        // `kmsKeyArn` is the key `CUSTOMER_KEY_ENCRYPTION` encrypts under, which no
+        // modelled constraint can tie to the type, so each type admits exactly one shape
+        // of request: that type needs the key, and the service-owned encryption uses no
+        // key of the caller's and so takes none. The refusal names the member and the
+        // type the request paired it with, so the caller can fix the request from the
+        // text alone.
+        //
+        // The first half is documented ("the AWS KMS key used for KMS encryption if you
+        // use KMS_BASED_ENCRYPTION"); the second is INFERRED from the same sentence —
+        // AWS may instead ignore a key sent with the service-owned type — so a recorded
+        // response showing that is what should correct it. The refusal is modelled and
+        // stores nothing either way.
+        let kms_key_arn = match (input.encryption_type.as_str(), input.kms_key_arn) {
+            (crate::state::CUSTOMER_KEY_ENCRYPTION_TYPE, None) => {
+                audit(&akid, &region, &asked_for, "refused");
+                return Err(PutDefaultEncryptionConfigurationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "kmsKeyArn is required when encryptionType is {:?}",
+                            crate::state::CUSTOMER_KEY_ENCRYPTION_TYPE
+                        )),
+                    },
+                )
+                .into());
+            }
+            (crate::state::DEFAULT_ENCRYPTION_TYPE, Some(_)) => {
+                audit(&akid, &region, &asked_for, "refused");
+                return Err(PutDefaultEncryptionConfigurationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "kmsKeyArn must not be set when encryptionType is {:?}",
+                            crate::state::DEFAULT_ENCRYPTION_TYPE
+                        )),
+                    },
+                )
+                .into());
+            }
+            (_, kms_key_arn) => kms_key_arn,
+        };
+
+        // The region becomes the KEY this configuration is stored under, so its shape is
+        // checked before it reaches the store. An EMULATOR-ONLY guard: the real service
+        // resolves an endpoint rather than reading the signing region out of the request,
+        // so it never refuses a call over the spelling of that region — this one refuses
+        // rather than keying its store by an arbitrary caller-supplied string.
+        if !crate::state::is_region_name(&region) {
+            audit(&akid, &region, &asked_for, "refused");
+            return Err(PutDefaultEncryptionConfigurationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "the request's credential scope must name a region of at most {} \
+                         lowercase letters, digits and hyphens",
+                        crate::state::MAX_REGION_NAME_LENGTH
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let current = store.default_encryption_in(&region);
+
+        // Changing the encryption an account's data is under is asynchronous: the
+        // configuration reports the submitted values at once, in progress, and comes into
+        // force when the clock makes it due. A put asking for the configuration already in
+        // force changes nothing, so it starts no switch and does not restart one still in
+        // flight either.
+        let changed = current.would_change(&input.encryption_type, kms_key_arn.as_deref());
+        let update_due_at = if changed {
+            Some(now + crate::state::ENCRYPTION_UPDATE_DELAY)
+        } else {
+            current.update_due_at
+        };
+
+        let configuration = crate::state::DefaultEncryptionConfiguration {
+            encryption_type: input.encryption_type,
+            kms_key_arn,
+            update_due_at,
+        };
+        let output = PutDefaultEncryptionConfigurationOutput {
+            configuration_status: configuration.status_at(now),
+            encryption_type: configuration.encryption_type.clone(),
+            kms_key_arn: configuration.kms_key_arn.clone(),
+        };
+
+        // The store keeps configurations for a bounded number of regions: past it, a put
+        // for a region it does not already hold is refused rather than grown into. The
+        // operation models no quota error, so the refusal is the modelled error closest to
+        // "this service will not take another one now" — the same one `CreateManagedThing`
+        // answers at its own bound.
+        //
+        // A put that changes nothing in a region holding no record stores nothing: the
+        // account default needs no entry, so restating it cannot consume a region slot.
+        let holds_a_record = store.default_encryption.contains_key(&region);
+        if (changed || holds_a_record)
+            && !store.set_default_encryption_in(&region, configuration)
+        {
+            audit(&akid, &region, &asked_for, "refused");
+            return Err(PutDefaultEncryptionConfigurationErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: Some(format!(
+                        "this service holds a default encryption configuration for the maximum \
+                         of {} regions; it cannot take on another region",
+                        crate::state::MAX_CONFIGURED_REGIONS
+                    )),
+                },
+            )
+            .into());
+        }
+        drop(store);
+
+        audit(
+            &akid,
+            &region,
+            &asked_for,
+            if changed { "configured" } else { "unchanged" },
+        );
+        Ok(output)
     }
+}
+
+/// Record this state-changing call for attribution: the access key id the caller presented
+/// (a public identifier, never a secret), the region whose configuration it addressed, the
+/// encryption type it asked for, and how the call ended. Nothing the request did not send,
+/// and no credential or key material — `kmsKeyArn` is the caller's own ARN and is left to
+/// the response rather than written to a log sink.
+fn audit(akid: &str, region: &str, encryption_type: &str, outcome: &str) {
+    ::tracing::info!(
+        target: "emulator::audit",
+        operation = "PutDefaultEncryptionConfiguration",
+        akid = %akid,
+        region = %region,
+        encryption_type = %encryption_type,
+        outcome = %outcome,
+        "state-changing operation"
+    );
 }

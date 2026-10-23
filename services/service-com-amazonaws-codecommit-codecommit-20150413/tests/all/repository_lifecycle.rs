@@ -16,11 +16,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use sha2::Digest;
+use sha1::Digest;
 use smithy_server_runtime::MultiServiceRouter;
 
-/// The region the test's requests are signed for; every ARN and clone URL the
-/// service reports must be built for it.
+/// The region the test's requests are signed for; every ARN the service reports
+/// must be built for it.
 ///
 /// This module's harness (`emulator`, `call`, `ok`, `error` and the small value
 /// helpers) is shared with the sibling suites in `tests/all/`, so every suite
@@ -28,6 +28,10 @@ use smithy_server_runtime::MultiServiceRouter;
 /// call as a NAMED principal uses `crate::wire`, which signs with a given access
 /// key id over this same protocol.
 pub(crate) const REGION: &str = "us-west-2";
+
+/// The authority the test's requests are addressed to — the endpoint the
+/// emulator is reached on, which is what every clone URL it announces must name.
+pub(crate) const ENDPOINT_AUTHORITY: &str = "codecommit.us-west-2.amazonaws.com";
 
 /// Build the emulator the way the router does: one shared engine, this service
 /// mounted on it, request authentication off so the test signs nothing. The
@@ -103,15 +107,14 @@ pub(crate) fn string_at(payload: &Value, pointer: &str) -> String {
         .to_string()
 }
 
-/// The object name of a blob — the git object encoding `"blob <len>\0<content>"`,
-/// hashed and truncated to the 20 bytes an object name is wide — computed here
-/// independently of the service, so `blobId` is checked against the rule rather
-/// than against itself.
+/// The object name of a blob — git's own object name function over the object
+/// encoding `"blob <len>\0<content>"` — computed here independently of the
+/// service, so `blobId` is checked against the rule rather than against itself.
 pub(crate) fn git_blob_id(content: &[u8]) -> String {
-    let mut hasher = sha2::Sha256::new();
+    let mut hasher = sha1::Sha1::new();
     hasher.update(format!("blob {}\0", content.len()).as_bytes());
     hasher.update(content);
-    hex::encode(&hasher.finalize()[..20])
+    hex::encode(hasher.finalize())
 }
 
 pub(crate) fn is_object_id(value: &str) -> bool {
@@ -253,20 +256,17 @@ async fn a_written_repository_and_file_are_read_back_from_state() {
             engine::emulator_account_id(),
             "case {label:?}: accountId"
         );
+        // The clone URL names the endpoint this request was addressed to — the
+        // address this emulator's git transport answers on — not the public AWS
+        // git host, which is a different server.
         assert_eq!(
             string_at(&metadata, "/cloneUrlHttp"),
-            format!(
-                "https://git-codecommit.{REGION}.amazonaws.com/v1/repos/{}",
-                case.name
-            ),
+            format!("https://{ENDPOINT_AUTHORITY}/v1/repos/{}", case.name),
             "case {label:?}: cloneUrlHttp"
         );
         assert_eq!(
             string_at(&metadata, "/cloneUrlSsh"),
-            format!(
-                "ssh://git-codecommit.{REGION}.amazonaws.com/v1/repos/{}",
-                case.name
-            ),
+            format!("ssh://{ENDPOINT_AUTHORITY}/v1/repos/{}", case.name),
             "case {label:?}: cloneUrlSsh"
         );
         assert_eq!(
@@ -1179,11 +1179,17 @@ async fn the_store_is_bounded_on_every_axis_a_caller_drives() {
             "after {writes} writes the repository must retain at most {MAX_COMMITS_RETAINED} commits, got {}",
             repository.commits.len()
         );
-        assert!(
-            repository.blobs.len() <= repository.commits.len(),
-            "no blob may outlive the commits that reference it: {} blobs for {} commits",
-            repository.blobs.len(),
-            repository.commits.len()
+        // Every object the store holds is one a ref reaches: an object nothing
+        // points at any more is released, and an object the history still needs
+        // is kept (a clone has to be able to serve it).
+        let roots: Vec<String> = repository.refs().into_iter().map(|(_, id)| id).collect();
+        let reachable = repository.reachable_from(&roots);
+        assert_eq!(
+            repository.objects.len(),
+            reachable.len(),
+            "the object store must be exactly what the refs reach: {} stored, {} reachable",
+            repository.objects.len(),
+            reachable.len()
         );
     }
 

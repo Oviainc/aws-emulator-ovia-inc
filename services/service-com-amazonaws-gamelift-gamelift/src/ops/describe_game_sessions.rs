@@ -227,13 +227,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // An alias is a separate slice that still answers 501, so no alias can have been
-        // created: no stored alias resolves to a fleet.
-        if let Some(alias_id) = &input.alias_id {
-            return Err(not_found(format!("The alias {alias_id} was not found.")));
-        }
+        // "To retrieve all game sessions active on a fleet, specify the fleet's unique
+        // identifier" and "provide a fleet or alias ID": an alias names the fleet its
+        // routing strategy points at, so a describe through an alias reports that fleet's
+        // sessions. An identifier no stored alias matches is the modelled
+        // `NotFoundException` — the alias is a resource the request names, not a filter
+        // over the reported collection — and a terminal alias "does not resolve to a
+        // fleet", so it answers the modelled `TerminalRoutingStrategyException`.
+        let fleet_reference = match (&input.fleet_id, &input.alias_id) {
+            (Some(fleet_reference), _) => Some(fleet_reference.clone()),
+            (None, Some(alias_reference)) => {
+                let Some(alias) = state.resolve_alias(alias_reference) else {
+                    return Err(not_found(format!(
+                        "The alias {alias_reference} was not found."
+                    )));
+                };
+                match alias.routing() {
+                    crate::state::AliasRouting::Fleet(fleet_id) => Some(fleet_id.to_string()),
+                    crate::state::AliasRouting::Terminal(message) => {
+                        return Err(
+                            DescribeGameSessionsErrorModeled::TerminalRoutingStrategyException(
+                                TerminalRoutingStrategyException {
+                                    message: message.map(str::to_string),
+                                },
+                            )
+                            .into(),
+                        )
+                    }
+                }
+            }
+            (None, None) => None,
+        };
 
-        let mut selected: Vec<GameSession> = if let Some(fleet_reference) = &input.fleet_id {
+        let mut selected: Vec<GameSession> = if let Some(fleet_reference) = &fleet_reference {
             // A reporting operation whose output is a paginated collection answers a
             // selector that picks out no stored session with that collection empty: the
             // sessions of a fleet this service does not hold are none, not an error. So

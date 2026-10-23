@@ -319,6 +319,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             glossaries: std::collections::BTreeMap::new(),
             asset_types: std::collections::BTreeMap::new(),
             domain_units: std::collections::BTreeMap::new(),
+            listings: std::collections::BTreeMap::new(),
             id: id.clone(),
         };
         // The `rootDomainUnitId` this response reports names a unit that exists from

@@ -1941,6 +1941,90 @@ pub struct Object {
     /// the write's own header decides the new one, and
     /// [`ComAmazonawsS3Amazons3State::replace_object_tags`] is what sets one afterwards.
     pub tags: Vec<ResourceTag>,
+    /// How this object is encrypted at rest — see [`ObjectEncryption`]. Decided by the
+    /// write that stored it and never afterwards, like every other member here: "You
+    /// cannot use PutObject to only update a single piece of metadata for an existing
+    /// object."
+    pub encryption: ObjectEncryption,
+}
+
+/// The server-side encryption in force on one stored object: the configuration the write
+/// that stored it settled on, which every reader of that object reports back.
+///
+/// The members are `PutObject`'s own encryption members
+/// (`smithy_query(query="operation",operation="PutObject")`): `ServerSideEncryption`
+/// (`x-amz-server-side-encryption`), `SSEKMSKeyId`, `SSEKMSEncryptionContext` and
+/// `BucketKeyEnabled` — the four `PutObject`, `GetObject` and `HeadObject` all report
+/// back as bound response headers.
+///
+/// What this records is an object's encryption CONFIGURATION, not a key and not a
+/// ciphertext: this emulator holds an object's bytes in this process's memory and
+/// performs no cryptography, so the only thing it can answer faithfully is which
+/// configuration the object was stored under — which is exactly what those response
+/// members report. The SSE-C members (a customer-provided KEY, which S3 itself never
+/// stores) are NOT here: `PutObject` refuses a write that carries them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObjectEncryption {
+    /// A `ServerSideEncryption` value (`AES256`, `aws:kms`, …), or `None` for an object
+    /// stored before any encryption state was recorded for it.
+    pub sse_algorithm: Option<String>,
+    /// `SSEKMSKeyId`, verbatim as the request carried it — "You can specify the key ID,
+    /// key alias, or the Amazon Resource Name (ARN) of the KMS key" — and `None` for a
+    /// write that named none. Only the request's own value: a bucket's DEFAULT encryption
+    /// configuration is not consulted here, which is why a write that names no encryption
+    /// member reports none.
+    pub kms_key_id: Option<String>,
+    /// `SSEKMSEncryptionContext`: "a Base64-encoded string holding a UTF-8 encoded JSON
+    /// of additional encryption context key-value pairs", verbatim.
+    pub kms_encryption_context: Option<String>,
+    /// `BucketKeyEnabled`: whether the object uses an S3 Bucket Key for SSE-KMS.
+    pub bucket_key_enabled: Option<bool>,
+}
+
+impl ObjectEncryption {
+    /// Whether this object's encryption is SSE-KMS — the only kind a KMS key id, an
+    /// encryption context or an S3 Bucket Key belongs to
+    /// (`ApplyServerSideEncryptionByDefault$KMSMasterKeyID`: "This parameter is allowed if
+    /// and only if `SSEAlgorithm` is set to `aws:kms` or `aws:kms:dsse`", the two values
+    /// [`KMS_SSE_ALGORITHMS`] holds).
+    pub fn uses_kms(&self) -> bool {
+        self.sse_algorithm
+            .as_deref()
+            .is_some_and(|algorithm| KMS_SSE_ALGORITHMS.contains(&algorithm))
+    }
+
+    /// The header name of the first member here that only SSE-KMS has, or `None` when this
+    /// record names none of them: what a caller is told it may not combine with another
+    /// algorithm. An S3 Bucket Key counts only when it is switched ON — "Setting this
+    /// header to true causes Amazon S3 to use an S3 Bucket Key"
+    /// (`PutObjectRequest$BucketKeyEnabled`), so `false` asks for nothing KMS-only.
+    pub fn kms_only_member(&self) -> Option<&'static str> {
+        if self.kms_key_id.is_some() {
+            return Some("x-amz-server-side-encryption-aws-kms-key-id");
+        }
+        if self.kms_encryption_context.is_some() {
+            return Some("x-amz-server-side-encryption-context");
+        }
+        if self.bucket_key_enabled == Some(true) {
+            return Some("x-amz-server-side-encryption-bucket-key-enabled");
+        }
+        None
+    }
+
+    /// How many bytes this record retains — the caller-supplied strings it holds, which
+    /// the per-bucket and service-wide budgets must count like every other string kept
+    /// beside an object.
+    pub fn retained_bytes(&self) -> usize {
+        [
+            &self.sse_algorithm,
+            &self.kms_key_id,
+            &self.kms_encryption_context,
+        ]
+        .iter()
+        .filter_map(|member| member.as_ref())
+        .map(String::len)
+        .sum()
+    }
 }
 
 impl Object {
@@ -1959,6 +2043,7 @@ impl Object {
             + self.version_id.as_ref().map_or(0, String::len)
             + self.metadata_bytes()
             + tag_set_bytes(&self.tags)
+            + self.encryption.retained_bytes()
             + [
                 &self.content_type,
                 &self.cache_control,
@@ -2014,6 +2099,38 @@ pub fn object_etag(body: &[u8]) -> String {
 /// (`PutObjectRequest$ContentMD5`), which is what makes that header checkable.
 pub fn content_md5(body: &[u8]) -> String {
     ::aws_smithy_types::base64::encode(Md5::digest(body))
+}
+
+/// The one `EncodingType` the model declares: `url`
+/// (`smithy_query(query="shape",shape="EncodingType")` reports exactly one value), which
+/// is also the one the AWS CLI sends on every listing.
+pub const ENCODING_TYPE_URL: &str = "url";
+
+/// The characters percent-encoding LEAVES ALONE: RFC 3986's unreserved set,
+/// `A-Z a-z 0-9 - _ . ~`.
+///
+/// Everything else in a key name is encoded as `%XX` per UTF-8 code value, which is what
+/// `encoding-type=url` asks for: "non-ASCII characters that are used in an object's key
+/// name will be percent-encoded according to UTF-8 code values. For example, the object
+/// `test_file(3).png` will appear as `test_file%283%29.png`" (the `EncodingType` enum's
+/// own documentation) — so even an ASCII character outside that set (`(`, `)`, and the
+/// `/` of a key prefix) is encoded, which is why the set is subtractive rather than a
+/// hand-written list of characters to escape.
+const KEY_UNRESERVED: &::percent_encoding::AsciiSet = &::percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~');
+
+/// `value` as a listing reports it when the request asked for `encoding-type=url`.
+///
+/// The elements this applies to are the ones `ListObjectsV2Output$EncodingType` names —
+/// "returns encoded key name values in the following response elements: Delimiter,
+/// Prefix, Key, and StartAfter" — plus the same key-name elements of the other listings
+/// (`ListObjectVersions`' markers and its `CommonPrefixes`). A listing that asked for no
+/// encoding type reports every one of them verbatim.
+pub fn url_encoded_key(value: &str) -> String {
+    ::percent_encoding::utf8_percent_encode(value, KEY_UNRESERVED).to_string()
 }
 
 /// The canonical user id of the one account this emulator serves — what an S3 response
@@ -2657,6 +2774,7 @@ mod tests {
             website_redirect_location: None,
             metadata: BTreeMap::new(),
             tags: Vec::new(),
+            encryption: ObjectEncryption::default(),
             // The store mints the id; an object handed to `put_object` carries none.
             version_id: None,
         }

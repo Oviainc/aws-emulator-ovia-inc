@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteMembers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteMembers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteMembers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the member associations of the calling (administrator) account's hub, one
+//! per `AccountIds` entry: the association record is REMOVED, so the account is no
+//! longer a member of that hub and `GetMembers` reports it unprocessed. An id the hub
+//! holds no association for is reported in `UnprocessedAccounts` — "the list of Amazon
+//! Web Services accounts that were not deleted" — rather than failing the accounts in
+//! the same call that can be deleted.
 //!
 //! ## Shape of an operation
 //!
@@ -115,6 +113,16 @@ impl From<DeleteMembersErrorModeled> for DeleteMembersError {
     }
 }
 
+/// The modelled 400 for an input value outside a documented bound.
+fn invalid_input(message: String) -> DeleteMembersError {
+    DeleteMembersError::Modeled(DeleteMembersErrorModeled::InvalidInputException(
+        InvalidInputException {
+            message: Some(message),
+            code: Some("InvalidInputException".to_string()),
+        },
+    ))
+}
+
 /// The `DeleteMembers` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -151,18 +159,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteMembers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteMembersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteMembers"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteMembersError::Modeled(DeleteMembersErrorModeled::InternalException(
+                InternalException {
+                    message: Some(crate::state::STATE_UNAVAILABLE_MESSAGE.to_string()),
+                    code: Some("InternalException".to_string()),
+                },
+            ))
+        })?;
+
+        let hub = crate::state::hub_key(ctx);
+        let administrator_id = hub.0.as_str();
+        let region = hub.1.as_str();
+
+        // Deleting an administrator account's members needs that account to be
+        // subscribed, exactly as creating and reading them does: without the hub there
+        // is no administrator account the associations could belong to.
+        let mut store = state.lock();
+        if !store.hubs.contains_key(&hub) {
+            return Err(DeleteMembersErrorModeled::InvalidAccessException(
+                InvalidAccessException {
+                    message: Some(crate::state::not_subscribed_message(administrator_id, region)),
+                    code: Some("InvalidAccessException".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // `AccountIdList` carries no `length` trait, so this handler holds the batch
+        // bound the model puts on `CreateMembers`' own account list: one call does a
+        // bounded amount of work under the state lock and answers a bounded response.
+        if input.account_ids.len() > crate::state::MAX_MEMBER_BATCH {
+            return Err(invalid_input(format!(
+                "AccountIds must contain at most {} account ids, got {}",
+                crate::state::MAX_MEMBER_BATCH,
+                input.account_ids.len()
+            )));
+        }
+
+        // Same rule as every other member operation: a malformed account id is an
+        // invalid input parameter, so the whole request is refused and nothing is
+        // deleted — a caller never has to work out which half of its batch landed.
+        if let Some(bad) = input
+            .account_ids
+            .iter()
+            .find(|account_id| !crate::state::is_account_id(account_id))
+        {
+            return Err(invalid_input(format!(
+                "AccountIds must each be {} digits, got '{bad}'",
+                crate::state::ACCOUNT_ID_LEN
+            )));
+        }
+
+        let mut unprocessed_accounts: Vec<Result2> = Vec::new();
+        for account_id in &input.account_ids {
+            // The administrator account is the other end of an association, never a
+            // member of its own hub, so there is nothing to delete for it.
+            if account_id == administrator_id {
+                unprocessed_accounts.push(Result2 {
+                    account_id: Some(account_id.clone()),
+                    processing_result: Some(format!(
+                        "The request is rejected because the account {administrator_id} is the \
+                         administrator account and cannot be its own member account"
+                    )),
+                });
+                continue;
+            }
+
+            // The delete is the removal of the association record itself, so a
+            // repeated call deletes nothing more and the account is reported as not
+            // deleted the second time round.
+            if store
+                .members
+                .remove(&crate::state::member_key(&hub, account_id))
+                .is_none()
+            {
+                unprocessed_accounts.push(Result2 {
+                    account_id: Some(account_id.clone()),
+                    processing_result: Some(format!(
+                        "The request is rejected because the account {account_id} is not an \
+                         associated member account of {administrator_id}"
+                    )),
+                });
+            }
+        }
+
+        Ok(DeleteMembersOutput {
+            unprocessed_accounts: Some(unprocessed_accounts),
+        })
     }
 }

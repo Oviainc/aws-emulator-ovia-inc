@@ -255,13 +255,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         // The ACL every MemoryDB account already has is the service's, not the
-        // caller's: its membership cannot be changed.
-        if acl_name == crate::state::OPEN_ACCESS_ACL_NAME {
+        // caller's: its membership cannot be changed. The refusal is built by the one
+        // rule every write path over a built-in resource reads.
+        if let Some(message) = crate::state::builtin_resource_rejection(
+            crate::state::ResourceKind::Acl,
+            &acl_name,
+            crate::state::Mutation::Modify,
+        ) {
             return Err(UpdateACLErrorModeled::InvalidParameterValueException(
                 InvalidParameterValueException {
-                    message: Some(format!(
-                        "ACL {acl_name} is a default ACL and cannot be modified."
-                    )),
+                    message: Some(message),
                 },
             )
             .into());

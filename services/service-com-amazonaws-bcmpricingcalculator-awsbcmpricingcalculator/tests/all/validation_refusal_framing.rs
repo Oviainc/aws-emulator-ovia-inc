@@ -31,17 +31,17 @@ use crate::bill_scenario_lifecycle::{error_code, Emulator};
 /// `WorkloadEstimateName` / `BillScenarioName` / `BillEstimateName` declare
 /// `@pattern "^[a-zA-Z0-9-]+$"` (smithy_query `shape="WorkloadEstimateName"`); this is
 /// that expression as a clause has to quote it — without the anchors.
-const NAME_PATTERN: &str = "[a-zA-Z0-9-]+";
+pub(crate) const NAME_PATTERN: &str = "[a-zA-Z0-9-]+";
 
 /// `ResourceId`: `@pattern`
 /// `"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"`, unanchored.
-const RESOURCE_ID_PATTERN: &str =
+pub(crate) const RESOURCE_ID_PATTERN: &str =
     "[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}";
 
 /// `Arn`: `@pattern`
 /// `"^arn:aws[-a-z0-9]*:bcm-pricing-calculator:[-a-z0-9]*:[0-9]{12}:[-a-z0-9/:_]+$"`,
 /// unanchored.
-const ARN_PATTERN: &str =
+pub(crate) const ARN_PATTERN: &str =
     "arn:aws[-a-z0-9]*:bcm-pricing-calculator:[-a-z0-9]*:[0-9]{12}:[-a-z0-9/:_]+";
 
 /// `ClientToken`: `@pattern "^[\u0021-\u007E]+$"`, unanchored. The model spells the
@@ -49,7 +49,7 @@ const ARN_PATTERN: &str =
 const CLIENT_TOKEN_PATTERN: &str = r"[\u0021-\u007E]+";
 
 /// `ResourceTagValue` (the `Tags` map's value): `@pattern "^[\w\s:+=@/-]*$"`, unanchored.
-const TAG_VALUE_PATTERN: &str = r"[\w\s:+=@/-]*";
+pub(crate) const TAG_VALUE_PATTERN: &str = r"[\w\s:+=@/-]*";
 
 /// A well-formed `ResourceId` (the shape is `len 36..36` of lowercase hex), so a case
 /// that is about ANOTHER member is not also a violation of this one.
@@ -57,33 +57,33 @@ const VALID_RESOURCE_ID: &str = "0f9e8d7c-6b5a-4938-2716-05f4e3d2c1b0";
 
 /// A well-formed 36-character `ResourceId` EXCEPT for its last character, which is
 /// outside `[a-f0-9]`: a pattern violation with no length violation beside it.
-const PATTERN_ONLY_RESOURCE_ID: &str = "0f9e8d7c-6b5a-4938-2716-05f4e3d2c1bz";
+pub(crate) const PATTERN_ONLY_RESOURCE_ID: &str = "0f9e8d7c-6b5a-4938-2716-05f4e3d2c1bz";
 
 /// An ARN long enough for `Arn`'s `@length min 20` whose resource segment carries
 /// characters `[-a-z0-9/:_]` excludes: a pattern violation with no length violation.
-const PATTERN_ONLY_ARN: &str =
+pub(crate) const PATTERN_ONLY_ARN: &str =
     "arn:aws:bcm-pricing-calculator:us-east-1:000000000000:bill-scenario/NOT Allowed";
 
 /// The `message` an awsJson1_0 error body carries. (`error_code`, and the wire harness
 /// itself, come from `bill_scenario_lifecycle`: one copy per test target, so no suite
 /// drives a different front door.)
-fn error_message(body: &Value) -> String {
+pub(crate) fn error_message(body: &Value) -> String {
     body["message"].as_str().unwrap_or_default().to_string()
 }
 
 /// One clause of the envelope: the subject (`Value`, or `Value null` for an absent
 /// member), the member path, and the requirement.
-fn clause(subject: &str, path: &str, requirement: &str) -> String {
+pub(crate) fn clause(subject: &str, path: &str, requirement: &str) -> String {
     format!("{subject} at '{path}' failed to satisfy constraint: {requirement}")
 }
 
 /// The requirement a `@pattern` violation states.
-fn pattern_requirement(expression: &str) -> String {
+pub(crate) fn pattern_requirement(expression: &str) -> String {
     format!("Member must satisfy regular expression pattern: {expression}")
 }
 
 /// The whole message: the AWS envelope over `clauses`, joined the way AWS joins them.
-fn envelope(clauses: &[String]) -> String {
+pub(crate) fn envelope(clauses: &[String]) -> String {
     match clauses {
         [single] => format!("1 validation error detected: {single}"),
         many => format!(

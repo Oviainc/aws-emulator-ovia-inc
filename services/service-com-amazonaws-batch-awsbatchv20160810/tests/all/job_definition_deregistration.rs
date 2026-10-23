@@ -165,10 +165,11 @@ async fn deregistering_marks_exactly_the_referenced_revision_inactive() {
     }
 }
 
-/// A reference no stored revision answers to is refused with `ClientException`
-/// (HTTP 400), and nothing in the registry changes.
+/// A reference no stored revision answers to asks for a post-state that already holds —
+/// no ACTIVE revision under that reference — so it is the same empty 200, and nothing in
+/// the registry changes.
 #[tokio::test]
-async fn deregistering_an_unknown_reference_is_refused_and_changes_nothing() {
+async fn deregistering_an_unknown_reference_changes_nothing() {
     const TOTAL: i64 = 2;
     let batch = Batch::new();
     let name = "known";
@@ -204,13 +205,12 @@ async fn deregistering_an_unknown_reference_is_refused_and_changes_nothing() {
             )
             .await;
         assert_eq!(
-            status, 400,
-            "case {case:?}: expected 400 for {reference:?}, got {status} {body}"
+            status, 200,
+            "case {case:?}: expected the empty 200 for {reference:?}, got {status} {body}"
         );
-        assert_eq!(
-            error_code(&body),
-            "ClientException",
-            "case {case:?}: expected a ClientException for {reference:?}, got {body}"
+        assert!(
+            body.get("__type").is_none(),
+            "case {case:?}: expected no error for {reference:?}, got {body}"
         );
         let found = statuses(&batch, name).await;
         assert_eq!(

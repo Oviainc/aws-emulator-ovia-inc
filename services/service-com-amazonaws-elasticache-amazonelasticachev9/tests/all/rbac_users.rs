@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::cache_cluster_lifecycle::{params, Emulator, Reply};
+use crate::harness::{params, Emulator, Reply};
 
 /// The region these tests sign with; it is the region the user ARNs must name.
 const REGION: &str = "us-east-1";

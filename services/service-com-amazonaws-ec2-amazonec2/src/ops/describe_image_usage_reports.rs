@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeImageUsageReports
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeImageUsageReports`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the AMI usage reports [`crate::state`] holds, narrowed by the
+//! `ReportIds`, `ImageIds` and `Filters` the request names and cut into `MaxResults`-sized
+//! pages. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeImageUsageReports::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The answer is COMPUTED FROM THE STORE: `CreateImageUsageReport` is what adds a report
+//! and `DeleteImageUsageReport` what removes one, so a fresh account reports an empty set
+//! rather than a refusal. `ReportIds` names this operation's own resource, so an id the
+//! account holds no report for is refused with `InvalidImageUsageReportId.NotFound` the way
+//! `DeleteImageUsageReport` refuses one; `ImageIds` only NARROWS ("the IDs of the images
+//! for filtering the reports. If specified, only reports containing these images are
+//! returned"), so a well-formed AMI id no report names selects nothing, while something
+//! that is not an AMI id at all is refused with `InvalidAMIID.Malformed` before any lookup,
+//! the way this service answers every malformed resource id.
+//!
+//! A report whose `ExpirationTime` has passed is GONE — "the date and time when Amazon EC2
+//! will delete the report (30 days after the report was created)" — so this read
+//! materialises that deletion ([`expire_due_reports`]) before it answers: the deletion was
+//! owed at this instant whether or not anybody called, so it changes nothing a later caller
+//! would otherwise have seen.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +164,378 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeImageUsageReports` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeImageUsageReportsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            CompiledFilter, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES,
+            MAX_FILTERS, MAX_PAGE_SIZE, MAX_RESOURCE_IDS, MatchBudget, decode_page_token,
+            encode_page_token, image_id_is_well_formed, invalid_ami_id_malformed,
+            invalid_image_usage_report_id_not_found, invalid_pagination_token_for,
+            require_service_state,
+        };
+
+        // A usage report carries no Region member of its own, so nothing here depends on
+        // the Region the request was signed for; `ctx` carries request metadata only, and
+        // the store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        let requested_reports = input.report_ids.clone().unwrap_or_default();
+        let requested_images = input.image_ids.clone().unwrap_or_default();
+        // `ReportIds` and `ImageIds` each carry the modelled `length 0..200`, so a longer
+        // list is refused by the boundary validator before this handler runs. The check
+        // below is the service-wide id-list ceiling ([`MAX_RESOURCE_IDS`], 1000 — looser
+        // than the modelled bound, so it is what still bounds the narrowing should the
+        // model's own bound go away), not a restatement of the modelled 200.
+        for (member, ids) in [
+            ("ReportIds", &requested_reports),
+            ("ImageIds", &requested_images),
+        ] {
+            if ids.len() > MAX_RESOURCE_IDS {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "{member} carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                    ids.len()
+                )));
+            }
+        }
+
+        // Matching cost is filters x values x held values x stored reports and the model
+        // bounds none of them, so the request-controlled factors are capped here, before
+        // any work proportional to them is done — and their PRODUCT is charged to one
+        // [`MatchBudget`] below, which is the bound the per-factor caps cannot give.
+        let supplied_filters = input.filters.as_ref().map_or(0, Vec::len);
+        if supplied_filters > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {supplied_filters} filters, above the maximum \
+                 of {MAX_FILTERS}"
+            )));
+        }
+
+        // A filter name this operation does not document is refused whether or not any
+        // report would have matched it, so an unsupported filter can never read as "no
+        // results".
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            let canonical = canonical_filter_name(name).ok_or_else(|| {
+                Scaffolded::invalid_parameter_value(format!("The filter '{name}' is invalid"))
+            })?;
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(canonical.to_string(), values.to_vec()));
+        }
+
+        // "The token returned from a previous paginated request" (`NextToken`) — anything
+        // else is refused rather than read as an id, and it is refused before any other
+        // member is looked at, so whether a bogus token is caught never depends on the rest
+        // of the request.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                Some(decode_page_token(token).ok_or_else(|| invalid_pagination_token_for(token))?)
+            }
+        };
+
+        // "The IDs of the images for filtering the reports" (`ImageIds`): something that is
+        // not an AMI id at all is refused before any lookup, the way this service answers
+        // every malformed resource id. A well-formed id the account can see no image for is
+        // NOT refused — the member only narrows the reports, and a report outlives the
+        // image it was created for.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeImageUsageReports"))
+        // Both id lists go into SETS, so narrowing one stored report is a logarithmic
+        // lookup rather than a scan of up to `MAX_RESOURCE_IDS` ids per report under the
+        // state lock.
+        let mut named_images: ::std::collections::BTreeSet<&str> =
+            ::std::collections::BTreeSet::new();
+        for image_id in &requested_images {
+            if !image_id_is_well_formed(image_id) {
+                return Err(invalid_ami_id_malformed(image_id));
+            }
+            named_images.insert(image_id.as_str());
+        }
+        let named_reports: ::std::collections::BTreeSet<&str> = requested_reports
+            .iter()
+            .map(::std::string::String::as_str)
+            .collect();
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // A report EC2 has already deleted is not reported, and is not held either: the
+        // deletion fell due at its `ExpirationTime`, whether or not anybody called (see the
+        // module docs), so this is observed here rather than caused.
+        expire_due_reports(&mut store, ::std::time::SystemTime::now());
+
+        // "The IDs of the image usage reports" (`ReportIds`) name this operation's own
+        // resource, so one the account holds no report for is an error rather than an
+        // absent row — the answer `DeleteImageUsageReport` gives the same id.
+        for report_id in &named_reports {
+            if !store.image_usage_reports.contains_key(*report_id) {
+                return Err(invalid_image_usage_report_id_not_found(report_id));
+            }
+        }
+
+        // DryRun sits AFTER every parameter has been validated and every named report
+        // resolved: the flag asks whether the request WOULD have succeeded, so one that
+        // would have been refused is refused with that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // Every comparison is charged to ONE budget — one step per report as well, so even
+        // an unfiltered scan is counted — so the PRODUCT of stored reports, filters,
+        // values, held values and value length is bounded however the caller combines
+        // them, which is also what bounds how long this holds the state lock.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<ImageUsageReport> = Vec::new();
+        // Whether the scan stopped before it had looked at every report. Checked together
+        // with the budget after the loop, so neither an early stop nor a comparison aborted
+        // on the last report can be answered as a complete page.
+        let mut stopped_early = false;
+        for report in store.image_usage_reports.values() {
+            if budget.exhausted() {
+                stopped_early = true;
+                break;
+            }
+            // The id narrowing is read off the stored report, so one the request did not
+            // name costs no comparison at all.
+            if !named_reports.is_empty()
+                && !report
+                    .report_id
+                    .as_deref()
+                    .is_some_and(|report_id| named_reports.contains(report_id))
+            {
+                continue;
+            }
+            // "If specified, only reports containing these images are returned"
+            // (`ImageIds`): the image a report was created for is the one it contains.
+            if !named_images.is_empty()
+                && !report
+                    .image_id
+                    .as_deref()
+                    .is_some_and(|image_id| named_images.contains(image_id))
+            {
+                continue;
+            }
+            if matches_every_filter(report, &selectors, &mut budget) {
+                selected.push(report.clone());
+            }
+        }
+        // A scan that stopped early, or a budget spent while the last report was being
+        // compared, answers an INCOMPLETE set, which is not something to report as a
+        // result: the request asked for more filtering than one call will do, and is told
+        // so rather than given a silently truncated page.
+        if stopped_early || budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them or page with MaxResults"
+            )));
+        }
+
+        // Page in `ReportId` order, which the cursor below names a position in. The store
+        // is an ordered map, so its iteration order already satisfies this sort; doing it
+        // here establishes the invariant the cursor depends on at the point of use.
+        selected.sort_by(|left, right| left.report_id.cmp(&right.report_id));
+
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|report| {
+                report.report_id.as_deref().unwrap_or_default() < cursor
+            }),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // `MaxResults` carries the modelled `range 1..`
+        // (`smithy_query(query="operation",operation="DescribeImageUsageReports")`) — a
+        // MINIMUM only, so the boundary validator has already refused anything below it and
+        // the ceiling is the largest page this service serves. A request that names no page
+        // size gets one of that size too, so the `NextToken` path behaves the same whether
+        // or not a page size was asked for.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        // "The token to include in another request to get the next page of items. This
+        // value is null when there are no more items to return" (`NextToken`): a token only
+        // when a report follows this page.
+        let next_token = page
+            .get(limit)
+            .and_then(|report| report.report_id.as_deref())
+            .map(encode_page_token);
+
+        Ok(DescribeImageUsageReportsOutput {
+            image_usage_reports: Some(page.iter().take(limit).cloned().collect()),
+            next_token,
+        })
     }
+}
+
+/// Drop every AMI usage report whose expiration has come due as of `now`.
+///
+/// "The date and time when Amazon EC2 will delete the report (30 days after the report was
+/// created)" (`ImageUsageReport$ExpirationTime`): past that instant the report no longer
+/// exists, so this reporting operation may apply the deletion — it was owed at this instant
+/// whether or not anybody asked, so materialising it changes nothing a later caller would
+/// otherwise have seen. A report carrying no expiration time is never owed one.
+///
+/// Instants are compared as `(seconds, nanoseconds)`, the way every other instant
+/// comparison in this crate does it: the modelled timestamp type carries no `Ord`, and
+/// comparing through `f64` seconds would lose precision the `MillisecondDateTime` the
+/// member targets keeps.
+fn expire_due_reports(
+    store: &mut crate::state::ComAmazonawsEc2Amazonec2State,
+    now: ::std::time::SystemTime,
+) {
+    fn key(at: ::aws_smithy_types::DateTime) -> (i64, u32) {
+        (at.secs(), at.subsec_nanos())
+    }
+
+    let now = key(crate::state::system_time_to_date_time(now));
+    store.image_usage_reports.retain(|_report_id, report| {
+        report
+            .expiration_time
+            .map(key)
+            .is_none_or(|expires_at| now < expires_at)
+    });
+}
+
+/// The filter names this operation documents, from
+/// `DescribeImageUsageReportsRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeImageUsageReportsRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// "`creation-time` - The time when the report was created", "`state` - The state of the
+/// report (available | pending | error)", "`tag:<key>` - The key/value combination of a tag
+/// assigned to the resource" and "`tag-key` - The key of a tag assigned to the resource".
+/// `tag:<key>` is the one name with a variable part, so it is matched by prefix rather than
+/// listed here. Every entry must be answered by [`filter_values`].
+const IMAGE_USAGE_REPORT_FILTERS: [&str; 3] = ["creation-time", "state", "tag-key"];
+
+/// The prefix of the tag filter: the tag key is part of the filter NAME, and the values it
+/// selects on are the filter's values.
+const TAG_FILTER_PREFIX: &str = "tag:";
+
+/// The name [`filter_values`] answers for the filter the request called `name`, or `None`
+/// when this operation documents no such filter.
+///
+/// "Filter names are case-sensitive" (`Filter$Name`), so every comparison is exact — and a
+/// `tag:` prefix with no key names no tag, so it is as undocumented as any other
+/// misspelling. The `tag:<key>` family keeps its whole name, the key being part of what it
+/// selects on.
+fn canonical_filter_name(name: &str) -> Option<&str> {
+    if name
+        .strip_prefix(TAG_FILTER_PREFIX)
+        .is_some_and(|key| !key.is_empty())
+    {
+        return Some(name);
+    }
+    IMAGE_USAGE_REPORT_FILTERS.contains(&name).then_some(name)
+}
+
+/// A modelled timestamp as the `creation-time` filter compares against it.
+///
+/// The member documents the value as "the ISO 8601 format in the UTC time zone
+/// (YYYY-MM-DDThh:mm:ss.sssZ), for example, 2025-11-29T11:04:43.305Z", and the response
+/// carries the same instant in the rendering the wire uses, which drops a zero fraction. So
+/// an instant holds BOTH renderings for the filter to match: the millisecond form the
+/// member documents, and the form the caller was shown. A member that is not set carries no
+/// value for the filter to match, like any other absent attribute.
+fn creation_time_values(
+    at: Option<::aws_smithy_types::DateTime>,
+) -> Vec<::std::borrow::Cow<'static, str>> {
+    use ::std::borrow::Cow;
+
+    let Some(at) = at else {
+        return Vec::new();
+    };
+    let Ok(on_the_wire) = at.fmt(::aws_smithy_types::date_time::Format::DateTime) else {
+        return Vec::new();
+    };
+    let to_the_second = on_the_wire
+        .strip_suffix('Z')
+        .unwrap_or(&on_the_wire)
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let milliseconds = at.subsec_nanos() / 1_000_000;
+    let documented = format!("{to_the_second}.{milliseconds:03}Z");
+    if documented == on_the_wire {
+        return vec![Cow::Owned(documented)];
+    }
+    vec![Cow::Owned(documented), Cow::Owned(on_the_wire)]
+}
+
+/// The values the EC2 filter `name` compares against this report.
+///
+/// A filter naming an attribute this report does not carry compares against NO values, so
+/// it selects nothing — the answer for `tag:Owner` on an untagged report. `name` is a name
+/// [`canonical_filter_name`] resolved.
+fn filter_values<'a>(report: &'a ImageUsageReport, name: &str) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    if let Some(key) = name.strip_prefix(TAG_FILTER_PREFIX) {
+        return report
+            .tags
+            .iter()
+            .flatten()
+            .filter(|tag| tag.key.as_deref() == Some(key))
+            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+            .collect();
+    }
+
+    match name {
+        "creation-time" => creation_time_values(report.creation_time),
+        "state" => report
+            .state
+            .as_deref()
+            .map(Cow::Borrowed)
+            .into_iter()
+            .collect(),
+        "tag-key" => report
+            .tags
+            .iter()
+            .flatten()
+            .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
+            .collect(),
+        // Unreachable: `canonical_filter_name` has already refused every other name. An
+        // undefined name compares against nothing, so it could never widen a result even if
+        // that check were bypassed.
+        _ => Vec::new(),
+    }
+}
+
+/// Does `report` satisfy every filter?
+///
+/// The AND/OR evaluation, the wildcard matching and the budget charging all live in
+/// [`crate::state::matches_every_filter`], so this operation only says WHERE a filter's
+/// values come from.
+fn matches_every_filter(
+    report: &ImageUsageReport,
+    selectors: &[crate::state::CompiledFilter],
+    budget: &mut crate::state::MatchBudget,
+) -> bool {
+    crate::state::matches_every_filter(selectors, budget, &|name| filter_values(report, name))
 }

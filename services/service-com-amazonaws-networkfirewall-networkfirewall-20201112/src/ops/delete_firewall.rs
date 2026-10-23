@@ -236,6 +236,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for sync_state in record.sync_states.values_mut() {
             sync_state.attachment_status = crate::state::ATTACHMENT_DELETING.to_string();
         }
+        // The response projects the removed record rather than echoing a
+        // request, so the firewall's tag collection is reported as a list —
+        // empty when it carries no tags (see `state::removed_resource_tags`).
+        record.tags = crate::state::removed_resource_tags(record.tags.take());
 
         Ok(DeleteFirewallOutput {
             firewall: Some(record.to_firewall()),

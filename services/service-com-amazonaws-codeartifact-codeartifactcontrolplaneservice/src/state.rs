@@ -36,12 +36,17 @@ pub const SERVICE_SIGNING_NAME: &str = "codeartifact";
 /// generated client config uses.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
-/// The only status a domain this emulator holds can be in: CodeArtifact creates a
+/// The only status a domain this emulator HOLDS can be in: CodeArtifact creates a
 /// domain synchronously and `DescribeDomain` reports it `Active` from the first read, so
 /// there is no transient creating state to move through. (`DomainStatus` models exactly
-/// `Active` and `Deleted`; `Deleted` is never observable, because a deleted domain is
-/// gone from the store.)
+/// `Active` and `Deleted` — `smithy_query(query="shape",shape="DomainStatus")`.)
 pub const DOMAIN_STATUS_ACTIVE: &str = "Active";
+
+/// The terminal status of a domain that has been deleted — the other half of
+/// `DomainStatus`. No domain in the store ever carries it: it belongs to the description
+/// `DeleteDomain` answers with ([`Domain::deleted_description`]), which reports the state
+/// the domain is in AFTER the call, not the record as it was before.
+pub const DOMAIN_STATUS_DELETED: &str = "Deleted";
 
 /// The only status an external connection this emulator holds can be in.
 /// `ExternalConnectionStatus` models exactly one value, `Available`, and the
@@ -148,6 +153,16 @@ pub const MAX_ASSET_BYTES: usize = 64 * 1024 * 1024;
 /// reason as [`MAX_ASSET_BYTES`]: an unfinished version accepts assets until it closes).
 pub const MAX_ASSETS_PER_PACKAGE_VERSION: usize = 100;
 
+/// Maximum versions one `CopyPackageVersions` request may name.
+///
+/// This is the modelled `PackageVersionList` bound (`@length(0..100)`) that the `versions`
+/// member already carries, applied to the `versionRevisions` member, which names the SAME
+/// set and carries NO modelled length — so the boundary validator caps one form of the
+/// request and nothing but this constant caps the other. A request past it is refused with
+/// the same 400 `ValidationException` the validator answers for an over-long `versions`
+/// list, before the keys are collected.
+pub const MAX_VERSIONS_PER_COPY_REQUEST: usize = 100;
+
 /// Maximum versions one package may hold (the emulator's own bound).
 pub const MAX_PACKAGE_VERSIONS_PER_PACKAGE: usize = 1_000;
 
@@ -185,6 +200,14 @@ pub const PACKAGE_VERSION_STATUS_PUBLISHED: &str = "Published";
 /// `PackageVersionStatus` of a version that is still accepting assets, which is what the
 /// `unfinished` flag keeps a publish in.
 pub const PACKAGE_VERSION_STATUS_UNFINISHED: &str = "Unfinished";
+
+/// `PackageVersionStatus` of a version a delete removed, which is what
+/// `DeletePackageVersions` reports for every version it deleted ("The status of every
+/// successful version will be `Deleted`" — `DeletePackageVersionsResult$successfulVersions`).
+///
+/// Never STORED: a deleted version is gone from the store, so this status is reported by
+/// the call that removed it and by nothing that reads a stored record.
+pub const PACKAGE_VERSION_STATUS_DELETED: &str = "Deleted";
 
 /// The `AllowPublish`/`AllowUpstream` value that permits the action.
 pub const ORIGIN_RESTRICTION_ALLOW: &str = "ALLOW";
@@ -573,6 +596,20 @@ impl Domain {
             repository_count: self.repository_count(),
             asset_size_bytes: self.asset_size_bytes(),
             s3_bucket_arn: Some(self.s3_bucket_arn.clone()),
+        }
+    }
+
+    /// The modelled `DomainDescription` of this domain AFTER it has been deleted: the
+    /// projection [`Domain::description`] builds, with `status` moved to the terminal
+    /// [`DOMAIN_STATUS_DELETED`].
+    ///
+    /// A delete answers for the post-delete state of the resource, so the status it
+    /// reports is the one the domain reached by being removed — never the `Active` the
+    /// record carried while it was still held.
+    pub fn deleted_description(&self) -> DomainDescription {
+        DomainDescription {
+            status: Some(DOMAIN_STATUS_DELETED.to_string()),
+            ..self.description()
         }
     }
 
@@ -1433,6 +1470,22 @@ pub fn attached_policy(resource_arn: &str, document: String, attachment: u64) ->
     }
 }
 
+/// The `ResourcePolicy` a policy delete answers with for the resource `resource_arn`
+/// names: `removed` is the record the resource held, or `None` when it held no policy.
+///
+/// Removing a policy that is not there is the delete's goal already met, not a failure, so
+/// the answer is the bare `ResourcePolicy` ENVELOPE — `resourceArn` identifying the
+/// resource the request targeted, with no `revision` and no `document`, both of which the
+/// model leaves optional. Shared by the domain and the repository policy delete so the two
+/// cannot report "there was nothing to delete" differently.
+pub fn deleted_policy(resource_arn: &str, removed: Option<ResourcePolicy>) -> ResourcePolicy {
+    removed.unwrap_or_else(|| ResourcePolicy {
+        resource_arn: Some(resource_arn.to_string()),
+        revision: None,
+        document: None,
+    })
+}
+
 /// The revision a resource policy carries once it is written.
 ///
 /// Derived from the resource the policy hangs off, the document being written and
@@ -1581,6 +1634,19 @@ pub fn package_group_not_found_message(
          owned by account '{}' does not exist.",
         addressed_domain_owner(domain_owner)
     )
+}
+
+/// The `ResourceNotFoundException` message for a package the addressed repository does not
+/// hold. A package is addressed by its whole `(format, namespace, name)` triple, so the
+/// sentence quotes the name the request asked for and the repository it asked in.
+pub fn package_not_found_message(package: &str, repository: &str) -> String {
+    format!("Package {package} not found in repository {repository}.")
+}
+
+/// The `ResourceNotFoundException` message for a version the addressed package does not
+/// hold, and the `errorMessage` of a `NOT_FOUND` entry in a per-version answer map.
+pub fn package_version_not_found_message(package: &str, version: &str, repository: &str) -> String {
+    format!("Package version {package} {version} not found in repository {repository}.")
 }
 
 /// The `ConflictException` message for a create whose package-group pattern is already

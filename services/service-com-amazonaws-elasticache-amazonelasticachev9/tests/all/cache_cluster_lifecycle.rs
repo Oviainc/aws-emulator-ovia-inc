@@ -3,233 +3,34 @@
 //! End-to-end tests for the ElastiCache cache-cluster and cache-subnet-group
 //! lifecycle.
 //!
-//! Every assertion goes over the wire: an `awsQuery` form-urlencoded request is
-//! built, dispatched through the same [`MultiServiceRouter`] the production
-//! emulator mounts, and only the HTTP status and the XML body are inspected.
-//! Nothing reaches into the service's state struct, so a response that is not
-//! computed from persisted state cannot pass.
+//! Every assertion goes over the wire through [`crate::harness`]: an
+//! `awsQuery` form-urlencoded request is built, dispatched through the same
+//! `MultiServiceRouter` the production emulator mounts, and only the HTTP
+//! status and the XML body are inspected. Nothing reaches into the service's
+//! state struct, so a response that is not computed from persisted state cannot
+//! pass.
 //!
 //! The tests are tables: each row is one input along the axis the rule under
 //! test generalises over (engine, node count, port, region, page size, subnet
 //! count, apply-immediately), and the `demo-cluster` case from the bootstrap
 //! issue is only one row.
 //!
-//! The wire harness below ([`Emulator`], [`Reply`], [`params`]) is
-//! `pub(crate)`, so the other suites of this test target drive the same router
-//! through the same helpers instead of carrying a second copy of them.
+//! The wire harness this suite drives the emulator through lives in
+//! [`crate::harness`], so every suite of this test target drives the same
+//! router through the same helpers instead of carrying a second copy of them.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
-use service_com_amazonaws_elasticache_amazonelasticachev9::EmulatedService;
-use smithy_server_runtime::MultiServiceRouter;
 
-/// The region every test signs with unless it is exercising the region rule
-/// itself.
-///
-/// `pub(crate)` here and below: the sibling suites in `tests/all/` share this
-/// one wire harness rather than carrying copies of it.
-pub(crate) const REGION: &str = "us-east-1";
+use crate::harness::{params, Emulator, RefusalCase, Reply, PAST_TRANSITION, REGION};
 
-/// The API version an `awsQuery` client sends beside `Action`, from the model's
-/// service version (`smithy_query(query="service_info")`: `version 2015-02-02`).
-const API_VERSION: &str = "2015-02-02";
 
-/// Long enough past [`state::CLUSTER_TRANSITION`] that the clock owes a cluster
-/// its next status; the handlers never sleep, so only the test waits.
-pub(crate) const PAST_TRANSITION: Duration = Duration::from_millis(750);
-
-/// One wire answer, reduced to what a client branches on: the status, and every
-/// text node in the XML body keyed by its element path.
-///
-/// `pub(crate)` because the other suites of this test target read their answers
-/// through it rather than keeping a second copy of the reader.
-#[derive(Debug)]
-pub(crate) struct Reply {
-    pub(crate) status: u16,
-    pub(crate) body: String,
-    pub(crate) nodes: Vec<(String, String)>,
-}
-
-impl Reply {
-    /// The first text node whose element path ends in `suffix`.
-    pub(crate) fn text(&self, suffix: &str) -> Option<&str> {
-        self.all(suffix).into_iter().next()
-    }
-
-    /// Every text node whose element path ends in `suffix`, in document order.
-    pub(crate) fn all(&self, suffix: &str) -> Vec<&str> {
-        self.nodes
-            .iter()
-            .filter(|(path, _)| path == suffix || path.ends_with(&format!("/{suffix}")))
-            .map(|(_, text)| text.as_str())
-            .collect()
-    }
-
-    /// The `awsQuery` error code (`<ErrorResponse><Error><Code>`), or the empty
-    /// string on a success.
-    pub(crate) fn error_code(&self) -> &str {
-        self.text("Error/Code").unwrap_or_default()
-    }
-
-    /// The pagination `Marker` a describe answered with, if any. `Marker` is the
-    /// only element of that name in either describe's output.
-    pub(crate) fn marker(&self) -> Option<&str> {
-        self.text("Marker")
-    }
-}
-
-/// Resolve the five predefined XML entities in an element's text.
-fn unescape_xml(text: &str) -> String {
-    text.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        // `&amp;` last, so `&amp;lt;` does not become `<`.
-        .replace("&amp;", "&")
-}
-
-/// Parse an XML document into `(element path, text)` pairs in document order.
-///
-/// Deliberately a local scanner rather than an XML-crate dependency: adding one
-/// would put this crate's only edit into `Cargo.lock`, the one file every
-/// concurrent fix also edits, and that collision is what kept the merge gate's
-/// squash refusing this change. The bodies parsed here are the awsQuery
-/// envelopes the vendored protocol serializer emits — elements, text and an
-/// `xmlns` attribute — so a scanner over `<` / `>` reads them exactly.
-fn xml_text_nodes(body: &str) -> Vec<(String, String)> {
-    let mut path: Vec<String> = Vec::new();
-    let mut out: Vec<(String, String)> = Vec::new();
-    let mut rest = body;
-    while let Some(open) = rest.find('<') {
-        // Whatever precedes the tag is the text of the element now open.
-        let text = rest[..open].trim();
-        if !text.is_empty() && !path.is_empty() {
-            out.push((path.join("/"), unescape_xml(text)));
-        }
-        rest = &rest[open + 1..];
-        let Some(close) = rest.find('>') else {
-            panic!("unterminated XML tag in response body:\n{body}");
-        };
-        let tag = &rest[..close];
-        rest = &rest[close + 1..];
-        // `<?xml …?>`, `<!-- … -->` and `<![CDATA[…]]>` open no element.
-        if tag.starts_with('?') || tag.starts_with('!') {
-            continue;
-        }
-        if tag.starts_with('/') {
-            assert!(
-                path.pop().is_some(),
-                "closing tag with no open element in response body:\n{body}"
-            );
-            continue;
-        }
-        let self_closing = tag.ends_with('/');
-        let name = tag
-            .trim_end_matches('/')
-            .split_whitespace()
-            .next()
-            .unwrap_or_default();
-        if !self_closing {
-            path.push(name.to_string());
-        }
-    }
-    out
-}
-
-/// Percent-encode one form value, leaving only the unreserved characters.
-fn form_encode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(char::from(byte));
-            }
-            other => out.push_str(&format!("%{other:02X}")),
-        }
-    }
-    out
-}
-
-/// An emulator with just this service mounted on a fresh engine, driven
-/// in-process through the production router.
-///
-/// `pub(crate)` for the same reason as [`Reply`]: one harness per test target.
-pub(crate) struct Emulator {
-    router: MultiServiceRouter,
-}
-
-impl Emulator {
-    pub(crate) fn new() -> Self {
-        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-        let mut router = MultiServiceRouter::new();
-        // Signatures are not what these tests are about; the router still routes
-        // by the SigV4 credential scope below, which is also where an ARN's
-        // region comes from.
-        router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
-    }
-
-    /// Send one `awsQuery` call: `Action`, `Version` and the given form pairs.
-    pub(crate) async fn call_in(
-        &self,
-        region: &str,
-        action: &str,
-        params: &[(String, String)],
-    ) -> Reply {
-        let mut body = format!("Action={action}&Version={API_VERSION}");
-        for (key, value) in params {
-            body.push('&');
-            body.push_str(key);
-            body.push('=');
-            body.push_str(&form_encode(value));
-        }
-        let authorization = format!(
-            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/elasticache/aws4_request, \
-             SignedHeaders=host, Signature=deadbeef"
-        );
-        let request = http::Request::builder()
-            .method("POST")
-            .uri("/")
-            .header("host", format!("elasticache.{region}.amazonaws.com"))
-            .header("authorization", authorization)
-            .header("content-type", "application/x-www-form-urlencoded")
-            .body(Bytes::from(body))
-            .expect("build request");
-
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let bytes = response.into_body();
-        let body = String::from_utf8_lossy(&bytes).into_owned();
-        let nodes = if body.is_empty() {
-            Vec::new()
-        } else {
-            xml_text_nodes(&body)
-        };
-        Reply {
-            status,
-            body,
-            nodes,
-        }
-    }
-
-    pub(crate) async fn call(&self, action: &str, params: &[(String, String)]) -> Reply {
-        self.call_in(REGION, action, params).await
-    }
-}
-
-/// One refusal row: the case name, the form pairs that make the request, and
-/// the HTTP status plus `awsQuery` error code it must be answered with.
-pub(crate) type RefusalCase = (
-    &'static str,
-    &'static [(&'static str, &'static str)],
-    u16,
-    &'static str,
-);
+/// One refusal row whose request has to be BUILT rather than listed, because a
+/// value in it is derived (a subnet id the account has): the case name, the form
+/// pairs, the HTTP status and the awsQuery error code.
+pub(crate) type BuiltRefusalCase = (&'static str, Vec<(String, String)>, u16, &'static str);
 
 /// One node-placement row: the case name, the form pairs that make the
 /// request, how many distinct zones its nodes must end up in, and what
@@ -241,12 +42,43 @@ type PlacementCase = (
     &'static str,
 );
 
-/// `[("A", "b")]` as the owned pairs [`Emulator::call`] takes.
-pub(crate) fn params(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-    pairs
-        .iter()
-        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+/// The subnets the account HAS in [`REGION`] — the only subnet ids a request may
+/// name, derived from the Region exactly as every service that places a resource
+/// in a subnet derives them (`state::region_subnets`, the contract in
+/// `services/common/src/network.rs`).
+///
+/// `pub(crate)` for the same reason as the rest of this harness: the sibling
+/// suites name the same subnets rather than inventing ids the service refuses.
+pub(crate) fn account_subnet_ids() -> Vec<String> {
+    state::region_subnets(REGION)
+        .into_iter()
+        .map(|subnet| subnet.subnet_id)
         .collect()
+}
+
+/// `ids` as the indexed `SubnetIds` form pairs of a request, under the list's
+/// member name (`SubnetIdentifier` for a cache subnet group, `SubnetId` for a
+/// serverless cache).
+pub(crate) fn subnet_pairs(member: &str, ids: &[String]) -> Vec<(String, String)> {
+    ids.iter()
+        .enumerate()
+        .map(|(index, id)| (format!("SubnetIds.{member}.{}", index + 1), id.clone()))
+        .collect()
+}
+
+/// One `CreateCacheSubnetGroup` request: the name, the description and the
+/// account subnets `ids` names.
+pub(crate) fn subnet_group_params(
+    name: &str,
+    description: &str,
+    ids: &[String],
+) -> Vec<(String, String)> {
+    let mut pairs = params(&[
+        ("CacheSubnetGroupName", name),
+        ("CacheSubnetGroupDescription", description),
+    ]);
+    pairs.extend(subnet_pairs("SubnetIdentifier", ids));
+    pairs
 }
 
 /// Create one cluster with `CacheClusterId` and whatever else `extra` names.
@@ -660,11 +492,7 @@ async fn a_create_naming_a_resource_this_emulator_does_not_hold_is_refused() {
     let group = emulator
         .call(
             "CreateCacheSubnetGroup",
-            &params(&[
-                ("CacheSubnetGroupName", "demo-subnets"),
-                ("CacheSubnetGroupDescription", "demo"),
-                ("SubnetIds.SubnetIdentifier.1", "subnet-11111111"),
-            ]),
+            &subnet_group_params("demo-subnets", "demo", &account_subnet_ids()[..1]),
         )
         .await;
     assert_eq!(group.status, 200, "the subnet group must be created: {}", group.body);
@@ -691,10 +519,10 @@ async fn a_create_naming_a_resource_this_emulator_does_not_hold_is_refused() {
             "ReplicationGroupNotFoundFault",
         ),
         (
-            "unknown cache security group",
+            "cache security group named at all",
             &[("CacheSecurityGroupNames.CacheSecurityGroupName.1", "sg-a")],
-            404,
-            "CacheSecurityGroupNotFound",
+            400,
+            "InvalidParameterValue",
         ),
         (
             "unknown parameter group",
@@ -2053,48 +1881,41 @@ struct SubnetGroupCase {
     name: &'static str,
     stored_name: &'static str,
     description: &'static str,
-    subnets: &'static [&'static str],
+    /// How many of the account's subnets (`state::region_subnets`) the request
+    /// puts in the group — the axis the group's size varies along, since those
+    /// are the only ids the service accepts.
+    subnet_count: usize,
 }
 
 #[tokio::test]
 async fn a_created_subnet_group_is_read_back_from_persisted_state() {
     // The axis: the name's case, the description, and the number of subnets.
+    let account_subnets = account_subnet_ids();
     let cases = [
         SubnetGroupCase {
             name: "demo-subnets",
             stored_name: "demo-subnets",
             description: "demo",
-            subnets: &["subnet-11111111", "subnet-22222222"],
+            subnet_count: 2,
         },
         SubnetGroupCase {
             name: "Single-Subnet",
             stored_name: "single-subnet",
             description: "one subnet, mixed-case name",
-            subnets: &["subnet-abc123"],
+            subnet_count: 1,
         },
         SubnetGroupCase {
             name: "wide-group",
             stored_name: "wide-group",
-            description: "seven subnets, so the chosen zones wrap",
-            subnets: &[
-                "subnet-a1", "subnet-a2", "subnet-a3", "subnet-a4", "subnet-a5", "subnet-a6",
-                "subnet-a7",
-            ],
+            description: "every subnet the account has",
+            subnet_count: account_subnets.len(),
         },
     ];
 
     let emulator = Emulator::new();
     for case in &cases {
-        let mut pairs = params(&[
-            ("CacheSubnetGroupName", case.name),
-            ("CacheSubnetGroupDescription", case.description),
-        ]);
-        for (index, subnet) in case.subnets.iter().enumerate() {
-            pairs.push((
-                format!("SubnetIds.SubnetIdentifier.{}", index + 1),
-                (*subnet).to_string(),
-            ));
-        }
+        let subnets = &account_subnets[..case.subnet_count];
+        let pairs = subnet_group_params(case.name, case.description, subnets);
         let created = emulator.call("CreateCacheSubnetGroup", &pairs).await;
         assert_eq!(
             created.status, 200,
@@ -2127,29 +1948,34 @@ async fn a_created_subnet_group_is_read_back_from_persisted_state() {
         );
         assert_eq!(
             described.all("Subnets/Subnet/SubnetIdentifier"),
-            case.subnets.to_vec(),
+            subnets.iter().map(String::as_str).collect::<Vec<&str>>(),
             "case {case:?}: the stored subnets must round-trip in order, got {:?}",
             described.all("Subnets/Subnet/SubnetIdentifier")
         );
-        let zones = described.all("SubnetAvailabilityZone/Name");
+        // The zone of each subnet is the zone that subnet SITS in, read off the
+        // account's network rather than chosen by position.
+        let expected_zones: Vec<String> = state::region_subnets(REGION)
+            .into_iter()
+            .take(case.subnet_count)
+            .map(|subnet| subnet.availability_zone)
+            .collect();
         assert_eq!(
-            zones.len(),
-            case.subnets.len(),
-            "case {case:?}: every subnet reports a zone, got {zones:?}"
+            described.all("SubnetAvailabilityZone/Name"),
+            expected_zones
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<&str>>(),
+            "case {case:?}: every subnet reports its own zone, got {:?}",
+            described.all("SubnetAvailabilityZone/Name")
         );
-        assert!(
-            zones.iter().all(|zone| zone.starts_with(REGION)),
-            "case {case:?}: a chosen zone is in the request's region, got {zones:?}"
-        );
-        // Minted once and stored: the create answer and the describe answer
-        // must agree.
-        for minted in ["CacheSubnetGroup/VpcId", "CacheSubnetGroup/ARN"] {
+        // Stored once: the create answer and the describe answer must agree.
+        for stored in ["CacheSubnetGroup/VpcId", "CacheSubnetGroup/ARN"] {
             assert_eq!(
-                created.text(minted),
-                described.text(minted),
-                "case {case:?}: {minted} must be stored once, got {:?} then {:?}",
-                created.text(minted),
-                described.text(minted)
+                created.text(stored),
+                described.text(stored),
+                "case {case:?}: {stored} must be stored once, got {:?} then {:?}",
+                created.text(stored),
+                described.text(stored)
             );
         }
         assert_eq!(
@@ -2167,8 +1993,8 @@ async fn a_created_subnet_group_is_read_back_from_persisted_state() {
         );
     }
 
-    // Every group is listed, and each VpcId is distinct: the id is minted per
-    // group rather than shared.
+    // Every group is listed, and each reports the VPC its subnets belong to —
+    // the account's default VPC in the Region, not an id invented per group.
     let listed = emulator.call("DescribeCacheSubnetGroups", &[]).await;
     let names = listed.all("CacheSubnetGroups/CacheSubnetGroup/CacheSubnetGroupName");
     assert_eq!(
@@ -2181,41 +2007,42 @@ async fn a_created_subnet_group_is_read_back_from_persisted_state() {
         .into_iter()
         .map(|id| (id, ()))
         .collect();
+    let default_vpc = state::default_vpc_id(REGION);
     assert_eq!(
-        vpc_ids.len(),
-        cases.len(),
-        "each group carries its own VpcId, got {vpc_ids:?}"
+        vpc_ids.keys().copied().collect::<Vec<&str>>(),
+        vec![default_vpc.as_str()],
+        "every group's subnets belong to the account's default VPC, got {vpc_ids:?}"
     );
 }
 
 #[tokio::test]
 async fn a_subnet_group_request_that_cannot_hold_is_refused() {
     let emulator = Emulator::new();
-    let base = params(&[
-        ("CacheSubnetGroupName", "taken"),
-        ("CacheSubnetGroupDescription", "first"),
-        ("SubnetIds.SubnetIdentifier.1", "subnet-11111111"),
-    ]);
-    let first = emulator.call("CreateCacheSubnetGroup", &base).await;
+    let account_subnets = account_subnet_ids();
+    let first = emulator
+        .call(
+            "CreateCacheSubnetGroup",
+            &subnet_group_params("taken", "first", &account_subnets[..1]),
+        )
+        .await;
     assert_eq!(first.status, 200, "the first create must succeed: {}", first.body);
 
-    let cases: [RefusalCase; 5] = [
+    // Each row: the case name, the request, and the status plus code it must be
+    // answered with. The rows are built rather than listed, because a subnet id
+    // the account HAS is derived from the Region.
+    let cases: [BuiltRefusalCase; 7] = [
         (
             "duplicate name",
-            &[
-                ("CacheSubnetGroupName", "TAKEN"),
-                ("CacheSubnetGroupDescription", "second"),
-                ("SubnetIds.SubnetIdentifier.1", "subnet-33333333"),
-            ],
+            subnet_group_params("TAKEN", "second", &account_subnets[1..2]),
             400,
             "CacheSubnetGroupAlreadyExists",
         ),
         (
             "absent SubnetIds",
-            &[
+            params(&[
                 ("CacheSubnetGroupName", "empty"),
                 ("CacheSubnetGroupDescription", "none"),
-            ],
+            ]),
             400,
             // `SubnetIds` is `@required`, so the boundary validator refuses an
             // absent one before the handler runs.
@@ -2223,40 +2050,51 @@ async fn a_subnet_group_request_that_cannot_hold_is_refused() {
         ),
         (
             "an empty subnet id",
-            &[
-                ("CacheSubnetGroupName", "empty-id"),
-                ("CacheSubnetGroupDescription", "none"),
-                ("SubnetIds.SubnetIdentifier.1", ""),
-            ],
+            subnet_group_params("empty-id", "none", &[String::new()]),
             400,
             "InvalidSubnet",
         ),
         (
             "not a subnet id",
-            &[
-                ("CacheSubnetGroupName", "bad-id"),
-                ("CacheSubnetGroupDescription", "bad"),
-                ("SubnetIds.SubnetIdentifier.1", "vpc-11111111"),
-            ],
+            subnet_group_params("bad-id", "bad", &["vpc-11111111".to_string()]),
             400,
             "InvalidSubnet",
         ),
         (
+            // Subnet-SHAPED but naming no subnet of the account: the account
+            // lookup refuses it, not the form check.
+            "a subnet that does not exist",
+            subnet_group_params(
+                "ghost-subnet",
+                "ghost",
+                &["subnet-0123456789abcdef0".to_string()],
+            ),
+            400,
+            "InvalidParameterValue",
+        ),
+        (
+            "one nonexistent subnet among real ones",
+            subnet_group_params(
+                "mixed-ids",
+                "mixed",
+                &[account_subnets[0].clone(), "subnet-00000000deadbeef".to_string()],
+            ),
+            400,
+            "InvalidParameterValue",
+        ),
+        (
             "one bad subnet id among good ones",
-            &[
-                ("CacheSubnetGroupName", "mixed-ids"),
-                ("CacheSubnetGroupDescription", "mixed"),
-                ("SubnetIds.SubnetIdentifier.1", "subnet-11111111"),
-                ("SubnetIds.SubnetIdentifier.2", "not-a-subnet"),
-            ],
+            subnet_group_params(
+                "mixed-forms",
+                "mixed",
+                &[account_subnets[0].clone(), "not-a-subnet".to_string()],
+            ),
             400,
             "InvalidSubnet",
         ),
     ];
     for (case, pairs, status, code) in cases {
-        let reply = emulator
-            .call("CreateCacheSubnetGroup", &params(pairs))
-            .await;
+        let reply = emulator.call("CreateCacheSubnetGroup", &pairs).await;
         assert_eq!(
             reply.status, status,
             "case {case}: expected HTTP {status}, got {} {}",
@@ -2306,17 +2144,18 @@ async fn a_subnet_group_request_that_cannot_hold_is_refused() {
 #[tokio::test]
 async fn subnet_group_pages_are_bounded_and_resumable() {
     let emulator = Emulator::new();
+    let account_subnets = account_subnet_ids();
     // One more than the smallest page size the service serves.
     let total = 21;
     for index in 0..total {
         let reply = emulator
             .call(
                 "CreateCacheSubnetGroup",
-                &params(&[
-                    ("CacheSubnetGroupName", &format!("group-{index:03}")),
-                    ("CacheSubnetGroupDescription", "paged"),
-                    ("SubnetIds.SubnetIdentifier.1", "subnet-11111111"),
-                ]),
+                &subnet_group_params(
+                    &format!("group-{index:03}"),
+                    "paged",
+                    &account_subnets[..1],
+                ),
             )
             .await;
         assert_eq!(reply.status, 200, "group {index} must be created: {}", reply.body);
@@ -2507,11 +2346,12 @@ async fn the_documented_identifier_port_and_tag_constraints_are_enforced() {
 #[tokio::test]
 async fn the_documented_subnet_group_constraints_are_enforced() {
     let emulator = Emulator::new();
+    let account_subnets = account_subnet_ids();
 
     // `CacheSubnetGroupName` "must contain no more than 255 alphanumeric
     // characters or hyphens": the bound is a row and so is one past it. This
-    // operation models no invalid-parameter error, so a refusal is the
-    // framework's `ValidationException`.
+    // operation models no invalid-parameter error for the NAME, so a refusal is
+    // the framework's `ValidationException`.
     let longest = "g".repeat(255);
     let too_long = "g".repeat(256);
     let name_cases: [(&str, bool); 5] = [
@@ -2525,11 +2365,7 @@ async fn the_documented_subnet_group_constraints_are_enforced() {
         let reply = emulator
             .call(
                 "CreateCacheSubnetGroup",
-                &params(&[
-                    ("CacheSubnetGroupName", name),
-                    ("CacheSubnetGroupDescription", "constraint row"),
-                    ("SubnetIds.SubnetIdentifier.1", "subnet-11111111"),
-                ]),
+                &subnet_group_params(name, "constraint row", &account_subnets[..1]),
             )
             .await;
         if accepted {
@@ -2553,18 +2389,32 @@ async fn the_documented_subnet_group_constraints_are_enforced() {
         }
     }
 
-    // The per-group subnet bound: the limit is a row and so is one past it.
-    for (count, accepted) in [(20usize, true), (21usize, false)] {
+    // The per-group subnet bound: the account's whole network fits in one
+    // group, and one subnet past the bound is refused. The over-bound row names
+    // subnet-SHAPED ids the account does not have, because the account has far
+    // fewer subnets than the bound: the COUNT is what this row is about, and the
+    // handler checks it before it resolves the ids.
+    assert!(
+        state::SUBNETS_PER_GROUP > account_subnets.len(),
+        "the bound is unreachable with ids the account has ({} subnets vs a bound of {}), which \
+         is why the over-bound row names ids that resolve to nothing",
+        account_subnets.len(),
+        state::SUBNETS_PER_GROUP
+    );
+    for (count, accepted) in [
+        (account_subnets.len(), true),
+        (state::SUBNETS_PER_GROUP + 1, false),
+    ] {
         let mut pairs = params(&[
             ("CacheSubnetGroupName", &format!("subnets-{count}")),
             ("CacheSubnetGroupDescription", "bound row"),
         ]);
-        for index in 1..=count {
-            pairs.push((
-                format!("SubnetIds.SubnetIdentifier.{index}"),
-                format!("subnet-{index:08x}"),
-            ));
-        }
+        let ids: Vec<String> = if accepted {
+            account_subnets.clone()
+        } else {
+            (1..=count).map(|index| format!("subnet-{index:08x}")).collect()
+        };
+        pairs.extend(subnet_pairs("SubnetIdentifier", &ids));
         let reply = emulator.call("CreateCacheSubnetGroup", &pairs).await;
         if accepted {
             assert_eq!(
@@ -2597,12 +2447,11 @@ async fn the_documented_subnet_group_constraints_are_enforced() {
     let repeated = emulator
         .call(
             "CreateCacheSubnetGroup",
-            &params(&[
-                ("CacheSubnetGroupName", "repeated-subnet"),
-                ("CacheSubnetGroupDescription", "duplicate"),
-                ("SubnetIds.SubnetIdentifier.1", "subnet-11111111"),
-                ("SubnetIds.SubnetIdentifier.2", "subnet-11111111"),
-            ]),
+            &subnet_group_params(
+                "repeated-subnet",
+                "duplicate",
+                &[account_subnets[0].clone(), account_subnets[0].clone()],
+            ),
         )
         .await;
     assert_eq!(
@@ -2618,11 +2467,7 @@ async fn the_documented_subnet_group_constraints_are_enforced() {
     );
 
     // The same 50-tag bound as a cluster.
-    let mut pairs = params(&[
-        ("CacheSubnetGroupName", "too-many-tags"),
-        ("CacheSubnetGroupDescription", "tags"),
-        ("SubnetIds.SubnetIdentifier.1", "subnet-11111111"),
-    ]);
+    let mut pairs = subnet_group_params("too-many-tags", "tags", &account_subnets[..1]);
     for index in 1..=51 {
         pairs.push((format!("Tags.Tag.{index}.Key"), format!("k{index}")));
     }

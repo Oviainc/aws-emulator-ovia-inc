@@ -17,47 +17,11 @@
 //! Region the request is signed for, and in how many aliases one key already holds.
 
 use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
 
 use super::harness::{
-    call, create_key, describe, error_code, failure, failure_in, ok, ok_in, router, text, REGION,
+    alias_arn, call, create_alias, create_alias_in, create_key, describe, error_code, failure,
+    failure_in, ok, ok_in, router, text, REGION,
 };
-
-/// Create an alias and require the answer AWS documents for it: "This operation does
-/// not return a response", so a success carries no members at all.
-async fn create_alias(router: &MultiServiceRouter, case: &str, alias: &str, target: &str) {
-    create_alias_in(router, REGION, case, alias, target).await;
-}
-
-/// [`create_alias`], in `region`.
-async fn create_alias_in(
-    router: &MultiServiceRouter,
-    region: &str,
-    case: &str,
-    alias: &str,
-    target: &str,
-) {
-    let answer = ok_in(
-        router,
-        region,
-        "CreateAlias",
-        &json!({"AliasName": alias, "TargetKeyId": target}),
-    )
-    .await;
-    let empty = answer.is_null() || answer.as_object().is_some_and(|members| members.is_empty());
-    assert!(
-        empty,
-        "case {case}: CreateAlias must answer an empty 200 body, got {answer}"
-    );
-}
-
-/// The alias ARN of `alias` as the endpoint of `region` names it.
-fn alias_arn(region: &str, alias: &str) -> String {
-    format!(
-        "arn:aws:kms:{region}:{account}:{alias}",
-        account = engine::emulator_account_id()
-    )
-}
 
 /// One row of the "which key states accept alias management" table: the case name,
 /// the calls that put the target key into that state, and the error code the create

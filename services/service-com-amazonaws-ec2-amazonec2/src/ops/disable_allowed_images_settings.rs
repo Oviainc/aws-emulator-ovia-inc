@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisableAllowedImagesSettings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisableAllowedImagesSettings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisableAllowedImagesSettings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Moves the account's Allowed AMIs setting in the Region the request was signed for to
+//! `disabled`, in [`crate::state`]. A MUTATION: this call is what stops the setting being
+//! applied.
+//!
+//! It moves the STATE only. "When set to disabled, the image criteria in your Allowed AMIs
+//! settings do not apply" — they do not apply, they are not forgotten — so the criteria
+//! stored beside the state survive a disable and `GetAllowedImagesSettings` goes on
+//! reporting them, which is also what lets a later enable apply exactly the criteria the
+//! account already set.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +141,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisableAllowedImagesSettings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisableAllowedImagesSettingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisableAllowedImagesSettings"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            ALLOWED_IMAGES_SETTINGS_DISABLED, allowed_images_settings_full, request_region,
+            require_service_state,
+        };
+
+        // `DryRun` is this request's only member, so there is nothing else to validate
+        // before the flag is answered — and it stays ahead of the write, so a dry run
+        // leaves the settings untouched. Of the two outcomes the member documents, only
+        // `DryRunOperation` ("if you have the required permissions") can be answered here:
+        // this emulator models no principal permissions, so there is no caller for
+        // `UnauthorizedOperation` to describe.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // "Disables Allowed AMIs for your account in the specified Amazon Web Services
+        // Region": the Region this request was signed for is the one being disabled.
+        let region = request_region(ctx.parts());
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // Only the state moves; the stored criteria are deliberately left as they stand (see
+        // the module docs). A disable of a setting that is already disabled is the state it
+        // is already in, so it is idempotent rather than an error.
+        store
+            .set_allowed_images_settings_state(&region, ALLOWED_IMAGES_SETTINGS_DISABLED)
+            .map_err(|full| allowed_images_settings_full(&region, full))?;
+
+        // "Returns `disabled` if the request succeeds" — the only member
+        // `AllowedImagesSettingsDisabledState` has.
+        Ok(DisableAllowedImagesSettingsOutput {
+            allowed_images_settings_state: Some(ALLOWED_IMAGES_SETTINGS_DISABLED.to_string()),
+        })
     }
 }

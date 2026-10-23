@@ -50,10 +50,14 @@
 //! A cache parameter group is a supporting resource:
 //! `CreateCacheParameterGroup` mints a custom one and
 //! `DescribeCacheParameterGroups` reports it beside the family defaults the
-//! service publishes. The parameter VALUES inside a group are not held here —
-//! `DescribeCacheParameters`, `ModifyCacheParameterGroup` and
-//! `ResetCacheParameterGroup` are still scaffolded 501s and own their own gap
-//! issues.
+//! service publishes. The parameter VALUES a group has had SET on it live on
+//! that record ([`CacheParameterGroupRecord::parameter_values`]), because a
+//! group reports its family's engine defaults with exactly those values laid
+//! over them — which is what `DescribeCacheParameters` answers with.
+//! `ModifyCacheParameterGroup` and `ResetCacheParameterGroup`, the two
+//! operations that WRITE that map, are still scaffolded 501s and own their own
+//! gap issues; keeping the map on the group record is what will let them write
+//! the copy the reader already reads instead of a second one beside it.
 //!
 //! Beside the cache resources sits the RBAC user: `CreateUser` mints one and
 //! `DescribeUsers` reports it, over the one [`UserRecord`] map below, which also
@@ -91,14 +95,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::ops::types::{
     Authentication, AuthenticationMode, AvailabilityZone, CacheCluster, CacheEngineVersion,
     CacheNode, CacheNodeTypeSpecificParameter, CacheNodeTypeSpecificValue, CacheParameterGroup,
-    CacheParameterGroupStatus, CacheSubnetGroup, CacheUsageLimits, CreateUserOutput,
-    DestinationDetails, Endpoint, Event, LogDeliveryConfiguration,
-    LogDeliveryConfigurationRequest, NodeGroup, NodeGroupConfiguration, NodeGroupMember,
-    NodeSnapshot, NotificationConfiguration, Parameter, PendingModifiedValues,
-    CacheNodeUpdateStatus, NodeGroupMemberUpdateStatus, NodeGroupUpdateStatus,
-    ProcessedUpdateAction, RecurringCharge, ReplicationGroup, ReservedCacheNode,
-    ReservedCacheNodesOffering, ScaleConfig, SecurityGroupMembership, ServerlessCache,
-    ServiceUpdate, Snapshot, Subnet, Tag, UnprocessedUpdateAction, UpdateAction,
+    CacheNodeUpdateStatus, CacheParameterGroupStatus, CacheSubnetGroup, CacheUsageLimits,
+    ConfigureShard, CreateUserGroupOutput, CreateUserOutput, DestinationDetails, Endpoint, Event,
+    GlobalNodeGroup, GlobalReplicationGroup, GlobalReplicationGroupInfo,
+    GlobalReplicationGroupMember, LogDeliveryConfiguration, LogDeliveryConfigurationRequest,
+    NodeGroup, NodeGroupConfiguration, NodeGroupMember, NodeGroupMemberUpdateStatus,
+    NodeGroupUpdateStatus, NodeSnapshot, NotificationConfiguration, Parameter,
+    PendingModifiedValues, ProcessedUpdateAction, RecurringCharge, ReplicationGroup,
+    ReservedCacheNode, ReservedCacheNodesOffering, ScaleConfig, SecurityGroupMembership,
+    ServerlessCache, ServiceUpdate, Snapshot, Subnet, Tag, UnprocessedUpdateAction, UpdateAction,
 };
 
 /// The region a request is treated as having been made in when its SigV4
@@ -278,12 +283,6 @@ pub fn is_valid_identifier(value: &str, max_len: usize) -> bool {
 /// [`is_valid_identifier`].
 pub fn is_valid_cluster_id(value: &str) -> bool {
     is_valid_identifier(value, CLUSTER_ID_MAX_LEN)
-}
-
-/// True when `value` satisfies `ReplicationGroupId`'s documented constraints;
-/// see [`is_valid_identifier`].
-pub fn is_valid_replication_group_id(value: &str) -> bool {
-    is_valid_identifier(value, REPLICATION_GROUP_ID_MAX_LEN)
 }
 
 /// True when `value` can name a snapshot: 1 to 255 alphanumeric characters or
@@ -605,6 +604,9 @@ pub fn default_parameter_groups() -> BTreeMap<String, CacheParameterGroupRecord>
                 description: format!("Default parameter group for {family}"),
                 // Nothing tags a group the service itself provides.
                 tags: Vec::new(),
+                // A family default starts out being exactly its family's engine
+                // defaults: nothing has set a value on it.
+                parameter_values: BTreeMap::new(),
             };
             (record.name.clone(), record)
         })
@@ -619,10 +621,6 @@ pub fn default_parameter_groups() -> BTreeMap<String, CacheParameterGroupRecord>
 /// default is provided in every Region, and a custom one is created in the
 /// Region of the create — so the ARN a read reports names the Region of the
 /// request reading it; see [`CacheParameterGroupRecord::to_modeled`].
-///
-/// The parameter VALUES inside a group are not here: `DescribeCacheParameters`,
-/// `ModifyCacheParameterGroup` and `ResetCacheParameterGroup` are scaffolded
-/// 501s with their own issues.
 #[derive(Debug, Clone)]
 pub struct CacheParameterGroupRecord {
     /// The group's identity, which "is stored as a lowercase string"
@@ -635,9 +633,30 @@ pub struct CacheParameterGroupRecord {
     /// The tags `CreateCacheParameterGroup` was given; see
     /// [`CacheClusterRecord::tags`].
     pub tags: Vec<(String, String)>,
+    /// The value SET on this group for a parameter, keyed by
+    /// `Parameter$ParameterName`.
+    ///
+    /// A group holds only the values it DIFFERS from its family's engine
+    /// defaults by, never a copy of the catalog: that is what makes a group's
+    /// effective parameter list "the family defaults with these laid over
+    /// them", and what makes a parameter's `Parameter$Source` derivable — a
+    /// name in this map is the customer's value ([`PARAMETER_SOURCE_USER`]),
+    /// one that is not is the service's ([`PARAMETER_SOURCE_SYSTEM`]).
+    /// `ModifyCacheParameterGroup` sets an entry and
+    /// `ResetCacheParameterGroup` removes one; both are still scaffolded 501s
+    /// with their own issues, so a group answers its family's defaults until
+    /// one of them lands.
+    pub parameter_values: BTreeMap<String, String>,
 }
 
 impl CacheParameterGroupRecord {
+    /// The value set on this group for the parameter `name`, or `None` when
+    /// this group reports the engine's own default for it; see
+    /// [`Self::parameter_values`].
+    pub fn set_value(&self, name: &str) -> Option<&str> {
+        self.parameter_values.get(name).map(String::as_str)
+    }
+
     /// This record as the modelled `CacheParameterGroup`, read from `region`.
     pub fn to_modeled(&self, region: &str) -> CacheParameterGroup {
         CacheParameterGroup {
@@ -663,6 +682,49 @@ impl CacheParameterGroupRecord {
 /// engine-default"); an engine default is the service's own value, so it is
 /// reported as `system`.
 pub const PARAMETER_SOURCE_SYSTEM: &str = "system";
+
+/// The `Parameter$Source` of a value a customer set on the group being read,
+/// from the same `DescribeCacheParameters$Source` vocabulary as
+/// [`PARAMETER_SOURCE_SYSTEM`].
+pub const PARAMETER_SOURCE_USER: &str = "user";
+
+/// The third spelling `DescribeCacheParameters$Source` accepts as a FILTER
+/// ("Valid values: user | system | engine-default").
+///
+/// It selects the same parameters as [`PARAMETER_SOURCE_SYSTEM`] — the ones a
+/// group reports the engine's own default for — because an engine default IS
+/// the service's value and is reported under the `system` spelling; see
+/// [`PARAMETER_SOURCE_SYSTEM`].
+pub const PARAMETER_SOURCE_FILTER_ENGINE_DEFAULT: &str = "engine-default";
+
+/// The `Parameter$Source` the `DescribeCacheParameters$Source` filter `value`
+/// selects, or the reason that value is refused.
+///
+/// `Source` is a plain string with NO modelled enum or pattern, so the
+/// vocabulary its own documentation states ("Valid values: user | system |
+/// engine-default") is enforced here, and it is a SUPERSET of the two spellings
+/// a response reports: `engine-default` and `system` both select the parameters
+/// whose value is the engine's own. Matched ignoring ASCII case, as this
+/// service's other unconstrained filter vocabularies are (see
+/// [`snapshot_source_filter`]): a source is a vocabulary word, not an identity.
+pub fn parameter_source_filter(value: &str) -> Result<&'static str, String> {
+    for (spelling, selected) in [
+        (PARAMETER_SOURCE_USER, PARAMETER_SOURCE_USER),
+        (PARAMETER_SOURCE_SYSTEM, PARAMETER_SOURCE_SYSTEM),
+        (
+            PARAMETER_SOURCE_FILTER_ENGINE_DEFAULT,
+            PARAMETER_SOURCE_SYSTEM,
+        ),
+    ] {
+        if value.eq_ignore_ascii_case(spelling) {
+            return Ok(selected);
+        }
+    }
+    Err(format!(
+        "Invalid value {value} for Source: must be one of {PARAMETER_SOURCE_USER} | \
+         {PARAMETER_SOURCE_SYSTEM} | {PARAMETER_SOURCE_FILTER_ENGINE_DEFAULT}."
+    ))
+}
 
 /// `ChangeType`'s values (`smithy_query(query="shape", shape="ChangeType")`:
 /// `immediate | requires-reboot`): whether a change to the parameter is applied
@@ -1461,6 +1523,33 @@ impl ParameterRecord {
         }
     }
 
+    /// The `Parameter$Source` a group reporting this parameter answers under:
+    /// the customer's when the group holds a value for it, the service's
+    /// otherwise; see [`CacheParameterGroupRecord::parameter_values`].
+    ///
+    /// A parameter whose value is per cache node type is never the customer's:
+    /// its value is the node's own capacity, which is why every such row of the
+    /// published catalog is `IsModifiable: false` and so can hold no set value.
+    pub fn source_in_group(&self, set_value: Option<&str>) -> &'static str {
+        if set_value.is_some() && !self.is_node_type_specific() {
+            PARAMETER_SOURCE_USER
+        } else {
+            PARAMETER_SOURCE_SYSTEM
+        }
+    }
+
+    /// This record as the modelled `Parameter` of a group that holds
+    /// `set_value` for it: the value the group was given, reported as the
+    /// customer's, or the engine's own default reported as the service's.
+    pub fn to_modeled_in_group(&self, set_value: Option<&str>) -> Parameter {
+        let mut parameter = self.to_modeled();
+        parameter.source = Some(self.source_in_group(set_value).to_string());
+        if let Some(value) = set_value {
+            parameter.parameter_value = Some(value.to_string());
+        }
+        parameter
+    }
+
     /// This record as the modelled `CacheNodeTypeSpecificParameter`, for a
     /// parameter whose value is per cache node type.
     pub fn to_node_type_specific(&self) -> CacheNodeTypeSpecificParameter {
@@ -1606,6 +1695,162 @@ pub fn is_subnet_id(value: &str) -> bool {
         .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_alphanumeric()))
 }
 
+/// How many hex characters an identifier of the account's EC2 network carries:
+/// a subnet its long form (`subnet-0bb1c79de3example`), a VPC EC2's short one
+/// (`vpc-0a1b2c3d`).
+const SUBNET_ID_HEX_LEN: usize = 17;
+/// See [`SUBNET_ID_HEX_LEN`].
+const VPC_ID_HEX_LEN: usize = 8;
+
+/// One subnet of the account's EC2 network in one Region: the identifier a
+/// request names, the VPC it belongs to and the Availability Zone it sits in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountSubnet {
+    /// The EC2 subnet identifier, as a request names it.
+    pub subnet_id: String,
+    /// The VPC this subnet belongs to.
+    pub vpc_id: String,
+    /// The Availability Zone this subnet sits in.
+    pub availability_zone: String,
+}
+
+/// The id of the account's default VPC in `region`.
+///
+/// AWS gives an account a default VPC in every Region and this emulator models
+/// no other, so the id is DERIVED from the Region name — stable, so every read
+/// reports the same VPC, and holding no state, so nothing has to be seeded or
+/// reset. This is the contract `services/common/src/network.rs` states for
+/// every service that places a resource in a subnet, implemented here constant
+/// for constant, so a client that creates an ElastiCache subnet group and a DAX
+/// one "in the same subnet" is talking to one account.
+pub fn default_vpc_id(region: &str) -> String {
+    use ::sha2::Digest;
+    let digest = ::hex::encode(::sha2::Sha256::digest(region.as_bytes()));
+    format!("vpc-{}", &digest[..VPC_ID_HEX_LEN])
+}
+
+/// How many Availability Zones a Region's default VPC has a default subnet in.
+///
+/// The account's network is the SAME fact for every service that places a
+/// resource in a subnet, so this is the count
+/// `services/common/src/network.rs` states — "a Region's default subnets sit one
+/// per Availability Zone, in the zones named `<region>a`, `<region>b`,
+/// `<region>c`" — and NOT the number of them ElastiCache selects for a
+/// serverless cache that names none ([`default_subnet_count`], which selects a
+/// SUBSET of these).
+const DEFAULT_SUBNETS_PER_REGION: usize = 3;
+
+/// The subnets that exist in `region`: the default VPC's default subnet in each
+/// Availability Zone of that Region.
+///
+/// AWS creates the default VPC with "a size /16 IPv4 CIDR block and a default
+/// subnet in each Availability Zone" (EC2's `CreateDefaultVpc`), so these
+/// subnets are facts of the account's Region rather than resources an
+/// ElastiCache request creates, and each sits in the zone [`availability_zone`]
+/// names. Each identifier is derived from its zone name, so a Region always
+/// reports the same subnets and [`resolve_subnet`] can tell an identifier that
+/// names one from an identifier that names nothing at all.
+///
+/// The subnets ElastiCache SELECTS for a serverless cache that names none are
+/// the first [`default_subnet_count`] of these, so what it selects is always
+/// something a request could have named itself.
+pub fn region_subnets(region: &str) -> Vec<AccountSubnet> {
+    use ::sha2::Digest;
+    let vpc_id = default_vpc_id(region);
+    (0..DEFAULT_SUBNETS_PER_REGION)
+        .map(|index| {
+            let availability_zone = availability_zone(region, index);
+            let digest = ::hex::encode(::sha2::Sha256::digest(availability_zone.as_bytes()));
+            AccountSubnet {
+                subnet_id: format!("subnet-{}", &digest[..SUBNET_ID_HEX_LEN]),
+                vpc_id: vpc_id.clone(),
+                availability_zone,
+            }
+        })
+        .collect()
+}
+
+/// The subnets ElastiCache selects for a resource in `region` whose request
+/// named none: the first [`default_subnet_count`] of the Region's own
+/// ([`region_subnets`]).
+pub fn selected_default_subnets(region: &str) -> Vec<AccountSubnet> {
+    let mut subnets = region_subnets(region);
+    subnets.truncate(default_subnet_count(region));
+    subnets
+}
+
+/// The subnet `subnet_id` names in `region`, or `None` when no subnet of that
+/// Region carries that identifier — which is what lets a request naming it be
+/// refused instead of stored.
+///
+/// EC2's own subnet operations still answer 501 in this emulator; when they are
+/// implemented, this is the one place that has to start consulting the stored
+/// subnets beside the derived ones.
+pub fn resolve_subnet(region: &str, subnet_id: &str) -> Option<AccountSubnet> {
+    region_subnets(region)
+        .into_iter()
+        .find(|subnet| subnet.subnet_id == subnet_id)
+}
+
+/// The subnet ids among `subnet_ids` that name no subnet of `region`, in the
+/// order the request listed them.
+pub fn unresolved_subnets<'a, I>(region: &str, subnet_ids: I) -> Vec<&'a str>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let known = region_subnets(region);
+    subnet_ids
+        .into_iter()
+        .filter(|id| !known.iter().any(|subnet| subnet.subnet_id == *id))
+        .collect()
+}
+
+/// How ElastiCache words a request naming subnets the account does not have,
+/// built from the offending ids: `Some input subnets in :[<ids>] are invalid.`
+pub fn invalid_subnets_message(subnet_ids: &[&str]) -> String {
+    format!("Some input subnets in :[{}] are invalid.", subnet_ids.join(", "))
+}
+
+/// The length bound a LOOKUP applies to an identifier before resolving it:
+/// ElastiCache's own identifier bound (`CacheClusterId`: "A name must contain
+/// from 1 to 50 alphanumeric characters or hyphens"), which is also the bound
+/// the service states when it refuses an over-long `ReplicationGroupId` on a
+/// describe ("Replication Group ID cannot be longer than 50 characters").
+///
+/// A CREATE applies the stricter bound its own member documents — see
+/// [`REPLICATION_GROUP_ID_MAX_LEN`], 40 characters, because creating a
+/// replication group also mints the member cluster ids from the group id — so
+/// an id between the two bounds is refused by a create and merely not found by
+/// a lookup.
+pub const LOOKUP_IDENTIFIER_MAX_LEN: usize = CLUSTER_ID_MAX_LEN;
+
+/// Why `value` cannot name a resource of this service, or `None` when it can:
+/// the refusal a lookup answers BEFORE it resolves the identifier, so a value
+/// that no resource could ever carry is reported as the bad parameter it is
+/// rather than as a resource that does not exist.
+///
+/// `prose` is how the service names the member in the length refusal
+/// ("Replication Group ID"), `parameter` how it names it in the identifier-rule
+/// refusal ("ReplicationGroupIdentifier"); both texts are the service's own.
+pub fn identifier_refusal(
+    prose: &str,
+    parameter: &str,
+    value: &str,
+    max_len: usize,
+) -> Option<String> {
+    if value.len() > max_len {
+        return Some(format!("{prose} cannot be longer than {max_len} characters."));
+    }
+    if is_valid_identifier(value, max_len) {
+        return None;
+    }
+    Some(format!(
+        "The parameter {parameter} is not a valid identifier. Identifiers must begin with a \
+         letter; must contain only ASCII letters, digits, and hyphens; and must not end with a \
+         hyphen or contain two consecutive hyphens."
+    ))
+}
+
 /// The ARN of a cache cluster: `arn:aws:elasticache:<region>:<account>:cluster:<id>`.
 pub fn cluster_arn(region: &str, cache_cluster_id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("cluster:{cache_cluster_id}"))
@@ -1653,25 +1898,45 @@ pub fn decode_marker(marker: &str) -> Option<String> {
     String::from_utf8(::hex::decode(marker).ok()?).ok()
 }
 
-/// The page size a describe serves, or the reason `MaxRecords` is refused.
+/// The page size a describe serves, or the reason the page-size member is
+/// refused.
 ///
-/// `MaxRecords` carries no modelled `@range`, so the boundary validator passes
-/// any integer and the bounds the asking operation's own `MaxRecords` documents
-/// are enforced here — `default` and `max` are that operation's, the minimum is
-/// the [`MAX_RECORDS_MIN`] every paginated describe in this service shares. It
-/// is refused rather than clamped: a caller that asked for a page size the
-/// service does not serve gets told so instead of a silently different page.
-pub fn page_size_within(max_records: Option<i32>, default: i32, max: i32) -> Result<usize, String> {
-    let requested = max_records.unwrap_or(default);
-    if !(MAX_RECORDS_MIN..=max).contains(&requested) {
-        // The wording ElastiCache itself answers a `MaxRecords` outside the
-        // bounds its member documents with: the member's own constraint,
-        // stated in the service's words, with the operation's own maximum.
-        return Err(format!(
-            "Invalid value for max records. Must be between {MAX_RECORDS_MIN} and {max}"
-        ));
+/// A page-size member carries no modelled `@range`, so the boundary validator
+/// passes any integer and the bounds the asking operation's own member
+/// documents are enforced here — `member` names it in the refusal, and
+/// `default`, `min` and `max` are that operation's. It is refused rather than
+/// clamped: a caller that asked for a page size the service does not serve gets
+/// told so instead of a silently different page.
+fn page_size_bounded(
+    requested: Option<i32>,
+    member: &str,
+    default: i32,
+    min: i32,
+    max: i32,
+) -> Result<usize, String> {
+    let requested = requested.unwrap_or(default);
+    if !(min..=max).contains(&requested) {
+        // The wording ElastiCache itself answers a page size outside the bounds
+        // its member documents with: the member's own constraint, stated in the
+        // service's words, with the operation's own maximum. `MaxRecords` keeps
+        // the recorded wording exactly; another member names itself.
+        return Err(if member == "MaxRecords" {
+            format!("Invalid value for max records. Must be between {min} and {max}")
+        } else {
+            format!(
+                "Invalid value {requested} for {member}: must be at least {min} and no more than \
+                 {max}."
+            )
+        });
     }
-    Ok(usize::try_from(requested).unwrap_or(MAX_RECORDS_MIN as usize))
+    Ok(usize::try_from(requested).unwrap_or(min.max(1) as usize))
+}
+
+/// The page size a `MaxRecords` describe serves; see [`page_size_bounded`]. The
+/// minimum is the [`MAX_RECORDS_MIN`] every `MaxRecords` member in this service
+/// documents.
+pub fn page_size_within(max_records: Option<i32>, default: i32, max: i32) -> Result<usize, String> {
+    page_size_bounded(max_records, "MaxRecords", default, MAX_RECORDS_MIN, max)
 }
 
 /// The page size `DescribeCacheClusters` / `DescribeCacheSubnetGroups` /
@@ -2919,7 +3184,8 @@ impl CacheClusterRecord {
                 }
             }),
             // Cache security groups (the pre-VPC, EC2-Classic mechanism) cannot
-            // exist here: `CreateCacheSecurityGroup` is a scaffolded 501.
+            // exist here: the whole surface is closed for this account, see
+            // [`CACHE_SECURITY_GROUPS_UNSUPPORTED`].
             cache_security_groups: None,
             cache_parameter_group: Some(CacheParameterGroupStatus {
                 cache_parameter_group_name: Some(self.cache_parameter_group_name.clone()),
@@ -3334,6 +3600,14 @@ pub struct ReplicationGroupRecord {
     /// The tags `CreateReplicationGroup` was given; see
     /// [`CacheClusterRecord::tags`].
     pub tags: Vec<(String, String)>,
+    /// The Global datastore this group is a member of, and its role in it,
+    /// which is what `ReplicationGroup$GlobalReplicationGroupInfo` reports.
+    /// `CreateGlobalReplicationGroup` is still a scaffolded 501 with its own
+    /// issue, so today only the Global datastore operations that MOVE a
+    /// membership (associate, disassociate, failover, delete) write these.
+    pub global_replication_group_id: Option<String>,
+    /// See [`ReplicationGroupRecord::global_replication_group_id`].
+    pub global_member_role: Option<String>,
 }
 
 impl ReplicationGroupRecord {
@@ -3416,6 +3690,53 @@ impl ReplicationGroupRecord {
         Some(settled)
     }
 
+    /// How many replicas the shard `node_group_id` has: every member of it that
+    /// is not the primary.
+    pub fn shard_replica_count(&self, node_group_id: &str) -> Option<i32> {
+        let shard = self
+            .node_groups
+            .iter()
+            .find(|shard| shard.node_group_id == node_group_id)?;
+        Some(
+            i32::try_from(
+                shard
+                    .members
+                    .iter()
+                    .filter(|member| member.current_role != ROLE_PRIMARY)
+                    .count(),
+            )
+            .unwrap_or(0),
+        )
+    }
+
+    /// Whether `cache_cluster_id` is a REPLICA of the shard `node_group_id`:
+    /// what `ReplicasToRemove` has to name.
+    pub fn is_shard_replica(&self, node_group_id: &str, cache_cluster_id: &str) -> bool {
+        self.node_groups
+            .iter()
+            .filter(|shard| shard.node_group_id == node_group_id)
+            .flat_map(|shard| shard.members.iter())
+            .any(|member| {
+                member.current_role != ROLE_PRIMARY
+                    && member.cache_cluster_id == cache_cluster_id
+            })
+    }
+
+    /// Start the span after which the clock owes this group `available`, leaving
+    /// it and its shards in `status` until then — the same transition a create
+    /// gets, so a caller that polls straight after a change sees the transient
+    /// status.
+    pub fn begin_transition(&mut self, status: &str, now: SystemTime) {
+        self.status = status.to_string();
+        self.pending_status = Some(PendingTransition {
+            due: now + CLUSTER_TRANSITION,
+            status: STATUS_AVAILABLE.to_string(),
+        });
+        for shard in &mut self.node_groups {
+            shard.status = status.to_string();
+        }
+    }
+
     /// This record as the modelled `ReplicationGroup`.
     ///
     /// `clusters` is the store's cluster map, which the members' read endpoints
@@ -3427,11 +3748,15 @@ impl ReplicationGroupRecord {
         ReplicationGroup {
             replication_group_id: Some(self.replication_group_id.clone()),
             description: Some(self.description.clone()),
-            // A Global datastore cannot exist here: every
-            // global-replication-group operation is a scaffolded 501, so
-            // `CreateReplicationGroup` refuses a `GlobalReplicationGroupId`
-            // with the modelled not-found.
-            global_replication_group_info: None,
+            // The Global datastore this group is a member of, if the Global
+            // datastore operations have made it one; see
+            // [`ReplicationGroupRecord::global_replication_group_id`].
+            global_replication_group_info: self.global_replication_group_id.as_ref().map(|id| {
+                GlobalReplicationGroupInfo {
+                    global_replication_group_id: Some(id.clone()),
+                    global_replication_group_member_role: self.global_member_role.clone(),
+                }
+            }),
             status: Some(self.status.clone()),
             // Nothing can be pending on a group this operation created:
             // `ModifyReplicationGroup` and the resharding and replica-count
@@ -3571,9 +3896,10 @@ pub struct CacheSubnetGroupRecord {
     pub name: String,
     pub description: String,
     pub subnets: Vec<SubnetRecord>,
-    /// The VPC the group's subnets belong to, minted once by
-    /// [`ComAmazonawsElasticacheAmazonelasticachev9State::mint_vpc_id`] because
-    /// the emulator models no EC2 VPCs to read one from.
+    /// The VPC the group's subnets belong to: the VPC of the subnets the group
+    /// was created with, which is the account's default VPC in that Region
+    /// ([`default_vpc_id`]) because every subnet [`region_subnets`] reports
+    /// belongs to it.
     pub vpc_id: String,
     pub arn: String,
     /// The tags `CreateCacheSubnetGroup` was given; see
@@ -5613,6 +5939,15 @@ fn unprocessed_update_action(
 
 /// The `Authentication` the passwords in `passwords` give a user, or why they
 /// are refused.
+///
+/// Both published rules are enforced here, so every request that carries
+/// passwords — `CreateUser`'s `Passwords` and `AuthenticationMode$Passwords`,
+/// and `ModifyUser`'s — takes the same ones: at most
+/// [`MAX_PASSWORDS_PER_USER`] passwords, each [`PASSWORD_MIN_LENGTH`] to
+/// [`PASSWORD_MAX_LENGTH`] characters. A password outside the length rule is
+/// refused rather than stored: a user whose password the service would never
+/// have accepted must not exist. The passwords themselves are never kept; see
+/// [`AuthenticationRecord`].
 fn password_authentication(passwords: &[String]) -> Result<AuthenticationRecord, AuthRefusal> {
     if passwords.len() > MAX_PASSWORDS_PER_USER {
         return Err(AuthRefusal::Value(format!(
@@ -5620,6 +5955,14 @@ fn password_authentication(passwords: &[String]) -> Result<AuthenticationRecord,
              for each user.",
             passwords.len()
         )));
+    }
+    for password in passwords {
+        if !(PASSWORD_MIN_LENGTH..=PASSWORD_MAX_LENGTH).contains(&password.chars().count()) {
+            return Err(AuthRefusal::Value(format!(
+                "Passwords length must be between \
+                 {PASSWORD_MIN_LENGTH}-{PASSWORD_MAX_LENGTH} characters."
+            )));
+        }
     }
     // At most `MAX_PASSWORDS_PER_USER`, refused above, so the conversion is
     // exact; the fallback only keeps the handler panic-free.
@@ -5755,14 +6098,25 @@ impl UserRecord {
             ),
             access_string: Some(self.access_string.clone()),
             // "Returns a list of the user group IDs the user belongs to":
-            // membership is held by the user GROUPS that list the user, and every
-            // user-group operation is still a scaffolded 501 (each with its own
-            // issue), so no group can list a user yet and the list is empty
-            // rather than invented. When those land they derive it from the group
-            // records instead of a second copy kept here.
+            // membership is held by the user GROUPS that list the user, so it is
+            // derived from those records rather than copied onto the user — see
+            // [`ComAmazonawsElasticacheAmazonelasticachev9State::user_group_ids_of`],
+            // which is what the handlers pass to [`UserRecord::to_modeled_in`].
             user_group_ids: Some(Vec::new()),
             authentication: Some(self.authentication.to_modeled()),
             arn: Some(self.arn.clone()),
+        }
+    }
+
+    /// The user as the API reports it, belonging to `user_group_ids`.
+    ///
+    /// `User$UserGroupIds` is "a list of the user group IDs the user belongs
+    /// to", which the user-group records are the one copy of; a handler reads
+    /// them with `user_group_ids_of` and hands them here.
+    pub fn to_modeled_in(&self, user_group_ids: Vec<String>) -> CreateUserOutput {
+        CreateUserOutput {
+            user_group_ids: Some(user_group_ids),
+            ..self.to_modeled()
         }
     }
 
@@ -5823,6 +6177,14 @@ pub struct ComAmazonawsElasticacheAmazonelasticachev9State {
     /// Every stored subnet group, keyed by its (lowercased) name, ordered for
     /// the same reason.
     pub cache_subnet_groups: BTreeMap<String, CacheSubnetGroupRecord>,
+    /// Every stored user group, keyed by its `UserGroupId` EXACTLY as the
+    /// request spelled it: unlike `CacheClusterId` / `UserId` /
+    /// `ReplicationGroupId`, the model documents no lowercasing for it, so the
+    /// identity a later describe or association resolves is case-sensitive.
+    pub user_groups: BTreeMap<String, UserGroupRecord>,
+    /// Every stored Global datastore, keyed by its (lowercased)
+    /// `GlobalReplicationGroupId`.
+    pub global_replication_groups: BTreeMap<String, GlobalReplicationGroupRecord>,
     /// Every stored replication group, keyed by its (lowercased)
     /// `ReplicationGroupId`, ordered for the same reason: it is what gives
     /// `DescribeReplicationGroups` the stable total order its `Marker` indexes
@@ -5883,14 +6245,11 @@ pub struct ComAmazonawsElasticacheAmazonelasticachev9State {
     pub serverless_caches: BTreeMap<String, ServerlessCacheRecord>,
     /// The counter endpoint DNS labels are minted from.
     pub dns_token_seq: u64,
-    /// The counter VPC ids are minted from.
-    pub vpc_seq: u64,
-    /// The counter the default subnet ids of a serverless cache are minted from.
-    pub subnet_seq: u64,
     /// The reserved-cache-node offerings this service publishes, keyed for the
     /// same stable total order. Stocked from [`offering_catalog`] when the store
     /// is created, because the catalog is the service's own and no operation
-    /// creates or removes an entry: a describe only reports it.
+    /// creates or removes an entry: a describe only reports it, and
+    /// `PurchaseReservedCacheNodesOffering` prices a reservation from it.
     pub reserved_cache_nodes_offerings: BTreeMap<String, ReservedCacheNodesOffering>,
     /// The engine default parameters this service publishes, keyed by cache
     /// parameter group family and, inside a family, by
@@ -5911,20 +6270,29 @@ pub struct ComAmazonawsElasticacheAmazonelasticachev9State {
 impl Default for ComAmazonawsElasticacheAmazonelasticachev9State {
     /// A fresh store is an account ElastiCache has just become available in: no
     /// customer resources, the default parameter group of every family the
-    /// service publishes, and the catalogs this service publishes rather than
-    /// an account creating them — the service updates and the
-    /// reserved-cache-node offerings.
+    /// service publishes, the account's built-in `default` user, and the
+    /// catalogs this service publishes rather than an account creating them —
+    /// the service updates and the reserved-cache-node offerings.
     ///
     /// The engine builds this the first time a handler of this service asks for
     /// its state, so that instant is the anchor the service-update catalog's
     /// release and end dates hang off — fixed for the life of the process, which
     /// is what makes every later read of an update report the same dates.
+    ///
+    /// The `default` user is seeded here for the same reason as the catalogs:
+    /// ElastiCache creates it with the ACCOUNT, before any API call (see
+    /// [`DEFAULT_USER_ID`]), so no reporting operation has to write it into the
+    /// store on first read — which would put the region of whichever request
+    /// read first into its ARN. Its ARN names [`DEFAULT_REGION`], the region
+    /// this service treats a request as made in when nothing says otherwise.
     fn default() -> Self {
         Self {
             cache_clusters: BTreeMap::new(),
             cache_subnet_groups: BTreeMap::new(),
-            replication_groups: BTreeMap::new(),
+            user_groups: BTreeMap::new(),
             serverless_caches: BTreeMap::new(),
+            replication_groups: BTreeMap::new(),
+            global_replication_groups: BTreeMap::new(),
             cache_parameter_groups: default_parameter_groups(),
             snapshots: BTreeMap::new(),
             service_updates: published_service_updates(SystemTime::now()),
@@ -5934,8 +6302,6 @@ impl Default for ComAmazonawsElasticacheAmazonelasticachev9State {
             users: built_in_users(),
             cache_engine_versions: published_cache_engine_versions(),
             dns_token_seq: 0,
-            vpc_seq: 0,
-            subnet_seq: 0,
             reserved_cache_nodes_offerings: offering_catalog(),
             engine_default_parameters: published_engine_default_parameters(),
             reserved_cache_nodes: BTreeMap::new(),
@@ -5944,6 +6310,20 @@ impl Default for ComAmazonawsElasticacheAmazonelasticachev9State {
 }
 
 impl ComAmazonawsElasticacheAmazonelasticachev9State {
+    /// The groups `user_id` belongs to, which is what `User$UserGroupIds`
+    /// reports.
+    ///
+    /// Derived from the user-group records, which are the one copy of a
+    /// membership: a group lists its users, so a user's groups are the groups
+    /// that list it, in the stable order the map holds them.
+    pub fn user_group_ids_of(&self, user_id: &str) -> Vec<String> {
+        self.user_groups
+            .values()
+            .filter(|group| group.user_ids.iter().any(|member| member == user_id))
+            .map(|group| group.user_group_id.clone())
+            .collect()
+    }
+
     /// The parameter group `name` names, or `None` when this account holds no
     /// such group — the one lookup every handler that resolves a
     /// `CacheParameterGroupName` goes through, so they cannot disagree about
@@ -5966,23 +6346,6 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
     pub fn mint_dns_token(&mut self) -> String {
         self.dns_token_seq = self.dns_token_seq.wrapping_add(1);
         format!("{:06x}", self.dns_token_seq & 0xff_ffff)
-    }
-
-    /// Mint the VPC id a new subnet group reports: `vpc-` and eight lowercase
-    /// hex digits, the form EC2 uses.
-    pub fn mint_vpc_id(&mut self) -> String {
-        self.vpc_seq = self.vpc_seq.wrapping_add(1);
-        format!("vpc-{:08x}", self.vpc_seq & 0xffff_ffff)
-    }
-
-    /// Mint the id of one subnet ElastiCache selects for a serverless cache the
-    /// request gave no `SubnetIds`: `subnet-` and eight lowercase hex digits,
-    /// the form EC2 uses. The emulator models no EC2 subnets to read one from,
-    /// so the selected ids are minted once and STORED on the record, which is
-    /// what makes every later read report the same subnets.
-    pub fn mint_subnet_id(&mut self) -> String {
-        self.subnet_seq = self.subnet_seq.wrapping_add(1);
-        format!("subnet-{:08x}", self.subnet_seq & 0xffff_ffff)
     }
 
     /// Build and store a serverless-cache record, returning what was stored.
@@ -6364,6 +6727,202 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
             return;
         };
         self.events.retain(|_, event| event.at >= cutoff);
+    }
+
+    /// Materialise every status change the clock owes a user group.
+    pub fn settle_user_groups(&mut self, now: SystemTime) {
+        for group in self.user_groups.values_mut() {
+            group.settle(now);
+        }
+    }
+
+    /// Materialise every status change the clock owes a replication group.
+    pub fn settle_replication_groups(&mut self, now: SystemTime) {
+        for group in self.replication_groups.values_mut() {
+            group.settle(now);
+        }
+    }
+
+    /// Materialise every status change the clock owes a Global datastore.
+    pub fn settle_global_replication_groups(&mut self, now: SystemTime) {
+        for group in self.global_replication_groups.values_mut() {
+            group.settle(now);
+        }
+    }
+
+    /// The replication group `id` names, with any status change the clock owes
+    /// it already materialised.
+    pub fn settled_replication_group_mut(
+        &mut self,
+        id: &str,
+        now: SystemTime,
+    ) -> Option<&mut ReplicationGroupRecord> {
+        let group = self.replication_groups.get_mut(id)?;
+        group.settle(now);
+        Some(group)
+    }
+
+    /// Give the shard `node_group_id` of the replication group `group_id`
+    /// `replicas` replicas, minting a member CLUSTER for each replica added and
+    /// deleting the member cluster of each replica removed.
+    ///
+    /// A replica of a Valkey / Redis OSS replication group IS a cache cluster —
+    /// which is why `insert_replication_group` puts every member in
+    /// [`Self::cache_clusters`] — so scaling a shard has to create and remove
+    /// those clusters too, or `DescribeCacheClusters` and
+    /// `DescribeReplicationGroups` would disagree about what the account runs.
+    /// `remove` names the replicas to drop (`ReplicasToRemove`); when it is
+    /// empty the last-added replicas go, which is what `ReplicaConfiguration`
+    /// alone asks for.
+    pub fn set_shard_replica_count(
+        &mut self,
+        group_id: &str,
+        node_group_id: &str,
+        replicas: i32,
+        remove: &[String],
+        now: SystemTime,
+    ) {
+        let Some(group) = self.replication_groups.get(group_id) else {
+            return;
+        };
+        let Some(shard) = group
+            .node_groups
+            .iter()
+            .find(|shard| shard.node_group_id == node_group_id)
+        else {
+            return;
+        };
+        // What the shard has to end up with, decided before anything is
+        // written: the primary always stays, the named replicas go first, and
+        // then the newest replicas go until the count is right.
+        let mut keep: Vec<NodeGroupMemberRecord> = Vec::new();
+        let mut drop_clusters: Vec<String> = Vec::new();
+        for member in &shard.members {
+            if member.current_role == ROLE_PRIMARY || !remove.contains(&member.cache_cluster_id) {
+                keep.push(member.clone());
+            } else {
+                drop_clusters.push(member.cache_cluster_id.clone());
+            }
+        }
+        let target = usize::try_from(replicas.saturating_add(1)).unwrap_or(1);
+        while keep.len() > target {
+            if let Some(member) = keep.pop() {
+                drop_clusters.push(member.cache_cluster_id);
+            }
+        }
+        // The values a new member cluster takes: the group's own, so a replica
+        // runs what the group runs.
+        let template = group.clone();
+        let mut add: Vec<(String, Option<String>)> = Vec::new();
+        let mut next = template
+            .node_groups
+            .iter()
+            .flat_map(|shard| shard.members.iter())
+            .filter_map(|member| {
+                member
+                    .cache_cluster_id
+                    .rsplit('-')
+                    .next()
+                    .and_then(|tail| tail.parse::<u32>().ok())
+            })
+            .max()
+            .unwrap_or(0);
+        while keep.len() + add.len() < target {
+            next = next.saturating_add(1);
+            let zone = availability_zone(&template.region, (keep.len() + add.len()) % 3);
+            add.push((
+                format!("{}-{next:03}", template.replication_group_id),
+                Some(zone),
+            ));
+        }
+
+        for cluster_id in &drop_clusters {
+            self.cache_clusters.remove(cluster_id);
+        }
+        for (cluster_id, zone) in &add {
+            let _ = self.insert_cluster(NewCluster {
+                cache_cluster_id: cluster_id.clone(),
+                region: template.region.clone(),
+                engine: template.engine.clone(),
+                engine_version: template.engine_version.clone(),
+                cache_node_type: template.cache_node_type.clone(),
+                // "For clusters running Valkey or Redis OSS, this value must
+                // be 1": a shard's replicas are further member CLUSTERS.
+                num_cache_nodes: REDIS_NUM_CACHE_NODES,
+                port: template.port,
+                availability_zones: zone.clone().into_iter().collect(),
+                az_mode: None,
+                preferred_maintenance_window: template.preferred_maintenance_window.clone(),
+                cache_subnet_group_name: template.cache_subnet_group_name.clone(),
+                cache_parameter_group_name: template.cache_parameter_group_name.clone(),
+                snapshot_retention_limit: template.snapshot_retention_limit,
+                snapshot_window: template.snapshot_window.clone(),
+                auto_minor_version_upgrade: template.auto_minor_version_upgrade,
+                security_group_ids: Vec::new(),
+                notification_topic_arn: None,
+                auth_token_enabled: template.auth_token_enabled,
+                transit_encryption_enabled: Some(template.transit_encryption_enabled),
+                transit_encryption_mode: template.transit_encryption_mode.clone(),
+                at_rest_encryption_enabled: Some(template.at_rest_encryption_enabled),
+                network_type: template.network_type.clone(),
+                ip_discovery: template.ip_discovery.clone(),
+                log_delivery_configurations: template.log_delivery_configurations.clone(),
+                tags: template.tags.clone(),
+                now,
+                replication_group_id: Some(template.replication_group_id.clone()),
+                replication_group_log_delivery_enabled: Some(
+                    !template.log_delivery_configurations.is_empty(),
+                ),
+            });
+        }
+
+        let Some(group) = self.replication_groups.get_mut(group_id) else {
+            return;
+        };
+        let Some(shard) = group
+            .node_groups
+            .iter_mut()
+            .find(|shard| shard.node_group_id == node_group_id)
+        else {
+            return;
+        };
+        shard.members = keep;
+        for (cluster_id, zone) in add {
+            shard.members.push(NodeGroupMemberRecord {
+                cache_cluster_id: cluster_id,
+                cache_node_id: FIRST_CACHE_NODE_ID.to_string(),
+                availability_zone: zone,
+                current_role: ROLE_REPLICA.to_string(),
+            });
+        }
+    }
+
+    /// The Global datastore `id` names, with any status change the clock owes it
+    /// already materialised.
+    pub fn settled_global_replication_group_mut(
+        &mut self,
+        id: &str,
+        now: SystemTime,
+    ) -> Option<&mut GlobalReplicationGroupRecord> {
+        let group = self.global_replication_groups.get_mut(id)?;
+        group.settle(now);
+        Some(group)
+    }
+
+    /// Build and store a Global datastore, returning what was stored.
+    pub fn insert_global_replication_group(
+        &mut self,
+        new: NewGlobalReplicationGroup,
+    ) -> &GlobalReplicationGroupRecord {
+        let key = new.global_replication_group_id.to_ascii_lowercase();
+        let record = GlobalReplicationGroupRecord::new(new);
+        match self.global_replication_groups.entry(key) {
+            Entry::Vacant(slot) => slot.insert(record),
+            Entry::Occupied(mut slot) => {
+                slot.insert(record);
+                slot.into_mut()
+            }
+        }
     }
 
     /// The resource a batch update-action call named, resolved against this
@@ -6769,6 +7328,12 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
             durability: new.durability,
             effective_durability: new.effective_durability,
             tags: new.tags,
+            // A created group belongs to no Global datastore: the Global
+            // datastore operations are what make a group a member, and
+            // `CreateReplicationGroup` refuses a `GlobalReplicationGroupId`
+            // because `CreateGlobalReplicationGroup` is still a scaffolded 501.
+            global_replication_group_id: None,
+            global_member_role: None,
         };
         self.replication_groups
             .insert(new.replication_group_id.clone(), record);
@@ -6824,6 +7389,523 @@ pub struct NewCluster {
     /// See [`CacheClusterRecord::replication_group_log_delivery_enabled`].
     pub replication_group_log_delivery_enabled: Option<bool>,
 }
+
+/// Why every operation on the legacy cache-security-group surface is refused.
+///
+/// A cache security group is the pre-VPC (EC2-Classic) access-control mechanism:
+/// `CreateCacheSecurityGroup` documents that "cache security groups are only used
+/// when you are creating a cluster outside of an Amazon Virtual Private Cloud
+/// (Amazon VPC). If you are creating a cluster inside of a VPC, use a cache
+/// subnet group instead." This emulator provisions no EC2-Classic network — a
+/// cluster is always placed in a VPC subnet group ([`CacheSubnetGroupRecord`]) —
+/// so the account it presents is VPC-only, which after EC2-Classic retirement is
+/// the only kind of account AWS has. Every operation on the surface is therefore
+/// refused account-wide with the modelled `InvalidParameterValueException`
+/// (awsQuery code `InvalidParameterValue`, HTTP 400) rather than a per-name
+/// not-found: the construct is unavailable, not the name. The status and the code
+/// are the contract; this wording is the one AWS was recorded answering with.
+pub const CACHE_SECURITY_GROUPS_UNSUPPORTED: &str =
+    "Use of cache security groups is not permitted in this API version for your account.";
+
+/// The length a user's password must have.
+///
+/// ElastiCache enforces the same password rule for a user as `AuthToken`
+/// documents for a cluster: "Must be at least 16 characters and no more than 128
+/// characters in length." A password outside it is refused with
+/// `InvalidParameterValueException`, and no user is created — see
+/// [`password_authentication`], which is where every password-bearing request
+/// goes through it.
+pub const PASSWORD_MIN_LENGTH: usize = 16;
+/// See [`PASSWORD_MIN_LENGTH`].
+pub const PASSWORD_MAX_LENGTH: usize = 128;
+
+/// How many user groups the store holds before a create is refused with the
+/// modelled quota fault. The emulator's own bound on the store, for the reason
+/// [`CLUSTER_QUOTA`] gives, and the counterpart of [`USER_QUOTA`].
+pub const USER_GROUP_QUOTA: usize = 100;
+
+/// A replication group's and a Global datastore's statuses, from
+/// `ReplicationGroup$Status` ("creating, available, modifying, deleting,
+/// create-failed, snapshotting") and `GlobalReplicationGroup$Status`.
+pub const STATUS_PRIMARY_ONLY: &str = "primary-only";
+
+/// The `AutomaticFailoverStatus` / `MultiAZStatus` values, from those enums.
+pub const FAILOVER_ENABLED: &str = "enabled";
+/// See [`FAILOVER_ENABLED`].
+pub const FAILOVER_DISABLED: &str = "disabled";
+
+/// The `ClusterMode` values, from that enum (`enabled`, `disabled`,
+/// `compatible`).
+pub const CLUSTER_MODE_DISABLED: &str = "disabled";
+/// See [`CLUSTER_MODE_DISABLED`].
+pub const CLUSTER_MODE_ENABLED: &str = "enabled";
+
+/// The role a member of a Global datastore has, from
+/// `GlobalReplicationGroupMember$Role`: "Indicates the role of the replication
+/// group, primary or secondary."
+pub const GLOBAL_ROLE_PRIMARY: &str = "primary";
+/// See [`GLOBAL_ROLE_PRIMARY`].
+pub const GLOBAL_ROLE_SECONDARY: &str = "secondary";
+
+/// Materialise a status change the clock owes a resource, if it is due.
+///
+/// The ONE write a reporting operation may make: the transition was owed at this
+/// instant whether or not anybody called. Shared by every record that carries a
+/// [`PendingTransition`] so the rule has one implementation.
+fn settle_status(
+    status: &mut String,
+    pending: &mut Option<PendingTransition>,
+    now: SystemTime,
+) -> bool {
+    let Some(transition) = pending.as_ref() else {
+        return false;
+    };
+    if now < transition.due {
+        return false;
+    }
+    *status = transition.status.clone();
+    *pending = None;
+    true
+}
+
+/// The transition the clock owes a resource that a call has just put in a
+/// transient status: `status` once [`CLUSTER_TRANSITION`] has passed.
+fn transition_to(status: &str, now: SystemTime) -> Option<PendingTransition> {
+    Some(PendingTransition {
+        due: now + CLUSTER_TRANSITION,
+        status: status.to_string(),
+    })
+}
+
+/// The transition the clock owes a just-created user group:
+/// [`USER_STATUS_ACTIVE`], which is what `UserGroup$Status` settles at.
+pub fn user_group_transition(now: SystemTime) -> Option<PendingTransition> {
+    transition_to(USER_STATUS_ACTIVE, now)
+}
+
+/// True when `value` is one of the engines access control exists for, lowercased
+/// by the caller; see [`USER_ENGINES`].
+pub fn is_user_engine(value: &str) -> bool {
+    USER_ENGINES.contains(&value)
+}
+
+/// The ARN of a user group.
+pub fn user_group_arn(region: &str, user_group_id: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("usergroup:{user_group_id}"))
+}
+
+/// The ARN of a Global datastore.
+pub fn global_replication_group_arn(region: &str, global_replication_group_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("globalreplicationgroup:{global_replication_group_id}"),
+    )
+}
+
+/// The keyspace each of `count` node groups owns, as `NodeGroup$Slots` and
+/// `GlobalNodeGroup$Slots` report it.
+///
+/// One rule, one implementation: each range is [`default_slots`], the split a
+/// replication group's shards already take, so a Global datastore's slice
+/// groups and a replication group's shards cannot divide the keyspace
+/// differently.
+pub fn even_slot_ranges(count: usize) -> Vec<String> {
+    let shards = i32::try_from(count).unwrap_or(i32::MAX);
+    (0..shards)
+        .map(|index| default_slots(shards, index))
+        .collect()
+}
+
+/// The statuses a Global datastore accepts a change in: settled ones. A
+/// datastore still `creating`, `modifying` or on its way out is refused with
+/// `InvalidGlobalReplicationGroupStateFault`.
+pub const GLOBAL_ACTIONABLE_STATUSES: [&str; 2] = [STATUS_AVAILABLE, STATUS_PRIMARY_ONLY];
+
+/// Why this service refuses a deferred change.
+///
+/// `ApplyImmediately` chooses between applying a change now and applying it "during
+/// the next maintenance window". The `GlobalReplicationGroup` shape models NO
+/// pending-values member, so a deferred change would have nowhere to be
+/// reported: a caller would get a 200 and then read back the old settings with
+/// nothing saying a change is coming. It is refused with the modelled
+/// `InvalidParameterValueException` instead of being accepted and lost.
+pub const APPLY_IMMEDIATELY_REQUIRED: &str =
+    "Invalid value false for ApplyImmediately: this emulator applies a Global datastore change \
+     at once, and the GlobalReplicationGroup shape has no member to report a pending one.";
+
+/// Why a replica-count request is refused, and with which modelled error.
+///
+/// `IncreaseReplicaCount` and `DecreaseReplicaCount` declare the same two
+/// client-input errors, so the shared argument check names which one its answer
+/// is and each handler lifts it into its own error enum.
+#[derive(Debug, Clone)]
+pub enum ReplicaCountRefusal {
+    /// `InvalidParameterValueException`: one value is not one the service
+    /// serves.
+    Value(String),
+    /// `InvalidParameterCombinationException`: two members cannot hold
+    /// together.
+    Combination(String),
+}
+
+/// How many replicas a replica-count request asks each shard to end up with.
+#[derive(Debug, Clone)]
+pub enum ReplicaTargets {
+    /// `NewReplicaCount`: "the number of read replica nodes you want at the end
+    /// of this operation" — the same count for every shard of the group.
+    EveryShard(i32),
+    /// `ReplicaConfiguration`: a count per named shard.
+    PerShard(Vec<(String, i32)>),
+}
+
+/// The per-shard replica counts a request asks for, or why it is refused.
+///
+/// The argument check both replica-count operations share, and it runs BEFORE
+/// the replication group is resolved: `ReplicationGroupId` is validated as an
+/// argument by these two operations rather than looked up first, which is why an
+/// id the account does not hold is answered `InvalidParameterValue` here while
+/// the rest of the replication-group surface answers
+/// `ReplicationGroupNotFoundFault`.
+///
+/// CC-02 growth bound: the replicas a request asks for are allocated per
+/// request, so every count — `NewReplicaCount` and each
+/// `ReplicaConfiguration` entry's — is checked against
+/// [`MAX_REPLICAS_PER_NODE_GROUP`] here, before any member is created, and a
+/// configuration entry can only name a shard the group already has (the
+/// handlers resolve it), which [`MAX_NODE_GROUPS`] bounds.
+pub fn replica_count_targets(
+    new_replica_count: Option<i32>,
+    replica_configuration: &[ConfigureShard],
+) -> Result<ReplicaTargets, ReplicaCountRefusal> {
+    if new_replica_count.is_some() && !replica_configuration.is_empty() {
+        return Err(ReplicaCountRefusal::Combination(
+            "NewReplicaCount cannot be combined with ReplicaConfiguration.".to_string(),
+        ));
+    }
+    let in_range = |count: i32, member: &str| -> Result<(), ReplicaCountRefusal> {
+        if (0..=MAX_REPLICAS_PER_NODE_GROUP).contains(&count) {
+            Ok(())
+        } else {
+            Err(ReplicaCountRefusal::Value(format!(
+                "Invalid value {count} for {member}: a node group has between 0 and \
+                 {MAX_REPLICAS_PER_NODE_GROUP} replicas."
+            )))
+        }
+    };
+    if let Some(count) = new_replica_count {
+        in_range(count, "NewReplicaCount")?;
+        return Ok(ReplicaTargets::EveryShard(count));
+    }
+    if replica_configuration.is_empty() {
+        return Err(ReplicaCountRefusal::Value(
+            "Invalid value for NewReplicaCount: name either NewReplicaCount or \
+             ReplicaConfiguration."
+                .to_string(),
+        ));
+    }
+    let mut targets: Vec<(String, i32)> = Vec::new();
+    for shard in replica_configuration {
+        in_range(shard.new_replica_count, "ReplicaConfiguration.NewReplicaCount")?;
+        if targets.iter().any(|(id, _)| id == &shard.node_group_id) {
+            return Err(ReplicaCountRefusal::Value(format!(
+                "Invalid value {} for ReplicaConfiguration.NodeGroupId: it is configured more \
+                 than once.",
+                shard.node_group_id
+            )));
+        }
+        // "The number of PreferredAvailabilityZone values must equal the value
+        // of NewReplicaCount plus 1 to account for the primary node."
+        if let Some(zones) = shard.preferred_availability_zones.as_deref() {
+            let expected = usize::try_from(shard.new_replica_count.saturating_add(1)).unwrap_or(1);
+            if zones.len() != expected {
+                return Err(ReplicaCountRefusal::Value(format!(
+                    "Invalid value for ReplicaConfiguration.PreferredAvailabilityZones: {} zones \
+                     were given for a node group of {expected} nodes.",
+                    zones.len()
+                )));
+            }
+        }
+        // Outposts: the emulator provisions no Outpost capacity, so a replica
+        // cannot be placed in one.
+        if let Some(arn) = shard
+            .preferred_outpost_arns
+            .as_deref()
+            .unwrap_or_default()
+            .first()
+        {
+            return Err(ReplicaCountRefusal::Value(format!(
+                "Invalid value {arn} for ReplicaConfiguration.PreferredOutpostArns: this \
+                 emulator provisions no Outpost capacity."
+            )));
+        }
+        targets.push((shard.node_group_id.clone(), shard.new_replica_count));
+    }
+    Ok(ReplicaTargets::PerShard(targets))
+}
+
+/// One user group, as this emulator persists it.
+#[derive(Debug, Clone)]
+pub struct UserGroupRecord {
+    pub user_group_id: String,
+    pub engine: String,
+    pub user_ids: Vec<String>,
+    pub status: String,
+    /// The status change the clock owes this group, if any.
+    pub pending_status: Option<PendingTransition>,
+    /// The replication groups and serverless caches this group is attached to,
+    /// which is what `UserGroup$ReplicationGroups` / `$ServerlessCaches` report.
+    pub replication_group_ids: Vec<String>,
+    pub serverless_cache_names: Vec<String>,
+    pub region: String,
+    pub arn: String,
+    pub tags: Vec<(String, String)>,
+}
+
+impl UserGroupRecord {
+    /// Materialise the status change the clock owes this group.
+    pub fn settle(&mut self, now: SystemTime) {
+        settle_status(&mut self.status, &mut self.pending_status, now);
+    }
+
+    /// This record as the modelled `UserGroup`.
+    pub fn to_modeled(&self) -> CreateUserGroupOutput {
+        CreateUserGroupOutput {
+            user_group_id: Some(self.user_group_id.clone()),
+            status: Some(self.status.clone()),
+            engine: Some(self.engine.clone()),
+            user_ids: Some(self.user_ids.clone()),
+            minimum_engine_version: Some(USER_MIN_ENGINE_VERSION.to_string()),
+            // A membership change is applied by `ModifyUserGroup`, a scaffolded
+            // 501, so no group of this slice has one pending.
+            pending_changes: None,
+            replication_groups: Some(self.replication_group_ids.clone()),
+            serverless_caches: Some(self.serverless_cache_names.clone()),
+            arn: Some(self.arn.clone()),
+        }
+    }
+}
+
+/// One member of a Global datastore, as this emulator persists it.
+#[derive(Debug, Clone)]
+pub struct GlobalMemberRecord {
+    pub replication_group_id: String,
+    pub region: String,
+    /// [`GLOBAL_ROLE_PRIMARY`] or [`GLOBAL_ROLE_SECONDARY`].
+    pub role: String,
+    pub automatic_failover: String,
+    pub status: String,
+}
+
+/// One slice group of a Global datastore, as this emulator persists it.
+#[derive(Debug, Clone)]
+pub struct GlobalNodeGroupRecord {
+    pub global_node_group_id: String,
+    pub slots: String,
+}
+
+/// The validated values a new Global datastore is built from.
+#[derive(Debug, Clone)]
+pub struct NewGlobalReplicationGroup {
+    pub global_replication_group_id: String,
+    pub description: Option<String>,
+    pub region: String,
+    pub engine: String,
+    pub engine_version: String,
+    pub cache_node_type: Option<String>,
+    /// The replication group that accepts writes, which becomes the datastore's
+    /// primary member.
+    pub primary_replication_group_id: String,
+    pub node_group_count: i32,
+    pub cluster_enabled: bool,
+    pub now: SystemTime,
+}
+
+/// One Global datastore, as this emulator persists it.
+#[derive(Debug, Clone)]
+pub struct GlobalReplicationGroupRecord {
+    pub global_replication_group_id: String,
+    pub description: Option<String>,
+    pub status: String,
+    pub pending_status: Option<PendingTransition>,
+    pub region: String,
+    pub engine: String,
+    pub engine_version: String,
+    pub cache_node_type: Option<String>,
+    pub members: Vec<GlobalMemberRecord>,
+    pub cluster_enabled: bool,
+    pub global_node_groups: Vec<GlobalNodeGroupRecord>,
+    pub auth_token_enabled: bool,
+    pub transit_encryption_enabled: Option<bool>,
+    pub at_rest_encryption_enabled: Option<bool>,
+    pub arn: String,
+    pub tags: Vec<(String, String)>,
+}
+
+impl GlobalReplicationGroupRecord {
+    /// A Global datastore with one primary member, in the status a just-created
+    /// datastore has.
+    pub fn new(new: NewGlobalReplicationGroup) -> Self {
+        let mut record = Self {
+            arn: global_replication_group_arn(&new.region, &new.global_replication_group_id),
+            global_replication_group_id: new.global_replication_group_id,
+            description: new.description,
+            status: STATUS_CREATING.to_string(),
+            pending_status: transition_to(STATUS_AVAILABLE, new.now),
+            engine: new.engine,
+            engine_version: new.engine_version,
+            cache_node_type: new.cache_node_type,
+            members: vec![GlobalMemberRecord {
+                replication_group_id: new.primary_replication_group_id,
+                region: new.region.clone(),
+                role: GLOBAL_ROLE_PRIMARY.to_string(),
+                automatic_failover: FAILOVER_DISABLED.to_string(),
+                status: STATUS_ASSOCIATED.to_string(),
+            }],
+            cluster_enabled: new.cluster_enabled,
+            global_node_groups: Vec::new(),
+            auth_token_enabled: false,
+            transit_encryption_enabled: None,
+            at_rest_encryption_enabled: None,
+            region: new.region,
+            tags: Vec::new(),
+        };
+        record.set_node_group_count(new.node_group_count);
+        record
+    }
+
+    /// Materialise the status change the clock owes this datastore.
+    pub fn settle(&mut self, now: SystemTime) {
+        settle_status(&mut self.status, &mut self.pending_status, now);
+    }
+
+    /// Start the span after which the clock owes this datastore its settled
+    /// status, leaving it in `status` until then.
+    ///
+    /// The settled status is [`STATUS_AVAILABLE`] while the datastore has a
+    /// secondary member and [`STATUS_PRIMARY_ONLY`] once it has none, which is
+    /// what that status means.
+    pub fn begin_transition(&mut self, status: &str, now: SystemTime) {
+        let settled = self.settled_status();
+        self.status = status.to_string();
+        self.pending_status = transition_to(settled, now);
+    }
+
+    /// The status this datastore settles at; see
+    /// [`GlobalReplicationGroupRecord::begin_transition`].
+    pub fn settled_status(&self) -> &'static str {
+        if self
+            .members
+            .iter()
+            .any(|member| member.role != GLOBAL_ROLE_PRIMARY)
+        {
+            STATUS_AVAILABLE
+        } else {
+            STATUS_PRIMARY_ONLY
+        }
+    }
+
+    /// The member that accepts writes, if this datastore still has one.
+    pub fn primary(&self) -> Option<&GlobalMemberRecord> {
+        self.members
+            .iter()
+            .find(|member| member.role == GLOBAL_ROLE_PRIMARY)
+    }
+
+    /// Give this datastore `count` slice groups, keeping the ones it already has
+    /// and re-slicing the keyspace evenly over the result.
+    ///
+    /// CC-02 growth bound: `count` is clamped to [`MAX_NODE_GROUPS`] here as
+    /// well as refused above it by the callers, so this allocation cannot be
+    /// driven past the shard quota by any request.
+    pub fn set_node_group_count(&mut self, count: i32) {
+        let target = usize::try_from(count.clamp(0, MAX_NODE_GROUPS)).unwrap_or(0);
+        while self.global_node_groups.len() > target {
+            self.global_node_groups.pop();
+        }
+        while self.global_node_groups.len() < target {
+            let ordinal = self.global_node_groups.len() + 1;
+            self.global_node_groups.push(GlobalNodeGroupRecord {
+                global_node_group_id: format!(
+                    "{}-{ordinal:04}",
+                    self.global_replication_group_id
+                ),
+                slots: String::new(),
+            });
+        }
+        self.rebalance_slots();
+    }
+
+    /// Re-slice the keyspace evenly over this datastore's slice groups, which is
+    /// what `RebalanceSlotsInGlobalReplicationGroup` does.
+    pub fn rebalance_slots(&mut self) {
+        let ranges = even_slot_ranges(self.global_node_groups.len());
+        for (group, range) in self.global_node_groups.iter_mut().zip(ranges) {
+            group.slots = range;
+        }
+    }
+
+    /// Keep only the slice groups `retain` names, then re-slice the keyspace.
+    pub fn retain_node_groups(&mut self, retain: &[String]) {
+        self.global_node_groups
+            .retain(|group| retain.contains(&group.global_node_group_id));
+        self.rebalance_slots();
+    }
+
+    /// The member `replication_group_id` has in `region`, if it is one.
+    pub fn member(&self, replication_group_id: &str, region: &str) -> Option<&GlobalMemberRecord> {
+        self.members.iter().find(|member| {
+            member.replication_group_id == replication_group_id && member.region == region
+        })
+    }
+
+    /// This record as the modelled `GlobalReplicationGroup`.
+    ///
+    /// `Members` is reported only when the caller asked for it
+    /// (`DescribeGlobalReplicationGroups$ShowMemberInfo`: "Returns the list of
+    /// members that comprise the Global datastore"); the mutating operations
+    /// return the datastore they changed, members and all.
+    pub fn to_modeled(&self, include_members: bool) -> GlobalReplicationGroup {
+        GlobalReplicationGroup {
+            global_replication_group_id: Some(self.global_replication_group_id.clone()),
+            global_replication_group_description: self.description.clone(),
+            status: Some(self.status.clone()),
+            cache_node_type: self.cache_node_type.clone(),
+            engine: Some(self.engine.clone()),
+            engine_version: Some(self.engine_version.clone()),
+            members: include_members.then(|| {
+                self.members
+                    .iter()
+                    .map(|member| GlobalReplicationGroupMember {
+                        replication_group_id: Some(member.replication_group_id.clone()),
+                        replication_group_region: Some(member.region.clone()),
+                        role: Some(member.role.clone()),
+                        automatic_failover: Some(member.automatic_failover.clone()),
+                        status: Some(member.status.clone()),
+                    })
+                    .collect()
+            }),
+            cluster_enabled: Some(self.cluster_enabled),
+            global_node_groups: Some(
+                self.global_node_groups
+                    .iter()
+                    .map(|group| GlobalNodeGroup {
+                        global_node_group_id: Some(group.global_node_group_id.clone()),
+                        slots: Some(group.slots.clone()),
+                    })
+                    .collect(),
+            ),
+            auth_token_enabled: Some(self.auth_token_enabled),
+            transit_encryption_enabled: self.transit_encryption_enabled,
+            at_rest_encryption_enabled: self.at_rest_encryption_enabled,
+            arn: Some(self.arn.clone()),
+        }
+    }
+}
+
+/// The status a replication group has as a member of a Global datastore, which
+/// is what `GlobalReplicationGroupMember$Status` reports.
+pub const STATUS_ASSOCIATED: &str = "associated";
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

@@ -1,15 +1,46 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateComponentType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateComponentType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Updates information in a component type stored in [`crate::state`], so
+//! `GetComponentType` reads back what the update persisted.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateComponentType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The update is a PATCH over the request's top-level members: every member it
+//! NAMES replaces the stored value for that member, and every member it does
+//! not name keeps the value already persisted. A named member is replaced
+//! WHOLE whatever its shape — a map member (`propertyDefinitions`,
+//! `functions`, `propertyGroups`, `compositeComponentTypes`) is a value, not a
+//! collection of separately addressable entries, so the entries the request
+//! carries are the entries the component type ends up with and one it leaves
+//! out is DROPPED. The API models no per-entry "remove this key", so replacing
+//! the map is the only way a caller can shorten one, and the recorded traffic
+//! observes exactly that: a property definition left out of an update's
+//! `propertyDefinitions` is gone from the component type afterwards.
+//!
+//! Like `CreateComponentType`, this update does NOT complete within the call:
+//! the `state` it answers is the non-terminal `UPDATING`, and the component
+//! type settles back in `ACTIVE` once
+//! [`crate::state::COMPONENT_TYPE_SETTLE_SPAN`] has elapsed — an instant stored
+//! on the record and materialised by the next reader, never slept for.
+//!
+//! The refusals this handler owns:
+//!
+//! * the workspace or the component type the labels name does not exist — the
+//!   modelled `ResourceNotFoundException` (HTTP 404), the same reading
+//!   `GetComponentType` gives the same two labels, since both address a
+//!   resource that must already exist;
+//! * the patched component type would hold a property definition with no
+//!   `dataType` while extending nothing — a `ValidationException`, the rule
+//!   [`crate::state::property_definition_needs_data_type`] holds for every
+//!   writer of a definition. Checked over the WHOLE patched record, because an
+//!   update that clears `extendsFrom` takes away the inheritance an older
+//!   definition was relying on.
+//!
+//! The same deliberate gaps as the create: `extendsFrom` is stored without
+//! checking that the parent component types exist (this emulator holds no
+//! registry of the service's built-in types), and authorization is not
+//! emulated, so the modelled `AccessDeniedException` is never returned. No
+//! quota applies to a call that creates nothing, so the modelled
+//! `ServiceQuotaExceededException` is not returned either.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +203,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateComponentType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateComponentTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateComponentType"))
+        // Every call is recorded, successful or refused: the real service logs
+        // control-plane access, and this one mutates tenant state.
+        ::tracing::info!(
+            operation = "UpdateComponentType",
+            workspace_id = %input.workspace_id,
+            component_type_id = %input.component_type_id,
+            "serving a request"
+        );
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateComponentTypeErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iottwinmaker store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // Both labels address an EXISTING resource, so neither naming something
+        // the store does not hold is anything but a 404 — the same reading
+        // `GetComponentType` gives the same two labels.
+        let Some(workspace) = state.workspaces.get_mut(&input.workspace_id) else {
+            return Err(UpdateComponentTypeErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::workspace_not_found_message(
+                        &input.workspace_id,
+                    )),
+                },
+            )
+            .into());
+        };
+        let Some(stored) = workspace.component_types.get_mut(&input.component_type_id) else {
+            return Err(UpdateComponentTypeErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::component_type_not_found_message(
+                        &input.workspace_id,
+                        &input.component_type_id,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        // The clock's transition first: the update applies to the record as it
+        // stands at this instant, not as the previous call left it. The service
+        // models no conflict for an update that arrives while a create or an
+        // earlier update is still in flight, so one is applied rather than
+        // refused; it simply reopens the window.
+        stored.settle(now);
+
+        // The patch is built on a COPY, so a request refused below leaves the
+        // stored record exactly as it was.
+        let mut updated = stored.clone();
+        if let Some(component_type_name) = input.component_type_name {
+            updated.component_type_name = Some(component_type_name);
+        }
+        if let Some(description) = input.description {
+            updated.description = Some(description);
+        }
+        if let Some(is_singleton) = input.is_singleton {
+            updated.is_singleton = is_singleton;
+        }
+        // A member the request NAMES is replaced WHOLE, whatever its shape: a
+        // map member is a value like a scalar or a list, not a collection of
+        // separately addressable entries, so the entries the request carries
+        // are the entries the component type ends up with and one it leaves out
+        // is dropped. That is the only way the API can shorten a map at all —
+        // it models no per-entry "remove this key" — and dropping a property
+        // definition by leaving it out is exactly what the recorded traffic
+        // observes.
+        if let Some(extends_from) = input.extends_from {
+            updated.extends_from = extends_from;
+        }
+        if let Some(property_definitions) = input.property_definitions {
+            updated.property_definitions = property_definitions.into_iter().collect();
+        }
+        if let Some(functions) = input.functions {
+            updated.functions = functions.into_iter().collect();
+        }
+        if let Some(property_groups) = input.property_groups {
+            updated.property_groups = property_groups
+                .into_iter()
+                .map(|(group_name, group)| {
+                    (
+                        group_name,
+                        crate::state::PropertyGroupRecord::from_request(group),
+                    )
+                })
+                .collect();
+        }
+        if let Some(composite_component_types) = input.composite_component_types {
+            updated.composite_component_types = composite_component_types.into_iter().collect();
+        }
+
+        // Every definition the patched record would hold has to be reportable,
+        // not just the ones this request carried: an update that clears
+        // `extendsFrom` takes the inheritance an older definition was relying
+        // on away with it.
+        for (property_name, definition) in &updated.property_definitions {
+            if crate::state::property_definition_needs_data_type(&updated.extends_from, definition)
+            {
+                return Err(UpdateComponentTypeErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "propertyDefinitions.{property_name}.dataType is required for a \
+                             component type that extends nothing"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The change has landed, so the record's `updateDateTime` moves and the
+        // component type reports the non-terminal state an update in flight is
+        // in; the clock, not a caller, settles it back in `ACTIVE`.
+        updated.begin_update(now);
+        *stored = updated;
+
+        Ok(UpdateComponentTypeOutput {
+            workspace_id: stored.workspace_id.clone(),
+            component_type_id: stored.component_type_id.clone(),
+            arn: stored.arn.clone(),
+            state: stored.state.clone(),
+        })
     }
 }

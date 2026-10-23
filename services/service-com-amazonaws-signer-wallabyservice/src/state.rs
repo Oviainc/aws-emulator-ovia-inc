@@ -333,6 +333,11 @@ impl SigningJobRecord {
     }
 }
 
+/// The cross-account permission policy of a signing profile: the statements
+/// `AddProfilePermission` writes, the revision chain they move along and the
+/// document whose size `ListProfilePermissions` reports.
+pub mod permissions;
+
 /// Per-service state for com-amazonaws-signer-wallabyservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSignerWallabyserviceState {
@@ -347,12 +352,18 @@ pub struct ComAmazonawsSignerWallabyserviceState {
     /// A `StartSigningJob` `clientRequestToken` to the job that token started, so
     /// a retried start answers with the first job instead of a second one.
     pub job_tokens: HashMap<String, String>,
+    /// The cross-account permission policy of every profile that has one, keyed by
+    /// `profileName` — the same key [`Self::profiles`] uses, so a policy always
+    /// resolves through the profile it belongs to.
+    pub profile_permissions: BTreeMap<String, permissions::ProfilePermissionPolicy>,
     /// The counter profile versions are minted from.
     pub profile_version_seq: u64,
     /// The counter profile tokens are minted from.
     pub profile_token_seq: u64,
     /// The counter job ids are minted from.
     pub job_id_seq: u64,
+    /// The counter permission-policy revision ids are minted from.
+    pub permission_revision_seq: u64,
 }
 
 impl ComAmazonawsSignerWallabyserviceState {
@@ -393,6 +404,18 @@ impl ComAmazonawsSignerWallabyserviceState {
     pub fn mint_profile_token(&mut self) -> String {
         self.profile_token_seq = self.profile_token_seq.wrapping_add(1);
         uuid_shaped(PROFILE_TOKEN_NAMESPACE, self.profile_token_seq)
+    }
+
+    /// Mint an unused permission-policy revision id.
+    ///
+    /// `revisionId` is an unconstrained string that AWS mints as a UUID, so the
+    /// counter is rendered in that shape; its namespace differs from the job-id
+    /// and profile-token ones, so a revision id can never be mistaken for either.
+    /// Strictly increasing, so a revision this mints is never one a client is
+    /// already holding.
+    pub fn mint_permission_revision_id(&mut self) -> String {
+        self.permission_revision_seq = self.permission_revision_seq.wrapping_add(1);
+        uuid_shaped(PERMISSION_REVISION_NAMESPACE, self.permission_revision_seq)
     }
 
     /// The job `job_id` names, with any completion the clock owes it already
@@ -438,6 +461,10 @@ const JOB_ID_NAMESPACE: u64 = 0;
 /// The id namespace profile tokens are minted in, so no token ever collides with
 /// a job id.
 const PROFILE_TOKEN_NAMESPACE: u64 = 1;
+
+/// The id namespace permission-policy revision ids are minted in, so no revision
+/// id ever collides with a job id or a profile token.
+const PERMISSION_REVISION_NAMESPACE: u64 = 2;
 
 /// `(namespace, counter)` rendered as the 32 hex digits of a UUID, in UUID form.
 ///

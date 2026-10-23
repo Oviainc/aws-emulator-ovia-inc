@@ -2,12 +2,12 @@
 
 //! Engine state for the com-amazonaws-gamelift-gamelift service.
 //!
-//! The hosting resources this emulator persists — fleets, the game sessions placed on
-//! them, and the player slots reserved in those sessions — plus the behaviour every
-//! handler shares over them: resolving a fleet or a game session by id or ARN,
-//! materialising the status changes the clock has already made due, minting ids and
-//! ARNs in the formats the model documents, and the opaque pagination token the
-//! paginated describes share.
+//! The hosting resources this emulator persists — fleets, the aliases that route at
+//! them, the game sessions placed on them, and the player slots reserved in those
+//! sessions — plus the behaviour every handler shares over them: resolving a fleet, an
+//! alias or a game session by id or ARN, materialising the status changes the clock has
+//! already made due, minting ids and ARNs in the formats the model documents, and the
+//! opaque pagination token the paginated describes share.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -16,15 +16,22 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AnywhereConfiguration, CertificateConfiguration, FleetAttributes, GameProperty, GameSession,
-    IpPermission, LocationState, PlayerGatewayConfiguration, PlayerSession,
-    ResourceCreationLimitPolicy, RuntimeConfiguration, Tag,
+    Alias, AnywhereConfiguration, CertificateConfiguration, FilterConfiguration, FleetAttributes,
+    GameProperty, GameSession, GameSessionQueue, GameSessionQueueDestination, IpPermission,
+    LocationState, PlayerGatewayConfiguration, PlayerLatencyPolicy, PlayerSession,
+    PriorityConfiguration, ResourceCreationLimitPolicy, RoutingStrategy, RuntimeConfiguration, Tag,
 };
 
 /// `ComputeType` values the model declares (`smithy_query shape=ComputeType`).
 pub const COMPUTE_TYPE_EC2: &str = "EC2";
 /// See [`COMPUTE_TYPE_EC2`].
 pub const COMPUTE_TYPE_ANYWHERE: &str = "ANYWHERE";
+
+/// `RoutingStrategyType` values the model declares (`smithy_query
+/// shape=RoutingStrategyType`), i.e. the two routings an alias can carry.
+pub const ROUTING_STRATEGY_TYPE_SIMPLE: &str = "SIMPLE";
+/// See [`ROUTING_STRATEGY_TYPE_SIMPLE`].
+pub const ROUTING_STRATEGY_TYPE_TERMINAL: &str = "TERMINAL";
 
 /// `FleetStatus` values this slice uses (`smithy_query shape=FleetStatus`).
 pub const FLEET_STATUS_NEW: &str = "NEW";
@@ -114,6 +121,73 @@ pub const MAX_FLEETS_PER_ACCOUNT: usize = 100;
 /// can exist, so no legitimate request is refused — and naming more than that can only
 /// be repetition, which would otherwise let one request drive an unbounded response.
 pub const MAX_FLEET_IDS_PER_REQUEST: usize = MAX_FLEETS_PER_ACCOUNT;
+
+/// How many aliases this emulator holds before `CreateAlias` answers the modelled
+/// `LimitExceededException` ("The requested operation would cause the resource to exceed
+/// the allowed service limit").
+///
+/// Like [`MAX_FLEETS_PER_ACCOUNT`], Amazon GameLift Servers caps aliases per account per
+/// Region while this emulator keeps ONE store for the account — an alias is reported
+/// whatever Region the request is signed for, and carries the Region of the request that
+/// created it in its ARN — so the cap is account-wide. The model carries no quota, so the
+/// count is CHOSEN: far above any realistic script ("a fleet can have multiple aliases"),
+/// and the bound that keeps the alias store from growing without limit.
+pub const MAX_ALIASES_PER_ACCOUNT: usize = 100;
+
+/// How many game session queues this emulator holds before `CreateGameSessionQueue`
+/// answers the modelled `LimitExceededException` ("The requested operation would cause
+/// the resource to exceed the allowed service limit").
+///
+/// Like [`MAX_FLEETS_PER_ACCOUNT`], Amazon GameLift Servers caps queues per account per
+/// Region while this emulator keeps ONE store for the account, so the cap is
+/// account-wide. The model carries no quota, so the count is CHOSEN: far above any
+/// realistic script, and the bound that keeps the queue store from growing without limit.
+pub const MAX_GAME_SESSION_QUEUES_PER_ACCOUNT: usize = 50;
+
+/// How many queue identifiers one `DescribeGameSessionQueues` request may name.
+///
+/// The model bounds `GameSessionQueueNameOrArnList` neither above nor below, and each
+/// entry that is an ARN is resolved by a scan of the queue store, so the work one request
+/// can ask for is the PRODUCT of the list length and the stored queue count. This count
+/// is CHOSEN, exactly as [`MAX_FLEET_IDS_PER_REQUEST`] is: it is
+/// [`MAX_GAME_SESSION_QUEUES_PER_ACCOUNT`], the most distinct queues that can exist, so
+/// no legitimate request is refused — and naming more than that can only be repetition.
+pub const MAX_QUEUE_NAMES_PER_REQUEST: usize = MAX_GAME_SESSION_QUEUES_PER_ACCOUNT;
+
+/// How many destinations one game session queue may list.
+///
+/// `GameSessionQueueDestinationList` carries no modelled length, and a stored queue holds
+/// the list verbatim for as long as the queue exists, so this count is CHOSEN: far above
+/// any realistic queue — a destination is a fleet or alias of the account, which
+/// [`MAX_FLEETS_PER_ACCOUNT`] already bounds — and the bound that keeps one request from
+/// deciding how much a stored record occupies.
+pub const MAX_QUEUE_DESTINATIONS: usize = MAX_FLEETS_PER_ACCOUNT;
+
+/// How many player latency policies one game session queue may list.
+///
+/// `PlayerLatencyPolicyList` carries no modelled length either, and the policies are
+/// "evaluated in order starting with the lowest maximum latency value" to "gradually
+/// relax the cap over time", so a queue needs a handful. This count is CHOSEN for the
+/// same reason as [`MAX_QUEUE_DESTINATIONS`]: it bounds what one request can make a
+/// stored record occupy.
+pub const MAX_QUEUE_PLAYER_LATENCY_POLICIES: usize = 10;
+
+/// The bounds a game session queue's `TimeoutInSeconds` must lie within.
+///
+/// `CreateGameSessionQueue$TimeoutInSeconds` and `GameSessionQueue$TimeoutInSeconds`
+/// carry the same note: "The minimum value is 10 and the maximum value is 600." The
+/// modelled `WholeNumber` range bounds the member only below (`0..`), so the documented
+/// bounds are enforced here.
+pub const QUEUE_TIMEOUT_RANGE_SECONDS: (i32, i32) = (10, 600);
+
+/// The `TimeoutInSeconds` a queue created without one carries.
+///
+/// `CreateGameSessionQueue$TimeoutInSeconds`' doc: "If you don't specify a request
+/// timeout, the queue uses a default value." Neither the model nor the docs name that
+/// value, so it is CHOSEN: the documented maximum
+/// ([`QUEUE_TIMEOUT_RANGE_SECONDS`]`.1`), the most permissive setting, which keeps a
+/// placement request queued for as long as the service allows before it times out.
+pub const DEFAULT_QUEUE_TIMEOUT_SECONDS: i32 = QUEUE_TIMEOUT_RANGE_SECONDS.1;
 
 /// The port range a fleet that opens no inbound permissions draws game-session ports
 /// from, and the range an opened one must lie within. `IpPermission$FromPort`'s doc:
@@ -245,6 +319,8 @@ pub enum PageKind {
     Fleets,
     /// `DescribeGameSessions`.
     GameSessions,
+    /// `DescribeGameSessionQueues`.
+    GameSessionQueues,
 }
 
 impl PageKind {
@@ -253,6 +329,7 @@ impl PageKind {
         match self {
             Self::Fleets => 'f',
             Self::GameSessions => 'g',
+            Self::GameSessionQueues => 'q',
         }
     }
 }
@@ -693,11 +770,175 @@ impl PlayerSessionRecord {
     }
 }
 
+/// A game session placement queue, as `CreateGameSessionQueue` persisted it.
+///
+/// `GameSessionQueue` is "configuration for a game session placement mechanism": every
+/// member of it is a setting the request supplied or the service decided, so the record
+/// holds them all and [`GameSessionQueueRecord::to_modelled`] is the one projection every
+/// read of the queue is served from.
+#[derive(Debug, Clone)]
+pub struct GameSessionQueueRecord {
+    pub name: String,
+    pub queue_arn: String,
+    pub timeout_in_seconds: i32,
+    pub player_latency_policies: Vec<PlayerLatencyPolicy>,
+    pub destinations: Vec<GameSessionQueueDestination>,
+    pub filter_configuration: Option<FilterConfiguration>,
+    pub priority_configuration: Option<PriorityConfiguration>,
+    pub custom_event_data: Option<String>,
+    pub notification_target: Option<String>,
+    /// The labels assigned to the queue resource. `GameSessionQueue` has no `Tags`
+    /// member — tags are read back through `ListTagsForResource` — so they are held on
+    /// the record and reported by no projection of it yet.
+    pub tags: Vec<Tag>,
+    pub creation_time: SystemTime,
+    /// The Region of the request that created the queue, which its ARN names.
+    pub region: String,
+}
+
+impl GameSessionQueueRecord {
+    /// This queue as the modelled `GameSessionQueue`.
+    ///
+    /// The two list members are always reported — empty for a queue configured with
+    /// none, since "a queue can't make placements without at least one destination" is a
+    /// property of an empty list, not of an absent one — while the two optional
+    /// configuration structures are reported only when the queue carries them.
+    pub fn to_modelled(&self) -> GameSessionQueue {
+        GameSessionQueue {
+            name: Some(self.name.clone()),
+            game_session_queue_arn: Some(self.queue_arn.clone()),
+            timeout_in_seconds: Some(self.timeout_in_seconds),
+            player_latency_policies: Some(self.player_latency_policies.clone()),
+            destinations: Some(self.destinations.clone()),
+            filter_configuration: self.filter_configuration.clone(),
+            priority_configuration: self.priority_configuration.clone(),
+            custom_event_data: self.custom_event_data.clone(),
+            notification_target: self.notification_target.clone(),
+        }
+    }
+}
+
+/// An alias for a fleet, as `CreateAlias` persisted it.
+///
+/// Every member of the modelled `Alias` is either a setting the request supplied or one
+/// the service decided, so the record holds them all and [`AliasRecord::to_modelled`] is
+/// the one projection every read of the alias is served from.
+#[derive(Debug, Clone)]
+pub struct AliasRecord {
+    pub alias_id: String,
+    pub alias_arn: String,
+    pub name: String,
+    pub description: Option<String>,
+    /// The routing configuration as the request configured it: what every read of the
+    /// alias reports, and what [`AliasRecord::routing`] routes a request through.
+    pub routing_strategy: RoutingStrategy,
+    /// The labels assigned to the alias resource. `Alias` has no `Tags` member — tags are
+    /// read back through `ListTagsForResource` — so they are held on the record and
+    /// reported by no projection of it yet.
+    pub tags: Vec<Tag>,
+    pub creation_time: SystemTime,
+    /// When the alias was last modified, which `UpdateAlias` moves forward.
+    pub last_updated_time: SystemTime,
+    /// The Region of the request that created the alias, which its ARN names.
+    pub region: String,
+}
+
+/// Where a request that names an alias is routed, which is what the alias's
+/// `RoutingStrategy$Type` decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AliasRouting<'a> {
+    /// `SIMPLE` — "The alias resolves to one specific fleet": the `FleetId` it names.
+    Fleet(&'a str),
+    /// `TERMINAL` — "The alias does not resolve to a fleet but instead can be used to
+    /// display a message to the user. A terminal alias throws a
+    /// TerminalRoutingStrategyException with the message embedded": that message.
+    Terminal(Option<&'a str>),
+}
+
+impl AliasRecord {
+    /// This alias as the modelled `Alias`.
+    pub fn to_modelled(&self) -> Alias {
+        Alias {
+            alias_id: Some(self.alias_id.clone()),
+            alias_arn: Some(self.alias_arn.clone()),
+            name: Some(self.name.clone()),
+            description: self.description.clone(),
+            routing_strategy: Some(self.routing_strategy.clone()),
+            creation_time: Some(to_date_time(self.creation_time)),
+            last_updated_time: Some(to_date_time(self.last_updated_time)),
+        }
+    }
+
+    /// Where this alias routes a request that names it.
+    ///
+    /// Only the two forms [`validate_routing_strategy`] accepts are ever stored, so a
+    /// strategy that is not a `SIMPLE` one naming a fleet is the `TERMINAL` one, which
+    /// resolves to no fleet at all.
+    pub fn routing(&self) -> AliasRouting<'_> {
+        match (
+            self.routing_strategy.r#type.as_deref(),
+            self.routing_strategy.fleet_id.as_deref(),
+        ) {
+            (Some(ROUTING_STRATEGY_TYPE_SIMPLE), Some(fleet_id)) => AliasRouting::Fleet(fleet_id),
+            _ => AliasRouting::Terminal(self.routing_strategy.message.as_deref()),
+        }
+    }
+}
+
+/// Whether `strategy` is one of the two routings an alias can carry, or the reason it is
+/// not — which a handler answers with the modelled `InvalidRequestException`.
+///
+/// `RoutingStrategy$Type`'s doc names both forms and what each one needs: "SIMPLE - The
+/// alias resolves to one specific fleet", so a simple strategy names the fleet it points
+/// at; "TERMINAL - The alias does not resolve to a fleet but instead can be used to
+/// display a message to the user. A terminal alias throws a
+/// TerminalRoutingStrategyException with the message embedded", so a terminal strategy
+/// carries that message. The modelled `RoutingStrategyType` enum is refused by the
+/// boundary walk before a handler runs, so an unknown type cannot reach here; which
+/// member each type requires is the service's own rule, enforced here.
+///
+/// Whether the named fleet EXISTS is deliberately not checked: an alias outlives the
+/// fleets it points at ("You can reassign an alias to another fleet by calling
+/// UpdateAlias"), so resolution is what discovers that a target has gone.
+pub fn validate_routing_strategy(strategy: &RoutingStrategy) -> Result<(), String> {
+    match strategy.r#type.as_deref() {
+        Some(ROUTING_STRATEGY_TYPE_SIMPLE) => {
+            if strategy.fleet_id.is_none() {
+                return Err(format!(
+                    "RoutingStrategy of type {ROUTING_STRATEGY_TYPE_SIMPLE} must name the fleet \
+                     it resolves to in RoutingStrategy.FleetId."
+                ));
+            }
+            Ok(())
+        }
+        Some(ROUTING_STRATEGY_TYPE_TERMINAL) => {
+            if strategy.message.is_none() {
+                return Err(format!(
+                    "RoutingStrategy of type {ROUTING_STRATEGY_TYPE_TERMINAL} must carry the \
+                     message to display in RoutingStrategy.Message."
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(format!(
+            "RoutingStrategy.Type is required, and must be {ROUTING_STRATEGY_TYPE_SIMPLE} or \
+             {ROUTING_STRATEGY_TYPE_TERMINAL}."
+        )),
+    }
+}
+
 /// Per-service state for com-amazonaws-gamelift-gamelift. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsGameliftGameliftState {
     /// Fleets by `FleetId`.
     pub fleets: HashMap<String, Fleet>,
+    /// Aliases by `AliasId`: "Alias IDs are unique within a Region", while "alias names
+    /// do not need to be unique", so the id is the alias's key.
+    pub aliases: HashMap<String, AliasRecord>,
+    /// Game session queues by `Name`: "Queue names must be unique within each Region",
+    /// and this store — like the fleet store — is the account's one store, so the name
+    /// is the queue's key.
+    pub game_session_queues: HashMap<String, GameSessionQueueRecord>,
     /// Game sessions by their full-ARN `GameSessionId`.
     pub game_sessions: HashMap<String, GameSessionRecord>,
     /// Player sessions by `PlayerSessionId`.
@@ -870,6 +1111,50 @@ impl ComAmazonawsGameliftGameliftState {
                 .then_with(|| left.game_session_id.cmp(&right.game_session_id))
         });
         sessions
+    }
+
+    /// The alias an `AliasIdOrArn` names, or `None` when no stored alias matches it.
+    ///
+    /// `AliasArn`'s doc: "In a GameLift alias ARN, the resource ID matches the alias ID
+    /// value", so either form selects the same alias.
+    pub fn resolve_alias(&self, id_or_arn: &str) -> Option<&AliasRecord> {
+        if id_or_arn.starts_with("arn:") {
+            self.aliases
+                .values()
+                .find(|alias| alias.alias_arn == id_or_arn)
+        } else {
+            self.aliases.get(id_or_arn)
+        }
+    }
+
+    /// The `Name` of the queue a `GameSessionQueueNameOrArn` names, or `None` when no
+    /// stored queue matches it.
+    ///
+    /// `GameSessionQueueArn`'s doc: "In a Amazon GameLift Servers game session queue ARN,
+    /// the resource ID matches the `Name` value", so either form selects the same queue.
+    pub fn resolve_queue_name(&self, name_or_arn: &str) -> Option<String> {
+        if name_or_arn.starts_with("arn:") {
+            self.game_session_queues
+                .values()
+                .find(|queue| queue.queue_arn == name_or_arn)
+                .map(|queue| queue.name.clone())
+        } else {
+            self.game_session_queues
+                .get(name_or_arn)
+                .map(|queue| queue.name.clone())
+        }
+    }
+
+    /// Every stored game session queue, oldest first, so a paginated walk is stable
+    /// across calls.
+    pub fn game_session_queues_in_order(&self) -> Vec<&GameSessionQueueRecord> {
+        let mut queues: Vec<&GameSessionQueueRecord> = self.game_session_queues.values().collect();
+        queues.sort_by(|left, right| {
+            left.creation_time
+                .cmp(&right.creation_time)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        queues
     }
 
     /// An address for a newly provisioned fleet instance, held by no stored fleet.

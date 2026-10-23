@@ -248,12 +248,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// `InsightNotEnabledException` (HTTP 400): "If you run GetInsightSelectors on a trail
 /// or event data store that does not have Insights events enabled, the operation throws
 /// the exception InsightNotEnabledException."
-fn insight_not_enabled(resource: &str) -> GetInsightSelectorsError {
+///
+/// The text is [`crate::state::insight_not_enabled_message`] — stated once there
+/// because every operation that reads Insights events on a resource with none enabled
+/// refuses alike — and `kind` is the noun the subject opens with, so the refusal names
+/// the resource the call actually addressed.
+fn insight_not_enabled(kind: &str, resource: &str) -> GetInsightSelectorsError {
     GetInsightSelectorsErrorModeled::InsightNotEnabledException(InsightNotEnabledException {
-        message: Some(format!(
-            "Insights event logging is not enabled on {resource}: enable it with \
-             PutInsightSelectors."
-        )),
+        message: Some(crate::state::insight_not_enabled_message(kind, resource)),
     })
     .into()
 }
@@ -303,7 +305,10 @@ fn report_trail(
         })?;
 
     if record.insight_selectors.is_empty() {
-        return Err(insight_not_enabled(&record.trail_arn));
+        return Err(insight_not_enabled(
+            crate::state::TRAIL_SUBJECT,
+            &record.trail_arn,
+        ));
     }
     Ok(GetInsightSelectorsOutput {
         // "The Amazon Resource Name (ARN) of a trail for which you want to get Insights
@@ -350,7 +355,10 @@ fn report_event_data_store(
         })?;
 
     if record.insight_selectors.is_empty() {
-        return Err(insight_not_enabled(&record.arn()));
+        return Err(insight_not_enabled(
+            crate::state::EVENT_DATA_STORE_SUBJECT,
+            &record.arn(),
+        ));
     }
     Ok(GetInsightSelectorsOutput {
         trail_arn: None,

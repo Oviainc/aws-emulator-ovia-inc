@@ -13,6 +13,14 @@
 // points it into `tests/all/`.
 #[path = "all/account_settings.rs"]
 mod account_settings;
+#[path = "all/async_invocation.rs"]
+mod async_invocation;
+#[path = "all/capacity_providers.rs"]
+mod capacity_providers;
+#[path = "all/function_aliases.rs"]
+mod function_aliases;
+#[path = "all/function_code_update.rs"]
+mod function_code_update;
 #[path = "all/function_configuration.rs"]
 mod function_configuration;
 #[path = "all/function_lifecycle.rs"]
@@ -25,9 +33,13 @@ mod function_url_config;
 mod layer_versions;
 #[path = "all/resource_policy.rs"]
 mod resource_policy;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/signing_name_routing.rs"]
 mod signing_name_routing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_function_configuration.rs"]
+mod update_function_configuration;
 #[path = "all/version_publishing.rs"]
 mod version_publishing;

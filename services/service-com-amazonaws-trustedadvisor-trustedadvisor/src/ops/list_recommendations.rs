@@ -10,8 +10,12 @@
 //! every read ([`crate::state::ComAmazonawsTrustedadvisorTrustedadvisorState::aggregates_for`]),
 //! so it always agrees with `ListRecommendationResources`.
 //!
-//! `language` is accepted and does not change the text: the store holds one
-//! (English) copy of each name and description.
+//! `language` SELECTS the text: the store holds each recommendation's `name`
+//! (and `description`) once per `RecommendationLanguage`
+//! ([`crate::state::TextCatalog`]), and this handler reports the copy the
+//! request asked for — [`crate::state::DEFAULT_LANGUAGE`] when it named no
+//! language. It is not a filter: which recommendations are reported never
+//! depends on it.
 //!
 //! ## Shape of an operation
 //!
@@ -108,14 +112,22 @@ fn millis_of(value: &::aws_smithy_types::DateTime) -> i64 {
     value.to_millis().unwrap_or(i64::MAX)
 }
 
-/// The stored recommendation, as the modelled `RecommendationSummary`.
+/// The stored recommendation, as the modelled `RecommendationSummary`, with its
+/// `name` in the language the request asked for (`None` when it named none).
 ///
-/// `pillarSpecificAggregates` and `statusReason` are left absent: the store
-/// holds no cost-savings aggregate and no status-determination discrepancy, and
-/// both members are optional.
+/// `statusReason` is left absent: the store records no discrepancy in how a
+/// status was determined, and the member is optional.
+///
+/// `pillarSpecificAggregates` is the same aggregate `GetRecommendation` reports
+/// — computed from the recommendation's own resources by
+/// [`crate::state::ComAmazonawsTrustedadvisorTrustedadvisorState::pillar_aggregates_for`],
+/// so a single read and a listing agree — and is `None` only for a
+/// recommendation that optimizes no cost.
 fn recommendation_summary(
     entry: &crate::state::RecommendationEntry,
     resources_aggregates: RecommendationResourcesAggregates,
+    pillar_specific_aggregates: Option<RecommendationPillarSpecificAggregates>,
+    language: Option<&str>,
 ) -> RecommendationSummary {
     RecommendationSummary {
         id: entry.id.clone(),
@@ -126,9 +138,9 @@ fn recommendation_summary(
         pillars: entry.pillars.clone(),
         source: entry.source.clone(),
         aws_services: Some(entry.aws_services.clone()),
-        name: entry.name.clone(),
+        name: entry.text.text(language).name.clone(),
         resources_aggregates,
-        pillar_specific_aggregates: None,
+        pillar_specific_aggregates,
         created_at: Some(crate::state::date_time(entry.created_at_millis)),
         last_updated_at: Some(crate::state::date_time(entry.last_updated_at_millis)),
         arn: entry.arn.clone(),
@@ -255,7 +267,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|(arn, entry)| {
                 (
                     arn.clone(),
-                    recommendation_summary(entry, state.aggregates_for(arn)),
+                    recommendation_summary(
+                        entry,
+                        state.aggregates_for(arn),
+                        state.pillar_aggregates_for(arn),
+                        input.language.as_deref(),
+                    ),
                 )
             })
             .collect();

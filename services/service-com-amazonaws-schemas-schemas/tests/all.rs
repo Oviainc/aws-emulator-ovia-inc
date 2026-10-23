@@ -27,6 +27,8 @@ mod empty_response_framing;
 mod error_body_codes;
 #[path = "all/iso8601_timestamps.rs"]
 mod iso8601_timestamps;
+#[path = "all/json_refusal_diagnostics.rs"]
+mod json_refusal_diagnostics;
 #[path = "all/malformed_content_and_policy_deletion.rs"]
 mod malformed_content_and_policy_deletion;
 #[path = "all/registry_schema_lifecycle.rs"]

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemovePermission
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemovePermission`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemovePermission::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the action group's statement from the profiling group's resource-based
+//! policy under optimistic locking on `revisionId`, and answers with the policy as it
+//! then stands — the empty document once the last statement is gone, which also
+//! leaves the group with no policy for `GetPolicy` to find.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +161,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemovePermission` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemovePermissionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemovePermission"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RemovePermissionErrorModeled::InternalServerException(InternalServerException {
+                message: "the profiling-group store is unavailable".to_string(),
+            })
+        })?;
+
+        // The same closed-enum refusal `PutPermission` makes: an action group whose
+        // permissions the service cannot name is not one it can hold a statement for,
+        // so it can name none to remove either.
+        if crate::state::action_group_actions(&input.action_group).is_empty() {
+            return Err(RemovePermissionErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "actionGroup must be one of {}, got {}",
+                        ACTION_GROUP_VALUES.join(", "),
+                        input.action_group
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let written = state.lock().remove_permission(
+            &input.profiling_group_name,
+            &input.action_group,
+            &input.revision_id,
+        );
+
+        match written {
+            crate::state::PolicyWrite::Written {
+                policy,
+                revision_id,
+            } => Ok(RemovePermissionOutput {
+                policy,
+                revision_id,
+            }),
+            crate::state::PolicyWrite::UnknownGroup => {
+                Err(RemovePermissionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        // The service's own not-found text for an operation ON a group,
+                        // as `crate::state` words it for every group-scoped operation.
+                        message: crate::state::group_not_found_message(
+                            &input.profiling_group_name,
+                        ),
+                    },
+                )
+                .into())
+            }
+            // Nothing to remove from: the policy this request names does not exist, so
+            // the answer is the same 404 `GetPolicy` gives for it.
+            crate::state::PolicyWrite::NoPolicy => {
+                Err(RemovePermissionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "profiling group {} has no resource-based policy granting {}",
+                            input.profiling_group_name, input.action_group
+                        ),
+                    },
+                )
+                .into())
+            }
+            crate::state::PolicyWrite::RevisionMismatch(mismatch) => Err(
+                RemovePermissionErrorModeled::ConflictException(ConflictException {
+                    message: crate::state::revision_conflict_message(
+                        &input.profiling_group_name,
+                        &mismatch,
+                    ),
+                })
+                .into(),
+            ),
+            // Unreachable: a removal only ever makes the policy smaller, so it cannot
+            // leave it past one of the store's bounds. Answered as a server fault, the
+            // same way `PutPermission` answers its own unreachable arm, rather than
+            // reported as something the caller did wrong.
+            crate::state::PolicyWrite::LimitExceeded(limit) => Err(
+                RemovePermissionErrorModeled::InternalServerException(InternalServerException {
+                    message: format!(
+                        "the resource-based policy could not be written: {}",
+                        crate::state::policy_limit_message(&input.profiling_group_name, &limit)
+                    ),
+                })
+                .into(),
+            ),
+        }
     }
 }

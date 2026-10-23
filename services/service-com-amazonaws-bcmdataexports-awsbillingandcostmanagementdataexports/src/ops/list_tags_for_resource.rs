@@ -179,15 +179,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // without a lookup is also what keeps the answer from reporting on a resource AWS
         // never looks up. The resource segment is NOT judged here: an ARN of this account
         // whose resource names no export is a resource this service looked for and did
-        // not find, which is the 404 below.
+        // not find, which is the modelled not-found below.
         crate::state::validate_taggable_resource_arn(&input.resource_arn)
             .map_err(ListTagsForResourceErrorModeled::ValidationException)?;
 
         let tags: Vec<(String, ResourceTag)> = {
             let store = state.lock();
             let stored = store.exports.get(&input.resource_arn).ok_or_else(|| {
-                ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                    crate::state::export_not_found(&input.resource_arn),
+                crate::state::tagged_resource_not_found_error(
+                    &input.resource_arn,
+                    ListTagsForResourceErrorModeled::ResourceNotFoundException,
                 )
             })?;
             crate::state::tag_list(&stored.tags)

@@ -158,7 +158,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(job_template) = state.job_template_view(&input.id) else {
             return Err(DescribeJobTemplateErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Job template {} was not found", input.id)),
+                    // EMR on EKS builds a not-found message from the id the request
+                    // asked for, in the form `<Resource type> <id> doesn't exist.` —
+                    // the form the recorded refusals of this service show for both a
+                    // job template and a security configuration.
+                    message: Some(format!("Job Template {} doesn't exist.", input.id)),
                 },
             )
             .into());

@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDocumentationPart
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDocumentationPart`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: stores one `DocumentationPart` under the API named by `restApiId` — its
+//! location completed from the entity type's valid fields, its content map kept as the
+//! JSON text the request supplied — and answers from the stored record.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDocumentationPart::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This file also holds what the documentation-part family shares: the location rules
+//! ([`validated_location`]), the content-map rule ([`validated_properties`]), the
+//! record's identity ([`location_key`]) and the one renderer of the `DocumentationPart`
+//! body ([`documentation_part_body`]) — so `GetDocumentationPart`,
+//! `GetDocumentationParts` and `ImportDocumentationParts` cannot disagree with this
+//! operation about any of them.
 //!
 //! ## Shape of an operation
 //!
@@ -94,6 +95,302 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{DocumentationPartEntry, RestApiEntry};
+
+/// The `path` a location carries when the entity type makes `path` valid and the request
+/// sets none: from `DocumentationPartLocation$path`, "The default value is `/` for the
+/// root resource."
+pub const DEFAULT_LOCATION_PATH: &str = "/";
+
+/// The `method` a location carries when the entity type makes `method` valid and the
+/// request sets none: from `DocumentationPartLocation$method`, "The default value is `*`
+/// for any method."
+pub const DEFAULT_LOCATION_METHOD: &str = "*";
+
+/// The `statusCode` a location carries when the entity type makes `statusCode` valid and
+/// the request sets none: from `DocumentationPartLocation$statusCode`, "The default value
+/// is `*` for any status code."
+pub const DEFAULT_LOCATION_STATUS_CODE: &str = "*";
+
+/// The entity types whose location may carry `path`.
+///
+/// From `DocumentationPartLocation$path`: "It is a valid field for the API entity types
+/// of `RESOURCE`, `METHOD`, `PATH_PARAMETER`, `QUERY_PARAMETER`, `REQUEST_HEADER`,
+/// `REQUEST_BODY`, `RESPONSE`, `RESPONSE_HEADER`, and `RESPONSE_BODY`."
+const PATH_ENTITY_TYPES: &[&str] = &[
+    "RESOURCE",
+    "METHOD",
+    "PATH_PARAMETER",
+    "QUERY_PARAMETER",
+    "REQUEST_HEADER",
+    "REQUEST_BODY",
+    "RESPONSE",
+    "RESPONSE_HEADER",
+    "RESPONSE_BODY",
+];
+
+/// The entity types whose location may carry `method`.
+///
+/// From `DocumentationPartLocation$method`: "It is a valid field for the API entity types
+/// of `METHOD`, `PATH_PARAMETER`, `QUERY_PARAMETER`, `REQUEST_HEADER`, `REQUEST_BODY`,
+/// `RESPONSE`, `RESPONSE_HEADER`, and `RESPONSE_BODY`."
+const METHOD_ENTITY_TYPES: &[&str] = &[
+    "METHOD",
+    "PATH_PARAMETER",
+    "QUERY_PARAMETER",
+    "REQUEST_HEADER",
+    "REQUEST_BODY",
+    "RESPONSE",
+    "RESPONSE_HEADER",
+    "RESPONSE_BODY",
+];
+
+/// The entity types whose location may carry `statusCode`.
+///
+/// From `DocumentationPartLocation$statusCode`: "It is a valid field for the API entity
+/// types of `RESPONSE`, `RESPONSE_HEADER`, and `RESPONSE_BODY`."
+const STATUS_CODE_ENTITY_TYPES: &[&str] = &["RESPONSE", "RESPONSE_HEADER", "RESPONSE_BODY"];
+
+/// The entity types whose location may carry `name`.
+///
+/// From `DocumentationPartLocation$name`: "It is a valid and required field for the API
+/// entity types of `AUTHORIZER`, `MODEL`, `PATH_PARAMETER`, `QUERY_PARAMETER`,
+/// `REQUEST_HEADER`, `REQUEST_BODY` and `RESPONSE_HEADER`. It is an invalid field for any
+/// other entity type."
+///
+/// Only the "invalid field" half of that sentence is a REFUSAL here: the
+/// `DocumentationPart$location` documentation states that "all the valid location fields
+/// are not required", so a valid field the request leaves out is defaulted (see
+/// [`validated_location`]) rather than demanded.
+const NAME_ENTITY_TYPES: &[&str] = &[
+    "AUTHORIZER",
+    "MODEL",
+    "PATH_PARAMETER",
+    "QUERY_PARAMETER",
+    "REQUEST_HEADER",
+    "REQUEST_BODY",
+    "RESPONSE_HEADER",
+];
+
+/// Emulator resource guard, NOT an AWS quota: the longest `properties` content map this
+/// emulator stores. API Gateway publishes no size for it, so the bound is chosen — the
+/// same order as the resource-policy document this service does bound
+/// ([`crate::state::MAX_POLICY_CHARS`]), which is far past the content map a
+/// documentation part carries.
+pub const MAX_PROPERTIES_CHARS: usize = 8192;
+
+/// A location member as the request SET it: `None` when it is absent, and when it is
+/// blank.
+///
+/// An empty string names no entity and no verb, and the `statusCode` pattern
+/// (`^([1-5]\d\d|\*|\s*)$`) admits a blank value, so blank is read as "not explicitly
+/// specified" — which is what the documented default is for.
+fn set_member(value: &Option<String>) -> Option<&str> {
+    value.as_deref().filter(|text| !text.trim().is_empty())
+}
+
+/// One location member, checked against the entity types it is valid for and defaulted
+/// when the type makes it valid and the request set none.
+///
+/// `Err` carries the message for a member the entity type does not make valid, naming the
+/// member, the type and the types it IS valid for — the caller has to fix the request from
+/// this text alone.
+fn located_member(
+    value: Option<&str>,
+    member: &str,
+    entity_type: &str,
+    valid_for: &[&str],
+    default: Option<&str>,
+) -> Result<Option<String>, String> {
+    let valid = valid_for.contains(&entity_type);
+    match (value, valid) {
+        (Some(value), true) => Ok(Some(value.to_string())),
+        (Some(_), false) => Err(format!(
+            "location.{member} is not a valid field for a documentation part of type \
+             {entity_type}; it is valid for {}",
+            valid_for.join(", ")
+        )),
+        // "If not explicitly specified, a valid location field is treated as a wildcard"
+        // (`DocumentationPart$location`): the documented wildcard is STORED, so every read
+        // of the part reports the location the service resolved rather than the one the
+        // request happened to spell out.
+        (None, true) => Ok(default.map(str::to_string)),
+        (None, false) => Ok(None),
+    }
+}
+
+/// Whether `value` satisfies `DocumentationPartLocation$statusCode`'s own pattern,
+/// `^([1-5]\d\d|\*|\s*)$`: a 1xx-5xx status code, the `*` wildcard, or blank.
+///
+/// The boundary validator already enforces the pattern on the MODELLED member, so this is
+/// for the one path that reaches a location without it — the `body` blob
+/// `ImportDocumentationParts` reads, whose entries are not schema-validated.
+fn status_code_matches_pattern(value: &str) -> bool {
+    if value == DEFAULT_LOCATION_STATUS_CODE || value.trim().is_empty() {
+        return true;
+    }
+    let digits: Vec<char> = value.chars().collect();
+    digits.len() == 3
+        && matches!(digits.first(), Some('1'..='5'))
+        && digits[1..].iter().all(char::is_ascii_digit)
+}
+
+/// The location as it is STORED and reported: every member the entity type makes valid,
+/// defaulted where the model documents a default, and nothing the type makes invalid.
+///
+/// One function for every operation that takes a location, so `CreateDocumentationPart`
+/// and `ImportDocumentationParts` cannot store the same location two different ways.
+///
+/// `Err` carries the message the caller has to fix the request from.
+pub fn validated_location(
+    location: &DocumentationPartLocation,
+) -> Result<DocumentationPartLocation, String> {
+    let entity_type = location.r#type.as_str();
+    // The modelled enum, which the boundary validator enforces for a schema-validated
+    // member; checked here for the import body, whose entries are not.
+    if !DOCUMENTATION_PART_TYPE_VALUES.contains(&entity_type) {
+        return Err(format!(
+            "location.type must be one of {}, got {entity_type}",
+            DOCUMENTATION_PART_TYPE_VALUES.join(", ")
+        ));
+    }
+    let path = located_member(
+        set_member(&location.path),
+        "path",
+        entity_type,
+        PATH_ENTITY_TYPES,
+        Some(DEFAULT_LOCATION_PATH),
+    )?;
+    let method = located_member(
+        set_member(&location.method),
+        "method",
+        entity_type,
+        METHOD_ENTITY_TYPES,
+        Some(DEFAULT_LOCATION_METHOD),
+    )?;
+    let status_code = located_member(
+        set_member(&location.status_code),
+        "statusCode",
+        entity_type,
+        STATUS_CODE_ENTITY_TYPES,
+        Some(DEFAULT_LOCATION_STATUS_CODE),
+    )?;
+    // `name` documents no default: it is the targeted entity's own name, so a location
+    // that sets none names no named entity rather than a wildcard one.
+    let name = located_member(
+        set_member(&location.name),
+        "name",
+        entity_type,
+        NAME_ENTITY_TYPES,
+        None,
+    )?;
+    if let Some(status_code) = &status_code {
+        if !status_code_matches_pattern(status_code) {
+            return Err(format!(
+                "location.statusCode must satisfy the pattern ^([1-5]\\d\\d|\\*|\\s*)$, got \
+                 {status_code}"
+            ));
+        }
+    }
+    // Nothing caller-sized reaches the store unchecked.
+    if let Some(path) = &path {
+        crate::state::bound_chars("location.path", path, crate::state::MAX_PATH_CHARS)?;
+    }
+    for (member, value) in [("location.method", &method), ("location.name", &name)] {
+        if let Some(value) = value {
+            crate::state::bound_chars(member, value, crate::state::MAX_STRING_CHARS)?;
+        }
+    }
+    Ok(DocumentationPartLocation {
+        r#type: entity_type.to_string(),
+        path,
+        method,
+        status_code,
+        name,
+    })
+}
+
+/// The content map as it is STORED: the request's own text, once it has been read as the
+/// JSON object the member documents.
+///
+/// From `DocumentationPart$properties`: "A content map of API-specific key-value pairs
+/// describing the targeted API entity. The map must be encoded as a JSON string" — so a
+/// `properties` that is not a JSON object is not a content map, whoever sent it. The text
+/// is kept verbatim rather than re-rendered, so what a later read reports is what the
+/// caller wrote.
+pub fn validated_properties(properties: &str) -> Result<String, String> {
+    crate::state::bound_chars("properties", properties, MAX_PROPERTIES_CHARS)?;
+    let read = ::serde_json::from_str::<::serde_json::Value>(properties)
+        .map_err(|_| "properties must be a content map encoded as a JSON string".to_string())?;
+    if !read.is_object() {
+        return Err("properties must be a content map encoded as a JSON string".to_string());
+    }
+    Ok(properties.to_string())
+}
+
+/// A documentation part's identity: the API entity its location names.
+///
+/// API Gateway documents a documentation part as "a documentation part for a targeted API
+/// entity", so the completed location is the record's key — which is what makes a second
+/// part at one location a conflict and what an import's `merge` mode lands on. Compared
+/// after [`validated_location`], so two locations that differ only in a member the request
+/// left to its default name ONE entity.
+pub fn location_key(location: &DocumentationPartLocation) -> [String; 5] {
+    [
+        location.r#type.clone(),
+        location.path.clone().unwrap_or_default(),
+        location.method.clone().unwrap_or_default(),
+        location.status_code.clone().unwrap_or_default(),
+        location.name.clone().unwrap_or_default(),
+    ]
+}
+
+/// The stored documentation part of `api` at `location`, when the API documents that
+/// entity.
+pub fn part_at_location<'a>(
+    api: &'a RestApiEntry,
+    location: &DocumentationPartLocation,
+) -> Option<&'a DocumentationPartEntry> {
+    let key = location_key(location);
+    api.documentation_parts
+        .values()
+        .find(|part| location_key(&part.location) == key)
+}
+
+/// The `ConflictException` message for a location another documentation part of the same
+/// API already documents.
+///
+/// Built from the request: it names the entity whose documentation already exists, which
+/// is the one thing the caller has to change.
+pub fn location_clash_message(location: &DocumentationPartLocation) -> String {
+    let mut named = vec![format!("type={}", location.r#type)];
+    for (member, value) in [
+        ("path", &location.path),
+        ("method", &location.method),
+        ("statusCode", &location.status_code),
+        ("name", &location.name),
+    ] {
+        if let Some(value) = value {
+            named.push(format!("{member}={value}"));
+        }
+    }
+    format!(
+        "Documentation part already exists for the specified location: {}",
+        named.join(", ")
+    )
+}
+
+/// The `DocumentationPart` body for a stored part — the one place this crate renders that
+/// shape, so `CreateDocumentationPart`, `GetDocumentationPart`, `GetDocumentationParts`
+/// and an import cannot report one record differently.
+pub fn documentation_part_body(entry: &DocumentationPartEntry) -> CreateDocumentationPartOutput {
+    CreateDocumentationPartOutput {
+        id: Some(entry.id.clone()),
+        location: Some(entry.location.clone()),
+        properties: Some(entry.properties.clone()),
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -167,18 +464,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDocumentationPart` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDocumentationPartErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDocumentationPart"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // Every refusal below is the modelled 400: the request's location or content map
+        // is wrong, and the message names what to fix.
+        fn bad_request(message: String) -> CreateDocumentationPartError {
+            CreateDocumentationPartErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into()
+        }
+
+        // Both are read BEFORE the store lock is taken, so a bad location or an over-sized
+        // content map never reaches the records.
+        let location = validated_location(&input.location).map_err(bad_request)?;
+        let properties = validated_properties(&input.properties).map_err(bad_request)?;
+
+        let mut store = state.lock();
+
+        {
+            let api = store.rest_apis.get(&input.rest_api_id).ok_or_else(|| {
+                CreateDocumentationPartErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
+                })
+            })?;
+            // One part per request, and at most this many per API: the store cannot grow
+            // past the quota however many requests arrive.
+            if api.documentation_parts.len() >= crate::state::MAX_DOCUMENTATION_PARTS_PER_API {
+                return Err(CreateDocumentationPartErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        retry_after_seconds: None,
+                        message: Some(format!(
+                            "Maximum number of documentation parts exceeded for this API: {}",
+                            crate::state::MAX_DOCUMENTATION_PARTS_PER_API
+                        )),
+                    },
+                )
+                .into());
+            }
+            // One documentation part per API entity: a second part at one location would
+            // make that entity's documentation ambiguous.
+            if part_at_location(api, &location).is_some() {
+                return Err(CreateDocumentationPartErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(location_clash_message(&location)),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let id = store.mint_id();
+        let sequence = store.next_sequence();
+
+        let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {
+            CreateDocumentationPartErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
+            })
+        })?;
+        api.documentation_parts.insert(
+            id.clone(),
+            DocumentationPartEntry {
+                id: id.clone(),
+                location,
+                properties,
+                sequence,
+            },
+        );
+        // Rendered from the record that was just stored, so the answer is the stored part
+        // and not the request read back.
+        let body = api
+            .documentation_parts
+            .get(&id)
+            .map(documentation_part_body)
+            // Unreachable: the entry was inserted under this id a statement ago. A miss
+            // would mean the store did not keep it, which is answered as the server-side
+            // failure it would be rather than reported as a success.
+            .ok_or_else(crate::state::state_unavailable)?;
+        // Everything below is owned, so the store lock is released before the access
+        // record is emitted: the critical section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome.
+        // Metadata only — never the content map itself.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            rest_api = ?input.rest_api_id,
+            documentation_part = ?id,
+            outcome = "created",
+            "documentation part created",
+        );
+        Ok(body)
     }
 }

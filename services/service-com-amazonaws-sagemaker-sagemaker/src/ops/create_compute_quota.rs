@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateComputeQuota
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateComputeQuota`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateComputeQuota::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: validates the `ClusterArn` against `crate::state` BEFORE any
+//! name-conflict arbitration — a cluster this account does not hold is a 400
+//! `ValidationException`, since this operation models no not-found error — then refuses
+//! a quota name already used in that cluster as a `ConflictException` and otherwise
+//! stores the definition `Creating` in the compute-allocation slice, minting its id and
+//! ARN. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +159,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateComputeQuota` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateComputeQuotaErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateComputeQuota"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let region = crate::state::request_region(ctx);
+
+        let mut store = state.lock();
+        // Cluster existence is validated FIRST, before any name-conflict arbitration: two
+        // callers racing the same name against a cluster that does not exist are both
+        // refused for the cluster, and neither learns whether the name was free. The
+        // `ClusterArn` is a request parameter and this operation models no not-found
+        // error, so the refusal is a 400 `ValidationException`.
+        if store.cluster_by_arn(&input.cluster_arn).is_none() {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Specified cluster not found: {}.",
+                input.cluster_arn
+            )));
+        }
+        // A name already in use is a conflict, never an overwrite: this operation models
+        // `ConflictException` for exactly that. The scope is the CLUSTER the `ClusterArn`
+        // names, as `CreateComputeQuota$Name` documents ("The name must be unique within
+        // the SageMaker AI HyperPod cluster specified by ClusterArn. You can use the same
+        // name in other clusters"), so the check is keyed by (ClusterArn, Name).
+        if let Some(existing) = store
+            .compute_quotas
+            .values()
+            .find(|quota| quota.cluster_arn == input.cluster_arn && quota.name == input.name)
+        {
+            return Err(CreateComputeQuotaErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Compute quota \"{}\" already exists in cluster \"{}\".",
+                    existing.name, existing.cluster_arn
+                )),
+            })
+            .into());
+        }
+        // The store is bounded, so a caller varying `Name` cannot grow it without end.
+        if !store.compute_quotas_below_quota() {
+            return Err(CreateComputeQuotaErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The account-level service limit for compute quotas is {}, with \
+                         current utilization of {} and a request delta of 1.",
+                        crate::state::COMPUTE_QUOTA_QUOTA,
+                        store.compute_quotas.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The id is the server's, minted by the compute-allocation slice's own mint so no
+        // two quotas share one.
+        let id = store.mint_compute_quota_id();
+        let arn = crate::state::resource_arn(&region, "compute-quota", &id);
+        let now = ::std::time::SystemTime::now();
+        store.compute_quotas.insert(
+            id.clone(),
+            crate::state::ComputeQuota {
+                id: id.clone(),
+                arn: arn.clone(),
+                name: input.name,
+                description: input.description,
+                cluster_arn: input.cluster_arn,
+                config: input.compute_quota_config,
+                target: input.compute_quota_target,
+                // "Use to enable or disable compute allocation. Default is Enabled."
+                activation_state: input
+                    .activation_state
+                    .unwrap_or_else(|| crate::state::DEFAULT_ACTIVATION_STATE.to_string()),
+                version: crate::state::FIRST_COMPUTE_QUOTA_VERSION,
+                status: crate::state::STATUS_QUOTA_CREATING.to_string(),
+                // Nothing has failed: the quota is being created.
+                failure_reason: None,
+                tags: input.tags.unwrap_or_default(),
+                creation_time: now,
+                last_modified_time: now,
+                created_status_at: now + crate::state::COMPUTE_QUOTA_CREATED_AFTER,
+            },
+        );
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateComputeQuotaOutput {
+            compute_quota_arn: arn,
+            compute_quota_id: id,
+        })
     }
 }

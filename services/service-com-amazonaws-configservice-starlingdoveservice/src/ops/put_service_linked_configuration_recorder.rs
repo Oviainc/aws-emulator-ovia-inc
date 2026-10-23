@@ -275,7 +275,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // Config records with the service-linked role this API creates in the
                 // account, not with a role the caller names: this operation takes no
                 // `roleARN`.
-                role_arn: crate::state::config_service_linked_role_arn(),
+                role_arn: Some(crate::state::config_service_linked_role_arn()),
                 // "The configuration recorder's name, recordingGroup, recordingMode,
                 // and recordingScope is set by the service that is linked to the
                 // configuration recorder": the linked service records every supported
@@ -287,6 +287,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 recording_mode: Some(crate::state::materialised_recording_mode(None)),
                 recording_scope: Some(crate::state::RECORDING_SCOPE_INTERNAL.to_string()),
                 service_principal: Some(service_principal.clone()),
+                // A connector and the scope of third-party resources it records belong
+                // to a recorder `PutThirdPartyServiceLinkedConfigurationRecorder`
+                // created; this recorder records this account's own resources.
+                connector_arn: None,
+                scope_configuration: None,
                 // A provider names the third-party cloud a recorder records from, which
                 // only `PutThirdPartyServiceLinkedConfigurationRecorder` sets.
                 provider: None,
@@ -301,7 +306,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for it: the caller cannot start or stop one.
         store.recorder_status.insert(
             name.clone(),
-            crate::state::RecorderStatusEntry::started(&name, &arn, now),
+            crate::state::RecorderStatusEntry::started(&name, &arn, &service_principal, now),
         );
 
         Ok(PutServiceLinkedConfigurationRecorderOutput {

@@ -8,6 +8,12 @@
 //! `Alias` "must be unique and identifiable", so a second create under a live alias is
 //! refused with the modelled `ConflictException`.
 //!
+//! The ACCOUNT-level Incident Manager precondition
+//! ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`])
+//! is evaluated FIRST: a contact lives in the Regions of the account's replication set, so
+//! an account with no ACTIVE one is refused with the modelled `ValidationException`
+//! (HTTP 400) and nothing is minted or written.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -181,11 +187,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let mut state = state.lock();
+
+        // The account gate comes FIRST: Amazon SSM Contacts is fronted by the account's
+        // Incident Manager replication set, and a contact lives in that set's Regions, so
+        // until the account has an ACTIVE one there is no home Region to create it in and
+        // the call is refused rather than serviced — before anything in the request is
+        // resolved, and before anything is written.
+        state
+            .require_active_replication_set()
+            .map_err(account_precondition_failed)?;
+
         // `Type` is an enum SHAPE, which reaches a handler as a plain string: the
         // boundary validator enforces length/pattern/range, not an enum's value set.
         check_enum("type", &input.r#type, CONTACT_TYPE_VALUES).map_err(validation)?;
-
-        let mut state = state.lock();
 
         // A retried create carrying the token its first call carried is the SAME call:
         // "a token ensuring that the operation is called only once with the specified
@@ -255,7 +270,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The `resourceType` this operation's conflict and quota errors name.
 const CONTACT_RESOURCE_TYPE: &str = "contact";
 
-/// This operation's modelled `ValidationException`, carrying `message`.
+/// The account precondition's refusal: this operation's modelled `ValidationException`,
+/// which the model classifies `client` with `httpError` 400.
+///
+/// `reason` carries `OTHER` — the model's `ValidationExceptionReason` set is
+/// `CANNOT_PARSE | FIELD_VALIDATION_FAILED | OTHER | UNKNOWN_OPERATION`, and an
+/// account-level failure is none of the first three — and `fields` is present but EMPTY,
+/// because no member of the request is at fault.
+fn account_precondition_failed(message: String) -> CreateContactError {
+    CreateContactErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some("OTHER".to_string()),
+        fields: Some(Vec::new()),
+    })
+    .into()
+}
+
+/// A member-level refusal: this operation's modelled `ValidationException`, carrying
+/// `message`.
 fn validation(message: impl Into<String>) -> CreateContactError {
     CreateContactErrorModeled::ValidationException(ValidationException {
         message: message.into(),

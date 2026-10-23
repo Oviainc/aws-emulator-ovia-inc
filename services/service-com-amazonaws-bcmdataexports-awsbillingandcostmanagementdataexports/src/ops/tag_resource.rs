@@ -180,9 +180,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         let stored = store.exports.get_mut(&input.resource_arn).ok_or_else(|| {
-            TagResourceErrorModeled::ResourceNotFoundException(crate::state::export_not_found(
+            crate::state::tagged_resource_not_found_error(
                 &input.resource_arn,
-            ))
+                TagResourceErrorModeled::ResourceNotFoundException,
+            )
         })?;
 
         // A key already on the export takes a new value rather than adding a tag, so only

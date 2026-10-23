@@ -1,16 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! `GetExecution` over the awsJson1_1 wire.
+//! `GetExecution` and `ListExecutions` over the awsJson1_1 wire.
 //!
 //! The rule under test: `GetExecution` reports the recorded execution its two ids name —
 //! the `ExecutionId`, that execution's `ExecutionStatus`, and the snapshot of the export
 //! definition the execution was generated from ("This export data is a snapshot from when
 //! the execution was generated… The data could be different from the current export data
 //! if the export was updated since" — smithy_query shape `GetExecutionResponse`, member
-//! `Export`) — and otherwise answers the modelled `ResourceNotFoundException` (HTTP 404):
+//! `Export`) — and otherwise answers the modelled `ResourceNotFoundException` (at the
+//! status this service answers the not-found condition with,
+//! `export_lifecycle::NOT_FOUND_STATUS`), reporting the EXECUTION as absent — the resource
+//! it addresses — while the modelled `ResourceId` / `ResourceType` name whichever
+//! identifier resolved to nothing:
 //! for an `ExportArn` that names no export, and for an `ExecutionId` that names no
 //! execution OF THAT export. It never answers an error the operation does not model, and
-//! reading an execution changes nothing a later caller sees.
+//! reading an execution changes nothing a later caller sees. `ListExecutions` reports the
+//! executions of the export its ARN names — all of them and no other export's, in one
+//! stable order, paged — and answers 200 with an EMPTY list for an ARN that names no
+//! export, which is recorded AWS behaviour for this one listing.
 //!
 //! Nothing in this emulator CREATES an execution — an execution records a data-plane
 //! delivery (a query run and a file written to the caller's bucket), which this emulator
@@ -32,11 +39,11 @@ use service_com_amazonaws_bcmdataexports_awsbillingandcostmanagementdataexports:
     ExecutionStatus, EXECUTION_STATUS_CODE_VALUES,
 };
 use service_com_amazonaws_bcmdataexports_awsbillingandcostmanagementdataexports::state::{
-    StoredExecution, EXPORT_NOT_FOUND_MESSAGE,
+    StoredExecution, EXECUTION_NOT_FOUND_MESSAGE,
 };
 use service_com_amazonaws_bcmdataexports_awsbillingandcostmanagementdataexports::ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState as State;
 
-use crate::export_lifecycle::{cases, error_code, Client};
+use crate::export_lifecycle::{cases, error_code, Client, NOT_FOUND_STATUS};
 
 /// The ids a bogus-execution lookup is tried with: the recorded shape (a UUID), and the
 /// other forms `ExecutionId` admits (`@length 0..1024`, `@pattern ^[\S\s]*$` —
@@ -132,8 +139,8 @@ async fn an_execution_id_that_names_nothing_is_a_modelled_not_found() {
             .await;
         assert_eq!(
             (status, error_code(&body).as_str()),
-            (404, "ResourceNotFoundException"),
-            "case {label:?}: expected HTTP 404 ResourceNotFoundException, got {status} with {body}"
+            (NOT_FOUND_STATUS, "ResourceNotFoundException"),
+            "case {label:?}: expected the modelled ResourceNotFoundException, got {status} with {body}"
         );
         assert_eq!(
             (
@@ -142,15 +149,17 @@ async fn an_execution_id_that_names_nothing_is_a_modelled_not_found() {
                 body["ResourceType"].as_str(),
             ),
             (
-                Some(EXPORT_NOT_FOUND_MESSAGE),
+                Some(EXECUTION_NOT_FOUND_MESSAGE),
                 Some(id.as_str()),
                 Some("Execution"),
             ),
-            "case {label:?}: the 404 must report the execution it could not find, got {body}"
+            "case {label:?}: the refusal must report the execution it could not find, got {body}"
         );
     }
 
-    // An ARN that names no export is a not-found about the EXPORT, reported as such.
+    // An ARN that names no export leaves the pair naming no execution, so the refusal is
+    // worded as the absent EXECUTION while its members name the ARN that resolved to
+    // nothing.
     let absent = ::engine::emulator_arn("bcm-data-exports", "us-east-1", "export/never_created");
     let (status, body) = client
         .call(
@@ -162,16 +171,18 @@ async fn an_execution_id_that_names_nothing_is_a_modelled_not_found() {
         (
             status,
             error_code(&body).as_str(),
+            body["Message"].as_str(),
             body["ResourceId"].as_str(),
             body["ResourceType"].as_str(),
         ),
         (
-            404,
+            NOT_FOUND_STATUS,
             "ResourceNotFoundException",
+            Some(EXECUTION_NOT_FOUND_MESSAGE),
             Some(absent.as_str()),
             Some("Export"),
         ),
-        "an ARN naming no export must be reported as the absent export, got {body}"
+        "an ARN naming no export must report the execution as absent while naming the ARN, got {body}"
     );
 }
 
@@ -259,7 +270,7 @@ async fn a_recorded_execution_is_reported_from_the_store() {
             .await;
         assert_eq!(
             (status, error_code(&body).as_str()),
-            (404, "ResourceNotFoundException"),
+            (NOT_FOUND_STATUS, "ResourceNotFoundException"),
             "case {execution_id:?} under {other}: an execution belongs to ONE export, got {status} with {body}"
         );
     }
@@ -301,5 +312,238 @@ async fn a_recorded_execution_is_reported_from_the_store() {
     assert_eq!(
         after, before,
         "an execution reports the snapshot it was generated from, not the current definition"
+    );
+}
+
+/// RULE: `ListExecutions` reports the executions OF THE EXPORT its ARN names — every one
+/// of them, no other export's, in one stable order — and an export with none reports an
+/// empty list rather than a refusal.
+///
+/// Asserted over a table whose rows differ along the number of recorded executions (none,
+/// one, several) and over two exports, so an execution of one is never listed for the
+/// other.
+#[tokio::test]
+async fn list_executions_reports_the_executions_of_its_own_export() {
+    let (client, engine) = client_and_engine();
+
+    let first = create_export(&client, 0).await;
+    let second = create_export(&client, 1).await;
+
+    // An export that has recorded none lists none: nothing in this emulator creates an
+    // execution, so this is the ordinary answer.
+    for (label, arn) in [("first", &first), ("second", &second)] {
+        let body = client
+            .ok("ListExecutions", &json!({ "ExportArn": arn }))
+            .await;
+        assert_eq!(
+            body["Executions"],
+            json!([]),
+            "case {label:?}: an export with no recorded execution must list none, got {body}"
+        );
+        assert!(
+            body.get("NextToken").is_none(),
+            "case {label:?}: a last page must omit NextToken, got {body}"
+        );
+    }
+
+    // Record several executions of the first export and one of the second.
+    let mut expected_first: Vec<String> = Vec::new();
+    for (index, _) in EXECUTION_STATUS_CODE_VALUES.iter().enumerate() {
+        let execution_id = format!("list-{index:04}-0000-0000-0000-000000000000");
+        record_execution(&engine, &first, &execution_id, index);
+        expected_first.push(execution_id);
+    }
+    expected_first.sort();
+    let only_second = "second-0000-0000-0000-000000000000".to_string();
+    record_execution(&engine, &second, &only_second, 0);
+
+    for (label, arn, expected) in [
+        ("the first export", &first, expected_first.clone()),
+        ("the second export", &second, vec![only_second.clone()]),
+    ] {
+        let body = client
+            .ok("ListExecutions", &json!({ "ExportArn": arn }))
+            .await;
+        let listed: Vec<String> = body["Executions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {label:?}: ListExecutions must report a list: {body}"))
+            .iter()
+            .map(|reference| {
+                reference["ExecutionId"]
+                    .as_str()
+                    .unwrap_or_else(|| {
+                        panic!("case {label:?}: a reference carries its ExecutionId: {body}")
+                    })
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            listed, expected,
+            "case {label:?}: expected exactly this export's executions {expected:?}, got {listed:?}"
+        );
+        // Each reference carries that execution's own recorded status.
+        for reference in body["Executions"].as_array().unwrap_or(&Vec::new()) {
+            let execution_id = reference["ExecutionId"].as_str().unwrap_or_default();
+            let reported = client
+                .ok(
+                    "GetExecution",
+                    &json!({ "ExportArn": arn, "ExecutionId": execution_id }),
+                )
+                .await;
+            assert_eq!(
+                reference["ExecutionStatus"],
+                reported["ExecutionStatus"],
+                "case {label:?}: the listed status of {execution_id} must be the one GetExecution reports, got {reference}"
+            );
+        }
+
+        // A listing changes nothing a later caller sees.
+        let again = client
+            .ok("ListExecutions", &json!({ "ExportArn": arn }))
+            .await;
+        assert_eq!(
+            again, body,
+            "case {label:?}: ListExecutions is a reporting operation and must answer identically"
+        );
+    }
+}
+
+/// RULE: the listing pages — each page carries at most `MaxResults` references, the token
+/// resumes immediately after it, every execution appears exactly once over the pages, and
+/// the last page carries no token. A token this listing never issued is refused.
+#[tokio::test]
+async fn list_executions_pages_over_every_recorded_execution() {
+    let (client, engine) = client_and_engine();
+    let arn = create_export(&client, 0).await;
+
+    let total = EXECUTION_STATUS_CODE_VALUES.len();
+    let mut expected: Vec<String> = Vec::new();
+    for index in 0..total {
+        let execution_id = format!("page-{index:04}-0000-0000-0000-000000000000");
+        record_execution(&engine, &arn, &execution_id, index);
+        expected.push(execution_id);
+    }
+    expected.sort();
+
+    for page_size in 1..=total + 1 {
+        let case = format!("MaxResults {page_size}");
+        let mut seen: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let mut request = json!({ "ExportArn": arn, "MaxResults": page_size });
+            if let Some(token) = &token {
+                request
+                    .as_object_mut()
+                    .expect("the request is a JSON object")
+                    .insert("NextToken".to_string(), json!(token));
+            }
+            let body = client.ok("ListExecutions", &request).await;
+            let references = body["Executions"]
+                .as_array()
+                .unwrap_or_else(|| panic!("case {case:?}: a page must carry Executions: {body}"))
+                .clone();
+            assert!(
+                references.len() <= page_size,
+                "case {case:?}: a page must carry at most {page_size} references, got {body}"
+            );
+            for reference in &references {
+                seen.push(
+                    reference["ExecutionId"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+            }
+            pages += 1;
+            assert!(
+                pages <= total + 2,
+                "case {case:?}: paging must terminate, got {pages} pages"
+            );
+            match body.get("NextToken").and_then(Value::as_str) {
+                Some(next) => token = Some(next.to_string()),
+                None => break,
+            }
+        }
+        assert_eq!(
+            seen, expected,
+            "case {case:?}: every execution must appear exactly once, in order, got {seen:?}"
+        );
+    }
+
+    // A token this listing never issued is refused rather than resumed somewhere.
+    for bogus in ["not-a-token", "00", "6e6f7420612074616720617420616c6c"] {
+        let (status, body) = client
+            .call(
+                "ListExecutions",
+                &json!({ "ExportArn": arn, "NextToken": bogus }),
+            )
+            .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "ValidationException"),
+            "case {bogus:?}: a token this listing never issued must be refused, got {status} with {body}"
+        );
+    }
+}
+
+/// RULE: `ListExecutions` on an ARN that names no export answers 200 with an EMPTY list
+/// — recorded AWS behaviour for this listing, and unlike every other ARN-addressed
+/// operation of this service, which answers the not-found refusal. The answer is the
+/// executions recorded for that ARN, and an unknown ARN has none.
+#[tokio::test]
+async fn list_executions_on_an_absent_export_lists_none() {
+    let (client, engine) = client_and_engine();
+    let live = create_export(&client, 0).await;
+    // A recorded execution of a LIVE export, so an empty answer below is about the ARN
+    // asked for and not about an empty store.
+    record_execution(&engine, &live, "live-0000-0000-0000-000000000000", 0);
+    let other = create_export(&client, 1).await;
+    client
+        .ok("DeleteExport", &json!({ "ExportArn": other }))
+        .await;
+
+    let absent = [
+        (
+            "never created",
+            ::engine::emulator_arn("bcm-data-exports", "us-east-1", "export/never_created"),
+        ),
+        ("deleted", other.clone()),
+        (
+            "another region",
+            ::engine::emulator_arn("bcm-data-exports", "eu-west-1", "export/never_created"),
+        ),
+        (
+            "another account",
+            "arn:aws:bcm-data-exports:us-east-1:111122223333:export/isolated".to_string(),
+        ),
+    ];
+    for (label, arn) in absent {
+        let body = client
+            .ok("ListExecutions", &json!({ "ExportArn": arn }))
+            .await;
+        assert_eq!(
+            body["Executions"],
+            json!([]),
+            "case {label:?}: an ARN that names no export lists no execution, got {body}"
+        );
+        assert!(
+            body.get("NextToken").is_none(),
+            "case {label:?}: a last page must omit NextToken, got {body}"
+        );
+    }
+
+    // And the live export's own execution is still listed, so the empty answers above are
+    // not an empty store.
+    let body = client
+        .ok("ListExecutions", &json!({ "ExportArn": live }))
+        .await;
+    assert_eq!(
+        body["Executions"]
+            .as_array()
+            .map(std::vec::Vec::len)
+            .unwrap_or_default(),
+        1,
+        "the live export's recorded execution must still be listed, got {body}"
     );
 }

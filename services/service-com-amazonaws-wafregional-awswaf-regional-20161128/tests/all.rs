@@ -20,10 +20,14 @@ mod geo_match_set_lifecycle;
 mod harness;
 #[path = "all/ip_set_lifecycle.rs"]
 mod ip_set_lifecycle;
+#[path = "all/permission_policy.rs"]
+mod permission_policy;
 #[path = "all/rate_based_rule_lifecycle.rs"]
 mod rate_based_rule_lifecycle;
 #[path = "all/regex_pattern_set.rs"]
 mod regex_pattern_set;
+#[path = "all/regex_pattern_set_updates.rs"]
+mod regex_pattern_set_updates;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/rule_group_lifecycle.rs"]
@@ -34,6 +38,8 @@ mod rule_lifecycle;
 mod rule_predicates;
 #[path = "all/size_constraint_set.rs"]
 mod size_constraint_set;
+#[path = "all/size_constraint_set_updates.rs"]
+mod size_constraint_set_updates;
 #[path = "all/sql_injection_match_set.rs"]
 mod sql_injection_match_set;
 #[path = "all/sql_injection_match_set_updates.rs"]

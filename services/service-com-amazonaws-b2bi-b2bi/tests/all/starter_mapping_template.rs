@@ -25,7 +25,8 @@ use service_com_amazonaws_b2bi_b2bi::ops::types::MAPPING_TYPE_VALUES;
 
 // The wire harness this test target shares: one b2bi service on one shared engine, a
 // signed awsJson1_0 call, and the `__type` of an error body.
-use crate::onboarding_loop::{b2bi_router, call, error_code};
+use crate::edi_parsing::{given_object, X12_850 as X12_850_SAMPLE, BUCKET};
+use crate::onboarding_loop::{b2bi_router, call, error_code, s3};
 
 /// The request body for one starter template.
 fn request(mapping_type: &str, transaction_set: &str, version: &str) -> Value {
@@ -460,6 +461,111 @@ async fn the_same_request_always_answers_with_the_same_template() {
     }
 }
 
+/// One row of the sample table: the case, the sample's key and content, the mapping type,
+/// then what the derived template must carry — the sample's ST01, ISA06 and GS08, and the
+/// (business field, sample value) pair that must have become a placeholder.
+type SampleCase<'a> = (
+    &'a str,
+    &'a str,
+    &'a str,
+    &'a str,
+    &'a str,
+    &'a str,
+    &'a str,
+    (&'a str, &'a str),
+);
+
+/// RULE: when `outputSampleLocation` names a readable sample EDI object, the template is
+/// DERIVED FROM THAT SAMPLE — the sample's envelope values (ISA/GS/ST…) are carried
+/// through verbatim and each transaction-set business field becomes a marker over the
+/// value the sample carried there — rather than generated from `templateDetails` alone.
+///
+/// The rows differ along what the rule generalises over: the sample's transaction set and
+/// release, the delimiters it is written with, and the requested mapping type.
+#[tokio::test]
+async fn a_template_generated_from_a_sample_carries_the_samples_own_values() {
+    use service_com_amazonaws_b2bi_b2bi::ops::create_starter_mapping_template::SAMPLE_PLACEHOLDER_PREFIX;
+
+    let router = b2bi_router();
+
+    /// A sample 810 invoice at release 005010, written with `|` between elements — the
+    /// sample's own delimiters, transaction set and release, none of them the request's.
+    const SAMPLE_810: &str = concat!(
+        "ISA|00|          |00|          |ZZ|INVSENDER      |ZZ|INVRECEIVER    ",
+        "|240201|0900|^|00501|000000009|0|P|>\n",
+        "GS|IN|INVSENDER|INVRECEIVER|20240201|0900|9|X|005010\n",
+        "ST|810|0009\n",
+        "BIG|20240201|INV-42|20240101|PO-77\n",
+        "SE|3|0009\n",
+        "GE|1|9\n",
+        "IEA|1|000000009\n",
+    );
+
+    // Each row: the case, the sample's key and content, the mapping type, and what the
+    // template must carry — the sample's ST01, its ISA06, its GS08 and the
+    // (business field, sample value) pair that must have become a placeholder.
+    let cases: Vec<SampleCase<'_>> = vec![
+        (
+            "an 850 sample, JSONATA",
+            "samples/sample-850.edi",
+            X12_850_SAMPLE,
+            "JSONATA",
+            "850",
+            "SENDER",
+            "004010",
+            ("BEG_03", "PO12345"),
+        ),
+        (
+            "an 850 sample, XSLT",
+            "samples/sample-850.edi",
+            X12_850_SAMPLE,
+            "XSLT",
+            "850",
+            "SENDER",
+            "004010",
+            ("BEG_03", "PO12345"),
+        ),
+        (
+            "an 810 sample at release 5010 with pipe delimiters, JSONATA",
+            "samples/sample-810.edi",
+            SAMPLE_810,
+            "JSONATA",
+            "810",
+            "INVSENDER",
+            "005010",
+            ("BIG_02", "INV-42"),
+        ),
+    ];
+
+    for (case, key, body, mapping_type, st01, isa06, gs08, (field, sample_value)) in cases {
+        given_object(&router, key, body).await;
+        let mut request = request(mapping_type, "X12_850", "VERSION_4010");
+        request["outputSampleLocation"] = json!({ "bucketName": BUCKET, "key": key });
+        let (status, response) = call(&router, "CreateStarterMappingTemplate", request).await;
+        let template = mapping_template(case, status, &response);
+
+        // The envelope values come from the SAMPLE, not from the request: the request
+        // names X12_850 / VERSION_4010 in every row, so an 810 sample at release 5010
+        // proves the template was derived from the file.
+        for expected in [st01, isa06, gs08] {
+            assert!(
+                template.contains(expected),
+                "case {case:?}: the template must carry the sample's {expected:?}, got {template}"
+            );
+        }
+        let marker = format!("{SAMPLE_PLACEHOLDER_PREFIX}{sample_value}");
+        assert!(
+            template.contains(&marker),
+            "case {case:?}: the business field {field} must become {marker:?}, got {template}"
+        );
+        assert!(
+            !template.contains(PLACEHOLDER_PREFIX),
+            "case {case:?}: a sample-derived template carries the sample's values, not the \
+             placeholders of a template generated without one, got {template}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn every_modelled_mapping_type_generates_a_template() {
     let router = b2bi_router();
@@ -558,34 +664,55 @@ async fn a_request_the_model_does_not_declare_is_refused() {
     }
 }
 
+/// RULE: `outputSampleLocation` is resolved through Amazon S3, and only a sample that
+/// genuinely does not resolve is the modelled `ResourceNotFoundException` (404): a missing
+/// bucket and a missing key both are. A location that names no object at all — no bucket,
+/// or no key — is instead the caller's own `ValidationException` (400), because it
+/// addresses nothing to look for.
 #[tokio::test]
 async fn a_sample_edi_file_that_cannot_be_read_is_refused_as_not_found() {
     let router = b2bi_router();
 
-    // A sample EDI file lives in Amazon S3, which this service cannot read: the request
-    // for a template generated from one is refused rather than answered with a template
-    // that only looks as though it came from the sample.
-    let cases: Vec<(&str, Value)> = vec![
+    // One bucket really exists, so the rows separate "this bucket holds no such object"
+    // from "there is no such bucket".
+    let (status, _) = s3(&router, "PUT", "/edi-samples", b"").await;
+    assert_eq!(status, 200, "the sample bucket must be created, got {status}");
+
+    // (case, the outputSampleLocation, the expected status and error code)
+    let cases: Vec<(&str, Value, u16, &str)> = vec![
         (
-            "bucket and key",
+            "a key that bucket does not hold",
             json!({ "bucketName": "edi-samples", "key": "outbound/850.edi" }),
+            404,
+            "ResourceNotFoundException",
         ),
-        ("bucket only", json!({ "bucketName": "edi-samples" })),
-        ("empty location", json!({})),
+        (
+            "a bucket that does not exist",
+            json!({ "bucketName": "no-such-samples", "key": "outbound/850.edi" }),
+            404,
+            "ResourceNotFoundException",
+        ),
+        (
+            "bucket only",
+            json!({ "bucketName": "edi-samples" }),
+            400,
+            "ValidationException",
+        ),
+        ("empty location", json!({}), 400, "ValidationException"),
     ];
 
-    for (case, location) in cases {
+    for (case, location, expected_status, expected_code) in cases {
         let mut body = request("JSONATA", "X12_850", "VERSION_4010");
         body["outputSampleLocation"] = location;
         let (status, response) = call(&router, "CreateStarterMappingTemplate", body).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected HTTP 404, got {status} with body {response:?}"
+            status, expected_status,
+            "case {case:?}: expected HTTP {expected_status}, got {status} with body {response:?}"
         );
         assert_eq!(
             error_code(&response),
-            "ResourceNotFoundException",
-            "case {case:?}: expected a ResourceNotFoundException, got {response:?}"
+            expected_code,
+            "case {case:?}: expected a {expected_code}, got {response:?}"
         );
     }
 }

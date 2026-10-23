@@ -27,10 +27,14 @@ mod codedeploy_deployment_outcome;
 mod codedeploy_lifecycle;
 #[path = "all/deployment_configs.rs"]
 mod deployment_configs;
+#[path = "all/delete_deployment_group.rs"]
+mod delete_deployment_group;
 #[path = "all/deployment_group_defaults.rs"]
 mod deployment_group_defaults;
 #[path = "all/deployment_group_update.rs"]
 mod deployment_group_update;
+#[path = "all/deployment_targets.rs"]
+mod deployment_targets;
 #[path = "all/git_hub_account_token_names.rs"]
 mod git_hub_account_token_names;
 #[path = "all/github_account_tokens.rs"]
@@ -43,6 +47,8 @@ mod list_deployment_configs;
 mod list_deployment_groups;
 #[path = "all/list_deployment_targets.rs"]
 mod list_deployment_targets;
+#[path = "all/list_on_premises_instances.rs"]
+mod list_on_premises_instances;
 #[path = "all/on_premises_instances.rs"]
 mod on_premises_instances;
 #[path = "all/on_premises_revisions_and_blue_green.rs"]

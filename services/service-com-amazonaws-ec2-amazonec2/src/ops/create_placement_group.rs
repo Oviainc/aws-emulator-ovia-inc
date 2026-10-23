@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePlacementGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePlacementGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: creates the placement group the request describes, stores it as the
+//! modelled [`PlacementGroup`] shape in
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::placement_groups`], and answers that
+//! stored group — its `GroupId`, ARN, state, strategy and tags.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePlacementGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +153,227 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePlacementGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePlacementGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePlacementGroup"))
+        use crate::state;
+
+        // "A name for the placement group. Must be unique within the scope of your account
+        // for the Region. Constraints: Up to 255 ASCII characters" (`$GroupName`). The
+        // member is not modelled `@required`, so a request that leaves it out reaches this
+        // handler and has to be refused here.
+        let group_name = input
+            .group_name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                state::missing_parameter("The request must contain the parameter GroupName")
+            })?;
+        if group_name.chars().count() > state::MAX_PLACEMENT_GROUP_NAME_CHARS {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({group_name}) for parameter groupName is invalid. \
+                 A placement group name accepts at most {max} characters",
+                max = state::MAX_PLACEMENT_GROUP_NAME_CHARS,
+            )));
+        }
+        if !group_name.is_ascii() {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({group_name}) for parameter groupName is invalid. \
+                 A placement group name accepts ASCII characters only"
+            )));
+        }
+
+        // "The placement strategy" (`$Strategy`), one of the modelled `PlacementStrategy`
+        // members. Not `@required` either, and the group's whole behaviour follows from it,
+        // so a request naming none is refused rather than given a strategy nobody asked
+        // for.
+        let requested_strategy = input
+            .strategy
+            .as_deref()
+            .filter(|strategy| !strategy.is_empty())
+            .ok_or_else(|| {
+                state::missing_parameter("The request must contain the parameter Strategy")
+            })?;
+        let strategy = state::placement_strategy(requested_strategy).ok_or_else(|| {
+            state::invalid_parameter_value(format!(
+                "Value ({requested_strategy}) for parameter strategy is invalid. \
+                 Valid values: {valid}",
+                valid = PLACEMENT_STRATEGY_VALUES.join(" | "),
+            ))
+        })?;
+
+        // "The number of partitions. Valid only when Strategy is set to partition"
+        // (`$PartitionCount`): with any other strategy there are no partitions for the
+        // count to describe, so naming one is a combination that cannot hold rather than a
+        // value to ignore.
+        let partition_count = match (strategy, input.partition_count) {
+            (state::PLACEMENT_STRATEGY_PARTITION, Some(count)) => {
+                if !(state::MIN_PLACEMENT_GROUP_PARTITION_COUNT
+                    ..=state::MAX_PLACEMENT_GROUP_PARTITION_COUNT)
+                    .contains(&count)
+                {
+                    return Err(state::invalid_parameter_value(format!(
+                        "Value ({count}) for parameter partitionCount is invalid. \
+                         A partition placement group accepts between {min} and {max} \
+                         partitions",
+                        min = state::MIN_PLACEMENT_GROUP_PARTITION_COUNT,
+                        max = state::MAX_PLACEMENT_GROUP_PARTITION_COUNT,
+                    )));
+                }
+                Some(count)
+            }
+            // A partition group the request named no count for still has partitions.
+            (state::PLACEMENT_STRATEGY_PARTITION, None) => {
+                Some(state::DEFAULT_PLACEMENT_GROUP_PARTITION_COUNT)
+            }
+            (_, Some(count)) => {
+                return Err(state::invalid_parameter_combination(format!(
+                    "PartitionCount ({count}) is valid only when Strategy is \
+                     '{partition}', not '{strategy}'",
+                    partition = state::PLACEMENT_STRATEGY_PARTITION,
+                )))
+            }
+            (_, None) => None,
+        };
+
+        // "Determines how placement groups spread instances" (`$SpreadLevel`), one of the
+        // modelled `SpreadLevel` members — so it describes the `spread` strategy and holds
+        // for no other, the way `PartitionCount` holds only for `partition`. A spread group
+        // the request names no level for gets `rack`, the level with "no usage
+        // restrictions"; `host` "you can use only with Outpost placement groups".
+        let spread_level = match (strategy, input.spread_level.as_deref().filter(|level| !level.is_empty())) {
+            (state::PLACEMENT_STRATEGY_SPREAD, Some(requested)) => {
+                Some(state::spread_level(requested).ok_or_else(|| {
+                    state::invalid_parameter_value(format!(
+                        "Value ({requested}) for parameter spreadLevel is invalid. \
+                         Valid values: {valid}",
+                        valid = SPREAD_LEVEL_VALUES.join(" | "),
+                    ))
+                })?)
+            }
+            (state::PLACEMENT_STRATEGY_SPREAD, None) => Some(state::SPREAD_LEVEL_RACK),
+            (_, Some(requested)) => {
+                return Err(state::invalid_parameter_combination(format!(
+                    "SpreadLevel ({requested}) is valid only when Strategy is \
+                     '{spread}', not '{strategy}'",
+                    spread = state::PLACEMENT_STRATEGY_SPREAD,
+                )))
+            }
+            (_, None) => None,
+        };
+
+        // "Reserved for future use" (`$LinkedGroupId`) and "reserved for internal use"
+        // (`$Operator`): AWS publishes no rule by which a customer request gives a group
+        // either, so a request that sets one is told so rather than having a value stored
+        // — and reported back as fact — under a meaning this emulator invented. In
+        // particular a caller cannot mark its own group as managed by a service provider.
+        if input
+            .linked_group_id
+            .as_deref()
+            .is_some_and(|id| !id.is_empty())
+        {
+            return Err(state::invalid_parameter_value(
+                "LinkedGroupId is reserved for future use and cannot be set",
+            ));
+        }
+        if input
+            .operator
+            .as_ref()
+            .and_then(|operator| operator.principal.as_deref())
+            .is_some_and(|principal| !principal.is_empty())
+        {
+            return Err(state::invalid_parameter_value(
+                "Operator is reserved for internal use and cannot be set",
+            ));
+        }
+
+        // "The tags to apply to the new placement group" (`$TagSpecifications`) — the
+        // shared reader refuses a specification naming any other resource type and holds
+        // the tag payload to the same documented bounds every create of this crate holds
+        // its tags to, so one rule has one implementation.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_PLACEMENT_GROUP,
+            Self::NAME,
+        )?;
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let region = state::request_region(ctx.parts());
+        let mut store = state_handle.lock();
+
+        // "The ID of a parent placement group. Valid only when Strategy is set to cluster"
+        // (`$ParentGroupId`): a parent that the account holds no placement group for cannot
+        // be a parent, so it is resolved against the store before anything is written.
+        let parent_group_id = match input
+            .parent_group_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+        {
+            Some(parent) => {
+                if strategy != state::PLACEMENT_STRATEGY_CLUSTER {
+                    return Err(state::invalid_parameter_combination(format!(
+                        "ParentGroupId ({parent}) is valid only when Strategy is \
+                         '{cluster}', not '{strategy}'",
+                        cluster = state::PLACEMENT_STRATEGY_CLUSTER,
+                    )));
+                }
+                if !store.placement_groups.contains_key(parent) {
+                    return Err(state::invalid_placement_group_unknown(parent));
+                }
+                Some(parent.to_string())
+            }
+            None => None,
+        };
+
+        // "Must be unique within the scope of your account for the Region"
+        // (`$GroupName`). This emulator's store IS that one account's resources, and it
+        // holds them the way it holds the account's VPCs and security groups — in one map
+        // rather than one per Region — so the uniqueness domain here is the whole store.
+        if store.placement_group_id_for_name(group_name).is_some() {
+            return Err(state::invalid_placement_group_duplicate(group_name));
+        }
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds strings the caller chose the length of.
+        if !store.has_placement_group_capacity() {
+            return Err(state::placement_group_limit_exceeded());
+        }
+        let spec = state::PlacementGroupSpec {
+            group_name: group_name.to_string(),
+            strategy,
+            partition_count,
+            spread_level,
+            parent_group_id,
+            region,
+            tags,
+        };
+        // ONE formula for the charge: the same helper `insert_placement_group` charges, so
+        // the budget this check reserves cannot drift from what the insert actually takes,
+        // whatever members the spec grows.
+        let payload_bytes = state::placement_group_spec_bytes(&spec);
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(crate::scaffolded::Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                 data, so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`$DryRun`).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // `insert_placement_group` derives the id, the ARN and the state itself, so this
+        // handler never invents one, and it answers the record as it was stored — so
+        // `CreatePlacementGroup` and `DescribePlacementGroups` cannot drift apart. It asks
+        // the ceiling again for itself, so the quota refusal above cannot be bypassed.
+        let group = store
+            .insert_placement_group(spec)
+            .ok_or_else(state::placement_group_limit_exceeded)?;
+
+        Ok(CreatePlacementGroupOutput {
+            placement_group: Some(group),
+        })
     }
 }

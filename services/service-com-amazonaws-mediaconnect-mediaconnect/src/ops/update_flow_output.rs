@@ -249,45 +249,10 @@ fn merged_transport(stored: Option<&Transport>, input: &UpdateFlowOutputInput) -
 }
 
 /// The encryption the output holds after `update` is applied to `stored`, or `None` when
-/// the request would leave an encryption with no role ARN.
-///
-/// `UpdateEncryption` mirrors `Encryption` member for member with every member optional,
-/// so this is the same member-wise merge as [`merged_transport`]. `Encryption$RoleArn` is
-/// REQUIRED (`smithy_query(query="shape",shape="Encryption")`) while
-/// `UpdateEncryption$RoleArn` is not, so an output that is not encrypted yet can only be
-/// given encryption by a request that carries the role — hence the `None`.
+/// the request would leave an encryption with no role ARN: the crate's one merge of an
+/// `UpdateEncryption` into a stored `Encryption` ([`crate::state::merged_encryption`]).
 fn merged_encryption(stored: Option<&Encryption>, update: &UpdateEncryption) -> Option<Encryption> {
-    let role_arn = update
-        .role_arn
-        .clone()
-        .or_else(|| stored.map(|encryption| encryption.role_arn.clone()))?;
-    let mut merged = stored.cloned().unwrap_or_default();
-    merged.role_arn = role_arn;
-    if let Some(algorithm) = update.algorithm.clone() {
-        merged.algorithm = Some(algorithm);
-    }
-    if let Some(vector) = update.constant_initialization_vector.clone() {
-        merged.constant_initialization_vector = Some(vector);
-    }
-    if let Some(device_id) = update.device_id.clone() {
-        merged.device_id = Some(device_id);
-    }
-    if let Some(key_type) = update.key_type.clone() {
-        merged.key_type = Some(key_type);
-    }
-    if let Some(region) = update.region.clone() {
-        merged.region = Some(region);
-    }
-    if let Some(resource_id) = update.resource_id.clone() {
-        merged.resource_id = Some(resource_id);
-    }
-    if let Some(secret_arn) = update.secret_arn.clone() {
-        merged.secret_arn = Some(secret_arn);
-    }
-    if let Some(url) = update.url.clone() {
-        merged.url = Some(url);
-    }
-    Some(merged)
+    crate::state::merged_encryption(stored, update)
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative

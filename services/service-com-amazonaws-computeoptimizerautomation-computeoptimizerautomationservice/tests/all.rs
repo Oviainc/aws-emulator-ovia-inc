@@ -25,6 +25,8 @@ mod enrollment_gate;
 mod error_payloads;
 #[path = "all/recommended_actions.rs"]
 mod recommended_actions;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/rule_projection.rs"]

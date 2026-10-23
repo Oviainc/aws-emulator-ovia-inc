@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAddressTransfers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAddressTransfers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the Elastic IP address transfers [`crate::state`] holds for the
+//! source account, narrowed by `AllocationIds` and paged by `MaxResults`/`NextToken`. This
+//! is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAddressTransfers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A transfer is stored by `EnableAddressTransfer` and withdrawn by
+//! `DisableAddressTransfer`; this operation only reads. The one write it may do is the one
+//! the clock already owed — dropping a record whose offer window, or whose 14 days of
+//! visibility after an acceptance, has run out
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::materialize_due_transitions`]) — so two
+//! calls in a row answer the same thing.
+//!
+//! "The source account can view the pending transfer by using this action": this emulator
+//! serves ONE account (`engine::emulator_account_id`), which is the account every stored
+//! transfer was started by, so there is no second account whose transfers could be reported
+//! here and no caller identity to narrow by. The window half of that sentence IS enforced,
+//! by the expiry above.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +154,128 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAddressTransfers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAddressTransfersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            allocation_id_is_well_formed, decode_page_token, encode_page_token,
+            invalid_allocation_id_malformed, invalid_pagination_token_for, require_service_state,
+            MAX_PAGE_SIZE, MAX_RESOURCE_IDS,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "The allocation IDs of Elastic IP addresses"
+        // (`DescribeAddressTransfersRequest$AllocationIds`): the one way a request narrows
+        // what it asks about, and the model bounds neither the list nor its entries, so it
+        // is bounded here before any work proportional to it is done.
+        let requested_ids = input.allocation_ids.clone().unwrap_or_default();
+        if requested_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "AllocationIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                requested_ids.len()
+            )));
+        }
+        // A value that is not an allocation id at all names nothing this service could look
+        // up, so it is refused the way every other allocation-id member of this service
+        // refuses one. A WELL-FORMED id is NOT required to name a transfer, or even an
+        // address the account still holds: this operation reports TRANSFERS, and an accepted
+        // transfer outlives the source account's allocation by the days it stays visible —
+        // so an id with no transfer selects no row rather than failing the call.
+        for allocation_id in &requested_ids {
+            if !allocation_id_is_well_formed(allocation_id) {
+                return Err(invalid_allocation_id_malformed(allocation_id));
+            }
+        }
+
+        // "Specify the pagination token from a previous request to retrieve the next page of
+        // results" (`DescribeAddressTransfersRequest$NextToken`) — anything else is refused
+        // rather than read as an id.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                Some(decode_page_token(token).ok_or_else(|| invalid_pagination_token_for(token))?)
+            }
+        };
+
+        // DryRun sits AFTER every parameter has been validated: the flag asks whether the
+        // request WOULD have succeeded, so one that would have been refused is refused with
+        // that reason instead. The model's own `@range` on `MaxResults` (5..1000) was
+        // already applied at the boundary, before this handler ran.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // The only write a REPORT may do: every move applied here was already owed at this
+        // instant whether or not anybody called — for this operation, a transfer whose offer
+        // window ran out ("After seven days, the transfer expires and ownership of the
+        // Elastic IP address returns to the source account") and an accepted one past its 14
+        // days of visibility. So two calls in a row answer the same thing, and no later
+        // caller can tell this one was made.
+        store.materialize_due_transitions();
+
+        // "Describes an Elastic IP address transfer": with no `AllocationIds` every transfer
+        // the source account can see is reported, and with the list given a transfer is
+        // reported when the list names the address being transferred. Every stored transfer
+        // IS the source account's — this emulator serves one account — so the only narrowing
+        // the request can ask for is by allocation id.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAddressTransfers"))
+        // Each row carries the store's own KEY beside the transfer, and the page cursor is
+        // defined over that key rather than over `AddressTransfer$AllocationId`: the key is
+        // not optional, so a page can never end without a token because a record's member
+        // was absent.
+        let mut selected: Vec<(&String, AddressTransfer)> = store
+            .address_transfers
+            .iter()
+            .filter(|(allocation_id, _)| {
+                requested_ids.is_empty()
+                    || requested_ids
+                        .iter()
+                        .any(|requested| requested == *allocation_id)
+            })
+            .map(|(allocation_id, record)| (allocation_id, record.transfer.clone()))
+            .collect();
+        // Page in `AllocationId` order, which the cursor below names a position in. The
+        // store is an ordered map keyed by that id, so its iteration order already satisfies
+        // this sort; doing it here establishes the invariant the cursor depends on at the
+        // point of use.
+        selected.sort_by(|left, right| left.0.cmp(right.0));
+
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => {
+                selected.partition_point(|(allocation_id, _)| allocation_id.as_str() < cursor)
+            }
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // A request that names no page size gets the largest page this service serves, so
+        // the `NextToken` path behaves the same whether or not a page size was asked for.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        // A token only when a transfer follows this page: "Specify the pagination token from
+        // a previous request to retrieve the next page of results"
+        // (`DescribeAddressTransfersResult$NextToken`), so a caller stops when it is absent.
+        let next_token = page
+            .get(limit)
+            .map(|(allocation_id, _)| encode_page_token(allocation_id));
+
+        Ok(DescribeAddressTransfersOutput {
+            // Present even when it holds nothing: an account with no transfer is an answer,
+            // and `addressTransferSet` is the member that carries it.
+            address_transfers: Some(
+                page.iter()
+                    .take(limit)
+                    .map(|(_, transfer)| transfer.clone())
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }

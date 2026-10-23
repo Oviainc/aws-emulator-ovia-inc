@@ -297,6 +297,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             family,
             description: input.description,
             tags,
+            // A new group is exactly its family's engine defaults: this call
+            // sets no parameter value, which is what `ModifyCacheParameterGroup`
+            // is for.
+            parameter_values: ::std::collections::BTreeMap::new(),
         };
         store.cache_parameter_groups.insert(name.clone(), record);
         // Creating a cache parameter group is one of the events this service

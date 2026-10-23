@@ -529,8 +529,9 @@ async fn a_report_on_a_missing_dashboard_is_refused_and_persists_nothing() {
     );
 }
 
-/// GetScheduledReport refuses an ARN no report is stored under with the modelled
-/// ResourceNotFoundException (404) — including the ARN of a report that was never
+/// GetScheduledReport refuses an ARN no report is stored under with the service's
+/// not-found answer — the `ResourceNotFoundException` code at HTTP 400 (see
+/// `tests/all/resource_not_found.rs`) — including the ARN of a report that was never
 /// created and a well-formed ARN of another resource's shape.
 #[tokio::test]
 async fn getting_a_report_that_was_never_created_is_not_found() {
@@ -557,8 +558,8 @@ async fn getting_a_report_that_was_never_created_is_not_found() {
     ] {
         let (status, body) = call(&router, "GetScheduledReport", &json!({"arn": arn})).await;
         assert_eq!(
-            status, 404,
-            "case {arn}: an unknown report arn answers 404, got {status}: {body}"
+            status, 400,
+            "case {arn}: an unknown report arn answers 400, got {status}: {body}"
         );
         assert!(
             error_code(&body).ends_with("ResourceNotFoundException"),

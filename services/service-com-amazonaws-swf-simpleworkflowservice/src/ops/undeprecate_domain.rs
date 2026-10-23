@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UndeprecateDomain
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UndeprecateDomain`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UndeprecateDomain::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: the stored domain record's own `RegistrationStatus` moves back to
+//! `REGISTERED` and nothing else in the domain changes — the types registered in it
+//! keep their own status — and the call is refused when the domain is unknown
+//! (`UnknownResourceFault`) or currently registered
+//! (`DomainAlreadyExistsFault`). This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -168,20 +164,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UndeprecateDomain` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UndeprecateDomainErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UndeprecateDomain"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // The model declares no server fault for this operation, and
+            // `OperationNotPermittedFault` is this service's common error: the request
+            // cannot be served, and saying so with a modelled code beats a 501, which
+            // would claim the operation is unwritten.
+            UndeprecateDomainErrorModeled::OperationNotPermittedFault(
+                OperationNotPermittedFault {
+                    message: Some("the SWF domain store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        let mut guard = state.lock();
+        let Some(domain) = guard.domains.get_mut(&input.name) else {
+            // `UnknownResourceFault` is documented as "Returned when the named resource
+            // cannot be found with in the scope of this operation (region or domain)":
+            // a name no domain record is stored under names no domain, reported the way
+            // every other domain reader of this service reports it. Deprecating a domain
+            // does not remove its record, so a deprecated domain is reachable here —
+            // which is what lets this call bring it back.
+            return Err(UndeprecateDomainErrorModeled::UnknownResourceFault(
+                UnknownResourceFault {
+                    message: Some(format!("Unknown domain: {}", input.name)),
+                },
+            )
+            .into());
+        };
+
+        // Undeprecation moves a record OFF `DEPRECATED`: one that is already REGISTERED
+        // is the modelled `DomainAlreadyExistsFault` ("You may get this fault if you are
+        // registering a domain that is either already registered or deprecated, or if
+        // you undeprecate a domain that is currently registered"), and the stored record
+        // is left exactly as it was. The message names the requested domain, in the same
+        // form `RegisterDomain` reports this fault with.
+        if !domain.is_deprecated() {
+            return Err(UndeprecateDomainErrorModeled::DomainAlreadyExistsFault(
+                DomainAlreadyExistsFault {
+                    message: Some(format!("the domain {} already exists", input.name)),
+                },
+            )
+            .into());
+        }
+
+        // The whole effect of the call, on the one domain record it addresses: back to
+        // REGISTERED, so the domain "can be used to create new workflow executions or
+        // register new types" again. The types registered in it keep their own
+        // `RegistrationStatus` (a type's status moves only for a call addressing that
+        // type), and the executions, tags, ARN and retention period are untouched.
+        domain.undeprecate();
+
+        Ok(UndeprecateDomainOutput)
     }
 }

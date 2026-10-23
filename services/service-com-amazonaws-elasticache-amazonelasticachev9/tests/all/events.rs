@@ -22,8 +22,9 @@ use aws_smithy_types::date_time::Format;
 use aws_smithy_types::DateTime;
 
 use crate::cache_cluster_lifecycle::{
-    create_available_cluster, create_cluster, params, Emulator, RefusalCase, Reply, PAST_TRANSITION,
+    account_subnet_ids, create_available_cluster, create_cluster, subnet_group_params,
 };
+use crate::harness::{params, Emulator, RefusalCase, Reply, PAST_TRANSITION};
 
 /// One `Event` of a reply, reduced to where it came from and what it says.
 /// `Date` is read separately, as an instant inside the window asked for.
@@ -125,8 +126,10 @@ async fn events_of(emulator: &Emulator, case: &str, pairs: &[(&str, &str)]) -> V
 /// wait after which the clock owes a pending status change.
 #[derive(Debug, Clone, Copy)]
 enum Step {
-    /// `CreateCacheSubnetGroup`, with the subnets to put in the group.
-    SubnetGroup(&'static str, &'static [&'static str]),
+    /// `CreateCacheSubnetGroup`, with how many of the account's subnets
+    /// (`state::region_subnets`, the only ids the service accepts) to put in the
+    /// group.
+    SubnetGroup(&'static str, usize),
     /// `CreateServerlessCache`, with whatever else the request names.
     ServerlessCache(&'static str, &'static [(&'static str, &'static str)]),
     /// `CreateUser`, with whatever else the request names.
@@ -150,18 +153,12 @@ enum Step {
 /// Run one step and insist the call it makes succeeded.
 async fn run_step(emulator: &Emulator, case: &str, step: Step) {
     let (action, pairs) = match step {
-        Step::SubnetGroup(name, subnets) => {
-            let mut pairs = params(&[
-                ("CacheSubnetGroupName", name),
-                ("CacheSubnetGroupDescription", "the events suite"),
-            ]);
-            for (index, subnet) in subnets.iter().enumerate() {
-                pairs.push((
-                    format!("SubnetIds.SubnetIdentifier.{}", index + 1),
-                    (*subnet).to_string(),
-                ));
-            }
-            ("CreateCacheSubnetGroup", pairs)
+        Step::SubnetGroup(name, subnet_count) => {
+            let subnets = account_subnet_ids();
+            (
+                "CreateCacheSubnetGroup",
+                subnet_group_params(name, "the events suite", &subnets[..subnet_count]),
+            )
         }
         Step::ServerlessCache(name, extra) => {
             let mut pairs = params(&[("ServerlessCacheName", name)]);
@@ -222,10 +219,7 @@ async fn every_change_this_service_makes_is_reported_as_an_event() {
     let scenarios = [
         Scenario {
             name: "a cache subnet group is created",
-            steps: &[Step::SubnetGroup(
-                "Events-Subnets",
-                &["subnet-11111111", "subnet-22222222"],
-            )],
+            steps: &[Step::SubnetGroup("Events-Subnets", 2)],
             // `CacheSubnetGroupName` "is stored as a lowercase string", so that
             // is the source the event is recorded under.
             expected: &[(
@@ -449,7 +443,7 @@ async fn every_change_this_service_makes_is_reported_as_an_event() {
         Scenario {
             name: "two resources of different kinds share one log",
             steps: &[
-                Step::SubnetGroup("evt-group", &["subnet-aa11", "subnet-bb22"]),
+                Step::SubnetGroup("evt-group", 2),
                 Step::Cluster("evt-in-group", &[("CacheSubnetGroupName", "evt-group")]),
                 Step::Settle,
             ],
@@ -674,14 +668,11 @@ type FilterCase = (&'static str, &'static [(&'static str, &'static str)]);
 #[tokio::test]
 async fn source_identifier_and_source_type_filter_the_log() {
     let emulator = Emulator::new();
-    let mut group = params(&[
-        ("CacheSubnetGroupName", "Filter-Group"),
-        ("CacheSubnetGroupDescription", "the events suite"),
-    ]);
-    group.push((
-        "SubnetIds.SubnetIdentifier.1".to_string(),
-        "subnet-7777".to_string(),
-    ));
+    let group = subnet_group_params(
+        "Filter-Group",
+        "the events suite",
+        &account_subnet_ids()[..1],
+    );
     let created = emulator.call("CreateCacheSubnetGroup", &group).await;
     assert_eq!(
         created.status, 200,

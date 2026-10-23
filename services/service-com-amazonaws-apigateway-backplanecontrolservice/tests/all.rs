@@ -15,10 +15,18 @@
 mod api_key_collection_members;
 #[path = "all/api_key_lifecycle.rs"]
 mod api_key_lifecycle;
+#[path = "all/authorizer_lifecycle.rs"]
+mod authorizer_lifecycle;
 #[path = "all/delete_lifecycle.rs"]
 mod delete_lifecycle;
+#[path = "all/delete_method_response.rs"]
+mod delete_method_response;
+#[path = "all/documentation_parts.rs"]
+mod documentation_parts;
 #[path = "all/epoch_second_timestamps.rs"]
 mod epoch_second_timestamps;
+#[path = "all/gateway_response.rs"]
+mod gateway_response;
 #[path = "all/method_integration.rs"]
 mod method_integration;
 #[path = "all/method_response.rs"]
@@ -41,5 +49,9 @@ mod service_claim;
 mod stage_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_reads_by_arn.rs"]
+mod tag_reads_by_arn;
+#[path = "all/update_method_response.rs"]
+mod update_method_response;
 #[path = "all/validation_message_rules.rs"]
 mod validation_message_rules;

@@ -17,6 +17,8 @@ mod firewall_lifecycle;
 mod harness;
 #[path = "all/resource_policies.rs"]
 mod resource_policies;
+#[path = "all/response_projections.rs"]
+mod response_projections;
 #[path = "all/rule_group_capacity_and_resource_policy.rs"]
 mod rule_group_capacity_and_resource_policy;
 #[path = "all/rule_group_lifecycle.rs"]

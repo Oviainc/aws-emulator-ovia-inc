@@ -170,10 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 DescribeDocumentClassifierErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "RESOURCE_NOT_FOUND: Could not find the document classifier {}.",
-                            input.document_classifier_arn
-                        )),
+                        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                     },
                 )
             })?;

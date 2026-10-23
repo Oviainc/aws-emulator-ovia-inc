@@ -255,6 +255,12 @@ impl ComAmazonawsWafv2Awswaf20190729State {
         (entry.ip_set.name == name).then_some(entry)
     }
 
+    /// [`Self::ip_set`], mutably.
+    pub fn ip_set_mut(&mut self, scope: &str, name: &str, id: &str) -> Option<&mut IpSetEntry> {
+        let entry = self.ip_sets.get_mut(&(scope.to_string(), id.to_string()))?;
+        (entry.ip_set.name == name).then_some(entry)
+    }
+
     /// Drop a web ACL and every index entry that pointed at it.
     pub fn remove_web_acl(&mut self, scope: &str, id: &str) -> Option<WebAclEntry> {
         let entry = self.web_acls.remove(&(scope.to_string(), id.to_string()))?;
@@ -335,21 +341,25 @@ impl ComAmazonawsWafv2Awswaf20190729State {
     /// being deleted and keeps a rule that names a missing one from being stored.
     ///
     /// Each of the model's four reference-bearing statements is resolved against
-    /// this service's own stores. An `IPSetReferenceStatement` and a
-    /// `RuleGroupReferenceStatement` resolve through [`Self::arn_index`], each only
-    /// to a resource of its own kind in the SAME scope, because a scope is a
-    /// namespace. The other two — `ManagedRuleGroupStatement` and
-    /// `RegexPatternSetReferenceStatement` — name entity kinds this emulator has no
-    /// store for yet (`CreateRegexPatternSet` and the managed-rule-group catalogue
-    /// are still scaffolded 501s, tracked as separate gap issues), so every
-    /// reference to one names nothing that exists and is refused here. The `Some` it
-    /// answers is the DIAGNOSTIC for the refusal's audit record — the response
-    /// itself carries [`NONEXISTENT_ITEM_MESSAGE`], the constant sentence that
-    /// exception type always carries. That is also what keeps
+    /// the entities that KIND of reference names. An `IPSetReferenceStatement` and a
+    /// `RuleGroupReferenceStatement` name resources of this account, so they resolve
+    /// through [`Self::arn_index`], each only to a resource of its own kind in the
+    /// SAME scope, because a scope is a namespace. A `ManagedRuleGroupStatement`
+    /// names no resource of this account at all — it names a group its VENDOR
+    /// publishes, identified by `(VendorName, Name)` — so it resolves against
+    /// [`MANAGED_RULE_GROUP_CATALOGUE`], the catalogue this service publishes, and a
+    /// pair the catalogue does not list names nothing that exists. A
+    /// `RegexPatternSetReferenceStatement` names an entity kind this emulator has no
+    /// store for yet (`CreateRegexPatternSet` is still a scaffolded 501, tracked as a
+    /// separate gap issue), so every reference to one names nothing that exists and
+    /// is refused here. The `Some` it answers is the DIAGNOSTIC for the refusal's
+    /// audit record — the response itself carries [`NONEXISTENT_ITEM_MESSAGE`], the
+    /// constant sentence that exception type always carries. That is also what keeps
     /// [`web_acl_capacity`] from pricing a statement whose cost it cannot know: a
     /// stored rule list can only carry a reference to a rule group this service
-    /// holds, whose declared `Capacity` is exactly that statement's cost, and never
-    /// a managed-rule-group or regex-pattern-set reference.
+    /// holds, whose declared `Capacity` is exactly that statement's cost, or to a
+    /// catalogued managed rule group, whose published capacity is its cost, and never
+    /// a regex-pattern-set reference.
     ///
     /// Walked with an explicit worklist, like [`validate_statement_nesting`]: the
     /// tree is supplied by the request.
@@ -392,7 +402,13 @@ impl ComAmazonawsWafv2Awswaf20190729State {
                     reference.arn
                 ));
             }
-            if let Some(managed) = statement.managed_rule_group_statement.as_ref() {
+            if let Some(managed) = statement
+                .managed_rule_group_statement
+                .as_ref()
+                .filter(|managed| {
+                    managed_rule_group(&managed.vendor_name, &managed.name).is_none()
+                })
+            {
                 return Some(format!(
                     "No managed rule group named {:?} from vendor {:?} is available",
                     managed.name, managed.vendor_name
@@ -478,6 +494,98 @@ pub const MAX_RULE_GROUPS_PER_SCOPE: usize = 100;
 /// addresses or ranges per IP set. It bounds how large a single stored entry can
 /// be, beside the serve path's own 16 MiB request-body cap.
 pub const MAX_IP_SET_ADDRESSES: usize = 10_000;
+
+// ---------------------------------------------------------------------------
+// The managed rule group catalogue
+// ---------------------------------------------------------------------------
+
+/// The `VendorName` every rule group AWS itself publishes carries.
+///
+/// `ManagedRuleGroupStatement$VendorName` is "the name of the managed rule group
+/// vendor. You use this, along with the rule group name, to identify a rule
+/// group", and the groups in [`MANAGED_RULE_GROUP_CATALOGUE`] are the ones AWS
+/// publishes, so they all carry this one vendor name.
+pub const AWS_MANAGED_RULE_GROUP_VENDOR: &str = "AWS";
+
+/// One managed rule group as its vendor publishes it: the pair that identifies it
+/// and the capacity a web ACL spends to run it.
+///
+/// A managed rule group is NOT a resource of this account — nothing creates,
+/// updates or deletes one — so it lives in a constant catalogue rather than in
+/// [`ComAmazonawsWafv2Awswaf20190729State`], which holds only what this account
+/// owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManagedRuleGroupDescriptor {
+    /// The vendor that publishes the group
+    /// (`ManagedRuleGroupStatement$VendorName`).
+    pub vendor_name: &'static str,
+    /// The group's name (`ManagedRuleGroupStatement$Name`).
+    pub name: &'static str,
+    /// The WCUs a web ACL spends on one rule that runs this group; see
+    /// [`web_acl_capacity`].
+    pub capacity: i64,
+}
+
+/// The managed rule groups this emulator publishes, with the capacity of each.
+///
+/// A managed rule group is identified by `(VendorName, Name)` and "you can
+/// retrieve the required names by calling `ListAvailableManagedRuleGroups`"
+/// (`ManagedRuleGroupStatement`'s own doc), so the set of groups a save may
+/// reference is a CATALOGUE the service publishes rather than anything the request
+/// carries. This is the AWS-vendor catalogue as the WAF Developer Guide's "AWS
+/// Managed Rules rule groups list" publishes it: each entry's `Name` and its
+/// "Capacity units required" (WCU) column, which is the cost that list states for
+/// running the group in a web ACL.
+///
+/// Kept in the guide's own order (baseline groups, then use-case-specific ones,
+/// then the IP-reputation and intelligent-threat-mitigation groups), so a new
+/// group the vendor publishes is added where the guide lists it.
+///
+/// One capacity per group: where the guide states a group's cost per
+/// CONFIGURATION (Bot Control, whose targeted inspection level costs more than its
+/// common one), the entry carries the group's base figure, because nothing here
+/// prices a `ManagedRuleGroupConfigs` setting.
+pub const MANAGED_RULE_GROUP_CATALOGUE: &[ManagedRuleGroupDescriptor] = &[
+    descriptor("AWSManagedRulesCommonRuleSet", 700),
+    descriptor("AWSManagedRulesAdminProtectionRuleSet", 100),
+    descriptor("AWSManagedRulesKnownBadInputsRuleSet", 200),
+    descriptor("AWSManagedRulesSQLiRuleSet", 200),
+    descriptor("AWSManagedRulesLinuxRuleSet", 200),
+    descriptor("AWSManagedRulesUnixRuleSet", 100),
+    descriptor("AWSManagedRulesWindowsRuleSet", 200),
+    descriptor("AWSManagedRulesPHPRuleSet", 100),
+    descriptor("AWSManagedRulesWordPressRuleSet", 100),
+    descriptor("AWSManagedRulesAmazonIpReputationList", 25),
+    descriptor("AWSManagedRulesAnonymousIpList", 50),
+    descriptor("AWSManagedRulesBotControlRuleSet", 50),
+    descriptor("AWSManagedRulesATPRuleSet", 50),
+    descriptor("AWSManagedRulesACFPRuleSet", 50),
+    descriptor("AWSManagedRulesAntiDDoSRuleSet", 50),
+];
+
+/// One [`MANAGED_RULE_GROUP_CATALOGUE`] entry, of the AWS vendor.
+const fn descriptor(name: &'static str, capacity: i64) -> ManagedRuleGroupDescriptor {
+    ManagedRuleGroupDescriptor {
+        vendor_name: AWS_MANAGED_RULE_GROUP_VENDOR,
+        name,
+        capacity,
+    }
+}
+
+/// The published managed rule group a `(VendorName, Name)` pair names, if the
+/// catalogue holds one.
+///
+/// Both members are matched exactly: `ManagedRuleGroupStatement$Name` targets
+/// `EntityName`, whose names WAF treats as case-sensitive, and the vendor name is
+/// the vendor's own.
+pub fn managed_rule_group(
+    vendor_name: &str,
+    name: &str,
+) -> Option<&'static ManagedRuleGroupDescriptor> {
+    MANAGED_RULE_GROUP_CATALOGUE
+        .iter()
+        .find(|group| group.vendor_name == vendor_name && group.name == name)
+}
 
 /// The statements nested directly inside `statement`, in no particular order.
 ///
@@ -578,44 +686,101 @@ pub fn validate_statement_nesting(rules: &[Rule]) -> Result<(), String> {
     Ok(())
 }
 
-/// Where a `RuleGroupReferenceStatement` may appear, if `rules` puts one
-/// somewhere it may not. `Err` carries the reason, for the refusal's message.
+/// One kind of statement that runs a whole RULE GROUP: how to spot it, what to
+/// call it in a refusal's reason, and the `ParameterExceptionField` value that
+/// names it.
+struct RuleGroupRunningStatement {
+    /// The statement's shape name, for the refusal's reason.
+    shape_name: &'static str,
+    /// The `ParameterExceptionField` value naming this statement.
+    field: &'static str,
+    /// `true` when `statement` carries this kind of statement.
+    present: fn(&Statement) -> bool,
+}
+
+/// Which statements run a whole rule group: the customer-owned
+/// `RuleGroupReferenceStatement` and the vendor-published
+/// `ManagedRuleGroupStatement`.
 ///
-/// The model states the placement rule on the statement itself
-/// (`smithy_query(query="doc",shape="RuleGroupReferenceStatement")`): "You cannot
-/// nest a `RuleGroupReferenceStatement`, for example for use inside a
-/// `NotStatement` or `OrStatement`. You cannot use a rule group reference
+/// One list, because the model states the SAME placement rule on both and the
+/// check below is defined over that rule rather than over either statement.
+const RULE_GROUP_RUNNING_STATEMENTS: &[RuleGroupRunningStatement] = &[
+    RuleGroupRunningStatement {
+        shape_name: "RuleGroupReferenceStatement",
+        field: FIELD_RULE_GROUP_REFERENCE_STATEMENT,
+        present: |statement| statement.rule_group_reference_statement.is_some(),
+    },
+    RuleGroupRunningStatement {
+        shape_name: "ManagedRuleGroupStatement",
+        field: FIELD_MANAGED_RULE_SET_STATEMENT,
+        present: |statement| statement.managed_rule_group_statement.is_some(),
+    },
+];
+
+/// Where a statement that runs a whole rule group may appear, if `rules` puts one
+/// somewhere it may not. `Some` carries the `ParameterExceptionField` value naming
+/// the statement at fault and the reason, for the refusal.
+///
+/// The model states the placement rule on each such statement itself, in the same
+/// words: "You cannot nest a `RuleGroupReferenceStatement`, for example for use
+/// inside a `NotStatement` or `OrStatement`. You cannot use a rule group reference
 /// statement inside another rule group. You can only reference a rule group as a
-/// top-level statement within a rule that you define in a web ACL." So a reference
-/// is well placed ONLY as a rule's own top-level statement, and only in a web ACL:
-/// `top_level_allowed` is `true` for a web ACL save and `false` for a rule group
-/// save. A misplacement is a parameter WAF does not accept rather than a dangling
-/// reference, so it is answered with `WAFInvalidParameterException` ("Your nested
-/// statement isn't valid. You might have tried to nest a statement that can’t be
-/// nested", from that error's own doc) — and it is judged BEFORE the reference is
-/// resolved, because a well-placed reference is what resolution is defined over.
+/// top-level statement within a rule that you define in a web ACL"
+/// (`smithy_query(query="doc",shape="RuleGroupReferenceStatement")`) and "You
+/// cannot nest a `ManagedRuleGroupStatement`, for example for use inside a
+/// `NotStatement` or `OrStatement`. You cannot use a managed rule group inside
+/// another rule group. You can only reference a managed rule group as a top-level
+/// statement within a rule that you define in a web ACL"
+/// (`smithy_query(query="doc",shape="ManagedRuleGroupStatement")`). So a statement
+/// that runs a rule group — whoever owns that group — is well placed ONLY as a
+/// rule's own top-level statement, and only in a web ACL: `top_level_allowed` is
+/// `true` for a web ACL save and `false` for a rule group save. A misplacement is a
+/// parameter WAF does not accept rather than a dangling reference, so it is
+/// answered with `WAFInvalidParameterException` ("Your nested statement isn't
+/// valid. You might have tried to nest a statement that can’t be nested", from that
+/// error's own doc) — and it is judged BEFORE the reference is resolved, because a
+/// well-placed reference is what resolution is defined over.
+///
+/// A managed rule group's own `ScopeDownStatement` is NOT a misplacement: it is the
+/// nested statement that managed statement is modelled to carry ("an optional
+/// nested statement that narrows the scope of the web requests that are evaluated
+/// by the managed rule group"), and what this refuses is a group-running statement
+/// reached THROUGH a nesting.
 ///
 /// Walked with an explicit worklist, like [`validate_statement_nesting`]: the tree
 /// is supplied by the request.
-pub fn misplaced_rule_group_reference(rules: &[Rule], top_level_allowed: bool) -> Option<String> {
+pub fn misplaced_rule_group_statement(
+    rules: &[Rule],
+    top_level_allowed: bool,
+) -> Option<(&'static str, String)> {
     for rule in rules {
-        if !top_level_allowed && rule.statement.rule_group_reference_statement.is_some() {
-            return Some(format!(
-                "the rule {:?} carries a RuleGroupReferenceStatement; a rule group \
-                 can only be referenced from a rule of a web ACL, not from a rule \
-                 of another rule group",
-                rule.name
-            ));
+        for kind in RULE_GROUP_RUNNING_STATEMENTS {
+            if !top_level_allowed && (kind.present)(&rule.statement) {
+                return Some((
+                    kind.field,
+                    format!(
+                        "the rule {:?} carries a {}; a rule group can only be \
+                         referenced from a rule of a web ACL, not from a rule of \
+                         another rule group",
+                        rule.name, kind.shape_name
+                    ),
+                ));
+            }
         }
         let mut pending: Vec<&Statement> = nested_statements(&rule.statement);
         while let Some(statement) = pending.pop() {
-            if statement.rule_group_reference_statement.is_some() {
-                return Some(format!(
-                    "the rule {:?} nests a RuleGroupReferenceStatement inside another \
-                     statement; a rule group can only be referenced by a rule's \
-                     top-level statement",
-                    rule.name
-                ));
+            for kind in RULE_GROUP_RUNNING_STATEMENTS {
+                if (kind.present)(statement) {
+                    return Some((
+                        kind.field,
+                        format!(
+                            "the rule {:?} nests a {} inside another statement; a \
+                             rule group can only be referenced by a rule's \
+                             top-level statement",
+                            rule.name, kind.shape_name
+                        ),
+                    ));
+                }
             }
             pending.extend(nested_statements(statement));
         }
@@ -879,13 +1044,12 @@ pub fn validate_cidr(address: &str, ip_address_version: &str) -> Result<(), Stri
 /// [`ComAmazonawsWafv2Awswaf20190729State::unresolvable_rule_reference`], so every
 /// reference a stored rule list carries is in that map.
 ///
-/// The one cost that is still never reached rather than guessed is a
-/// `ManagedRuleGroupStatement`'s: it costs the managed group's capacity and the
-/// managed catalogue (`ListAvailableManagedRuleGroups`) is not implemented yet — a
-/// separate gap issue, as is `CheckCapacity`. Such a statement names nothing this
-/// service holds and is refused on ingress too, so this function never has to
-/// price a reference whose cost it cannot know, and no caller is handed an
-/// understated `Capacity`.
+/// A `ManagedRuleGroupStatement` is priced the same way, from the published
+/// capacity of the catalogued group it names ([`managed_rule_group`]): a managed
+/// rule group's capacity is a property of the group, not of the request, and a
+/// statement naming a group the catalogue does not list is refused on ingress by
+/// the same resolution, so this function never has to price a statement whose cost
+/// it cannot know and no caller is handed an understated `Capacity`.
 pub fn web_acl_capacity(rules: &[Rule], rule_group_capacities: &HashMap<String, i64>) -> i64 {
     rules
         .iter()
@@ -991,6 +1155,14 @@ fn statement_capacity(
         capacity += rule_group_capacities
             .get(&reference.arn)
             .copied()
+            .unwrap_or_default();
+    }
+    // A managed rule group reference costs the published capacity of the group it
+    // names. A statement naming a group the catalogue does not list never reaches
+    // here.
+    if let Some(managed) = statement.managed_rule_group_statement.as_ref() {
+        capacity += managed_rule_group(&managed.vendor_name, &managed.name)
+            .map(|group| group.capacity)
             .unwrap_or_default();
     }
     capacity += nested_statements(statement)
@@ -1219,6 +1391,11 @@ pub const FIELD_RULE_GROUP: &str = "RULE_GROUP";
 /// The `ParameterExceptionField` value naming a `RuleGroupReferenceStatement`. See
 /// [`FIELD_RESOURCE_ARN`].
 pub const FIELD_RULE_GROUP_REFERENCE_STATEMENT: &str = "RULE_GROUP_REFERENCE_STATEMENT";
+
+/// The `ParameterExceptionField` value naming a managed-rule-group statement
+/// (`MANAGED_RULE_SET_STATEMENT`, as the enum spells it). See
+/// [`FIELD_RESOURCE_ARN`].
+pub const FIELD_MANAGED_RULE_SET_STATEMENT: &str = "MANAGED_RULE_SET_STATEMENT";
 
 /// The `ParameterExceptionField` value naming a `Scope`. See
 /// [`FIELD_RESOURCE_ARN`].

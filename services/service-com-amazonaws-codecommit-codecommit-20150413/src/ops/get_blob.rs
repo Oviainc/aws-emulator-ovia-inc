@@ -205,7 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A blob belongs to the repository that holds it: an object name this
         // repository has no object for does not exist here, whatever another
         // repository holds under it.
-        let content = repository.blobs.get(&blob_id).ok_or_else(|| {
+        let content = repository.blob(&blob_id).ok_or_else(|| {
             GetBlobErrorModeled::BlobIdDoesNotExistException(BlobIdDoesNotExistException {
                 message: Some(format!(
                     "the blob ID {blob_id} does not exist in the repository {}",
@@ -218,7 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // written through a `fileContent` the model bounds at 6 MB, so no object this
         // store holds exceeds the size a read would have to refuse.
         Ok(GetBlobOutput {
-            content: content.clone(),
+            content: content.to_vec(),
         })
     }
 }

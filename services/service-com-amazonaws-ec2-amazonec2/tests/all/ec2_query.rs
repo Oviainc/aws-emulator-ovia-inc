@@ -61,6 +61,21 @@ pub async fn call(
     action: &str,
     params: &[(String, String)],
 ) -> (u16, String) {
+    let (status, _content_type, body) = call_with_content_type(router, region, action, params).await;
+    (status, body)
+}
+
+/// The same call as [`call`], answering the response's `content-type` header beside the
+/// status and the body — `None` when the response declares none at all.
+///
+/// Separate from [`call`] because the media type is part of the ec2Query envelope rather
+/// than of any one operation, so only the suite that asserts on the envelope reads it.
+pub async fn call_with_content_type(
+    router: &MultiServiceRouter,
+    region: &str,
+    action: &str,
+    params: &[(String, String)],
+) -> (u16, Option<String>, String) {
     let mut body = format!("Action={action}&Version={API_VERSION}");
     for (name, value) in params {
         body.push('&');
@@ -81,7 +96,12 @@ pub async fn call(
         .expect("a well-formed ec2Query request");
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
-    (status, String::from_utf8_lossy(response.body()).to_string())
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    (status, content_type, String::from_utf8_lossy(response.body()).to_string())
 }
 
 /// `ZoneName.N` / `VpcId.N` / `Filter.N.Name` form fields, as ec2Query flattens a list

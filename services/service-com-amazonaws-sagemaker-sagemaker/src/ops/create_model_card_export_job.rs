@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateModelCardExportJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateModelCardExportJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: resolves the model card and the version to export in `crate::state`,
+//! registers the export job under that card with the ARN it mints
+//! (`<card ARN>/export-job/<job name>`) and the modelled `InProgress` status, and leaves
+//! the terminal status to the clock, which `DescribeModelCardExportJob` materialises. A
+//! card or version the store does not hold is refused with the modelled
+//! `ResourceNotFound` naming the card's ARN, a job name already used for that card with
+//! `ConflictException`.
+//! This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateModelCardExportJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
+//! Nothing here renders the model card PDF the export writes to S3, so the job ends in
+//! the modelled `Failed` status with `crate::state::MODEL_CARD_EXPORT_NOT_RUN_FAILURE`;
+//! see that constant for why no `Completed` status and no `ExportArtifacts` are invented.
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -151,18 +153,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateModelCardExportJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateModelCardExportJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // `ModelCardName` is a `ModelCardNameOrArn`: both forms name one stored card.
+        let card_name = crate::state::name_from_arn_or_name(&input.model_card_name);
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        // What this operation refuses with when it cannot resolve the model card VERSION
+        // to export — whether the card itself is not held or the version it was asked for
+        // is not one the card has. SageMaker names the card's ARN, built from the request
+        // (its region, this account and the card the request named), and says no more:
+        // the export addresses one versioned card, so a version the card never had is the
+        // same miss as a card nobody created, and the refusal does not disclose which of
+        // the two it was.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateModelCardExportJob"))
+        // This wording is the export surface's own: `DescribeModelCard` answers `Could not
+        // find model card '<name>'.` for the same resource, and the recorded unit this
+        // operation was filed from (`sagemaker.create-model-card-export-job-card-not-found`)
+        // pins the form below for the export path — so the two are deliberately not
+        // unified.
+        let not_found = || {
+            CreateModelCardExportJobErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!(
+                    "Modelcard {} does not exist",
+                    crate::state::resource_arn(&region, "model-card", card_name)
+                )),
+            })
+        };
+
+        // The whole resolve-and-insert runs under the one store lock, so when two callers
+        // race on one export-job name exactly one creates it and the other reads the
+        // conflict below.
+        let mut store = state.lock();
+
+        // An export job exports a card that exists: a job naming a card the store does
+        // not hold is refused, never accepted against a card nobody created.
+        let Some(card) = store.model_cards.get(card_name) else {
+            return Err(not_found().into());
+        };
+
+        // "If a version is not provided, then the latest version of the model card is
+        // exported" (`ModelCardVersion`'s model doc). The version is RESOLVED here and
+        // stored, so a later read reports the version this job exports rather than
+        // whichever is the latest by then.
+        let exported = match input.model_card_version {
+            Some(requested) => card.version(requested),
+            None => card.latest_version(),
+        };
+        let Some(exported) = exported else {
+            return Err(not_found().into());
+        };
+        let card_version = exported.version;
+        // The card's own stored name, so the job's ARN carries it however the request
+        // addressed the card.
+        let card_name = card.name.clone();
+
+        let key =
+            crate::state::model_card_export_job_key(&card_name, &input.model_card_export_job_name);
+
+        // A job name already used for this card is refused, never overwritten: otherwise
+        // the caller reads a 200 for a job it did not start and the one it did start is
+        // gone. The name is scoped to the card, because the card's name is part of the
+        // job's ARN. Decided BEFORE the quota below: a name already taken is a conflict
+        // whatever the store's utilization, and re-submitting it would consume no quota.
+        if store.model_card_export_jobs.contains_key(&key) {
+            return Err(CreateModelCardExportJobErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "Model Card Export Job with name {} already exists for model card \
+                         {card_name}. Choose a different name.",
+                        input.model_card_export_job_name
+                    )),
+                },
+            )
+            .into());
+        }
+        // The store is bounded, so a caller varying the job name cannot grow it without
+        // end. `ResourceLimitExceeded` is the limit failure this operation models.
+        if !store.model_card_export_jobs_below_quota() {
+            return Err(CreateModelCardExportJobErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The account-level service limit for model card export jobs is {}, \
+                         with current utilization of {} and a request delta of 1.",
+                        crate::state::MODEL_CARD_EXPORT_JOB_QUOTA,
+                        store.model_card_export_jobs.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let arn = crate::state::resource_arn(
+            &region,
+            "model-card",
+            &format!(
+                "{card_name}/export-job/{}",
+                input.model_card_export_job_name
+            ),
+        );
+        store.model_card_export_jobs.insert(
+            key,
+            crate::state::ModelCardExportJob {
+                name: input.model_card_export_job_name,
+                arn: arn.clone(),
+                card_name,
+                card_version,
+                status: crate::state::MODEL_CARD_EXPORT_STATUS_IN_PROGRESS.to_string(),
+                output_config: input.output_config,
+                // Nothing has failed yet: the job is running, and the clock owes it a
+                // terminal status a span from now.
+                failure_reason: None,
+                created_at: now,
+                last_modified_at: now,
+                // The instant the move out of `InProgress` falls due: stored, never slept
+                // on. See `state::MODEL_CARD_EXPORT_NOT_RUN_FAILURE` for which terminal
+                // status it is.
+                ends_at: now + crate::state::MODEL_CARD_EXPORT_JOB_SETTLES_AFTER,
+            },
+        );
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateModelCardExportJobOutput {
+            model_card_export_job_arn: arn,
+        })
     }
 }

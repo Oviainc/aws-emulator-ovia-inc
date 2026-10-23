@@ -38,6 +38,11 @@
 //! [`instance_type_offerings`] derives them from the Region and the modelled
 //! `InstanceType` catalog, and `DescribeInstanceTypeOfferings` writes nothing either.
 //!
+//! The REGIONS themselves are facts of the account's partition in the same way — no EC2
+//! operation creates a Region, and opting one in or out is the Account API's job — so
+//! [`regions_for_request`] derives them from the Region catalog and the Region the request
+//! was signed for, and `DescribeRegions` writes nothing either.
+//!
 //! ## Resources callers create are stored
 //!
 //! [`ComAmazonawsEc2Amazonec2State::vpcs`] holds the account's VPCs as the modelled
@@ -99,6 +104,22 @@
 //! Keyed by `VolumeId` in a [`BTreeMap`], the same stable order the VPC and subnet stores
 //! are kept in, so a pagination token can name the id the next page starts at.
 //!
+//! ## EBS volume modifications
+//!
+//! [`ComAmazonawsEc2Amazonec2State::volume_modifications`] holds, per `VolumeId`, the most
+//! recent modification of that volume as a [`VolumeModificationRecord`]: the modelled
+//! [`VolumeModification`] every operation that reports one answers with, plus the instants
+//! the clock owes it its `modifying` -> `optimizing` -> `completed` moves. The state, the
+//! progress and the end time are facts of the modification's age rather than of the request
+//! that started it, so [`VolumeModificationRecord::view_at`] derives all three on read
+//! instead of storing a word two writers could disagree about — the same arrangement
+//! [`VolumeRecord`] uses for a volume's own `State`, on the same monotonic clock and the
+//! same [`TRANSITION_DELAY`].
+//!
+//! One volume has at most ONE record: "Describes the most recent volume modification
+//! request for the specified EBS volumes" (`DescribeVolumesModifications`), so a later
+//! modification of the same volume replaces the record rather than adding one beside it.
+//!
 //! ## Verified Access trust providers
 //!
 //! [`ComAmazonawsEc2Amazonec2State::verified_access_trust_providers`] holds the account's
@@ -136,7 +157,11 @@
 //! clock and the same [`TRANSITION_DELAY`] as a `pending` VPC's `available` move). Keyed by
 //! the range itself in its canonical form ([`canonical_byoip_cidr`]), because the range IS
 //! the name the API takes — every BYOIP operation is addressed by `Cidr`, not by a minted id
-//! — which also gives the describe path one stable order.
+//! — which also gives the describe path one stable order. That key comes from a REQUEST, so
+//! the store is bounded like every other one here: a new range has to fit inside the record
+//! ceiling ([`ComAmazonawsEc2Amazonec2State::has_byoip_cidr_capacity`]) and the byte budget,
+//! and [`byoip_cidr_payload_bytes`] is the one definition of what a range is charged, given
+//! back when the clock's release drops it.
 //!
 //! ## Elastic IP addresses
 //!
@@ -149,6 +174,32 @@
 //! [`ComAmazonawsEc2Amazonec2State::allocation_id_for_public_ip`] because the API lets a
 //! caller name either. An Elastic IP address AWS hands back is usable at once — it has no
 //! non-terminal status — so no entry beside it records a clock-owed transition.
+//!
+//! An address's ASSOCIATION with one of the account's resources lives on that same record
+//! — `Address$AssociationId`, `Address$InstanceId` and `Address$PrivateIpAddress` — rather
+//! than in a map beside it, so `AssociateAddress` and `DescribeAddresses` cannot disagree
+//! about what an address is attached to. The instance reports the same address through
+//! `Instance$PublicIpAddress`, so the ONE primitive that ends an association
+//! ([`ComAmazonawsEc2Amazonec2State::detach_elastic_ip`]) clears both sides, and
+//! [`ComAmazonawsEc2Amazonec2State::allocation_id_associated_with_instance`] answers which
+//! address an instance holds.
+//!
+//! ## Elastic IP address transfers
+//!
+//! [`ComAmazonawsEc2Amazonec2State::address_transfers`] holds the Elastic IP address
+//! transfers the source account can see, as [`AddressTransferRecord`]s: the modelled
+//! [`AddressTransfer`] every operation that reports one answers with, plus the instant the
+//! record stops being one of that account's transfers
+//! ([`AddressTransferRecord::visible_until`]), which the shape carries no member for.
+//! Keyed by the `AllocationId` of the address being transferred, because an address has at
+//! most one transfer at a time — `EnableAddressTransfer` starts the one offer on it — which
+//! also gives the describe path one stable order to report and page over.
+//!
+//! Unlike a `pending` VPC's move, those instants are DOCUMENTED spans rather than chosen
+//! ones ([`ADDRESS_TRANSFER_OFFER_WINDOW`], [`ADDRESS_TRANSFER_ACCEPTED_VISIBILITY`]), so
+//! they are kept on the wall clock the reported timestamps are on;
+//! [`ComAmazonawsEc2Amazonec2State::expire_due_address_transfers`] drops a record whose
+//! instant has passed, from [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`].
 //!
 //! ## Dedicated Hosts
 //!
@@ -188,6 +239,16 @@
 //! owner acts: once `AcceptVpcEndpointConnections` has, the connection is `Pending` and
 //! [`ComAmazonawsEc2Amazonec2State::vpc_endpoint_connection_moves`] holds the instant the
 //! clock owes it `Available`.
+//!
+//! That pair of bounds — a count ceiling the writer itself re-checks, and a per-record byte
+//! floor so a record carrying no tags is not free — is the rule for EVERY store nothing in
+//! this emulator reclaims, not just this one. The writers of the transit gateway
+//! attachments, multicast domains and route table announcements, the VPC endpoint services
+//! and endpoints, and the IPAM pools answer `None` past [`MAX_STORED_RECORDS_PER_STORE`]
+//! and charge [`STORED_RECORD_OVERHEAD_BYTES`] on top of the caller-chosen bytes they hold,
+//! so repeated writes cannot grow this process's memory without bound whatever the records
+//! carry. The Allowed AMIs settings are bounded the same way
+//! ([`MAX_ALLOWED_IMAGES_SETTINGS_REGIONS`] and [`image_criteria_payload_bytes`]).
 //!
 //! ## VPC endpoints, endpoint services, transit gateway attachments and IPAM pools
 //!
@@ -237,6 +298,27 @@
 //! [`ComAmazonawsEc2Amazonec2State::insert_image`]. Each one's `CreationDate` is the build
 //! date its published name carries, so it is the same across reads and across runs and the
 //! newest image of a name pattern is always the same image.
+//!
+//! ## Allowed AMIs is an account-and-Region SETTING, not a resource
+//!
+//! [`ComAmazonawsEc2Amazonec2State::allowed_images_settings`] holds the Allowed AMIs
+//! setting of the account "at the account level in the specified Region"
+//! (`GetAllowedImagesSettings`) as an [`AllowedImagesSettings`], keyed by the Region the
+//! request that wrote it was signed for ([`request_region`]) — the one thing a request
+//! says about the Region it is asking in. It is not a resource: nothing mints or deletes
+//! one, so a Region nobody has configured has NO entry and reports
+//! [`AllowedImagesSettings::default`] — the `disabled` state with no criteria, which is
+//! what an account that has never enabled the feature has. `GetAllowedImagesSettings`
+//! therefore writes nothing at all, the way `DescribeAvailabilityZones` does.
+//!
+//! The two facts the setting carries move independently, which is why one record holds
+//! both: `EnableAllowedImagesSettings` / `DisableAllowedImagesSettings` move the state and
+//! leave the criteria alone (`GetAllowedImagesSettings` reports "the current state of the
+//! Allowed AMIs setting AND the list of Allowed AMIs criteria" whichever state it is in),
+//! and `ReplaceImageCriteriaInAllowedImagesSettings` replaces the criteria and leaves the
+//! state alone. The criteria are stored as the modelled [`ImageCriterion`] shape the get
+//! reports, so the request shapes a replace carries are converted once, where they are
+//! validated, rather than at every read.
 //!
 //! ## The default VPC's default subnets
 //!
@@ -291,6 +373,19 @@
 //! only as an id inside the gateway's options: the ids
 //! `TransitGatewayOptions$AssociationDefaultRouteTableId` and
 //! `$PropagationDefaultRouteTableId` report name that record.
+//!
+//! Which attachment propagates its routes into which of those route tables is a resource of
+//! its own too — "Enables the specified attachment to propagate routes to the specified
+//! propagation route table" (`EnableTransitGatewayRouteTablePropagation`) — so
+//! [`ComAmazonawsEc2Amazonec2State::transit_gateway_propagations`] holds one
+//! [`TransitGatewayPropagationRecord`] per (route table, attachment) pair, which is exactly
+//! as many as there can be: a pair either propagates or does not. The record carries the
+//! `TransitGatewayPropagationState` reached so far plus the move the clock owes it
+//! ([`PropagationMove`]) — `enabling` -> `enabled` after an enable, and the REMOVAL of the
+//! record after a disable, since a pair that no longer propagates is not a propagation the
+//! route table has at all. Both fall due on the same monotonic clock and at the same
+//! [`TRANSITION_DELAY`] as every other move this store owes, and
+//! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies them.
 //!
 //! ## Capacity Blocks
 //!
@@ -361,6 +456,16 @@
 //! [`ComAmazonawsEc2Amazonec2State::complete_due_import_image_tasks`]; only the PERCENTAGE
 //! of progress an active task reports is derived per read, being a fact of elapsed time
 //! that no store could hold.
+//!
+//! ## Placement groups
+//!
+//! [`ComAmazonawsEc2Amazonec2State::placement_groups`] holds the account's placement
+//! groups as the modelled [`PlacementGroup`] shape itself, keyed by `GroupId`, for the
+//! reason [`ComAmazonawsEc2Amazonec2State::vpcs`] holds VPCs that way: `CreatePlacementGroup`
+//! and `DescribePlacementGroups` answer the same shape, so storing it is what stops them
+//! reporting one group differently. A placement group is "a logical grouping of instances"
+//! (`CreatePlacementGroup`) with nothing to provision, so it is stored `available` and no
+//! clock-owed move is recorded for it.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -368,18 +473,21 @@ use std::net::Ipv6Addr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    Address, ApplicationStatus, ApplicationStatusDetail, AttachVolumeOutput, AvailabilityZone,
-    AvailabilityZoneMessage, BlockDeviceMapping, BlockPublicAccessStates, ByoipCidr,
+    Address, AddressTransfer, ApplicationStatus, ApplicationStatusDetail, AttachVolumeOutput,
+    AvailabilityZone, AvailabilityZoneMessage, BlockDeviceMapping, BlockPublicAccessStates,
+    ByoipCidr,
     CapacityBlock, ExportTask, FpgaImage, FpgaImageState, ImageUsageReport, LoadPermission,
     StorageLocation, VolumeRecycleBinInfo,
     CreateVolumeOutput, DescribeFastLaunchImagesSuccessItem, DisableFastLaunchOutput,
+    VolumeModification,
     EbsBlockDevice, EnableFastLaunchOutput, GroupIdentifier, Host, INSTANCE_TYPE_VALUES, Image,
-    Instance, InstanceApplicationStatus, IpamPool,
+    ImageCriterion, Instance, InstanceApplicationStatus, IpamPool,
     InstanceState, InstanceTypeOffering, IpPermission, IpRange, LOCATION_TYPE_VALUES,
     LaunchTemplate, MacHost, Monitoring, OperatorResponse, PeeringAttachmentStatus, Placement,
+    PlacementGroup,
     PrivateDnsNameOptionsOnLaunch,
     DnsEntry, PayerResponsibilityEntry,
-    RequestLaunchTemplateData, RunInstancesOutput, SecondaryNetwork,
+    Region, RequestLaunchTemplateData, RunInstancesOutput, SecondaryNetwork,
     SecondaryNetworkIpv4CidrBlockAssociation, SecondarySubnet,
     SecondarySubnetIpv4CidrBlockAssociation, SecurityGroup, ServiceConfiguration,
     SpotPlacementScore, StateReason,
@@ -387,8 +495,9 @@ use crate::ops::types::{
     TagSpecification,
     TransitGateway, TransitGatewayClientVpnAttachment,
     TransitGatewayMulticastDomainAssociation, TransitGatewayOptions,
-    TransitGatewayPeeringAttachment, TransitGatewayRequestOptions,
+    TransitGatewayPeeringAttachment, TransitGatewayPropagation, TransitGatewayRequestOptions,
     TransitGatewayRouteTable, TransitGatewayRouteTableAnnouncement,
+    TransitGatewayRouteTablePropagation,
     TransitGatewayVpcAttachment,
     UserIdGroupPair, Vpc, VpcBlockPublicAccessExclusion, VpcCidrBlockAssociation,
     VpcCidrBlockState, VpcEndpoint,
@@ -817,6 +926,11 @@ pub const INVALID_SNAPSHOT_ID_MALFORMED: &str = "InvalidSnapshotID.Malformed";
 /// `InvalidParameterValue`.
 pub const VOLUME_LIMIT_EXCEEDED: &str = "VolumeLimitExceeded";
 
+/// EC2's error code for a request that named an EBS volume this account holds no
+/// modification for: the volume resolves, so it is the MODIFICATION that is missing, and
+/// an absent modification is an error rather than an empty answer.
+pub const INVALID_VOLUME_MODIFICATION_NOT_FOUND: &str = "InvalidVolumeModification.NotFound";
+
 /// EC2's error code for a failure of the emulator itself, never for anything a request
 /// carries: a 5xx is retryable to an SDK's retry classifier.
 pub const INTERNAL_ERROR: &str = "InternalError";
@@ -1114,6 +1228,15 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// A `CreateVolume` `ClientToken` and the volume id it minted, so a repeat of the
     /// same request answers with that volume instead of creating a second one.
     pub volume_client_tokens: HashMap<String, String>,
+    /// The most recent modification of each EBS volume that has one, by `VolumeId` — see
+    /// the module docs. Ordered by that id, which is the order
+    /// `DescribeVolumesModifications` reports and pages over.
+    ///
+    /// Keyed by a volume of [`Self::volumes`], so this store can never hold more records
+    /// than that one holds volumes ([`MAX_STORED_VOLUMES`]), and every string a record
+    /// carries is either derived here or a value the modelled `VolumeType` enum admits —
+    /// nothing caller-sized — so no byte charge is made for one.
+    pub volume_modifications: BTreeMap<String, VolumeModificationRecord>,
     /// Every secondary network the account holds, by `SecondaryNetworkId` — see the module
     /// docs. Ordered by id, which is the order `DescribeSecondaryNetworks` reports and
     /// pages over.
@@ -1156,6 +1279,12 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// Monotonic source of the Elastic IP addresses [`Self::mint_elastic_ip`] hands out,
     /// so one allocation can never be given an address another still holds.
     next_elastic_ip: u64,
+    /// Every Elastic IP address transfer the source account can see, by the `AllocationId`
+    /// of the address being transferred — see the module docs. Ordered by that id, which is
+    /// the order `DescribeAddressTransfers` reports and pages over.
+    ///
+    /// Starts EMPTY: an account has no transfer until `EnableAddressTransfer` starts one.
+    pub address_transfers: BTreeMap<String, AddressTransferRecord>,
     /// Every transit gateway the account holds, by `TransitGatewayId`, as the modelled
     /// [`TransitGateway`] shape itself — so a member a writer sets round-trips through
     /// `DescribeTransitGateways` without a field-by-field copy. Ordered by id, which is
@@ -1176,6 +1305,12 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// `CreateTransitGateway` makes (see the module docs). Ordered by id, the stable order
     /// every reader of it reports in.
     pub transit_gateway_route_tables: BTreeMap<String, TransitGatewayRouteTable>,
+    /// Which attachment propagates its routes into which transit gateway route table, by
+    /// (`TransitGatewayRouteTableId`, `TransitGatewayAttachmentId`) — see
+    /// [`TransitGatewayPropagationRecord`] and the module docs. One entry per pair, because
+    /// a pair either propagates or does not; ordered by route table and then by attachment,
+    /// which is the order `GetTransitGatewayRouteTablePropagations` reports and pages over.
+    pub transit_gateway_propagations: BTreeMap<(String, String), TransitGatewayPropagationRecord>,
     /// Every Dedicated Host the account holds, by `HostId`, as the modelled [`Host`]
     /// shape itself — so a member a writer sets round-trips through a describe without a
     /// field-by-field copy that can silently drop one. Ordered by id, which is the order
@@ -1191,6 +1326,11 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// module docs. Ordered by endpoint id, which is the order
     /// `DescribeVpcEndpointConnections` reports and pages over.
     pub vpc_endpoint_connections: BTreeMap<String, VpcEndpointConnection>,
+    /// The account's Allowed AMIs setting in each Region a caller has configured it in, by
+    /// Region name — see the module docs. A Region with no entry has the setting an account
+    /// that never enabled the feature has ([`AllowedImagesSettings::default`]), so a read
+    /// never has to store one.
+    pub allowed_images_settings: BTreeMap<String, AllowedImagesSettings>,
     /// Every Amazon FPGA Image (AFI) the account holds, by `FpgaImageId` — see
     /// [`FpgaImageRecord`]. Ordered by id, which is the order a report of them pages over.
     pub fpga_images: BTreeMap<String, FpgaImageRecord>,
@@ -1264,6 +1404,15 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// same request answers with that task instead of starting a second import: "The token
     /// to enable idempotency for VM import requests" (`ImportImageRequest$ClientToken`).
     pub import_image_task_client_tokens: HashMap<String, String>,
+    /// The account's placement groups, as the modelled [`PlacementGroup`] shape every
+    /// operation that reports one answers with, keyed by `GroupId` in a [`BTreeMap`] — the
+    /// same stable order the other stores are kept in, which is the order
+    /// `DescribePlacementGroups` reports them in. A placement group is a Region-scoped
+    /// logical grouping with no network of its own, so nothing is stored beside the
+    /// modelled shape: every fact a reader needs ("the name", "the state", "the strategy",
+    /// "the number of partitions", "the spread level", "the ARN", "any tags applied to the
+    /// placement group" — [`PlacementGroup`]) is a member of it.
+    pub placement_groups: BTreeMap<String, PlacementGroup>,
     /// The state of the account's *block public access for snapshots* setting — see the
     /// module docs.
     ///
@@ -1306,6 +1455,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             id_counter: 0,
             volumes: BTreeMap::new(),
             volume_client_tokens: HashMap::new(),
+            volume_modifications: BTreeMap::new(),
             secondary_networks: BTreeMap::new(),
             secondary_network_client_tokens: HashMap::new(),
             byoip_cidrs: BTreeMap::new(),
@@ -1315,12 +1465,15 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             fast_launch_images: BTreeMap::new(),
             addresses: BTreeMap::new(),
             next_elastic_ip: 0,
+            address_transfers: BTreeMap::new(),
             transit_gateways: BTreeMap::new(),
             transit_gateway_available_at: BTreeMap::new(),
             transit_gateway_route_tables: BTreeMap::new(),
+            transit_gateway_propagations: BTreeMap::new(),
             dedicated_hosts: BTreeMap::new(),
             dedicated_host_client_tokens: HashMap::new(),
             vpc_endpoint_connections: BTreeMap::new(),
+            allowed_images_settings: BTreeMap::new(),
             fpga_images: BTreeMap::new(),
             fpga_image_client_tokens: HashMap::new(),
             volumes_in_recycle_bin: BTreeMap::new(),
@@ -1337,6 +1490,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             vpc_block_public_access_exclusions: BTreeMap::new(),
             import_image_tasks: BTreeMap::new(),
             import_image_task_client_tokens: HashMap::new(),
+            placement_groups: BTreeMap::new(),
             // "Public sharing is not blocked" is where an account that has never called
             // `EnableSnapshotBlockPublicAccess` sits.
             snapshot_block_public_access: SNAPSHOT_BLOCK_PUBLIC_ACCESS_UNBLOCKED,
@@ -2385,8 +2539,12 @@ impl ComAmazonawsEc2Amazonec2State {
         for cidr in due {
             let held = self.addresses_in_byoip_cidr(&cidr);
             if held.is_empty() {
-                // The release succeeded: the range is not one of the account's any more.
-                self.byoip_cidrs.remove(&cidr);
+                // The release succeeded: the range is not one of the account's any more, so
+                // the bytes its record held go back to the budget — exactly what
+                // [`Self::insert_byoip_cidr`] charged for it.
+                if let Some(record) = self.byoip_cidrs.remove(&cidr) {
+                    self.release_stored_bytes(byoip_cidr_payload_bytes(&record));
+                }
                 continue;
             }
             // "failed-deprovision: The request to deprovision the address range was
@@ -2514,6 +2672,37 @@ impl ComAmazonawsEc2Amazonec2State {
                 record.pending = None;
             }
         }
+        // The end of an enable or a disable of one route propagation: the pair either
+        // reaches `enabled`, or stops being a propagation of that route table at all —
+        // `TransitGatewayPropagationState` has no word for a pair that does not propagate,
+        // and a route table whose propagation was disabled simply does not have one any
+        // more. Due at its instant whether or not anybody called, like every other move
+        // above. The removals are collected first, the way the BYOIP block above collects
+        // its due ranges, so each one can give its bytes back to the store's budget.
+        let mut removed: Vec<(String, String)> = Vec::new();
+        for (key, record) in &mut self.transit_gateway_propagations {
+            let Some(due) = record
+                .pending
+                .as_ref()
+                .filter(|pending| now >= pending.due_at)
+                .map(|pending| pending.to)
+            else {
+                continue;
+            };
+            match due {
+                PropagationMove::Removed => removed.push(key.clone()),
+                PropagationMove::Enabled => {
+                    record.state = PROPAGATION_STATE_ENABLED.to_string();
+                    record.pending = None;
+                }
+            }
+        }
+        for key in removed {
+            if self.transit_gateway_propagations.remove(&key).is_some() {
+                // Exactly what the enable charged for the record.
+                self.release_stored_bytes(STORED_RECORD_OVERHEAD_BYTES);
+            }
+        }
         let connections = &mut self.vpc_endpoint_connections;
         self.vpc_endpoint_connection_moves.retain(|endpoint_id, pending| {
             if now < pending.due_at {
@@ -2525,6 +2714,12 @@ impl ComAmazonawsEc2Amazonec2State {
             // The move is applied once; nothing is owed on this connection any more.
             false
         });
+        // An Elastic IP address transfer the clock has taken past the end of what the
+        // source account is shown: the offer expired and ownership returned to that
+        // account, or an accepted transfer's 14 days of visibility ran out. Both were due
+        // at their instant whether or not anybody called, and both are spans AWS
+        // documents, so they are read off the wall clock rather than `now`.
+        self.expire_due_address_transfers(SystemTime::now());
         self.complete_due_import_image_tasks(now);
     }
 
@@ -3269,43 +3464,251 @@ pub fn offering_page_cursor(offering: &InstanceTypeOfferingRecord) -> String {
 }
 
 // =============================================================================
-// Spot placement scores
+// Regions
 // =============================================================================
+
+/// Every AWS partition that is not the commercial one: the prefix every Region code of
+/// that partition starts with, and the DNS suffix its service endpoints carry.
+///
+/// The prefixes are AWS's own partition prefixes — AWS China, GovCloud and the isolated
+/// partitions — the same ones
+/// `service-com-amazonaws-observabilityadmin-observabilityadmin` partitions
+/// `KNOWN_REGIONS` by. The suffix of each is the `dnsSuffix` that partition publishes in
+/// the AWS SDK partition metadata (`endpoints.json`), which is what every regional
+/// endpoint of the partition is built from: `aws-cn` `amazonaws.com.cn`, `aws-us-gov`
+/// `amazonaws.com`, `aws-iso` `c2s.ic.gov`, `aws-iso-b` `sc2s.sgov.gov`, `aws-iso-e`
+/// `cloud.adc-e.uk`, `aws-iso-f` `csp.hci.ic.gov`.
+///
+/// Every prefix ends in a hyphen, so `us-iso-` cannot swallow `us-isob-` and the order of
+/// the entries carries no meaning.
+const NON_COMMERCIAL_PARTITIONS: [(&str, &str); 6] = [
+    ("cn-", "amazonaws.com.cn"),
+    ("us-gov-", "amazonaws.com"),
+    ("us-iso-", "c2s.ic.gov"),
+    ("us-isob-", "sc2s.sgov.gov"),
+    ("us-isof-", "csp.hci.ic.gov"),
+    ("eu-isoe-", "cloud.adc-e.uk"),
+];
+
+/// The DNS suffix the commercial (`aws`) partition's endpoints carry — the one
+/// `DescribeRegionsRequest$Filters` spells out for the `endpoint` filter
+/// (`ec2.us-east-1.amazonaws.com`).
+pub const COMMERCIAL_DNS_SUFFIX: &str = "amazonaws.com";
+
+/// This service's endpoint prefix: the `endpointPrefix` of its `aws.api#service` trait
+/// (`smithy_query(query="service_info")`), which is the first label of every regional
+/// endpoint the service is reached through.
+pub const EC2_ENDPOINT_PREFIX: &str = "ec2";
+
+/// The Regions of the commercial partition an account can use WITHOUT opting in: the
+/// "Regions that are enabled by default" table of the Amazon Web Services Account
+/// Management Reference Guide, "Specify which Amazon Web Services Regions your account can
+/// use" — the guide `DescribeRegions`'s own documentation links to.
+///
+/// The ENABLED set is the written list and the opt-in set is its complement, rather than
+/// the other way round, because that is the direction AWS's rule runs: a Region
+/// introduced after the guide's cut-off is disabled until the account opts in, so a Region
+/// this emulator's catalog gains later is an opt-in Region without this list being
+/// touched. Regions outside the commercial partition are not in it at all — an account of
+/// the China, GovCloud or an isolated partition reaches its own partition's Regions
+/// directly — which is why [`region_opt_in_status`] asks about the partition first.
+pub const REGIONS_ENABLED_BY_DEFAULT: [&str; 17] = [
+    "ap-northeast-1",
+    "ap-northeast-2",
+    "ap-northeast-3",
+    "ap-south-1",
+    "ap-southeast-1",
+    "ap-southeast-2",
+    "ca-central-1",
+    "eu-central-1",
+    "eu-north-1",
+    "eu-west-1",
+    "eu-west-2",
+    "eu-west-3",
+    "sa-east-1",
+    "us-east-1",
+    "us-east-2",
+    "us-west-1",
+    "us-west-2",
+];
+
+/// `Region$OptInStatus` for a Region the account has opted in to — one of the three
+/// values the member's own doc lists ("The possible values are `opt-in-not-required`,
+/// `opted-in`, and `not-opted-in`").
+pub const OPT_IN_STATUS_OPTED_IN: &str = "opted-in";
+
+/// `Region$OptInStatus` for a Region that requires an opt-in the account has not made.
+pub const OPT_IN_STATUS_NOT_OPTED_IN: &str = "not-opted-in";
+
+/// Every filter `DescribeRegions` documents, as its `Filters` member lists them
+/// (`smithy_query(query="doc",shape="DescribeRegionsRequest",member="Filters")`). A
+/// filter outside this set is refused; a filter inside it is answered by
+/// [`RegionRecord::filter_values`], which must cover every entry.
+pub const REGION_FILTERS: [&str; 3] = ["endpoint", "opt-in-status", "region-name"];
+
+/// The [`NON_COMMERCIAL_PARTITIONS`] entry `region` belongs to, or `None` when `region`
+/// belongs to the commercial partition, whose Region codes carry no partition prefix at
+/// all.
+///
+/// One lookup answers both the prefix and the DNS suffix, so [`partition_prefix_of`] and
+/// [`partition_dns_suffix`] can never disagree about which prefix wins.
+fn partition_of(region: &str) -> Option<&'static (&'static str, &'static str)> {
+    NON_COMMERCIAL_PARTITIONS
+        .iter()
+        .find(|(prefix, _)| region.starts_with(prefix))
+}
+
+/// The Region-code prefix of `region`'s partition, or `None` when `region` belongs to the
+/// commercial partition.
+fn partition_prefix_of(region: &str) -> Option<&'static str> {
+    partition_of(region).map(|(prefix, _)| *prefix)
+}
+
+/// The DNS suffix the endpoints of `region`'s partition carry.
+pub fn partition_dns_suffix(region: &str) -> &'static str {
+    partition_of(region).map_or(COMMERCIAL_DNS_SUFFIX, |(_, suffix)| *suffix)
+}
+
+/// `region`'s EC2 service endpoint: this service's endpoint prefix, the Region code, and
+/// the DNS suffix of the Region's partition — `ec2.us-east-1.amazonaws.com`, the form
+/// `DescribeRegions`'s `endpoint` filter doc gives.
+pub fn region_endpoint(region: &str) -> String {
+    format!(
+        "{EC2_ENDPOINT_PREFIX}.{region}.{}",
+        partition_dns_suffix(region)
+    )
+}
+
+/// Every Region of the partition `region` belongs to, in Region-code order.
+///
+/// Neither the Smithy model nor any operation of this emulator carries a Region catalog —
+/// the model's endpoint rule set resolves ONE Region name rather than enumerating them,
+/// and no operation creates a Region — so the catalog is
+/// `emulator_telemetry::policy::KNOWN_REGIONS` ("every AWS region the wire may carry",
+/// already sorted for binary search), the same source two other services derive their
+/// Region catalogs from, rather than a second hand-written list that would drift from it.
+///
+/// It is narrowed to ONE partition because a partition is what bounds the Regions an
+/// account can ever see: an account lives in exactly one, and its Region codes are what
+/// name it. The order the catalog inherits is Region-code order, which is what makes
+/// [`MAX_SCORED_REGIONS`] a prefix of [`commercial_regions`].
+pub fn regions_in_partition_of(region: &str) -> Vec<&'static str> {
+    let partition = partition_prefix_of(region);
+    ::emulator_telemetry::policy::KNOWN_REGIONS
+        .iter()
+        .copied()
+        .filter(|known| partition_prefix_of(known) == partition)
+        .collect()
+}
 
 /// The Regions of the commercial (`aws`) partition, in Region-code order: the ones a
 /// `GetSpotPlacementScores` request that narrows nothing is scored over.
 ///
 /// `RegionNames` holds "the Regions used to narrow down the list of Regions to be
 /// scored" (`GetSpotPlacementScoresRequest$RegionNames`), so the list it narrows has to
-/// exist, and neither the Smithy model nor any operation of this emulator carries one —
-/// the model's endpoint rule set resolves ONE Region name rather than enumerating them,
-/// and no operation creates a Region. The catalog is therefore
-/// `emulator_telemetry::policy::KNOWN_REGIONS` ("every AWS region the wire may carry",
-/// already sorted for binary search) with the other partitions' Regions filtered out by
-/// [`NON_COMMERCIAL_REGION_PREFIXES`] — the same source two other services derive their
-/// Region catalogs from, rather than a second hand-written list that would drift from it.
-/// The order it inherits is what makes [`MAX_SCORED_REGIONS`] a prefix of this list.
-///
-/// Nothing here is tied to one operation: `DescribeRegions` is still a scaffold stub and
-/// wants exactly this catalog.
+/// exist; it is [`regions_in_partition_of`] for the partition [`DEFAULT_REGION`] belongs
+/// to.
 pub fn commercial_regions() -> Vec<&'static str> {
-    ::emulator_telemetry::policy::KNOWN_REGIONS
-        .iter()
-        .copied()
-        .filter(|region| {
-            !NON_COMMERCIAL_REGION_PREFIXES
-                .iter()
-                .any(|prefix| region.starts_with(prefix))
+    regions_in_partition_of(DEFAULT_REGION)
+}
+
+/// `region`'s opt-in status for an account calling in `signed_region`.
+///
+/// A Region outside the commercial partition, and a commercial Region of
+/// [`REGIONS_ENABLED_BY_DEFAULT`], needs no opt-in at all. Of the rest — the ones an
+/// account must enable — the Region the request was SIGNED for is one the account has
+/// evidently enabled, since a regional endpoint of a disabled Region answers nothing;
+/// this emulator holds no account-level opt-in store and EC2 has no operation that opts a
+/// Region in or out (that is the Account API's `EnableRegion`), so that is the one opt-in
+/// a request itself evidences, and every other opt-in Region is reported
+/// `not-opted-in`.
+pub fn region_opt_in_status(region: &str, signed_region: &str) -> &'static str {
+    if partition_prefix_of(region).is_some() || REGIONS_ENABLED_BY_DEFAULT.contains(&region) {
+        OPT_IN_NOT_REQUIRED
+    } else if region == signed_region {
+        OPT_IN_STATUS_OPTED_IN
+    } else {
+        OPT_IN_STATUS_NOT_OPTED_IN
+    }
+}
+
+/// One Region of the account's partition, as the describe reads it.
+///
+/// `opt_in_status` is a `&'static str` because it is one of the three words
+/// `Region$OptInStatus` documents rather than text a request can carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionRecord {
+    /// `us-east-1` — the Region code.
+    pub region_name: String,
+    /// The Region's EC2 service endpoint, as [`region_endpoint`] builds it.
+    pub endpoint: String,
+    /// `opt-in-not-required`, `opted-in` or `not-opted-in`.
+    pub opt_in_status: &'static str,
+}
+
+impl RegionRecord {
+    /// This Region as the modelled `Region` shape.
+    ///
+    /// `Geography` is absent because the geography of a Region ("for example, `United
+    /// States of America`") is display data AWS publishes per Region that neither the
+    /// model nor the request yields — reported absent rather than invented, the same way
+    /// [`AvailabilityZoneRecord::to_availability_zone`] leaves a zone's geography out.
+    pub fn to_region(&self) -> Region {
+        Region {
+            region_name: Some(self.region_name.clone()),
+            endpoint: Some(self.endpoint.clone()),
+            opt_in_status: Some(self.opt_in_status.to_string()),
+            geography: None,
+        }
+    }
+
+    /// Whether this Region is enabled for the account: every Region but one carrying an
+    /// opt-in the account has not made.
+    pub fn is_enabled(&self) -> bool {
+        self.opt_in_status != OPT_IN_STATUS_NOT_OPTED_IN
+    }
+
+    /// The values the EC2 filter `name` compares against this Region, or `None` when
+    /// `name` is not one of [`REGION_FILTERS`].
+    pub fn filter_values(&self, name: &str) -> Option<Vec<&str>> {
+        let values = match name {
+            "endpoint" => vec![self.endpoint.as_str()],
+            "opt-in-status" => vec![self.opt_in_status],
+            "region-name" => vec![self.region_name.as_str()],
+            _ => return None,
+        };
+        Some(values)
+    }
+}
+
+/// The Regions a request signed for `signed_region` can see, in Region-code order:
+/// every Region of that Region's partition ([`regions_in_partition_of`]), each with its
+/// endpoint and its opt-in status.
+///
+/// A well-formed `signed_region` the catalog does not hold is reported beside them, so a
+/// caller is never told the Region it is calling in does not exist — the same allowance
+/// `GetSpotPlacementScores` makes for the Region a call was signed for. A credential
+/// scope is caller-controlled text, so one that is not shaped like a Region code
+/// ([`region_name_is_well_formed`]) adds nothing.
+pub fn regions_for_request(signed_region: &str) -> Vec<RegionRecord> {
+    let mut names: Vec<&str> = regions_in_partition_of(signed_region);
+    if region_name_is_well_formed(signed_region) && !names.contains(&signed_region) {
+        names.push(signed_region);
+        names.sort_unstable();
+    }
+    names
+        .into_iter()
+        .map(|name| RegionRecord {
+            region_name: name.to_string(),
+            endpoint: region_endpoint(name),
+            opt_in_status: region_opt_in_status(name, signed_region),
         })
         .collect()
 }
 
-/// The region-code prefixes of the partitions that are not the commercial one: AWS China,
-/// GovCloud and the isolated partitions (`us-iso`, `us-isob`, `us-isof`, `eu-isoe` — the
-/// shorter prefixes cover the longer ones). They are AWS's own partition prefixes, the
-/// same ones `service-com-amazonaws-observabilityadmin-observabilityadmin` partitions
-/// `KNOWN_REGIONS` by.
-const NON_COMMERCIAL_REGION_PREFIXES: [&str; 4] = ["cn-", "us-gov-", "us-iso", "eu-iso"];
+// =============================================================================
+// Spot placement scores
+// =============================================================================
 
 /// The most Regions one `GetSpotPlacementScores` response scores: "The Spot placement
 /// score for the top 10 Regions or Availability Zones"
@@ -4765,6 +5168,137 @@ pub fn volume_limit_exceeded<E>(message: impl Into<String>) -> crate::scaffolded
 }
 
 // =============================================================================
+// EBS volume modifications
+// =============================================================================
+
+/// A modification that has been accepted and whose change is being applied:
+/// `VolumeModificationState`'s `modifying`
+/// (`smithy_query(query="shape",shape="VolumeModificationState")`).
+pub const VOLUME_MODIFICATION_STATE_MODIFYING: &str = "modifying";
+
+/// A modification whose change is in place and whose volume is being brought to its new
+/// performance: `VolumeModificationState`'s `optimizing`.
+pub const VOLUME_MODIFICATION_STATE_OPTIMIZING: &str = "optimizing";
+
+/// A modification that is finished: `VolumeModificationState`'s `completed`. The fourth
+/// value of the catalog, `failed`, is never stored here — nothing in this emulator fails a
+/// modification after it has been accepted; a change it cannot apply is refused at the
+/// call that asks for it.
+pub const VOLUME_MODIFICATION_STATE_COMPLETED: &str = "completed";
+
+/// The `Progress` a finished modification reports: "The modification progress, from 0 to
+/// 100 percent complete" (`VolumeModification$Progress`).
+pub const VOLUME_MODIFICATION_PROGRESS_COMPLETE: i64 = 100;
+
+/// One EBS volume's most recent modification: the modelled [`VolumeModification`] every
+/// operation that reports one answers with, plus the instants the clock owes it its
+/// `modifying` -> `optimizing` -> `completed` moves.
+///
+/// The view holds no `ModificationState`, `Progress` or `EndTime`: all three are facts of
+/// the modification's age, so [`VolumeModificationRecord::view_at`] derives them rather
+/// than letting two writers store two different answers — the arrangement
+/// [`VolumeRecord`] uses for a volume's own `State`.
+#[derive(Debug, Clone)]
+pub struct VolumeModificationRecord {
+    /// The modification as the model shapes it: the volume it belongs to, its original
+    /// values, its target values and its `StartTime`. `ModificationState`, `Progress` and
+    /// `EndTime` are left for [`Self::view_at`] to fill.
+    pub view: VolumeModification,
+    /// The instant the modification started, which [`Self::progress_at`] measures from.
+    pub started_at: Instant,
+    /// The instant from which this modification's `modifying` -> `optimizing` move is
+    /// due. Monotonic ([`Instant`]), because it is only ever compared against the clock
+    /// and never reported, so a wall-clock adjustment cannot move a finished
+    /// modification back to `modifying`.
+    pub optimizing_at: Instant,
+    /// The instant from which its `optimizing` -> `completed` move is due.
+    pub completed_at: Instant,
+    /// The wall-clock instant the modification finishes on, which it reports as its
+    /// `EndTime` once it has: the modification ended when that move fell due, not when
+    /// somebody next asked about it.
+    pub ends_at: SystemTime,
+}
+
+impl VolumeModificationRecord {
+    /// A modification of `view` that starts now: `modifying`, due `optimizing` one
+    /// [`TRANSITION_DELAY`] later and `completed` one further [`TRANSITION_DELAY`] after
+    /// that.
+    ///
+    /// Each move falls due a span after the move before it, read off the same monotonic
+    /// clock as every other clock-owed transition in this crate and recorded rather than
+    /// slept for, so a caller that reads straight after the call that started the
+    /// modification still observes it `modifying`.
+    pub fn starting_now(view: VolumeModification) -> Self {
+        let started_at = Instant::now();
+        Self {
+            view,
+            started_at,
+            optimizing_at: started_at + TRANSITION_DELAY,
+            completed_at: started_at + TRANSITION_DELAY * 2,
+            ends_at: SystemTime::now() + TRANSITION_DELAY * 2,
+        }
+    }
+
+    /// The modification's `VolumeModificationState` at `now`.
+    pub fn state_at(&self, now: Instant) -> &'static str {
+        if now < self.optimizing_at {
+            VOLUME_MODIFICATION_STATE_MODIFYING
+        } else if now < self.completed_at {
+            VOLUME_MODIFICATION_STATE_OPTIMIZING
+        } else {
+            VOLUME_MODIFICATION_STATE_COMPLETED
+        }
+    }
+
+    /// How far along the modification is at `now`, "from 0 to 100 percent complete"
+    /// (`VolumeModification$Progress`): the share of the span between its start and its
+    /// completion that the clock has passed, and [`VOLUME_MODIFICATION_PROGRESS_COMPLETE`]
+    /// once it is `completed`.
+    pub fn progress_at(&self, now: Instant) -> i64 {
+        let whole = self.completed_at.saturating_duration_since(self.started_at);
+        let elapsed = now.saturating_duration_since(self.started_at);
+        if whole.is_zero() || elapsed >= whole {
+            return VOLUME_MODIFICATION_PROGRESS_COMPLETE;
+        }
+        let percent = elapsed
+            .as_nanos()
+            .saturating_mul(u128::try_from(VOLUME_MODIFICATION_PROGRESS_COMPLETE).unwrap_or(100))
+            / whole.as_nanos();
+        i64::try_from(percent)
+            .unwrap_or(VOLUME_MODIFICATION_PROGRESS_COMPLETE)
+            .clamp(0, VOLUME_MODIFICATION_PROGRESS_COMPLETE)
+    }
+
+    /// This modification as of `now`: the stored view with the state, the progress and the
+    /// end time the clock has reached. A read observes the moves the clock already owed
+    /// without writing anything, so it cannot change what a later caller sees.
+    ///
+    /// `EndTime` is "the modification completion or failure time"
+    /// (`VolumeModification$EndTime`), so a modification that has not finished reports
+    /// none at all.
+    pub fn view_at(&self, now: Instant) -> VolumeModification {
+        let mut view = self.view.clone();
+        view.modification_state = Some(self.state_at(now).to_string());
+        view.progress = Some(self.progress_at(now));
+        view.end_time = (now >= self.completed_at).then(|| system_time_to_date_time(self.ends_at));
+        view
+    }
+}
+
+/// Refuse a request that named an EBS volume this account holds no modification for, the
+/// way EC2 does: HTTP 400 `InvalidVolumeModification.NotFound`, whose message names the
+/// volume the request asked about — the one thing about the refusal that is not fixed text.
+pub fn invalid_volume_modification_not_found<E>(
+    volume_id: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_VOLUME_MODIFICATION_NOT_FOUND,
+        400,
+        format!("Modification for volume '{volume_id}' does not exist."),
+    )
+}
+
+// =============================================================================
 // Secondary networks
 // =============================================================================
 
@@ -5813,6 +6347,45 @@ impl Default for ImageSpec {
     }
 }
 
+/// The caller-chosen bytes one stored AMI holds: its tags, and every string of the record
+/// whose LENGTH a request chose — the name (which the derived `ImageLocation` holds a
+/// second copy of), the description, the architecture, the root device name (stored on the
+/// image and on its block device mapping), the volume type, the state, the billing strings,
+/// the creation date, the owning account and its alias, the deprecation time, the public
+/// parameter name, the platform, the boot mode and the IMDS support. The ids, the snapshot
+/// and the fixed facts of an EBS-backed HVM image are derived by this module, so they are
+/// fixed-size.
+///
+/// The ONE definition of that charge, the way [`address_payload_bytes`] is for an Elastic
+/// IP address: [`ComAmazonawsEc2Amazonec2State::insert_image`] charges exactly it, so no
+/// path can store those bytes uncharged, and a writer that asks
+/// [`ComAmazonawsEc2Amazonec2State::would_exceed_stored_bytes`] first asks it with this
+/// number. A string stored twice is counted twice, because that is what the store holds.
+pub fn image_payload_bytes(spec: &ImageSpec) -> usize {
+    let optional = |value: Option<&String>| -> usize { value.map_or(0, String::len) };
+    tag_list_bytes(&spec.tags)
+        // `Image$Name`, and the `<owner>/<name>` `ImageLocation` derived from it.
+        .saturating_add(spec.name.len().saturating_mul(2))
+        .saturating_add(spec.description.len())
+        .saturating_add(spec.architecture.len())
+        // `Image$RootDeviceName`, and the block device mapping's own `DeviceName`.
+        .saturating_add(spec.root_device_name.len().saturating_mul(2))
+        .saturating_add(spec.root_volume_type.len())
+        .saturating_add(spec.state.len())
+        .saturating_add(spec.platform_details.len())
+        .saturating_add(spec.usage_operation.len())
+        .saturating_add(spec.creation_date.len())
+        // The owning account, and the `ImageLocation` prefix when no alias replaces it.
+        .saturating_add(spec.owner_id.len().saturating_mul(2))
+        // `Image$ImageOwnerAlias`, and the `ImageLocation` prefix when it is set.
+        .saturating_add(optional(spec.owner_alias.as_ref()).saturating_mul(2))
+        .saturating_add(optional(spec.deprecation_time.as_ref()))
+        .saturating_add(optional(spec.public_ssm_parameter_name.as_ref()))
+        .saturating_add(optional(spec.platform.as_ref()))
+        .saturating_add(optional(spec.boot_mode.as_ref()))
+        .saturating_add(optional(spec.imds_support.as_ref()))
+}
+
 impl ComAmazonawsEc2Amazonec2State {
     /// Whether another image fits inside the store's ceiling ([`MAX_IMAGES`]).
     ///
@@ -5829,8 +6402,14 @@ impl ComAmazonawsEc2Amazonec2State {
     /// manifest location `<owner>/<name>` the `manifest-location` filter selects on, and
     /// the fixed facts of an EBS-backed HVM machine image — so two writers cannot report
     /// the same image differently. Like [`Self::insert_vpc`], the caller-chosen bytes of
-    /// `spec.tags` are charged against the store's byte budget here.
+    /// the record are charged against the store's byte budget here, counted by the ONE
+    /// definition of that charge ([`image_payload_bytes`]) rather than by the tags alone:
+    /// a count ceiling ([`MAX_IMAGES`]) is no memory bound on its own, so every string
+    /// whose LENGTH a request chose is charged against [`MAX_STORED_BYTES`] too.
     pub fn insert_image(&mut self, spec: ImageSpec) -> String {
+        // Counted BEFORE `spec` is taken apart below, so the charge covers what the
+        // caller supplied rather than what survived into the record.
+        let payload_bytes = image_payload_bytes(&spec);
         let image_id = self.next_id("ami");
         let snapshot_id = self.next_id("snap");
         let owner = spec
@@ -5890,8 +6469,12 @@ impl ComAmazonawsEc2Amazonec2State {
             // image this store has only just published reports none.
             last_launched_time: None,
             // "If `true`, the AMI satisfies the criteria for Allowed AMIs"
-            // (`Image$ImageAllowed`). This account declares no Allowed AMIs criteria, so
-            // every image it can see satisfies them.
+            // (`Image$ImageAllowed`), which is the value of an account whose Allowed AMIs
+            // criteria every image satisfies — among them an account that declares none,
+            // which is what [`Self::allowed_images_settings`] starts empty at. Evaluating
+            // stored criteria against an image is `DescribeImages`'s own behaviour and the
+            // `ImageCriterion` matcher it would need does not exist yet, so nothing writes
+            // another value here.
             image_allowed: Some(true),
             // Set only for an image copied from another (`CopyImage`).
             source_image_id: None,
@@ -5920,7 +6503,7 @@ impl ComAmazonawsEc2Amazonec2State {
             ramdisk_id: None,
             platform: spec.platform,
         };
-        self.add_stored_bytes(tag_list_bytes(image.tags.as_deref().unwrap_or_default()));
+        self.add_stored_bytes(payload_bytes);
         self.images.insert(image_id.clone(), image);
         image_id
     }
@@ -7130,9 +7713,58 @@ impl ByoipCidrRecord {
     }
 }
 
+/// The bytes one stored BYOIP address range holds.
+///
+/// The ONE definition of that charge, the way [`volume_recycle_bin_entry_payload_bytes`] is
+/// for an entry of the Recycle Bin: the fixed [`STORED_RECORD_OVERHEAD_BYTES`] every stored
+/// record costs — so a range carrying no optional text is NOT free against
+/// [`MAX_STORED_BYTES`] — plus the caller-chosen text the record carries, which is what a
+/// request can make large. [`ComAmazonawsEc2Amazonec2State::insert_byoip_cidr`] charges
+/// exactly this and every path that drops a range gives back exactly this.
+pub fn byoip_cidr_payload_bytes(record: &ByoipCidrRecord) -> usize {
+    let range = &record.byoip_cidr;
+    let asn_bytes = range
+        .asn_associations
+        .iter()
+        .flatten()
+        .map(|association| {
+            association
+                .asn
+                .as_deref()
+                .map_or(0, str::len)
+                .saturating_add(association.cidr.as_deref().map_or(0, str::len))
+                .saturating_add(association.status_message.as_deref().map_or(0, str::len))
+                .saturating_add(association.state.as_deref().map_or(0, str::len))
+        })
+        .fold(0usize, usize::saturating_add);
+    STORED_RECORD_OVERHEAD_BYTES
+        .saturating_add(range.cidr.as_deref().map_or(0, str::len))
+        .saturating_add(range.description.as_deref().map_or(0, str::len))
+        .saturating_add(range.status_message.as_deref().map_or(0, str::len))
+        .saturating_add(range.network_border_group.as_deref().map_or(0, str::len))
+        .saturating_add(range.advertisement_type.as_deref().map_or(0, str::len))
+        .saturating_add(range.pool_id.as_deref().map_or(0, str::len))
+        .saturating_add(range.ipam_pool_id.as_deref().map_or(0, str::len))
+        .saturating_add(asn_bytes)
+}
+
 impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another BYOIP address range fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]).
+    ///
+    /// The same contract as [`Self::has_volume_recycle_bin_capacity`]: a writer asks this
+    /// BEFORE provisioning anything and refuses the request with EC2's own quota code when
+    /// it answers `false`, and [`Self::insert_byoip_cidr`] asks it again for itself, so no
+    /// path can get past the ceiling by forgetting to. The ceiling is needed because the
+    /// key is the range a REQUEST names, so without it a client could provision distinct
+    /// ranges without end and grow this process's memory without bound — nothing in this
+    /// module reclaims a stored range except the release the clock applies.
+    pub fn has_byoip_cidr_capacity(&self) -> bool {
+        self.byoip_cidrs.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
     /// Store `record` as the account's range for the `Cidr` it carries, replacing whatever
-    /// range that CIDR named before.
+    /// range that CIDR named before, and answer whether it was stored.
     ///
     /// The key is the range in the CANONICAL form the store documents
     /// ([`canonical_byoip_cidr`]), taken here rather than trusted from the caller, so a
@@ -7140,16 +7772,37 @@ impl ComAmazonawsEc2Amazonec2State {
     /// carrying no `Cidr`, or one that is not an address range at all, names no range the
     /// API can address — every BYOIP operation is addressed by `Cidr` — so there is no key
     /// to file it under and it is not stored.
-    pub fn insert_byoip_cidr(&mut self, record: ByoipCidrRecord) {
+    ///
+    /// `false`, with NOTHING written, when there is no key to file it under, or when the
+    /// range is a new one and the store is at [`MAX_STORED_RECORDS_PER_STORE`] or the bytes
+    /// it would hold would cross [`MAX_STORED_BYTES`]. Both ceilings are asked before the
+    /// first write, so a refused provision leaves the store exactly as it was.
+    pub fn insert_byoip_cidr(&mut self, record: ByoipCidrRecord) -> bool {
         let Some(cidr) = record
             .byoip_cidr
             .cidr
             .as_deref()
             .and_then(|cidr| canonical_byoip_cidr(cidr).ok())
         else {
-            return;
+            return false;
         };
+        let charge = byoip_cidr_payload_bytes(&record);
+        // A range the store does not already hold is a NEW record, so it is the one that
+        // has to fit inside both ceilings. Replacing a range held under the same key stores
+        // no further record and gives back what the record it replaces was charged, so the
+        // byte budget stays the sum of what the store actually holds.
+        let refund = self.byoip_cidrs.get(&cidr).map(byoip_cidr_payload_bytes);
+        if refund.is_none()
+            && (!self.has_byoip_cidr_capacity() || self.would_exceed_stored_bytes(charge))
+        {
+            return false;
+        }
+        if let Some(refund) = refund {
+            self.release_stored_bytes(refund);
+        }
+        self.add_stored_bytes(charge);
         self.byoip_cidrs.insert(cidr, record);
+        true
     }
 
     /// Start releasing the range `cidr`: move it to `pending-deprovision` and record when
@@ -7996,6 +8649,24 @@ pub const INVALID_ALLOCATION_ID_NOT_FOUND: &str = "InvalidAllocationID.NotFound"
 /// allocation id at all, so there is nothing to look up.
 pub const INVALID_ALLOCATION_ID_MALFORMED: &str = "InvalidAllocationID.Malformed";
 
+/// `Resource.AlreadyAssociated` (HTTP 400): the request asked for an association the
+/// resource already has with something else, and did not allow that one to be replaced
+/// ("you can specify false to ensure the operation fails if the Elastic IP address is
+/// already associated with another resource" — `AssociateAddressRequest$AllowReassociation`).
+pub const RESOURCE_ALREADY_ASSOCIATED: &str = "Resource.AlreadyAssociated";
+
+/// `InvalidNetworkInterfaceID.NotFound` (HTTP 400): the request named a network interface
+/// id this account holds no network interface for.
+pub const INVALID_NETWORK_INTERFACE_ID_NOT_FOUND: &str = "InvalidNetworkInterfaceID.NotFound";
+
+/// `InvalidNetworkInterfaceID.Malformed` (HTTP 400): the request named something that is
+/// not a network interface id at all, so there is nothing to look up.
+pub const INVALID_NETWORK_INTERFACE_ID_MALFORMED: &str = "InvalidNetworkInterfaceID.Malformed";
+
+/// The id prefix of the association between an Elastic IP address and a resource, which
+/// is what `ElasticIpAssociationId` names and `AssociateAddress` mints.
+pub const ELASTIC_IP_ASSOCIATION_ID_PREFIX: &str = "eipassoc";
+
 impl ComAmazonawsEc2Amazonec2State {
     /// The next unused Elastic IP address, or `None` when the search is exhausted.
     ///
@@ -8036,6 +8707,57 @@ impl ComAmazonawsEc2Amazonec2State {
             .iter()
             .find(|(_, address)| address.public_ip.as_deref() == Some(public_ip))
             .map(|(allocation_id, _)| allocation_id.clone())
+    }
+
+    /// The allocation id of the address currently associated with `instance_id`, or `None`
+    /// when no address of the account is.
+    ///
+    /// Scanned off the address records themselves, like
+    /// [`Self::allocation_id_for_public_ip`] and for the same reason: `Address$InstanceId`
+    /// is where an association is stored, so there is no second copy of it to fall out of
+    /// step. An instance holds at most one Elastic IP address — "if you associate an
+    /// Elastic IP address with an instance that has an existing Elastic IP address, the
+    /// existing address is disassociated from the instance" (`AssociateAddress`) — so the
+    /// first match is the only one.
+    pub fn allocation_id_associated_with_instance(&self, instance_id: &str) -> Option<String> {
+        self.addresses
+            .iter()
+            .find(|(_, address)| address.instance_id.as_deref() == Some(instance_id))
+            .map(|(allocation_id, _)| allocation_id.clone())
+    }
+
+    /// End `allocation_id`'s association, leaving the address ALLOCATED to the account:
+    /// "the existing address is disassociated from the instance, but remains allocated to
+    /// your account" (`AssociateAddress`).
+    ///
+    /// Shared because every path that ends an association does exactly this — the remap
+    /// `AssociateAddress` performs, and `DisassociateAddress` and `ReleaseAddress` once
+    /// they are implemented. The instance the address was associated with also gives up
+    /// the public address it was reporting through it (`Instance$PublicIpAddress`), so the
+    /// instance store and the address store cannot disagree about one address. Storing
+    /// nothing new, it makes no byte charge.
+    ///
+    /// A no-op for an allocation id the account holds no address for, so a caller does not
+    /// have to look one up first.
+    pub fn detach_elastic_ip(&mut self, allocation_id: &str) {
+        let Some(address) = self.addresses.get_mut(allocation_id) else {
+            return;
+        };
+        let public_ip = address.public_ip.clone();
+        let was_on = address.instance_id.take();
+        address.association_id = None;
+        address.network_interface_id = None;
+        address.network_interface_owner_id = None;
+        address.private_ip_address = None;
+        let Some(instance) = was_on.and_then(|instance_id| self.instances.get_mut(&instance_id))
+        else {
+            return;
+        };
+        // Only the address this association carried: an instance reporting some other
+        // public address keeps it.
+        if instance.public_ip == public_ip {
+            instance.public_ip = None;
+        }
     }
 
     /// Store a newly allocated Elastic IP address, charging the caller-chosen bytes it
@@ -8086,7 +8808,7 @@ impl ComAmazonawsEc2Amazonec2State {
         let associates = options.default_route_table_association.as_deref() == Some(OPTION_ENABLE);
         let propagates = options.default_route_table_propagation.as_deref() == Some(OPTION_ENABLE);
         if associates || propagates {
-            let route_table_id = self.next_id("tgw-rtb");
+            let route_table_id = self.next_id(TRANSIT_GATEWAY_ROUTE_TABLE_ID_PREFIX);
             self.transit_gateway_route_tables.insert(
                 route_table_id.clone(),
                 TransitGatewayRouteTable {
@@ -8213,6 +8935,49 @@ pub fn invalid_address_not_found<E>(public_ip: &str) -> Scaffolded<E> {
     )
 }
 
+/// Whether `id` is a well-formed network interface id.
+///
+/// `eni-` followed by 8 or 17 lowercase hexadecimal digits — the short and the long EC2
+/// resource id form, read the way [`allocation_id_is_well_formed`] reads an allocation id.
+/// The all-zero suffix is WELL FORMED here, unlike an instance id's: AWS answers
+/// `eni-00000000000000000` with `InvalidNetworkInterfaceID.NotFound` rather than
+/// `.Malformed`, which is the counter-example [`instance_id_is_well_formed`] records.
+pub fn network_interface_id_is_well_formed(id: &str) -> bool {
+    let Some(suffix) = id.strip_prefix("eni-") else {
+        return false;
+    };
+    matches!(suffix.len(), 8 | 17)
+        && suffix
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Refuse a request that named something that is not a network interface id: HTTP 400
+/// `InvalidNetworkInterfaceID.Malformed`.
+pub fn invalid_network_interface_id_malformed<E>(network_interface_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_NETWORK_INTERFACE_ID_MALFORMED,
+        400,
+        format!("Invalid id: '{network_interface_id}'"),
+    )
+}
+
+/// Refuse a request that named a network interface id no interface of the account has:
+/// HTTP 400 `InvalidNetworkInterfaceID.NotFound`.
+pub fn invalid_network_interface_id_not_found<E>(network_interface_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_NETWORK_INTERFACE_ID_NOT_FOUND,
+        400,
+        format!("The networkInterface ID '{network_interface_id}' does not exist"),
+    )
+}
+
+/// Refuse an association the resource already has with something else, which the request
+/// did not allow to be replaced: HTTP 400 `Resource.AlreadyAssociated`.
+pub fn resource_already_associated<E>(message: impl Into<String>) -> Scaffolded<E> {
+    Scaffolded::service_error(RESOURCE_ALREADY_ASSOCIATED, 400, message)
+}
+
 /// Refuse an allocation that would take the store past [`MAX_STORED_ADDRESSES`]: HTTP 400
 /// `AddressLimitExceeded`.
 pub fn address_limit_exceeded<E>(message: impl Into<String>) -> Scaffolded<E> {
@@ -8229,6 +8994,156 @@ pub fn address_limit_exceeded<E>(message: impl Into<String>) -> Scaffolded<E> {
 /// one border group.
 pub fn network_border_group_of_region(region: &str) -> String {
     region.to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Elastic IP address transfers
+// ---------------------------------------------------------------------------
+
+/// A transfer the source account has started that has neither been accepted nor expired:
+/// the `AddressTransferStatus` enum's `pending` member
+/// (`smithy_query(query="shape",shape="AddressTransferStatus")`).
+pub const ADDRESS_TRANSFER_STATUS_PENDING: &str = "pending";
+
+/// A transfer offer the source account has withdrawn: the `AddressTransferStatus` enum's
+/// `disabled` member, which is what "Disables Elastic IP address transfer"
+/// (`DisableAddressTransfer`) leaves behind.
+pub const ADDRESS_TRANSFER_STATUS_DISABLED: &str = "disabled";
+
+/// A transfer the transfer account has taken: the `AddressTransferStatus` enum's
+/// `accepted` member.
+pub const ADDRESS_TRANSFER_STATUS_ACCEPTED: &str = "accepted";
+
+/// How long a transfer offer stands before it expires on its own.
+///
+/// DOCUMENTED, not chosen: "When the source account starts the transfer, the transfer
+/// account has seven days to accept the Elastic IP address transfer … After seven days,
+/// the transfer expires and ownership of the Elastic IP address returns to the source
+/// account" (`DescribeAddressTransfers`). It is also the instant
+/// `AddressTransfer$TransferOfferExpirationTimestamp` reports.
+pub const ADDRESS_TRANSFER_OFFER_WINDOW: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// How long an accepted transfer stays visible to the source account.
+///
+/// DOCUMENTED, not chosen: "Accepted transfers are visible to the source account for 14
+/// days after the transfers have been accepted" (`DescribeAddressTransfers`).
+pub const ADDRESS_TRANSFER_ACCEPTED_VISIBILITY: Duration =
+    Duration::from_secs(14 * 24 * 60 * 60);
+
+/// One Elastic IP address transfer the source account can see: the modelled
+/// [`AddressTransfer`] every operation that reports one answers with, plus when the record
+/// stops being one of that account's transfers — the one fact that shape carries no member
+/// for.
+///
+/// Built in exactly one place ([`ComAmazonawsEc2Amazonec2State::offer_address_transfer`]),
+/// so the instant beside the record and the timestamps on it cannot disagree.
+#[derive(Debug, Clone)]
+pub struct AddressTransferRecord {
+    /// The transfer as every operation that reports one answers with it.
+    pub transfer: AddressTransfer,
+    /// When this record stops being one of the source account's transfers: the end of the
+    /// offer window for a transfer that was never accepted, and
+    /// [`ADDRESS_TRANSFER_ACCEPTED_VISIBILITY`] after the acceptance for one that was. On
+    /// the wall clock, because both spans are documented in days and are the same instants
+    /// the record's own timestamps report.
+    pub visible_until: SystemTime,
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Start the transfer of the Elastic IP address `allocation_id` to
+    /// `transfer_account_id`, as of `at`, and answer the `AllocationId` the record is keyed
+    /// by.
+    ///
+    /// "Enables Elastic IP address transfer" (`EnableAddressTransfer`): the offer is
+    /// `pending` and stands for [`ADDRESS_TRANSFER_OFFER_WINDOW`], which is the instant
+    /// `TransferOfferExpirationTimestamp` reports and the instant the record stops being
+    /// visible. An address has at most one transfer at a time, so starting one on an
+    /// address that already carries a record REPLACES it: the call says what the account
+    /// wants the address's transfer to be, and the model declares no error for an address
+    /// that already has one.
+    ///
+    /// No byte charge is made for the record: it is keyed by an id of [`Self::addresses`],
+    /// so there can be no more of them than there are stored addresses, and the only
+    /// caller-supplied value it retains is an account id, which is
+    /// [`AWS_ACCOUNT_ID_DIGITS`] digits.
+    pub fn offer_address_transfer(
+        &mut self,
+        allocation_id: &str,
+        public_ip: Option<&str>,
+        transfer_account_id: &str,
+        at: SystemTime,
+    ) -> String {
+        let expires_at = at + ADDRESS_TRANSFER_OFFER_WINDOW;
+        let record = AddressTransferRecord {
+            transfer: AddressTransfer {
+                public_ip: public_ip.map(str::to_string),
+                allocation_id: Some(allocation_id.to_string()),
+                transfer_account_id: Some(transfer_account_id.to_string()),
+                transfer_offer_expiration_timestamp: Some(system_time_to_date_time(expires_at)),
+                // Nothing has accepted the offer: "The timestamp when the Elastic IP
+                // address transfer was accepted"
+                // (`AddressTransfer$TransferOfferAcceptedTimestamp`) names no instant yet.
+                transfer_offer_accepted_timestamp: None,
+                address_transfer_status: Some(ADDRESS_TRANSFER_STATUS_PENDING.to_string()),
+            },
+            visible_until: expires_at,
+        };
+        self.address_transfers
+            .insert(allocation_id.to_string(), record);
+        allocation_id.to_string()
+    }
+
+    /// Withdraw the transfer offer on `allocation_id`, answering whether there was a
+    /// `pending` one to withdraw.
+    ///
+    /// "Disables Elastic IP address transfer" (`DisableAddressTransfer`): only a `pending`
+    /// offer can be withdrawn — an accepted transfer has already moved the address, and a
+    /// disabled one is already withdrawn — so this answers `false` for every other state
+    /// and the caller refuses the request with
+    /// [`address_transfer_not_available`]. The record keeps the expiration instant it was
+    /// offered with: withdrawing the offer does not move when the offer would have run out,
+    /// which is also when the record stops being reported.
+    pub fn withdraw_address_transfer(&mut self, allocation_id: &str) -> bool {
+        let Some(record) = self.address_transfers.get_mut(allocation_id) else {
+            return false;
+        };
+        if record.transfer.address_transfer_status.as_deref()
+            != Some(ADDRESS_TRANSFER_STATUS_PENDING)
+        {
+            return false;
+        }
+        record.transfer.address_transfer_status =
+            Some(ADDRESS_TRANSFER_STATUS_DISABLED.to_string());
+        true
+    }
+
+    /// Drop every transfer record the clock has taken past
+    /// [`AddressTransferRecord::visible_until`].
+    ///
+    /// Reached through [`Self::materialize_due_transitions`], so a reporting operation may
+    /// apply it: "After seven days, the transfer expires and ownership of the Elastic IP
+    /// address returns to the source account", and an accepted transfer is visible "for 14
+    /// days after the transfers have been accepted" (`DescribeAddressTransfers`) — each was
+    /// already owed at `now` whether or not anybody asked.
+    pub fn expire_due_address_transfers(&mut self, now: SystemTime) {
+        self.address_transfers
+            .retain(|_allocation_id, record| now < record.visible_until);
+    }
+}
+
+/// Refuse a request the Elastic IP address transfer surface has no transfer to act on:
+/// HTTP 400 `InvalidAddress.NotFound`.
+///
+/// The message is the one the real service answers there — `The Elastic IP address
+/// '<address>' does not exist or is not available.`, naming the address from the request —
+/// which is a different sentence from [`invalid_address_not_found`]'s, that one being for an
+/// address the account holds no allocation for at all.
+pub fn address_transfer_not_available<E>(address: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_ADDRESS_NOT_FOUND,
+        400,
+        format!("The Elastic IP address '{address}' does not exist or is not available."),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -8528,6 +9443,346 @@ pub fn transit_gateway_limit_exceeded<E>() -> Scaffolded<E> {
             "The maximum number of transit gateways has been reached ({MAX_TRANSIT_GATEWAYS})"
         ),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Transit gateway route tables, and the route propagations into them
+// ---------------------------------------------------------------------------
+
+/// The id prefix every transit gateway route table is minted with, the one
+/// [`ComAmazonawsEc2Amazonec2State::insert_transit_gateway`] gives the default route table
+/// it creates.
+///
+/// A route table ANNOUNCEMENT id extends this prefix
+/// ([`TRANSIT_GATEWAY_ROUTE_TABLE_ANNOUNCEMENT_ID_PREFIX`]), so the prefix alone cannot
+/// separate the two kinds; it is the hex suffix [`prefixed_id_is_well_formed`] requires that
+/// does, exactly as [`vpc_endpoint_id_is_well_formed`] separates the three `vpce-` kinds.
+pub const TRANSIT_GATEWAY_ROUTE_TABLE_ID_PREFIX: &str = "tgw-rtb";
+
+/// `InvalidRouteTableID.NotFound` (HTTP 400): the request named a route table id this
+/// account holds no transit gateway route table for. EC2 answers the route table's own code
+/// here rather than a transit-gateway-specific one.
+pub const INVALID_ROUTE_TABLE_ID_NOT_FOUND: &str = "InvalidRouteTableID.NotFound";
+
+/// `InvalidRouteTableId.Malformed` (HTTP 400): the request named something that is not a
+/// transit gateway route table id at all, so there is nothing to look up.
+pub const INVALID_ROUTE_TABLE_ID_MALFORMED: &str = "InvalidRouteTableId.Malformed";
+
+/// Refuse a request that named a transit gateway route table id no route table of the
+/// account has: HTTP 400 [`INVALID_ROUTE_TABLE_ID_NOT_FOUND`].
+///
+/// Worded like [`invalid_transit_gateway_id_not_found`], the refusal the gateway itself
+/// answers, so one family of resources reads one way.
+pub fn invalid_transit_gateway_route_table_id_not_found<E>(route_table_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_ROUTE_TABLE_ID_NOT_FOUND,
+        400,
+        format!("Transit Gateway Route Table {route_table_id} was deleted or does not exist."),
+    )
+}
+
+/// A propagation whose enable is being carried out: the `TransitGatewayPropagationState`
+/// enum's `enabling` member ([`crate::ops::types::TRANSIT_GATEWAY_PROPAGATION_STATE_VALUES`]).
+pub const PROPAGATION_STATE_ENABLING: &str = "enabling";
+
+/// A propagation in force: that enum's `enabled` member.
+pub const PROPAGATION_STATE_ENABLED: &str = "enabled";
+
+/// A propagation whose disable is being carried out: that enum's `disabling` member.
+pub const PROPAGATION_STATE_DISABLING: &str = "disabling";
+
+/// What the clock owes one stored route propagation next.
+///
+/// The `disabled` member of `TransitGatewayPropagationState` is deliberately not a move:
+/// once the disable has been carried out the pair does not propagate at all, which is not a
+/// propagation of that route table — the same reading as [`FastLaunchMove::Discontinued`],
+/// where the state catalog has no word for "not configured" either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropagationMove {
+    /// `enabling` -> `enabled`: the attachment's routes are in the table.
+    Enabled,
+    /// `disabling` -> reported no longer: the propagation is gone.
+    Removed,
+}
+
+/// The move the clock owes one route propagation: a [`ClockTransition`] to the next
+/// [`PropagationMove`].
+pub type PropagationTransition = ClockTransition<PropagationMove>;
+
+/// One attachment's propagation of routes into one transit gateway route table.
+///
+/// Flattened rather than holding a modelled shape, because the two shapes that report a
+/// propagation carry different member sets — `TransitGatewayPropagation` names the route
+/// table, `TransitGatewayRouteTablePropagation` does not, being reported under it — so
+/// [`Self::view`] and [`Self::route_table_view`] build each from the one stored record and
+/// the two reports cannot disagree.
+#[derive(Debug, Clone)]
+pub struct TransitGatewayPropagationRecord {
+    /// The propagation route table the routes go into.
+    pub transit_gateway_route_table_id: String,
+    /// The attachment whose routes propagate.
+    pub transit_gateway_attachment_id: String,
+    /// The resource that attachment attaches, which a report of the propagation names as
+    /// its `ResourceId`; absent for an attachment that carries no resource id.
+    pub resource_id: Option<String>,
+    /// That resource's `TransitGatewayAttachmentResourceType`.
+    pub resource_type: String,
+    /// The route table announcement the propagation was asked for through, when it was.
+    pub transit_gateway_route_table_announcement_id: Option<String>,
+    /// The propagation's state, a member of `TransitGatewayPropagationState`.
+    pub state: String,
+    /// The move the clock owes this propagation, while one is owed.
+    pub pending: Option<PropagationTransition>,
+}
+
+impl TransitGatewayPropagationRecord {
+    /// The propagation as `EnableTransitGatewayRouteTablePropagation` and
+    /// `DisableTransitGatewayRouteTablePropagation` answer with it.
+    pub fn view(&self) -> TransitGatewayPropagation {
+        TransitGatewayPropagation {
+            transit_gateway_attachment_id: Some(self.transit_gateway_attachment_id.clone()),
+            resource_id: self.resource_id.clone(),
+            resource_type: Some(self.resource_type.clone()),
+            transit_gateway_route_table_id: Some(self.transit_gateway_route_table_id.clone()),
+            state: Some(self.state.clone()),
+            transit_gateway_route_table_announcement_id: self
+                .transit_gateway_route_table_announcement_id
+                .clone(),
+        }
+    }
+
+    /// The propagation as `GetTransitGatewayRouteTablePropagations` reports it: the same
+    /// record without the route table id, which that request named.
+    pub fn route_table_view(&self) -> TransitGatewayRouteTablePropagation {
+        TransitGatewayRouteTablePropagation {
+            transit_gateway_attachment_id: Some(self.transit_gateway_attachment_id.clone()),
+            resource_id: self.resource_id.clone(),
+            resource_type: Some(self.resource_type.clone()),
+            state: Some(self.state.clone()),
+            transit_gateway_route_table_announcement_id: self
+                .transit_gateway_route_table_announcement_id
+                .clone(),
+        }
+    }
+
+    /// Put the propagation into `transient` now and owe it `to` [`TRANSITION_DELAY`] later.
+    ///
+    /// The span is never zero, so a caller acting straight after the enabling or disabling
+    /// call still sees the transient state and the refusals that go with it.
+    pub fn begin_move(&mut self, transient: &str, to: PropagationMove) {
+        self.state = transient.to_string();
+        self.pending = Some(PropagationTransition::starting_now(to));
+    }
+}
+
+/// What a propagation request asks of one (route table, attachment) pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropagationDecision {
+    /// "Enables the specified attachment to propagate routes to the specified propagation
+    /// route table" (`EnableTransitGatewayRouteTablePropagation`).
+    Enable,
+    /// "Disables the specified resource attachment from propagating routes to the specified
+    /// propagation route table" (`DisableTransitGatewayRouteTablePropagation`).
+    Disable,
+}
+
+/// The attachment, the route table announcement and the propagation route table one
+/// propagation request names: the members
+/// `Enable`/`DisableTransitGatewayRouteTablePropagationRequest` share.
+#[derive(Debug, Clone, Copy)]
+pub struct PropagationRequest<'a> {
+    /// "The ID of the propagation route table" (`$TransitGatewayRouteTableId`), the one
+    /// required member.
+    pub route_table_id: &'a str,
+    /// "The ID of the attachment" (`$TransitGatewayAttachmentId`), when the request names
+    /// one.
+    pub attachment_id: Option<&'a str>,
+    /// "The ID of the route table announcement" (`$TransitGatewayRouteTableAnnouncementId`),
+    /// when the request names one.
+    pub announcement_id: Option<&'a str>,
+}
+
+/// Act on the route propagation `request` names, and answer it as it now stands.
+///
+/// The ONE place the rule the enabling and the disabling operation share is written, so
+/// they cannot disagree about one pair:
+///
+/// * the propagation route table must be one the account holds, or there is nothing to
+///   propagate into ([`invalid_transit_gateway_route_table_id_not_found`]);
+/// * the attachment whose routes propagate is the one the request names, or — for a request
+///   that names a route table announcement instead — the peering attachment that
+///   announcement was made for, and a request that names neither has not said what to
+///   propagate;
+/// * that attachment must be one the account holds
+///   ([`INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND`]);
+/// * an enable needs a pair that does not propagate yet and a disable needs one that does,
+///   so the other way round each is refused with `IncorrectState` and NOTHING is written;
+/// * the pair then moves into the TRANSIENT state of the move asked for, with the clock
+///   owing it the end of it ([`PropagationMove`]).
+///
+/// The CALLER refuses a malformed id first, before its own `DryRun` arm, so nothing here
+/// depends on the request's form.
+pub fn decide_transit_gateway_route_table_propagation<E>(
+    store: &mut ComAmazonawsEc2Amazonec2State,
+    request: PropagationRequest<'_>,
+    decision: PropagationDecision,
+) -> Result<TransitGatewayPropagation, Scaffolded<E>> {
+    // The clock first: a propagation whose move has fallen due is already enabled, or gone,
+    // so whether this call is admissible is asked of the state the pair is ACTUALLY in
+    // rather than of the one it was left in.
+    store.materialize_due_transitions();
+    let route_table_id = request.route_table_id;
+    if !store
+        .transit_gateway_route_tables
+        .contains_key(route_table_id)
+    {
+        return Err(invalid_transit_gateway_route_table_id_not_found(
+            route_table_id,
+        ));
+    }
+
+    // "The ID of the route table announcement": an announcement is a propagation of the
+    // peering attachment it was made for, so the announcement names the attachment when the
+    // request does not — and when the request names both they must be the same attachment,
+    // rather than one silently winning over the other.
+    let announced: Option<String> = match request.announcement_id {
+        None => None,
+        Some(announcement_id) => store
+            .transit_gateway_route_table_announcements
+            .get(announcement_id)
+            .ok_or_else(|| {
+                id_not_found(
+                    INVALID_TRANSIT_GATEWAY_ROUTE_TABLE_ANNOUNCEMENT_ID_NOT_FOUND,
+                    "transit gateway route table announcement ID",
+                    announcement_id,
+                )
+            })?
+            .view
+            .peering_attachment_id
+            .clone(),
+    };
+    let attachment_id = match (request.attachment_id, announced.as_deref()) {
+        (Some(named), Some(announced)) if named != announced => {
+            return Err(Scaffolded::invalid_parameter_combination(format!(
+                "The attachment '{named}' is not the attachment the route table \
+                 announcement was made for ('{announced}')"
+            )))
+        }
+        (Some(named), _) => named.to_string(),
+        (None, Some(announced)) => announced.to_string(),
+        (None, None) => {
+            return Err(Scaffolded::missing_parameter(
+                "The request must name the attachment whose routes propagate, either as \
+                 transitGatewayAttachmentId or through a route table announcement",
+            ))
+        }
+    };
+
+    let attachment = store
+        .transit_gateway_attachments
+        .get(&attachment_id)
+        .ok_or_else(|| {
+            id_not_found(
+                INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND,
+                "transit gateway attachment ID",
+                &attachment_id,
+            )
+        })?;
+    let resource_id = attachment.view.resource_id().map(str::to_string);
+    let resource_type = attachment.view.resource_type();
+    let key = (route_table_id.to_string(), attachment_id.clone());
+
+    match decision {
+        PropagationDecision::Enable => {
+            // A pair that already propagates, or is still finishing a disable, has no
+            // enable to perform: the request is refused and nothing is written, which is
+            // how the first call's write is observable to a later one.
+            if let Some(existing) = store.transit_gateway_propagations.get(&key) {
+                return Err(incorrect_state(format!(
+                    "The attachment '{attachment_id}' already propagates routes to the \
+                     transit gateway route table '{route_table_id}' in state '{state}'",
+                    state = existing.state,
+                )));
+            }
+            if !store.has_transit_gateway_propagation_capacity() {
+                return Err(resource_limit_exceeded(format!(
+                    "This emulator holds {} route propagations, which is as many as it \
+                     stores",
+                    store.transit_gateway_propagations.len()
+                )));
+            }
+            if store.would_exceed_stored_bytes(STORED_RECORD_OVERHEAD_BYTES) {
+                return Err(resource_limit_exceeded(format!(
+                    "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                     caller-supplied data, so it cannot store another route propagation",
+                    store.stored_bytes()
+                )));
+            }
+            let record = TransitGatewayPropagationRecord {
+                transit_gateway_route_table_id: route_table_id.to_string(),
+                transit_gateway_attachment_id: attachment_id,
+                resource_id,
+                resource_type: resource_type.to_string(),
+                transit_gateway_route_table_announcement_id: request
+                    .announcement_id
+                    .map(str::to_string),
+                // The TRANSIENT state of an enable, with the clock owing it `enabled`: the
+                // span is never zero, so a caller acting straight after this call still
+                // sees the pair enabling.
+                state: PROPAGATION_STATE_ENABLING.to_string(),
+                pending: Some(PropagationTransition::starting_now(
+                    PropagationMove::Enabled,
+                )),
+            };
+            let view = record.view();
+            store.add_stored_bytes(STORED_RECORD_OVERHEAD_BYTES);
+            store.transit_gateway_propagations.insert(key, record);
+            Ok(view)
+        }
+        PropagationDecision::Disable => {
+            let record = store
+                .transit_gateway_propagations
+                .get_mut(&key)
+                .filter(|record| record.state != PROPAGATION_STATE_DISABLING)
+                .ok_or_else(|| {
+                    incorrect_state(format!(
+                        "The attachment '{attachment_id}' does not propagate routes to the \
+                         transit gateway route table '{route_table_id}'"
+                    ))
+                })?;
+            record.begin_move(PROPAGATION_STATE_DISABLING, PropagationMove::Removed);
+            Ok(record.view())
+        }
+    }
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another route propagation fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]), on the contract of
+    /// [`Self::has_transit_gateway_attachment_capacity`].
+    pub fn has_transit_gateway_propagation_capacity(&self) -> bool {
+        self.transit_gateway_propagations.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// The route propagations of one transit gateway route table, in attachment-id order —
+    /// the stable order `GetTransitGatewayRouteTablePropagations` reports and pages over.
+    ///
+    /// The store is keyed by (route table, attachment), so this is a RANGE over the keys of
+    /// one route table rather than a scan of every propagation stored: the cost is
+    /// proportional to the propagations of the table asked about.
+    ///
+    /// A read, so it writes nothing: the caller applies the clock-owed moves
+    /// ([`Self::materialize_due_transitions`]) before asking, exactly as every describe of
+    /// this module does.
+    pub fn transit_gateway_route_table_propagations<'a>(
+        &'a self,
+        route_table_id: &'a str,
+    ) -> impl Iterator<Item = &'a TransitGatewayPropagationRecord> {
+        self.transit_gateway_propagations
+            .range((route_table_id.to_string(), String::new())..)
+            .take_while(move |((table, _), _)| table == route_table_id)
+            .map(|(_, record)| record)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -9263,15 +10518,33 @@ impl TransitGatewayAttachmentView {
         }
     }
 
-    /// The caller-chosen bytes this attachment holds: its tags, the only member of any kind
-    /// that a caller sizes.
+    /// The caller-chosen bytes this attachment holds: its tags, and — for an attachment
+    /// shape that carries none — the ids of what it attaches, which a writer supplies.
+    ///
+    /// NOTHING here answers zero for a whole variant: the fixed per-record overhead
+    /// [`STORED_RECORD_OVERHEAD_BYTES`] is charged beside it by
+    /// [`ComAmazonawsEc2Amazonec2State::insert_transit_gateway_attachment`], so no stored
+    /// attachment is free against the byte budget whatever it carries.
     fn payload_bytes(&self) -> usize {
         match self {
             Self::Vpc(attachment) => tag_list_bytes(attachment.tags.as_deref().unwrap_or_default()),
             Self::Peering(attachment) => {
                 tag_list_bytes(attachment.tags.as_deref().unwrap_or_default())
             }
-            Self::ClientVpn(_) => 0,
+            // `TransitGatewayClientVpnAttachment` models no tags, so what a writer sizes
+            // here is the Client VPN endpoint it names and the account that owns it.
+            Self::ClientVpn(attachment) => attachment
+                .client_vpn_endpoint_id
+                .as_deref()
+                .unwrap_or_default()
+                .len()
+                .saturating_add(
+                    attachment
+                        .client_vpn_owner_id
+                        .as_deref()
+                        .unwrap_or_default()
+                        .len(),
+                ),
         }
     }
 }
@@ -10221,6 +11494,13 @@ impl ComAmazonawsEc2Amazonec2State {
     /// instant. In each case NOTHING was removed and nothing stored — every fallible step is
     /// taken before the first mutation — so a refused move leaves the volume where it was
     /// instead of losing it between the two stores.
+    ///
+    /// The byte accounting is symmetric, the way [`Self::remove_fpga_image`] is: the bytes
+    /// the create charged for the volume are given back as it leaves the store, and the
+    /// entry that takes its place is charged for itself
+    /// ([`volume_recycle_bin_entry_payload_bytes`]), so a repeated create-then-delete
+    /// sequence advances the byte budget rather than trading a charged volume for a free
+    /// entry.
     pub fn move_volume_to_recycle_bin(
         &mut self,
         volume_id: &str,
@@ -10573,15 +11853,33 @@ pub struct SecondarySubnetSpec {
 }
 
 impl ComAmazonawsEc2Amazonec2State {
-    /// Store a secondary subnet, and answer the `SecondarySubnetId` it was given.
+    /// Is there room for another secondary subnet in this store
+    /// ([`MAX_STORED_SECONDARY_SUBNETS`])?
+    ///
+    /// A create asks this so it can refuse with the quota code instead of overshooting the
+    /// ceiling; [`Self::insert_secondary_subnet`] asks it again, so a writer that forgets
+    /// the gate still cannot grow the store past it.
+    pub fn has_secondary_subnet_capacity(&self) -> bool {
+        self.secondary_subnets.len() < MAX_STORED_SECONDARY_SUBNETS
+    }
+
+    /// Store a secondary subnet, and answer the `SecondarySubnetId` it was given — or
+    /// `None` when this store is already at [`MAX_STORED_SECONDARY_SUBNETS`], which a
+    /// handler answers with [`secondary_subnet_limit_exceeded`].
     ///
     /// Everything the service itself owns is derived here rather than taken from the
     /// caller — the subnet's id, the ARN built from it, the owning account, and the
     /// association id of each IPv4 CIDR block — so two writers cannot report the same
     /// secondary subnet differently. Like [`Self::insert_subnet`], the caller-chosen bytes
-    /// the record holds are charged against the store's byte budget here, so no writer can
-    /// store them uncharged.
-    pub fn insert_secondary_subnet(&mut self, spec: SecondarySubnetSpec) -> String {
+    /// the record holds are charged against the store's byte budget here — by
+    /// [`secondary_subnet_payload_bytes`], which is the one definition of that charge and
+    /// already carries the fixed per-record overhead, so a tag-free subnet is not free
+    /// against the budget either — and the ceiling is checked BEFORE any id is minted, so a
+    /// refused write consumes nothing at all.
+    pub fn insert_secondary_subnet(&mut self, spec: SecondarySubnetSpec) -> Option<String> {
+        if !self.has_secondary_subnet_capacity() {
+            return None;
+        }
         let secondary_subnet_id = self.next_id(SECONDARY_SUBNET_ID_PREFIX);
         let mut ipv4_cidr_block_associations = Vec::with_capacity(spec.ipv4_cidr_blocks.len());
         for block in spec.ipv4_cidr_blocks {
@@ -10610,17 +11908,40 @@ impl ComAmazonawsEc2Amazonec2State {
             state_reason: spec.state_reason,
             tags: Some(spec.tags),
         };
+        // `secondary_subnet_payload_bytes` is the ONE definition of this charge and
+        // already carries the fixed per-record overhead, so the call site adds nothing to
+        // it: a removal path gives back exactly this number.
         self.add_stored_bytes(secondary_subnet_payload_bytes(&secondary_subnet));
         self.secondary_subnets
             .insert(secondary_subnet_id.clone(), secondary_subnet);
-        secondary_subnet_id
+        Some(secondary_subnet_id)
     }
 }
 
-/// The caller-chosen bytes one stored secondary subnet holds: its tags, the CIDR block of
-/// each association, and the state reasons. The ids, the ARN, the owning account, the
-/// states and the network type are derived by this module or bounded by the model, so they
-/// are fixed-size.
+/// How many secondary subnets this emulator stores before a write of another is refused.
+///
+/// CHOSEN, like [`MAX_SECONDARY_NETWORKS`] and [`MAX_STORED_RECORDS_PER_STORE`] and for
+/// the same
+/// reason the module gives for every other ceiling: nothing in this emulator reclaims a
+/// stored secondary subnet, so this store needs a ceiling that is not the process's memory.
+/// It is the same ceiling the other record stores keep.
+pub const MAX_STORED_SECONDARY_SUBNETS: usize = MAX_STORED_RECORDS_PER_STORE;
+
+/// Refuse a create that would take the store past [`MAX_STORED_SECONDARY_SUBNETS`]: HTTP
+/// 400, with the same quota code family a secondary network's own ceiling answers with.
+pub fn secondary_subnet_limit_exceeded<E>(message: impl Into<String>) -> Scaffolded<E> {
+    Scaffolded::service_error(SECONDARY_NETWORK_LIMIT_EXCEEDED, 400, message)
+}
+
+/// The bytes one stored secondary subnet is charged: its tags, the CIDR block of each
+/// association, and the state reasons, plus [`STORED_RECORD_OVERHEAD_BYTES`] for the
+/// record itself.
+/// The ids, the ARN, the owning account, the states and the network type are derived by
+/// this module or bounded by the model, so they are fixed-size.
+///
+/// The fixed overhead is what makes a subnet written with no tags, no IPv4 CIDR block and
+/// no state reason cost something: a count ceiling alone leaves a zero-payload record free
+/// against [`MAX_STORED_BYTES`], so repeated writes would advance no budget at all.
 ///
 /// The ONE definition of that charge, the way [`vpc_endpoint_connection_payload_bytes`] is
 /// for a VPC endpoint connection: a writer charges exactly it, and a removal path must give
@@ -10636,12 +11957,15 @@ pub fn secondary_subnet_payload_bytes(secondary_subnet: &SecondarySubnet) -> usi
         })
         .sum();
     tag_list_bytes(secondary_subnet.tags.as_deref().unwrap_or_default())
-        + association_bytes
-        + secondary_subnet
-            .state_reason
-            .as_deref()
-            .unwrap_or_default()
-            .len()
+        .saturating_add(association_bytes)
+        .saturating_add(
+            secondary_subnet
+                .state_reason
+                .as_deref()
+                .unwrap_or_default()
+                .len(),
+        )
+        .saturating_add(STORED_RECORD_OVERHEAD_BYTES)
 }
 
 // ---------------------------------------------------------------------------
@@ -10897,5 +12221,579 @@ impl ComAmazonawsEc2Amazonec2State {
             },
         );
         stored
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Placement groups
+// ---------------------------------------------------------------------------
+
+/// The id prefix of a placement group, as AWS mints one: `pg-<hex>`.
+///
+/// [`ComAmazonawsEc2Amazonec2State::next_id`] appends the 17 lowercase hexadecimal digits
+/// every EC2 resource id of the long form carries.
+pub const PLACEMENT_GROUP_ID_PREFIX: &str = "pg";
+
+/// A placement group that can be launched into: the `PlacementGroupState` enum's
+/// `available` member.
+///
+/// A placement group is "a logical grouping of instances" (`CreatePlacementGroup`) — there
+/// is no hardware to bring up for it — so it is the state a group is created in and the
+/// only state this emulator ever reports one in.
+pub const PLACEMENT_GROUP_STATE_AVAILABLE: &str = "available";
+
+/// The `ResourceType` a `CreatePlacementGroup` tag specification may name: the placement
+/// group it creates (the modelled `ResourceType` enum's `placement-group` member).
+pub const RESOURCE_TYPE_PLACEMENT_GROUP: &str = "placement-group";
+
+/// The `PlacementStrategy` member a partition placement group is created with: the one
+/// strategy `CreatePlacementGroupRequest$PartitionCount` is "valid only when" set to.
+pub const PLACEMENT_STRATEGY_PARTITION: &str = "partition";
+
+/// The `PlacementStrategy` member a spread placement group is created with: the strategy
+/// `SpreadLevel` — "determines how placement groups spread instances" — belongs to.
+pub const PLACEMENT_STRATEGY_SPREAD: &str = "spread";
+
+/// The `PlacementStrategy` member a cluster placement group is created with: the one
+/// strategy `CreatePlacementGroupRequest$ParentGroupId` is "valid only when" set to.
+pub const PLACEMENT_STRATEGY_CLUSTER: &str = "cluster";
+
+/// The `SpreadLevel` member a spread placement group gets when the request names none:
+/// `rack`, the level with "no usage restrictions", as opposed to `host`, which "you can use
+/// only with Outpost placement groups" (`CreatePlacementGroupRequest$SpreadLevel`).
+pub const SPREAD_LEVEL_RACK: &str = "rack";
+
+/// "Up to 255 ASCII characters" (`CreatePlacementGroupRequest$GroupName`).
+pub const MAX_PLACEMENT_GROUP_NAME_CHARS: usize = 255;
+
+/// The most partitions a partition placement group may be created with.
+///
+/// "A partition placement group can have a maximum of seven partitions per Availability
+/// Zone" (Amazon EC2 User Guide, "Partition placement groups").
+pub const MAX_PLACEMENT_GROUP_PARTITION_COUNT: i32 = 7;
+
+/// The fewest partitions a partition placement group may be created with: a count of
+/// partitions is a count, so it is at least one.
+pub const MIN_PLACEMENT_GROUP_PARTITION_COUNT: i32 = 1;
+
+/// The partition count a partition placement group gets when the request names none.
+///
+/// AWS documents no default for `CreatePlacementGroupRequest$PartitionCount`, so this is
+/// the emulator's choice: the smallest count that actually partitions the group, since a
+/// partition group "places groups of instances in different partitions, where instances in
+/// one partition do not share the same hardware with instances in another partition"
+/// (`CreatePlacementGroup`) and one partition has no other partition to differ from.
+pub const DEFAULT_PLACEMENT_GROUP_PARTITION_COUNT: i32 = 2;
+
+/// The largest number of placement groups this store holds.
+///
+/// "Placement groups per Region: 500" (Amazon EC2 service quotas).
+/// [`ComAmazonawsEc2Amazonec2State::has_placement_group_capacity`] is the predicate a
+/// writer asks before inserting; a create past it refuses with
+/// [`placement_group_limit_exceeded`].
+pub const MAX_PLACEMENT_GROUPS: usize = 500;
+
+/// The code EC2 answers for a placement group name the account already holds a group
+/// under: "the specified placement group already exists in your account" (AWS's
+/// `InvalidPlacementGroup.Duplicate` error-code entry).
+pub const INVALID_PLACEMENT_GROUP_DUPLICATE: &str = "InvalidPlacementGroup.Duplicate";
+
+/// The code EC2 answers for a placement group a request named that the account holds
+/// none of: "the specified placement group cannot be found" (AWS's
+/// `InvalidPlacementGroup.Unknown` error-code entry).
+pub const INVALID_PLACEMENT_GROUP_UNKNOWN: &str = "InvalidPlacementGroup.Unknown";
+
+/// The code a create past [`MAX_PLACEMENT_GROUPS`] answers with: "you've reached the limit
+/// on the number of placement groups you can have" (AWS's `PlacementGroupLimitExceeded`
+/// error-code entry).
+pub const PLACEMENT_GROUP_LIMIT_EXCEEDED: &str = "PlacementGroupLimitExceeded";
+
+/// Refuse a second placement group with a name the account already holds: HTTP 400
+/// [`INVALID_PLACEMENT_GROUP_DUPLICATE`]. The name "must be unique within the scope of your
+/// account for the Region" (`CreatePlacementGroupRequest$GroupName`).
+pub fn invalid_placement_group_duplicate<E>(group_name: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_PLACEMENT_GROUP_DUPLICATE,
+        400,
+        format!("The placement group '{group_name}' already exists"),
+    )
+}
+
+/// Refuse a placement group a request named that the account holds none of: HTTP 400
+/// [`INVALID_PLACEMENT_GROUP_UNKNOWN`]. `group` is the name or the id the request named,
+/// whichever could not be resolved.
+pub fn invalid_placement_group_unknown<E>(group: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_PLACEMENT_GROUP_UNKNOWN,
+        400,
+        format!("The placement group '{group}' does not exist"),
+    )
+}
+
+/// Refuse a create that would take the store past [`MAX_PLACEMENT_GROUPS`]: HTTP 400
+/// [`PLACEMENT_GROUP_LIMIT_EXCEEDED`].
+pub fn placement_group_limit_exceeded<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        PLACEMENT_GROUP_LIMIT_EXCEEDED,
+        400,
+        format!("The maximum number of placement groups has been reached ({MAX_PLACEMENT_GROUPS})"),
+    )
+}
+
+/// The caller-chosen bytes one stored placement group holds, plus the fixed overhead the
+/// record itself costs.
+///
+/// Only the members whose length the REQUEST chose are counted on top of
+/// [`STORED_RECORD_OVERHEAD_BYTES`]: the id and the ARN are minted by
+/// [`ComAmazonawsEc2Amazonec2State::insert_placement_group`], and the state, strategy and
+/// spread level are words out of this module's own catalogs. The ONE definition of that
+/// charge, the way [`vpc_endpoint_connection_payload_bytes`] is for a connection: the
+/// writer charges exactly it and `CreatePlacementGroup` reserves exactly it, so the budget
+/// a create checks cannot drift from what the insert takes, and a group with no tags is not
+/// free against [`MAX_STORED_BYTES`].
+pub fn placement_group_spec_bytes(spec: &PlacementGroupSpec) -> usize {
+    STORED_RECORD_OVERHEAD_BYTES
+        .saturating_add(spec.group_name.len())
+        .saturating_add(tag_list_bytes(&spec.tags))
+        .saturating_add(spec.parent_group_id.as_ref().map_or(0, String::len))
+}
+
+/// What a writer must say to store a placement group; everything else about the record —
+/// the id, the ARN, the state — is derived by
+/// [`ComAmazonawsEc2Amazonec2State::insert_placement_group`].
+#[derive(Debug, Clone)]
+pub struct PlacementGroupSpec {
+    /// "A name for the placement group" (`CreatePlacementGroupRequest$GroupName`).
+    pub group_name: String,
+    /// "The placement strategy" (`CreatePlacementGroupRequest$Strategy`), as a
+    /// `&'static str` out of the modelled `PlacementStrategy` catalog
+    /// ([`placement_strategy`]), so the stored word is never the request's own text.
+    pub strategy: &'static str,
+    /// "The number of partitions" a partition group was created with, and `None` for every
+    /// other strategy: `PartitionCount` is "valid only when Strategy is set to partition"
+    /// (`CreatePlacementGroupRequest$PartitionCount`).
+    pub partition_count: Option<i32>,
+    /// "The spread level for the placement group" a spread group was created with, and
+    /// `None` for every other strategy, out of the modelled `SpreadLevel` catalog
+    /// ([`spread_level`]).
+    pub spread_level: Option<&'static str>,
+    /// "The ID of the parent placement group" (`PlacementGroup$ParentGroupId`), resolved
+    /// against this store, when the request named one.
+    pub parent_group_id: Option<String>,
+    /// The Region the request was signed for, which the group's ARN names.
+    pub region: String,
+    /// The tags the request's `TagSpecifications` assign to the group.
+    pub tags: Vec<Tag>,
+}
+
+/// The modelled `PlacementStrategy` member `requested` names, or `None` when it names
+/// none.
+///
+/// The catalog is the generated [`crate::ops::types::PLACEMENT_STRATEGY_VALUES`], so this
+/// crate holds no second copy of it. Answering a `&'static str` out of that catalog is what
+/// keeps request text out of the store.
+pub fn placement_strategy(requested: &str) -> Option<&'static str> {
+    crate::ops::types::PLACEMENT_STRATEGY_VALUES
+        .iter()
+        .copied()
+        .find(|strategy| *strategy == requested)
+}
+
+/// The modelled `SpreadLevel` member `requested` names, or `None` when it names none.
+///
+/// The catalog is the generated [`crate::ops::types::SPREAD_LEVEL_VALUES`], for the reason
+/// [`placement_strategy`] gives.
+pub fn spread_level(requested: &str) -> Option<&'static str> {
+    crate::ops::types::SPREAD_LEVEL_VALUES
+        .iter()
+        .copied()
+        .find(|level| *level == requested)
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another placement group fits inside the store's ceiling
+    /// ([`MAX_PLACEMENT_GROUPS`]).
+    ///
+    /// The same contract as [`Self::has_vpc_capacity`]: a create asks first and refuses
+    /// with [`placement_group_limit_exceeded`] when it answers `false`.
+    pub fn has_placement_group_capacity(&self) -> bool {
+        self.placement_groups.len() < MAX_PLACEMENT_GROUPS
+    }
+
+    /// The id of the placement group named `group_name`, if the account holds one.
+    ///
+    /// A name "must be unique within the scope of your account for the Region"
+    /// (`CreatePlacementGroupRequest$GroupName`), so this answers at most one group: it is
+    /// both what a create asks before storing a duplicate and how a request that names a
+    /// group by name (`DeletePlacementGroup`, `DescribePlacementGroups$GroupNames`)
+    /// resolves it. Compared byte for byte, the name being an opaque identifier the model
+    /// publishes no case rule for.
+    pub fn placement_group_id_for_name(&self, group_name: &str) -> Option<String> {
+        self.placement_groups
+            .iter()
+            .find(|(_, group)| group.group_name.as_deref() == Some(group_name))
+            .map(|(group_id, _)| group_id.clone())
+    }
+
+    /// Store a placement group and answer it as it was stored — or `None` when the store is
+    /// at [`MAX_PLACEMENT_GROUPS`] and nothing was stored.
+    ///
+    /// The one way a placement group is stored, so the id it carries, the ARN it reports,
+    /// the state it starts in and the bytes it charges cannot be built two ways, and the
+    /// ceiling is asked HERE as well as by the caller — the contract every writer of this
+    /// module follows, so a writer that forgets the gate cannot grow the store without
+    /// bound. What comes back is the stored view itself, so a create answers exactly what a
+    /// later `DescribePlacementGroups` reports without reading the store a second time.
+    pub fn insert_placement_group(
+        &mut self,
+        spec: PlacementGroupSpec,
+    ) -> Option<PlacementGroup> {
+        if !self.has_placement_group_capacity() {
+            return None;
+        }
+        let group_id = self.next_id(PLACEMENT_GROUP_ID_PREFIX);
+        // Charged from the spec, so the quantity is exactly the one `CreatePlacementGroup`
+        // reserved against the byte budget before calling this.
+        self.add_stored_bytes(placement_group_spec_bytes(&spec));
+        let group = PlacementGroup {
+            group_id: Some(group_id.clone()),
+            group_name: Some(spec.group_name.clone()),
+            // "A logical grouping of instances" has nothing to provision, so it is
+            // available as soon as it exists.
+            state: Some(PLACEMENT_GROUP_STATE_AVAILABLE.to_string()),
+            strategy: Some(spec.strategy.to_string()),
+            partition_count: spec.partition_count,
+            spread_level: spec.spread_level.map(str::to_string),
+            // "The Amazon Resource Name (ARN) of the placement group"
+            // (`PlacementGroup$GroupArn`): an EC2 ARN in the Region the request was signed
+            // for, under the `placement-group` resource type, naming the group by NAME —
+            // the form `PlacementGroupArn`'s own pattern publishes
+            // (`arn:aws:ec2:<region>:<account>:placement-group/<name>`).
+            group_arn: Some(::engine::emulator_arn(
+                "ec2",
+                &spec.region,
+                &format!("{RESOURCE_TYPE_PLACEMENT_GROUP}/{group_name}", group_name = spec.group_name),
+            )),
+            // "Reserved for future use" (`PlacementGroup$LinkedGroupId`), and "the service
+            // provider that manages the Placement Group" (`PlacementGroup$Operator`), whose
+            // request member is "reserved for internal use": AWS publishes no rule by which
+            // a customer request gives a group either, and no service provider manages a
+            // group an account created for itself, so this emulator reports neither rather
+            // than inventing a meaning for them.
+            linked_group_id: None,
+            operator: None,
+            parent_group_id: spec.parent_group_id,
+            tags: Some(spec.tags),
+        };
+        let stored = group.clone();
+        self.placement_groups.insert(group_id, group);
+        Some(stored)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Allowed AMIs: the account's image-criteria setting in one Region
+// ---------------------------------------------------------------------------
+//
+// See the module docs for why this is a SETTING keyed by Region rather than a resource,
+// and why one record holds both the state and the criteria. The words below are members
+// of the model's own enums, named here so the four operations that read or write the
+// setting cannot spell one value two ways.
+
+/// The Allowed AMIs state of an account that has not enabled the feature, and the one
+/// `DisableAllowedImagesSettings` moves it to: the `AllowedImagesSettingsDisabledState`
+/// enum's only member, `disabled` — "All AMIs are allowed"
+/// (`GetAllowedImagesSettingsResult$State`). The generated catalog is
+/// `crate::ops::types::ALLOWED_IMAGES_SETTINGS_DISABLED_STATE_VALUES`.
+pub const ALLOWED_IMAGES_SETTINGS_DISABLED: &str = "disabled";
+
+/// `AllowedImagesSettingsEnabledState`'s `enabled` member — "Only AMIs matching the image
+/// criteria are discoverable and available for use". The generated catalog of the two
+/// states an enable accepts is
+/// `crate::ops::types::ALLOWED_IMAGES_SETTINGS_ENABLED_STATE_VALUES`.
+pub const ALLOWED_IMAGES_SETTINGS_ENABLED: &str = "enabled";
+
+/// `AllowedImagesSettingsEnabledState`'s `audit-mode` member — "All AMIs are allowed, but
+/// the ImageAllowed field is set to true if the AMI would be allowed with the current list
+/// of criteria if allowed AMIs was enabled" (see [`ALLOWED_IMAGES_SETTINGS_ENABLED`] for
+/// the catalog).
+pub const ALLOWED_IMAGES_SETTINGS_AUDIT_MODE: &str = "audit-mode";
+
+// The entity that manages the setting is `ManagedBy`'s `account` member for Allowed AMIs
+// exactly as it is for snapshot block public access — "the Allowed AMIs settings is managed
+// by the account" (`GetAllowedImagesSettingsResult$ManagedBy`), the account being the only
+// writer of either setting this emulator has — so this crate spells it once, as
+// [`MANAGED_BY_ACCOUNT`] above, and `GetAllowedImagesSettings` reports that constant.
+
+/// The most `ImageCriterion` entries one Allowed AMIs setting may carry.
+///
+/// `ImageCriterionRequest`'s own doc: "The `ImageCriteria` can include up to: 10
+/// `ImageCriterion`". The model declares no `@length` on `ImageCriterionRequestList`, so
+/// the handler is the only place the bound can be enforced.
+pub const MAX_IMAGE_CRITERIA: usize = 10;
+
+/// The most `ImageProviders` values one `ImageCriterion` may carry: "Maximum: 200 values"
+/// (`ImageCriterionRequest$ImageProviders`).
+pub const MAX_IMAGE_PROVIDERS_PER_CRITERION: usize = 200;
+
+/// The most `ImageNames` values one `ImageCriterion` may carry: "Maximum: 50 values"
+/// (`ImageCriterionRequest$ImageNames`).
+pub const MAX_IMAGE_NAMES_PER_CRITERION: usize = 50;
+
+/// The most `MarketplaceProductCodes` values one `ImageCriterion` may carry: "Maximum: 50
+/// values" (`ImageCriterionRequest$MarketplaceProductCodes`).
+pub const MAX_MARKETPLACE_PRODUCT_CODES_PER_CRITERION: usize = 50;
+
+/// The most `ImageWatermarks` entries one `ImageCriterion` may carry: "50 values for
+/// `ImageWatermarks`" (`ImageCriterionRequest`'s own doc).
+pub const MAX_IMAGE_WATERMARKS_PER_CRITERION: usize = 50;
+
+/// The image-provider words `ImageProviders` accepts beside an account id and
+/// [`IMAGE_PROVIDER_NONE`]: "`amazon`: Allow AMIs created by Amazon or verified providers.
+/// `aws-marketplace`: Allow AMIs created by verified providers in the Amazon Web Services
+/// Marketplace. `aws-backup-vault`: Allow AMIs created by Amazon Web Services Backup"
+/// (`ImageCriterionRequest$ImageProviders`).
+///
+/// The same three aliases `DescribeImages`'s `Owners` accepts ([`IMAGE_OWNER_ALIASES`]),
+/// which is why that catalog is the one read here rather than a second copy.
+pub const IMAGE_PROVIDER_ALIASES: &[&str] = &IMAGE_OWNER_ALIASES;
+
+/// The `ImageProviders` word that stands for the account itself: "`none`: Allow AMIs
+/// created by your own account only. When `none` is specified, no other values can be
+/// specified" (`ImageCriterionRequest$ImageProviders`).
+pub const IMAGE_PROVIDER_NONE: &str = "none";
+
+/// The fewest characters an `ImageNames` value may carry: "Length: 1–128 characters"
+/// (`ImageCriterionRequest$ImageNames`).
+pub const MIN_IMAGE_NAME_CRITERION_CHARS: usize = 1;
+
+/// The most characters an `ImageNames` value may carry: the ceiling of that same
+/// documented "Length: 1–128 characters".
+///
+/// Enforced by this crate rather than relied on from the model: the `@length` the model
+/// carries sits on `ImageNameCriteriaRequestList`'s member, and a handler must not depend on
+/// where the request walk happens to apply it — without a per-STRING ceiling every stored
+/// name would be caller-sized.
+pub const MAX_IMAGE_NAME_CRITERION_CHARS: usize = 128;
+
+/// The fewest characters an `ImageNames` value carrying a `?` wildcard may have: "With
+/// `?`, the minimum is 3 characters" (`ImageCriterionRequest$ImageNames`).
+pub const MIN_IMAGE_NAME_CRITERION_CHARS_WITH_WILDCARD: usize = 3;
+
+/// The special characters an `ImageNames` value may carry beside letters, numbers and
+/// spaces: "Special characters: `( ) [ ] . / - ' @ _ * ?`"
+/// (`ImageCriterionRequest$ImageNames`).
+pub const IMAGE_NAME_CRITERION_SPECIAL_CHARACTERS: &str = "()[]./-'@_*?";
+
+/// The fewest characters a `MarketplaceProductCodes` value may carry: "Length: 1-25
+/// characters" (`ImageCriterionRequest$MarketplaceProductCodes`).
+pub const MIN_MARKETPLACE_PRODUCT_CODE_CHARS: usize = 1;
+
+/// The most characters a `MarketplaceProductCodes` value may carry (see
+/// [`MIN_MARKETPLACE_PRODUCT_CODE_CHARS`]); the model declares no `@length` for it.
+pub const MAX_MARKETPLACE_PRODUCT_CODE_CHARS: usize = 25;
+
+/// The most characters one `ImageWatermarkFilter` pattern — a `WatermarkKey` or a
+/// `SourceImageRegion` — may carry.
+///
+/// CHOSEN, not an AWS-documented length: the model bounds neither, and both are
+/// caller-chosen strings this store keeps. A watermark key is an `accountId:name` and a
+/// source image region is a Region name, with `*` and `?` wildcards allowed in either, so
+/// this is far above anything either form needs while keeping one stored setting's size
+/// finite.
+pub const MAX_IMAGE_WATERMARK_PATTERN_CHARS: usize = 128;
+
+/// The most Regions this emulator holds an Allowed AMIs setting for.
+///
+/// [`MAX_STORED_RECORDS_PER_STORE`] is the crate's ceiling for a store nothing reclaims, and
+/// this store is bounded by it like every other: a setting is keyed by the Region of the
+/// request's own SigV4 credential scope, so without a ceiling a caller could write a setting
+/// for unboundedly many Region names. The bytes each setting holds are charged against
+/// [`MAX_STORED_BYTES`] on top of that ([`image_criteria_payload_bytes`]), so neither the
+/// number of settings nor their size is unbounded.
+pub const MAX_ALLOWED_IMAGES_SETTINGS_REGIONS: usize = MAX_STORED_RECORDS_PER_STORE;
+
+/// The account's Allowed AMIs setting in ONE Region: the state the feature is in, and the
+/// criteria that are evaluated when it is applied.
+///
+/// Held in [`ComAmazonawsEc2Amazonec2State::allowed_images_settings`] under the Region's
+/// name. The criteria are the modelled [`ImageCriterion`] shape `GetAllowedImagesSettings`
+/// reports, so a replace converts and validates the request shapes once rather than at
+/// every read.
+#[derive(Debug, Clone)]
+pub struct AllowedImagesSettings {
+    /// "The current state of the Allowed AMIs setting at the account level in the specified
+    /// Amazon Web Services Region" (`GetAllowedImagesSettingsResult$State`): one of
+    /// [`ALLOWED_IMAGES_SETTINGS_DISABLED`], [`ALLOWED_IMAGES_SETTINGS_ENABLED`] or
+    /// [`ALLOWED_IMAGES_SETTINGS_AUDIT_MODE`].
+    pub state: String,
+    /// "The list of criteria for images that are discoverable and usable in the account in
+    /// the specified Amazon Web Services Region"
+    /// (`GetAllowedImagesSettingsResult$ImageCriteria`), at most
+    /// [`MAX_IMAGE_CRITERIA`] of them.
+    pub image_criteria: Vec<ImageCriterion>,
+}
+
+/// The setting of a Region nobody has configured: `disabled` — "All AMIs are allowed" — with
+/// no criteria, which is what an account that has never enabled Allowed AMIs has.
+impl Default for AllowedImagesSettings {
+    fn default() -> Self {
+        Self {
+            state: ALLOWED_IMAGES_SETTINGS_DISABLED.to_string(),
+            image_criteria: Vec::new(),
+        }
+    }
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// The Allowed AMIs setting of `region` as it stands.
+    ///
+    /// A READ: a Region with no stored setting answers [`AllowedImagesSettings::default`]
+    /// without storing it, so `GetAllowedImagesSettings` cannot change what a later caller
+    /// sees.
+    pub fn allowed_images_settings_in(&self, region: &str) -> Cow<'_, AllowedImagesSettings> {
+        match self.allowed_images_settings.get(region) {
+            Some(settings) => Cow::Borrowed(settings),
+            None => Cow::Owned(AllowedImagesSettings::default()),
+        }
+    }
+
+    /// Move the state of `region`'s Allowed AMIs setting to `state`, leaving its criteria as
+    /// they stand — what `EnableAllowedImagesSettings` and `DisableAllowedImagesSettings`
+    /// do.
+    ///
+    /// `Err` means NOTHING was stored and the writer must refuse the request; see
+    /// [`AllowedImagesSettingsFull`].
+    pub fn set_allowed_images_settings_state(
+        &mut self,
+        region: &str,
+        state: &str,
+    ) -> Result<(), AllowedImagesSettingsFull> {
+        self.allowed_images_settings_entry(region)?.state = state.to_string();
+        Ok(())
+    }
+
+    /// Replace the image criteria of `region`'s Allowed AMIs setting, leaving its state as it
+    /// stands — what `ReplaceImageCriteriaInAllowedImagesSettings` does.
+    ///
+    /// The bytes the new criteria hold are charged against [`MAX_STORED_BYTES`] and the ones
+    /// the criteria they replace held are given back, so a store that is replaced over and
+    /// over does not drift, and a replace that would cross the budget is refused with
+    /// NOTHING stored ([`AllowedImagesSettingsFull::Bytes`]).
+    pub fn set_allowed_images_criteria(
+        &mut self,
+        region: &str,
+        criteria: Vec<ImageCriterion>,
+    ) -> Result<(), AllowedImagesSettingsFull> {
+        let requested = image_criteria_payload_bytes(&criteria);
+        let released = self
+            .allowed_images_settings
+            .get(region)
+            .map_or(0, |settings| {
+                image_criteria_payload_bytes(&settings.image_criteria)
+            });
+        // Only the GROWTH has to fit: a replace gives the bytes of the criteria it replaces
+        // back, so the charge is the difference.
+        if self.would_exceed_stored_bytes(requested.saturating_sub(released)) {
+            return Err(AllowedImagesSettingsFull::Bytes { requested });
+        }
+        self.allowed_images_settings_entry(region)?.image_criteria = criteria;
+        self.release_stored_bytes(released);
+        self.add_stored_bytes(requested);
+        Ok(())
+    }
+
+    /// The Allowed AMIs setting of `region` to write to, started at
+    /// [`AllowedImagesSettings::default`] when the Region has none yet and charged
+    /// [`STORED_RECORD_OVERHEAD_BYTES`] for the record it adds, the way every other store's
+    /// writer charges for one.
+    ///
+    /// `Err` once the store holds settings for [`MAX_ALLOWED_IMAGES_SETTINGS_REGIONS`] other
+    /// Regions: a writer refuses rather than growing past the ceiling. Private, so the two
+    /// public writers above are the only way a setting is written and neither can skip the
+    /// ceiling or the charge.
+    fn allowed_images_settings_entry(
+        &mut self,
+        region: &str,
+    ) -> Result<&mut AllowedImagesSettings, AllowedImagesSettingsFull> {
+        if !self.allowed_images_settings.contains_key(region) {
+            if self.allowed_images_settings.len() >= MAX_ALLOWED_IMAGES_SETTINGS_REGIONS {
+                return Err(AllowedImagesSettingsFull::Regions);
+            }
+            self.add_stored_bytes(STORED_RECORD_OVERHEAD_BYTES);
+        }
+        Ok(self
+            .allowed_images_settings
+            .entry(region.to_string())
+            .or_default())
+    }
+}
+
+/// Why a write to an Allowed AMIs setting was refused, with NOTHING stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllowedImagesSettingsFull {
+    /// The store already holds the settings of
+    /// [`MAX_ALLOWED_IMAGES_SETTINGS_REGIONS`] other Regions.
+    Regions,
+    /// The criteria would take the store past [`MAX_STORED_BYTES`]; `requested` is what they
+    /// would have cost.
+    Bytes {
+        /// The bytes the refused criteria would have held.
+        requested: usize,
+    },
+}
+
+/// The caller-chosen bytes one Allowed AMIs criteria list holds: its image providers, image
+/// names, Marketplace product codes and watermark patterns. The day conditions are two
+/// integers bounded by the model's own range, so they are fixed-size.
+///
+/// The ONE definition of that charge, the way [`vpc_endpoint_connection_payload_bytes`] is
+/// for a connection: a writer charges exactly it, and a replace gives back exactly what the
+/// criteria it replaces cost.
+pub fn image_criteria_payload_bytes(criteria: &[ImageCriterion]) -> usize {
+    let text_bytes = |values: Option<&Vec<String>>| -> usize {
+        values.into_iter().flatten().map(String::len).sum()
+    };
+    criteria
+        .iter()
+        .map(|criterion| {
+            let watermark_bytes: usize = criterion
+                .image_watermarks
+                .iter()
+                .flatten()
+                .map(|watermark| {
+                    watermark.watermark_key.as_deref().unwrap_or_default().len()
+                        + watermark
+                            .source_image_region
+                            .as_deref()
+                            .unwrap_or_default()
+                            .len()
+                })
+                .sum();
+            text_bytes(criterion.image_providers.as_ref())
+                .saturating_add(text_bytes(criterion.image_names.as_ref()))
+                .saturating_add(text_bytes(criterion.marketplace_product_codes.as_ref()))
+                .saturating_add(watermark_bytes)
+        })
+        .fold(0usize, usize::saturating_add)
+}
+
+/// Refuse a write to an Allowed AMIs setting this emulator has no room for: HTTP 400, EC2's
+/// `InvalidParameterValue`.
+///
+/// A bad request rather than a server error: nothing is wrong with the emulator, the Region
+/// and the criteria are values of the request, and a retry of the same request would be
+/// refused the same way.
+pub fn allowed_images_settings_full<E>(region: &str, full: AllowedImagesSettingsFull) -> Scaffolded<E> {
+    match full {
+        AllowedImagesSettingsFull::Regions => invalid_parameter_value(format!(
+            "This emulator holds the Allowed AMIs settings of \
+             {MAX_ALLOWED_IMAGES_SETTINGS_REGIONS} Regions, which is as many as it stores, so \
+             it cannot store the settings of '{region}' too"
+        )),
+        AllowedImagesSettingsFull::Bytes { requested } => invalid_parameter_value(format!(
+            "The image criteria carry {requested} bytes, which this emulator has no room for: \
+             it stores at most {MAX_STORED_BYTES} bytes of caller-supplied data"
+        )),
     }
 }

@@ -21,6 +21,8 @@ mod count_open_workflow_executions;
 mod count_pending_decision_tasks;
 #[path = "all/delete_workflow_type.rs"]
 mod delete_workflow_type;
+#[path = "all/deprecate_activity_type.rs"]
+mod deprecate_activity_type;
 #[path = "all/deprecate_workflow_type.rs"]
 mod deprecate_workflow_type;
 #[path = "all/domain_deprecation.rs"]
@@ -29,6 +31,8 @@ mod domain_deprecation;
 mod domain_tag_resource;
 #[path = "all/domain_tagging.rs"]
 mod domain_tagging;
+#[path = "all/domain_undeprecation.rs"]
+mod domain_undeprecation;
 #[path = "all/list_open_workflow_executions.rs"]
 mod list_open_workflow_executions;
 #[path = "all/pending_activity_task_count.rs"]

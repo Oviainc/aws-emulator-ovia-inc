@@ -37,6 +37,8 @@ mod gateway_lifecycle;
 mod lifecycle_preconditions;
 #[path = "all/ops_name_bindings.rs"]
 mod ops_name_bindings;
+#[path = "all/remove_flow_media_stream.rs"]
+mod remove_flow_media_stream;
 #[path = "all/remove_flow_output.rs"]
 mod remove_flow_output;
 #[path = "all/resource_tags.rs"]
@@ -55,3 +57,5 @@ mod update_flow_entitlement;
 mod update_flow_media_stream;
 #[path = "all/update_flow_output.rs"]
 mod update_flow_output;
+#[path = "all/update_flow_source.rs"]
+mod update_flow_source;
