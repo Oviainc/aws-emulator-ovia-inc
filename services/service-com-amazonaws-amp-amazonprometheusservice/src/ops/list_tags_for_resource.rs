@@ -4,7 +4,9 @@
 //! IMPLEMENTED: reports exactly the tags the stored workspace the `resourceArn` names
 //! currently carries. @readonly — the only write it makes is
 //! [`crate::state::ComAmazonawsAmpAmazonprometheusserviceState::materialize_due`],
-//! which applies the lifecycle transitions the clock already owed at this instant.
+//! which applies the lifecycle transitions the clock already owed at this instant. An
+//! ARN that resolves to no live resource is refused with `NotFoundException` (404), the
+//! code aps answers on this ARN-addressed path (`crate::state::arn_not_found`).
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -164,14 +166,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resolved = store.workspace_id_of_arn(&input.resource_arn);
         let Some(workspace) = resolved.and_then(|workspace_id| store.workspaces.get(&workspace_id))
         else {
-            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
-                    resource_id: input.resource_arn.clone(),
-                    resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
-                },
-            )
-            .into());
+            // The same refusal `TagResource` answers for an ARN that resolves to no live
+            // resource — one composition for all three tagging operations.
+            return Err(crate::state::arn_not_found());
         };
 
         Ok(ListTagsForResourceOutput {
