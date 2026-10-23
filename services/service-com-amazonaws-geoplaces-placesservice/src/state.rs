@@ -139,6 +139,47 @@ pub fn granularity_place_types(
         .map(|(_, place_types)| *place_types)
 }
 
+/// Every `PlaceType` the model's enum declares, grouped into granularity LEVELS,
+/// COARSEST LEVEL FIRST. The enum walks the place hierarchy down — a country
+/// encloses a region, a region a sub-region, a sub-region a locality, and so on to
+/// a single point inside a street — so the declaration order IS the granularity
+/// order; the types grouped in one level name the same KIND of geometry (a line
+/// for a street or an intersection, a single point for an address or the business
+/// standing at it), so neither of them is finer than the other.
+///
+/// SOURCE: `com.amazonaws.geoplaces#PlaceType`
+/// (`smithy_query(query="shape",shape="PlaceType")`).
+pub const PLACE_TYPE_LEVELS: [&[&str]; 11] = [
+    &[PLACE_TYPE_COUNTRY],
+    &[PLACE_TYPE_REGION],
+    &[PLACE_TYPE_SUB_REGION],
+    &[PLACE_TYPE_LOCALITY],
+    &[PLACE_TYPE_DISTRICT],
+    &["SubDistrict"],
+    &["PostalCode"],
+    &["Block"],
+    &["SubBlock"],
+    &["Intersection", "Street"],
+    &[
+        PLACE_TYPE_POINT_OF_INTEREST,
+        PLACE_TYPE_POINT_ADDRESS,
+        "InterpolatedAddress",
+        "SecondaryAddress",
+        "InferredSecondaryAddress",
+    ],
+];
+
+/// How FINE a `PlaceType` is: the higher the rank, the more specific the place.
+///
+/// A type [`PLACE_TYPE_LEVELS`] does not name ranks below every one it does, so an
+/// unknown type never outranks a known one.
+pub fn granularity_rank(place_type: &str) -> usize {
+    PLACE_TYPE_LEVELS
+        .iter()
+        .position(|level| level.contains(&place_type))
+        .map_or(0, |rank| rank + 1)
+}
+
 /// `AdditionalFeatures` values this emulator can answer, from the per-operation
 /// `*AdditionalFeature` enums in the model.
 pub const FEATURE_ACCESS: &str = "Access";
@@ -373,8 +414,8 @@ fn affinity(term: &str, wanted: &str) -> Option<f64> {
 ///
 /// The score is the share of the LONGER of the two that was accounted for, word by
 /// word, so "Broad Street" answers the street "Broad St" in full (the street type
-/// is a standard abbreviation of the word) while "King" answers the sub-region
-/// "King County" by half: it names part of it.
+/// is a standard abbreviation of the word) while "Broad" answers it by half: it
+/// names part of it.
 fn text_affinity(terms: &[String], wanted: &[String]) -> Option<f64> {
     if terms.is_empty() || wanted.is_empty() {
         return None;
@@ -600,6 +641,74 @@ pub struct Scored {
 // The catalog records
 // ---------------------------------------------------------------------------
 
+/// The NAME text of one address, as one language writes it: the overrides a
+/// [`language variant`] applies to the record's own text.
+///
+/// Only name-valued components appear here. A code (`CountryCode2`, a region
+/// code), a postal code and an address number are the same string in every
+/// language, so no language renames them.
+///
+/// [`language variant`]: AddressRecord::names_by_language
+#[derive(Debug, Clone, Default)]
+pub struct AddressNames {
+    pub country_name: Option<String>,
+    pub region_name: Option<String>,
+    /// The sub-region's bare name as this language writes it. A localized name
+    /// carries whatever division word that language spells out, so it REPLACES
+    /// the default's [`AddressRecord::sub_region_division`] rather than taking it
+    /// over.
+    pub sub_region_name: Option<String>,
+    pub locality: Option<String>,
+    pub district: Option<String>,
+    pub street: Option<String>,
+}
+
+impl AddressNames {
+    /// The names this variant gives, named by the member they override — used to
+    /// index a record by its text in EVERY language it holds.
+    fn given(&self) -> impl Iterator<Item = &str> {
+        [
+            self.country_name.as_deref(),
+            self.region_name.as_deref(),
+            self.sub_region_name.as_deref(),
+            self.locality.as_deref(),
+            self.district.as_deref(),
+            self.street.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+
+/// The variant of `table` a requested BCP 47 language tag selects, with the tag
+/// the catalog spells it under, or `None` when the entry holds no text in that
+/// language — in which case "data will be returned in the default language for the
+/// entry" (`ReverseGeocodeRequest$Language`).
+///
+/// The match is RFC 4647 "lookup": the whole requested tag first, then
+/// progressively shorter prefixes of it cut at a subtag boundary, so `uk-UA`
+/// selects an entry's `uk` text. Tags are compared case-insensitively, as BCP 47
+/// defines them to be.
+fn lookup_language<'a, T>(
+    table: &'a BTreeMap<String, T>,
+    requested: Option<&str>,
+) -> Option<(&'a str, &'a T)> {
+    let requested = requested?;
+    let mut candidate = requested;
+    loop {
+        if let Some((tag, value)) = table
+            .iter()
+            .find(|(tag, _)| tag.eq_ignore_ascii_case(candidate))
+        {
+            return Some((tag.as_str(), value));
+        }
+        match candidate.rfind('-') {
+            Some(cut) => candidate = &candidate[..cut],
+            None => return None,
+        }
+    }
+}
+
 /// A place's address, as every operation that reports an `Address` renders it.
 ///
 /// The `Label` is NOT stored: it is assembled from these components on the way out
@@ -611,21 +720,90 @@ pub struct AddressRecord {
     pub country_name: String,
     pub region_code: String,
     pub region_name: String,
+    /// The sub-region's NAME, bare: `Address$SubRegion$Name` is "name for the
+    /// county or sub-region", so it holds what the area is CALLED and not the
+    /// generic division word a display title writes beside it — that word is
+    /// [`Self::sub_region_division`], and it reaches a response only through the
+    /// `Title`/`Label` of a place that IS this sub-region.
     pub sub_region_name: String,
+    /// The administrative division word the sub-region's display name carries
+    /// beside its bare name ("County" for a US county), or empty where the
+    /// language writes none. Never reported as a component of its own.
+    pub sub_region_division: String,
     pub locality: String,
     pub district: Option<String>,
     pub postal_code: String,
     pub street: Option<String>,
     pub address_number: Option<String>,
-    /// The BCP 47 language this record's text is written in, reported as the
-    /// street components' `Language`: "If there is no data for the result in the
-    /// requested language, data will be returned in the default language for the
-    /// entry" (`StreetComponents$Language`), and this catalog holds one language
-    /// per entry.
+    /// The BCP 47 language this record's OWN text is written in: "the default
+    /// language for the entry" the per-operation `Language` member falls back to,
+    /// and the language reported as the street components' `Language`.
     pub language: String,
+    /// This entry's name text in other languages, keyed by BCP 47 language tag —
+    /// what a request's `Language` selects ("a list of BCP 47 compliant language
+    /// codes for the results to be rendered in"), with [`Self::language`] as the
+    /// fallback.
+    ///
+    /// A variant RENAMES a component this record holds; it never adds one, so a
+    /// record that names no locality has no locality in any language.
+    pub names_by_language: BTreeMap<String, AddressNames>,
 }
 
 impl AddressRecord {
+    /// This address as one language writes it: the variant the requested BCP 47
+    /// tag selects applied over the record's own text, with [`Self::language`] set
+    /// to the language the result is actually rendered in.
+    ///
+    /// With no language asked for — or none this entry holds text in — the record
+    /// answers in its own language, which is what `Language` documents ("if there
+    /// is no data for the result in the requested language, data will be returned
+    /// in the default language for the entry").
+    pub fn rendered_in(&self, language: Option<&str>) -> Self {
+        let Some((tag, names)) = lookup_language(&self.names_by_language, language) else {
+            return self.clone();
+        };
+        // A variant renames what this record HOLDS: an override of a component
+        // the record leaves empty is not applied, so no language adds a component
+        // the place does not have.
+        let renamed = |current: &str, localized: Option<&String>| match localized {
+            Some(localized) if !current.is_empty() => localized.clone(),
+            _ => current.to_string(),
+        };
+        let optional = |current: &Option<String>, localized: Option<&String>| match localized {
+            Some(localized) if current.is_some() => Some(localized.clone()),
+            _ => current.clone(),
+        };
+        let sub_region_name = renamed(&self.sub_region_name, names.sub_region_name.as_ref());
+        Self {
+            country_name: renamed(&self.country_name, names.country_name.as_ref()),
+            region_name: renamed(&self.region_name, names.region_name.as_ref()),
+            sub_region_division: if sub_region_name == self.sub_region_name {
+                self.sub_region_division.clone()
+            } else {
+                // The localized name carries its own division word, if that
+                // language writes one at all.
+                String::new()
+            },
+            sub_region_name,
+            locality: renamed(&self.locality, names.locality.as_ref()),
+            district: optional(&self.district, names.district.as_ref()),
+            street: optional(&self.street, names.street.as_ref()),
+            language: tag.to_string(),
+            ..self.clone()
+        }
+    }
+
+    /// The sub-region's DISPLAY name: its bare [`Self::sub_region_name`] with the
+    /// administrative division word its title carries, where it has one. Used to
+    /// name a place that IS this sub-region — never as the `SubRegion` component,
+    /// which the model documents as the name alone.
+    pub fn sub_region_display(&self) -> String {
+        if self.sub_region_name.is_empty() || self.sub_region_division.is_empty() {
+            return self.sub_region_name.clone();
+        }
+        format!("{} {}", self.sub_region_name, self.sub_region_division)
+    }
+
     /// This address as the modeled `Address` structure, with the assembled `Label`
     /// the place computed and the street split into `StreetComponents`.
     ///
@@ -710,23 +888,51 @@ impl AddressRecord {
     /// The texts a `GeocodeQueryComponents` member may match against, named by that
     /// member. A component the catalog does not carry matches nothing — an absent
     /// component holds no text, so it cannot answer a query word.
-    pub fn component_texts(&self, component: &str) -> Vec<&str> {
-        let texts = match component {
+    ///
+    /// A component is matchable by EVERY name the entry holds for it: its own text,
+    /// the text of each language variant, and — for the sub-region — both its bare
+    /// name and the display name its division word makes, so a caller may name the
+    /// county either way.
+    pub fn component_texts(&self, component: &str) -> Vec<String> {
+        let mut texts: Vec<String> = self.component_texts_of(self, component);
+        if component == "SubRegion" {
+            texts.push(self.sub_region_display());
+        }
+        for tag in self.names_by_language.keys() {
+            let localized = self.rendered_in(Some(tag));
+            texts.extend(self.component_texts_of(&localized, component));
+            if component == "SubRegion" {
+                texts.push(localized.sub_region_display());
+            }
+        }
+        texts.retain(|text| !text.is_empty());
+        texts.sort();
+        texts.dedup();
+        texts
+    }
+
+    /// The text ONE rendering of this address holds for a component.
+    fn component_texts_of(&self, rendered: &Self, component: &str) -> Vec<String> {
+        let texts: Vec<&str> = match component {
             "Country" => vec![
-                self.country_code2.as_str(),
-                self.country_code3.as_str(),
-                self.country_name.as_str(),
+                rendered.country_code2.as_str(),
+                rendered.country_code3.as_str(),
+                rendered.country_name.as_str(),
             ],
-            "Region" => vec![self.region_code.as_str(), self.region_name.as_str()],
-            "SubRegion" => vec![self.sub_region_name.as_str()],
-            "Locality" => vec![self.locality.as_str()],
-            "District" => self.district.as_deref().into_iter().collect(),
-            "Street" => self.street.as_deref().into_iter().collect(),
-            "AddressNumber" => self.address_number.as_deref().into_iter().collect(),
-            "PostalCode" => vec![self.postal_code.as_str()],
+            "Region" => vec![rendered.region_code.as_str(), rendered.region_name.as_str()],
+            "SubRegion" => vec![rendered.sub_region_name.as_str()],
+            "Locality" => vec![rendered.locality.as_str()],
+            "District" => rendered.district.as_deref().into_iter().collect(),
+            "Street" => rendered.street.as_deref().into_iter().collect(),
+            "AddressNumber" => rendered.address_number.as_deref().into_iter().collect(),
+            "PostalCode" => vec![rendered.postal_code.as_str()],
             _ => Vec::new(),
         };
-        texts.into_iter().filter(|text| !text.is_empty()).collect()
+        texts
+            .into_iter()
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+            .collect()
     }
 
     /// How well a supplied structured component answers this address's own
@@ -778,9 +984,12 @@ impl AddressRecord {
 ///
 /// Either convention skips a component the address does not hold rather than
 /// rendering it empty, so a place reads at its OWN level: a country as "France", a
-/// sub-region as "King County, WA, United States". The district is part of the
-/// label only for a place that IS a district — for a business or an address it is
-/// finer detail than the postal address needs.
+/// sub-region as "King County, WA, United States" — a place that IS the sub-region
+/// is named by the sub-region's DISPLAY name ([`AddressRecord::sub_region_display`]),
+/// division word and all, while the `SubRegion` component itself stays the bare
+/// name the model documents. The district is part of the label only for a place
+/// that IS a district — for a business or an address it is finer detail than the
+/// postal address needs.
 fn assemble_label(address: &AddressRecord, name: Option<&str>, place_type: &str) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(name) = name.filter(|name| !name.is_empty()) {
@@ -793,12 +1002,12 @@ fn assemble_label(address: &AddressRecord, name: Option<&str>, place_type: &str)
 
     // The settlement: the finest level at or above this place's own granularity
     // that the address names, below the region.
-    let mut settlement: Vec<&str> = Vec::new();
+    let mut settlement: Vec<String> = Vec::new();
     if place_type == PLACE_TYPE_DISTRICT {
-        settlement.extend(address.district.as_deref());
+        settlement.extend(address.district.clone());
     }
     settlement.extend(
-        [address.locality.as_str(), address.sub_region_name.as_str()]
+        [address.locality.clone(), address.sub_region_display()]
             .into_iter()
             .find(|level| !level.is_empty()),
     );
@@ -815,7 +1024,7 @@ fn assemble_label(address: &AddressRecord, name: Option<&str>, place_type: &str)
         };
         let mut line = settlement
             .iter()
-            .copied()
+            .map(String::as_str)
             .chain([region])
             .filter(|level| !level.is_empty())
             .collect::<Vec<_>>()
@@ -829,7 +1038,7 @@ fn assemble_label(address: &AddressRecord, name: Option<&str>, place_type: &str)
     } else {
         settlement
             .iter()
-            .copied()
+            .map(String::as_str)
             .chain([address.region_name.as_str()])
             .filter(|level| !level.is_empty())
             .collect::<Vec<_>>()
@@ -872,6 +1081,14 @@ pub struct PlaceRecord {
     /// commonly searched by. A place is findable by ANY of its names, so a query
     /// in one language answers with the record written in another.
     pub alternate_names: Vec<String>,
+    /// The place's OWN name as other languages write it, keyed by BCP 47 language
+    /// tag: what a request's `Language` selects for the `Title` ("the localized
+    /// display name of this result item based on request parameter language"),
+    /// with the name in [`AddressRecord::language`] as the fallback.
+    ///
+    /// A place is findable by every one of these too, the way it is by its
+    /// [`Self::alternate_names`].
+    pub titles_by_language: BTreeMap<String, String>,
     pub address: AddressRecord,
     /// The attribution this place carries under a political view, keyed by the
     /// view's alpha-3 country code: "the political view applies to the results of
@@ -923,6 +1140,7 @@ impl PlaceRecord {
             place_type: place_type.to_string(),
             title: title.to_string(),
             alternate_names: Vec::new(),
+            titles_by_language: BTreeMap::new(),
             address,
             political_attributions: BTreeMap::new(),
             position,
@@ -943,6 +1161,16 @@ impl PlaceRecord {
     /// The place's other names: see [`PlaceRecord::alternate_names`].
     fn with_alternate_names(mut self, names: &[&str]) -> Self {
         self.alternate_names = names.iter().map(|name| (*name).to_string()).collect();
+        self
+    }
+
+    /// The place's own name in other languages, as `(BCP 47 tag, name)` pairs:
+    /// see [`PlaceRecord::titles_by_language`].
+    fn with_localized_titles(mut self, titles: &[(&str, &str)]) -> Self {
+        self.titles_by_language = titles
+            .iter()
+            .map(|(tag, name)| ((*tag).to_string(), (*name).to_string()))
+            .collect();
         self
     }
 
@@ -1015,7 +1243,19 @@ impl PlaceRecord {
         (self.place_type == PLACE_TYPE_POINT_OF_INTEREST).then_some(self.title.as_str())
     }
 
-    /// Every name this place is KNOWN by: its own title and its alternate names.
+    /// The place's own name as one language writes it: the localized name the
+    /// requested BCP 47 tag selects, or the record's own where it holds none in
+    /// that language.
+    pub fn name_in(&self, language: Option<&str>) -> Option<&str> {
+        let name = self.name()?;
+        Some(
+            lookup_language(&self.titles_by_language, language)
+                .map_or(name, |(_, localized)| localized.as_str()),
+        )
+    }
+
+    /// Every name this place is KNOWN by: its own title, its localized titles and
+    /// its alternate names.
     ///
     /// Unlike [`PlaceRecord::name`], which is the name that LEADS a postal label
     /// and so belongs to a point of interest alone, these are the names a query
@@ -1024,14 +1264,16 @@ impl PlaceRecord {
     pub fn names(&self) -> impl Iterator<Item = &str> {
         std::iter::once(self.title.as_str())
             .chain(self.alternate_names.iter().map(String::as_str))
+            .chain(self.titles_by_language.values().map(String::as_str))
     }
 
-    /// The names a postal label may lead with: a point of interest's own name and
-    /// its alternates.
+    /// The names a postal label may lead with: a point of interest's own name, in
+    /// every language it holds one, and its alternates.
     fn label_names(&self) -> Vec<&str> {
         match self.name() {
             Some(name) => std::iter::once(name)
                 .chain(self.alternate_names.iter().map(String::as_str))
+                .chain(self.titles_by_language.values().map(String::as_str))
                 .collect(),
             None => Vec::new(),
         }
@@ -1046,16 +1288,31 @@ impl PlaceRecord {
             .unwrap_or(&self.address)
     }
 
-    /// This place's assembled address label: see [`assemble_label`].
-    pub fn assembled_label(&self) -> String {
-        self.assembled_label_in(None)
+    /// This place's address under a political view, rendered in the requested
+    /// language: the ONE place a reported `Address` is resolved from.
+    pub fn address_rendered_in(
+        &self,
+        political_view: Option<&str>,
+        language: Option<&str>,
+    ) -> AddressRecord {
+        self.address_in(political_view).rendered_in(language)
     }
 
-    /// This place's assembled address label under a political view.
-    pub fn assembled_label_in(&self, political_view: Option<&str>) -> String {
+    /// This place's assembled address label: see [`assemble_label`].
+    pub fn assembled_label(&self) -> String {
+        self.assembled_label_in(None, None)
+    }
+
+    /// This place's assembled address label under a political view, rendered in
+    /// the requested language.
+    pub fn assembled_label_in(
+        &self,
+        political_view: Option<&str>,
+        language: Option<&str>,
+    ) -> String {
         assemble_label(
-            self.address_in(political_view),
-            self.name(),
+            &self.address_rendered_in(political_view, language),
+            self.name_in(language),
             &self.place_type,
         )
     }
@@ -1066,25 +1323,37 @@ impl PlaceRecord {
     /// shows this as the single display line for the place, so a bare address
     /// component is not one.
     pub fn title_modeled(&self) -> String {
-        self.title_modeled_in(None)
+        self.title_modeled_in(None, None)
     }
 
-    /// `Title` under a political view: a label that names a country names the one
-    /// that view attributes the place to.
-    pub fn title_modeled_in(&self, political_view: Option<&str>) -> String {
-        self.name()
-            .map_or_else(|| self.assembled_label_in(political_view), str::to_string)
+    /// `Title` under a political view, rendered in the requested language: a label
+    /// that names a country names the one that view attributes the place to, and
+    /// the text is the entry's own unless the request asked for a language the
+    /// entry holds text in.
+    pub fn title_modeled_in(
+        &self,
+        political_view: Option<&str>,
+        language: Option<&str>,
+    ) -> String {
+        self.name_in(language).map_or_else(
+            || self.assembled_label_in(political_view, language),
+            str::to_string,
+        )
     }
 
     /// `Address`, with the assembled `Label` this place renders.
     pub fn address_modeled(&self) -> Address {
-        self.address_modeled_in(None)
+        self.address_modeled_in(None, None)
     }
 
-    /// `Address` under a political view.
-    pub fn address_modeled_in(&self, political_view: Option<&str>) -> Address {
-        self.address_in(political_view)
-            .to_modeled(self.assembled_label_in(political_view))
+    /// `Address` under a political view, rendered in the requested language.
+    pub fn address_modeled_in(
+        &self,
+        political_view: Option<&str>,
+        language: Option<&str>,
+    ) -> Address {
+        self.address_rendered_in(political_view, language)
+            .to_modeled(self.assembled_label_in(political_view, language))
     }
 
     /// Does this place COVER `position` — does the point fall inside the place's
@@ -1344,7 +1613,7 @@ impl PlaceRecord {
                     .address
                     .component_texts(component)
                     .into_iter()
-                    .filter_map(|text| locate(query, text))
+                    .filter_map(|text| locate(query, &text))
                     .max_by(|left, right| left.score.total_cmp(&right.score));
                 if let Some(found) = best {
                     explanation.components.push(ComponentMatch {
@@ -1461,34 +1730,52 @@ fn synthesize_place_id(title: &str, position: [f64; 2]) -> String {
 /// term: a large part of what a text search is asked is "find me a coffee shop",
 /// which names what the place IS rather than what it is called.
 ///
+/// Every LANGUAGE the entry holds text in IS indexed: a place is findable by the
+/// name any language gives it, and the result then renders in the language the
+/// request asked for, so a query in one language never answers with a name the
+/// response does not carry.
+///
 /// A political view's alternative attribution is NOT indexed: a result is reported
 /// under the attribution the request's view selects, and a query answered with an
 /// attribution it did not ask for would name a country the response then
 /// contradicts.
 fn index_terms(place: &PlaceRecord) -> Vec<String> {
     let label = place.assembled_label();
-    let mut sources: Vec<&str> = place.names().collect();
-    sources.extend([
-        label.as_str(),
-        place.address.locality.as_str(),
-        place.address.region_code.as_str(),
-        place.address.region_name.as_str(),
-        place.address.sub_region_name.as_str(),
-        place.address.country_name.as_str(),
-        place.address.country_code2.as_str(),
-        place.address.country_code3.as_str(),
-        place.address.postal_code.as_str(),
-    ]);
-    sources.extend(place.address.street.as_deref());
-    sources.extend(place.address.district.as_deref());
+    let mut sources: Vec<String> = place.names().map(str::to_string).collect();
+    sources.push(label);
+    sources.extend(
+        [
+            place.address.locality.as_str(),
+            place.address.region_code.as_str(),
+            place.address.region_name.as_str(),
+            place.address.country_name.as_str(),
+            place.address.country_code2.as_str(),
+            place.address.country_code3.as_str(),
+            place.address.postal_code.as_str(),
+        ]
+        .into_iter()
+        .map(str::to_string),
+    );
+    // The sub-region under both the bare name the `SubRegion` component reports
+    // and the display name its division word makes.
+    sources.push(place.address.sub_region_name.clone());
+    sources.push(place.address.sub_region_display());
+    sources.extend(place.address.street.clone());
+    sources.extend(place.address.district.clone());
+    // Every language the entry holds text in: an entry written in one language is
+    // still findable by the name another language gives it, which is what its
+    // alternate names do for a place's own name.
+    for names in place.address.names_by_language.values() {
+        sources.extend(names.given().map(str::to_string));
+    }
     sources.extend(
         place
             .categories
             .iter()
-            .flat_map(|category| [category.id.as_str(), category.name.as_str()]),
+            .flat_map(|category| [category.id.clone(), category.name.clone()]),
     );
-    sources.extend(place.food_types.iter().map(String::as_str));
-    sources.extend(place.business_chains.iter().map(String::as_str));
+    sources.extend(place.food_types.iter().cloned());
+    sources.extend(place.business_chains.iter().cloned());
 
     let mut terms: Vec<String> = sources
         .iter()
@@ -2137,7 +2424,8 @@ impl ComAmazonawsGeoplacesPlacesserviceState {
         candidates
     }
 
-    /// The records AT `position`: the places that cover it, nearest first.
+    /// The records AT `position`: the places that cover it, nearest first and, among
+    /// those equally near, FINEST FIRST.
     ///
     /// Resolving a position is positional by definition, so a candidate has to
     /// contain the position rather than merely be the closest record the catalog
@@ -2146,6 +2434,15 @@ impl ComAmazonawsGeoplacesPlacesserviceState {
     /// granularity — a country covers a region of the world, a point of interest
     /// covers its own block). A position no place covers resolves to NO records,
     /// which is an empty `ResultItems` list rather than an address somewhere else.
+    ///
+    /// A point inside a country is also inside the region, sub-region and locality
+    /// of that country that contain it, so the candidates are ranked by
+    /// [`granularity_rank`] — the most specific place containing the point first.
+    /// That is what makes ReverseGeocode's documented default of one result
+    /// ("Default value: 1") the finest answer the catalog can give rather than an
+    /// arbitrary one of the levels covering the point: "reverse geocode converts
+    /// geographic coordinates into a human-readable address or place", and the
+    /// address of a point is the finest one that contains it.
     ///
     /// An explicit radius is the caller's own bound and replaces the extent test:
     /// "the maximum distance in meters from the QueryPosition from which a result
@@ -2176,32 +2473,37 @@ impl ComAmazonawsGeoplacesPlacesserviceState {
                 .collect(),
         };
         // What each candidate REPORTS, computed once: zero where the record covers
-        // the position, beside the distance to the record's own position, which is
-        // what puts the finest record at the position first among the records that
-        // all contain the point and so all report zero.
-        let mut reported: Vec<(Scored, i64)> = candidates
+        // the position, beside how FINE the record is and the distance to its own
+        // position, which order the records that all contain the point and so all
+        // report zero.
+        let mut reported: Vec<(Scored, usize, i64)> = candidates
             .into_iter()
             .map(|candidate| {
-                let covers = self.places[candidate.index].covers(position);
+                let place = &self.places[candidate.index];
+                let covers = place.covers(position);
                 let own = candidate.distance;
                 (
                     Scored {
                         distance: if covers { 0 } else { own },
                         ..candidate
                     },
+                    granularity_rank(&place.place_type),
                     own,
                 )
             })
             .collect();
-        reported.sort_by(|(left, left_own), (right, right_own)| {
-            left.distance
-                .cmp(&right.distance)
-                .then(left_own.cmp(right_own))
-                .then_with(|| self.tie_break(left, right))
-        });
+        reported.sort_by(
+            |(left, left_rank, left_own), (right, right_rank, right_own)| {
+                left.distance
+                    .cmp(&right.distance)
+                    .then(right_rank.cmp(left_rank))
+                    .then(left_own.cmp(right_own))
+                    .then_with(|| self.tie_break(left, right))
+            },
+        );
         reported
             .into_iter()
-            .map(|(candidate, _)| candidate)
+            .map(|(candidate, _, _)| candidate)
             .collect()
     }
 
@@ -2289,6 +2591,11 @@ const DISTRICT_EXTENT_M: f64 = 3_000.0;
 /// `MapView` extent for a locality, which covers a whole settlement.
 const LOCALITY_EXTENT_M: f64 = 12_000.0;
 
+/// `MapView` extent for a RURAL district reported at locality granularity (a
+/// raion): the area covers a cluster of villages rather than one built-up place,
+/// so it is wider than a town's extent and narrower than the sub-region holding it.
+const RURAL_DISTRICT_EXTENT_M: f64 = 40_000.0;
+
 /// `MapView` extent for a sub-region (a county).
 const SUB_REGION_EXTENT_M: f64 = 60_000.0;
 
@@ -2324,10 +2631,16 @@ const EASTERN_EUROPEAN: (&str, &str, i64) = ("Europe/Kyiv", "+02:00", 7_200);
 
 /// A US administrative area, down to the locality: the country is the same for
 /// every US record, so only the levels below it are named here.
+///
+/// `sub_region` is the county as `(bare name, division word)`: the name alone is
+/// what `Address$SubRegion$Name` reports, and the division word reaches a response
+/// only through the `Title`/`Label` of the place that IS that county. US counties
+/// are named by [`county`]; an area that is a county-equivalent under another word
+/// (a parish, a borough, a federal district) names its own, or none.
 fn us_area(
     region_code: &str,
     region_name: &str,
-    sub_region_name: &str,
+    sub_region: (&str, &str),
     locality: &str,
     postal_code: &str,
 ) -> AddressRecord {
@@ -2337,7 +2650,8 @@ fn us_area(
         country_name: "United States".to_string(),
         region_code: region_code.to_string(),
         region_name: region_name.to_string(),
-        sub_region_name: sub_region_name.to_string(),
+        sub_region_name: sub_region.0.to_string(),
+        sub_region_division: sub_region.1.to_string(),
         locality: locality.to_string(),
         district: None,
         // A locality's own postal code is the central one of the settlement; a
@@ -2347,7 +2661,29 @@ fn us_area(
         street: None,
         address_number: None,
         language: "en".to_string(),
+        names_by_language: BTreeMap::new(),
     }
+}
+
+/// A US county, as [`us_area`] takes a sub-region: the bare name the `SubRegion`
+/// component reports, and the division word its display name carries.
+fn county(name: &str) -> (&str, &str) {
+    (name, "County")
+}
+
+/// An administrative area that is its own sub-region under no division word — a
+/// federal district, or a city that IS the county-equivalent.
+fn bare_sub_region(name: &str) -> (&str, &str) {
+    (name, "")
+}
+
+/// The name text this entry holds in other languages, as
+/// [`AddressRecord::names_by_language`] keys it: `(BCP 47 tag, names)` pairs.
+fn names_in(variants: &[(&str, AddressNames)]) -> BTreeMap<String, AddressNames> {
+    variants
+        .iter()
+        .map(|(tag, names)| ((*tag).to_string(), names.clone()))
+        .collect()
 }
 
 /// A street address inside an administrative `area`: the same administrative
@@ -2405,22 +2741,22 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
     let washington = us_area(
         "DC",
         "District of Columbia",
-        "District of Columbia",
+        bare_sub_region("District of Columbia"),
         "Washington",
         "20001",
     );
-    let seattle = us_area("WA", "Washington", "King County", "Seattle", "98104");
+    let seattle = us_area("WA", "Washington", county("King"), "Seattle", "98104");
     let san_francisco = us_area(
         "CA",
         "California",
-        "San Francisco County",
+        county("San Francisco"),
         "San Francisco",
         "94103",
     );
-    let new_york = us_area("NY", "New York", "New York County", "New York", "10007");
+    let new_york = us_area("NY", "New York", county("New York"), "New York", "10007");
     // The US homonym of Paris, France: a different country's place of the same
     // name, which is what an `IncludeCountries` filter is documented to pick out.
-    let paris_texas = us_area("TX", "Texas", "Lamar County", "Paris", "75460");
+    let paris_texas = us_area("TX", "Texas", county("Lamar"), "Paris", "75460");
 
     // --- France -------------------------------------------------------------
     let paris = AddressRecord {
@@ -2430,6 +2766,7 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
         region_code: "IDF".to_string(),
         region_name: "Ile-de-France".to_string(),
         sub_region_name: "Paris".to_string(),
+        sub_region_division: String::new(),
         locality: "Paris".to_string(),
         postal_code: "75001".to_string(),
         language: "fr".to_string(),
@@ -2437,48 +2774,102 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
     };
 
     // --- Ukraine, and the territory a political view reattributes ------------
+    //
+    // An entry's own text is written in the entry's own LANGUAGE — "the default
+    // language for the entry" a request's `Language` falls back to — and the other
+    // languages it is held in are variants beside it.
     let ukraine = AddressRecord {
         country_code2: "UA".to_string(),
         country_code3: "UKR".to_string(),
-        country_name: "Ukraine".to_string(),
+        country_name: "Україна".to_string(),
         region_code: String::new(),
         region_name: String::new(),
         sub_region_name: String::new(),
+        sub_region_division: String::new(),
         locality: String::new(),
         postal_code: String::new(),
         language: "uk".to_string(),
+        names_by_language: names_in(&[(
+            "en",
+            AddressNames {
+                country_name: Some("Ukraine".to_string()),
+                ..AddressNames::default()
+            },
+        )]),
         ..washington.clone()
     };
     // Crimea as the default (Ukrainian) view attributes it, and as the Russian
     // political view does: "the political view applies to the results of the
     // request to represent unresolved territorial claims through the point of
-    // view of the specified country" (`CountryCode`).
+    // view of the specified country" (`CountryCode`). The claim is unresolved over
+    // the administrative hierarchy as well as over the country: each view files the
+    // territory under the divisions that view's own administration gives it.
     let crimea_ukraine = AddressRecord {
+        // ISO 3166-2:UA assigns `UA-43` to the Autonomous Republic of Crimea; the
+        // territory is a first-level division with no region ABOVE it, so the
+        // region carries the code alone and the sub-region carries its name.
         region_code: "43".to_string(),
-        region_name: "Crimea".to_string(),
+        sub_region_name: "Автономна Республіка Крим".to_string(),
+        names_by_language: names_in(&[(
+            "en",
+            AddressNames {
+                country_name: Some("Ukraine".to_string()),
+                sub_region_name: Some("Autonomous Republic of Crimea".to_string()),
+                ..AddressNames::default()
+            },
+        )]),
         ..ukraine.clone()
     };
     let crimea_russia = AddressRecord {
         country_code2: "RU".to_string(),
         country_code3: "RUS".to_string(),
-        country_name: "Russia".to_string(),
+        country_name: "Россия".to_string(),
         region_code: "CR".to_string(),
-        region_name: "Crimea".to_string(),
+        region_name: "Южный федеральный округ".to_string(),
+        sub_region_name: "Республика Крым".to_string(),
         language: "ru".to_string(),
+        names_by_language: names_in(&[(
+            "en",
+            AddressNames {
+                country_name: Some("Russia".to_string()),
+                region_name: Some("Southern Federal District".to_string()),
+                sub_region_name: Some("Republic of Crimea".to_string()),
+                ..AddressNames::default()
+            },
+        )]),
         ..crimea_ukraine.clone()
     };
-    let simferopol_ukraine = AddressRecord {
-        sub_region_name: "Simferopol".to_string(),
-        locality: "Simferopol".to_string(),
-        postal_code: "95000".to_string(),
-        ..crimea_ukraine.clone()
+    // A settlement inside one of those territories, named in the attribution's own
+    // language and in English: `(name, English name)`.
+    let locality_of = |area: &AddressRecord, locality: (&str, &str), postal_code: &str| {
+        let mut names_by_language = area.names_by_language.clone();
+        if let Some(english) = names_by_language.get_mut("en") {
+            english.locality = Some(locality.1.to_string());
+        }
+        AddressRecord {
+            locality: locality.0.to_string(),
+            postal_code: postal_code.to_string(),
+            names_by_language,
+            ..area.clone()
+        }
     };
-    let simferopol_russia = AddressRecord {
-        sub_region_name: "Simferopol".to_string(),
-        locality: "Simferopol".to_string(),
-        postal_code: "95000".to_string(),
-        ..crimea_russia.clone()
-    };
+    let simferopol_ukraine = locality_of(&crimea_ukraine, ("Сімферополь", "Simferopol"), "95000");
+    let simferopol_russia = locality_of(&crimea_russia, ("Симферополь", "Simferopol"), "95000");
+    // The raion the recorded fixture's position sits in: a settlement-level
+    // division, which is the finest place the catalog holds over that territory.
+    // A raion is RURAL — its extent covers a cluster of villages rather than one
+    // built-up area, so a position tens of kilometres from its centre is still
+    // inside it.
+    let pervomaiske_ukraine = locality_of(
+        &crimea_ukraine,
+        ("Первомайський район", "Pervomaiske Raion"),
+        "96300",
+    );
+    let pervomaiske_russia = locality_of(
+        &crimea_russia,
+        ("Первомайский район", "Pervomaiske Raion"),
+        "296300",
+    );
 
     // The administrative levels above a locality name no settlement of their own.
     let sub_region_of = |area: &AddressRecord| AddressRecord {
@@ -2488,6 +2879,7 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
     };
     let above_locality = |area: &AddressRecord| AddressRecord {
         sub_region_name: String::new(),
+        sub_region_division: String::new(),
         ..sub_region_of(area)
     };
     let above_region = |area: &AddressRecord| AddressRecord {
@@ -2684,7 +3076,8 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
             },
             POINT_EXTENT_M,
         )
-        .with_alternate_names(&["Eiffel Tower"])
+        .with_alternate_names(&["La Tour Eiffel"])
+        .with_localized_titles(&[("en", "Eiffel Tower")])
         .with_categories(&[
             ("tourist_attraction", "Tourist Attraction"),
             ("monument", "Monument"),
@@ -3101,7 +3494,8 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
             street_in(&paris, "", "Rue de Rivoli", "75001", Some("1er Arrondissement")),
             POINT_EXTENT_M,
         )
-        .with_alternate_names(&["Louvre Museum", "The Louvre"])
+        .with_alternate_names(&["The Louvre"])
+        .with_localized_titles(&[("en", "Louvre Museum")])
         .with_categories(&[("museum", "Museum"), ("tourist_attraction", "Tourist Attraction")])
         .with_contacts(&["+33 1 40 20 53 17"], &["https://www.louvre.fr"])
         .with_opening_hours(&["Wed-Mon: 09:00 - 18:00"])
@@ -3128,32 +3522,50 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
 
     // --- A disputed territory: the records whose attribution a `PoliticalView`
     // --- changes, plus the country the default view attributes them to.
+    //
+    // The territory is held at the SUB-REGION level, which is the division its
+    // address component fills (`Address.SubRegion`), with the settlements inside it
+    // at locality level: a position there resolves to the finest of them that
+    // covers it.
     places.extend([
         PlaceRecord::new(
-            "Crimea",
-            PLACE_TYPE_REGION,
+            "Автономна Республіка Крим",
+            PLACE_TYPE_SUB_REGION,
             [34.100_000, 45.300_000],
             crimea_ukraine,
-            REGION_EXTENT_M,
+            SUB_REGION_EXTENT_M,
         )
+        .with_alternate_names(&["Crimea", "Krym", "Крым"])
         .with_political_attribution("RUS", crimea_russia)
         .in_time_zone(EASTERN_EUROPEAN),
         PlaceRecord::new(
-            "Simferopol",
+            "Сімферополь",
             PLACE_TYPE_LOCALITY,
             [34.102_417, 44.952_117],
             simferopol_ukraine,
             LOCALITY_EXTENT_M,
         )
+        .with_alternate_names(&["Simferopol", "Симферополь"])
         .with_political_attribution("RUS", simferopol_russia)
         .in_time_zone(EASTERN_EUROPEAN),
         PlaceRecord::new(
-            "Ukraine",
+            "Первомайський район",
+            PLACE_TYPE_LOCALITY,
+            [33.859_39, 45.714_2],
+            pervomaiske_ukraine,
+            RURAL_DISTRICT_EXTENT_M,
+        )
+        .with_alternate_names(&["Pervomaiske", "Первомайский район"])
+        .with_political_attribution("RUS", pervomaiske_russia)
+        .in_time_zone(EASTERN_EUROPEAN),
+        PlaceRecord::new(
+            "Україна",
             PLACE_TYPE_COUNTRY,
             [31.165_581, 48.379_433],
             ukraine,
             COUNTRY_EXTENT_M,
         )
+        .with_alternate_names(&["Ukraine", "Украина"])
         .in_time_zone(EASTERN_EUROPEAN),
     ]);
 
