@@ -443,6 +443,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         cluster.status = crate::state::cluster_status::UPDATING.to_string();
         cluster.settles_at = Some(now + crate::state::SETTLE_AFTER);
         let response = cluster.to_api(true);
+        // The change this call made, recorded against the cluster it changed, so
+        // `DescribeEvents` reports it.
+        state.record_event(
+            crate::state::event_source_type::CLUSTER,
+            &cluster_name,
+            crate::state::EventKind::Modified,
+        );
         Ok(UpdateClusterOutput {
             cluster: Some(response),
         })

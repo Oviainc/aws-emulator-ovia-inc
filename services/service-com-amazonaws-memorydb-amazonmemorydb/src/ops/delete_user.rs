@@ -4,8 +4,10 @@
 //!
 //! Implemented: the named user is removed from this service's store AND from the
 //! `UserNames` of every ACL that listed it, and the response reports that user as the
-//! caller last had it, in the terminal `deleting` status. This is the ONLY file to
-//! touch for this operation.
+//! caller last had it, in the terminal `deleting` status. The deletion is recorded as a
+//! `user` event, and the membership change it makes to each ACL that listed the user as
+//! an `acl` event, which `DescribeEvents` reports. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -220,8 +222,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // choice `DeleteCluster` makes for a cluster it has just removed. Nothing
         // settles a removed user, so it carries no due transition.
         user.status = crate::state::user_status::DELETING.to_string();
+        let response = user.to_api(acl_names.clone());
+        // The resources this call changed, each with its own event, recorded in the
+        // order the change reached them: the user is gone, and every ACL it was taken
+        // out of holds a different `UserNames` than before — membership is stored on
+        // the ACL, so that is a change to the ACL's own state.
+        state.record_event(
+            crate::state::event_source_type::USER,
+            &user_name,
+            crate::state::EventKind::Deleted,
+        );
+        for acl_name in &acl_names {
+            state.record_event(
+                crate::state::event_source_type::ACL,
+                acl_name,
+                crate::state::EventKind::Modified,
+            );
+        }
         Ok(DeleteUserOutput {
-            user: Some(user.to_api(acl_names)),
+            user: Some(response),
         })
     }
 }

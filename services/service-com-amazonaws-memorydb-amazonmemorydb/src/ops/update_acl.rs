@@ -5,7 +5,8 @@
 //! `UserNamesToRemove` and answers with the stored record, so `DescribeACLs` reports
 //! exactly what was persisted — including the `MinimumEngineVersion` the new membership
 //! requires, which is DERIVED and so follows every change made here. The ACLs an
-//! account already had are refused: a built-in ACL is not the caller's to change.
+//! account already had are refused: a built-in ACL is not the caller's to change. The
+//! change is also recorded as an `acl` event, which `DescribeEvents` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -330,8 +331,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let clusters = state.clusters_using_acl(&acl_name);
         let minimum_engine_version = state.acl_minimum_engine_version(&user_names);
         let acl = &state.acls[&acl_name];
+        let response = acl.to_api(clusters, minimum_engine_version);
+        // The change this call made, recorded against the resource whose stored state
+        // moved: an ACL's membership is held ONCE, on the ACL (`User$ACLNames` is
+        // DERIVED from it), so a membership change is a change to the ACL.
+        state.record_event(
+            crate::state::event_source_type::ACL,
+            &acl_name,
+            crate::state::EventKind::Modified,
+        );
         Ok(UpdateACLOutput {
-            acl: Some(acl.to_api(clusters, minimum_engine_version)),
+            acl: Some(response),
         })
     }
 }

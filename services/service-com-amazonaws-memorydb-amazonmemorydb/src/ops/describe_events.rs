@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the events [`crate::state`] RECORDED — one per resource a call
+//! created, modified or deleted ([`crate::state::ComAmazonawsMemorydbAmazonmemorydbState::record_event`]) —
+//! narrowed to the requested `SourceName`/`SourceType` and to the time window the
+//! request bounds (the last hour by default, `Duration` minutes back, or an explicit
+//! `StartTime`/`EndTime`), NEWEST FIRST, paged with `MaxResults`/`NextToken`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This operation WRITES nothing of its own: an event exists only because some earlier
+//! call changed a resource, so a store nothing has changed reports no events.
 //!
 //! ## Shape of an operation
 //!
@@ -93,7 +92,8 @@
 //! * `InvalidParameterValueException` (HTTP 400) — The specified parameter value is not
 //!   valid.
 //! * `ServiceLinkedRoleNotFoundFault` (HTTP 400) — The required service-linked role was not
-//!   found.
+//!   found. NEVER answered: this listing reads the store's own event log, which depends on
+//!   no service-linked role.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -168,18 +168,162 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEvents"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in a mounted emulator (the router hands every service the
+            // one shared `InMemoryEngine`); this operation models no server fault, so
+            // the request is refused rather than answered with a canned event list.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the MemoryDB store is unreachable on this engine",
+            ));
+        };
+        if let Some(message) = crate::state::max_results_rejection(input.max_results) {
+            // A page size outside the window names no page: refused with the service's
+            // own modelled invalid-value error, the same one every other listing in
+            // this service answers with.
+            return Err(invalid_value(message));
+        }
+        // `SourceType` is a modelled enum, and the deserializer carries its value
+        // through as a string, so the token is checked against the GENERATED catalog
+        // here — a value no `SourceType` names selects nothing.
+        if let Some(source_type) = input.source_type.as_deref() {
+            if !crate::ops::types::SOURCE_TYPE_VALUES.contains(&source_type) {
+                return Err(invalid_value(format!(
+                    "SourceType must be one of {} — got {source_type:?}.",
+                    crate::ops::types::SOURCE_TYPE_VALUES.join(", ")
+                )));
+            }
+        }
+        if let Some(duration) = input.duration {
+            // "The number of minutes worth of events to retrieve": fewer than one
+            // minute bounds no window at all, and nothing older than the retention
+            // period is kept, so neither is a window this listing can serve.
+            if !(crate::state::MIN_EVENT_DURATION_MINUTES
+                ..=crate::state::MAX_EVENT_DURATION_MINUTES)
+                .contains(&duration)
+            {
+                return Err(invalid_value(format!(
+                    "Invalid value for duration. Must be between {} and {} minutes",
+                    crate::state::MIN_EVENT_DURATION_MINUTES,
+                    crate::state::MAX_EVENT_DURATION_MINUTES
+                )));
+            }
+        }
+
+        // The window this listing reports over, which the request bounds from the top
+        // down: `EndTime` or now, then `StartTime`, else `Duration` minutes before the
+        // end, else the documented default of one hour ("By default, only the events
+        // occurring within the last hour are returned"). `StartTime` is the stronger
+        // statement of the same bound, so a request carrying both it and `Duration` is
+        // served from `StartTime`.
+        let end = match input.end_time.as_ref() {
+            Some(stamp) => system_time(stamp).ok_or_else(|| {
+                invalid_value("EndTime does not name a point in time.".to_string())
+            })?,
+            None => std::time::SystemTime::now(),
+        };
+        let start = match input.start_time.as_ref() {
+            Some(stamp) => system_time(stamp).ok_or_else(|| {
+                invalid_value("StartTime does not name a point in time.".to_string())
+            })?,
+            None => {
+                let window = input
+                    .duration
+                    .map(|minutes| std::time::Duration::from_secs(u64::from(minutes.unsigned_abs()) * 60))
+                    .unwrap_or(crate::state::DEFAULT_EVENT_WINDOW);
+                // A window reaching past the epoch starts at it rather than wrapping.
+                end.checked_sub(window)
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+            }
+        };
+        if start > end {
+            // An interval that ends before it begins holds no instant, so the two
+            // members cannot be served together.
+            return Err(
+                DescribeEventsErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(
+                            "StartTime must not be later than EndTime.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let region = crate::state::request_region(ctx);
+        // A resource name is a case-insensitive identifier and the log holds the folded
+        // spelling, so the name this request filters by is folded the same way.
+        let source_name = input.source_name.as_deref().map(crate::state::fold_name);
+        let mut state = state.lock();
+        // The one write a read may make, which this caller did not ask for: the
+        // transition the clock already owed at this instant, exactly as every other
+        // handler in this service materialises it. It records no event — an event
+        // reports a change a CALL made.
+        state.settle(std::time::Instant::now());
+        // The resources the account already had before any call, materialised on first
+        // touch like every other handler does it. They carry no events: they pre-date
+        // every call, so no call ever created them.
+        state.ensure_builtins(&region);
+
+        let entries: Vec<(String, Event)> = state
+            .events
+            .iter()
+            // The service reports events NEWEST FIRST, so the log — held in record
+            // order — is walked backwards and the pagination keys count down with it.
+            .rev()
+            .filter(|event| event.date >= start && event.date <= end)
+            .filter(|event| {
+                source_name.as_deref().is_none_or(|name| event.source_name == name)
+            })
+            .filter(|event| {
+                input
+                    .source_type
+                    .as_deref()
+                    .is_none_or(|source_type| event.source_type == source_type)
+            })
+            .map(|event| (event.page_key(), event.to_api()))
+            .collect();
+
+        let (events, next_token) = crate::state::paginate(
+            entries,
+            crate::state::page_limit(input.max_results),
+            input.next_token.as_deref(),
+        )
+        .ok_or_else(|| {
+            // A token that names no position in this listing was never minted for it:
+            // reported rather than served as a silently empty page.
+            invalid_value("NextToken does not name a position in this listing.".to_string())
+        })?;
+        Ok(DescribeEventsOutput {
+            events: Some(events),
+            next_token,
+        })
     }
+}
+
+/// A value this listing cannot serve, as the modelled 400 the service answers every
+/// bad member of a listing request with.
+fn invalid_value(message: String) -> DescribeEventsError {
+    DescribeEventsErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The instant a modelled `TStamp` names, or `None` when it falls outside the range a
+/// [`std::time::SystemTime`] can hold.
+///
+/// `DateTime` keeps the seconds since the epoch (which may be negative) and a
+/// non-negative sub-second remainder, so the instant is the epoch moved by the one and
+/// then forward by the other.
+fn system_time(stamp: &::aws_smithy_types::DateTime) -> Option<std::time::SystemTime> {
+    let seconds = std::time::Duration::from_secs(stamp.secs().unsigned_abs());
+    let base = if stamp.secs() >= 0 {
+        std::time::SystemTime::UNIX_EPOCH.checked_add(seconds)?
+    } else {
+        std::time::SystemTime::UNIX_EPOCH.checked_sub(seconds)?
+    };
+    base.checked_add(std::time::Duration::from_nanos(u64::from(
+        stamp.subsec_nanos(),
+    )))
 }

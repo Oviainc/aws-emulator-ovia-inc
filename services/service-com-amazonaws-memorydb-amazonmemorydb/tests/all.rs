@@ -15,6 +15,8 @@
 mod cluster_lifecycle;
 #[path = "all/engine_versions.rs"]
 mod engine_versions;
+#[path = "all/events.rs"]
+mod events;
 #[path = "all/parameter_groups.rs"]
 mod parameter_groups;
 #[path = "all/parameters.rs"]

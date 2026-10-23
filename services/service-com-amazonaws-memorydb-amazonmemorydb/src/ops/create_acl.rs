@@ -4,7 +4,8 @@
 //! IMPLEMENTED: inserts the ACL into [`crate::state`] keyed by its FOLDED `ACLName` (a
 //! MemoryDB resource name is a case-insensitive identifier, refused outright when it
 //! breaks the service's name rule) and answers with the stored record, so
-//! `DescribeACLs` reports exactly what was persisted.
+//! `DescribeACLs` reports exactly what was persisted. The creation is also recorded as
+//! an `acl` event, which `DescribeEvents` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -263,7 +264,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `DescribeACLs` reads it with.
         let minimum_engine_version = state.acl_minimum_engine_version(&acl.user_names);
         let response = acl.to_api(clusters, minimum_engine_version);
-        state.acls.insert(acl_name, acl);
+        state.acls.insert(acl_name.clone(), acl);
+        // The change this call made, recorded against the resource it made it to: the
+        // membership the ACL starts with is part of the ACL's own stored state
+        // (`User$ACLNames` is DERIVED from it), so this one event reports it.
+        state.record_event(
+            crate::state::event_source_type::ACL,
+            &acl_name,
+            crate::state::EventKind::Created,
+        );
         Ok(CreateACLOutput {
             acl: Some(response),
         })

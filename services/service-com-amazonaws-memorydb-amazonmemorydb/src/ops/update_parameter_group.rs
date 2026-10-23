@@ -5,7 +5,8 @@
 //! [`crate::state`] and answers the stored `ParameterGroup`. Each pair is checked
 //! against the engine default parameter of the group's FAMILY it names — an unknown
 //! name or a value outside that parameter's domain is refused and NOTHING is written,
-//! so a refused update leaves the group exactly as it was.
+//! so a refused update leaves the group exactly as it was. An applied update is also
+//! recorded as a `parameter-group` event, which `DescribeEvents` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -270,8 +271,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // caller set: only `ResetParameterGroup` takes one back off the group.
             group.parameter_values.insert(name, value);
         }
+        let response = group.to_api();
+        // The change this call made, recorded against the parameter group it changed,
+        // so `DescribeEvents` reports it.
+        state.record_event(
+            crate::state::event_source_type::PARAMETER_GROUP,
+            &parameter_group_name,
+            crate::state::EventKind::Modified,
+        );
         Ok(UpdateParameterGroupOutput {
-            parameter_group: Some(group.to_api()),
+            parameter_group: Some(response),
         })
     }
 }

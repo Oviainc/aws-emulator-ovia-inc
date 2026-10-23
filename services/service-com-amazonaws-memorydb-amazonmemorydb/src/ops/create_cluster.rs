@@ -3,7 +3,8 @@
 //! @op CreateCluster
 //! IMPLEMENTED: persists the cluster in [`crate::state`] keyed by `ClusterName` —
 //! every member the request supplied, plus the ARN, configuration endpoint and shard
-//! layout the service derives — and answers from that stored record.
+//! layout the service derives — and answers from that stored record. The creation is
+//! also recorded as a `cluster` event, which `DescribeEvents` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -466,7 +467,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `CreateCluster` has no `ShowShardDetails` member, so the shards it just laid
         // out are reported here; `DescribeClusters` gates them on that flag.
         let response = cluster.to_api(true);
-        state.clusters.insert(cluster_name, cluster);
+        state.clusters.insert(cluster_name.clone(), cluster);
+        // The change this call made, recorded against the cluster it made it to, so
+        // `DescribeEvents` reports it.
+        state.record_event(
+            crate::state::event_source_type::CLUSTER,
+            &cluster_name,
+            crate::state::EventKind::Created,
+        );
         Ok(CreateClusterOutput {
             cluster: Some(response),
         })

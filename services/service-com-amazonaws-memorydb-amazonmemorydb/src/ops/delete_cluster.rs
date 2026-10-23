@@ -2,7 +2,8 @@
 
 //! @op DeleteCluster
 //! IMPLEMENTED: removes the cluster from [`crate::state`] and answers with the record
-//! as it stood, marked `deleting`, so the next `DescribeClusters` reports it gone.
+//! as it stood, marked `deleting`, so the next `DescribeClusters` reports it gone. The
+//! deletion is also recorded as a `cluster` event, which `DescribeEvents` reports.
 //!
 //! `FinalSnapshotName` and `MultiRegionClusterName` are REFUSED rather than accepted
 //! and dropped: taking a final snapshot needs the snapshot slice and a multi-Region
@@ -215,8 +216,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Its tags go with it: a tag store keyed by an ARN nothing resolves would be
         // read by a later `ListTags` for a resource that no longer exists.
         state.tags.remove(&cluster.arn);
+        let response = cluster.to_api(true);
+        // The change this call made, recorded against the cluster it removed, so
+        // `DescribeEvents` reports it.
+        state.record_event(
+            crate::state::event_source_type::CLUSTER,
+            &cluster_name,
+            crate::state::EventKind::Deleted,
+        );
         Ok(DeleteClusterOutput {
-            cluster: Some(cluster.to_api(true)),
+            cluster: Some(response),
         })
     }
 }
