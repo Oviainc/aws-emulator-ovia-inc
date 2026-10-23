@@ -27,6 +27,8 @@ mod delete_method_response;
 mod documentation_parts;
 #[path = "all/documentation_versions.rs"]
 mod documentation_versions;
+#[path = "all/domain_name_collection.rs"]
+mod domain_name_collection;
 #[path = "all/epoch_second_timestamps.rs"]
 mod epoch_second_timestamps;
 #[path = "all/execute_api_data_plane.rs"]

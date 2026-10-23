@@ -1242,10 +1242,12 @@ pub mod messages {
     }
 
     /// `GenerateMatchId`'s `ValidationException$message` (HTTP 400) when the named
-    /// rule-based workflow does not have real-time matching enabled — the constraint
-    /// `ResolutionTechniques$enableRealTimeMatching` states ("When you enable
-    /// real-time matching, you can use the GenerateMatchId operation with the
-    /// workflow"). Composed from the request, naming the member and the constraint.
+    /// rule-based workflow was created (or updated) with
+    /// `resolutionTechniques.enableRealTimeMatching` EXPLICITLY `false` — the
+    /// constraint that member states ("When you enable real-time matching, you can
+    /// use the GenerateMatchId operation with the workflow"). An absent member is not
+    /// this case; see [`super::real_time_matching_explicitly_disabled`]. Composed from
+    /// the request, naming the member and the constraint.
     pub fn generate_match_id_real_time_matching_disabled(workflow_name: &str) -> String {
         format!(
             "GenerateMatchId requires real-time matching: MatchingWorkflow {workflow_name} was \
@@ -1560,17 +1562,22 @@ pub fn workflow_rules(workflow: &MatchingWorkflow) -> &[Rule] {
         .map_or(&[][..], |properties| properties.rules.as_slice())
 }
 
-/// Is real-time matching enabled on `workflow`?
+/// Did the workflow's creator EXPLICITLY turn real-time matching off?
 ///
-/// `ResolutionTechniques$enableRealTimeMatching` is "whether real-time matching is
-/// enabled for the rule-based matching workflow. When you enable real-time matching,
-/// you can use the `GenerateMatchId` operation with the workflow" — so the member is
-/// the gate on `GenerateMatchId`, and an absent member is not enabled.
-pub fn real_time_matching_enabled(workflow: &MatchingWorkflow) -> bool {
-    workflow
-        .resolution_techniques
-        .enable_real_time_matching
-        .unwrap_or(false)
+/// `ResolutionTechniques$enableRealTimeMatching` is an OPTIONAL `Boolean` with no
+/// modelled `@default` (`smithy_query(query="shape",shape="ResolutionTechniques")`),
+/// so it has three states on the wire — `true`, `false` and absent — and only the
+/// explicit `false` is a statement that real-time matching is off. An ABSENT member
+/// says nothing, and the model states no rule that makes a request it admits
+/// (`enableRealTimeMatching` omitted) refuse an operation, so a precondition must not
+/// read absence as the refusing value: a rule-based workflow created without the
+/// member serves `GenerateMatchId`.
+///
+/// The doc sentence "When you enable real-time matching, you can use the
+/// `GenerateMatchId` operation with the workflow" is what keeps the refusal for the
+/// explicit `false`.
+pub fn real_time_matching_explicitly_disabled(workflow: &MatchingWorkflow) -> bool {
+    workflow.resolution_techniques.enable_real_time_matching == Some(false)
 }
 
 /// Does the workflow ask for normalization of the records that arrive from

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSyslogConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSyslogConfigurations`'s real behaviour. Implement it here — this is
+//! Implemented: enumerates the syslog configurations stored on this account's log
+//! groups, honouring the log-group and VPC-endpoint filters and the page bounds. This is
+//! the ONLY file to touch for this operation. Implement it here — this is
 //! the ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
@@ -120,6 +121,78 @@ impl From<ListSyslogConfigurationsErrorModeled> for ListSyslogConfigurationsErro
     }
 }
 
+/// The kind tag this operation's pagination cursor carries, so a token minted by
+/// another paginated operation is refused rather than misread.
+const CURSOR_KIND: &str = "ListSyslogConfigurations";
+
+/// The page size a request that leaves `maxResults` at its modelled default of `0` gets.
+/// Zero cannot bound the page at nothing: the member is "the maximum number of syslog
+/// configurations to return in the response", so a maximum of zero would make every call
+/// answer an empty page and no caller could ever read a configuration back. An unset
+/// maximum is therefore this service's documented list page default — "up to 50 items",
+/// [`crate::state::DEFAULT_LIST_LIMIT`] — which is also this member's own modelled maximum
+/// (`ListSyslogConfigurationsMaxResults`, `@range(min: 0, max: 50)`).
+const UNSET_MAX_RESULTS: i32 = crate::state::DEFAULT_LIST_LIMIT;
+
+/// Where the next page resumes: the `(log group name, endpoint key)` of the last
+/// configuration returned, plus the filters of the scan it belongs to. A continuation that
+/// changes a filter is refused, because the token is only a position within one filtered
+/// enumeration.
+#[derive(Debug, Clone)]
+struct Cursor {
+    filters: ::serde_json::Value,
+    after: (String, String),
+}
+
+impl Cursor {
+    fn encode(&self) -> String {
+        crate::state::encode_token(&::serde_json::json!({
+            "kind": CURSOR_KIND,
+            "filters": self.filters,
+            "afterLogGroup": self.after.0,
+            "afterEndpoint": self.after.1,
+        }))
+    }
+
+    fn decode(token: &str) -> Option<Self> {
+        let value = crate::state::decode_token(token)?;
+        if value.get("kind")?.as_str()? != CURSOR_KIND {
+            return None;
+        }
+        Some(Self {
+            filters: value.get("filters")?.clone(),
+            after: (
+                value.get("afterLogGroup")?.as_str()?.to_string(),
+                value.get("afterEndpoint")?.as_str()?.to_string(),
+            ),
+        })
+    }
+}
+
+/// Every member of the request that narrows the enumeration, as one comparable value: the
+/// page token is a position within THIS filtered scan, so a continuation that changes
+/// either filter is a different enumeration.
+fn filters_of(input: &ListSyslogConfigurationsInput) -> ::serde_json::Value {
+    ::serde_json::json!({
+        "logGroupIdentifier": input
+            .log_group_identifier
+            .as_deref()
+            .map(crate::state::log_group_name_from_identifier),
+        "vpcEndpointId": input.vpc_endpoint_id,
+    })
+}
+
+/// One configuration the scan selected: the position it occupies in the ordered
+/// enumeration (its log group's name, then the endpoint key it is stored under), the ARN
+/// it is reported under, and the record itself.
+#[derive(Debug)]
+struct Selected<'a> {
+    log_group_name: &'a str,
+    endpoint_key: &'a str,
+    log_group_arn: &'a str,
+    stored: &'a crate::state::SyslogConfigurationRecord,
+}
+
 /// The `ListSyslogConfigurations` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -156,18 +229,147 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSyslogConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSyslogConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSyslogConfigurations"))
+        // `ctx` carries only request metadata; a configuration is reported under the ARN
+        // its log group is stored with, so this operation reads nothing from the request
+        // beyond its input.
+        let _ = ctx;
+
+        let invalid = |message: String| {
+            ListSyslogConfigurationsError::from(
+                ListSyslogConfigurationsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                ),
+            )
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListSyslogConfigurationsError::from(
+                ListSyslogConfigurationsErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let store = state.lock();
+
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => {
+                let Some(cursor) = Cursor::decode(token) else {
+                    return Err(invalid("nextToken is not a valid token".to_string()));
+                };
+                if cursor.filters != filters_of(&input) {
+                    return Err(invalid(
+                        "nextToken was issued for a different ListSyslogConfigurations request"
+                            .to_string(),
+                    ));
+                }
+                Some(cursor)
+            }
+            None => None,
+        };
+
+        // "The name or ARN of the log group to filter syslog configurations for": an ARN
+        // resolves to the name the store is keyed by, and an identifier that names no log
+        // group is a missing RESOURCE — this operation models `ResourceNotFoundException`
+        // and the identifier is the only resource the request names — rather than an empty
+        // page, which could not be told from a group that carries no configuration.
+        let wanted_group = match input.log_group_identifier.as_deref() {
+            Some(identifier) => {
+                let name = crate::state::log_group_name_from_identifier(identifier);
+                if !store.log_groups.contains_key(name) {
+                    return Err(
+                        ListSyslogConfigurationsErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException {
+                                message: Some(crate::state::resource_not_found_message(
+                                    "log group",
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                Some(name)
+            }
+            None => None,
+        };
+
+        // Both maps are `BTreeMap`s, so one pass is already ordered by log group name and
+        // then by the endpoint key the configuration is stored under — the order the page
+        // token is a position in. A `vpcEndpointId` filter selects on the endpoint the
+        // configuration ingests through; unlike a log group, a VPC endpoint is not a
+        // resource this service holds, so one with no configuration is an empty page
+        // rather than a missing resource.
+        let matching: Vec<Selected<'_>> = store
+            .log_groups
+            .values()
+            .filter(|group| wanted_group.is_none_or(|name| group.name == name))
+            .flat_map(|group| {
+                group
+                    .syslog_configurations
+                    .iter()
+                    .filter(|(_, stored)| {
+                        input
+                            .vpc_endpoint_id
+                            .as_deref()
+                            .is_none_or(|endpoint| stored.vpc_endpoint_id == endpoint)
+                    })
+                    .map(move |(key, stored)| Selected {
+                        log_group_name: group.name.as_str(),
+                        endpoint_key: key.as_str(),
+                        log_group_arn: group.log_group_arn.as_str(),
+                        stored,
+                    })
+            })
+            .collect();
+
+        let first = match &cursor {
+            Some(cursor) => matching.partition_point(|selected| {
+                (selected.log_group_name, selected.endpoint_key)
+                    <= (cursor.after.0.as_str(), cursor.after.1.as_str())
+            }),
+            None => 0,
+        };
+        // `maxResults` is modelled `range 0..50` with a default of `0`, so the boundary
+        // validator has already refused a value outside it and only the unset default
+        // needs a page size of its own ([`UNSET_MAX_RESULTS`]).
+        let limit = usize::try_from(if input.max_results == 0 {
+            UNSET_MAX_RESULTS
+        } else {
+            input.max_results
+        })
+        .unwrap_or(0)
+        .max(1);
+        let last = first.saturating_add(limit).min(matching.len());
+        let page = &matching[first..last];
+
+        // A token only where a page follows this one: "The token for the next set of items
+        // to return."
+        let next_token = page.last().filter(|_| last < matching.len()).map(|selected| {
+            Cursor {
+                filters: filters_of(&input),
+                after: (
+                    selected.log_group_name.to_string(),
+                    selected.endpoint_key.to_string(),
+                ),
+            }
+            .encode()
+        });
+
+        Ok(ListSyslogConfigurationsOutput {
+            syslog_configurations: Some(
+                page.iter()
+                    .map(|selected| SyslogConfiguration {
+                        log_group_arn: Some(selected.log_group_arn.to_string()),
+                        source_type: Some(selected.stored.source_type.clone()),
+                        vpc_endpoint_id: Some(selected.stored.vpc_endpoint_id.clone()),
+                        created_at: Some(selected.stored.created_at_ms),
+                    })
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }

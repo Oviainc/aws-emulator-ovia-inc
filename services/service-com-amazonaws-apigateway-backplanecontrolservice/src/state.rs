@@ -6,8 +6,8 @@
 //! `Resource`s under it (including the implicit root resource every API is created
 //! with), the `Method`s put on those resources, the API's `Stage`s and the gateway
 //! responses a developer has customized on it — beside the
-//! account's `ApiKey` records. Every handler in `src/ops/` computes
-//! its response from these records; nothing is synthesised per request.
+//! account's `ApiKey` and custom `DomainName` records. Every handler in `src/ops/`
+//! computes its response from these records; nothing is synthesised per request.
 //!
 //! A few leaf values are stored as the modelled shapes from [`crate::ops::types`]
 //! (`EndpointConfiguration`, `Method`'s responses and integration) rather than as a
@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::ops::types::{
     CanarySettings, DocumentationPartLocation, EndpointConfiguration, GetGatewayResponseOutput,
     GetIntegrationOutput, GetMethodResponseOutput, GetSdkTypeOutput, MethodSetting, MethodSnapshot,
-    SdkConfigurationProperty,
+    MutualTlsAuthentication, SdkConfigurationProperty,
 };
 
 /// Per-service state for com-amazonaws-apigateway-backplanecontrolservice. A handler reaches it through [`service_state`].
@@ -37,6 +37,10 @@ pub struct ComAmazonawsApigatewayBackplanecontrolserviceState {
     /// Every created `ApiKey`, keyed by its API key id — the identifier `GetApiKey`
     /// and `DeleteApiKey` take in their `apiKey` path label, NOT the key's value.
     pub api_keys: BTreeMap<String, ApiKeyEntry>,
+    /// Every created custom `DomainName`, keyed by [`domain_name_key`]: the domain name
+    /// itself, or `<domainName>+<domainNameId>` for a private one, which is addressed by
+    /// both members because several private domain names may carry one name.
+    pub domain_names: BTreeMap<String, DomainNameEntry>,
     /// The account-level settings `UpdateAccount` writes and `GetAccount` reports.
     /// There is exactly one per account, so it is a field rather than a map.
     pub account: AccountEntry,
@@ -478,14 +482,125 @@ pub struct ApiKeyEntry {
     pub sequence: u64,
 }
 
+/// One stored custom `DomainName`: the name a client reaches an API by, the certificate
+/// and endpoint configuration it was created with, and the endpoint names API Gateway
+/// assigned it.
+///
+/// `distribution*` and `regional*` are the endpoint the domain name is served by, and a
+/// domain name has exactly the one its endpoint type names: the `types` member documents
+/// `EDGE` for "an edge-optimized API and its custom domain name" and `REGIONAL` for "a
+/// regional API and its custom domain name", so an edge-optimized record carries the
+/// CloudFront distribution's names and a regional one the regional endpoint's. A PRIVATE
+/// record carries NEITHER: it is reached through the VPC endpoints its endpoint
+/// configuration names (`vpcEndpointIds` is "only supported for `PRIVATE` endpoint
+/// type"), not through a public alias. Whichever it has is assigned by the service when
+/// the record is created and stored, so every later read reports the same values.
+///
+/// `regionalHostedZoneId` is NOT among them: it is the Route 53 hosted zone of the
+/// Region's API Gateway endpoint, a per-Region constant this service's model carries no
+/// value for (the member's doc points at the AWS General Reference table instead), so a
+/// stored record reports none rather than a zone id this emulator would have to invent.
+/// `distributionHostedZoneId`, whose single value the model DOES state, is stored.
+#[derive(Debug, Clone, Default)]
+pub struct DomainNameEntry {
+    pub domain_name: String,
+    /// The identifier API Gateway assigns a PRIVATE custom domain name
+    /// (`domainNameId` is "supported only for private custom domain names"), minted from
+    /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::mint_id`]; absent for an
+    /// edge-optimized or regional one.
+    pub domain_name_id: Option<String>,
+    pub domain_name_arn: String,
+    pub certificate_name: Option<String>,
+    pub certificate_arn: Option<String>,
+    /// When the certificate this domain name uses was uploaded: the instant the record
+    /// was created, and only for a record created WITH a certificate.
+    pub certificate_upload_date: Option<::aws_smithy_types::DateTime>,
+    pub regional_domain_name: Option<String>,
+    pub regional_certificate_name: Option<String>,
+    pub regional_certificate_arn: Option<String>,
+    pub distribution_domain_name: Option<String>,
+    /// `Z2FDTNDATAQYW2` for an edge-optimized domain name, absent otherwise; see
+    /// [`EDGE_DISTRIBUTION_HOSTED_ZONE_ID`].
+    pub distribution_hosted_zone_id: Option<String>,
+    /// What the request set, completed by [`defaulted_endpoint_configuration`], so the
+    /// stored configuration always names its endpoint types and its IP address type.
+    pub endpoint_configuration: Option<EndpointConfiguration>,
+    /// When this domain name's endpoint finishes being set up, after which it reports
+    /// [`DOMAIN_NAME_AVAILABLE`]; absent for a domain name that was ready when it was
+    /// created. See [`DomainNameEntry::status`] and [`DOMAIN_NAME_CREATE_SPAN`].
+    pub available_at: Option<::std::time::Instant>,
+    pub domain_name_status_message: Option<String>,
+    /// What the request set, or [`DEFAULT_SECURITY_POLICY`]: the service picks a value
+    /// at create time, so a stored domain name always has one.
+    pub security_policy: Option<String>,
+    pub endpoint_access_mode: Option<String>,
+    pub mutual_tls_authentication: Option<MutualTlsAuthentication>,
+    pub ownership_verification_certificate_arn: Option<String>,
+    pub management_policy: Option<String>,
+    pub policy: Option<String>,
+    pub routing_mode: Option<String>,
+    pub tags: BTreeMap<String, String>,
+    /// This domain name's creation rank, from
+    /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`], so a
+    /// listing can report creation order rather than key order.
+    pub sequence: u64,
+}
+
+impl DomainNameEntry {
+    /// The `domainNameStatus` this domain name reports now.
+    ///
+    /// An edge-optimized domain name is served by a CloudFront distribution API Gateway
+    /// creates for it, which is not in place when the create call answers, so the record
+    /// is reported [`DOMAIN_NAME_PENDING`] until [`DOMAIN_NAME_CREATE_SPAN`] has passed
+    /// and [`DOMAIN_NAME_AVAILABLE`] after it; a regional or private domain name is
+    /// ready when it is created and has no span to wait out. The transition is one the
+    /// CLOCK owes, materialised from the stored due instant rather than by sleeping or
+    /// by being read.
+    pub fn status(&self) -> &'static str {
+        match self.available_at {
+            None => DOMAIN_NAME_AVAILABLE,
+            Some(available_at) if ::std::time::Instant::now() < available_at => {
+                DOMAIN_NAME_PENDING
+            }
+            Some(_) => DOMAIN_NAME_AVAILABLE,
+        }
+    }
+
+    /// The key this record is stored under; see [`domain_name_key`].
+    pub fn key(&self) -> String {
+        domain_name_key(&self.domain_name, self.domain_name_id.as_deref())
+    }
+}
+
+/// The key a stored [`DomainNameEntry`] is addressed by, and the cursor a
+/// `GetDomainNames` page hands back.
+///
+/// A `domainNameId` is "supported only for private custom domain names", and a private
+/// domain name needs it to be identified at all: AWS lets several private records carry
+/// one name, so the name alone does not select one. The two members are therefore joined
+/// into `<domainName>+<domainNameId>` — the same form this emulator writes into a
+/// private domain name's ARN — while an edge-optimized or regional record, which has no
+/// id, is keyed by its name alone.
+pub fn domain_name_key(domain_name: &str, domain_name_id: Option<&str>) -> String {
+    match domain_name_id {
+        Some(domain_name_id) if !domain_name_id.is_empty() => {
+            format!("{domain_name}+{domain_name_id}")
+        }
+        _ => domain_name.to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Service-side defaults for a created `RestApi`
+// Service-side defaults for a created `RestApi` or custom `DomainName`
 //
-// Several `RestApi` members are optional on input and yet never absent on a created
-// API: the service picks a value when the request sets none, stores it, and reports it
-// from every read. The constants below are those values, and
+// Several members are optional on input and yet never absent on a created record: the
+// service picks a value when the request sets none, stores it, and reports it from
+// every read. The constants below are those values, and
 // [`defaulted_endpoint_configuration`] is the one place the nested
-// `EndpointConfiguration` is completed, so a record can never be stored half-defaulted.
+// `EndpointConfiguration` is completed, so a record can never be stored
+// half-defaulted. The endpoint configuration is shared because the model's own
+// `EndpointConfiguration` is: it is "the endpoint configuration to indicate the types
+// of endpoints an API (RestApi) or its custom domain name (DomainName) has".
 // ---------------------------------------------------------------------------
 
 /// The `apiKeySource` a created API carries when the request sets none: from the
@@ -503,6 +618,12 @@ pub const DEFAULT_ENDPOINT_TYPE: &str = "EDGE";
 /// `dualstack` is supported."
 pub const PRIVATE_ENDPOINT_TYPE: &str = "PRIVATE";
 
+/// The endpoint type of a regional API and of its custom domain name, from the `types`
+/// member's own documentation ("`REGIONAL` for regional API endpoint setup"). A domain
+/// name of this type is served by the Region's API Gateway endpoint rather than by a
+/// CloudFront distribution, which is what decides which endpoint members it carries.
+pub const REGIONAL_ENDPOINT_TYPE: &str = "REGIONAL";
+
 /// The `endpointConfiguration.ipAddressType` a created API carries when the request
 /// sets none and the API is not private: `ipv4`, the first of the two documented values
 /// ("Use `ipv4` to allow only IPv4 addresses to invoke an API").
@@ -514,16 +635,53 @@ pub const DUALSTACK_ADDRESS_TYPE: &str = "dualstack";
 
 /// The `securityPolicy` a created API carries when the request sets none: `TLS_1_0`, the
 /// TLS version API Gateway starts an API on (and the first value of the modelled
-/// `SecurityPolicy` enum).
+/// `SecurityPolicy` enum). A created custom domain name is given the same value by the
+/// same rule: the member is optional on input and reported from every read.
 pub const DEFAULT_SECURITY_POLICY: &str = "TLS_1_0";
 
+/// The `distributionHostedZoneId` of an edge-optimized custom domain name, from the
+/// member's own documentation: "The region-agnostic Amazon Route 53 Hosted Zone ID of
+/// the edge-optimized endpoint. The valid value is Z2FDTNDATAQYW2 for all the regions."
+pub const EDGE_DISTRIBUTION_HOSTED_ZONE_ID: &str = "Z2FDTNDATAQYW2";
+
+/// The `domainNameStatus` of a custom domain name whose endpoint is in place: one of the
+/// two values `DomainName$domainNameStatus` documents ("The valid values are AVAILABLE
+/// and UPDATING") and a value of the modelled `DomainNameStatus` enum.
+pub const DOMAIN_NAME_AVAILABLE: &str = "AVAILABLE";
+
+/// The `domainNameStatus` of a custom domain name whose endpoint is still being set up —
+/// a value of the modelled `DomainNameStatus` enum
+/// (`smithy_query(query="shape", shape="DomainNameStatus")`).
+pub const DOMAIN_NAME_PENDING: &str = "PENDING";
+
+/// The `distributionDomainName` of an edge-optimized custom domain name: the CloudFront
+/// distribution API Gateway puts in front of it, which is "the domain name of the Amazon
+/// CloudFront distribution associated with this custom domain name" the caller points a
+/// DNS record at. `id` is minted from the store's own id bijection and stored on the
+/// record, so the name is assigned once and reported unchanged by every later read.
+pub fn edge_distribution_domain_name(id: &str) -> String {
+    format!("d{id}.cloudfront.net")
+}
+
+/// The `regionalDomainName` of a regional custom domain name: the Region's API Gateway
+/// endpoint, which the member documents as "returned by API Gateway when you create a
+/// regional endpoint" and which a caller points a DNS record at. The host label is
+/// minted and stored the way [`edge_distribution_domain_name`]'s is.
+pub fn regional_endpoint_domain_name(id: &str, region: &str) -> String {
+    format!("d-{id}.execute-api.{region}.amazonaws.com")
+}
+
 /// Complete a request's (possibly absent) `endpointConfiguration` with the values the
-/// service fills in, so what is stored is what every read of the API must report.
+/// service fills in, so what is stored is what every read of the record must report.
 ///
 /// An absent or empty `types` becomes [`DEFAULT_ENDPOINT_TYPE`]; an absent
-/// `ipAddressType` becomes [`DUALSTACK_ADDRESS_TYPE`] for a private API, which supports
-/// no other, and [`IPV4_ADDRESS_TYPE`] otherwise. Whatever the request DID set — its
-/// endpoint types, its address type, its `vpcEndpointIds` — is kept as given.
+/// `ipAddressType` becomes [`DUALSTACK_ADDRESS_TYPE`] for a private endpoint, which
+/// supports no other, and [`IPV4_ADDRESS_TYPE`] otherwise. Whatever the request DID set
+/// — its endpoint types, its address type, its `vpcEndpointIds` — is kept as given.
+///
+/// Shared by `CreateRestApi` and `CreateDomainName`: the shape and its defaulting rule
+/// are the model's own, declared for "an API (RestApi) or its custom domain name
+/// (DomainName)".
 pub fn defaulted_endpoint_configuration(
     requested: Option<EndpointConfiguration>,
 ) -> EndpointConfiguration {
@@ -848,6 +1006,10 @@ pub const MAX_REST_APIS: usize = 600;
 /// API Gateway's default quota "API keys per account per Region: 10,000".
 pub const MAX_API_KEYS: usize = 10_000;
 
+/// API Gateway's default quota "Custom domain names (regional or edge-optimized) per
+/// account per Region: 120".
+pub const MAX_DOMAIN_NAMES: usize = 120;
+
 /// API Gateway's default quota "Resources per API: 300".
 pub const MAX_RESOURCES_PER_API: usize = 300;
 
@@ -906,6 +1068,16 @@ pub const CACHE_CLUSTER_FLUSH_IN_PROGRESS: &str = "FLUSH_IN_PROGRESS";
 pub const CACHE_CLUSTER_FLUSH_SPAN: ::std::time::Duration =
     ::std::time::Duration::from_millis(500);
 
+/// How long an edge-optimized custom domain name takes to become
+/// [`DOMAIN_NAME_AVAILABLE`]: the CloudFront distribution API Gateway creates for it is
+/// not in place when the create call answers. API Gateway documents no duration for it
+/// ("it can take up to 40 minutes" is guidance, not a contract), so this span is the
+/// emulator's own, chosen short enough not to slow a caller down and long enough that a
+/// caller reading straight after `CreateDomainName` still observes
+/// [`DOMAIN_NAME_PENDING`].
+pub const DOMAIN_NAME_CREATE_SPAN: ::std::time::Duration =
+    ::std::time::Duration::from_millis(500);
+
 /// From `Authorizer$authorizerResultTtlInSeconds`'s own documentation: "If this field
 /// is not set, the default value is 300."
 pub const DEFAULT_AUTHORIZER_RESULT_TTL_SECONDS: i32 = 300;
@@ -957,16 +1129,15 @@ pub const MAX_TAG_VALUE_CHARS: usize = 256;
 const ARN_SERVICE: &str = "apigateway";
 
 /// The leading resource-portion segment of each taggable resource kind whose records
-/// this emulator does not keep: the operations that create a usage plan, a domain name,
-/// a client certificate, a VPC link or a domain name access association are still
-/// scaffolds, so nothing can answer to one of these ARNs — while the ARN itself is a
-/// well-formed ARN of a taggable API Gateway resource and so is not a malformed request.
+/// this emulator does not keep: the operations that create a usage plan, a client
+/// certificate, a VPC link or a domain name access association are still scaffolds, so
+/// nothing can answer to one of these ARNs — while the ARN itself is a well-formed ARN
+/// of a taggable API Gateway resource and so is not a malformed request.
 ///
 /// The segments are the first path segment of each kind's read URI; see the section
 /// comment above for the `smithy_query` calls they come from.
 const UNSTORED_TAGGABLE_KINDS: &[&str] = &[
     "usageplans",
-    "domainnames",
     "clientcertificates",
     "vpclinks",
     "domainnameaccessassociations",
@@ -985,6 +1156,9 @@ pub enum TaggedResource {
     },
     /// `/apikeys/{apiKey}` — an [`ApiKeyEntry`]'s tags.
     ApiKey { api_key_id: String },
+    /// `/domainnames/{domainName}` — a [`DomainNameEntry`]'s tags, where the path
+    /// segment is the record's [`domain_name_key`].
+    DomainName { domain_name_key: String },
     /// A taggable kind this emulator keeps no records of; see
     /// [`UNSTORED_TAGGABLE_KINDS`]. `kind` is that list's entry and `id` the identifier
     /// the ARN carried, so the refusal can name what it could not resolve.
@@ -1023,6 +1197,9 @@ pub fn parse_tagged_resource(resource_arn: &str) -> Option<TaggedResource> {
         }),
         ["apikeys", api_key_id] => Some(TaggedResource::ApiKey {
             api_key_id: (*api_key_id).to_string(),
+        }),
+        ["domainnames", domain_name_key] => Some(TaggedResource::DomainName {
+            domain_name_key: (*domain_name_key).to_string(),
         }),
         [kind, id] => UNSTORED_TAGGABLE_KINDS
             .iter()
@@ -1074,6 +1251,50 @@ pub fn bound_chars(member: &str, value: &str, max: usize) -> Result<(), String> 
     }
     Ok(())
 }
+
+/// Refuse a caller-supplied `domainName` that is not a domain name.
+///
+/// A custom domain name is a DNS name a client resolves and then presents in its TLS
+/// handshake, so what this service can serve is bounded by what DNS allows: dot-separated
+/// labels of ASCII letters, digits and hyphens that neither begin nor end with a hyphen,
+/// at most [`MAX_DOMAIN_LABEL_CHARS`] each and [`MAX_DOMAIN_NAME_CHARS`] in total, with a
+/// leading `*` label allowed because AWS serves wildcard custom domain names. The model
+/// declares no constraint on the member, so the check lives here and the refusal names
+/// what was rejected.
+///
+/// `Err` carries the message, for the caller to fix the request from; a refused name
+/// never reaches the store.
+pub fn bound_domain_name(domain_name: &str) -> Result<(), String> {
+    bound_chars("domainName", domain_name, MAX_DOMAIN_NAME_CHARS)?;
+    let labels: Vec<&str> = domain_name.split('.').collect();
+    let well_formed = !domain_name.is_empty()
+        && labels.len() > 1
+        && labels.iter().enumerate().all(|(index, label)| {
+            let wildcard = index == 0 && *label == "*";
+            wildcard
+                || (!label.is_empty()
+                    && label.chars().count() <= MAX_DOMAIN_LABEL_CHARS
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric() || character == '-'))
+        });
+    if !well_formed {
+        return Err(format!(
+            "domainName must be a domain name of dot-separated labels of letters, digits \
+             and inner hyphens, got {domain_name:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// The longest a domain name can be: 253 characters, the DNS limit on a fully qualified
+/// name (RFC 1035's 255-octet wire form, less its length and root bytes).
+pub const MAX_DOMAIN_NAME_CHARS: usize = 253;
+
+/// The longest one dot-separated label of a domain name can be: 63 characters (RFC 1035).
+pub const MAX_DOMAIN_LABEL_CHARS: usize = 63;
 
 /// A caller-supplied map as it is STORED and reported: absent when the caller set no
 /// entry, so an empty map in the request does not become an empty map in every later
@@ -1678,6 +1899,15 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
         ordered.into_iter().map(|api| api.id.clone()).collect()
     }
 
+    /// The keys of every stored custom domain name in creation order, the stable
+    /// sequence [`page_of`] cuts a `GetDomainNames` page out of. See
+    /// [`domain_name_key`] for what one key is.
+    pub fn domain_name_keys_in_creation_order(&self) -> Vec<String> {
+        let mut ordered: Vec<&DomainNameEntry> = self.domain_names.values().collect();
+        ordered.sort_by_key(|domain| (domain.sequence, domain.key()));
+        ordered.into_iter().map(DomainNameEntry::key).collect()
+    }
+
     /// The tag collection stored on the resource a `resourceArn` named, as
     /// [`parse_tagged_resource`] read it.
     ///
@@ -1709,6 +1939,11 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
                 .get(api_key_id)
                 .map(|key| &key.tags)
                 .ok_or_else(|| NO_SUCH_API_KEY.to_string()),
+            TaggedResource::DomainName { domain_name_key } => self
+                .domain_names
+                .get(domain_name_key)
+                .map(|domain| &domain.tags)
+                .ok_or_else(|| NO_SUCH_DOMAIN_NAME.to_string()),
             TaggedResource::Unstored { kind, id } => Err(no_such_tagged_resource(kind, id)),
         }
     }
@@ -1741,6 +1976,11 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
                 .get_mut(api_key_id)
                 .map(|key| &mut key.tags)
                 .ok_or_else(|| NO_SUCH_API_KEY.to_string()),
+            TaggedResource::DomainName { domain_name_key } => self
+                .domain_names
+                .get_mut(domain_name_key)
+                .map(|domain| &mut domain.tags)
+                .ok_or_else(|| NO_SUCH_DOMAIN_NAME.to_string()),
             TaggedResource::Unstored { kind, id } => Err(no_such_tagged_resource(kind, id)),
         }
     }
@@ -1825,6 +2065,12 @@ pub const NO_SUCH_DEPLOYMENT: &str = "Invalid deployment identifier specified";
 /// The `NotFoundException` message for an `apiKey` that names no stored API key.
 pub const NO_SUCH_API_KEY: &str = "Invalid API Key identifier specified";
 
+/// The `NotFoundException` message for a `domainName` (with its `domainNameId`, for a
+/// private one) that names no stored custom domain name, in the shape of the sibling
+/// identifier messages above. Shared by every operation that resolves a domain name, so
+/// all of them say the same thing about the same failure.
+pub const NO_SUCH_DOMAIN_NAME: &str = "Invalid domain name identifier specified";
+
 /// The `NotFoundException` message for a well-formed ARN of a taggable resource kind
 /// this emulator keeps no records of (see [`UNSTORED_TAGGABLE_KINDS`]): nothing answers
 /// to it, which is a missing resource and not a malformed request.
@@ -1878,6 +2124,38 @@ pub const AUDIT_TARGET: &str = "emulator::audit";
 /// signature and the secret key are never read here.
 pub fn request_caller(parts: &http::request::Parts) -> String {
     ::emulator_server::extract_akid(&parts.headers)
+}
+
+/// The Region a request is scoped to: the Region of its SigV4 credential scope, or
+/// [`DEFAULT_REGION`] for a request that carries none.
+///
+/// A custom domain name's ARN and its regional endpoint name both name the Region the
+/// record was created in, which is the Region the caller addressed.
+pub fn request_region(parts: &http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The Region a request that carries no SigV4 credential scope is treated as addressing:
+/// `us-east-1`, AWS's own default Region for a client configured with none.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The ARN of a stored resource of this service, whose resource portion is the URI of
+/// the operation that reads it (see the "Taggable resources" section above).
+///
+/// API Gateway's own ARNs carry an EMPTY account field —
+/// `arn:aws:apigateway:{region}::/domainnames/{domainName}` — so this is not
+/// [`::emulator_server::emulator_arn`], which always writes the account in. The
+/// partition and the vendor are the ones [`parse_tagged_resource`] reads back, so an ARN
+/// this service REPORTS is one it can resolve again.
+pub fn service_arn(region: &str, resource_path: &str) -> String {
+    format!("arn:aws:{ARN_SERVICE}:{region}::{resource_path}")
+}
+
+/// The ARN of the stored custom domain name addressed by `key` (a [`domain_name_key`]).
+pub fn domain_name_arn(region: &str, key: &str) -> String {
+    service_arn(region, &format!("/domainnames/{key}"))
 }
 
 /// The length of an API Gateway-minted API key value: 40 characters, as observed from

@@ -57,6 +57,8 @@ mod retention_policy;
 mod state_roundtrip;
 #[path = "all/subscription_filters.rs"]
 mod subscription_filters;
+#[path = "all/syslog_configurations.rs"]
+mod syslog_configurations;
 #[path = "all/transformers.rs"]
 mod transformers;
 #[path = "all/validation_message_rendering.rs"]

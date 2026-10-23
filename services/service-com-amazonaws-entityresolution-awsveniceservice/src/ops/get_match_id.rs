@@ -20,13 +20,13 @@
 //! reader and `GenerateMatchId` cannot disagree about a group.
 //!
 //! This reader gates on the workflow's `resolutionType` but DELIBERATELY not on
-//! `enableRealTimeMatching`, where the writer refuses: real-time matching is what
-//! admits a WRITE to the index ("When you enable real-time matching, you can use the
-//! GenerateMatchId operation with the workflow"), so a workflow that never had it
-//! enabled has simply indexed nothing and this reporting operation answers the empty
-//! result for it — the same answer it gives for a record the index does not hold. A
-//! read is not refused for a condition that only bounds writes; do not "align" the two
-//! sides by adding the writer's refusal here.
+//! `enableRealTimeMatching`, where the writer refuses the EXPLICIT `false`: real-time
+//! matching is what admits a WRITE to the index ("When you enable real-time matching,
+//! you can use the GenerateMatchId operation with the workflow"), so a workflow whose
+//! writes were refused has simply indexed nothing and this reporting operation answers
+//! the empty result for it — the same answer it gives for a record the index does not
+//! hold. A read is not refused for a condition that only bounds writes; do not "align"
+//! the two sides by adding the writer's refusal here.
 //!
 //! ## Shape of an operation
 //!

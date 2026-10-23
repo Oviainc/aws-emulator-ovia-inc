@@ -34,6 +34,12 @@
 //! log group: a definition is identified only by its own `queryDefinitionId`, and the log
 //! groups it names are a value it carries, not its owner.
 //!
+//! A log group's syslog configurations live on the group as well
+//! ([`LogGroupRecord::syslog_configurations`]), because `PutSyslogConfiguration` "creates
+//! or updates a syslog configuration for a log group" and the only other thing that names
+//! one is the VPC endpoint it ingests through — so the group keys them by that endpoint and
+//! deleting the group takes them with it.
+//!
 //! The account's deliveries — each "a connection between a logical delivery source and a
 //! logical delivery destination", which `CreateDelivery` creates and `DescribeDeliveries`
 //! reports — live in [`ComAmazonawsCloudwatchlogsLogs20140328State::deliveries`], each one
@@ -380,6 +386,14 @@ pub const MAX_STREAM_EVENTS: usize = 20_000;
 
 /// The byte half of the per-stream storage ceiling. See [`MAX_STREAM_EVENTS`].
 pub const MAX_STREAM_BYTES: i64 = 8 * 1024 * 1024;
+
+/// THE EMULATOR'S OWN CEILING on the syslog configurations one log group holds, not an AWS
+/// quota: CloudWatch Logs documents no limit on them, but a `vpcEndpointId` is caller-chosen
+/// (`^vpce-[0-9a-f]{1,64}$` admits astronomically many) and every configuration a put
+/// creates stays resident in this store, so a group refuses to take on more than this many
+/// rather than growing without bound on request. A put naming an endpoint the group already
+/// holds is an UPDATE of that configuration, so it does not count against this.
+pub const MAX_SYSLOG_CONFIGURATIONS_PER_GROUP: usize = 100;
 
 /// An import task that is still running, from the model's `ImportStatus` enum
 /// (`IN_PROGRESS` | `CANCELLED` | `COMPLETED` | `FAILED`). This is the only
@@ -1954,6 +1968,14 @@ pub struct LogGroupRecord {
     /// counts log groups by. See [`DataSourceRecord`] for why a group created through
     /// this emulator's API carries none.
     pub data_sources: Vec<DataSourceRecord>,
+    /// The syslog configurations put on this group, keyed by the `vpcEndpointId` the
+    /// configuration ingests through — `PutSyslogConfiguration` "enables ingestion of
+    /// syslog data through the specified VPC endpoint into the log group", so one group
+    /// holds at most one configuration per endpoint and a put under an endpoint already
+    /// stored updates that configuration in place. A `BTreeMap` so
+    /// `ListSyslogConfigurations` enumerates them ASCII-sorted by endpoint id without
+    /// re-sorting. Every configuration names an endpoint ([`VPC_ENDPOINT_ID_REQUIRED`]).
+    pub syslog_configurations: BTreeMap<String, SyslogConfigurationRecord>,
 }
 
 impl LogGroupRecord {
@@ -1979,6 +2001,7 @@ impl LogGroupRecord {
             data_protection_policy: None,
             had_data_protection_policy: false,
             data_sources: Vec::new(),
+            syslog_configurations: BTreeMap::new(),
         }
     }
 
@@ -1999,6 +2022,42 @@ impl LogGroupRecord {
             None
         }
     }
+}
+
+/// The one value the model's `SyslogSourceType` enum admits
+/// ([`crate::ops::types::SYSLOG_SOURCE_TYPE_VALUES`]), and the source a syslog
+/// configuration ingests through: the VPC endpoint `PutSyslogConfiguration` names. Kept as
+/// a named constant so the stamped `SyslogConfiguration$sourceType` is the model's value
+/// rather than a literal typed into a handler; `tests/all/syslog_configurations.rs` pins
+/// what a listed configuration reports to that catalogue.
+pub const SYSLOG_SOURCE_TYPE: &str = "VPCE";
+
+/// The key a syslog configuration is stored under: its `vpcEndpointId`. The member is
+/// OPTIONAL in the model on both `PutSyslogConfiguration` and
+/// `DeleteSyslogConfiguration`, but a syslog configuration IS the ingestion a log group
+/// accepts through one VPC endpoint — the only `SyslogSourceType` the model admits is
+/// `VPCE`, and the endpoint is the only thing that distinguishes one configuration on a log
+/// group from another — so the service refuses a request that names none. This is that
+/// refusal's sentence: the service's own fixed wording for the constraint, naming the member
+/// and what it requires.
+pub const VPC_ENDPOINT_ID_REQUIRED: &str = "vpcEndpointId is required";
+
+/// One syslog configuration stored on a log group: the model's `SyslogConfiguration`
+/// minus the `logGroupArn` the owning group already carries.
+#[derive(Debug, Clone)]
+pub struct SyslogConfigurationRecord {
+    /// `SyslogConfiguration$vpcEndpointId` — "The ID of the VPC endpoint used for syslog
+    /// ingestion", which is also the key the owning group stores this configuration under
+    /// (see [`VPC_ENDPOINT_ID_REQUIRED`]).
+    pub vpc_endpoint_id: String,
+    /// `SyslogConfiguration$sourceType` — "The source type for the syslog
+    /// configuration": [`SYSLOG_SOURCE_TYPE`].
+    pub source_type: String,
+    /// `SyslogConfiguration$createdAt` — "The time when the syslog configuration was
+    /// created, expressed as the number of milliseconds after Jan 1, 1970 00:00:00 UTC".
+    /// A put over a configuration already stored UPDATES it, so this keeps the instant the
+    /// first put created it.
+    pub created_at_ms: i64,
 }
 
 /// One data source that ingests into a log group: the model's `DataSource` — "a data
@@ -2908,6 +2967,15 @@ pub fn resource_not_found_message(resource_kind: &str) -> String {
 /// instead of guessing which of its requests failed.
 pub fn policy_not_found_message(policy_name: &str) -> String {
     format!("Policy with name [{policy_name}] does not exist.")
+}
+
+/// The refusal CloudWatch Logs builds from the request when the log group names no syslog
+/// configuration for the endpoint a `DeleteSyslogConfiguration` names. The message
+/// interpolates the requested `vpcEndpointId`, so a caller deleting configurations in a
+/// loop can attribute the refusal to one endpoint instead of guessing which of its
+/// requests failed.
+pub fn syslog_configuration_not_found_message(vpc_endpoint_id: &str) -> String {
+    format!("No syslog configuration for vpcEndpointId [{vpc_endpoint_id}] exists on this log group.")
 }
 
 /// The refusal for a value outside the set a member's own documentation enumerates: the
