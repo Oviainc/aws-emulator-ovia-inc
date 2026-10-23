@@ -18,7 +18,8 @@ use serde_json::{json, Value};
 
 use crate::inference_deployment_lifecycle::{error_code, message, str_field, Emulator, ACCOUNT};
 use crate::model_card_governance::{
-    content_with_description, create_body, number_field, CONTENT_MAX_LEN, MODEL_CARD_STATUSES,
+    content_with_description, create_body, describe_body, number_field, CONTENT_MAX_LEN,
+    MODEL_CARD_STATUSES,
 };
 
 /// An `UpdateModelCard` body moving `name` to `status`.
@@ -29,14 +30,6 @@ fn status_update(name: &str, status: &str) -> Value {
 /// An `UpdateModelCard` body replacing `name`'s content with `content`.
 fn content_update(name: &str, content: &str) -> Value {
     json!({ "ModelCardName": name, "Content": content })
-}
-
-/// `DescribeModelCard` for `name`, at `version` when one is given.
-fn describe_body(name: &str, version: Option<i32>) -> Value {
-    match version {
-        Some(version) => json!({ "ModelCardName": name, "ModelCardVersion": version }),
-        None => json!({ "ModelCardName": name }),
-    }
 }
 
 /// RULE: an `UpdateModelCard` that carries a `ModelCardStatus` moves the card's LATEST

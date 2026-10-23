@@ -46,6 +46,16 @@ pub(crate) fn content_with_description(description: &str) -> String {
     .to_string()
 }
 
+/// `DescribeModelCard` for `name`, at `version` when one is given — "If a version is
+/// not provided, then the latest version of the model card is described"
+/// (smithy_query query="operation" operation="DescribeModelCard": `ModelCardVersion`).
+pub(crate) fn describe_body(name: &str, version: Option<i32>) -> Value {
+    match version {
+        Some(version) => json!({ "ModelCardName": name, "ModelCardVersion": version }),
+        None => json!({ "ModelCardName": name }),
+    }
+}
+
 pub(crate) fn number_field(body: &Value, member: &str) -> f64 {
     body.get(member)
         .and_then(Value::as_f64)

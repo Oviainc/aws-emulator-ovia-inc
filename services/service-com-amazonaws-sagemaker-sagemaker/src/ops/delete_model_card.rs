@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteModelCard
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteModelCard`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteModelCard::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: releases the model card `CreateModelCard` registered in `crate::state`,
+//! with every version of it, so a later `DescribeModelCard` for that name is refused;
+//! a name the store does not hold is refused with the modelled `ResourceNotFound`. This
+//! is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +148,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteModelCard` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteModelCardErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteModelCard"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // `DeleteModelCard`'s `ModelCardName` is an `EntityName` (never a
+        // `ModelCardNameOrArn`, as `DescribeModelCard`'s is), so the identifier the
+        // caller passes is the store's key as it stands.
+        let mut store = state.lock();
+        // The operation names no version, so it releases the CARD: its whole version
+        // history goes with it, and the name is free for a later create. The
+        // remove-and-report runs under the one store lock, so of two callers racing on
+        // one name exactly one deletes it and the other reads the refusal below.
+        let Some(card) = store.model_cards.remove(&input.model_card_name) else {
+            // Nothing was deleted, so never a 200: a caller cannot tell that from a
+            // delete that landed. The message quotes the identifier the CALLER passed.
+            //
+            // This is also what a second delete of one card reads: the delete is
+            // complete when this call answers, so no deletion is ever in flight for a
+            // later call to conflict with, and `ConflictException` — the other error
+            // this operation models — has no state in this emulator that produces it
+            // (model card export jobs, what a real conflict would be about, are not
+            // modelled here).
+            return Err(DeleteModelCardErrorModeled::ResourceNotFound(ResourceNotFound {
+                // The wording the model-card readers use for the same fact: the kind,
+                // then the identifier AS THE CALLER SENT IT, in single quotes.
+                message: Some(format!(
+                    "Could not find model card '{}'.",
+                    input.model_card_name
+                )),
+            })
+            .into());
+        };
+        drop(store);
+
+        // The ARN the deleted card carried, as `CreateModelCard` minted it, rather than
+        // one rebuilt from this request.
+        crate::state::record_state_change(Self::NAME, &card.arn, ctx);
+        // `DeleteModelCard`'s output is the modelled `Unit`: there is nothing to report
+        // about a card that no longer exists.
+        Ok(DeleteModelCardOutput)
     }
 }
