@@ -21,6 +21,8 @@ mod create_deployment_strategy;
 mod deployment_wire_fidelity;
 #[path = "all/environment_update.rs"]
 mod environment_update;
+#[path = "all/experiment_definitions.rs"]
+mod experiment_definitions;
 #[path = "all/extensions.rs"]
 mod extensions;
 #[path = "all/list_configuration_profiles.rs"]
