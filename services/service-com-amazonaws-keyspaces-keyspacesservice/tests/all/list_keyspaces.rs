@@ -5,7 +5,8 @@
 //!
 //! The rules under test, each exercised over a SET of inputs rather than one example:
 //!
-//! 1. `ListKeyspaces` reports the keyspaces that are in state — every one that a create
+//! 1. `ListKeyspaces` reports the keyspaces that are in state — the service-managed
+//!    keyspaces every account holds before it creates anything, every one that a create
 //!    stored and none that a delete removed — each with the ARN it was minted with and
 //!    the replication it was created with, and `replicationRegions` only where the
 //!    strategy is `MULTI_REGION` (`KeyspaceSummary$replicationRegions`: "if the
@@ -19,10 +20,30 @@
 //!    never a silently ignored token and never the scaffold's 501.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_keyspaces_keyspacesservice::state as keyspaces;
 
 use crate::keyspace_table_lifecycle::{
     assert_failure, assert_ok, keyspace_arn, Emulator, REGION,
 };
+
+/// The names of the keyspaces Amazon Keyspaces manages itself, which every account holds
+/// before it creates anything: a listing is the service-managed catalog PLUS whatever the
+/// caller created, never the caller's keyspaces alone.
+fn managed_names() -> Vec<String> {
+    keyspaces::SERVICE_MANAGED_KEYSPACES
+        .iter()
+        .map(|(name, _)| (*name).to_string())
+        .collect()
+}
+
+/// `created` plus the service-managed keyspaces, in the one total order a listing reports
+/// them in.
+fn expected_names(created: &[&str]) -> Vec<String> {
+    let mut all = managed_names();
+    all.extend(created.iter().map(|name| (*name).to_string()));
+    all.sort();
+    all
+}
 
 /// `rs` values, from the model's `rs` enum (`SINGLE_REGION` | `MULTI_REGION`).
 const SINGLE_REGION: &str = "SINGLE_REGION";
@@ -144,22 +165,36 @@ async fn list_keyspaces_reports_each_stored_keyspace_with_its_replication() {
 
     let emulator = Emulator::start();
 
-    // An account with no keyspaces is an empty list, not a missing member and not a token.
-    let empty = assert_ok(
-        "no keyspaces yet",
+    // An account that has created nothing is NOT an empty catalog: the service-managed
+    // keyspaces are already there, each single-Region and therefore reporting no
+    // replication Regions, and nothing is a pagination token.
+    let untouched = assert_ok(
+        "no keyspaces created yet",
         emulator.call("ListKeyspaces", json!({})).await,
     );
     assert_eq!(
-        empty["keyspaces"],
-        json!([]),
-        "case {:?}: expected an empty keyspaces list, got {empty}",
-        "no keyspaces yet"
+        names(&untouched),
+        managed_names(),
+        "case {:?}: expected the service-managed keyspaces, got {untouched}",
+        "no keyspaces created yet"
     );
+    for summary in summaries(&untouched) {
+        let name = summary["keyspaceName"].as_str().unwrap_or_default().to_string();
+        assert_eq!(
+            summary,
+            json!({
+                "keyspaceName": name,
+                "resourceArn": keyspace_arn(&name),
+                "replicationStrategy": SINGLE_REGION,
+            }),
+            "case {name:?}: expected the service-managed keyspace's summary, got {summary}"
+        );
+    }
     assert_eq!(
-        empty.get("nextToken"),
+        untouched.get("nextToken"),
         None,
-        "case {:?}: a complete page carries no nextToken, got {empty}",
-        "no keyspaces yet"
+        "case {:?}: a complete page carries no nextToken, got {untouched}",
+        "no keyspaces created yet"
     );
 
     for case in &cases {
@@ -175,12 +210,14 @@ async fn list_keyspaces_reports_each_stored_keyspace_with_its_replication() {
         emulator.call("ListKeyspaces", json!({})).await,
     );
     let reported = summaries(&listed);
+    let expected_all = expected_names(
+        &cases.iter().map(|case| case.name).collect::<Vec<&str>>(),
+    );
     assert_eq!(
-        reported.len(),
-        cases.len(),
-        "case {:?}: expected {} keyspaces, got {listed}",
-        "all keyspaces",
-        cases.len()
+        names(&listed),
+        expected_all,
+        "case {:?}: expected {expected_all:?}, got {listed}",
+        "all keyspaces"
     );
 
     for case in &cases {
@@ -229,9 +266,8 @@ async fn list_keyspaces_reports_each_stored_keyspace_with_its_replication() {
         "after the delete",
         emulator.call("ListKeyspaces", json!({})).await,
     );
-    let mut expected_rest: Vec<String> = cases
-        .iter()
-        .map(|case| case.name.to_string())
+    let mut expected_rest: Vec<String> = expected_all
+        .into_iter()
         .filter(|name| name != removed)
         .collect();
     expected_rest.sort();
@@ -260,12 +296,13 @@ async fn list_keyspaces_pages_the_account_in_one_total_order_for_any_page_size()
                 .await,
         );
     }
-    let mut expected: Vec<String> = created.iter().map(|name| name.to_string()).collect();
-    expected.sort();
+    // The service-managed keyspaces are part of the account too, so they page with the
+    // created ones in the same total order.
+    let expected = expected_names(&created);
 
     // Page sizes that divide the collection evenly, ones that do not, the smallest the
     // model allows (`maxResults` range 1..1000), and sizes at and past the collection.
-    for page_size in [1usize, 2, 3, 4, 5, 6, 1000] {
+    for page_size in [1usize, 2, 3, 4, 5, 6, 7, 1000] {
         let case = format!("page size {page_size}");
         let (seen, pages) = walk_pages(&emulator, page_size, expected.len()).await;
         assert_eq!(
@@ -416,9 +453,14 @@ async fn a_next_token_this_operation_did_not_issue_is_a_modelled_validation_erro
             .call("ListKeyspaces", json!({"nextToken": own_token}))
             .await,
     );
+    // Everything the account holds except the one keyspace the first page reported.
+    let after_first: Vec<String> = expected_names(&["token_ks_a", "token_ks_b"])
+        .into_iter()
+        .skip(1)
+        .collect();
     assert_eq!(
         names(&second),
-        vec!["token_ks_b".to_string()],
+        after_first,
         "case {:?}: expected the listing to resume after the first page, got {second}",
         "second page"
     );

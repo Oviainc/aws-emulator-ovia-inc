@@ -199,6 +199,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut store = state.lock();
+        // The service-managed keyspaces are part of the account before any call, so a
+        // create that names one is a name already taken, refused by the duplicate check
+        // below rather than by a rule of its own.
+        store.ensure_service_managed_catalog(&region);
         store.settle(now);
 
         // "keyspace names must be unique within each Region": a create of a name already
