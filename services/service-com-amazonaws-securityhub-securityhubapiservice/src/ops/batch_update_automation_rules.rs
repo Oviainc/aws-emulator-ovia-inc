@@ -226,6 +226,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::ACTION_TYPE_FINDING_FIELDS_UPDATE
                     )));
                 }
+                // A rule's note is written to every finding the rule ever matches,
+                // so the documented bound on `Note$Text` is enforced where the rule
+                // is stored, exactly as the create holds it.
+                if let Some(message) = action
+                    .finding_fields_update
+                    .as_ref()
+                    .and_then(|update| update.note.as_ref())
+                    .and_then(crate::state::note_update_violation)
+                {
+                    return Err(invalid_input(message));
+                }
             }
             if let Some(status) = item.rule_status.as_deref() {
                 if status != crate::state::RULE_STATUS_ENABLED
