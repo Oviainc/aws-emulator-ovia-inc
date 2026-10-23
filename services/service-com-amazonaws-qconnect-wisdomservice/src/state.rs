@@ -11,10 +11,12 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    AIAgentConfigurationData, AssistantCapabilityConfiguration, AssistantData,
-    AssistantIntegrationConfiguration, AssistantSummary, KnowledgeBaseData,
-    OrchestratorConfigurationEntry, RenderingConfiguration, ServerSideEncryptionConfiguration,
-    SessionData, SourceConfiguration, TagFilter, VectorIngestionConfiguration,
+    AIAgentConfigurationData, AssistantAssociationData, AssistantAssociationInputData,
+    AssistantAssociationOutputData, AssistantCapabilityConfiguration, AssistantData,
+    AssistantIntegrationConfiguration, AssistantSummary, ExternalBedrockKnowledgeBaseConfig,
+    KnowledgeBaseAssociationData, KnowledgeBaseData, OrchestratorConfigurationEntry,
+    RenderingConfiguration, ServerSideEncryptionConfiguration, SessionData, SourceConfiguration,
+    TagFilter, VectorIngestionConfiguration,
 };
 
 /// The only `AssistantType` the model declares
@@ -89,9 +91,18 @@ pub const MESSAGE_KNOWLEDGE_BASE_NOT_FOUND: &str = "Knowledge Base does not exis
 /// hold. See [`MESSAGE_ASSISTANT_NOT_FOUND`].
 pub const MESSAGE_SESSION_NOT_FOUND: &str = "Session does not exist.";
 
+/// The fixed text for a request addressed to an assistant association its named
+/// assistant does not hold. See [`MESSAGE_ASSISTANT_NOT_FOUND`].
+pub const MESSAGE_ASSOCIATION_NOT_FOUND: &str = "Assistant Association does not exist.";
+
 /// The fixed text of the modelled `ConflictException` a create whose `name` a live
 /// resource already holds is refused with. See [`MESSAGE_ASSISTANT_NOT_FOUND`].
 pub const MESSAGE_NAME_IN_USE: &str = "Name is already in use";
+
+/// The fixed text of the modelled `ConflictException` a create that reuses an
+/// `@idempotencyToken` with different parameters is refused with. See
+/// [`MESSAGE_ASSISTANT_NOT_FOUND`].
+pub const MESSAGE_IDEMPOTENCY_CONFLICT: &str = "Idempotency conflict";
 
 /// The fixed text of the modelled `UnauthorizedException`. See
 /// [`MESSAGE_ASSISTANT_NOT_FOUND`].
@@ -154,6 +165,24 @@ pub const DEFAULT_AI_AGENT_TYPES: [&str; 8] = [
 /// CHOSEN: AWS quotas knowledge bases per account but does not publish the figure.
 pub const MAX_KNOWLEDGE_BASES: usize = 100;
 
+/// The most assistant associations one assistant may hold at a time. A create beyond it
+/// is refused with the modelled `ServiceQuotaExceededException` (HTTP 402), which
+/// `CreateAssistantAssociation` declares for exactly this, and which is also what keeps
+/// this store finite: an association is released only by `DeleteAssistantAssociation`
+/// or by the delete of its assistant.
+///
+/// CHOSEN: AWS quotas associations per assistant but does not publish the figure.
+pub const MAX_ASSOCIATIONS_PER_ASSISTANT: usize = 100;
+
+/// The `AssociationType` of an association with a knowledge base this account holds
+/// (`smithy_query(query="shape",shape="AssociationType")`).
+pub const ASSOCIATION_TYPE_KNOWLEDGE_BASE: &str = "KNOWLEDGE_BASE";
+
+/// The `AssociationType` of an association with a Bedrock knowledge base outside this
+/// service (`smithy_query(query="shape",shape="AssociationType")`).
+pub const ASSOCIATION_TYPE_EXTERNAL_BEDROCK_KNOWLEDGE_BASE: &str =
+    "EXTERNAL_BEDROCK_KNOWLEDGE_BASE";
+
 /// How many ids a mint tries before giving up, so no request can spin here. Each
 /// candidate comes from the store's own sequence, so the first one is free unless the
 /// store already holds that exact id.
@@ -195,6 +224,24 @@ pub fn knowledge_base_arn(region: &str, knowledge_base_id: &str) -> String {
         ARN_NAMESPACE,
         region,
         &format!("knowledge-base/{knowledge_base_id}"),
+    )
+}
+
+/// This service's ARN for an assistant association, which names its parent assistant
+/// too: `arn:aws:wisdom:<region>:<account>:association/<assistantId>/<assistantAssociationId>`.
+///
+/// Two id segments, which is the form the modelled `Arn` pattern admits for a nested
+/// resource (`<label>/<uuid>(/<uuid>){0,2}`), and the form [`resolve_id`] reads the
+/// resource's own id back out of.
+pub fn assistant_association_arn(
+    region: &str,
+    assistant_id: &str,
+    assistant_association_id: &str,
+) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("association/{assistant_id}/{assistant_association_id}"),
     )
 }
 
@@ -530,6 +577,142 @@ impl KnowledgeBase {
     }
 }
 
+/// What one assistant association associates the assistant WITH: the modelled
+/// `AssistantAssociationInputData` union, as this emulator persists it.
+///
+/// The variant is the one the create named, and it is stored RESOLVED: a knowledge base
+/// of this account is kept by id together with the ARN it carried when the association
+/// was made, so a later read of the association reports the knowledge base it was made
+/// against even once that knowledge base is gone (`DeleteKnowledgeBase` does not refuse
+/// over a live association).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssociationTarget {
+    /// A knowledge base this account holds — `associationType` `KNOWLEDGE_BASE`.
+    KnowledgeBase {
+        knowledge_base_id: String,
+        knowledge_base_arn: String,
+    },
+    /// A Bedrock knowledge base outside this service — `associationType`
+    /// `EXTERNAL_BEDROCK_KNOWLEDGE_BASE`. Both ARNs name resources of OTHER services
+    /// (Bedrock, IAM), which this emulator does not hold, so they are stored as the
+    /// caller gave them; their form is already refused by the modelled `@pattern`/
+    /// `@length` of `ExternalBedrockKnowledgeBaseConfig` before a handler runs.
+    ExternalBedrockKnowledgeBase {
+        bedrock_knowledge_base_arn: String,
+        access_role_arn: String,
+    },
+}
+
+impl AssociationTarget {
+    /// This target as the modelled `AssistantAssociationOutputData` union every
+    /// operation that reports an association answers with.
+    fn to_output_data(&self) -> AssistantAssociationOutputData {
+        match self {
+            Self::KnowledgeBase {
+                knowledge_base_id,
+                knowledge_base_arn,
+            } => AssistantAssociationOutputData::knowledgeBaseAssociation(
+                KnowledgeBaseAssociationData {
+                    knowledge_base_id: Some(knowledge_base_id.clone()),
+                    knowledge_base_arn: Some(knowledge_base_arn.clone()),
+                },
+            ),
+            Self::ExternalBedrockKnowledgeBase {
+                bedrock_knowledge_base_arn,
+                access_role_arn,
+            } => AssistantAssociationOutputData::externalBedrockKnowledgeBaseConfig(
+                ExternalBedrockKnowledgeBaseConfig {
+                    bedrock_knowledge_base_arn: bedrock_knowledge_base_arn.clone(),
+                    access_role_arn: access_role_arn.clone(),
+                },
+            ),
+        }
+    }
+}
+
+/// One association between an assistant and the data it answers out of, as this
+/// emulator persists it.
+///
+/// An association is reachable only through its assistant — the modelled routes are all
+/// `/assistants/{assistantId}/associations/…` — so [`Self::assistant_id`] is what makes
+/// a lookup under another assistant miss.
+#[derive(Debug, Clone)]
+pub struct AssistantAssociation {
+    pub assistant_association_id: String,
+    pub assistant_association_arn: String,
+    pub assistant_id: String,
+    pub assistant_arn: String,
+    pub association_type: String,
+    pub target: AssociationTarget,
+    pub tags: HashMap<String, String>,
+    /// The fingerprint of the create that minted this record — see
+    /// [`association_fingerprint`]. What a replayed `@idempotencyToken` is compared
+    /// against, so a token reused with different parameters is told it conflicts instead
+    /// of being handed a resource it did not ask for.
+    pub fingerprint: String,
+    /// When the create that minted this record ran, as every other record here keeps it.
+    /// `AssistantAssociationData` models no creation-time member, so nothing reports it.
+    pub created_at: SystemTime,
+}
+
+impl AssistantAssociation {
+    /// The `AssistantAssociationData` every operation that reports this association
+    /// answers with.
+    pub fn to_assistant_association_data(&self) -> AssistantAssociationData {
+        AssistantAssociationData {
+            assistant_association_id: self.assistant_association_id.clone(),
+            assistant_association_arn: self.assistant_association_arn.clone(),
+            assistant_id: self.assistant_id.clone(),
+            assistant_arn: self.assistant_arn.clone(),
+            association_type: self.association_type.clone(),
+            association_data: self.target.to_output_data(),
+            tags: tags_out(&self.tags),
+        }
+    }
+}
+
+/// The fingerprint of a `CreateAssistantAssociation` request: what its
+/// `@idempotencyToken` identifies.
+///
+/// An idempotency token identifies ONE request, so a replay carrying the identical
+/// request is a retry and answers with the resource the first call created, while the
+/// same token carrying a DIFFERENT request is an idempotency conflict and is refused.
+/// The fingerprint therefore covers every member the created record is made of — the
+/// association type, the association target ([`input_target_key`]) and the tags — and
+/// nothing else; the tag pairs are sorted, so the same request written in another order
+/// is one request.
+pub fn association_fingerprint(
+    association_type: &str,
+    target: &str,
+    tags: &HashMap<String, String>,
+) -> String {
+    let mut pairs: Vec<String> = tags.iter().map(|(key, tag)| format!("{key}={tag}")).collect();
+    pairs.sort();
+    format!(
+        "{association_type}\u{1f}{target}\u{1f}{}",
+        pairs.join("\u{1e}")
+    )
+}
+
+/// What the association target a request names comes down to: the member of the
+/// `AssistantAssociationInputData` union it carries, and the values that identify the
+/// resource under it.
+///
+/// Taken from the REQUEST, so [`association_fingerprint`] can be computed before the
+/// target is resolved: a retry whose token is known is answered out of the record the
+/// first call made even when the resource it named has since been deleted.
+pub fn input_target_key(association: &AssistantAssociationInputData) -> String {
+    match association {
+        AssistantAssociationInputData::knowledgeBaseId(knowledge_base_id) => {
+            format!("knowledgeBase={knowledge_base_id}")
+        }
+        AssistantAssociationInputData::externalBedrockKnowledgeBaseConfig(config) => format!(
+            "externalBedrock={}|{}",
+            config.bedrock_knowledge_base_arn, config.access_role_arn
+        ),
+    }
+}
+
 /// Per-service state for com-amazonaws-qconnect-wisdomservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsQconnectWisdomserviceState {
@@ -537,6 +720,10 @@ pub struct ComAmazonawsQconnectWisdomserviceState {
     pub assistants: HashMap<String, Assistant>,
     /// Every live knowledge base, keyed by its `knowledgeBaseId`.
     pub knowledge_bases: HashMap<String, KnowledgeBase>,
+    /// Every live assistant association, keyed by its `assistantAssociationId`. Each
+    /// record names the assistant it belongs to, so a lookup is always scoped to the
+    /// parent the route named.
+    pub assistant_associations: HashMap<String, AssistantAssociation>,
     /// `name` -> `knowledgeBaseId`: a knowledge base's name identifies it, so a second
     /// create under a live name is the conflict `ConflictException` describes.
     pub knowledge_base_name_index: HashMap<String, String>,
@@ -686,11 +873,21 @@ impl ComAmazonawsQconnectWisdomserviceState {
         self.assistants.get_mut(resolve_id(label))
     }
 
-    /// Forget an assistant, its sessions and every index entry that named them, as
-    /// `DeleteAssistant` does.
+    /// Forget an assistant, its sessions, its associations and every index entry that
+    /// named them, as `DeleteAssistant` does.
     pub fn remove_assistant(&mut self, label: &str) -> Option<Assistant> {
         let assistant = self.assistants.remove(resolve_id(label))?;
         self.assistant_name_index.remove(&assistant.name);
+        // An association exists only inside its assistant, so it goes with it.
+        let associations: Vec<String> = self
+            .assistant_associations
+            .iter()
+            .filter(|(_, association)| association.assistant_id == assistant.assistant_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &associations {
+            self.assistant_associations.remove(id);
+        }
         // A token whose resource is gone must not resurrect it on a replay.
         let gone: Vec<String> = self
             .idempotency
@@ -698,6 +895,7 @@ impl ComAmazonawsQconnectWisdomserviceState {
             .filter(|(_, created)| {
                 *created == &assistant.assistant_id
                     || assistant.sessions.contains_key(created.as_str())
+                    || associations.contains(*created)
             })
             .map(|(token, _)| token.clone())
             .collect();
@@ -722,6 +920,71 @@ impl ComAmazonawsQconnectWisdomserviceState {
         let mut ids: Vec<String> = self.assistants.keys().cloned().collect();
         ids.sort();
         ids
+    }
+
+    /// An assistant-association id no stored association holds, or `None` when
+    /// [`MINT_ATTEMPTS`] candidates of this sequence number's block were all taken.
+    pub fn mint_assistant_association_id(&mut self) -> Option<String> {
+        let seq = self.next_seq();
+        (0..MINT_ATTEMPTS as u64)
+            .map(|attempt| mint_candidate(seq, attempt))
+            .find(|candidate| !self.assistant_associations.contains_key(candidate))
+    }
+
+    /// Store an assistant association under the assistant it names.
+    pub fn insert_assistant_association(&mut self, association: AssistantAssociation) {
+        self.assistant_associations
+            .insert(association.assistant_association_id.clone(), association);
+    }
+
+    /// The association a (resolved `assistantId`, `UuidOrArn` label) pair names, or
+    /// `None` when this assistant holds none under that label — including an id that
+    /// names an association of ANOTHER assistant, which this assistant does not hold.
+    pub fn assistant_association(
+        &self,
+        assistant_id: &str,
+        label: &str,
+    ) -> Option<&AssistantAssociation> {
+        self.assistant_associations
+            .get(resolve_id(label))
+            .filter(|association| association.assistant_id == assistant_id)
+    }
+
+    /// Every association of one assistant, in `assistantAssociationId` order, so what a
+    /// read reports does not depend on map iteration order.
+    pub fn assistant_associations_of(&self, assistant_id: &str) -> Vec<&AssistantAssociation> {
+        let mut associations: Vec<&AssistantAssociation> = self
+            .assistant_associations
+            .values()
+            .filter(|association| association.assistant_id == assistant_id)
+            .collect();
+        associations.sort_by(|left, right| {
+            left.assistant_association_id
+                .cmp(&right.assistant_association_id)
+        });
+        associations
+    }
+
+    /// Forget one association, as `DeleteAssistantAssociation` does, together with the
+    /// `clientToken` entry that created it: a token whose resource is gone must not
+    /// resurrect it on a replay.
+    pub fn remove_assistant_association(
+        &mut self,
+        assistant_id: &str,
+        label: &str,
+    ) -> Option<AssistantAssociation> {
+        let id = self.assistant_association(assistant_id, label)?.assistant_association_id.clone();
+        let association = self.assistant_associations.remove(&id)?;
+        let gone: Vec<String> = self
+            .idempotency
+            .iter()
+            .filter(|(_, created)| *created == &id)
+            .map(|(token, _)| token.clone())
+            .collect();
+        for token in gone {
+            self.idempotency.remove(&token);
+        }
+        Some(association)
     }
 }
 

@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAssistantAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAssistantAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: associates an assistant with a knowledge base this account holds,
+//! then answers out of the STORED record, so what this call reports is what every
+//! later `GetAssistantAssociation` reports.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAssistantAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rules it keeps:
+//!
+//! * the parent is resolved first: a request naming an assistant this account
+//!   does not hold is the modelled `ResourceNotFoundException` (404), and so is
+//!   one naming a knowledge base it does not hold;
+//! * a replayed `clientToken` carrying the SAME request answers with the
+//!   association that token already created; carrying a DIFFERENT request it is
+//!   an idempotency conflict, `ConflictException` (409);
+//! * an assistant is associated with one knowledge base once: a second create
+//!   naming a knowledge base it is already associated with is
+//!   `ConflictException` (409);
+//! * the per-assistant association bound is `ServiceQuotaExceededException`
+//!   (402), the error the model declares for exactly that.
 //!
 //! ## Shape of an operation
 //!
@@ -91,6 +99,24 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The modelled `ResourceNotFoundException` (HTTP 404), naming the resource the
+/// request addressed — the member the model provides for exactly that.
+fn not_found(message: String, resource_name: &str) -> CreateAssistantAssociationError {
+    CreateAssistantAssociationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+        resource_name: Some(resource_name.to_string()),
+    })
+    .into()
+}
+
+/// The modelled `ConflictException` (HTTP 409).
+fn conflict(message: &str) -> CreateAssistantAssociationError {
+    CreateAssistantAssociationErrorModeled::ConflictException(ConflictException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -163,18 +189,177 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAssistantAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAssistantAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Mounted on an engine that holds no state: nothing can be persisted,
+            // and this operation models no error that says so.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateAssistantAssociation",
+            ));
+        };
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let mut state = state.lock();
+
+        // An association only exists under an assistant, so an unknown parent is
+        // a 404 rather than an association with no owner.
+        let Some(assistant_id) = state.resolve_assistant_id(&input.assistant_id) else {
+            return Err(not_found(
+                format!("No assistant {} found.", input.assistant_id),
+                &input.assistant_id,
+            ));
+        };
+        let Some(assistant_arn) = state
+            .assistants
+            .get(&assistant_id)
+            .map(|assistant| assistant.assistant_arn.clone())
+        else {
+            // Unreachable: the id was just resolved out of this map while the
+            // lock is held.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateAssistantAssociation",
+            ));
+        };
+
+        // The model puts no bound on the `tags` map, so the store does: AWS's
+        // tagging restrictions allow at most 50 tags on a resource. Every input
+        // refusal happens before an id is minted, and the count is taken from
+        // what the caller sent.
+        let requested_tags = input.tags.clone().unwrap_or_default();
+        if requested_tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(CreateAssistantAssociationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "tags must have at most {} entries, but {} were given.",
+                        crate::state::MAX_TAGS_PER_RESOURCE,
+                        requested_tags.len()
+                    )),
+                },
+            )
+            .into());
+        }
+        let tags: ::std::collections::BTreeMap<String, String> =
+            requested_tags.into_iter().collect();
+
+        // This model's `AssistantAssociationInputData` union declares the single
+        // member `knowledgeBaseId`, and `AssociationType` the single value
+        // `KNOWLEDGE_BASE` — both already enforced before this handler runs — so
+        // the knowledge base the caller named is the whole target.
+        let AssistantAssociationInputData::knowledgeBaseId(knowledge_base_id) = &input.association;
+
+        // The fingerprint is taken from the REQUEST, before the knowledge base is
+        // resolved, so a retry whose token is known is answered out of the record
+        // the first call made even when the knowledge base it named is gone.
+        let fingerprint = crate::state::association_fingerprint(
+            &input.association_type,
+            knowledge_base_id,
+            &tags,
+        );
+
+        // A retried create carrying the same `clientToken` answers with the
+        // association the first call created, rather than making a second one.
+        // The token is scoped to the parent assistant: the same token under
+        // another assistant is a different create. An idempotency token
+        // identifies ONE request, so the same token carrying a DIFFERENT request
+        // is a conflict, not a retry.
+        if let Some(token) = input.client_token.as_deref() {
+            let replayed = state
+                .replayed_resource_id(Self::NAME, &assistant_id, token)
+                .cloned()
+                .and_then(|association_id| {
+                    state.assistant_association(&assistant_id, &association_id)
+                })
+                .map(|association| (association.fingerprint.clone(), association.to_data()));
+            if let Some((stored_fingerprint, association)) = replayed {
+                if stored_fingerprint != fingerprint {
+                    return Err(conflict(
+                        "The clientToken has already been used for a different request.",
+                    ));
+                }
+                return Ok(CreateAssistantAssociationOutput {
+                    assistant_association: Some(association),
+                });
+            }
+        }
+
+        // The knowledge base is one THIS account holds, so an id it holds none
+        // under is not found. Its ARN is read off the stored knowledge base
+        // rather than rebuilt, so the association reports that record's own ARN.
+        let Some(knowledge_base) = state.knowledge_base(knowledge_base_id).cloned() else {
+            return Err(not_found(
+                format!("No knowledge base {knowledge_base_id} found."),
+                knowledge_base_id,
+            ));
+        };
+
+        // One association per associated knowledge base: a second create naming a
+        // knowledge base this assistant is already associated with is the
+        // conflict `ConflictException` describes, and the refusal leaves the first
+        // association untouched.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAssistantAssociation"))
+        // The model's prose says "An assistant can have only a single
+        // association", but what the service enforces is this per-knowledge-base
+        // rule: the behavioural corpus has one assistant associated with several
+        // DISTINCT knowledge bases and succeeding, so the refusal is keyed to the
+        // knowledge base rather than to the number of associations.
+        if state
+            .assistant_associations_of(&assistant_id)
+            .iter()
+            .any(|association| association.knowledge_base_id == knowledge_base.knowledge_base_id)
+        {
+            return Err(conflict(
+                "The assistant is already associated with this knowledge base.",
+            ));
+        }
+
+        let assistant_association_id = crate::state::new_resource_id();
+        let stored = state.insert_assistant_association(crate::state::AssistantAssociation {
+            assistant_association_arn: crate::state::assistant_association_arn(
+                &region,
+                &assistant_id,
+                &assistant_association_id,
+            ),
+            assistant_association_id: assistant_association_id.clone(),
+            assistant_id: assistant_id.clone(),
+            assistant_arn,
+            association_type: input.association_type.clone(),
+            knowledge_base_id: knowledge_base.knowledge_base_id.clone(),
+            knowledge_base_arn: knowledge_base.knowledge_base_arn.clone(),
+            tags,
+            fingerprint,
+            created_at: ::std::time::SystemTime::now(),
+        });
+        if !stored {
+            // The assistant holds as many associations as this emulator's store
+            // ceiling keeps, which is what `ServiceQuotaExceededException` (402)
+            // is declared for.
+            return Err(
+                CreateAssistantAssociationErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "Assistant {} already holds the maximum of {} associations.",
+                            input.assistant_id,
+                            crate::state::MAX_ASSOCIATIONS_PER_ASSISTANT
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if let Some(token) = input.client_token.as_deref() {
+            state.remember_client_token(
+                Self::NAME,
+                &assistant_id,
+                token,
+                &assistant_association_id,
+            );
+        }
+
+        // Answer from what was just persisted, so this response and a later
+        // `GetAssistantAssociation` cannot disagree.
+        let assistant_association = state
+            .assistant_association(&assistant_id, &assistant_association_id)
+            .map(crate::state::AssistantAssociation::to_data);
+        Ok(CreateAssistantAssociationOutput {
+            assistant_association,
+        })
     }
 }
