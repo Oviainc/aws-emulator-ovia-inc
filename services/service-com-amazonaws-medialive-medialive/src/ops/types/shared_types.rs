@@ -328,6 +328,184 @@ macro_rules! event_bridge_rule_template_response {
     };
 }
 
+/// The schema and the serializer for one cloudwatch alarm TEMPLATE response shape.
+///
+/// `CreateCloudWatchAlarmTemplateResponse` and `GetCloudWatchAlarmTemplateResponse` are
+/// member for member the same shape (`smithy_query(query="shape",shape="…")`): seventeen
+/// members, in the model's order, with `CreatedAt` and `ModifiedAt` targeting
+/// `__timestampIso8601`. See [`template_group_response`] for why the schema is written out
+/// and why no deserializer is emitted.
+macro_rules! cloud_watch_alarm_template_response {
+    ($ty:ident, $schema_static:ident, $shape:literal) => {
+        impl $ty {
+            const M_ARN: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "Arn", "arn", String, 0);
+            // `CloudWatchAlarmTemplateComparisonOperator` is an enum shape, which the
+            // generator writes as `ShapeType::String`; so are the three enum members
+            // below it.
+            const M_COMPARISON_OPERATOR: ::aws_smithy_schema::Schema =
+                shared_types::member_of!(
+                    $shape,
+                    "ComparisonOperator",
+                    "comparisonOperator",
+                    String,
+                    1
+                );
+            const M_CREATED_AT: ::aws_smithy_schema::Schema =
+                shared_types::date_time_member_of!($shape, "CreatedAt", "createdAt", 2);
+            const M_DATAPOINTS_TO_ALARM: ::aws_smithy_schema::Schema =
+                shared_types::member_of!(
+                    $shape,
+                    "DatapointsToAlarm",
+                    "datapointsToAlarm",
+                    Integer,
+                    3
+                );
+            const M_DESCRIPTION: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "Description", "description", String, 4);
+            const M_EVALUATION_PERIODS: ::aws_smithy_schema::Schema =
+                shared_types::member_of!(
+                    $shape,
+                    "EvaluationPeriods",
+                    "evaluationPeriods",
+                    Integer,
+                    5
+                );
+            const M_GROUP_ID: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "GroupId", "groupId", String, 6);
+            const M_ID: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "Id", "id", String, 7);
+            const M_METRIC_NAME: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "MetricName", "metricName", String, 8);
+            const M_MODIFIED_AT: ::aws_smithy_schema::Schema =
+                shared_types::date_time_member_of!($shape, "ModifiedAt", "modifiedAt", 9);
+            const M_NAME: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "Name", "name", String, 10);
+            const M_PERIOD: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "Period", "period", Integer, 11);
+            const M_STATISTIC: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "Statistic", "statistic", String, 12);
+            const M_TAGS: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "Tags", "tags", Map, 13);
+            const M_TARGET_RESOURCE_TYPE: ::aws_smithy_schema::Schema =
+                shared_types::member_of!(
+                    $shape,
+                    "TargetResourceType",
+                    "targetResourceType",
+                    String,
+                    14
+                );
+            const M_THRESHOLD: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "Threshold", "threshold", Double, 15);
+            const M_TREAT_MISSING_DATA: ::aws_smithy_schema::Schema =
+                shared_types::member_of!(
+                    $shape,
+                    "TreatMissingData",
+                    "treatMissingData",
+                    String,
+                    16
+                );
+
+            pub const SCHEMA: ::aws_smithy_schema::Schema =
+                ::aws_smithy_schema::Schema::new_struct(
+                    ::aws_smithy_schema::ShapeId::from_static(
+                        concat!("com.amazonaws.medialive#", $shape),
+                        shared_types::NAMESPACE,
+                        $shape,
+                    ),
+                    ::aws_smithy_schema::ShapeType::Structure,
+                    &[
+                        &Self::M_ARN,
+                        &Self::M_COMPARISON_OPERATOR,
+                        &Self::M_CREATED_AT,
+                        &Self::M_DATAPOINTS_TO_ALARM,
+                        &Self::M_DESCRIPTION,
+                        &Self::M_EVALUATION_PERIODS,
+                        &Self::M_GROUP_ID,
+                        &Self::M_ID,
+                        &Self::M_METRIC_NAME,
+                        &Self::M_MODIFIED_AT,
+                        &Self::M_NAME,
+                        &Self::M_PERIOD,
+                        &Self::M_STATISTIC,
+                        &Self::M_TAGS,
+                        &Self::M_TARGET_RESOURCE_TYPE,
+                        &Self::M_THRESHOLD,
+                        &Self::M_TREAT_MISSING_DATA,
+                    ],
+                );
+        }
+
+        pub static $schema_static: &::aws_smithy_schema::Schema = &$ty::SCHEMA;
+
+        impl ::aws_smithy_schema::serde::SerializableStruct for $ty {
+            fn serialize_members(
+                &self,
+                serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+            ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+                if let Some(value) = self.arn.as_ref() {
+                    serializer.write_string(&Self::M_ARN, value.as_str())?;
+                }
+                if let Some(value) = self.comparison_operator.as_ref() {
+                    serializer.write_string(&Self::M_COMPARISON_OPERATOR, value.as_str())?;
+                }
+                if let Some(value) = self.created_at.as_ref() {
+                    serializer.write_timestamp(&Self::M_CREATED_AT, value)?;
+                }
+                if let Some(value) = self.datapoints_to_alarm {
+                    serializer.write_integer(&Self::M_DATAPOINTS_TO_ALARM, value)?;
+                }
+                if let Some(value) = self.description.as_ref() {
+                    serializer.write_string(&Self::M_DESCRIPTION, value.as_str())?;
+                }
+                if let Some(value) = self.evaluation_periods {
+                    serializer.write_integer(&Self::M_EVALUATION_PERIODS, value)?;
+                }
+                if let Some(value) = self.group_id.as_ref() {
+                    serializer.write_string(&Self::M_GROUP_ID, value.as_str())?;
+                }
+                if let Some(value) = self.id.as_ref() {
+                    serializer.write_string(&Self::M_ID, value.as_str())?;
+                }
+                if let Some(value) = self.metric_name.as_ref() {
+                    serializer.write_string(&Self::M_METRIC_NAME, value.as_str())?;
+                }
+                if let Some(value) = self.modified_at.as_ref() {
+                    serializer.write_timestamp(&Self::M_MODIFIED_AT, value)?;
+                }
+                if let Some(value) = self.name.as_ref() {
+                    serializer.write_string(&Self::M_NAME, value.as_str())?;
+                }
+                if let Some(value) = self.period {
+                    serializer.write_integer(&Self::M_PERIOD, value)?;
+                }
+                if let Some(value) = self.statistic.as_ref() {
+                    serializer.write_string(&Self::M_STATISTIC, value.as_str())?;
+                }
+                if let Some(value) = self.tags.as_ref() {
+                    serializer.write_map(&Self::M_TAGS, &|entries| {
+                        for (key, tag) in value.iter() {
+                            entries.write_string(&Self::M_TAGS, key.as_str())?;
+                            entries.write_string(&Self::M_TAGS, tag.as_str())?;
+                        }
+                        Ok(())
+                    })?;
+                }
+                if let Some(value) = self.target_resource_type.as_ref() {
+                    serializer.write_string(&Self::M_TARGET_RESOURCE_TYPE, value.as_str())?;
+                }
+                if let Some(value) = self.threshold {
+                    serializer.write_double(&Self::M_THRESHOLD, value)?;
+                }
+                if let Some(value) = self.treat_missing_data.as_ref() {
+                    serializer.write_string(&Self::M_TREAT_MISSING_DATA, value.as_str())?;
+                }
+                Ok(())
+            }
+        }
+    };
+}
+
 /// The schema and the serializer for one flat SIGNAL MAP response shape.
 ///
 /// `CreateSignalMapResponse` and `GetSignalMapResponse` are member for member the same
@@ -576,6 +754,7 @@ macro_rules! signal_map_response {
 // Re-exported as items so the hand-written shapes of this service can invoke them by path
 // (`shared_types::member_of!(..)`) from whichever `types/` module declares them, without a
 // copy of the macro per module.
+pub(crate) use cloud_watch_alarm_template_response;
 pub(crate) use date_time_member_of;
 pub(crate) use event_bridge_rule_template_response;
 pub(crate) use member_of;

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribePipelineExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribePipelineExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: replays the `PipelineExecution` `StartPipelineExecution` recorded in
+//! `crate::state` under the `PipelineExecutionArn` the request names, materialising
+//! first whatever terminal status the clock already owes it. This is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribePipelineExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The one write this report makes is that due transition
+//! ([`crate::state::PipelineExecution::settle_status`]): it was owed at the same instant
+//! whether or not anybody described the execution, so a read never changes what a later
+//! caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +165,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribePipelineExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribePipelineExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribePipelineExecution"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The writes this report may make: a pipeline removal the clock already owed —
+        // which takes that pipeline's executions with it — and the execution's own due
+        // terminal status. Both were due at the same instant whether or not anybody
+        // called.
+        store.settle_pipeline_deletions(now);
+
+        let Some(execution) = store
+            .pipeline_executions
+            .get_mut(&input.pipeline_execution_arn)
+        else {
+            // Never a 200 with empty fields: a caller cannot tell that from an execution
+            // that exists and carries nothing.
+            return Err(DescribePipelineExecutionErrorModeled::ResourceNotFound(
+                ResourceNotFound {
+                    message: Some(format!(
+                        "Pipeline execution {} does not exist.",
+                        input.pipeline_execution_arn
+                    )),
+                },
+            )
+            .into());
+        };
+        let settled = execution.settle_status(now);
+        let reported = execution.clone();
+        drop(store);
+
+        if settled {
+            crate::state::record_state_change(Self::NAME, &reported.arn, ctx);
+        }
+
+        Ok(DescribePipelineExecutionOutput {
+            pipeline_arn: Some(reported.pipeline_arn),
+            pipeline_execution_arn: Some(reported.arn),
+            pipeline_execution_display_name: reported.display_name,
+            pipeline_execution_status: Some(reported.status),
+            pipeline_execution_description: reported.description,
+            failure_reason: reported.failure_reason,
+            creation_time: Some(crate::state::timestamp(reported.creation_time)),
+            last_modified_time: Some(crate::state::timestamp(reported.last_modified_time)),
+            created_by: Some(reported.created_by.clone()),
+            // Nothing has modified the execution since it started but the clock, which
+            // acts for the service rather than for an identity; the identity that
+            // started it is the last one to have changed it.
+            last_modified_by: Some(reported.created_by),
+            parallelism_configuration: reported.parallelism_configuration,
+            selective_execution_config: reported.selective_execution_config,
+            pipeline_version_id: Some(reported.pipeline_version_id),
+            // SageMaker fills this from the MLflow tracking server the run logs to. The
+            // only member this emulator knows is the experiment name the start call
+            // supplied; it serves no tracking server, so no resource ARN is reported
+            // beside it, and a run that named no experiment reports no config at all.
+            m_lflow_config: reported
+                .mlflow_experiment_name
+                .map(|experiment| MLflowConfiguration {
+                    mlflow_resource_arn: None,
+                    mlflow_experiment_name: Some(experiment),
+                }),
+            // SageMaker creates an experiment and a trial per run and names them here.
+            // This emulator creates neither, so reporting names would name resources
+            // nothing holds.
+            pipeline_experiment_config: None,
+        })
     }
 }
