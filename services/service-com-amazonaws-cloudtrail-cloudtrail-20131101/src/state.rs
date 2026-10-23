@@ -18,6 +18,11 @@
 //! the ones the model documents, and both are applied by every dashboard
 //! operation rather than copied into each.
 //!
+//! It owns the **resource-based policy** registry too — the policy document attached
+//! to one CloudTrail resource — plus the rules every resource-policy operation
+//! shares: how a `ResourceArn` is read, which resource types carry a policy at all,
+//! which stored resource an ARN resolves to, and what makes a policy document valid.
+//!
 //! It owns the CloudTrail Lake **channel** registry on the same terms again: a channel
 //! identifier is a channel ARN or the bare id the service minted for it, and the refusal
 //! wording for an `arn:` value that is not a channel ARN, or for an identifier that names
@@ -1347,6 +1352,22 @@ pub struct ComAmazonawsCloudtrailCloudtrail20131101State {
     pub dashboards: BTreeMap<DashboardKey, DashboardRecord>,
     /// Every CloudTrail Lake channel in the account, keyed by [`channels::ChannelKey`].
     pub channels: BTreeMap<channels::ChannelKey, channels::ChannelRecord>,
+    /// The resource-based policy attached to each resource that has one, keyed by
+    /// the canonical ARN of that resource ([`PolicyResourceArn::canonical`]).
+    ///
+    /// Bounded by the resource registries above rather than by a quota of its own: a
+    /// policy is only ever written for a resource that exists
+    /// ([`ComAmazonawsCloudtrailCloudtrail20131101State::resolve_policy_resource`]),
+    /// and the modelled `ResourcePolicy` length caps each document at 8192
+    /// characters.
+    ///
+    /// An entry outlives nothing: a policy belongs to the resource it is attached to,
+    /// so whoever implements an operation that DELETES one of those resources
+    /// (`DeleteDashboard`, `DeleteEventDataStore`, `DeleteChannel`, all still 501
+    /// stubs) drops that resource's entry here too — otherwise a resource later
+    /// created with the same name in the same Region would inherit a policy nobody
+    /// attached to it.
+    pub resource_policies: BTreeMap<String, String>,
 }
 
 /// What a mutating operation found for the identifier it was given.
@@ -1909,6 +1930,437 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
 }
 
 // ---------------------------------------------------------------------------
+// Resource-based policies
+// ---------------------------------------------------------------------------
+
+/// The resource prefix of a channel ARN:
+/// `arn:aws:cloudtrail:<region>:<account>:channel/<channel-id>`, as the model doc for
+/// `ResourceArn` and for `AddTagsRequest$ResourceId` both give it ("Example channel
+/// ARN format: arn:aws:cloudtrail:us-east-2:123456789012:channel/01234567890"). The
+/// event data store and dashboard prefixes the same docs give are already defined
+/// above, with the registries they address.
+const CHANNEL_RESOURCE_PREFIX: &str = "channel/";
+
+/// What kind of CloudTrail resource an ARN names.
+///
+/// The three kinds a resource-based policy attaches to are the ones the model doc
+/// for `ResourceArn` names: "the CloudTrail event data store, dashboard, or channel
+/// attached to the resource-based policy". [`ResourceKind::Trail`] is here because a
+/// trail ARN is a well-formed CloudTrail resource ARN that carries no resource-based
+/// policy, and that is a different refusal from an ARN that is not well formed at
+/// all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceKind {
+    EventDataStore,
+    Dashboard,
+    Channel,
+    Trail,
+}
+
+impl ResourceKind {
+    /// Every kind, so a caller can walk them rather than restate the list.
+    pub const ALL: [Self; 4] = [
+        Self::EventDataStore,
+        Self::Dashboard,
+        Self::Channel,
+        Self::Trail,
+    ];
+
+    /// The `<type>/` prefix this kind's ARN carries in its resource segment.
+    pub fn resource_prefix(self) -> &'static str {
+        match self {
+            Self::EventDataStore => EVENT_DATA_STORE_RESOURCE_PREFIX,
+            Self::Dashboard => DASHBOARD_RESOURCE_PREFIX,
+            Self::Channel => CHANNEL_RESOURCE_PREFIX,
+            Self::Trail => TRAIL_RESOURCE_PREFIX,
+        }
+    }
+
+    /// The resource type as an ARN spells it, without the trailing separator.
+    pub fn resource_type(self) -> &'static str {
+        self.resource_prefix().trim_end_matches('/')
+    }
+
+    /// How a refusal names this kind of resource in prose.
+    ///
+    /// CloudTrail's resource-policy surface words a resource it could not find per
+    /// resource kind, and the recorded answers word two of them differently: an event
+    /// data store's and a channel's sentence name the ARN they were given ("The event
+    /// data store <arn> was not found."), a dashboard's names no identifier at all
+    /// ("The dashboard was not found."). [`ResourceKind::not_found_message`] is where
+    /// that split lives. It is NOT
+    /// [`EVENT_DATA_STORE_NOT_FOUND_MESSAGE`]: that is the text of a different
+    /// exception on a different surface (`EventDataStoreNotFoundException`, which the
+    /// Lake query operations answer), which states no identifier.
+    pub fn described(self) -> &'static str {
+        match self {
+            Self::EventDataStore => "event data store",
+            Self::Dashboard => "dashboard",
+            Self::Channel => "channel",
+            Self::Trail => "trail",
+        }
+    }
+
+    /// The refusal text for a resource of this kind that `value` named and that does
+    /// not exist.
+    ///
+    /// See [`ResourceKind::described`]: a dashboard's sentence carries no identifier,
+    /// every other kind's names the ARN the request supplied. An event data store's
+    /// and a channel's are the ones this crate already states for those kinds
+    /// ([`event_data_store_not_found_message`],
+    /// [`channels::channel_not_found_message`]), so the surfaces cannot drift.
+    /// The dashboard's is NOT [`DASHBOARD_NOT_FOUND_MESSAGE`]: the dashboard
+    /// operations were recorded answering "No matching dashboard found." and this
+    /// surface "The dashboard was not found.", so the two are deliberately not one
+    /// sentence.
+    pub fn not_found_message(self, value: &str) -> String {
+        match self {
+            Self::EventDataStore => event_data_store_not_found_message(value),
+            Self::Channel => channels::channel_not_found_message(value),
+            Self::Dashboard => format!("The {} was not found.", self.described()),
+            // Spelled out rather than `_`, so a resource kind added later is a
+            // compile error here rather than silently taking this wording.
+            Self::Trail => format!("The {} {value} was not found.", self.described()),
+        }
+    }
+
+    /// Whether a resource-based policy can be attached to this kind of resource:
+    /// true for the three kinds the `ResourceArn` doc names, false for every other
+    /// CloudTrail resource — which is what `ResourceTypeNotSupportedException`
+    /// ("the specified resource type is not supported by CloudTrail") refuses.
+    pub fn takes_resource_policy(self) -> bool {
+        match self {
+            Self::EventDataStore | Self::Dashboard | Self::Channel => true,
+            Self::Trail => false,
+        }
+    }
+}
+
+/// A CloudTrail resource ARN, as a resource-policy operation reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyResourceArn {
+    pub kind: ResourceKind,
+    /// The Region the ARN pins the resource to.
+    pub region: String,
+    /// The resource segment after the `<type>/` prefix: a dashboard's name, an event
+    /// data store's or a channel's id.
+    pub id: String,
+}
+
+impl PolicyResourceArn {
+    /// This resource's canonical ARN — the one the emulator mints for it, which is
+    /// the key its policy is stored under.
+    ///
+    /// Reading an ARN back out canonically is what keeps two spellings of one
+    /// resource (another partition, or a caller quoting a real account id) from
+    /// addressing two different policies, exactly as a dashboard lookup keys on the
+    /// name and the Region rather than on the ARN's account segment.
+    pub fn canonical(&self) -> String {
+        ::engine::emulator_arn(
+            SERVICE_NAMESPACE,
+            &self.region,
+            &format!("{}{}", self.kind.resource_prefix(), self.id),
+        )
+    }
+}
+
+/// Read `arn:<partition>:cloudtrail:<region>:<account>:<type>/<id>`, the ARN form the
+/// model documents for every resource a resource-based policy can name.
+///
+/// The six-field split is NOT re-derived here: it is
+/// [`service_common::arn::parse_of`], the one caller-supplied-ARN parse, narrowed to
+/// this service's vendor. What this layers on top of it is CloudTrail's own: a
+/// resource is homed in a Region and an account (the shared parse admits the
+/// partition-global and account-less forms AWS writes for other services, which no
+/// CloudTrail resource has), and the resource field names one of this service's
+/// resource kinds with a non-empty id.
+///
+/// `None` is a value that is not a CloudTrail resource ARN at all: a bare name, an
+/// ARN of another service, one missing a field, or one whose resource segment names
+/// no CloudTrail resource type.
+///
+/// SHARES ITS SUBJECT WITH [`parse_taggable_arn`], which classifies the same four
+/// CloudTrail resource kinds for the TAGGING surface. The two are kept apart because
+/// what each surface does with a kind differs beyond the wording: a tagging ARN has to
+/// satisfy the addressed resource's own naming rules before it can be refused as the
+/// right kind of invalid ARN (`ChannelARNInvalidException` versus
+/// `CloudTrailARNInvalidException`), while a policy ARN is classified only to pick
+/// between `ResourceARNNotValidException`, `ResourceTypeNotSupportedException` and
+/// `ResourceNotFoundException` and is then resolved through the registries. Both read
+/// the ARN itself through [`::service_common::arn`], so neither re-derives the split;
+/// a change to WHICH resource types this service has belongs in both, and the fix that
+/// merges them states the shared classification once and layers each surface's
+/// rejection mapping on top.
+pub fn parse_resource_arn(value: &str) -> Option<PolicyResourceArn> {
+    let parsed = ::service_common::arn::parse_of(value, SERVICE_NAMESPACE)?;
+    if parsed.region.is_empty() || parsed.account.is_empty() {
+        return None;
+    }
+    let kind = ResourceKind::ALL
+        .into_iter()
+        .find(|kind| kind.resource_type() == parsed.resource_type())?;
+    // The shared reader takes the id out of either form AWS writes a resource in
+    // (`<type>/<id>` and `<type>:<id>`); CloudTrail writes the slash form, which is
+    // the one the canonical ARN this resolves to is built in.
+    let id = ::service_common::arn::resource_id_of_type(value, kind.resource_type())?;
+    if id.is_empty() {
+        return None;
+    }
+    Some(PolicyResourceArn {
+        kind,
+        region: parsed.region.to_string(),
+        id: id.to_string(),
+    })
+}
+
+/// Why a resource-policy operation could not reach the resource its `ResourceArn`
+/// names.
+///
+/// Each variant names the modelled error every resource-policy operation answers it
+/// with, so the three operations cannot drift in how they refuse one ARN.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyResourceRejection {
+    /// Not a well-formed CloudTrail resource ARN ⇒ `ResourceARNNotValidException`
+    /// (HTTP 400).
+    ArnNotValid(String),
+    /// A well-formed CloudTrail ARN naming a resource type that carries no
+    /// resource-based policy ⇒ `ResourceTypeNotSupportedException` (HTTP 400).
+    TypeNotSupported(String),
+    /// A well-formed ARN of a supported type that names no stored resource ⇒
+    /// `ResourceNotFoundException` (HTTP 400).
+    ResourceNotFound(String),
+}
+
+impl PolicyResourceRejection {
+    /// The refusal text: built from the request, naming the value and the rule it
+    /// broke, so a caller can fix the request from it alone.
+    ///
+    /// Borrowed, so a handler reads the text and matches on the variant without
+    /// cloning the rejection.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::ArnNotValid(message)
+            | Self::TypeNotSupported(message)
+            | Self::ResourceNotFound(message) => message,
+        }
+    }
+}
+
+/// The resource a resource-policy operation addresses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyResource {
+    /// The canonical ARN of the resource, which is the registry key its policy is
+    /// stored under and the ARN the operation reports back.
+    pub arn: String,
+    /// Whether the resource has finished loading. A resource CloudTrail is still
+    /// loading is what `ConflictException` ("the specified resource is not ready for
+    /// an operation … before CloudTrail has time to fully load the resource")
+    /// refuses a WRITE to; a read reports its policy regardless.
+    pub ready: bool,
+}
+
+impl ComAmazonawsCloudtrailCloudtrail20131101State {
+    /// Resolve a caller-supplied `ResourceArn` to the resource whose policy it
+    /// addresses, materialising any transition that resource's clock already owes.
+    ///
+    /// The three refusals are ordered the way the ARN is read: an ARN that is not a
+    /// CloudTrail resource ARN cannot name a resource type, and a resource type that
+    /// carries no policy cannot be looked up.
+    pub fn resolve_policy_resource(
+        &mut self,
+        value: &str,
+        now: SystemTime,
+    ) -> Result<PolicyResource, PolicyResourceRejection> {
+        let parsed = parse_resource_arn(value).ok_or_else(|| {
+            // The recorded refusal names the value and nothing else: "The format of
+            // the resource ARN <value> is not valid." — built from the request, so a
+            // caller sees which value it was.
+            PolicyResourceRejection::ArnNotValid(format!(
+                "The format of the resource ARN {value} is not valid."
+            ))
+        })?;
+        if !parsed.kind.takes_resource_policy() {
+            return Err(PolicyResourceRejection::TypeNotSupported(format!(
+                "Resource type '{}' does not support resource-based policies: a CloudTrail \
+                 resource-based policy attaches to an event data store, a dashboard or a \
+                 channel",
+                parsed.kind.resource_type()
+            )));
+        }
+
+        let ready = match parsed.kind {
+            // Through the dashboard registry's own reader, so the key shape and the
+            // transition the clock owes (`CREATING -> CREATED`, due at `settles_at`
+            // whether or not anybody addressed the dashboard) are stated once. The
+            // ARN's own Region is the Region the identifier is read in, and its
+            // resource id is the dashboard's name.
+            ResourceKind::Dashboard => self
+                .resolve_dashboard_mut(&parsed.id, &parsed.region, now)
+                .map(|record| record.status != DASHBOARD_STATUS_CREATING),
+            // An event data store id is unique across Regions, and a store is
+            // reachable only from the Region it lives in — so an ARN pinning
+            // another Region names no store.
+            ResourceKind::EventDataStore => self
+                .event_data_stores
+                .get(&parsed.id)
+                .filter(|record| record.region == parsed.region)
+                // `EventDataStoreStatus` carries no "still loading" state, so a
+                // stored store is ready for a write unless it is on its way out:
+                // a store awaiting deletion is the resource `ConflictException`
+                // ("another operation is modifying the resource") covers.
+                .map(|record| record.status.is_queryable()),
+            // A channel lives in the Region its ARN carries, keyed by the id
+            // CloudTrail minted for it ([`channels::ChannelKey`]). A channel record
+            // carries no transient status, so a stored channel is ready to take a
+            // policy.
+            ResourceKind::Channel => self
+                .channels
+                .get(&(parsed.id.clone(), parsed.region.clone()))
+                .map(|_| true),
+            // Refused above by `takes_resource_policy`; answered rather than
+            // panicked so the two rules cannot disagree at runtime.
+            ResourceKind::Trail => None,
+        };
+        let Some(ready) = ready else {
+            return Err(PolicyResourceRejection::ResourceNotFound(
+                parsed.kind.not_found_message(value),
+            ));
+        };
+
+        Ok(PolicyResource {
+            arn: parsed.canonical(),
+            ready,
+        })
+    }
+}
+
+/// The policy elements a resource-based policy statement is checked against, from
+/// the IAM JSON policy grammar: a statement states an `Effect` of `Allow` or `Deny`,
+/// an `Action` (or `NotAction`), and — because this is a policy attached TO a
+/// resource rather than to an identity — a `Principal` (or `NotPrincipal`).
+const POLICY_EFFECTS: [&str; 2] = ["Allow", "Deny"];
+
+/// Check a caller-supplied resource-based policy document.
+///
+/// `Err` carries the refusal text for `ResourcePolicyNotValidException`, which the
+/// model documents for a policy that "has syntax errors, or contains a principal
+/// that is not valid" — so the syntax of the JSON policy document and the presence
+/// of a usable principal are what this checks, each named in the message so a caller
+/// can fix the request from it alone.
+///
+/// MIGRATION NOTE: the GRAMMAR this walks is one IAM rule, and three other services
+/// already walk it against their own recorded wording —
+/// `service-com-amazonaws-ecr-amazonec2containerregistry-v20150921`,
+/// `service-com-amazonaws-s3files-s3files` and `service-com-amazonaws-rum-rum`, each
+/// in its own `src/state.rs`. `services/common` carries no shared grammar check yet
+/// (its `iam_authorization` / `iam_trust_policy` EVALUATE a policy rather than
+/// validate one, and the latter's parse is `pub(crate)`), and each copy's messages
+/// are its service's dialect, so the structural fix is a shared
+/// `services/common` policy-grammar module that takes the per-service wording from
+/// its caller and that every copy — this one included — then calls. Until that lands
+/// the document is still parsed by `serde_json` rather than by a hand-rolled parser,
+/// and only the element checks live here.
+pub fn validate_resource_policy(document: &str) -> Result<(), String> {
+    let parsed: ::serde_json::Value = ::serde_json::from_str(document)
+        .map_err(|error| format!("The resource policy is not valid JSON: {error}"))?;
+    let Some(members) = parsed.as_object() else {
+        return Err(
+            "The resource policy must be a JSON object carrying a Statement element".to_string(),
+        );
+    };
+
+    let statement = members.get("Statement").ok_or_else(|| {
+        "The resource policy carries no Statement element: a policy document states at least \
+         one statement"
+            .to_string()
+    })?;
+    let statements: Vec<&::serde_json::Value> = match statement {
+        // The Statement element is a statement or an array of statements.
+        ::serde_json::Value::Array(items) => items.iter().collect(),
+        ::serde_json::Value::Object(_) => vec![statement],
+        _ => {
+            return Err(
+                "The resource policy's Statement element must be a statement or an array of \
+                 statements"
+                    .to_string(),
+            )
+        }
+    };
+    if statements.is_empty() {
+        return Err(
+            "The resource policy's Statement element is empty: a policy document states at \
+             least one statement"
+                .to_string(),
+        );
+    }
+
+    for (index, statement) in statements.iter().enumerate() {
+        // 1-based, so the message counts statements the way a caller reads them.
+        let position = index + 1;
+        let Some(elements) = statement.as_object() else {
+            return Err(format!(
+                "Statement {position} of the resource policy is not a JSON object"
+            ));
+        };
+
+        let effect = elements.get("Effect").and_then(::serde_json::Value::as_str);
+        if !effect.is_some_and(|effect| POLICY_EFFECTS.contains(&effect)) {
+            return Err(format!(
+                "Statement {position} of the resource policy must state an Effect of {} or {}",
+                POLICY_EFFECTS[0], POLICY_EFFECTS[1]
+            ));
+        }
+        if !elements.contains_key("Action") && !elements.contains_key("NotAction") {
+            return Err(format!(
+                "Statement {position} of the resource policy states no Action or NotAction"
+            ));
+        }
+        let principal = elements
+            .get("Principal")
+            .or_else(|| elements.get("NotPrincipal"));
+        let Some(principal) = principal else {
+            return Err(format!(
+                "Statement {position} of the resource policy states no Principal: a \
+                 resource-based policy names the principal it grants access to"
+            ));
+        };
+        if !is_valid_principal(principal) {
+            return Err(format!(
+                "Statement {position} of the resource policy contains a principal that is not \
+                 valid: a Principal is `*`, or a map of principal type to one or more \
+                 non-empty identifiers"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Whether a statement's `Principal` element names a principal at all: the `*`
+/// wildcard, or a map of principal type (`AWS`, `Service`, …) to one identifier or a
+/// non-empty list of them, as the IAM JSON policy `Principal` element documents.
+fn is_valid_principal(principal: &::serde_json::Value) -> bool {
+    let named = |value: &::serde_json::Value| {
+        value
+            .as_str()
+            .is_some_and(|identifier| !identifier.trim().is_empty())
+    };
+    match principal {
+        ::serde_json::Value::String(_) => named(principal),
+        ::serde_json::Value::Object(types) => {
+            !types.is_empty()
+                && types.values().all(|identifiers| match identifiers {
+                    ::serde_json::Value::Array(items) => {
+                        !items.is_empty() && items.iter().all(named)
+                    }
+                    other => named(other),
+                })
+        }
+        _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tagging: the resource a tagging call addresses by ARN
 // ---------------------------------------------------------------------------
 
@@ -1926,10 +2378,6 @@ pub const TAGGING_REFUSAL_STATUS: u16 = 400;
 /// How many ARNs one `ListTags` call may name, from the model doc for
 /// `ListTagsRequest$ResourceIdList`: "The list has a limit of 20 ARNs."
 pub const LIST_TAGS_RESOURCE_LIMIT: usize = 20;
-
-/// The resource prefix of a channel ARN:
-/// `arn:aws:cloudtrail:<region>:<account>:channel/<channel-id>`.
-const CHANNEL_RESOURCE_PREFIX: &str = "channel/";
 
 /// A well-formed tagging ARN: which kind of resource it names, the Region that
 /// resource lives in, and its name or id.
@@ -2062,6 +2510,10 @@ impl TaggableArnRejection {
 /// the bare name / bare id form their OWN operations document, and each already knows
 /// which kind of resource it is looking for, while a tagging `ResourceId` has to be
 /// classified by kind before it can be read at all.
+///
+/// [`parse_resource_arn`] classifies the same four kinds for the resource-POLICY
+/// surface; see the note there for what keeps the two apart and what merging them
+/// would take.
 pub fn parse_taggable_arn(value: &str) -> Result<TaggableArn, TaggableArnRejection> {
     let reject = || {
         if value.contains(CHANNEL_RESOURCE_PREFIX) {

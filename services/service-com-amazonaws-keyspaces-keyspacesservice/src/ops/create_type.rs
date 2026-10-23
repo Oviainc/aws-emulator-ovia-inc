@@ -235,7 +235,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // The service-managed keyspaces are part of the account before any call.
+        store.ensure_service_managed_catalog(&region);
         store.settle(now);
+
+        // A service-managed keyspace takes none of the caller's resources: Cassandra
+        // refuses DDL against a system keyspace as an invalid query ("system keyspace is
+        // not user-modifiable"), which is this operation's `ValidationException`.
+        if crate::state::is_service_managed_keyspace(&input.keyspace_name) {
+            return Err(CreateTypeErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::service_managed_rejection(&input.keyspace_name)),
+            })
+            .into());
+        }
 
         let Some(keyspace) = store.keyspaces.get_mut(&input.keyspace_name) else {
             return Err(CreateTypeErrorModeled::ResourceNotFoundException(

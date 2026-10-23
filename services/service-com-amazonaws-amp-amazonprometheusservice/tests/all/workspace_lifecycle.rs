@@ -15,8 +15,8 @@
 use bytes::Bytes;
 use service_com_amazonaws_amp_amazonprometheusservice::ops::types::WORKSPACE_STATUS_CODE_VALUES;
 use service_com_amazonaws_amp_amazonprometheusservice::state::{
-    STATUS_ACTIVE, STATUS_CREATING, STATUS_DELETING, TAGS_PER_RESOURCE_LIMIT, TRANSITION_DELAY,
-    WORKSPACE_QUOTA,
+    RESOURCE_NOT_FOUND_CODE, STATUS_ACTIVE, STATUS_CREATING, STATUS_DELETING,
+    TAGS_PER_RESOURCE_LIMIT, TRANSITION_DELAY, WORKSPACE_QUOTA,
 };
 use service_com_amazonaws_amp_amazonprometheusservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -168,7 +168,12 @@ impl Amp {
         self.call("DELETE", &uri, region, "").await
     }
 
-    async fn tag(&self, region: &str, resource_arn: &str, tags: &serde_json::Value) -> Reply {
+    pub(crate) async fn tag(
+        &self,
+        region: &str,
+        resource_arn: &str,
+        tags: &serde_json::Value,
+    ) -> Reply {
         self.call(
             "POST",
             &format!("/tags/{}", encode_label(resource_arn)),
@@ -178,7 +183,7 @@ impl Amp {
         .await
     }
 
-    async fn untag(&self, region: &str, resource_arn: &str, tag_keys: &[&str]) -> Reply {
+    pub(crate) async fn untag(&self, region: &str, resource_arn: &str, tag_keys: &[&str]) -> Reply {
         let query: Vec<String> = tag_keys
             .iter()
             .map(|key| format!("tagKeys={}", encode_label(key)))
@@ -192,7 +197,7 @@ impl Amp {
         .await
     }
 
-    async fn list_tags(&self, region: &str, resource_arn: &str) -> Reply {
+    pub(crate) async fn list_tags(&self, region: &str, resource_arn: &str) -> Reply {
         self.call("GET", &format!("/tags/{}", encode_label(resource_arn)), region, "")
             .await
     }
@@ -1033,7 +1038,9 @@ async fn tags_round_trip_through_the_tag_operations() {
         "case \"reserved tag key at create\": must be refused, got {refused_at_create:?}"
     );
 
-    // An ARN naming no stored resource is a 404 from every one of the three.
+    // An ARN naming no stored resource is a 404 from every one of the three, with the
+    // code aps answers on this ARN-addressed path (`state::RESOURCE_NOT_FOUND_CODE`);
+    // `tests/all/rejection_codes.rs` holds that rule to a table of ARN types.
     let unknown_arn = format!(
         "arn:aws:aps:us-west-2:{}:workspace/ws-00000000-0000-4000-8000-000000000000",
         engine::emulator_account_id()
@@ -1057,7 +1064,7 @@ async fn tags_round_trip_through_the_tag_operations() {
         );
         assert_eq!(
             reply.error_code(),
-            "ResourceNotFoundException",
+            RESOURCE_NOT_FOUND_CODE,
             "case {case:?}: unexpected error code, got {reply:?}"
         );
     }
