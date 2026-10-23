@@ -59,7 +59,7 @@ const FRESH_DOMAIN_CONTROLLERS: i64 = 2;
 
 /// A minimal well-formed `CreateMicrosoftAD` body for `name`: only the three required
 /// members, so every other value in the stored record is one the service derived.
-fn minimal_microsoft_ad(name: &str) -> Value {
+pub(crate) fn minimal_microsoft_ad(name: &str) -> Value {
     json!({
         "Name": name,
         "Password": PASSWORD,
@@ -71,7 +71,11 @@ fn minimal_microsoft_ad(name: &str) -> Value {
 }
 
 /// `CreateMicrosoftAD` with `body`, asserting it was accepted and returning the id.
-async fn create_microsoft_ad(router: &MultiServiceRouter, body: Value, case: &str) -> String {
+pub(crate) async fn create_microsoft_ad(
+    router: &MultiServiceRouter,
+    body: Value,
+    case: &str,
+) -> String {
     let answer = ok(router, "CreateMicrosoftAD", body, case).await;
     let id = string(&answer, "DirectoryId", case);
     assert_directory_id(&id, case);
