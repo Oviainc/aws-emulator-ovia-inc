@@ -307,6 +307,33 @@ fn configure_event_data_store(
     region: &str,
     now: ::std::time::SystemTime,
 ) -> Result<PutEventConfigurationOutput, PutEventConfigurationError> {
+    // The store the call addresses is resolved FIRST: existence dominates the
+    // parameter rules below, so a caller probing an identifier that names no store
+    // is told the store is absent rather than being told about a parameter of a
+    // store that is not there. It is the order `EnableFederation`,
+    // `DisableFederation` and `GetEventConfiguration` already resolve it in.
+    let parsed =
+        crate::state::parse_event_data_store_identifier(identifier).map_err(|rejection| {
+            PutEventConfigurationErrorModeled::EventDataStoreARNInvalidException(
+                EventDataStoreARNInvalidException {
+                    message: Some(rejection.message(region)),
+                },
+            )
+        })?;
+    let addressed_arn = parsed.arn(region);
+    let Some(record) = store.addressed_event_data_store_mut(&parsed, region) else {
+        return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+            PutEventConfigurationErrorModeled::EventDataStoreNotFoundException(
+                EventDataStoreNotFoundException {
+                    message: Some(crate::state::event_data_store_not_found_message(
+                        &addressed_arn,
+                    )),
+                },
+            ),
+            EVENT_DATA_STORE_NOT_FOUND_STATUS,
+        ));
+    };
+
     let (Some(max_event_size), Some(context_key_selectors)) = (
         input.max_event_size.as_deref(),
         input.context_key_selectors.as_deref(),
@@ -356,28 +383,6 @@ fn configure_event_data_store(
             .into(),
         );
     }
-
-    let parsed =
-        crate::state::parse_event_data_store_identifier(identifier).map_err(|rejection| {
-            PutEventConfigurationErrorModeled::EventDataStoreARNInvalidException(
-                EventDataStoreARNInvalidException {
-                    message: Some(rejection.message(region)),
-                },
-            )
-        })?;
-    let addressed_arn = parsed.arn(region);
-    let Some(record) = store.addressed_event_data_store_mut(&parsed, region) else {
-        return Err(crate::scaffolded::Scaffolded::modeled_with_status(
-            PutEventConfigurationErrorModeled::EventDataStoreNotFoundException(
-                EventDataStoreNotFoundException {
-                    message: Some(crate::state::event_data_store_not_found_message(
-                        &addressed_arn,
-                    )),
-                },
-            ),
-            EVENT_DATA_STORE_NOT_FOUND_STATUS,
-        ));
-    };
     // A store awaiting deletion holds no configuration to change, which is what
     // the modelled `InactiveEventDataStoreException` ("The event data store is
     // inactive") reports.
@@ -423,28 +428,10 @@ fn configure_trail(
     identifier: &str,
     region: &str,
 ) -> Result<PutEventConfigurationOutput, PutEventConfigurationError> {
-    let Some(aggregation_configurations) = input.aggregation_configurations.as_deref() else {
-        return Err(crate::scaffolded::Scaffolded::validation(
-            crate::state::MISSING_TRAIL_CONFIGURATION_MESSAGE,
-        ));
-    };
-    // `MaxEventSize` and `ContextKeySelectors` configure an event data store, so
-    // neither can come with a trail.
-    if input.max_event_size.is_some() || input.context_key_selectors.is_some() {
-        return Err(
-            PutEventConfigurationErrorModeled::InvalidParameterCombinationException(
-                InvalidParameterCombinationException {
-                    message: Some(
-                        "MaxEventSize and ContextKeySelectors configure an event data store, \
-                         so neither can be set with TrailName."
-                            .to_string(),
-                    ),
-                },
-            )
-            .into(),
-        );
-    }
-
+    // The trail the call addresses is resolved FIRST, for the reason the event
+    // data store branch resolves its store first: existence dominates the
+    // parameter rules below.
+    //
     // Configuration is written in the trail's own Region, as every other change
     // to a trail is: a trail of this name in another Region, or one addressed by
     // an ARN from another Region, exists but cannot be driven from here. A
@@ -493,15 +480,41 @@ fn configure_trail(
             )
             .into())
         }
-        crate::state::TrailForMutation::Absent { .. } => {
+        crate::state::TrailForMutation::Absent { name } => {
+            // The model says 404 for a not-found trail; CloudTrail answers 400
+            // (`crate::state::TRAIL_NOT_FOUND_STATUS`), and the refusal names the
+            // trail by the ARN the identifier resolved to
+            // (`crate::state::trail_not_found_arn_message`).
             return Err(crate::scaffolded::Scaffolded::modeled_with_status(
                 PutEventConfigurationErrorModeled::TrailNotFoundException(TrailNotFoundException {
-                    message: Some(crate::state::unknown_trail_message(identifier)),
+                    message: Some(crate::state::trail_not_found_arn_message(region, &name)),
                 }),
                 crate::state::TRAIL_NOT_FOUND_STATUS,
             ))
         }
     };
+
+    let Some(aggregation_configurations) = input.aggregation_configurations.as_deref() else {
+        return Err(crate::scaffolded::Scaffolded::validation(
+            crate::state::MISSING_TRAIL_CONFIGURATION_MESSAGE,
+        ));
+    };
+    // `MaxEventSize` and `ContextKeySelectors` configure an event data store, so
+    // neither can come with a trail.
+    if input.max_event_size.is_some() || input.context_key_selectors.is_some() {
+        return Err(
+            PutEventConfigurationErrorModeled::InvalidParameterCombinationException(
+                InvalidParameterCombinationException {
+                    message: Some(
+                        "MaxEventSize and ContextKeySelectors configure an event data store, \
+                         so neither can be set with TrailName."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into(),
+        );
+    }
 
     record.aggregation_configurations = aggregation_configurations.to_vec();
 

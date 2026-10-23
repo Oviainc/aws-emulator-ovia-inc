@@ -403,14 +403,20 @@ async fn trail_names_follow_the_documented_name_rules() {
                 "InvalidTrailNameException",
             );
     }
-    emulator
+    // `DescribeTrails` is the exception, and not because the name rule is laxer
+    // there: it SELECTS the trails to report, so an entry that can name no trail
+    // matches none and narrows the answer instead of failing the request.
+    let described = emulator
         .call("DescribeTrails", &json!({"trailNameList": ["my--namespace"]}))
-        .await
-        .expect_error(
-            "DescribeTrails with an invalid name",
-            400,
-            "InvalidTrailNameException",
-        );
+        .await;
+    assert_eq!(
+        names(
+            described.expect_ok("DescribeTrails with an invalid name"),
+            "trailList"
+        ),
+        Vec::<String>::new(),
+        "case DescribeTrails with an invalid name: expected no trails, got {described:?}"
+    );
 }
 
 /// Every operation that takes a trail identifier accepts the trail's ARN as well as
