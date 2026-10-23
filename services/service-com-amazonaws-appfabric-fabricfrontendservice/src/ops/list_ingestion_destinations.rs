@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListIngestionDestinations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListIngestionDestinations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! REPORTS one ingestion's destinations, one page at a time, and writes nothing:
+//! every item is built from a stored record (see
+//! [`crate::state::IngestionDestinationRecord::to_summary`]), so a listing
+//! reflects exactly what `CreateIngestionDestination` and
+//! `UpdateIngestionDestination` wrote.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListIngestionDestinations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `@readonly` and `@paginated(items: ingestionDestinations)`: a page is taken
+//! through [`crate::state::page`], whose token names the position of the last
+//! record the page returned WITHIN this ingestion's listing, so following tokens
+//! visits every destination exactly once.
+//!
+//! Both parents are looked up before the page is taken, and a parent the store
+//! does not hold is the HTTP 404 `ResourceNotFoundException` this operation
+//! models — the READING path's answer for an identifier the write path refuses
+//! with HTTP 400 instead (see `crate::state::ingestion_does_not_exist`).
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +171,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListIngestionDestinations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListIngestionDestinationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListIngestionDestinations"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListIngestionDestinationsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the AppFabric emulator could not reach its state store"
+                            .to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let store = state.lock();
+        let Some(bundle) = store.resolve_bundle(&input.app_bundle_identifier) else {
+            return Err(
+                ListIngestionDestinationsErrorModeled::ResourceNotFoundException(
+                    crate::state::app_bundle_not_found(&input.app_bundle_identifier),
+                )
+                .into(),
+            );
+        };
+        let Some(ingestion) = bundle.resolve_ingestion(&input.ingestion_identifier) else {
+            return Err(
+                ListIngestionDestinationsErrorModeled::ResourceNotFoundException(
+                    crate::state::ingestion_not_found(&input.ingestion_identifier),
+                )
+                .into(),
+            );
+        };
+
+        let destinations = ingestion.destinations_in_order();
+        // The token is scoped to THIS ingestion's destinations, so one
+        // ingestion's token is not read as a position in another's listing.
+        let listing = crate::state::ingestion_destination_listing(&ingestion.id);
+        let page = crate::state::page(
+            &destinations,
+            &listing,
+            |destination| destination.sequence,
+            crate::state::IngestionDestinationRecord::to_summary,
+            input.max_results,
+            input.next_token.as_deref(),
+        )
+        .map_err(ListIngestionDestinationsErrorModeled::ValidationException)?;
+
+        Ok(ListIngestionDestinationsOutput {
+            ingestion_destinations: page.items,
+            next_token: page.next_token,
+        })
     }
 }

@@ -108,6 +108,40 @@ impl Emulator {
     }
 
     async fn create_ingestion(&self, bundle: &str) -> Answer {
+        // AppFabric's chain is authorize → connect → ingest: an ingestion needs
+        // a CONNECTED app authorization for its (app, tenant) pair, so the
+        // destination tests set that dependency up before creating the parent
+        // ingestion they actually assert on.
+        let created = self
+            .call(
+                "POST",
+                &format!("/appbundles/{}/appauthorizations", encode(bundle)),
+                Some(json!({
+                    "app": "SLACK",
+                    "authType": "apiKey",
+                    "credential": {"apiKeyCredential": {"apiKey": "placeholder-api-key"}},
+                    "tenant": {"tenantIdentifier": "t-1", "tenantDisplayName": "t-1"},
+                })),
+            )
+            .await;
+        if let Some(authorization) = created
+            .body
+            .get("appAuthorization")
+            .and_then(|authorization| authorization.get("appAuthorizationArn"))
+            .and_then(Value::as_str)
+        {
+            let _ = self
+                .call(
+                    "POST",
+                    &format!(
+                        "/appbundles/{}/appauthorizations/{}/connect",
+                        encode(bundle),
+                        encode(authorization)
+                    ),
+                    Some(json!({})),
+                )
+                .await;
+        }
         self.call(
             "POST",
             &format!("/appbundles/{}/ingestions", encode(bundle)),

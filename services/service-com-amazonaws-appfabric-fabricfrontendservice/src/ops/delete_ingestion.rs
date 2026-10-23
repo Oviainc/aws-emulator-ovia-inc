@@ -173,10 +173,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // The bundle is the parent of this path and a resource of its own: an
         // identifier naming no stored bundle is the not-found this operation
-        // models, the same answer `GetIngestion` and `ListIngestions` give.
+        // models, worded the way AppFabric words it on a WRITE path (see
+        // `crate::state::app_bundle_id_not_valid`).
         let Some(bundle) = store.resolve_bundle_mut(&input.app_bundle_identifier) else {
             return Err(DeleteIngestionErrorModeled::ResourceNotFoundException(
-                crate::state::app_bundle_not_found(&input.app_bundle_identifier),
+                crate::state::app_bundle_id_not_valid(&input.app_bundle_identifier),
             )
             .into());
         };

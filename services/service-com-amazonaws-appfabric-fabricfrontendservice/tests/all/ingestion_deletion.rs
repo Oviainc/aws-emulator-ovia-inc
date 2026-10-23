@@ -384,12 +384,12 @@ async fn deleting_under_an_unknown_app_bundle_is_not_found() {
 
 /// Put the stored ingestion into the `IngestionState` a precondition row needs.
 ///
-/// `StartIngestion` and `StopIngestion` are still scaffolded (HTTP 501), so the
-/// store is the only way to reach the `enabled` state — and it is the SAME store
-/// the handler reads (`state::service_state`, the engine this emulator was
-/// mounted on), so the set-up is the real record, not a double of one. The
-/// destinations a row needs are created through the real
-/// `CreateIngestionDestination` instead (see [`create_destination`]).
+/// `StartIngestion` is still scaffolded (HTTP 501), so the store is the only way
+/// to reach the `enabled` state — and it is the SAME store the handler reads
+/// (`state::service_state`, the engine this emulator was mounted on), so the
+/// set-up is the real record, not a double of one. The destinations a row needs
+/// are created through the real `CreateIngestionDestination` instead (see
+/// [`create_destination`]).
 fn set_ingestion_state(
     engine: &engine::InMemoryEngine,
     bundle_identifier: &str,

@@ -123,7 +123,58 @@ impl Emulator {
         self.call("GET", &format!("/appbundles{query}"), None).await
     }
 
+    /// The dependency AppFabric's resource chain puts BEFORE an ingestion: the
+    /// bundle must already hold an app authorization for the ingestion's
+    /// (`app`, `tenantId`) pair that has completed the connect handshake
+    /// (authorize → connect → ingest).
+    ///
+    /// Every failure here is ignored on purpose: a caller may be exercising a
+    /// bundle that does not exist, or a pair this bundle already holds an
+    /// authorization for. What a test asserts on is always the call that
+    /// follows.
+    pub(crate) async fn authorize(&self, bundle: &str, app: &str, tenant: &str) {
+        let created = self
+            .call(
+                "POST",
+                &format!("/appbundles/{}/appauthorizations", encode(bundle)),
+                Some(json!({
+                    "app": app,
+                    "authType": "apiKey",
+                    "credential": {"apiKeyCredential": {"apiKey": "placeholder-api-key"}},
+                    "tenant": {"tenantIdentifier": tenant, "tenantDisplayName": tenant},
+                })),
+            )
+            .await;
+        let Some(authorization) = created
+            .body
+            .get("appAuthorization")
+            .and_then(|authorization| authorization.get("appAuthorizationArn"))
+            .and_then(Value::as_str)
+        else {
+            return;
+        };
+        let _ = self
+            .call(
+                "POST",
+                &format!(
+                    "/appbundles/{}/appauthorizations/{}/connect",
+                    encode(bundle),
+                    encode(authorization)
+                ),
+                Some(json!({})),
+            )
+            .await;
+    }
+
     pub(crate) async fn create_ingestion(&self, bundle: &str, body: Value) -> Answer {
+        // Satisfy the ingestion's app-authorization dependency first, so a test
+        // about ingestions is not a test about the chain that precedes them.
+        if let (Some(app), Some(tenant)) = (
+            body.get("app").and_then(Value::as_str),
+            body.get("tenantId").and_then(Value::as_str),
+        ) {
+            self.authorize(bundle, app, tenant).await;
+        }
         self.call(
             "POST",
             &format!("/appbundles/{}/ingestions", encode(bundle)),
