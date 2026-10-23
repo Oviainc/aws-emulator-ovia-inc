@@ -84,6 +84,14 @@ pub const MAX_ACTIVITY_TYPES_PER_DOMAIN: usize = 1_000;
 /// `LimitExceededFault`.
 pub const MAX_EXECUTIONS_PER_DOMAIN: usize = 1_000;
 
+/// The largest count a visibility `Count*` operation reports in one answer. The
+/// modelled `truncated` member is what reports a count clipped to it: "If set to true,
+/// indicates that the actual count was more than the maximum supported by this API and
+/// the count returned is the truncated value." Emulator-chosen, and equal to
+/// [`MAX_EXECUTIONS_PER_DOMAIN`] — the most executions one domain can hold — so a count
+/// this emulator can actually reach is never clipped and `truncated` stays false.
+pub const MAX_REPORTED_EXECUTION_COUNT: usize = MAX_EXECUTIONS_PER_DOMAIN;
+
 /// The page size `GetWorkflowExecutionHistory` uses when the caller passes no
 /// `maximumPageSize` (the member defaults to `0`), so one unparameterised request
 /// cannot materialise a response that grows without bound. It is the modelled

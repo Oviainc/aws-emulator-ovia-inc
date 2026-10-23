@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CountOpenWorkflowExecutions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CountOpenWorkflowExecutions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CountOpenWorkflowExecutions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Counts the OPEN workflow executions stored in the named domain whose start time
+//! meets the required `startTimeFilter` window and which match whichever ONE of the
+//! mutually exclusive `executionFilter`/`typeFilter`/`tagFilter` the request carries.
+//! A reporting operation: it reads state and writes nothing, and a domain name the
+//! store does not hold counts zero (see the note on the lookup in `handle`).
 //!
 //! ## Shape of an operation
 //!
@@ -165,20 +162,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CountOpenWorkflowExecutions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CountOpenWorkflowExecutionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CountOpenWorkflowExecutionsErrorModeled::OperationNotPermittedFault(
+                OperationNotPermittedFault {
+                    message: Some("the SWF domain store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // "executionFilter, typeFilter and tagFilter are mutually exclusive. You can
+        // specify at most one of these in a request." The model cannot express that, so
+        // a request carrying two of them is refused here as a bad request rather than
+        // counted under some invented precedence.
+        crate::state::validate_exclusive_filters(&[
+            ("executionFilter", input.execution_filter.is_some()),
+            ("typeFilter", input.type_filter.is_some()),
+            ("tagFilter", input.tag_filter.is_some()),
+        ])
+        .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        let guard = state.lock();
+        // This operation is documented as an eventually consistent, best-effort REPORT
+        // over the domain's visibility store ("The results are best effort and may not
+        // exactly reflect recent updates and changes"), and the recorded AWS answer for
+        // a domain name that was never registered is a successful count of zero, not
+        // the modelled `UnknownResourceFault` (corpus unit
+        // `swf.count-open-executions-unknown-domain-returns-zero`). A name with no
+        // stored domain therefore holds no matching runs, and reporting that must not
+        // create the domain: callers that DO address a resource (DescribeDomain,
+        // StartWorkflowExecution) keep answering `UnknownResourceFault` for it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CountOpenWorkflowExecutions"))
+        // A domain's registration status does not gate the count either: deprecating a
+        // domain stops new registrations and starts in it, while its executions stay
+        // visible.
+        let matched = guard
+            .domains
+            .get(&input.domain)
+            .map(|domain| {
+                domain
+                    .executions
+                    .values()
+                    .filter(|execution| {
+                        // OPEN only: a run that has closed is counted by
+                        // `CountClosedWorkflowExecutions` instead.
+                        execution.is_open()
+                            && crate::state::within_time_window(
+                                execution.start_timestamp,
+                                &input.start_time_filter,
+                            )
+                            && crate::state::execution_matches_filters(
+                                execution,
+                                input.execution_filter.as_ref(),
+                                input.type_filter.as_ref(),
+                                input.tag_filter.as_ref(),
+                            )
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+
+        // `truncated` reports a count clipped to the most this API answers with; one
+        // domain holds fewer executions than that cap, so it stays false.
+        let truncated = matched > crate::state::MAX_REPORTED_EXECUTION_COUNT;
+        let reported = matched.min(crate::state::MAX_REPORTED_EXECUTION_COUNT);
+        Ok(CountOpenWorkflowExecutionsOutput {
+            count: i32::try_from(reported).unwrap_or(i32::MAX),
+            truncated,
+        })
     }
 }
