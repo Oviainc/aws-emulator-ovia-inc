@@ -199,11 +199,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if content_length > crate::state::MAX_HOSTED_CONFIGURATION_BYTES {
             return Err(CreateHostedConfigurationVersionErrorModeled::PayloadTooLargeException(
                 PayloadTooLargeException {
-                    message: Some(format!(
-                        "The configuration content is larger than the maximum of {} bytes this \
-                         emulator stores for a hosted configuration version.",
-                        crate::state::MAX_HOSTED_CONFIGURATION_BYTES
-                    )),
+                    // The service's own fixed text, not prose of the emulator's: a client
+                    // that surfaces or matches `Message` must see what AppConfig sends.
+                    // The numbers are reported in the members that exist for them.
+                    message: Some(
+                        crate::state::CONTENT_SIZE_LIMIT_EXCEEDED_MESSAGE.to_string(),
+                    ),
                     measure: Some(crate::state::BYTES_MEASURE_KILOBYTES.to_string()),
                     limit: crate::state::MAX_HOSTED_CONFIGURATION_BYTES as f32
                         / crate::state::BYTES_PER_KILOBYTE,
@@ -216,9 +217,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(application) = store.applications.get(&input.application_id) else {
             return Err(CreateHostedConfigurationVersionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "No application with id {} exists.",
-                        input.application_id
+                    message: Some(crate::state::application_not_found(
+                        &input.application_id,
                     )),
                     resource_name: Some(input.application_id),
                 },
@@ -228,9 +228,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(profile) = application.profiles.get(&input.configuration_profile_id) else {
             return Err(CreateHostedConfigurationVersionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "No configuration profile with id {} exists in application {}.",
-                        input.configuration_profile_id, input.application_id
+                    message: Some(crate::state::configuration_profile_not_found(
+                        &input.application_id,
+                        &input.configuration_profile_id,
                     )),
                     resource_name: Some(input.configuration_profile_id),
                 },
@@ -252,6 +252,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         profile.location_uri,
                         crate::state::HOSTED_LOCATION_URI
                     )),
+                    reason: None,
+                    details: None,
+                },
+            )
+            .into());
+        }
+
+        // A profile of Type `AWS.AppConfig.FeatureFlags` holds a feature-flag document,
+        // not arbitrary bytes: AppConfig runs the content through its feature-flags
+        // helper extension before storing it, and refuses a document the extension
+        // rejects. Storing one anyway would leave a version a deployment could serve
+        // that AppConfig would have refused at write time.
+        if profile.profile_type.as_deref() == Some(crate::state::FEATURE_FLAGS_PROFILE_TYPE)
+            && !crate::state::feature_flags::is_valid_feature_flags_content(&input.content)
+        {
+            return Err(CreateHostedConfigurationVersionErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(
+                        crate::state::feature_flags::INVALID_FEATURE_FLAGS_CONTENT_MESSAGE
+                            .to_string(),
+                    ),
                     reason: None,
                     details: None,
                 },

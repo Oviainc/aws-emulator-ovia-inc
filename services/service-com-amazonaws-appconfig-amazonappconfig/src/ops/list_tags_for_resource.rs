@@ -155,10 +155,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(tags) = store.tags_of(&input.resource_arn) else {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "No AppConfig resource is addressed by {}.",
-                        input.resource_arn
-                    )),
+                    message: Some(crate::state::resource_arn_not_found(&input.resource_arn)),
                     resource_name: Some(input.resource_arn),
                 },
             )
