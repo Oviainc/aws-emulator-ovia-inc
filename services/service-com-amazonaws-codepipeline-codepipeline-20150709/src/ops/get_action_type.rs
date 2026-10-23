@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetActionType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetActionType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetActionType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `GetActionType` reports the action-type definition `UpdateActionType` stored.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +142,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetActionType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetActionTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetActionType"))
+        let state = crate::state::require_state(&*self.engine)?;
+
+        // The four members a request names an action type by, in the order
+        // `ActionTypeId` declares them.
+        let key = crate::state::ActionTypeKey {
+            category: input.category,
+            owner: input.owner,
+            provider: input.provider,
+            version: input.version,
+        };
+        // An action type is a regional resource, so a definition is read in the
+        // Region the reading call was signed for.
+        let region = crate::state::request_region(&ctx.parts().headers);
+
+        // This operation reports the definition of "an action type created for an
+        // external provider" — the `ActionTypeDeclaration` an `UpdateActionType` call
+        // stored. An identity no stored definition carries is refused with the error
+        // the model declares for exactly that condition; being in the action-type
+        // catalog is not enough, because a catalog entry nobody has defined has no
+        // declaration to report and this operation must never invent one.
+        let declaration = state
+            .lock()
+            .declared_action_type(&key, &region)
+            .cloned()
+            .ok_or_else(|| {
+                GetActionTypeError::from(GetActionTypeErrorModeled::ActionTypeNotFoundException(
+                    ActionTypeNotFoundException {
+                        message: Some(crate::state::action_type_not_found_message(&key.to_id())),
+                    },
+                ))
+            })?;
+
+        Ok(GetActionTypeOutput {
+            action_type: Some(declaration),
+        })
     }
 }
