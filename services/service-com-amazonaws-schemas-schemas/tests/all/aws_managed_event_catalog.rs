@@ -20,7 +20,7 @@ use service_com_amazonaws_schemas_schemas::state::{
 };
 
 use crate::registry_schema_lifecycle::{
-    export_uri, schema_names, schema_uri, walk, Emulator, ACCOUNT, REGION,
+    export_uri, schema_names, schema_uri, walk, Emulator,
 };
 
 /// The listing of the AWS-managed registry's schemas.
@@ -118,7 +118,8 @@ async fn the_catalogue_holds_the_api_call_event_type_of_every_event_source() {
 
 /// RULE: every member of the catalogue is readable — `DescribeSchema` answers 200 with
 /// the member's stored `OpenApi3` document, the description AWS derives from its name,
-/// its one version, its (empty) tag set and the ARN of the asking region.
+/// its newest version, its (empty) tag set and the empty `SchemaArn` a schema AWS
+/// publishes carries.
 #[tokio::test]
 async fn every_catalogue_member_is_described_from_the_seeded_document() {
     let emulator = Emulator::new();
@@ -158,13 +159,14 @@ async fn every_catalogue_member_is_described_from_the_seeded_document() {
         );
         assert_eq!(
             described.str_at("SchemaVersion"),
-            "1",
-            "case {name:?}: the catalogue holds one version of each member"
+            seeded.version_count.to_string(),
+            "case {name:?}: the read answers the catalogue's newest version"
         );
         assert_eq!(
             described.str_at("SchemaArn"),
-            format!("arn:aws:schemas:{REGION}:{ACCOUNT}:schema/{AWS_MANAGED_REGISTRY}/{name}"),
-            "case {name:?}: a managed schema's ARN names the asking region"
+            "",
+            "case {name:?}: a schema AWS publishes is no customer resource and carries \
+             no ARN"
         );
         assert_eq!(
             described.value_at("tags"),
@@ -252,9 +254,13 @@ async fn every_catalogue_member_exports_in_both_schema_languages() {
         );
         let event_name = name.split_once('@').map(|(_, event)| event).unwrap_or("");
         assert_eq!(
-            content["properties"]["detail"]["$ref"],
+            content["definitions"]["AWSEvent"]["properties"]["detail"]["$ref"],
             serde_json::json!(format!("#/definitions/{event_name}")),
             "case {name:?}: the detail ref must point into definitions, got {content:?}"
+        );
+        assert!(
+            content["definitions"][event_name].is_object(),
+            "case {name:?}: every component of the source is a definition, got {content:?}"
         );
     }
 }
@@ -298,9 +304,10 @@ async fn paging_the_catalogue_walks_every_member_exactly_once() {
 
 /// RULE: `SearchSchemas` over the catalogue reports the members whose DECLARED event
 /// keywords — the event source and detail type their documents record — carry every
-/// keyword, each with the ARN of the asking region and its stored version.
+/// keyword, each with its stored versions and no `SchemaArn`, which a schema AWS
+/// publishes does not have.
 #[tokio::test]
-async fn searching_the_catalogue_reports_members_with_their_arns() {
+async fn searching_the_catalogue_reports_members_without_arns() {
     let emulator = Emulator::new();
 
     // Rows: a keyword that is a source namespace, keywords of an event's detail type,
@@ -354,20 +361,15 @@ async fn searching_the_catalogue_reports_members_with_their_arns() {
                     .iter()
                     .find(|item| item["SchemaName"].as_str() == Some(name))
                     .expect("the match just asserted");
-                assert_eq!(
-                    summary["SchemaArn"].as_str(),
-                    Some(
-                        format!(
-                            "arn:aws:schemas:{REGION}:{ACCOUNT}:schema/{AWS_MANAGED_REGISTRY}/{name}"
-                        )
-                        .as_str()
-                    ),
-                    "case {keywords:?}: a managed schema's ARN names the asking region, got {summary:?}"
+                assert!(
+                    summary["SchemaArn"].is_null(),
+                    "case {keywords:?}: a summary of a schema AWS publishes carries no \
+                     SchemaArn member, got {summary:?}"
                 );
                 assert_eq!(
                     summary["SchemaVersions"][0]["SchemaVersion"].as_str(),
                     Some("1"),
-                    "case {keywords:?}: the catalogue holds one version, got {summary:?}"
+                    "case {keywords:?}: the versions are reported from one, got {summary:?}"
                 );
             }
         }

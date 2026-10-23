@@ -76,7 +76,7 @@ use super::types::*;
 // documents these constants describe (the event envelope and the component refs that
 // point at it) and this operation converts them, so one definition keeps the writer
 // and the reader from drifting apart.
-use crate::state::{EVENT_ENVELOPE_COMPONENT, JSON_SCHEMA_DRAFT4_URI, OPENAPI_COMPONENT_REF};
+use crate::state::{JSON_SCHEMA_DRAFT4_URI, OPENAPI_COMPONENT_REF};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -242,7 +242,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(ExportSchemaOutput {
             content: Some(content),
-            schema_arn: Some(registry.schema_arn_in(&region, schema)),
+            schema_arn: Some(registry.reported_schema_arn_in(&region, schema)),
             schema_name: Some(schema.name.clone()),
             schema_version: Some(version.version.to_string()),
             r#type: Some(input.r#type.clone()),
@@ -261,96 +261,128 @@ const DRAFT4_DEFINITION_REF: &str = "#/definitions/";
 
 /// Render the OpenAPI 3 document `openapi` as one JSON Schema draft-4 document.
 ///
-/// The conversion is structural and computed entirely from the stored document: the
-/// document's `components.schemas` become the draft-4 `definitions`, the root
-/// component is promoted to the document root (the event envelope when the document
-/// has one, else the only component when there is exactly one, else no component —
-/// co-equal components have no single root), and every `$ref` into
-/// `#/components/schemas/` is rewritten to the `#/definitions/` the root now holds.
+/// The conversion is structural and computed entirely from the stored document:
+///
+/// * the document's `components.schemas` become the draft-4 `definitions`, every one of
+///   them — an OpenAPI document's components are co-equal reusable schemas, with no one
+///   of them marked as the document's root, so promoting one would be this emulator
+///   choosing a root the source document does not name;
+/// * every `$ref` into `#/components/schemas/` is rewritten to the `#/definitions/`
+///   that now holds it;
+/// * `nullable: true`, OpenAPI 3.0's way of saying a member may be null, becomes
+///   draft-04's way of saying it: the member's `type` turns into the union of that type
+///   and `"null"`, and the keyword itself — which draft-04 does not define — goes;
+/// * the root carries draft-04's `$schema` and the source document's `info.title`, so
+///   the translation says which event it describes.
 ///
 /// `None` when `openapi` is not a JSON document carrying an object at
-/// `components.schemas`, or when the component chosen as the root is not an object:
-/// there is nothing to convert.
+/// `components.schemas`: there is nothing to convert.
 fn to_json_schema_draft4(openapi: &str) -> Option<String> {
     let document: ::serde_json::Value = ::serde_json::from_str(openapi).ok()?;
     let components = document.get("components")?.get("schemas")?.as_object()?;
 
-    let mut definitions: ::serde_json::Map<String, ::serde_json::Value> = components
+    let definitions: ::serde_json::Map<String, ::serde_json::Value> = components
         .iter()
-        .map(|(name, schema)| (name.clone(), rewrite_refs(schema)))
+        .map(|(name, schema)| (name.clone(), to_draft4(schema)))
         .collect();
 
-    let root_name = if definitions.contains_key(EVENT_ENVELOPE_COMPONENT) {
-        Some(EVENT_ENVELOPE_COMPONENT.to_string())
-    } else if definitions.len() == 1 {
-        definitions.keys().next().cloned()
-    } else {
-        None
-    };
-    let mut root = match root_name {
-        Some(name) => match definitions.remove(&name)? {
-            ::serde_json::Value::Object(root) => root,
-            _ => return None,
-        },
-        None => ::serde_json::Map::new(),
-    };
-
+    let mut root = ::serde_json::Map::new();
     root.insert(
         "$schema".to_string(),
         ::serde_json::Value::String(JSON_SCHEMA_DRAFT4_URI.to_string()),
     );
-    if !definitions.is_empty() {
+    if let Some(title) = document
+        .get("info")
+        .and_then(|info| info.get("title"))
+        .and_then(::serde_json::Value::as_str)
+    {
         root.insert(
-            "definitions".to_string(),
-            ::serde_json::Value::Object(definitions),
+            "title".to_string(),
+            ::serde_json::Value::String(title.to_string()),
         );
     }
+    root.insert(
+        "definitions".to_string(),
+        ::serde_json::Value::Object(definitions),
+    );
     ::serde_json::to_string(&::serde_json::Value::Object(root)).ok()
 }
 
-/// Rewrite every `$ref` in `value` from the OpenAPI component it names to the
-/// draft-4 definition of the same name, recursively, leaving everything else as it
-/// stands. A `$ref` to anything else (an external document, say) is left alone: it
-/// names nothing this conversion moved.
-fn rewrite_refs(value: &::serde_json::Value) -> ::serde_json::Value {
-    match value {
-        ::serde_json::Value::Object(members) => ::serde_json::Value::Object(
-            members
-                .iter()
-                .map(|(key, member)| {
-                    let rewritten = match (key.as_str(), member.as_str()) {
-                        ("$ref", Some(target)) => target
-                            .strip_prefix(OPENAPI_COMPONENT_REF)
-                            .map(|name| {
-                                ::serde_json::Value::String(format!("{DRAFT4_DEFINITION_REF}{name}"))
-                            })
-                            .unwrap_or_else(|| member.clone()),
-                        _ => rewrite_refs(member),
-                    };
-                    (key.clone(), rewritten)
-                })
-                .collect(),
-        ),
-        ::serde_json::Value::Array(items) => {
-            ::serde_json::Value::Array(items.iter().map(rewrite_refs).collect())
+/// Translate one OpenAPI 3 schema value into the draft-4 value that says the same
+/// thing, recursively: `$ref`s follow the components this conversion moved into
+/// `definitions`, and `nullable` becomes a type union. Everything else is left as it
+/// stands — the two drafts share it.
+///
+/// A `$ref` to anything other than a component of this document (an external document,
+/// say) is left alone: it names nothing this conversion moved.
+fn to_draft4(value: &::serde_json::Value) -> ::serde_json::Value {
+    let ::serde_json::Value::Object(members) = value else {
+        return match value {
+            ::serde_json::Value::Array(items) => {
+                ::serde_json::Value::Array(items.iter().map(to_draft4).collect())
+            }
+            other => other.clone(),
+        };
+    };
+
+    let mut translated: ::serde_json::Map<String, ::serde_json::Value> = ::serde_json::Map::new();
+    let nullable = members.get(OPENAPI_NULLABLE) == Some(&::serde_json::Value::Bool(true));
+    for (key, member) in members {
+        // `nullable` is an OpenAPI 3.0 keyword with no draft-04 counterpart: what it
+        // says is carried by the member's `type` below, so the keyword itself does not
+        // travel.
+        if key == OPENAPI_NULLABLE {
+            continue;
         }
-        other => other.clone(),
+        if key == "$ref" {
+            if let Some(name) = member
+                .as_str()
+                .and_then(|target| target.strip_prefix(OPENAPI_COMPONENT_REF))
+            {
+                translated.insert(
+                    key.clone(),
+                    ::serde_json::Value::String(format!("{DRAFT4_DEFINITION_REF}{name}")),
+                );
+                continue;
+            }
+        }
+        if key == "type" && nullable {
+            if let Some(declared) = member.as_str() {
+                translated.insert(
+                    key.clone(),
+                    ::serde_json::json!([declared, DRAFT4_NULL_TYPE]),
+                );
+                continue;
+            }
+        }
+        translated.insert(key.clone(), to_draft4(member));
     }
+    ::serde_json::Value::Object(translated)
 }
+
+/// The OpenAPI 3.0 keyword that says a member may be null — see [`to_draft4`].
+const OPENAPI_NULLABLE: &str = "nullable";
+
+/// The draft-04 type a nullable member's type is unioned with.
+const DRAFT4_NULL_TYPE: &str = "null";
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The conversion is computed from the document it is given: the envelope becomes
-    /// the root, the rest becomes `definitions`, and references follow.
+    /// The conversion is computed from the document it is given: every component
+    /// becomes a definition, references follow them, the title travels, and
+    /// `nullable` becomes draft-04's type union.
     #[test]
-    fn the_conversion_promotes_the_envelope_and_rewrites_refs() {
-        let openapi = r##"{"openapi":"3.0.0","components":{"schemas":{
+    fn the_conversion_moves_every_component_into_definitions() {
+        let openapi = r##"{"openapi":"3.0.0","info":{"title":"Order Placed published by my.orders"},
+            "components":{"schemas":{
             "AWSEvent":{"type":"object","properties":{
                 "detail":{"$ref":"#/components/schemas/Detail"},
                 "resources":{"type":"array","items":{"$ref":"#/components/schemas/Resource"}}}},
-            "Detail":{"type":"object","properties":{"id":{"type":"string"}}},
+            "Detail":{"type":"object","properties":{
+                "id":{"type":"string"},
+                "extra":{"type":"object","nullable":true}}},
             "Resource":{"type":"string"}}}}"##;
         let converted = to_json_schema_draft4(openapi).expect("an OpenAPI 3 document converts");
         let converted: ::serde_json::Value =
@@ -361,26 +393,38 @@ mod tests {
             "the document must name draft 4, got {converted:?}"
         );
         assert_eq!(
-            converted["properties"]["detail"]["$ref"], "#/definitions/Detail",
+            converted["title"], "Order Placed published by my.orders",
+            "the source document's title must travel, got {converted:?}"
+        );
+        assert_eq!(
+            converted["definitions"]["AWSEvent"]["properties"]["detail"]["$ref"],
+            "#/definitions/Detail",
             "a component ref must point into definitions, got {converted:?}"
         );
         assert_eq!(
-            converted["properties"]["resources"]["items"]["$ref"], "#/definitions/Resource",
+            converted["definitions"]["AWSEvent"]["properties"]["resources"]["items"]["$ref"],
+            "#/definitions/Resource",
             "a nested component ref must be rewritten too, got {converted:?}"
         );
-        assert!(
-            converted["definitions"]["Detail"].is_object()
-                && converted["definitions"]["Resource"]["type"] == "string",
-            "every other component must be a definition, got {converted:?}"
+        assert_eq!(
+            converted["definitions"]["Detail"]["properties"]["extra"]["type"],
+            ::serde_json::json!(["object", "null"]),
+            "a nullable member must become a draft-04 type union, got {converted:?}"
         );
         assert!(
-            converted["definitions"]["AWSEvent"].is_null(),
-            "the promoted component is the root, not also a definition, got {converted:?}"
+            converted["definitions"]["Detail"]["properties"]["extra"]["nullable"].is_null(),
+            "draft-04 has no `nullable` keyword, got {converted:?}"
+        );
+        assert!(
+            converted["definitions"]["Resource"]["type"] == "string"
+                && converted["properties"].is_null(),
+            "every component is a definition and none is promoted to the root, \
+             got {converted:?}"
         );
     }
 
-    /// Rows: documents with no single root component, and documents that are not
-    /// OpenAPI 3 documents at all.
+    /// Rows: documents with one component, with co-equal components, and documents
+    /// that are not OpenAPI 3 documents at all.
     #[test]
     fn the_conversion_reports_what_it_cannot_render() {
         let only_one = r#"{"components":{"schemas":{"Solo":{"type":"object"}}}}"#;
@@ -388,8 +432,12 @@ mod tests {
         let converted: ::serde_json::Value =
             ::serde_json::from_str(&converted).expect("the conversion is JSON");
         assert_eq!(
-            converted["type"], "object",
-            "the only component is the root, got {converted:?}"
+            converted["definitions"]["Solo"]["type"], "object",
+            "the only component is a definition like any other, got {converted:?}"
+        );
+        assert!(
+            converted["title"].is_null(),
+            "a document with no title carries none, got {converted:?}"
         );
 
         let co_equal = r#"{"components":{"schemas":{"A":{"type":"object"},"B":{"type":"string"}}}}"#;
@@ -406,7 +454,6 @@ mod tests {
             "{}",
             r#"{"components":{}}"#,
             r#"{"components":{"schemas":[]}}"#,
-            r#"{"components":{"schemas":{"AWSEvent":"not an object"}}}"#,
         ] {
             assert!(
                 to_json_schema_draft4(case).is_none(),
