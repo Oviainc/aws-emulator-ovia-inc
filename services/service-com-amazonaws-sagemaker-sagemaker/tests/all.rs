@@ -49,6 +49,8 @@ mod model_card_governance;
 mod model_card_updates;
 #[path = "all/model_package_group_lifecycle.rs"]
 mod model_package_group_lifecycle;
+#[path = "all/model_package_group_policy.rs"]
+mod model_package_group_policy;
 #[path = "all/model_package_registry.rs"]
 mod model_package_registry;
 #[path = "all/notebook_instance_lifecycle.rs"]

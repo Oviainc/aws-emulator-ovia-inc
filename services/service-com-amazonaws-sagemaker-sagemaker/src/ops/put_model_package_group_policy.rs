@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutModelPackageGroupPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutModelPackageGroupPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutModelPackageGroupPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Attaches the resource-based policy a model package group is read and written under:
+//! the document is stored on the group the request names, replacing whatever policy that
+//! group carried, and the group's ARN is answered. A group no record is stored for is
+//! refused (400 `ValidationException`) rather than created, and a document that is not an
+//! IAM policy document is refused with the `ConflictException` this operation models.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +140,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutModelPackageGroupPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutModelPackageGroupPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutModelPackageGroupPolicy"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // `ModelPackageGroupName` is modelled `EntityName`, not `ArnOrName`: this
+        // operation addresses the group by name only.
+        let name = input.model_package_group_name.as_str();
+
+        // One lock spans the existence check and the write, so concurrent puts serialize:
+        // the group ends up carrying exactly one of the documents sent (the one the later
+        // write stored), never a mix of them.
+        let mut store = state.lock();
+        let Some(group) = store.model_package_groups.get_mut(name) else {
+            // A policy is attached TO a group, so a name no group is stored under leaves
+            // nothing to attach it to, and nothing is created here. The group's absence is
+            // a property of the request, which is why it is refused as a validation
+            // failure rather than as this operation's modelled conflict.
+            let arn = crate::state::resource_arn(
+                &crate::state::request_region(ctx),
+                "model-package-group",
+                name,
+            );
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Model Package Group \"{arn}\" does not exist."
+            )));
+        };
+
+        if let Some(violation) = crate::state::resource_policy_violation(&input.resource_policy) {
+            return Err(PutModelPackageGroupPolicyErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(violation),
+                },
+            )
+            .into());
+        }
+
+        // Stored verbatim: `GetModelPackageGroupPolicy` hands back the document this call
+        // sent, byte for byte, rather than a reformatting of it.
+        group.resource_policy = Some(input.resource_policy.clone());
+        let arn = group.arn.clone();
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(PutModelPackageGroupPolicyOutput {
+            model_package_group_arn: arn,
+        })
     }
 }

@@ -190,6 +190,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 created_by,
                 tags: input.tags.unwrap_or_default(),
                 creation_time: ::std::time::SystemTime::now(),
+                // A group is created with no resource policy;
+                // `PutModelPackageGroupPolicy` is what attaches one.
+                resource_policy: None,
             },
         );
         drop(store);

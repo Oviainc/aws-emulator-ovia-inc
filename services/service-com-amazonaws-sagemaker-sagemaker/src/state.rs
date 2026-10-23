@@ -1029,6 +1029,13 @@ pub struct Artifact {
 ///
 /// `created_by` is stored at creation rather than rebuilt per read, so every later read
 /// reports the identity that actually created the group.
+///
+/// `resource_policy` is the resource-based policy `PutModelPackageGroupPolicy` attached to
+/// the group, exactly as that call sent it, and `None` while the group carries none. It
+/// lives ON the group record rather than in a store of its own, so the one group has one
+/// policy whichever operation reads it, it is bounded by
+/// [`MODEL_PACKAGE_GROUP_QUOTA`] with the record it belongs to, and
+/// `DeleteModelPackageGroup` releases the policy with the group.
 #[derive(Debug, Clone)]
 pub struct ModelPackageGroup {
     pub name: String,
@@ -1039,6 +1046,32 @@ pub struct ModelPackageGroup {
     pub created_by: UserContext,
     pub tags: Vec<Tag>,
     pub creation_time: SystemTime,
+    pub resource_policy: Option<String>,
+}
+
+/// Why SageMaker refuses `policy` as a resource policy for a model group, or `None` when
+/// it accepts it.
+///
+/// A resource policy is an IAM policy document: `PolicyString`'s own documentation calls
+/// it "the resource policy for the model group", and IAM's policy grammar makes a document
+/// a JSON OBJECT (the `Version`/`Statement` elements are its members). The model bounds
+/// only the member's length and leaves its pattern `.*`, so the boundary validator passes
+/// a document that is not JSON at all and the service is what refuses it.
+///
+/// Nothing beyond that structural claim is checked here: which elements a statement
+/// carries is IAM's business, and a document this accepts is stored and handed back
+/// BYTE-FOR-BYTE rather than reformatted, so a caller reads back exactly the text it sent.
+///
+/// The returned text is the refusal's message; the caller renders it as the failure that
+/// operation models for a document it cannot take.
+pub fn resource_policy_violation(policy: &str) -> Option<String> {
+    match ::serde_json::from_str::<::serde_json::Value>(policy) {
+        Ok(::serde_json::Value::Object(_)) => None,
+        Ok(_) => Some(
+            "ResourcePolicy must be a JSON object: an IAM policy document".to_string(),
+        ),
+        Err(error) => Some(format!("ResourcePolicy is not valid JSON: {error}")),
+    }
 }
 
 /// The most notebook instance lifecycle configurations this service's store holds, after
