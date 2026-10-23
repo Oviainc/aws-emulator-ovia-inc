@@ -1,15 +1,38 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeprovisionByoipCidr
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeprovisionByoipCidr`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeprovisionByoipCidr::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Releases an address range the account brought to AWS with BYOIP.
+//!
+//! ## What this handler does
+//!
+//! * A `Cidr` that is not an address range at all is refused with `InvalidParameterValue`;
+//!   an empty one (the member is modelled `clientOptional`, so it reaches here) with
+//!   `MissingParameter`. The request is read before `DryRun` is answered: a value that is
+//!   no address range is wrong whatever the caller's permissions are.
+//! * `DryRun` is then answered from the permission check alone: "Checks whether you have
+//!   the required permissions for the action, without actually making the request"
+//!   (`$DryRun`) — the check is about the caller's permissions, not about the account's
+//!   ranges, so a dry run never looks a range up and answers HTTP 412 `DryRunOperation`
+//!   for a range the account does not hold.
+//! * A range the account has not provisioned is refused with `InvalidCidr.NotFound`:
+//!   "The prefix must be the same prefix that you specified when you provisioned the
+//!   address range" (`$Cidr`), so a different prefix length names a different range and
+//!   finds nothing.
+//! * "Before you can release an address range, you must stop advertising it ..." — a range
+//!   whose state is not one of [`crate::state::RELEASABLE_BYOIP_CIDR_STATES`] is refused
+//!   with `IncorrectState`.
+//! * "... and you must not have any IP addresses allocated from its address range" — a
+//!   range the account still holds Elastic IP addresses out of is ACCEPTED and the release
+//!   then fails: "failed-deprovision: The request to deprovision the address range was
+//!   unsuccessful. Ensure that all EIPs from the range have been deallocated and try
+//!   again" (`ByoipCidrState`), with the range's `StatusMessage` naming the allocations
+//!   that held it. That question is about the END of the release, so it is asked at the
+//!   instant the release falls due and not here: a caller that gives the addresses back
+//!   while the range is `pending-deprovision` still gets its release. A
+//!   `failed-deprovision` range can be released again.
+//! * Otherwise the range moves to `pending-deprovision` and the CLOCK, not a later caller,
+//!   takes it out of the account.
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +160,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeprovisionByoipCidr` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeprovisionByoipCidrErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only; this operation reads none of it — an address
+        // range is named by the range itself, which is the key the store holds it under.
+        let _ = ctx;
+        use crate::state;
+
+        // "The address range, in CIDR notation" (`$Cidr`). The member is modelled
+        // `clientOptional`, so a request that leaves it out reaches this handler with an
+        // empty string and is refused here.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeprovisionByoipCidr"))
+        // The REQUEST is read before the dry run is answered: a value that is no address
+        // range is wrong whatever the caller's permissions are, and `DryRun` is about "the
+        // required permissions for the action" (`$DryRun`) rather than about the request's
+        // syntax.
+        let requested = input.cidr.as_str();
+        if requested.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter cidr",
+            ));
+        }
+        // A value that is not an address range of either family names no range at all, so
+        // it is refused rather than looked up. The message names the value the request
+        // sent, in EC2's own "the value you sent, in parentheses" form.
+        let Ok(cidr) = state::canonical_byoip_cidr(requested) else {
+            return Err(state::invalid_parameter_value(format!(
+                "The CIDR ({requested}) is not valid."
+            )));
+        };
+
+        // "Checks whether you have the required permissions for the action, without
+        // actually making the request, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation" (`$DryRun`). What is
+        // checked is the CALLER's permissions, not the account's ranges, so it is answered
+        // before the store is read at all: a dry run neither looks a range up nor changes
+        // one, and answers `DryRunOperation` for a range the account does not hold.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // A release started earlier was owed at its due instant whether or not anybody
+        // called, so it is applied before this request is answered: a range whose release
+        // has fallen due is gone, and deprovisioning it again finds nothing.
+        store.materialize_due_transitions();
+
+        // "Releases the specified address range that you provisioned" — a range this
+        // account has not provisioned is a refusal, not a no-op, and the prefix is part of
+        // its name: "The prefix must be the same prefix that you specified when you
+        // provisioned the address range" (`$Cidr`).
+        let Some(record) = store.byoip_cidrs.get(&cidr) else {
+            // The range as the REQUEST wrote it, which is what the caller has to correct.
+            return Err(state::invalid_cidr_not_found(requested));
+        };
+        // "Before you can release an address range, you must stop advertising it" — and a
+        // range part way through another move is not the caller's to release yet either.
+        if !state::byoip_cidr_state_is_releasable(record.state()) {
+            return Err(state::incorrect_state(format!(
+                "The address range '{cidr}' is in state '{current}', \
+                 which is not a state it can be released from",
+                current = record.state(),
+            )));
+        }
+
+        // "... and you must not have any IP addresses allocated from its address range".
+        // AWS takes the request anyway and reports the outcome on the range:
+        // "failed-deprovision: The request to deprovision the address range was
+        // unsuccessful. Ensure that all EIPs from the range have been deallocated and try
+        // again" (`ByoipCidrState`) — so the addresses the account holds out of this range
+        // decide how the release ENDS, which is why they are read at the due instant, in
+        // `materialize_due_transitions`, and not here.
+
+        // The range moves to `pending-deprovision` and the clock owes it the end of the
+        // release; the caller is told the range as it now stands.
+        let byoip_cidr = store.begin_byoip_cidr_release(&cidr).ok_or_else(|| {
+            state::internal_error("the address range checked a moment ago could not be released")
+        })?;
+        Ok(DeprovisionByoipCidrOutput {
+            byoip_cidr: Some(byoip_cidr),
+        })
     }
 }
+
