@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDashboard
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDashboard`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a CloudTrail Lake dashboard in the shared dashboard registry
+//! (`crate::state`) and reports the stored record back.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDashboard::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rules it applies, each from the modelled contract below:
+//!
+//! * the name decides the TYPE — the reserved Highlights name names the dashboard
+//!   CloudTrail manages (`MANAGED`), every other name a `CUSTOM` one;
+//! * the Highlights dashboard needs an ENABLED refresh schedule of 6 HOURS, and
+//!   carries no caller-supplied widgets;
+//! * a custom dashboard carries at most ten widgets;
+//! * a refresh schedule's frequency is one the model publishes, and its time of day
+//!   is a UTC `HH:MM` defaulting to `00:00`;
+//! * a name already taken in the caller's Region is a conflict, never an overwrite;
+//! * a new dashboard is `CREATING` and the clock settles it into `CREATED`.
 //!
 //! ## Shape of an operation
 //!
@@ -207,18 +212,175 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDashboard` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDashboardErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDashboard"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // The name decides the dashboard's TYPE: "To create the Highlights
+        // dashboard, the name must be AWSCloudTrail-Highlights", and CloudTrail owns
+        // that one; every other name creates a custom dashboard.
+        let is_highlights = input.name == crate::state::HIGHLIGHTS_DASHBOARD_NAME;
+        let dashboard_type = if is_highlights {
+            crate::state::DASHBOARD_TYPE_MANAGED
+        } else {
+            crate::state::DASHBOARD_TYPE_CUSTOM
+        };
+
+        // `InvalidTagParameterException` covers both "duplicate tags" and "too many
+        // tags on the resource"; the limit is the one the model documents for every
+        // taggable CloudTrail resource.
+        let tags = input.tags_list.unwrap_or_default();
+        if tags.len() > crate::state::TAGS_PER_RESOURCE_LIMIT {
+            return Err(CreateDashboardErrorModeled::InvalidTagParameterException(
+                InvalidTagParameterException {
+                    message: Some(format!(
+                        "TagsList carries {} tags; the limit is {} tags per dashboard",
+                        tags.len(),
+                        crate::state::TAGS_PER_RESOURCE_LIMIT
+                    )),
+                },
+            )
+            .into());
+        }
+        if let Some(duplicate) = crate::state::first_duplicate_tag_key(&tags) {
+            return Err(CreateDashboardErrorModeled::InvalidTagParameterException(
+                InvalidTagParameterException {
+                    message: Some(format!(
+                        "TagsList carries the tag key '{duplicate}' more than once"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let requested_widgets = input.widgets.unwrap_or_default();
+        // "You do not need to specify widgets for the Highlights dashboard" —
+        // CloudTrail Lake manages that dashboard, so it has no caller-composed
+        // widgets to store.
+        if is_highlights && !requested_widgets.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Widgets cannot be set on the {} dashboard: CloudTrail Lake manages that \
+                 dashboard's widgets",
+                crate::state::HIGHLIGHTS_DASHBOARD_NAME
+            )));
+        }
+        // "You can add up to 10 widgets to a custom dashboard."
+        if requested_widgets.len() > crate::state::CUSTOM_DASHBOARD_WIDGET_LIMIT {
+            return Err(CreateDashboardErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "Widgets carries {} widgets; a custom dashboard can have a maximum \
+                         of {} widgets",
+                        requested_widgets.len(),
+                        crate::state::CUSTOM_DASHBOARD_WIDGET_LIMIT
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The frequency and the time of day are rules the model documents in prose,
+        // so the boundary validator cannot refuse them; `TimeOfDay` defaults to
+        // 00:00, which is what the dashboard then reports.
+        let refresh_schedule = match input.refresh_schedule.as_ref() {
+            Some(schedule) => Some(
+                crate::state::normalize_refresh_schedule(schedule)
+                    .map_err(crate::scaffolded::Scaffolded::validation)?,
+            ),
+            None => None,
+        };
+        if is_highlights
+            && !refresh_schedule
+                .as_ref()
+                .is_some_and(crate::state::is_highlights_refresh_schedule)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "The {} dashboard needs a RefreshSchedule with Status {} and a Frequency of \
+                 {} {}",
+                crate::state::HIGHLIGHTS_DASHBOARD_NAME,
+                crate::state::REFRESH_SCHEDULE_ENABLED,
+                crate::state::HIGHLIGHTS_REFRESH_FREQUENCY_VALUE,
+                crate::state::REFRESH_FREQUENCY_UNIT_HOURS,
+            )));
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateDashboardErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "CreateDashboard needs the CloudTrail dashboard registry, which this \
+                         engine does not carry"
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // "The name must be unique to your account": a name already taken is a
+        // conflict, never an overwrite.
+        let key = (input.name.clone(), region.clone());
+        if store.dashboards.contains_key(&key) {
+            return Err(CreateDashboardErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Dashboard {} already exists in {region}",
+                    input.name
+                )),
+            })
+            .into());
+        }
+
+        // The registry is bounded: it holds state for the life of the process and
+        // every request may add to it.
+        if store.dashboards.len() >= crate::state::DASHBOARD_QUOTA {
+            return Err(CreateDashboardErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "This account already holds the maximum of {} dashboards; delete a \
+                         dashboard before creating another",
+                        crate::state::DASHBOARD_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let record = crate::state::DashboardRecord {
+            dashboard_arn: crate::state::dashboard_arn(&region, &input.name),
+            name: input.name,
+            dashboard_type: dashboard_type.to_string(),
+            // CloudTrail loads a new dashboard asynchronously, so it reads CREATING
+            // until the clock settles it into CREATED.
+            status: crate::state::DASHBOARD_STATUS_CREATING.to_string(),
+            settles_at: now + crate::state::DASHBOARD_SETTLE_AFTER,
+            widgets: requested_widgets
+                .into_iter()
+                .map(crate::state::request_widget_to_widget)
+                .collect(),
+            refresh_schedule,
+            // "If termination protection is enabled, you cannot delete the
+            // dashboard" — off unless the request turns it on.
+            termination_protection_enabled: input.termination_protection_enabled.unwrap_or(false),
+            tags,
+            created_at: now,
+            updated_at: now,
+            home_region: region,
+            last_refresh_id: None,
+            last_refresh_failure_reason: None,
+        };
+
+        // Report the stored record, so the response and every later read of this
+        // dashboard are the same values.
+        let output = CreateDashboardOutput {
+            dashboard_arn: Some(record.dashboard_arn.clone()),
+            name: Some(record.name.clone()),
+            r#type: Some(record.dashboard_type.clone()),
+            widgets: Some(record.widgets.clone()),
+            tags_list: Some(record.tags.clone()),
+            refresh_schedule: record.refresh_schedule.clone(),
+            termination_protection_enabled: Some(record.termination_protection_enabled),
+        };
+
+        store.dashboards.insert(key, record);
+        Ok(output)
     }
 }
