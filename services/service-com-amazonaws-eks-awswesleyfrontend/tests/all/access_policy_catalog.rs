@@ -21,14 +21,30 @@ use crate::wire::{call, emulator, Answer};
 /// Written out here rather than imported from `crate::state`, so the test pins the
 /// catalogue against its SOURCE instead of against the handler's own copy. That
 /// source is the EKS "Access policy permissions" reference's table of Amazon EKS
-/// access policies — the policies whose permissions mirror the Kubernetes
+/// access policies: the policies whose permissions mirror the Kubernetes
 /// `cluster-admin`, `admin`, `edit` and `view` cluster roles that the model's own
-/// `AccessPolicy` documentation points at.
+/// `AccessPolicy` documentation points at, the read-only mirror of `admin`, and
+/// the policies Amazon EKS publishes for the controllers and Amazon Web Services
+/// services that work on a cluster.
 const EXPECTED_POLICIES: &[&str] = &[
+    "AIDevOpsAgentAccessPolicy",
+    "AWSBatchClusterPolicy",
+    "AWSBatchNamespacePolicy",
+    "AmazonAIOpsAssistantPolicy",
+    "AmazonARCRegionSwitchScalingPolicy",
+    "AmazonEKSACKPolicy",
     "AmazonEKSAdminPolicy",
     "AmazonEKSAdminViewPolicy",
+    "AmazonEKSArgoCDClusterPolicy",
+    "AmazonEKSArgoCDPolicy",
+    "AmazonEKSAutoNodePolicy",
+    "AmazonEKSBlockStorageClusterPolicy",
     "AmazonEKSClusterAdminPolicy",
+    "AmazonEKSComputeClusterPolicy",
     "AmazonEKSEditPolicy",
+    "AmazonEKSHybridPolicy",
+    "AmazonEKSLoadBalancingClusterPolicy",
+    "AmazonEKSNetworkingClusterPolicy",
     "AmazonEKSViewPolicy",
 ];
 
@@ -347,9 +363,106 @@ async fn a_foreign_next_token_is_refused() {
 }
 
 // ---------------------------------------------------------------------------
-// RULE: `maxResults` is modelled `1..100`, so each published bound is accepted
-// and a value past either one is refused 400.
+// RULE: an ARN the listing reports is an ARN `AssociateAccessPolicy` accepts — a
+// client that DISCOVERS the policy set from the API, instead of hardcoding it,
+// can associate every policy it discovered.
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn every_discovered_policy_arn_can_be_associated() {
+    let router = emulator();
+
+    // A cluster with one access entry to associate the discovered policies to.
+    let cluster = "discovered-policies";
+    let principal = "arn:aws:iam::000000000000:role/discovered-policies-role";
+    let created = call(
+        &router,
+        REGION,
+        "POST",
+        "/clusters",
+        &serde_json::json!({
+            "name": cluster,
+            "roleArn": "arn:aws:iam::000000000000:role/eksClusterRole",
+            "resourcesVpcConfig": { "subnetIds": ["subnet-aaaa1111", "subnet-bbbb2222"] },
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(created.status, 200, "setup create cluster: got {created:?}");
+    let entry = call(
+        &router,
+        REGION,
+        "POST",
+        &format!("/clusters/{cluster}/access-entries"),
+        &serde_json::json!({ "principalArn": principal }).to_string(),
+    )
+    .await;
+    assert_eq!(entry.status, 200, "setup create access entry: got {entry:?}");
+
+    // Rows: every entry the listing reported, paged through to exhaustion — the
+    // ARNs come from the API, not from a constant in this file.
+    let discovered = entries_of(&list(&router, "").await);
+    assert_eq!(
+        discovered.len(),
+        EXPECTED_POLICIES.len(),
+        "setup: expected the whole catalogue in one page, got {discovered:?}"
+    );
+    for (name, arn) in &discovered {
+        let associated = call(
+            &router,
+            REGION,
+            "POST",
+            &format!("/clusters/{cluster}/access-entries/{}/access-policies", encode(principal)),
+            &serde_json::json!({ "policyArn": arn, "accessScope": { "type": "cluster" } })
+                .to_string(),
+        )
+        .await;
+        assert_eq!(
+            associated.status, 200,
+            "case {name:?} ({arn:?}): a discovered policy ARN must associate, got {associated:?}"
+        );
+        assert_eq!(
+            associated.body["associatedAccessPolicy"]["policyArn"].as_str(),
+            Some(arn.as_str()),
+            "case {name:?}: the association must report the ARN it was given, got {associated:?}"
+        );
+    }
+
+    // And the entry now holds one record per discovered policy, read back through
+    // the listing that reports them.
+    let listed = call(
+        &router,
+        REGION,
+        "GET",
+        &format!(
+            "/clusters/{cluster}/access-entries/{}/access-policies?maxResults=100",
+            encode(principal)
+        ),
+        "",
+    )
+    .await;
+    let held = listed.body["associatedAccessPolicies"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item["policyArn"].as_str().map(str::to_owned))
+                .collect::<BTreeSet<String>>()
+        })
+        .unwrap_or_default();
+    let expected: BTreeSet<String> = discovered.iter().map(|(_, arn)| arn.clone()).collect();
+    assert_eq!(
+        held, expected,
+        "case read back: the entry must hold every discovered policy exactly once, got {held:?}"
+    );
+}
+
+/// Percent-encode a value travelling in ONE path segment, as an AWS SDK encodes a
+/// non-greedy `@httpLabel`: the crate's one copy of that rule lives in the wire
+/// harness.
+fn encode(value: &str) -> String {
+    crate::wire::encode_label(value)
+}
 
 #[tokio::test]
 async fn max_results_is_held_to_its_modelled_range() {

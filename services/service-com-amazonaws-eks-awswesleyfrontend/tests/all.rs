@@ -27,6 +27,8 @@ mod capability_lifecycle;
 mod certificate_authority;
 #[path = "all/cluster_lifecycle.rs"]
 mod cluster_lifecycle;
+#[path = "all/cluster_version_catalog.rs"]
+mod cluster_version_catalog;
 #[path = "all/cluster_versions.rs"]
 mod cluster_versions;
 #[path = "all/connected_clusters.rs"]

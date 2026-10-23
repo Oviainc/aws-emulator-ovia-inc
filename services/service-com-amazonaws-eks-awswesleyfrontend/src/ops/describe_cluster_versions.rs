@@ -3,12 +3,16 @@
 //! @op DescribeClusterVersions
 //! IMPLEMENTED. Reports the Kubernetes version calendar this service's state holds
 //! (`crate::state::ClusterVersionRecord`, seeded from the published Amazon EKS
-//! release calendar), filtered by the request and paged with an opaque `nextToken`
-//! derived from the last calendar row returned.
+//! release calendar, newest version first), filtered by the request and paged with
+//! an opaque `nextToken` derived from the last calendar row returned.
 //!
 //! This is a REPORTING operation: it writes nothing. A row's support status is not
 //! stored but DERIVED per request from the clock and the row's two end-of-support
-//! dates, so the same calendar keeps answering correctly as time passes.
+//! dates, so the same calendar keeps answering correctly as time passes. The rest
+//! of a row — its platform version, patch version, and the provisioned
+//! control-plane scaling tiers and component-config defaults and constraints the
+//! service publishes — comes from state too (`crate::state`), so every member of
+//! a reported `ClusterVersionInformation` has one source.
 //!
 //! What each input member does here:
 //!
