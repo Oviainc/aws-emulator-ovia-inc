@@ -412,6 +412,12 @@ async fn a_reused_client_token_never_mints_a_second_access_point() {
             "reuse with {case}: the error must name the existing id, got {:?}",
             repeat.get("AccessPointId")
         );
+        // Whatever the rest of the request said, the refusal carries the error's required
+        // members only: AWS sends no `Message` member on this error class.
+        crate::error_message_construction::assert_no_message_member(
+            &format!("reuse with {case}"),
+            &repeat,
+        );
     }
 
     // Not one of those refusals changed state.
@@ -434,6 +440,21 @@ async fn a_reused_client_token_never_mints_a_second_access_point() {
             listed.body
         );
     }
+
+    // Not one of them touched the MEMBERS of the access point the token names either: a
+    // refused retry that carried other parameters updates nothing.
+    let described = efs
+        .describe_access_points(&format!("AccessPointId={access_point_id}"))
+        .await;
+    assert_members(
+        "after every refused reuse",
+        &access_points(&described)[0],
+        &json!({
+            "RootDirectory": { "Path": "/first" },
+            "PosixUser": { "Uid": 1, "Gid": 1 },
+            "FileSystemId": file_system_id,
+        }),
+    );
 
     // A fresh token on the same file system mints a distinct access point.
     let distinct = efs

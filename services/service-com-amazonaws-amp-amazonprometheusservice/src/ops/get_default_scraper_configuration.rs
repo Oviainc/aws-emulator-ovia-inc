@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDefaultScraperConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDefaultScraperConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDefaultScraperConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -68,6 +59,88 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The default scraper configuration this service serves, exactly as the Amazon
+/// Managed Service for Prometheus User Guide publishes it under "Scraper
+/// configuration" (<https://docs.aws.amazon.com/prometheus/latest/userguide/AMP-collector-how-to.html#AMP-collector-configuration>),
+/// which `GetDefaultScraperConfigurationResponse$configuration` links to as the
+/// description of this very blob: the Prometheus scrape configuration Amazon EKS uses
+/// when it creates a scraper for you.
+///
+/// It is a service-wide DOCUMENT, not a resource: the operation takes no input, is
+/// modelled `@readonly`, and names no workspace or scraper — so there is nothing in
+/// this service's store that could vary it, and nothing for the call to write. Each
+/// `scrape_configs` entry is a Prometheus scrape job (`job_name` plus the Kubernetes
+/// service-discovery role it scrapes); `scrape_interval: 30s` and the comments are the
+/// published document's own, kept verbatim so a caller feeding the blob to Prometheus
+/// sees what AWS hands it.
+///
+/// ONE deliberate omission: the published document points the cAdvisor and API-server
+/// jobs at the in-cluster service-account token and CA files under the kubelet's secret
+/// mount (`authorization.credentials_file`, `bearer_token_file`, `tls_config.ca_file`).
+/// Emulator source may not name a host secret path at all — the merge gate's exfil scan
+/// refuses it — so those three members are left out rather than pointed somewhere else;
+/// a caller that feeds this blob to a real in-cluster Prometheus supplies them itself.
+/// Every job, service-discovery role and relabel rule is otherwise the published one.
+///
+/// Served as UTF-8 bytes; the `Blob` member is what base64-encodes it on the wire (the
+/// restJson1 serializer does that, so this handler must NOT encode it itself).
+pub(crate) const DEFAULT_SCRAPER_CONFIGURATION: &str = r#"global:
+  scrape_interval: 30s
+  external_labels:
+    clusterArn: apiserver-url-here
+scrape_configs:
+  # pod metrics
+  - job_name: pod_exporter
+    kubernetes_sd_configs:
+      - role: pod
+  # container metrics
+  - job_name: cadvisor
+    scheme: https
+    kubernetes_sd_configs:
+      - role: node
+    relabel_configs:
+      - action: labelmap
+        regex: __meta_kubernetes_node_label_(.+)
+      - replacement: 'kubernetes.default.svc:443'
+        target_label: __address__
+      - source_labels: [__meta_kubernetes_node_name]
+        regex: (.+)
+        target_label: __metrics_path__
+        replacement: /api/v1/nodes/$1/proxy/metrics/cadvisor
+  # apiserver metrics
+  - job_name: kubernetes-apiservers
+    kubernetes_sd_configs:
+      - role: endpoints
+    relabel_configs:
+      - action: keep
+        regex: default;kubernetes;https
+        source_labels:
+          - __meta_kubernetes_namespace
+          - __meta_kubernetes_service_name
+          - __meta_kubernetes_endpoint_port_name
+    scheme: https
+    tls_config:
+      insecure_skip_verify: false
+  # kube proxy metrics
+  - job_name: kube-proxy
+    honor_labels: true
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      - action: keep
+        source_labels:
+          - __meta_kubernetes_namespace
+          - __meta_kubernetes_pod_name
+        separator: '/'
+        regex: 'kube-system/kube-proxy.+'
+      - source_labels:
+          - __address__
+        action: replace
+        target_label: __address__
+        regex: '(.+?)(\:\d+)?'
+        replacement: '$1:10249'
+"#;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -139,18 +212,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
+        // `GetDefaultScraperConfigurationRequest` has no members and the response is the
+        // service-wide default document (see [`DEFAULT_SCRAPER_CONFIGURATION`]), so this
+        // handler reaches neither the request's values nor the store: there is no stored
+        // resource the answer could depend on, and the operation is modelled `@readonly`,
+        // so writing anything here would change what a later caller sees.
         let _ = (&input, ctx, &self.engine);
-        // Implement `GetDefaultScraperConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDefaultScraperConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDefaultScraperConfiguration"))
+        Ok(GetDefaultScraperConfigurationOutput {
+            configuration: DEFAULT_SCRAPER_CONFIGURATION.as_bytes().to_vec(),
+        })
     }
 }

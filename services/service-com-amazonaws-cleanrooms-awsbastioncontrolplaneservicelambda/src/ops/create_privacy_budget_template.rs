@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePrivacyBudgetTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePrivacyBudgetTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePrivacyBudgetTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The privacy budget template is a resource of the COLLABORATION the addressed
+//! membership belongs to, so every collaboration-derived member of the stored
+//! `PrivacyBudgetTemplate` (`membershipId`/`membershipArn`, `collaborationId`/
+//! `collaborationArn`) is copied FROM the stored membership, never from the request,
+//! and the template is indexed by collaboration: per this operation's doc, "each
+//! collaboration can have only one privacy budget template", so a second create in the
+//! same collaboration is a `ConflictException`.
+//!
+//! `autoRefresh` is optional on the request and REQUIRED on the resource, so the
+//! cadence in force is materialized at creation
+//! (`crate::state::effective_template_auto_refresh`) rather than left absent, and
+//! `parameters` is stored as the output projection of the union the request carried
+//! (`crate::state::privacy_budget_template_parameters_output`).
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +177,156 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePrivacyBudgetTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePrivacyBudgetTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePrivacyBudgetTemplate"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(CreatePrivacyBudgetTemplateErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("cleanrooms state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = st::request_region(ctx.parts());
+        let membership_id = input.membership_identifier;
+
+        let mut store = state.lock();
+
+        // The template is created "in the collaboration that this membership belongs
+        // to", so an unknown membership has no collaboration to create it in.
+        let Some(membership) = store.memberships.get(&membership_id).cloned() else {
+            return Err(CreatePrivacyBudgetTemplateErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("membership {membership_id} not found"),
+                    resource_id: membership_id,
+                    resource_type: st::RESOURCE_TYPE_MEMBERSHIP.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A membership outlives the collaboration behind it (its status records that),
+        // and a collaboration that is gone cannot hold a new template.
+        if !store.collaborations.contains_key(&membership.collaboration_id) {
+            return Err(CreatePrivacyBudgetTemplateErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "collaboration {} of membership {} not found",
+                        membership.collaboration_id, membership.id
+                    ),
+                    resource_id: membership.collaboration_id.clone(),
+                    resource_type: st::RESOURCE_TYPE_COLLABORATION.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // Each member of the `parameters` union carries the parameters of exactly one
+        // `PrivacyBudgetType`, so a `privacyBudgetType` naming the other one is a
+        // combination the model cannot refuse at the boundary but the service can.
+        let parameters_type = st::privacy_budget_type_of_parameters(&input.parameters);
+        if input.privacy_budget_type != parameters_type {
+            return Err(CreatePrivacyBudgetTemplateErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "parameters carry {parameters_type} parameters, which do not match privacyBudgetType {}",
+                        input.privacy_budget_type
+                    )),
+                    reason: Some(st::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string()),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "parameters".to_string(),
+                        message: format!(
+                            "must carry the parameters of privacyBudgetType {}",
+                            input.privacy_budget_type
+                        ),
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        // "Each collaboration can have only one privacy budget template. If you need to
+        // change the privacy budget template, use the UpdatePrivacyBudgetTemplate
+        // operation."
+        if let Some(existing) =
+            store.privacy_budget_template_of_collaboration(&membership.collaboration_id)
+        {
+            return Err(CreatePrivacyBudgetTemplateErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "collaboration {} already has privacy budget template {}; each collaboration can have only one privacy budget template",
+                        membership.collaboration_id, existing.id
+                    )),
+                    resource_id: Some(existing.id.clone()),
+                    // The model's `ResourceType` catalog (COLLABORATION | MEMBERSHIP |
+                    // CONFIGURED_TABLE | CONFIGURED_TABLE_ASSOCIATION) names no privacy
+                    // budget template, so the member is left absent rather than filled
+                    // with a value the enum does not declare.
+                    resource_type: None,
+                    reason: Some(st::CONFLICT_REASON_ALREADY_EXISTS.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Last, AFTER the resource-identity checks, so an unknown membership still
+        // answers 404 and a repeat create still answers 409 even at the cap: every
+        // template this store accepts lives for the life of the process (a collaboration
+        // can be deleted and recreated, which frees the slot `MAX_COLLABORATIONS`
+        // counts), so past the cap the service answers the quota error it models rather
+        // than accepting another entry. See `st::MAX_PRIVACY_BUDGET_TEMPLATES` — the cap
+        // and these quota identifiers are the emulator's own, not values AWS publishes.
+        if store.privacy_budget_templates.len() >= st::MAX_PRIVACY_BUDGET_TEMPLATES {
+            return Err(CreatePrivacyBudgetTemplateErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "the number of privacy budget templates would exceed the limit of {}",
+                        st::MAX_PRIVACY_BUDGET_TEMPLATES
+                    ),
+                    quota_name: "PrivacyBudgetTemplates".to_string(),
+                    quota_value: st::MAX_PRIVACY_BUDGET_TEMPLATES as f64,
+                },
+            )
+            .into());
+        }
+
+        let id = st::new_uuid();
+        let arn = st::privacy_budget_template_arn(&region, &id);
+        let created_at = st::now();
+        let template = PrivacyBudgetTemplate {
+            id: id.clone(),
+            arn: arn.clone(),
+            membership_id: membership.id.clone(),
+            membership_arn: membership.arn.clone(),
+            collaboration_id: membership.collaboration_id.clone(),
+            collaboration_arn: membership.collaboration_arn.clone(),
+            create_time: created_at,
+            update_time: created_at,
+            privacy_budget_type: input.privacy_budget_type,
+            auto_refresh: st::effective_template_auto_refresh(input.auto_refresh),
+            parameters: st::privacy_budget_template_parameters_output(&input.parameters),
+        };
+
+        if let Some(tags) = input.tags.filter(|tags| !tags.is_empty()) {
+            store.tags.insert(arn, tags);
+        }
+        store.privacy_budget_templates.insert(id.clone(), template);
+        store.privacy_budget_template_order.push(id.clone());
+        store
+            .privacy_budget_template_by_collaboration
+            .insert(membership.collaboration_id.clone(), id.clone());
+
+        let Some(privacy_budget_template) = store.privacy_budget_templates.get(&id).cloned() else {
+            return Err(CreatePrivacyBudgetTemplateErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(format!("privacy budget template {id} was not persisted")),
+                },
+            )
+            .into());
+        };
+        Ok(CreatePrivacyBudgetTemplateOutput {
+            privacy_budget_template,
+        })
     }
 }

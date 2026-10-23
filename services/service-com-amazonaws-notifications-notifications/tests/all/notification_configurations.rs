@@ -12,73 +12,21 @@
 //! `NOTIFICATION_CONFIGURATION_SUBTYPE_VALUES`), so a model change moves the
 //! test with it.
 
-use std::sync::Arc;
-
 use serde_json::{json, Value};
 use service_com_amazonaws_notifications_notifications::ops::types::{
     AGGREGATION_DURATION_VALUES, NOTIFICATION_CONFIGURATION_STATUS_VALUES,
     NOTIFICATION_CONFIGURATION_SUBTYPE_VALUES,
 };
-use service_com_amazonaws_notifications_notifications::{
-    ComAmazonawsNotificationsNotificationsState, EmulatedService,
-};
-use smithy_server_runtime::MultiServiceRouter;
+use service_com_amazonaws_notifications_notifications::ComAmazonawsNotificationsNotificationsState;
 
-/// A SigV4 credential scope naming this service, which is what the router's
-/// routing key is resolved from. Request authentication is off in these tests,
-/// so no real signature is needed — only the scope that names `notifications`.
-const CREDENTIAL_SCOPE: &str = "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/notifications/aws4_request, SignedHeaders=host, Signature=0";
+// The HTTP harness this suite drives the service through, shared with every
+// other suite in this crate.
+use crate::harness::{encode_path_label, error_code, Emulator};
 
-/// The emulator under test: the production router with this one service mounted
-/// on an engine the test also holds, so a test can read the store directly for
-/// state no operation reports yet.
-struct Emulator {
-    router: MultiServiceRouter,
-    engine: Arc<engine::InMemoryEngine>,
-}
-
+// The configuration-specific helpers this suite adds to the shared harness. An
+// inherent `impl` on a type declared elsewhere in the same crate is what keeps
+// them beside the tests that use them.
 impl Emulator {
-    fn new() -> Self {
-        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-        let mut router = MultiServiceRouter::new();
-        router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(Arc::clone(&engine)));
-        Self { router, engine }
-    }
-
-    /// Send one request and return its status and parsed JSON body (`Value::Null`
-    /// for an empty body).
-    async fn send(&self, method: &str, uri: &str, body: Option<Value>) -> (u16, Value) {
-        let payload = match &body {
-            Some(value) => {
-                bytes::Bytes::from(serde_json::to_vec(value).expect("a serializable body"))
-            }
-            None => bytes::Bytes::new(),
-        };
-        let request = http::Request::builder()
-            .method(method)
-            .uri(uri)
-            .header("host", "notifications.us-east-1.amazonaws.com")
-            .header("content-type", "application/json")
-            .header("authorization", CREDENTIAL_SCOPE)
-            .body(payload)
-            .expect("a well-formed request");
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let raw = response.body().clone();
-        let parsed = if raw.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&raw).unwrap_or_else(|error| {
-                panic!(
-                    "{method} {uri} answered a body that is not JSON ({error}): {}",
-                    String::from_utf8_lossy(&raw)
-                )
-            })
-        };
-        (status, parsed)
-    }
-
     /// Create a configuration and return its arn, failing the test on anything
     /// other than the modelled 201.
     async fn create(&self, body: Value) -> String {
@@ -130,21 +78,6 @@ impl Emulator {
     }
 }
 
-/// Percent-encode one URI path segment, the way an SDK encodes a non-greedy
-/// `@httpLabel`: an arn's `:` and `/` must not be read as segment structure.
-fn encode_path_label(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| {
-            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-                (byte as char).to_string()
-            } else {
-                format!("%{byte:02X}")
-            }
-        })
-        .collect()
-}
-
 /// The `NotificationConfigurationArn` pattern the model declares,
 /// `^arn:[a-z-]{3,10}:notifications::[0-9]{12}:configuration/[a-z0-9]{27}$`,
 /// checked by hand so the suite needs no regex dependency.
@@ -175,11 +108,6 @@ fn is_configuration_arn(value: &str) -> bool {
         return false;
     };
     id.len() == 27 && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-}
-
-/// The error code of an error response, from the restJson1 `__type` member.
-fn error_code(response: &Value) -> String {
-    response["__type"].as_str().unwrap_or_default().to_string()
 }
 
 /// One row of the create/get table.
