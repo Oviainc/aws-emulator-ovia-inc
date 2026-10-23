@@ -176,7 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     next_page_token = Some(name.clone());
                     break;
                 }
-                instances.push(instance.view());
+                instances.push(instance.view(store.attached_disk_views(name)));
             }
             GetInstancesOutput {
                 // An account with no instances reports an empty list, not an

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AttachDisk
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AttachDisk`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Attaches one stored block storage disk to one stored instance, at the device
+//! path the request names, and answers the operation-log entry the attachment
+//! appended.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AttachDisk::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +167,190 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AttachDisk` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AttachDiskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AttachDisk"))
+        // `ctx` carries request metadata only, and nothing this operation stores
+        // comes from it: the attachment is recorded where the DISK lives, which
+        // the stored disk already names.
+        let _ = ctx;
+
+        // `autoMounting` is accepted because the model declares it, and it
+        // changes nothing here: the modelled `AttachDisk$autoMounting` and
+        // `Disk$autoMountStatus` documentation both say the member "only applies
+        // to Lightsail for Research resources", and no resource this service
+        // holds is a Lightsail for Research virtual computer (every bundle in
+        // the published catalog carries no app category). There is therefore no
+        // mount for the disk to report, which is why `autoMountStatus` stays
+        // absent rather than carrying a status nothing performed.
+        let _auto_mounting = input.auto_mounting;
+
+        // `diskName`, `instanceName` and `diskPath` are modelled `@required`
+        // members and every pattern on this input is a modelled constraint, so
+        // the centralized walk refused anything outside them before this body
+        // ran. What is left is what the model cannot express: both resources
+        // must be ones this account holds, the disk must be free to attach, the
+        // instance must be in a state Lightsail attaches to, the two must share
+        // an Availability Zone, and the device path must not already be taken on
+        // that instance. Every one of those is checked BEFORE the first write,
+        // so a refused request attaches nothing.
+        let disk_name = input.disk_name;
+        let instance_name = input.instance_name;
+        let disk_path = input.disk_path;
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // The disk first: it is the resource this operation acts on, and the
+            // one tag-based access control is evaluated against ("supports
+            // tag-based access control via resource tags applied to the resource
+            // identified by disk name").
+            let disk = store
+                .disk(&disk_name)
+                .ok_or_else(|| not_found(crate::state::RESOURCE_TYPE_DISK, &disk_name))?;
+            let disk_state = disk.state;
+            let attached_to = disk.attached_to.clone();
+            let location = disk.location.clone();
+
+            let instance = store.instance(&instance_name).ok_or_else(|| {
+                not_found(crate::state::RESOURCE_TYPE_INSTANCE, &instance_name)
+            })?;
+            let instance_state = instance.state;
+            let instance_zone = instance.location.availability_zone.clone();
+            let instance_region = instance.location.region_name.clone();
+            // The device paths this instance already exposes: its system disk's,
+            // which exists for as long as the instance does, and one per block
+            // storage disk already attached to it.
+            let taken_paths: Vec<String> = std::iter::once(
+                crate::state::SYSTEM_DISK_PATH.to_string(),
+            )
+            .chain(
+                store
+                    .disks_attached_to(&instance_name)
+                    .into_iter()
+                    .filter_map(|disk| disk.path.clone()),
+            )
+            .collect();
+
+            // A disk is attached to at most one instance: the modelled
+            // `Disk$attachedTo` names the one resource it is attached to, so an
+            // attachment can only be made from a disk that has none. The refusal
+            // is keyed on the ATTACHMENT rather than on the disk's state, so it
+            // holds however the state is reported.
+            if let Some(holder) = attached_to {
+                return Err(operation_failure(format!(
+                    "The disk {disk_name} is already attached to the instance {holder}. \
+                     Detach the disk before attaching it to another instance."
+                )));
+            }
+            // Only a disk that exists and is doing nothing can be attached: a
+            // disk Lightsail is still provisioning (`pending`) has nothing to
+            // expose yet, and the modelled `DiskState`'s other values describe a
+            // disk that is in use or whose state is not reportable.
+            if disk_state != crate::state::DISK_STATE_AVAILABLE {
+                return Err(operation_failure(format!(
+                    "The disk {disk_name} is {disk_state}: a disk can be attached only \
+                     while it is {}.",
+                    crate::state::DISK_STATE_AVAILABLE
+                )));
+            }
+            // From this operation's own documentation: it "attaches a block
+            // storage disk to a running or stopped Lightsail instance". An
+            // instance still coming up or going down is neither, so there is
+            // nothing to expose the disk to yet.
+            if instance_state != crate::state::RUNNING && instance_state != crate::state::STOPPED
+            {
+                return Err(operation_failure(format!(
+                    "The instance {instance_name} is {}: a disk can be attached only to a \
+                     running or stopped instance.",
+                    instance_state.name
+                )));
+            }
+            // A disk is block storage of one Availability Zone, and an instance
+            // runs in one: the modelled `CreateDisk$availabilityZone`
+            // documentation says to "use the same Availability Zone as the
+            // Lightsail instance to which you want to attach the disk", so a
+            // disk in another zone cannot reach this instance.
+            if location.availability_zone != instance_zone {
+                return Err(operation_failure(format!(
+                    "The disk {disk_name} is in {} and the instance {instance_name} is in \
+                     {}: a disk can be attached only to an instance in the same \
+                     Availability Zone.",
+                    location
+                        .availability_zone
+                        .clone()
+                        .unwrap_or_else(|| location.region_name.clone()),
+                    instance_zone.unwrap_or(instance_region)
+                )));
+            }
+            // A device path addresses one device on the instance, so two disks
+            // cannot be exposed at the same one — including the path the
+            // instance's own system disk occupies.
+            if taken_paths.iter().any(|taken| taken == &disk_path) {
+                return Err(operation_failure(format!(
+                    "The disk path {disk_path} is already in use on the instance \
+                     {instance_name}: attach the disk at a path the instance does not \
+                     already expose."
+                )));
+            }
+
+            // The attachment itself: the disk names the instance it is attached
+            // to and the path it is exposed at, and its state is `in-use` for as
+            // long as that stands. The modelled `DiskState` enum has no
+            // "attaching" member — `pending` is a disk being provisioned — so
+            // there is no transient state for a span to show here; what the clock
+            // owes is the operation-log entry's terminal status, exactly as it
+            // does for every other mutating Lightsail call.
+            let Some(disk) = store.disk_mut(&disk_name) else {
+                // Unreachable: the disk was read above under this same lock.
+                return Err(not_found(crate::state::RESOURCE_TYPE_DISK, &disk_name));
+            };
+            disk.attached_to = Some(instance_name.clone());
+            disk.path = Some(disk_path);
+            disk.state = crate::state::DISK_STATE_IN_USE;
+
+            // `operations` is a list because other Lightsail calls act on
+            // several resources at once; `AttachDisk` acts on exactly one disk,
+            // so it answers exactly one entry, located where that disk is and
+            // left non-terminal until the attachment the clock owes is due.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_ATTACH_DISK,
+                crate::state::RESOURCE_TYPE_DISK,
+                &disk_name,
+                &location,
+                Some(now.saturating_add(crate::state::STATE_TRANSITION_MILLIS)),
+            );
+            Ok(AttachDiskOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// Lightsail's refusal of a well-formed request its resources' state does not
+/// allow: the modelled `OperationFailureException` — HTTP 400, "Lightsail throws
+/// this exception when an operation fails to execute" — whose message names the
+/// resource that is in the way and the state it is in.
+fn operation_failure(message: String) -> AttachDiskError {
+    AttachDiskErrorModeled::OperationFailureException(OperationFailureException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The request names a resource this account does not hold: Lightsail's
+/// `DoesNotExist` rejection — HTTP 400, wire error `NotFoundException`, body
+/// `code` `DoesNotExist` and a message naming the resource type and the
+/// requested name.
+fn not_found(resource_type: &str, name: &str) -> AttachDiskError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(resource_type, name)
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> AttachDiskError {
+    AttachDiskErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail disk store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }
