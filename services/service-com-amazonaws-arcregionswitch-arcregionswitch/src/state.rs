@@ -33,8 +33,8 @@ use std::time::{Duration, SystemTime};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    AbbreviatedPlan, ExecutionBlockConfiguration, ExecutionEvent, Plan, Route53HealthCheck, Step,
-    StepState,
+    AbbreviatedExecution, AbbreviatedPlan, ExecutionBlockConfiguration, ExecutionEvent, Plan,
+    Route53HealthCheck, Step, StepState,
 };
 
 /// How long after the call that starts one the clock owes an execution its NEXT
@@ -221,9 +221,9 @@ pub fn plan_not_found_message(arn: &str) -> String {
 
 /// The page size a paginated operation of this service serves.
 ///
-/// Both `ListPlans` and `GetPlanExecution`/`ListPlanExecutionEvents` constrain
-/// `maxResults` to `@range(1..100)`; an absent one asks for as many as that range allows.
-/// One helper so the rule is written once.
+/// `ListPlans`, `GetPlanExecution`, `ListPlanExecutionEvents` and `ListPlanExecutions`
+/// all constrain `maxResults` to `@range(1..100)`; an absent one asks for as many as
+/// that range allows. One helper so the rule is written once.
 pub fn page_size(requested: Option<i32>) -> usize {
     const MAX_PAGE_SIZE: i32 = 100;
     let clamped = requested.unwrap_or(MAX_PAGE_SIZE).clamp(1, MAX_PAGE_SIZE);
@@ -458,6 +458,30 @@ impl StoredExecution {
         self.step_states
             .iter()
             .position(|step| step.name.as_deref() == Some(name))
+    }
+
+    /// The `AbbreviatedExecution` projection `ListPlanExecutions` reports: the execution
+    /// record without the per-step detail, the plan and the report `GetPlanExecution`
+    /// adds.
+    ///
+    /// `actualRecoveryTime` is absent for the same reason it is absent from
+    /// `GetPlanExecution`: no execution block ran, so nothing measured a recovery time.
+    pub fn as_abbreviated_execution(&self) -> AbbreviatedExecution {
+        AbbreviatedExecution {
+            plan_arn: self.plan_arn.clone(),
+            execution_id: self.execution_id.clone(),
+            version: Some(self.plan_version.clone()),
+            updated_at: Some(self.updated_at),
+            comment: self.comment.clone(),
+            start_time: self.start_time,
+            end_time: self.end_time,
+            mode: self.mode.clone(),
+            execution_state: self.execution_state.clone(),
+            execution_action: self.action.clone(),
+            execution_region: self.execution_region.clone(),
+            recovery_execution_id: self.recovery_execution_id.clone(),
+            actual_recovery_time: None,
+        }
     }
 }
 
