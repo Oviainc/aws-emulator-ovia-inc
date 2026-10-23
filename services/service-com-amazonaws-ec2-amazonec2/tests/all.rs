@@ -56,6 +56,8 @@ mod instance_lifecycle;
 mod instance_type_offerings;
 #[path = "all/launch_templates.rs"]
 mod launch_templates;
+#[path = "all/local_gateway_route_table_virtual_interface_group_associations.rs"]
+mod local_gateway_route_table_virtual_interface_group_associations;
 #[path = "all/mac_dedicated_hosts.rs"]
 mod mac_dedicated_hosts;
 #[path = "all/modify_subnet_attribute.rs"]
