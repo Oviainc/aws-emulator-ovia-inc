@@ -26,7 +26,8 @@ tracing = { workspace = true }
 hex = { workspace = true }
 # SHA-256 derives each reserved-cache-node offering's id from its attributes, so
 # the published catalog needs no counter and reports the same id on every read
-# (src/state.rs).
+# (src/state.rs), and mints the per-response correlation id the awsQuery error
+# envelope carries (src/service/query_error_envelope.rs).
 sha2 = { workspace = true }
 
 [build-dependencies]
