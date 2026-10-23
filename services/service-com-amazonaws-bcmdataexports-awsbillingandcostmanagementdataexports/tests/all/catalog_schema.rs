@@ -7,10 +7,12 @@
 //! The rules under test, each asserted over the whole catalog rather than over the one
 //! table that showed the defect:
 //!
-//! 1. A CURATED table (the cost and usage dashboard) publishes exactly the aggregate
-//!    columns the dictionary lists for it and NONE of the underlying table's own
-//!    line-item columns: the dictionary's column set for a table name is that table's,
-//!    so a client writing a query for it cannot select a column AWS would reject.
+//! 1. A CURATED table (the cost and usage dashboard) publishes exactly the columns the
+//!    dictionary lists for it: its aggregate dimensions and measures, plus the few
+//!    columns it carries over from the underlying table under that table's own names, and
+//!    none of the underlying table's other line-item columns. The dictionary's column set
+//!    for a table name is that table's, so a client writing a query for it can select
+//!    every column AWS publishes and cannot select one AWS would reject.
 //! 2. A column's `Type` is the token ITS schema's dictionary publishes for it: the cost
 //!    and usage dictionary measures costs with `Number` and publishes the Savings Plan
 //!    commitment and rate as `String`, while the recommendations and carbon emissions
@@ -56,13 +58,15 @@ const CARBON_EMISSIONS: &str = "CARBON_EMISSIONS";
 /// dictionary).
 const DASHBOARD_DESCRIPTION: &str = "A view over CUR for CostAndUsageDashboard";
 
-/// How many columns the dashboard publishes: its aggregate dimensions and measures, and
-/// only those (AWS Data Exports table dictionary).
-const DASHBOARD_COLUMN_COUNT: usize = 37;
+/// How many columns the dashboard publishes: its aggregate dimensions and measures and
+/// the columns it carries over from the cost and usage table, and only those (AWS Data
+/// Exports table dictionary).
+const DASHBOARD_COLUMN_COUNT: usize = 40;
 
 /// The columns the dashboard publishes, with the kind of data each stores (AWS Data
 /// Exports table dictionary). This is the WHOLE published column set for the table, which
-/// is what rule 1 is about: no cost and usage line-item column belongs to it.
+/// is what rule 1 is about: every column AWS publishes for it is here, and no other cost
+/// and usage line-item column belongs to it.
 const DASHBOARD_OWN_COLUMNS: &[(&str, &str)] = &[
     ("amortized_cost", "Number"),
     ("availability_zone", "String"),
@@ -83,12 +87,16 @@ const DASHBOARD_OWN_COLUMNS: &[(&str, &str)] = &[
     ("payer_account_id", "String"),
     ("payer_account_name", "String"),
     ("platform", "String"),
+    // Carried over from the cost and usage table under its own name.
+    ("pricing_unit", "String"),
     ("processor", "String"),
     ("processor_features", "String"),
     ("product_code", "String"),
     ("product_family", "String"),
+    ("product_from_location", "String"),
     ("product_group", "String"),
     ("product_name", "String"),
+    ("product_to_location", "String"),
     ("public_cost", "Number"),
     ("purchase_option", "String"),
     ("region", "String"),
@@ -113,9 +121,14 @@ const NOT_PUBLISHED_BY_THE_DASHBOARD: &[&str] = &[
     "line_item_usage_start_date",
     "line_item_usage_amount",
     "pricing_rate_id",
-    "pricing_unit",
-    "product_from_location",
     "product_instancesku",
+    // The dashboard carries the two ends of a transfer over, but not the cost and usage
+    // table's location TYPE and Region CODE columns for them.
+    "product_from_location_type",
+    "product_from_region_code",
+    "product_to_location_type",
+    "product_to_region_code",
+    "product_location",
     "reservation_modification_status",
     "resource_tags",
     "savings_plan_used_commitment",
