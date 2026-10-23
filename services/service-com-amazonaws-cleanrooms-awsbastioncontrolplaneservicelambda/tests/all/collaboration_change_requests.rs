@@ -5,11 +5,14 @@
 //!
 //! The rule under test: a created change request's `changes[*].types` is the DIFFERENCE
 //! between the specification the request carried and the collaboration as stored, named
-//! from the model's `ChangeType` catalog; `isAutoApproved` is true exactly when the
-//! collaboration's `autoApprovedChangeTypes` covers every one of those types, in which
-//! case the change is applied to the collaboration and the request is COMMITTED with
-//! every approval APPROVED; otherwise it is stored PENDING with a PENDING approval per
-//! party to the collaboration and applies nothing. A specification that asks for no
+//! from the model's `ChangeType` catalog; `isAutoApproved` is true exactly when no
+//! approval the request needs is outstanding — the collaboration's
+//! `autoApprovedChangeTypes` covers every one of those types, or the requesting account is
+//! the only party whose approval it needs — in which case the change is applied to the
+//! collaboration and the request is COMMITTED with every approval APPROVED; otherwise it
+//! is stored PENDING with a PENDING approval per party to the collaboration and applies
+//! nothing. The auto-commit half of that rule has its own table in
+//! [`super::collaboration_change_request_auto_commit`]. A specification that asks for no
 //! modification the collaboration does not already have, or one the catalog cannot name,
 //! is refused (`ChangeTypeList` is `len 1..`). Every stored request reads back unchanged
 //! through `GetCollaborationChangeRequest`.
@@ -176,8 +179,8 @@ struct TypesCase {
 
 /// The service derives each change's `types` from the stored collaboration, covering
 /// every grant/revoke pair the `ChangeType` catalog names plus the add, payer-candidate
-/// and collaboration-setting types — and reports a request nobody auto-approves as
-/// PENDING, with one PENDING approval per party.
+/// and collaboration-setting types — and reports a request another party has yet to
+/// approve as PENDING, with one PENDING approval per party.
 #[tokio::test]
 async fn change_request_types_are_derived_from_the_stored_collaboration() {
     let emulator = Emulator::new();
@@ -187,7 +190,9 @@ async fn change_request_types_are_derived_from_the_stored_collaboration() {
         TypesCase {
             case: "an account that is not a party yet is added",
             creator_abilities: vec!["CAN_QUERY"],
-            members: json!([]),
+            // Every row carries a second party, so the request this table creates always
+            // has an approval outstanding and stays PENDING whatever its types are.
+            members: json!([declared_member(PARTNER_ACCOUNT, &["CAN_QUERY"])]),
             change: member_change(NEWCOMER_ACCOUNT, &["CAN_QUERY"]),
             expect_types: vec!["ADD_MEMBER"],
         },
@@ -247,7 +252,7 @@ async fn change_request_types_are_derived_from_the_stored_collaboration() {
         TypesCase {
             case: "the collaboration creator gains an ability",
             creator_abilities: vec!["CAN_QUERY"],
-            members: json!([]),
+            members: json!([declared_member(PARTNER_ACCOUNT, &["CAN_QUERY"])]),
             change: member_change(creator, &["CAN_QUERY", "CAN_RECEIVE_RESULTS"]),
             expect_types: vec!["GRANT_RECEIVE_RESULTS_ABILITY"],
         },
@@ -361,7 +366,7 @@ async fn change_request_types_are_derived_from_the_stored_collaboration() {
         TypesCase {
             case: "the collaboration's auto-approved change types are edited",
             creator_abilities: vec!["CAN_QUERY"],
-            members: json!([]),
+            members: json!([declared_member(PARTNER_ACCOUNT, &["CAN_QUERY"])]),
             change: json!({
                 "specificationType": "COLLABORATION",
                 "specification": { "collaboration": {
@@ -447,11 +452,11 @@ async fn change_request_types_are_derived_from_the_stored_collaboration() {
         );
         assert_eq!(
             request["status"], json!("PENDING"),
-            "case {label:?}: a change request nobody auto-approves is PENDING, got {request}"
+            "case {label:?}: a change request another party must still approve is PENDING, got {request}"
         );
         assert_eq!(
             request["isAutoApproved"], json!(false),
-            "case {label:?}: the collaboration auto-approves nothing, got {request}"
+            "case {label:?}: the collaboration auto-approves nothing and another party's approval is outstanding, got {request}"
         );
         assert_eq!(
             approvals_of(request),

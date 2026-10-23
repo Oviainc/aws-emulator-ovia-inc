@@ -75,6 +75,18 @@ impl Emulator {
     /// Dispatch one request and return its status and JSON body (`Value::Null` for an
     /// empty body, which is what a 204 carries).
     pub(crate) async fn call(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+        let (status, _, json) = self.call_with_error_type(method, path, body).await;
+        (status, json)
+    }
+
+    /// As [`Emulator::call`], plus the `x-amzn-errortype` header restJson1 names the
+    /// error shape in (an empty string when the response carries none).
+    pub(crate) async fn call_with_error_type(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> (u16, String, Value) {
         let host = format!("cleanrooms.{REGION}.amazonaws.com");
         let payload = body
             .map(|b| serde_json::to_vec(&b).expect("serialize request body"))
@@ -98,6 +110,12 @@ impl Emulator {
 
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
+        let error_type = response
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
         let body = response.into_body();
         let json = if body.is_empty() {
             Value::Null
@@ -109,7 +127,7 @@ impl Emulator {
                 )
             })
         };
-        (status, json)
+        (status, error_type, json)
     }
 
     pub(crate) async fn create_collaboration(&self, body: Value) -> (u16, Value) {

@@ -23,7 +23,7 @@
 //! a thing's oldest FINISHED executions) and
 //! [`JobExecutionStore::remember_client_token`] (oldest token evicted first).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A newly enqueued execution's status.
@@ -37,11 +37,96 @@ pub const STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
 /// (`UpdateJobExecution$stepTimeoutInMinutes`). It is a `JobExecutionStatus` value of
 /// both IoT models, and TERMINAL (it is not one of the [`PENDING_STATUSES`]).
 pub const STATUS_TIMED_OUT: &str = "TIMED_OUT";
+/// The status a device reports when it REFUSES the work it was handed. It is a
+/// terminal `JobExecutionStatus` value of both IoT models, and the one terminal
+/// status an execution can only be moved to while it is still `QUEUED` — a device
+/// rejects work it has not started ("Only queued jobs can be rejected").
+pub const STATUS_REJECTED: &str = "REJECTED";
 
 /// The two statuses an execution is PENDING in — the ones
 /// `GetPendingJobExecutions` documents as "not in a terminal status" and
 /// `StartNextPendingJobExecution` as the executions it may start.
 pub const PENDING_STATUSES: [&str; 2] = [STATUS_QUEUED, STATUS_IN_PROGRESS];
+
+/// How far through its lifecycle a status leaves a job execution: enqueued (0),
+/// taken up by its device (1), finished (2). A device update may hold an execution
+/// at its stage or carry it FORWARD; it may never carry it back.
+fn lifecycle_stage(status: &str) -> u8 {
+    match status {
+        STATUS_QUEUED => 0,
+        STATUS_IN_PROGRESS => 1,
+        // Every other modelled `JobExecutionStatus` value ends the execution.
+        _ => 2,
+    }
+}
+
+/// Why a device update of an execution in `current` to `requested` is REFUSED, or
+/// `None` while the move is legal.
+///
+/// A job execution runs forward through enqueued -> taken up -> finished
+/// ([`lifecycle_stage`]), so an update may repeat an execution's own stage (a
+/// progress report) or carry it forward (including straight from `QUEUED` to a
+/// terminal status, which skips no step the service requires), and nothing may carry
+/// it BACK: an execution a device already took up can neither return to the queue
+/// nor be rejected, and a finished one moves no further. The caller reports the
+/// reason as its own modelled state-transition error (HTTP 409); a caller that has
+/// its own wording for a finished execution refuses that case before asking.
+pub fn transition_refusal(current: &str, requested: &str) -> Option<String> {
+    if is_terminal_status(current) {
+        return Some(format!(
+            "The status of job execution cannot be changed to be {requested}"
+        ));
+    }
+    if requested == STATUS_REJECTED && current != STATUS_QUEUED {
+        return Some(format!(
+            "Only queued jobs can be rejected. Job was in status {current}"
+        ));
+    }
+    if lifecycle_stage(requested) < lifecycle_stage(current) {
+        return Some(format!(
+            "The status of job execution cannot be changed to be {requested}"
+        ));
+    }
+    None
+}
+
+/// Check a request's `statusDetails` against the bounds a job execution's details
+/// carry — at most [`MAX_STATUS_DETAIL_PAIRS`] name/value pairs, each name within
+/// [`MAX_STATUS_DETAIL_NAME_LEN`] and each value within
+/// [`MAX_STATUS_DETAIL_VALUE_LEN`] characters — and answer `Err` with the reason the
+/// caller reports as its modelled client error.
+///
+/// NOTHING about the stored record enters the check: a supplied map REPLACES the
+/// stored one ([`JobExecutionRecord::try_replace_status_details`]), so the map the
+/// request carries is the map the record will hold, and repeated updates cannot
+/// accumulate details without bound. An absent member changes nothing and is
+/// therefore always acceptable.
+pub fn check_status_details(details: Option<&HashMap<String, String>>) -> Result<(), String> {
+    let Some(details) = details else {
+        return Ok(());
+    };
+    for (name, value) in details {
+        let name_len = name.chars().count();
+        if name_len > MAX_STATUS_DETAIL_NAME_LEN {
+            return Err(format!(
+                "a statusDetails name of {name_len} characters is over the {MAX_STATUS_DETAIL_NAME_LEN} character maximum"
+            ));
+        }
+        let value_len = value.chars().count();
+        if value_len > MAX_STATUS_DETAIL_VALUE_LEN {
+            return Err(format!(
+                "the statusDetails value for {name} is {value_len} characters, over the {MAX_STATUS_DETAIL_VALUE_LEN} character maximum"
+            ));
+        }
+    }
+    if details.len() > MAX_STATUS_DETAIL_PAIRS {
+        return Err(format!(
+            "the job execution would hold {} statusDetails name/value pairs, over the maximum of {MAX_STATUS_DETAIL_PAIRS}",
+            details.len()
+        ));
+    }
+    Ok(())
+}
 
 /// The `versionNumber` a freshly created execution carries: "Job execution versions
 /// are incremented each time they are updated by a device"
@@ -305,50 +390,33 @@ impl JobExecutionRecord {
             .collect()
     }
 
-    /// Apply a request's `statusDetails` WITHIN the bounds a job execution's details
-    /// carry: every supplied pair is set and an absent map leaves the details
-    /// unchanged ("If not specified, the statusDetails are unchanged"), but a map
-    /// that would push the record past [`MAX_STATUS_DETAIL_PAIRS`],
-    /// [`MAX_STATUS_DETAIL_NAME_LEN`] or [`MAX_STATUS_DETAIL_VALUE_LEN`] is refused
-    /// with the reason, for the caller to report as the modelled client error.
-    /// Nothing is written on a refusal: the whole map is checked before the first
-    /// insert, so repeated updates cannot accumulate details without bound.
-    pub fn try_merge_status_details(
+    /// Apply a request's `statusDetails`: a map the request CARRIES replaces the
+    /// stored one wholesale (so a name the device no longer sends is dropped), while
+    /// an ABSENT member leaves the stored map exactly as it was ("If not specified,
+    /// the statusDetails are unchanged").
+    ///
+    /// The map is checked against the record's bounds first
+    /// ([`check_status_details`]) and `Err` names the reason for the caller to report
+    /// as its modelled client error; nothing is written on a refusal, so a map the
+    /// record cannot hold leaves the execution untouched.
+    pub fn try_replace_status_details(
         &mut self,
         details: Option<&HashMap<String, String>>,
     ) -> Result<(), String> {
-        let Some(details) = details else {
-            return Ok(());
-        };
-        for (name, value) in details {
-            let name_len = name.chars().count();
-            if name_len > MAX_STATUS_DETAIL_NAME_LEN {
-                return Err(format!(
-                    "a statusDetails name of {name_len} characters is over the {MAX_STATUS_DETAIL_NAME_LEN} character maximum"
-                ));
-            }
-            let value_len = value.chars().count();
-            if value_len > MAX_STATUS_DETAIL_VALUE_LEN {
-                return Err(format!(
-                    "the statusDetails value for {name} is {value_len} characters, over the {MAX_STATUS_DETAIL_VALUE_LEN} character maximum"
-                ));
-            }
-        }
-        let resulting_pairs = self
-            .status_details
-            .keys()
-            .chain(details.keys())
-            .collect::<BTreeSet<&String>>()
-            .len();
-        if resulting_pairs > MAX_STATUS_DETAIL_PAIRS {
-            return Err(format!(
-                "the job execution would hold {resulting_pairs} statusDetails name/value pairs, over the maximum of {MAX_STATUS_DETAIL_PAIRS}"
-            ));
-        }
-        for (name, value) in details {
-            self.status_details.insert(name.clone(), value.clone());
+        check_status_details(details)?;
+        if let Some(details) = details {
+            self.status_details = details
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect();
         }
         Ok(())
+    }
+
+    /// Why a device update of this execution to `requested` is refused, or `None`
+    /// while the move is legal — [`transition_refusal`] against the stored status.
+    pub fn transition_refusal(&self, requested: &str) -> Option<String> {
+        transition_refusal(&self.status, requested)
     }
 
     /// Apply a request's `stepTimeoutInMinutes`: absent leaves the current step timer
@@ -834,6 +902,131 @@ mod tests {
         store
             .try_insert_execution(record)
             .expect("the store accepts an execution below every quota");
+    }
+
+    /// RULE: a device update may hold an execution at its lifecycle stage or carry
+    /// it FORWARD (queued -> taken up -> finished), never back; and `REJECTED` is
+    /// reachable only from `QUEUED`.
+    ///
+    /// The rows span every pair of a pending status with a modelled status, plus the
+    /// moves out of a finished execution.
+    #[test]
+    fn a_status_update_may_never_carry_an_execution_backward() {
+        // (case, stored status, requested status, legal)
+        let rows: &[(&str, &str, &str, bool)] = &[
+            ("queued stays queued", STATUS_QUEUED, STATUS_QUEUED, true),
+            ("queued is taken up", STATUS_QUEUED, STATUS_IN_PROGRESS, true),
+            ("queued succeeds directly", STATUS_QUEUED, "SUCCEEDED", true),
+            ("queued fails directly", STATUS_QUEUED, "FAILED", true),
+            ("queued is rejected", STATUS_QUEUED, STATUS_REJECTED, true),
+            ("queued is canceled", STATUS_QUEUED, "CANCELED", true),
+            ("queued is removed", STATUS_QUEUED, "REMOVED", true),
+            ("queued times out", STATUS_QUEUED, STATUS_TIMED_OUT, true),
+            (
+                "in progress reports progress",
+                STATUS_IN_PROGRESS,
+                STATUS_IN_PROGRESS,
+                true,
+            ),
+            ("in progress succeeds", STATUS_IN_PROGRESS, "SUCCEEDED", true),
+            ("in progress fails", STATUS_IN_PROGRESS, "FAILED", true),
+            (
+                "in progress times out",
+                STATUS_IN_PROGRESS,
+                STATUS_TIMED_OUT,
+                true,
+            ),
+            (
+                "in progress is rewound to the queue",
+                STATUS_IN_PROGRESS,
+                STATUS_QUEUED,
+                false,
+            ),
+            (
+                "in progress is rejected",
+                STATUS_IN_PROGRESS,
+                STATUS_REJECTED,
+                false,
+            ),
+            ("a finished execution restarts", "SUCCEEDED", STATUS_IN_PROGRESS, false),
+            ("a finished execution is requeued", "FAILED", STATUS_QUEUED, false),
+            ("a finished execution finishes again", "SUCCEEDED", "FAILED", false),
+        ];
+
+        for (case, current, requested, legal) in rows {
+            let refusal = transition_refusal(current, requested);
+            assert_eq!(
+                refusal.is_none(),
+                *legal,
+                "case {case:?}: expected legal == {legal} for {current} -> {requested}, got {refusal:?}"
+            );
+        }
+    }
+
+    /// RULE: a supplied `statusDetails` REPLACES the stored map (a name no longer
+    /// sent is dropped), an absent one leaves it unchanged, and a map past the
+    /// bounds is refused with the record left untouched.
+    #[test]
+    fn supplied_status_details_replace_the_stored_map_and_an_absent_one_keeps_it() {
+        let mut record =
+            JobExecutionRecord::queued("job".to_string(), "thing".to_string(), None, 1_000);
+
+        /// One row: the case, the pairs the request carries (`None` when the member
+        /// is omitted) and the pairs the record then holds, in key order.
+        type Row = (&'static str, Option<&'static [(&'static str, &'static str)]>, &'static [(&'static str, &'static str)]);
+
+        let rows: &[Row] = &[
+            (
+                "the first write",
+                Some(&[("stage", "download"), ("attempt", "1")]),
+                &[("attempt", "1"), ("stage", "download")],
+            ),
+            (
+                "a write that no longer sends every name",
+                Some(&[("stage", "verify")]),
+                &[("stage", "verify")],
+            ),
+            ("a write that omits the member", None, &[("stage", "verify")]),
+            ("a write that empties the map", Some(&[]), &[]),
+        ];
+
+        for (case, written, expected) in rows {
+            let details: Option<HashMap<String, String>> = written.map(|pairs| {
+                pairs
+                    .iter()
+                    .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                    .collect()
+            });
+            record
+                .try_replace_status_details(details.as_ref())
+                .unwrap_or_else(|reason| {
+                    panic!("case {case:?}: expected the map accepted: {reason}")
+                });
+            let held: Vec<(&str, &str)> = record
+                .status_details
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect();
+            assert_eq!(
+                held, *expected,
+                "case {case:?}: expected the record to hold {expected:?}, got {held:?}"
+            );
+        }
+
+        // One pair past the bound is refused, and the record keeps what it had.
+        let over_bound: HashMap<String, String> = (0..=MAX_STATUS_DETAIL_PAIRS)
+            .map(|index| (format!("key-{index}"), "v".to_string()))
+            .collect();
+        let refusal = record.try_replace_status_details(Some(&over_bound));
+        assert!(
+            refusal.is_err(),
+            "case one pair too many: expected a refusal, got {refusal:?}"
+        );
+        assert!(
+            record.status_details.is_empty(),
+            "case one pair too many: the refused write must change nothing, got {:?}",
+            record.status_details
+        );
     }
 
     /// A created execution is pending at version 1, execution number 1, and the two

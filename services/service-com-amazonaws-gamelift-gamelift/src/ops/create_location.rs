@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLocation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLocation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLocation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates the custom location the request names and persists it, so this response and
+//! every later read of the locations (`ListLocations`) are served from the one stored
+//! record. A name a location already holds is refused with `ConflictException`: the
+//! uniqueness check and the insert happen under the one state lock, so two concurrent
+//! creates of the same name can never both win.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +159,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLocation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLocationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLocation"))
+        use crate::state::MAX_CUSTOM_LOCATIONS_PER_ACCOUNT;
+
+        // A resource's tags are a key-value MAP ("Tags are developer-defined key-value
+        // pairs"), so one key cannot carry two values; `TaggingFailedException`'s doc:
+        // "This may be due to invalid tag format". The modelled `TagList` length (0..200)
+        // and each tag's own lengths are refused by the boundary walk before this handler
+        // runs. Refused BEFORE any state is locked and before anything is stored.
+        let tags = input.tags.clone().unwrap_or_default();
+        let mut keys = ::std::collections::HashSet::new();
+        if let Some(duplicate) = tags.iter().find(|tag| !keys.insert(tag.key.clone())) {
+            return Err(CreateLocationErrorModeled::TaggingFailedException(
+                TaggingFailedException {
+                    message: Some(format!(
+                        "Tags assigns the key {} more than once; a resource's tags carry each key \
+                         at most once.",
+                        duplicate.key
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateLocationErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the GameLift emulator state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.tick(now);
+
+        // A location is named by its `LocationName` wherever a fleet or a queue refers to
+        // one, so a name identifies exactly one location: a second create under a name
+        // that is taken is the conflict `ConflictException` describes ("the requested
+        // operation would cause a conflict with the current state of a service resource
+        // associated with the request"), and the stored location is left exactly as it
+        // was. This check and the insert below both run under the state lock this handler
+        // holds, so concurrent creates of one name produce exactly ONE winner.
+        if state.custom_locations.contains_key(&input.location_name) {
+            return Err(CreateLocationErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "Location {} already exists; a custom location name identifies one \
+                         location.",
+                        input.location_name
+                    )),
+                },
+            )
+            .into());
+        }
+        if state.custom_locations.len() >= MAX_CUSTOM_LOCATIONS_PER_ACCOUNT {
+            return Err(CreateLocationErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The account already has the maximum of \
+                         {MAX_CUSTOM_LOCATIONS_PER_ACCOUNT} custom locations."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx);
+        // `LocationModel$LocationArn`'s modelled pattern is
+        // `^arn:.*:location\/custom-\S+$`, so the ARN's resource is the location's own
+        // name — which `CustomInputLocationStringModel` (`^custom-[A-Za-z0-9\-]+$`) has
+        // already constrained to that form.
+        let location_arn =
+            crate::state::gamelift_arn(&region, &format!("location/{}", input.location_name));
+        let record = crate::state::CustomLocationRecord {
+            location_name: input.location_name.clone(),
+            location_arn,
+            tags,
+            creation_time: now,
+            region,
+        };
+        state
+            .custom_locations
+            .insert(input.location_name.clone(), record);
+
+        // Report the STORED record, so this response and every later read of the same
+        // location can only agree.
+        let Some(stored) = state.custom_locations.get(&input.location_name) else {
+            return Err(CreateLocationErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the new custom location could not be read back".to_string()),
+                },
+            )
+            .into());
+        };
+        Ok(CreateLocationOutput {
+            location: Some(stored.to_modelled()),
+        })
     }
 }

@@ -28,7 +28,8 @@ use crate::ops::types::{
     ActionExecutionDetail, ActionExecutionInput, ActionRevision, ActionType,
     ActionTypeDeclaration, ActionTypeId, ActionTypeIdentifier, ActionTypeProperty,
     ActionTypeSettings, Artifact, ArtifactDetail, ArtifactDetails, ArtifactLocation, Condition,
-    ConditionState, CurrentRevision, EncryptionKey, ExecutionDetails, ExecutionTrigger, Job,
+    ConditionState, CurrentRevision, EncryptionKey, ExecutionDetails, ExecutionTrigger,
+    FailureDetails, Job,
     JobData, ListWebhookItem, PipelineContext, PipelineDeclaration, PipelineExecution,
     PipelineExecutionSummary, PipelineMetadata, PipelineSummary, PipelineVariable,
     ResolvedPipelineVariable, RuleState, S3ArtifactLocation, SourceRevision, StageConditionState,
@@ -2892,6 +2893,15 @@ pub struct ThirdPartyJobRecord {
     pub current_revision: Option<CurrentRevision>,
     /// The execution details the worker reported with its result.
     pub execution_details: Option<ExecutionDetails>,
+    /// The failure the worker reported for this job, when it reported one.
+    ///
+    /// `PutThirdPartyJobFailureResult$failureDetails` is "information about failure
+    /// details" — the `FailureType` the worker chose, its message, and the external
+    /// execution id of the run that failed — so it is the outcome of a failed job and
+    /// is retained with it, exactly as [`Self::execution_details`] retains what a
+    /// successful result reported. `None` means no failure has been reported for this
+    /// job.
+    pub failure_details: Option<FailureDetails>,
     /// When this job's status last changed.
     pub last_status_change: SystemTime,
 }
@@ -2923,6 +2933,7 @@ impl ThirdPartyJobRecord {
             continuation_token: None,
             current_revision: None,
             execution_details: None,
+            failure_details: None,
             last_status_change: SystemTime::now(),
         }
     }
@@ -2987,6 +2998,18 @@ impl ThirdPartyJobRecord {
         self.continuation_token = continuation_token;
         self.current_revision = current_revision;
         self.execution_details = execution_details;
+        self.last_status_change = now;
+    }
+
+    /// Record a worker's failure for this job: the job reaches [`JOB_STATUS_FAILED`]
+    /// and keeps the `failureDetails` the worker reported with it.
+    ///
+    /// The job's work has ended, so the status is terminal ([`Self::is_terminal`]) and
+    /// no later report for the same job is accepted ([`Self::accepts_result`]): the
+    /// outcome recorded here is the one a reader answers from.
+    pub fn record_failure(&mut self, failure: FailureDetails, now: SystemTime) {
+        self.status = JOB_STATUS_FAILED.to_string();
+        self.failure_details = Some(failure);
         self.last_status_change = now;
     }
 }

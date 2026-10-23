@@ -28,10 +28,14 @@
 //!
 //! A few stored members are not reported by any operation in this slice — a link's
 //! `sink_id` and `created_at`, and a sink's `created_at`. They are written where the
-//! resource is created so the slices that read them (`TagResource`/`UntagResource`
-//! and `ListSinks`, still 501 stubs) read the same record rather than a second copy
-//! of it. `ListTagsForResource` already reads the tags off that one record
-//! ([`ComAmazonawsOamOamserviceState::resource_tags`]).
+//! resource is created so the slices that read them (`UntagResource` and `ListSinks`,
+//! still 501 stubs) read the same record rather than a second copy of it.
+//!
+//! Tags live on the resource record itself, so `TagResource` writes through the very
+//! map `CreateSink`/`CreateLink` seeded and `GetSink`/`GetLink` and
+//! `ListTagsForResource` report
+//! ([`ComAmazonawsOamOamserviceState::resource_tags`]): a resource has ONE tag set
+//! however it is reached.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -82,6 +86,15 @@ pub const MAX_SINKS: usize = 100;
 /// cap is what keeps the store finite. A create that would exceed it is refused with
 /// the modelled `ServiceQuotaExceededException`.
 pub const MAX_LINKS: usize = 10_000;
+
+/// The most tags one resource may carry, sinks and links alike.
+///
+/// From `TooManyTagsException`'s own documentation ("A resource can have no more
+/// than 50 tags.") and `TagResource`'s ("You can associate as many as 50 tags with
+/// a resource."): the bound is on what the RESOURCE holds, not on what one request
+/// carries — the per-request bound is the modelled `TagMapInput` `@length(0..50)`,
+/// which the centralized walk enforces before a handler runs.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
 /// One stored sink: every member `GetSink` and `CreateSink` report, plus the
 /// resource policy `Put/GetSinkPolicy` will attach to it and the tags the tagging
@@ -363,6 +376,24 @@ impl ComAmazonawsOamOamserviceState {
         match self.tagged_resource(region, arn)? {
             TaggedResource::Sink(id) => self.sinks.get(&id).map(|sink| &sink.tags),
             TaggedResource::Link(id) => self.links.get(&id).map(|link| &link.tags),
+        }
+    }
+
+    /// The same stored tag map, for a tagging operation to write THROUGH; `None` when
+    /// that resource is not stored — which is the 404, never a tag map conjured for an
+    /// absent resource.
+    ///
+    /// Because it is the resource's own map, a write is visible to every later read of
+    /// that one record (`ListTagsForResource`, and `GetSink`/`GetLink` with
+    /// `IncludeTags`).
+    pub fn resource_tags_mut(
+        &mut self,
+        region: &str,
+        arn: &str,
+    ) -> Option<&mut BTreeMap<String, String>> {
+        match self.tagged_resource(region, arn)? {
+            TaggedResource::Sink(id) => self.sinks.get_mut(&id).map(|sink| &mut sink.tags),
+            TaggedResource::Link(id) => self.links.get_mut(&id).map(|link| &mut link.tags),
         }
     }
 

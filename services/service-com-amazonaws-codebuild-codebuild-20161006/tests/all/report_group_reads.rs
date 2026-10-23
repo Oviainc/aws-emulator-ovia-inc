@@ -108,8 +108,9 @@ async fn a_read_reports_the_stored_record_verbatim() {
         }]),
         "the read must report the stored record verbatim, got {read}"
     );
-    assert!(
-        read.get("reportGroupsNotFound").is_none(),
+    assert_eq!(
+        read["reportGroupsNotFound"],
+        json!([]),
         "a held ARN must not be reported missing, got {read}"
     );
 
@@ -189,8 +190,9 @@ async fn only_the_exact_stored_arn_resolves() {
                 json!(arn),
                 "case {case:?}: expected the stored record, got {read}"
             );
-            assert!(
-                read.get("reportGroupsNotFound").is_none(),
+            assert_eq!(
+                read["reportGroupsNotFound"],
+                json!([]),
                 "case {case:?}: a held ARN must not be reported missing, got {read}"
             );
         } else {
@@ -199,11 +201,12 @@ async fn only_the_exact_stored_arn_resolves() {
                 json!([arn]),
                 "case {case:?}: expected the ARN reported missing, got {read}"
             );
-            // `ReportGroups` is bounded at 1..100 entries, so an empty one is absent
-            // rather than serialized as `[]`.
-            assert!(
-                read.get("reportGroups").is_none(),
-                "case {case:?}: expected no reportGroups at all, got {read}"
+            // Both halves of the partition are always serialized: the found half is
+            // `[]`, not absent.
+            assert_eq!(
+                read["reportGroups"],
+                json!([]),
+                "case {case:?}: expected an empty reportGroups, got {read}"
             );
         }
     }

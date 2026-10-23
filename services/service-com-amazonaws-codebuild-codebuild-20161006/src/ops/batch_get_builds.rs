@@ -154,9 +154,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `Builds` carries no `@length`, so an empty one is serialized as `[]` —
             // which is what a caller that asked only for unknown ids should read.
             builds: Some(builds),
-            // `buildsNotFound` targets the model's `BuildIds`, bounded at 1..100
-            // entries, so an empty one is left absent rather than serialized as `[]`.
-            builds_not_found: (!not_found.is_empty()).then_some(not_found),
+            // The other half of the same partition, serialized the same way: `[]` when
+            // every id resolved. The `@length(min: 1)` on `BuildIds` bounds what a
+            // request may carry, not whether the answer states its result.
+            builds_not_found: Some(not_found),
         })
     }
 }
