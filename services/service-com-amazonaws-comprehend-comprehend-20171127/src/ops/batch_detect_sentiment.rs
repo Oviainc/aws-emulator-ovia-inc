@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDetectSentiment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDetectSentiment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchDetectSentiment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Each document in `TextList` is scored by the same in-process VADER
+//! sentiment engine `DetectSentiment` runs, so a batch answers, document by document,
+//! exactly what the single-document operation answers for the same text. The result
+//! of document `i` carries `Index` `i`, so `ResultList` is aligned with the input list
+//! and sorted ascending by `Index`; a document past the documented per-document byte
+//! ceiling takes an `ErrorList` entry at that same index instead, and a `TextList`
+//! longer than the documented 25 documents is refused wholesale with
+//! `BatchSizeLimitExceededException`.
 //!
 //! ## Shape of an operation
 //!
@@ -89,6 +89,44 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// Batching changes how many documents one request carries, never how a document is
+// scored or how large it may be: the per-document inference and the set of languages
+// the engine has a lexicon for live with `DetectSentiment`, and the per-document byte
+// quota lives with the state module, so the two operations cannot drift apart.
+use super::detect_sentiment::{score_sentiment, ANALYSABLE_LANGUAGES};
+
+/// The most documents one batch may carry.
+///
+/// Documented twice in this operation's own model: `BatchDetectSentimentRequest$TextList`
+/// says "The list can contain a maximum of 25 documents", and
+/// `BatchSizeLimitExceededException` says "The number of documents in the request exceeds
+/// the limit of 25". The model's `@length` trait states only the floor of 1, so the
+/// ceiling is enforced here, with the error the operation declares for it.
+const MAX_BATCH_DOCUMENTS: usize = 25;
+
+/// The largest single document in the batch, in UTF-8 bytes.
+///
+/// The same per-document real-time quota a single-document inference call enforces,
+/// [`crate::state::REALTIME_TEXT_QUOTA_BYTES`] — one document's quota cannot depend
+/// on whether it was submitted alone or in a batch. The member documentation rounds
+/// it to "5 KB"; the enforced quota is a count of BYTES, so it is that constant and
+/// not a multiple of 1024.
+///
+/// The quota is PER DOCUMENT, so an oversized document is reported as that
+/// document's `BatchItemError` rather than failing the whole call: the modelled
+/// `ErrorList` holds "one object for each document that contained an error", and its
+/// companion sentence — "If all of the documents contain an error, the ResultList is
+/// empty" — only describes a reachable response if a document's own failure leaves
+/// the call itself successful. This is the convention
+/// `ops::batch_detect_dominant_language` already serves.
+const MAX_DOCUMENT_BYTES: usize = crate::state::REALTIME_TEXT_QUOTA_BYTES;
+
+/// The `BatchItemError$ErrorCode` a document past [`MAX_DOCUMENT_BYTES`] carries: the
+/// screaming-snake-case spelling of the operation's own
+/// `TextSizeLimitExceededException`, which is the error that same document would get
+/// if it were submitted on its own to `DetectSentiment`.
+const TEXT_SIZE_LIMIT_ERROR_CODE: &str = "TEXT_SIZE_LIMIT_EXCEEDED";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -161,18 +199,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDetectSentiment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDetectSentimentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDetectSentiment"))
+        // Synchronous inference holds no state: the answer is a function of
+        // `TextList` and `LanguageCode` alone, so repeating a call returns the same
+        // scores in the same order.
+        let _ = (ctx, &self.engine);
+
+        // The model's `@length` floor of 1 on `TextList` is enforced at the
+        // boundary; the ceiling of 25 it documents in prose is not.
+        if input.text_list.len() > MAX_BATCH_DOCUMENTS {
+            return Err(BatchDetectSentimentErrorModeled::BatchSizeLimitExceededException(
+                BatchSizeLimitExceededException {
+                    message: Some(format!(
+                        "The number of documents in the request is {}, which exceeds the \
+                         limit of {MAX_BATCH_DOCUMENTS}. Try your request again with fewer \
+                         documents.",
+                        input.text_list.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Membership of the `LanguageCode` enum is enforced at the boundary; whether
+        // this emulator's sentiment engine can read that language is not. One
+        // `LanguageCode` covers the whole batch ("All documents must be in the same
+        // language"), so a language the engine has no lexicon for refuses the call
+        // rather than failing each document in turn.
+        if !ANALYSABLE_LANGUAGES.contains(&input.language_code.as_str()) {
+            return Err(BatchDetectSentimentErrorModeled::UnsupportedLanguageException(
+                UnsupportedLanguageException {
+                    message: Some(format!(
+                        "This emulator's sentiment engine cannot process the language \
+                         '{}'. Supported languages: {}.",
+                        input.language_code,
+                        ANALYSABLE_LANGUAGES.join(", ")
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Both lists are built in input order, so each is "sorted in ascending order
+        // by the Index field" and every entry's `Index` is its document's own
+        // zero-based position — the only mapping a caller has back to its input. A
+        // document past the per-document ceiling takes an `ErrorList` entry at that
+        // index instead of a result, so the two lists partition the input.
+        let mut result_list = Vec::new();
+        let mut error_list = Vec::new();
+        for (position, text) in input.text_list.iter().enumerate() {
+            let index = i32::try_from(position).ok();
+            // The ONE size check and the ONE size-report sentence every real-time
+            // inference operation shares; here it is the document's own
+            // `BatchItemError`, whose `Index` already says which document it is.
+            if let Some(message) = crate::state::text_size_refusal(text, MAX_DOCUMENT_BYTES) {
+                error_list.push(BatchItemError {
+                    index,
+                    error_code: Some(TEXT_SIZE_LIMIT_ERROR_CODE.to_string()),
+                    error_message: Some(message),
+                });
+                continue;
+            }
+            let (sentiment, sentiment_score) = score_sentiment(text);
+            result_list.push(BatchDetectSentimentItemResult {
+                index,
+                sentiment: Some(sentiment),
+                sentiment_score: Some(sentiment_score),
+            });
+        }
+
+        Ok(BatchDetectSentimentOutput {
+            result_list,
+            error_list,
+        })
     }
 }

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeMacHosts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeMacHosts`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: reports the EC2 Mac Dedicated Hosts [`crate::state`] holds, narrowed by
+//! `HostIds` and the documented filters and paged by `MaxResults`/`NextToken`. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeMacHosts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +132,243 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeMacHosts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeMacHostsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeMacHosts"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            decode_page_token, encode_page_token, invalid_pagination_token, invalid_request,
+            mac_host_view, require_service_state, unresolvable_host_id, CompiledFilter, MatchBudget,
+            MAX_FILTERS, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES,
+            MAX_PAGE_SIZE, MAX_RESOURCE_IDS,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+
+        let requested_ids = input.host_ids.clone().unwrap_or_default();
+        if requested_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "HostIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                requested_ids.len()
+            )));
+        }
+
+        // Matching cost is filters x values x held values x stored hosts, and the model
+        // bounds only the page size, so the request-controlled factors are capped here,
+        // before any work proportional to them is done — and their PRODUCT is charged to
+        // one [`MatchBudget`] below, which is the bound the per-factor caps cannot give.
+        let supplied_filters = input.filters.as_ref().map_or(0, Vec::len);
+        if supplied_filters > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {supplied_filters} filters, above the maximum \
+                 of {MAX_FILTERS}"
+            )));
+        }
+
+        // A filter name this operation does not document is refused whether or not any
+        // host would have matched it, so an unsupported filter can never read as "no
+        // results" — with `InvalidRequest`, the code this operation answers such a request
+        // with (see [`crate::state::INVALID_REQUEST`]).
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !MAC_HOST_FILTERS.contains(&name) {
+                // "Invalid filter" is the WHOLE message the service answers here — a
+                // constant that carries nothing from the request, so the message is part of
+                // the rule rather than one recording's text, and a client matching on it
+                // sees what the real service says.
+                return Err(invalid_request(INVALID_FILTER_MESSAGE));
+            }
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // "The token to use to retrieve the next page of results"
+        // (`DescribeMacHostsRequest$NextToken`) — anything else is refused rather than read
+        // as an id, and it is refused before any other member is looked at, so whether a
+        // bogus token is caught never depends on the rest of the request.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(decode_page_token(token).ok_or_else(invalid_pagination_token)?),
+        };
+
+        let state = require_service_state(&*self.engine)?;
+        let store = state.lock();
+
+        // "Describes the specified EC2 Mac Dedicated Host" (`DescribeMacHosts`): an id that
+        // names no EC2 Mac Dedicated Host of the account is an error, not an absent row —
+        // and a host of a family that does not run macOS is no Mac host of this account
+        // either, so it is answered the same way. A malformed id is answered as malformed
+        // before an unknown one, the way the service orders the two.
+        for host_id in &requested_ids {
+            let is_mac_host = store
+                .dedicated_hosts
+                .get(host_id)
+                .and_then(mac_host_view)
+                .is_some();
+            if !is_mac_host {
+                return Err(unresolvable_host_id(host_id));
+            }
+        }
+
+        // Every comparison is charged to ONE budget, so the PRODUCT of stored hosts,
+        // filters, values, held values and value length is bounded however the caller
+        // combines them — which is also what bounds how long this holds the state lock.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<MacHost> = Vec::new();
+        for host in store.dedicated_hosts.values() {
+            if budget.exhausted() {
+                break;
+            }
+            // The id narrowing is read off the stored host, so a host the request did not
+            // name costs no projection and no comparison at all.
+            if !requested_ids.is_empty()
+                && !requested_ids
+                    .iter()
+                    .any(|id| host.host_id.as_deref() == Some(id.as_str()))
+            {
+                continue;
+            }
+            let Some(mac_host) = mac_host_view(host) else {
+                continue;
+            };
+            if matches_every_filter(host, &selectors, &mut budget) {
+                selected.push(mac_host);
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report
+        // as a result: the request asked for more filtering than one call will do, and is
+        // told so rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them or page with MaxResults"
+            )));
+        }
+
+        // Page in `HostId` order, which the cursor below names a position in. The store is
+        // an ordered map, so its iteration order already satisfies this sort; doing it here
+        // establishes the invariant the cursor depends on at the point of use.
+        selected.sort_by(|left, right| left.host_id.cmp(&right.host_id));
+
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected
+                .partition_point(|host| host.host_id.as_deref().unwrap_or_default() < cursor),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // A request that names no page size gets the largest page this service serves, so
+        // the `NextToken` path behaves the same whether or not a page size was asked for.
+        // The model's own `@range` on `MaxResults` (5..500) has already refused a size
+        // outside it before this handler ran.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        // A token only when a host follows this page: "The token to use to retrieve the
+        // next page of results" (`DescribeMacHostsResult$NextToken`).
+        let next_token = page
+            .get(limit)
+            .and_then(|host| host.host_id.as_deref())
+            .map(encode_page_token);
+
+        Ok(DescribeMacHostsOutput {
+            mac_hosts: Some(page.iter().take(limit).cloned().collect()),
+            next_token,
+        })
     }
+}
+
+/// The filter names this operation documents, from `DescribeMacHostsRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeMacHostsRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// "`availability-zone` - The Availability Zone of the EC2 Mac Dedicated Host" and
+/// "`instance-type` - The instance type size that the EC2 Mac Dedicated Host is configured
+/// to support" — and nothing else, this operation documenting no `tag:` family. Every
+/// entry must be answered by [`filter_values`].
+const MAC_HOST_FILTERS: [&str; 2] = ["availability-zone", "instance-type"];
+
+/// The message this operation refuses an undocumented filter name with, beside the
+/// `InvalidRequest` code: the service answers this constant for any such name, naming
+/// neither the filter nor a value, so it is the rule and not one request's text.
+const INVALID_FILTER_MESSAGE: &str = "Invalid filter";
+
+/// The values the EC2 filter `name` compares against this host.
+///
+/// The filters select on the HOST — its zone and the instance type it is configured for —
+/// while the reported [`MacHost`] shape carries neither member, so they are read off the
+/// stored host rather than off the projection. A filter naming an attribute a host does not
+/// carry compares against NO values, so it selects nothing: a host allocated for a whole
+/// instance FAMILY supports no single instance type (`HostProperties$InstanceType`), and so
+/// matches no `instance-type` value. `name` is a name [`MAC_HOST_FILTERS`] holds.
+fn filter_values<'a>(host: &'a Host, name: &str) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "availability-zone" => text(host.availability_zone.as_deref()),
+        "instance-type" => text(
+            host.host_properties
+                .as_ref()
+                .and_then(|properties| properties.instance_type.as_deref()),
+        ),
+        // Unreachable: the handler has already refused every other name. An undefined name
+        // compares against nothing, so it could never widen a result even if that check
+        // were bypassed.
+        _ => Vec::new(),
+    }
+}
+
+/// Does `host` satisfy every filter?
+///
+/// "If you specify multiple filters, the filters are joined with an AND" (`Filter`), and
+/// within one filter "if you specify multiple values for a filter, the values are joined
+/// with an OR" (`Filter$Values`) — each value matched case-sensitively, with EC2's own
+/// `*`/`?` wildcards, by the pattern the value was compiled into. So a filter carrying no
+/// value at all matches nothing, there being no value for the attribute to match.
+///
+/// Every comparison is charged to `budget`, so one request's filtering cannot cost more
+/// than the ceiling however it combines filters, values and value length; once the budget
+/// is gone every further comparison answers "no match" and the caller is told the answer is
+/// incomplete.
+fn matches_every_filter(
+    host: &Host,
+    selectors: &[crate::state::CompiledFilter],
+    budget: &mut crate::state::MatchBudget,
+) -> bool {
+    selectors.iter().all(|filter| {
+        let held = filter_values(host, &filter.name);
+        filter
+            .patterns
+            .iter()
+            .any(|pattern| held.iter().any(|value| pattern.matches_within(value, budget)))
+    })
 }

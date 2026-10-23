@@ -41,6 +41,8 @@ mod error_message_rules;
 mod list_configuration_recorders;
 #[path = "all/pending_aggregation_requests.rs"]
 mod pending_aggregation_requests;
+#[path = "all/resource_evaluations.rs"]
+mod resource_evaluations;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 

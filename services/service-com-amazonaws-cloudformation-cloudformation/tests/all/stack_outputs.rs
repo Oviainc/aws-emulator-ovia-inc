@@ -12,9 +12,11 @@
 //! through the wire harness `stack_lifecycle.rs` builds, so what it asserts is what a
 //! client reading a deployed stack sees. The table spans the class the rule generalises
 //! over: both template spellings (JSON and YAML, long-form and short-form intrinsics),
-//! several resource types, each intrinsic function this service evaluates, and the count
-//! of declared outputs. The issue's own case (a YAML `AWS::SNS::Topic` template whose one
-//! output is `!Ref` of the topic) is the first row.
+//! several resource types — including the ones a Lambda + Amazon RDS + Secrets Manager
+//! stack declares, whose `Ref` and `Fn::GetAtt` return values are what a caller addresses
+//! the deployed resources by — each intrinsic function this service evaluates, and the
+//! count of declared outputs. The issue's own case (a YAML `AWS::SNS::Topic` template
+//! whose one output is `!Ref` of the topic) is the first row.
 
 use crate::stack_lifecycle::{
     call, create_stack, describe_stack, expected_status, member, router, wait_for_the_transition,
@@ -263,6 +265,62 @@ fn lambda_function_arn(name: &str) -> String {
 /// its ARNs carry no region.
 fn iam_role_arn(name: &str) -> String {
     format!("arn:aws:iam::{ACCOUNT_ID}:role/{name}")
+}
+
+/// The ARN `Fn::GetAtt <cluster>.DBClusterArn` reports for an Amazon RDS DB cluster, per
+/// the "Return values" section of the `AWS::RDS::DBCluster` resource-type reference.
+fn rds_cluster_arn(identifier: &str) -> String {
+    format!("arn:aws:rds:{REGION}:{ACCOUNT_ID}:cluster:{identifier}")
+}
+
+/// The ARN `Fn::GetAtt <instance>.DBInstanceArn` reports for an Amazon RDS DB instance.
+fn rds_instance_arn(identifier: &str) -> String {
+    format!("arn:aws:rds:{REGION}:{ACCOUNT_ID}:db:{identifier}")
+}
+
+/// Whether `value` is an Amazon RDS endpoint DNS name of the published form
+/// `<identifier><infix><service-assigned label>.<region>.rds.amazonaws.com`: the cluster
+/// endpoint's infix is `.cluster-`, the reader endpoint's `.cluster-ro-` and a DB
+/// instance's a plain `.` ("Amazon Aurora connection management" / "Finding the connection
+/// information for an RDS DB instance").
+fn is_rds_endpoint(value: &str, identifier: &str, infix: &str) -> bool {
+    let suffix = format!(".{REGION}.rds.amazonaws.com");
+    value
+        .strip_prefix(&format!("{identifier}{infix}"))
+        .and_then(|rest| rest.strip_suffix(&suffix))
+        .is_some_and(|label| !label.is_empty() && label.chars().all(is_lower_hex))
+}
+
+/// Whether `value` is an Amazon RDS immutable resource id: `prefix-` and 26 UPPERCASE
+/// characters, the form `DbClusterResourceId` and `DbiResourceId` publish.
+fn is_rds_resource_id(value: &str, prefix: &str) -> bool {
+    value
+        .strip_prefix(&format!("{prefix}-"))
+        .is_some_and(|id| {
+            id.len() == 26
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || c.is_ascii_uppercase())
+        })
+}
+
+/// Whether `value` is the ARN of the Secrets Manager secret named `name`:
+/// `arn:aws:secretsmanager:<region>:<account>:secret:<name>-<six characters Secrets
+/// Manager assigns>`.
+fn is_secret_arn(value: &str, name: &str) -> bool {
+    value
+        .strip_prefix(&format!(
+            "arn:aws:secretsmanager:{REGION}:{ACCOUNT_ID}:secret:{name}-"
+        ))
+        .is_some_and(|suffix| suffix.len() == 6 && suffix.chars().all(is_lower_hex))
+}
+
+/// Whether `value` is an Amazon EC2 security group id: `sg-` and 17 lowercase hexadecimal
+/// characters, the current (long) id form EC2 publishes.
+fn is_security_group_id(value: &str) -> bool {
+    value
+        .strip_prefix("sg-")
+        .is_some_and(|id| id.len() == 17 && id.chars().all(is_lower_hex))
 }
 
 /// The class the rule covers. Each row differs from the others along what the rule
@@ -856,6 +914,255 @@ fn output_cases() -> Vec<OutputCase> {
                     (key, Expected::Value(format!("o-{index}")))
                 })
                 .collect(),
+        },
+        OutputCase {
+            // The topology the Lambda + Amazon RDS + Secrets Manager issue deploys: a
+            // function reading its database credentials from a secret and querying an
+            // Aurora Serverless v2 cluster. Every identifier the caller needs afterwards
+            // is an output, and each comes from the "Return values" section of its own
+            // resource type — `Ref` for the cluster is its DBClusterIdentifier, for the
+            // secret the secret's ARN, and `Fn::GetAtt` reads the cluster's ARN, resource
+            // id and endpoints.
+            case: "a lambda, a secret and an aurora cluster: every declared output resolves",
+            stack_name: "serverless-app",
+            template: concat!(
+                "Parameters:\n",
+                "  ClusterIdentifier:\n",
+                "    Type: String\n",
+                "Resources:\n",
+                "  ExecutionRole:\n",
+                "    Type: AWS::IAM::Role\n",
+                "    Properties:\n",
+                "      RoleName: probe-app-role\n",
+                "  DBSecret:\n",
+                "    Type: AWS::SecretsManager::Secret\n",
+                "    Properties:\n",
+                "      Name: probe-app-secret\n",
+                "  DBCluster:\n",
+                "    Type: AWS::RDS::DBCluster\n",
+                "    Properties:\n",
+                "      DBClusterIdentifier: !Ref ClusterIdentifier\n",
+                "      Engine: aurora-postgresql\n",
+                "      EnableHttpEndpoint: true\n",
+                "  AppFunction:\n",
+                "    Type: AWS::Lambda::Function\n",
+                "    Properties:\n",
+                "      FunctionName: probe-app-fn\n",
+                "      Handler: index.handler\n",
+                "      Runtime: python3.12\n",
+                "      Role: !GetAtt ExecutionRole.Arn\n",
+                "Outputs:\n",
+                "  FunctionName:\n",
+                "    Value: !Ref AppFunction\n",
+                "  FunctionArn:\n",
+                "    Value: !GetAtt AppFunction.Arn\n",
+                "  SecretArn:\n",
+                "    Value: !Ref DBSecret\n",
+                "  SecretId:\n",
+                "    Value: !GetAtt DBSecret.Id\n",
+                "  ClusterRef:\n",
+                "    Value: !Ref DBCluster\n",
+                "  ClusterArn:\n",
+                "    Value: !GetAtt DBCluster.DBClusterArn\n",
+                "  ClusterResourceId:\n",
+                "    Value: !GetAtt DBCluster.DBClusterResourceId\n",
+                "  ClusterEndpoint:\n",
+                "    Value: !GetAtt DBCluster.Endpoint.Address\n",
+                "  ClusterReaderEndpoint:\n",
+                "    Value: !GetAtt DBCluster.ReadEndpoint.Address\n",
+                "  ClusterPort:\n",
+                "    Value: !GetAtt DBCluster.Endpoint.Port\n",
+            )
+            .to_string(),
+            parameters: params(&[("ClusterIdentifier", "probe-app-cluster")]),
+            expected: vec![
+                (
+                    "FunctionName",
+                    Expected::Value("probe-app-fn".to_string()),
+                ),
+                (
+                    "FunctionArn",
+                    Expected::Value(lambda_function_arn("probe-app-fn")),
+                ),
+                (
+                    // "Ref returns the ARN of the secret."
+                    "SecretArn",
+                    Expected::Form {
+                        described: "the ARN of the secret, with the suffix its service \
+                                    assigns",
+                        check: |value| is_secret_arn(value, "probe-app-secret"),
+                    },
+                ),
+                (
+                    "SecretId",
+                    Expected::Form {
+                        described: "the ARN of the secret",
+                        check: |value| is_secret_arn(value, "probe-app-secret"),
+                    },
+                ),
+                (
+                    // "Ref returns the DBClusterIdentifier" — here taken from a parameter
+                    // through the type's own `Identifier` name property.
+                    "ClusterRef",
+                    Expected::Value("probe-app-cluster".to_string()),
+                ),
+                (
+                    "ClusterArn",
+                    Expected::Value(rds_cluster_arn("probe-app-cluster")),
+                ),
+                (
+                    "ClusterResourceId",
+                    Expected::Form {
+                        described: "a DbClusterResourceId of the form cluster- + 26 \
+                                    uppercase characters",
+                        check: |value| is_rds_resource_id(value, "cluster"),
+                    },
+                ),
+                (
+                    "ClusterEndpoint",
+                    Expected::Form {
+                        described: "the Aurora cluster endpoint DNS name",
+                        check: |value| {
+                            is_rds_endpoint(value, "probe-app-cluster", ".cluster-")
+                        },
+                    },
+                ),
+                (
+                    "ClusterReaderEndpoint",
+                    Expected::Form {
+                        described: "the Aurora reader endpoint DNS name",
+                        check: |value| {
+                            is_rds_endpoint(value, "probe-app-cluster", ".cluster-ro-")
+                        },
+                    },
+                ),
+                (
+                    // The engine's documented default port, since the template declares
+                    // none: "RDS for PostgreSQL - 5432".
+                    "ClusterPort",
+                    Expected::Value("5432".to_string()),
+                ),
+            ],
+        },
+        OutputCase {
+            // The same rule two types along, in the JSON spelling, on inputs the row above
+            // does not cover: a DB INSTANCE (whose endpoint carries no `cluster-` infix)
+            // with the port DECLARED rather than defaulted, and a VPC security group,
+            // whose `Ref` is the id its service assigns rather than a name.
+            case: "a db instance and a security group: ids and an explicit port",
+            stack_name: "db-instance",
+            template: r#"{"Resources":{
+                   "Database":{"Type":"AWS::RDS::DBInstance",
+                     "Properties":{"DBInstanceIdentifier":"probe-db",
+                       "Engine":"mysql","Port":"13306",
+                       "DBInstanceClass":"db.t4g.micro"}},
+                   "ClientGroup":{"Type":"AWS::EC2::SecurityGroup",
+                     "Properties":{"GroupDescription":"probe"}}},
+                 "Outputs":{"InstanceRef":{"Value":{"Ref":"Database"}},
+                   "InstanceArn":{"Value":{"Fn::GetAtt":["Database","DBInstanceArn"]}},
+                   "InstanceResourceId":{"Value":{"Fn::GetAtt":["Database","DbiResourceId"]}},
+                   "InstanceEndpoint":{"Value":{"Fn::GetAtt":["Database","Endpoint.Address"]}},
+                   "InstancePort":{"Value":{"Fn::GetAtt":["Database","Endpoint.Port"]}},
+                   "GroupRef":{"Value":{"Ref":"ClientGroup"}},
+                   "GroupId":{"Value":{"Fn::GetAtt":["ClientGroup","GroupId"]}}}}"#
+                .to_string(),
+            parameters: vec![],
+            expected: vec![
+                ("InstanceRef", Expected::Value("probe-db".to_string())),
+                (
+                    "InstanceArn",
+                    Expected::Value(rds_instance_arn("probe-db")),
+                ),
+                (
+                    "InstanceResourceId",
+                    Expected::Form {
+                        described: "a DbiResourceId of the form db- + 26 uppercase \
+                                    characters",
+                        check: |value| is_rds_resource_id(value, "db"),
+                    },
+                ),
+                (
+                    "InstanceEndpoint",
+                    Expected::Form {
+                        described: "the DB instance endpoint DNS name",
+                        check: |value| is_rds_endpoint(value, "probe-db", "."),
+                    },
+                ),
+                (
+                    // The port the template DECLARED, not the engine's default (3306 for
+                    // RDS for MySQL).
+                    "InstancePort",
+                    Expected::Value("13306".to_string()),
+                ),
+                (
+                    // "Ref returns the ID of the security group."
+                    "GroupRef",
+                    Expected::Form {
+                        described: "a security group id of the form sg- + 17 hexadecimal \
+                                    characters",
+                        check: is_security_group_id,
+                    },
+                ),
+                (
+                    "GroupId",
+                    Expected::Form {
+                        described: "a security group id",
+                        check: is_security_group_id,
+                    },
+                ),
+            ],
+        },
+        OutputCase {
+            // The port and the engine of a DB resource are what the TEMPLATE declares, and
+            // a template declares them with an intrinsic as readily as with a literal: this
+            // row takes both from parameters, so `Endpoint.Port` can only be right if the
+            // declared properties were evaluated. The last resource's engine resolves to
+            // nothing (a `Ref` to a name the template never declares), so its port is
+            // reported with no value rather than defaulted to one engine's.
+            case: "a db port and engine declared through intrinsics, and an unresolvable engine",
+            stack_name: "db-intrinsics",
+            template: concat!(
+                "Parameters:\n",
+                "  DBPort:\n",
+                "    Type: String\n",
+                "  EngineName:\n",
+                "    Type: String\n",
+                "Resources:\n",
+                "  FixedPortCluster:\n",
+                "    Type: AWS::RDS::DBCluster\n",
+                "    Properties:\n",
+                "      DBClusterIdentifier: probe-fixed-port\n",
+                "      Engine: !Ref EngineName\n",
+                "      Port: !Ref DBPort\n",
+                "  DefaultPortCluster:\n",
+                "    Type: AWS::RDS::DBCluster\n",
+                "    Properties:\n",
+                "      DBClusterIdentifier: probe-default-port\n",
+                "      Engine: !Ref EngineName\n",
+                "  UnknownEngineDatabase:\n",
+                "    Type: AWS::RDS::DBInstance\n",
+                "    Properties:\n",
+                "      DBInstanceIdentifier: probe-unknown-engine\n",
+                "      Engine: !Ref NoSuchParameter\n",
+                "Outputs:\n",
+                "  FixedPort:\n",
+                "    Value: !GetAtt FixedPortCluster.Endpoint.Port\n",
+                "  DefaultPort:\n",
+                "    Value: !GetAtt DefaultPortCluster.Endpoint.Port\n",
+                "  UnknownEnginePort:\n",
+                "    Value: !GetAtt UnknownEngineDatabase.Endpoint.Port\n",
+            )
+            .to_string(),
+            parameters: params(&[("DBPort", "15432"), ("EngineName", "aurora-postgresql")]),
+            expected: vec![
+                // The port the template declared, through a parameter.
+                ("FixedPort", Expected::Value("15432".to_string())),
+                // No port declared: the default of the engine the parameter named, which
+                // is only reachable if the engine itself resolved.
+                ("DefaultPort", Expected::Value("5432".to_string())),
+                // The engine resolves to nothing, so the port does too.
+                ("UnknownEnginePort", Expected::NoValue),
+            ],
         },
         OutputCase {
             case: "outputs this service cannot evaluate are reported without a value",

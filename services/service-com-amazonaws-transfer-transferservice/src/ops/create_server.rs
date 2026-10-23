@@ -10,6 +10,18 @@
 //! reader never re-applies a default. The server's host key is minted here too, so
 //! `HostKeyFingerprint` reports a real key's real fingerprint.
 //!
+//! Three refusals precede the write, in this order:
+//!
+//! 1. the caller's own permission — an identity policy that explicitly denies
+//!    `transfer:CreateServer` is answered with `AccessDeniedException` (403), read out
+//!    of the account's IAM store by `crate::state::authorization`;
+//! 2. the documented cross-member requirements of the configuration the server would
+//!    have (`crate::state::ServerConfig::cross_member_violation`); and
+//! 3. for an `API_GATEWAY` identity provider, that its `InvocationRole` can actually
+//!    invoke the API its `Url` names — the one identity-provider precondition this
+//!    operation verifies synchronously. Anything else the server points at (a logging
+//!    role among them) is accepted as given.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -276,6 +288,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
 
+        // WHO is asking is decided before WHAT is asked: a caller whose identity
+        // policy explicitly denies this action is refused with the modelled
+        // `AccessDeniedException` (HTTP 403) and nothing is created. The gate reads
+        // the account's own IAM store, so a policy the caller changes changes the
+        // next answer. See `crate::state::authorization`.
+        if let Some(message) =
+            st::authorization::explicit_deny(&*self.engine, ctx.parts(), Self::NAME, None)
+        {
+            return Err(CreateServerErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         // Every member the model gives a documented default is resolved ONCE, HERE,
         // before the request is validated: a cross-member requirement is about the
         // configuration the server will actually have, so omitting `EndpointType`
@@ -318,6 +346,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 InvalidRequestException { message },
             )
             .into());
+        }
+
+        // An `API_GATEWAY` identity provider is VERIFIED before the server is
+        // persisted: the invocation role the request names has to be a role this
+        // account holds that is allowed to invoke the API the URL names, or the
+        // server could never authenticate a single user. The check reads the role's
+        // stored IAM policies — inline and attached — and nothing else; the refusal
+        // is the modelled `InvalidRequestException` (HTTP 400). A request that names
+        // no invocation role names no role to verify, and no other identity-provider
+        // precondition (a logging role among them) is verified synchronously.
+        if identity_provider_type == st::IDENTITY_PROVIDER_API_GATEWAY {
+            if let Some(invocation_role) = input
+                .identity_provider_details
+                .as_ref()
+                .and_then(|details| details.invocation_role.as_deref())
+            {
+                let url = input
+                    .identity_provider_details
+                    .as_ref()
+                    .and_then(|details| details.url.as_deref());
+                if !st::authorization::invocation_role_can_invoke(
+                    &*self.engine,
+                    invocation_role,
+                    url,
+                ) {
+                    return Err(CreateServerErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: st::unverifiable_identity_provider(url),
+                        },
+                    )
+                    .into());
+                }
+            }
         }
 
         let state = st::service_state(&*self.engine).ok_or_else(|| {

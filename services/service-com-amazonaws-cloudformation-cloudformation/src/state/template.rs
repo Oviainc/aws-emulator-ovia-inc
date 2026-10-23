@@ -864,8 +864,7 @@ pub fn provision(
             continue;
         }
         let name = physical_name(declared, scope, budget);
-        let (physical_resource_id, attributes) =
-            return_values(&declared.resource_type, &name, scope.stack);
+        let (physical_resource_id, attributes) = return_values(declared, &name, scope, budget);
         provisioned.push(StoredResource {
             logical_id: declared.logical_id.clone(),
             resource_type: declared.resource_type.clone(),
@@ -1069,9 +1068,11 @@ fn hyphenated(segment: &str) -> String {
 /// CloudFormation's own convention is that a resource type's name property is the type's
 /// last segment plus `Name` (`TopicName` on `AWS::SNS::Topic`, `QueueName` on
 /// `AWS::SQS::Queue`, `BucketName` on `AWS::S3::Bucket`), with `Name` itself used by the
-/// newer types; where neither is declared, "CloudFormation generates a unique physical ID
-/// and uses that ID for the resource name", in the form `<stack name>-<logical
-/// id>-<unique id>`.
+/// newer types and `Identifier` by the Amazon RDS ones (`DBClusterIdentifier` on
+/// `AWS::RDS::DBCluster`, `DBInstanceIdentifier` on `AWS::RDS::DBInstance`, each of which
+/// is also what that type's `Ref` returns); where none is declared, "CloudFormation
+/// generates a unique physical ID and uses that ID for the resource name", in the form
+/// `<stack name>-<logical id>-<unique id>`.
 fn physical_name(
     declared: &DeclaredResource,
     naming: &Scope<'_>,
@@ -1082,7 +1083,11 @@ fn physical_name(
         .rsplit("::")
         .next()
         .unwrap_or_default();
-    let candidates = [format!("{segment}Name"), "Name".to_string()];
+    let candidates = [
+        format!("{segment}Name"),
+        "Name".to_string(),
+        format!("{segment}Identifier"),
+    ];
     let declared_name = candidates.iter().find_map(|property| {
         declared
             .properties
@@ -1099,14 +1104,45 @@ fn physical_name(
 /// fresh, so it is stable across reads and across a later update of the same stack — the
 /// physical id of a resource that was not replaced does not change.
 fn generated_name(logical_id: &str, scope: StackScope<'_>) -> String {
+    format!(
+        "{}-{logical_id}-{}",
+        scope.stack_name,
+        derived_digits(scope.stack_id, logical_id, 12, Alphabet::Upper)
+    )
+}
+
+/// Which alphabet a derived identifier's digits are drawn from — the ONE thing the
+/// identifier forms below differ in.
+#[derive(Debug, Clone, Copy)]
+enum Alphabet {
+    /// Lowercase hexadecimal, the alphabet of an EC2/Transfer id and a DNS label.
+    Lower,
+    /// Uppercase hexadecimal, the alphabet of CloudFormation's own generated name
+    /// segment and of Amazon RDS's immutable resource ids.
+    Upper,
+}
+
+/// `digits` characters derived from `salt` and `name`, in `alphabet`.
+///
+/// The ONE derivation every identifier this module has to invent is built on: a SHA-256
+/// digest of `<salt>/<name>`, rendered as hexadecimal. It is a function of the resource's
+/// own name — itself derived from the stack id and the logical id — so every identifier
+/// built from it is stable across reads and across a later update of the same stack, and
+/// two resources of one stack never collide. The `salt` keeps two identifiers OF ONE
+/// resource (its endpoint label and its resource id, say) from being the same digits.
+fn derived_digits(salt: &str, name: &str, digits: usize, alphabet: Alphabet) -> String {
     use ::sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
-    hasher.update(scope.stack_id.as_bytes());
+    hasher.update(salt.as_bytes());
     hasher.update(b"/");
-    hasher.update(logical_id.as_bytes());
-    let digest = ::hex::encode_upper(hasher.finalize());
-    format!("{}-{logical_id}-{}", scope.stack_name, &digest[0..12])
+    hasher.update(name.as_bytes());
+    let finished = hasher.finalize();
+    let digest = match alphabet {
+        Alphabet::Lower => ::hex::encode(finished),
+        Alphabet::Upper => ::hex::encode_upper(finished),
+    };
+    digest[..digits.min(digest.len())].to_string()
 }
 
 /// A service-generated identifier of the form `<prefix>-<digits hexadecimal characters>`.
@@ -1116,19 +1152,83 @@ fn generated_name(logical_id: &str, scope: StackScope<'_>) -> String {
 /// `s-` + 17 hexadecimal characters, which is the `ServerId` pattern
 /// `^s-([0-9a-f]{17})$` in Transfer's own Smithy model). CloudFormation's
 /// `<stack name>-<logical id>-<unique id>` name is not such an identifier, so a resource
-/// of one of those types reports an identifier of ITS form instead — derived from the
-/// name, which is itself derived from the stack id and the logical id, so the identifier
-/// is stable across reads and across a later update of the same stack, and two resources
-/// of one stack never collide.
+/// of one of those types reports an identifier of ITS form instead — see
+/// [`derived_digits`] for why it is stable.
 fn generated_service_id(prefix: &str, name: &str, digits: usize) -> String {
-    use ::sha2::{Digest, Sha256};
+    format!(
+        "{prefix}-{}",
+        derived_digits(prefix, name, digits, Alphabet::Lower)
+    )
+}
 
-    let mut hasher = Sha256::new();
-    hasher.update(prefix.as_bytes());
-    hasher.update(b"/");
-    hasher.update(name.as_bytes());
-    let digest = ::hex::encode(hasher.finalize());
-    format!("{prefix}-{}", &digest[..digits])
+/// A service-assigned resource id of `digits` UPPERCASE characters after `prefix`.
+///
+/// Amazon RDS's immutable resource ids (`DbClusterResourceId`, `DbiResourceId`) are
+/// published as `cluster-`/`db-` followed by 26 uppercase alphanumeric characters, which
+/// is a different alphabet from [`generated_service_id`]'s lowercase hexadecimal; the
+/// derivation is the same one.
+fn generated_upper_resource_id(prefix: &str, name: &str, digits: usize) -> String {
+    format!(
+        "{prefix}-{}",
+        derived_digits(prefix, name, digits, Alphabet::Upper)
+    )
+}
+
+/// A label of `digits` characters the OWNING SERVICE assigns inside an identifier of its
+/// own, under `salt`.
+///
+/// Two kinds of published identifier carry one: the middle label of an Amazon RDS endpoint
+/// DNS name (`<identifier>.cluster-<label>.<region>.rds.amazonaws.com`) and the suffix of a
+/// Secrets Manager secret ARN (`:secret:<name>-<suffix>`). Each passes its own `salt`, so
+/// one resource's endpoint label and ARN suffix are different digits.
+fn service_assigned_label(salt: &str, name: &str, digits: usize) -> String {
+    derived_digits(salt, name, digits, Alphabet::Lower)
+}
+
+/// The port the database engine a DB cluster or DB instance declares listens on, or `None`
+/// where the declaration does not say.
+///
+/// `AWS::RDS::DBCluster`/`AWS::RDS::DBInstance` publish `Endpoint.Port` as a return value:
+/// the port a template DECLARES fixes it, and otherwise it is the declared engine's
+/// documented default (Amazon RDS: "RDS for MySQL - 3306, RDS for PostgreSQL - 5432, RDS
+/// for Oracle - 1521, RDS for SQL Server - 1433, RDS for Db2 - 50000"). The engine name is
+/// the prefix the property's own value list uses (`aurora-postgresql`, `sqlserver-ee`), so
+/// the family is matched on the prefix.
+///
+/// Both properties are evaluated through the template's intrinsics, exactly as
+/// [`physical_name`] evaluates a declared name, so `Port: !Ref DBPort` is the port and
+/// `Engine: !Ref EngineName` the engine. A declaration whose ENGINE cannot be resolved
+/// yields NO port rather than one engine's default standing in for an unknown engine's.
+fn database_port(
+    properties: &Value,
+    scope: &Scope<'_>,
+    budget: &mut Budget,
+) -> Option<String> {
+    if let Some(port) = properties
+        .get("Port")
+        .and_then(|value| text(value, scope, 0, budget))
+    {
+        return Some(port);
+    }
+    let engine = properties
+        .get("Engine")
+        .and_then(|value| text(value, scope, 0, budget))?
+        .to_ascii_lowercase();
+    Some(
+        if engine.contains("db2") {
+            "50000"
+        } else if engine.contains("sqlserver") {
+            "1433"
+        } else if engine.contains("oracle") {
+            "1521"
+        } else if engine.contains("postgres") {
+            "5432"
+        } else {
+            // mysql, mariadb, aurora-mysql and the Aurora MySQL aliases.
+            "3306"
+        }
+        .to_string(),
+    )
 }
 
 /// The LABEL an AgentCore identifier derived from `name` carries: `name` reduced to the
@@ -1210,13 +1310,17 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     "AWS::BedrockAgentCore::Runtime",
     "AWS::BedrockAgentCore::WorkloadIdentity",
     "AWS::DynamoDB::Table",
+    "AWS::EC2::SecurityGroup",
     "AWS::IAM::Role",
     "AWS::Lambda::Function",
     "AWS::Logs::LogGroup",
+    "AWS::RDS::DBCluster",
+    "AWS::RDS::DBInstance",
     "AWS::RUM::AppMonitor",
     "AWS::S3::Bucket",
     "AWS::SNS::Topic",
     "AWS::SQS::Queue",
+    "AWS::SecretsManager::Secret",
     "AWS::Transfer::Server",
     "AWS::Transfer::Workflow",
 ];
@@ -1235,12 +1339,21 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
 /// `As2ServiceManagedEgressIpAddresses`, say) is not carried either: the attribute map is
 /// string-valued, and reporting one element of a list as the whole of it would be worse
 /// than reporting no value.
+///
+/// The whole declared resource is in scope, not just its type and name, because a few
+/// published return values are functions of the resource's own properties — a DB
+/// endpoint's port is the one the template declared, or the declared engine's default —
+/// and those properties are evaluated through the template's intrinsics, which is what the
+/// `scope` and the `budget` are for.
 fn return_values(
-    resource_type: &str,
+    declared: &DeclaredResource,
     name: &str,
-    scope: StackScope<'_>,
+    scope: &Scope<'_>,
+    budget: &mut Budget,
 ) -> (String, BTreeMap<String, String>) {
-    let region = scope.region;
+    let region = scope.stack.region;
+    let resource_type = declared.resource_type.as_str();
+    let properties = &declared.properties;
     let mut attributes = BTreeMap::new();
     match resource_type {
         // "Ref returns the topic ARN"; Fn::GetAtt: TopicArn, TopicName.
@@ -1336,6 +1449,90 @@ fn return_values(
                 ::emulator_server::emulator_arn("iam", "", &format!("role/{name}")),
             );
             (name.to_string(), attributes)
+        }
+        // "Ref returns the DBClusterIdentifier"; Fn::GetAtt: DBClusterArn,
+        // DBClusterResourceId, Endpoint.Address, Endpoint.Port, ReadEndpoint.Address
+        // (MasterUserSecret.SecretArn is left out: it names a secret only RDS's own
+        // managed-password integration creates, which this emulator does not have). The
+        // endpoints are the published Aurora forms, `<identifier>.cluster-<label>` and
+        // `<identifier>.cluster-ro-<label>` under the regional RDS suffix.
+        "AWS::RDS::DBCluster" => {
+            let label = service_assigned_label(
+                RDS_ENDPOINT_LABEL_SALT,
+                name,
+                RDS_ENDPOINT_LABEL_HEX_DIGITS,
+            );
+            attributes.insert(
+                "DBClusterArn".to_string(),
+                ::emulator_server::emulator_arn("rds", region, &format!("cluster:{name}")),
+            );
+            attributes.insert(
+                "DBClusterResourceId".to_string(),
+                generated_upper_resource_id("cluster", name, RDS_RESOURCE_ID_DIGITS),
+            );
+            attributes.insert(
+                "Endpoint.Address".to_string(),
+                format!("{name}.cluster-{label}.{region}.rds.{URL_SUFFIX}"),
+            );
+            if let Some(port) = database_port(properties, scope, budget) {
+                attributes.insert("Endpoint.Port".to_string(), port);
+            }
+            attributes.insert(
+                "ReadEndpoint.Address".to_string(),
+                format!("{name}.cluster-ro-{label}.{region}.rds.{URL_SUFFIX}"),
+            );
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the DBInstanceIdentifier"; Fn::GetAtt: DBInstanceArn, DbiResourceId,
+        // Endpoint.Address, Endpoint.Port (Endpoint.HostedZoneId is a value AWS allocated
+        // per Region — nothing computes it — so it is left out rather than invented).
+        "AWS::RDS::DBInstance" => {
+            let label = service_assigned_label(
+                RDS_ENDPOINT_LABEL_SALT,
+                name,
+                RDS_ENDPOINT_LABEL_HEX_DIGITS,
+            );
+            attributes.insert(
+                "DBInstanceArn".to_string(),
+                ::emulator_server::emulator_arn("rds", region, &format!("db:{name}")),
+            );
+            attributes.insert(
+                "DbiResourceId".to_string(),
+                generated_upper_resource_id("db", name, RDS_RESOURCE_ID_DIGITS),
+            );
+            attributes.insert(
+                "Endpoint.Address".to_string(),
+                format!("{name}.{label}.{region}.rds.{URL_SUFFIX}"),
+            );
+            if let Some(port) = database_port(properties, scope, budget) {
+                attributes.insert("Endpoint.Port".to_string(), port);
+            }
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the ARN of the secret"; Fn::GetAtt: Id, which is that same ARN. A
+        // Secrets Manager secret ARN ends in a service-assigned six-character suffix
+        // (`arn:aws:secretsmanager:<region>:<account>:secret:<name>-<suffix>`), so the
+        // resource id is of THAT form rather than the name.
+        "AWS::SecretsManager::Secret" => {
+            let suffix =
+                service_assigned_label(SECRET_ARN_SUFFIX_SALT, name, SECRET_ARN_SUFFIX_CHARACTERS);
+            let arn = ::emulator_server::emulator_arn(
+                "secretsmanager",
+                region,
+                &format!("secret:{name}-{suffix}"),
+            );
+            attributes.insert("Id".to_string(), arn.clone());
+            (arn, attributes)
+        }
+        // "Ref returns the ID of the security group" for a VPC security group; Fn::GetAtt:
+        // GroupId (VpcId is left out: it is whatever the declared `VpcId` property
+        // resolves to, which is another resource of the template rather than a value of
+        // this one). The id is the service-assigned `sg-` + 17 hexadecimal form EC2
+        // publishes.
+        "AWS::EC2::SecurityGroup" => {
+            let group_id = generated_service_id("sg", name, EC2_ID_HEX_DIGITS);
+            attributes.insert("GroupId".to_string(), group_id.clone());
+            (group_id, attributes)
         }
         // The four Amazon Bedrock AgentCore types. Source for each one's identifiers: the
         // AgentCore control-plane model, whose `arnReference` traits name these very
@@ -1435,6 +1632,32 @@ fn return_values(
         _ => (name.to_string(), attributes),
     }
 }
+
+/// How many hexadecimal characters the service-assigned label of an Amazon RDS endpoint
+/// carries: an RDS endpoint's middle label is 12 characters
+/// (`mydb.cluster-c7g8h9i0j1k2.us-east-1.rds.amazonaws.com`).
+const RDS_ENDPOINT_LABEL_HEX_DIGITS: usize = 12;
+
+/// The salt an RDS endpoint label is derived under (see [`service_assigned_label`]).
+const RDS_ENDPOINT_LABEL_SALT: &str = "rds/endpoint";
+
+/// The salt a Secrets Manager secret ARN's suffix is derived under, so a secret's ARN
+/// suffix and any endpoint label of the same name are different digits.
+const SECRET_ARN_SUFFIX_SALT: &str = "secretsmanager/secret";
+
+/// How many characters an Amazon RDS immutable resource id carries after its prefix:
+/// `DbClusterResourceId`/`DbiResourceId` are published as `cluster-`/`db-` plus 26
+/// characters.
+const RDS_RESOURCE_ID_DIGITS: usize = 26;
+
+/// How many characters the service-assigned suffix of a Secrets Manager secret ARN
+/// carries: "Secrets Manager automatically adds a hyphen and six random characters after
+/// the secret name at the end of the ARN".
+const SECRET_ARN_SUFFIX_CHARACTERS: usize = 6;
+
+/// How many hexadecimal characters an Amazon EC2 resource id carries after its prefix: the
+/// current (long) id form is 17 (`sg-0123456789abcdef0`).
+const EC2_ID_HEX_DIGITS: usize = 17;
 
 /// A service-assigned identifier of the canonical UUID form, derived from `name` under
 /// `domain`.
@@ -2173,13 +2396,40 @@ mod tests {
     /// publishes, which a type outside the `match` has none of.
     #[test]
     fn every_implemented_resource_type_has_known_return_values() {
-        let scope = StackScope {
+        let stack = StackScope {
             region: "us-east-1",
             stack_name: "a-stack",
             stack_id: "a-stack-id",
         };
+        let parameters = BTreeMap::new();
+        let parameter_types = BTreeMap::new();
+        let resources = BTreeMap::new();
+        let mappings = Value::Null;
+        let conditions = Value::Null;
+        let scope = Scope {
+            stack,
+            parameters: &parameters,
+            parameter_types: &parameter_types,
+            resources: &resources,
+            mappings: &mappings,
+            conditions: &conditions,
+        };
+        let mut budget = Budget::new();
+        // `return_values` reads the whole declaration, because a few published return
+        // values are functions of the resource's own properties: a declaration carrying
+        // only the type is what a template that sets no property spells. A DB type's
+        // `Endpoint.Port` is one of those — it needs a declared engine — so each DB row
+        // declares the engine a template would.
+        let declared_as = |resource_type: &str| DeclaredResource {
+            logical_id: "ARes".to_string(),
+            resource_type: resource_type.to_string(),
+            properties: ::serde_json::json!({"Engine": "aurora-mysql"}),
+            condition: None,
+            declaration: Value::Null,
+        };
         for resource_type in IMPLEMENTED_RESOURCE_TYPES {
-            let (_, attributes) = return_values(resource_type, "a-name", scope);
+            let (_, attributes) =
+                return_values(&declared_as(resource_type), "a-name", &scope, &mut budget);
             assert!(
                 !attributes.is_empty(),
                 "case {resource_type:?}: expected the type's documented Fn::GetAtt \
@@ -2188,7 +2438,12 @@ mod tests {
             );
         }
         // And a type no arm carries is NOT in the catalogue: it has no attributes at all.
-        let (_, unknown) = return_values("AWS::NotAService::NotAType", "a-name", scope);
+        let (_, unknown) = return_values(
+            &declared_as("AWS::NotAService::NotAType"),
+            "a-name",
+            &scope,
+            &mut budget,
+        );
         assert!(
             unknown.is_empty(),
             "case \"a type no arm carries\": expected no attributes, got {unknown:?}"

@@ -147,9 +147,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-transfer-transferservic
 // here — hence the `UpdateUserError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.transfer#UpdateUser")]
+//
+// `AccessDeniedException` is widened in with `extra_errors`: the SERVICE models the
+// shape (`CreateServer`, `UpdateServer` and `DeleteServer` all list it) and the real
+// service answers this operation with it — for a caller an identity policy denies,
+// and for a role ARN in another account — but this operation's modelled error list
+// omits it. The shape, its status (403) and its body stay the model's own.
+#[smithy_macros::operation_error(
+    "com.amazonaws.transfer#UpdateUser",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum UpdateUserErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     InternalServiceError(InternalServiceError),
     InvalidRequestException(InvalidRequestException),
     ResourceNotFoundException(ResourceNotFoundException),
@@ -210,8 +220,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
 
-        // This operation reads no request metadata; the engine comes from `self`.
-        let _ = ctx;
+        // WHO is asking is decided before WHAT is asked: a caller whose identity
+        // policy explicitly denies this action on this user is refused with
+        // `AccessDeniedException` (HTTP 403) and nothing is written.
+        let resource = st::user_arn(
+            &st::request_region(ctx.parts()),
+            &input.server_id,
+            &input.user_name,
+        );
+        if let Some(message) = st::authorization::explicit_deny(
+            &*self.engine,
+            ctx.parts(),
+            Self::NAME,
+            Some(&resource),
+        ) {
+            return Err(UpdateUserErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // The ACCOUNT of a role this request asks the service to pass is checked
+        // before any resource the request names is resolved, exactly as on the
+        // create: passing a role across accounts is refused for its own reason.
+        if input
+            .role
+            .as_deref()
+            .is_some_and(st::authorization::cross_account_role)
+        {
+            return Err(UpdateUserErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(st::authorization::CROSS_ACCOUNT_PASS_ROLE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A session policy that is not a JSON document is refused before it can be
+        // stored: a document the service cannot parse would otherwise silently
+        // become this user's effective permissions.
+        if let Some(message) = st::policy_document_violation("Policy", input.policy.as_deref()) {
+            return Err(UpdateUserErrorModeled::InvalidRequestException(
+                InvalidRequestException { message },
+            )
+            .into());
+        }
+
         let state = st::service_state(&*self.engine).ok_or_else(|| {
             UpdateUserErrorModeled::InternalServiceError(InternalServiceError {
                 message: "the transfer service state is unavailable".to_string(),

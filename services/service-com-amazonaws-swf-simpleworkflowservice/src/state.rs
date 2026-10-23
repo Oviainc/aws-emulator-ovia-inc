@@ -16,6 +16,7 @@ use crate::ops::types::{
     ActivityType, ActivityTypeConfiguration, ActivityTypeInfo,
     DecisionTaskScheduledEventAttributes, DomainConfiguration, DomainInfo, ExecutionTimeFilter,
     HistoryEvent, ResourceTag, TagFilter, TaskList, WorkflowExecution,
+    WorkflowExecutionCancelRequestedEventAttributes,
     WorkflowExecutionConfiguration, WorkflowExecutionFilter, WorkflowExecutionInfo,
     WorkflowExecutionOpenCounts, WorkflowExecutionStartedEventAttributes,
     WorkflowExecutionTerminatedEventAttributes, WorkflowType, WorkflowTypeConfiguration,
@@ -259,6 +260,7 @@ pub enum EventAttributes {
     WorkflowExecutionStarted(Box<WorkflowExecutionStartedEventAttributes>),
     DecisionTaskScheduled(DecisionTaskScheduledEventAttributes),
     WorkflowExecutionTerminated(WorkflowExecutionTerminatedEventAttributes),
+    WorkflowExecutionCancelRequested(WorkflowExecutionCancelRequestedEventAttributes),
 }
 
 impl EventAttributes {
@@ -269,6 +271,7 @@ impl EventAttributes {
             Self::WorkflowExecutionStarted(_) => "WorkflowExecutionStarted",
             Self::DecisionTaskScheduled(_) => "DecisionTaskScheduled",
             Self::WorkflowExecutionTerminated(_) => "WorkflowExecutionTerminated",
+            Self::WorkflowExecutionCancelRequested(_) => "WorkflowExecutionCancelRequested",
         }
     }
 }
@@ -301,6 +304,10 @@ impl HistoryEventRecord {
             }
             EventAttributes::WorkflowExecutionTerminated(attributes) => {
                 event.workflow_execution_terminated_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::WorkflowExecutionCancelRequested(attributes) => {
+                event.workflow_execution_cancel_requested_event_attributes =
+                    Some(attributes.clone());
             }
         }
         event

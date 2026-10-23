@@ -50,6 +50,8 @@ mod instance_lifecycle;
 mod instance_type_offerings;
 #[path = "all/launch_templates.rs"]
 mod launch_templates;
+#[path = "all/mac_dedicated_hosts.rs"]
+mod mac_dedicated_hosts;
 #[path = "all/modify_subnet_attribute.rs"]
 mod modify_subnet_attribute;
 #[path = "all/security_group_filter_limits.rs"]
