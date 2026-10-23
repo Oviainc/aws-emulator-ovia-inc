@@ -200,7 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(mut record) = state.rule_groups.remove(&key) else {
             return Err(DeleteRuleGroupErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Rule group {key} does not exist.")),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -232,7 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 crate::state::impl_resolve_error!(
     delete_lookup_error -> DeleteRuleGroupError, DeleteRuleGroupErrorModeled,
-    resource = "rule group", plural = "rule groups",
+    plural = "rule groups",
     name_member = "RuleGroupName", arn_member = "RuleGroupArn"
 );
 

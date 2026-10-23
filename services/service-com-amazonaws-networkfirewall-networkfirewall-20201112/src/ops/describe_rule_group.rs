@@ -196,7 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             DescribeRuleGroupError::from(
                 DescribeRuleGroupErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!("Rule group {key} does not exist.")),
+                        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                     },
                 ),
             )
@@ -227,7 +227,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 crate::state::impl_resolve_error!(
     describe_lookup_error -> DescribeRuleGroupError, DescribeRuleGroupErrorModeled,
-    resource = "rule group", plural = "rule groups",
+    plural = "rule groups",
     name_member = "RuleGroupName", arn_member = "RuleGroupArn"
 );
 

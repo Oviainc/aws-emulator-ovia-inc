@@ -323,10 +323,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if state.firewalls.contains_key(&input.firewall_name) {
             return Err(CreateFirewallErrorModeled::InvalidOperationException(
                 InvalidOperationException {
-                    message: Some(format!(
-                        "A firewall named {} already exists.",
-                        input.firewall_name
-                    )),
+                    message: Some(crate::state::RESOURCE_ALREADY_EXISTS_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -336,6 +333,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `FirewallPolicyArn` is a reference to another resource, and the model
         // classes "references an ARN that ... corresponds to a resource that
         // isn't valid in the context of the request" as `InvalidRequestException`.
+        // The message is request-derived, so it takes the service's one shape for
+        // that: a fixed stem naming the referenced kind, then the offending ARN in
+        // parameter brackets.
         let Some(policy_name) = state
             .firewall_policy_arn_index
             .get(&input.firewall_policy_arn)
@@ -343,9 +343,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(CreateFirewallErrorModeled::InvalidRequestException(
                 InvalidRequestException {
-                    message: Some(format!(
-                        "Firewall policy {} does not exist.",
-                        input.firewall_policy_arn
+                    message: Some(crate::state::missing_arn_message(
+                        crate::state::KIND_FIREWALL_POLICY,
+                        &input.firewall_policy_arn,
                     )),
                 },
             )

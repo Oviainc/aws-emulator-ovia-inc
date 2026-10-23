@@ -210,7 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => {
                 return Err(DeleteFirewallErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!("Firewall {key} does not exist.")),
+                        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                     },
                 )
                 .into())
@@ -250,6 +250,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 crate::state::impl_resolve_error!(
     delete_lookup_error -> DeleteFirewallError, DeleteFirewallErrorModeled,
-    resource = "firewall", plural = "firewalls",
+    plural = "firewalls",
     name_member = "FirewallName", arn_member = "FirewallArn"
 );

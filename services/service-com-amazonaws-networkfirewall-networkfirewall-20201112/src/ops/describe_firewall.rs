@@ -183,7 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = state.firewalls.get_mut(&key) else {
             return Err(DescribeFirewallErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Firewall {key} does not exist.")),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -204,6 +204,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 crate::state::impl_resolve_error!(
     describe_lookup_error -> DescribeFirewallError, DescribeFirewallErrorModeled,
-    resource = "firewall", plural = "firewalls",
+    plural = "firewalls",
     name_member = "FirewallName", arn_member = "FirewallArn"
 );

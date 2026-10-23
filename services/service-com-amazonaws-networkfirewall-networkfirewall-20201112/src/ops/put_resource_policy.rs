@@ -173,10 +173,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(kind) = crate::state::shared_resource_kind(&input.resource_arn) else {
             return Err(PutResourcePolicyErrorModeled::InvalidRequestException(
                 InvalidRequestException {
-                    message: Some(format!(
-                        "{} does not name a rule group or a firewall policy, so it cannot carry a \
-                         resource policy.",
-                        input.resource_arn
+                    // Request-derived, so it takes the service's one shape for
+                    // that: a fixed stem, then the offending ARN in parameter
+                    // brackets.
+                    message: Some(crate::state::parameter_message(
+                        "resource ARN does not name a rule group or a firewall policy",
+                        &input.resource_arn,
                     )),
                 },
             )
@@ -217,10 +219,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !exists {
             return Err(PutResourcePolicyErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "No object with the provided name or resource identifier was found: {}",
-                        input.resource_arn
-                    )),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());

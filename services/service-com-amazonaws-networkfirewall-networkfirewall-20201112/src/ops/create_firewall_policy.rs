@@ -196,10 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(CreateFirewallPolicyErrorModeled::InvalidOperationException(
                 InvalidOperationException {
-                    message: Some(format!(
-                        "A firewall policy named {} already exists.",
-                        input.firewall_policy_name
-                    )),
+                    message: Some(crate::state::RESOURCE_ALREADY_EXISTS_MESSAGE.to_string()),
                 },
             )
             .into());

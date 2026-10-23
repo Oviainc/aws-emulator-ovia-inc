@@ -161,10 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DescribeResourcePolicyErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "No object with the provided name or resource identifier was found: {}",
-                            input.resource_arn
-                        )),
+                        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                     },
                 )
                 .into(),
