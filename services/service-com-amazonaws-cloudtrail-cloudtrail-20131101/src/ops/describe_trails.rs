@@ -200,30 +200,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect()
         } else {
             // Each entry names one trail, by bare name (this Region) or by ARN (the
-            // ARN's Region). An entry naming no trail contributes nothing: this
-            // operation models no not-found error. Reporting runs over the registry so
-            // the answer stays name-sorted and carries each trail once however often
-            // the request names it.
+            // ARN's Region): "a list of trail names, trail ARNs, or both, of the
+            // trails to describe". An entry that names no trail of the caller's
+            // account contributes nothing and refuses nothing — including an entry
+            // that can name no trail at all, which is one more selector that matches
+            // none. "If one or more trail names are specified, information is
+            // returned only if the names match the names of trails belonging only to
+            // the current Region and current account": this operation SELECTS, so an
+            // unmatched selector narrows the answer rather than failing it, which is
+            // why neither `CloudTrailARNInvalidException` nor
+            // `InvalidTrailNameException` is reachable here. Reporting runs over the
+            // registry so the answer stays name-sorted and carries each trail once
+            // however often the request names it.
             let mut wanted = ::std::collections::BTreeSet::new();
             for identifier in &requested {
-                let key = store
-                    .addressed_key(identifier, &region)
-                    .map_err(|rejection| match rejection {
-                        crate::state::IdentifierRejection::InvalidArn(message) => {
-                            DescribeTrailsErrorModeled::CloudTrailARNInvalidException(
-                                CloudTrailARNInvalidException {
-                                    message: Some(message),
-                                },
-                            )
-                        }
-                        crate::state::IdentifierRejection::InvalidName(message) => {
-                            DescribeTrailsErrorModeled::InvalidTrailNameException(
-                                InvalidTrailNameException {
-                                    message: Some(message),
-                                },
-                            )
-                        }
-                    })?;
+                let Ok(key) = store.addressed_key(identifier, &region) else {
+                    continue;
+                };
                 if store.trails.contains_key(&key) {
                     wanted.insert(key);
                 }

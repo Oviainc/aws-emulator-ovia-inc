@@ -24,7 +24,20 @@ use service_com_amazonaws_comprehend_comprehend_20171127::ops::types::{
     JOB_STATUS_VALUES, LANGUAGE_CODE_VALUES, PII_ENTITIES_DETECTION_MODE_VALUES,
 };
 
-use crate::comprehend_client::{error_code, Comprehend, ACCOUNT_ID, REGION};
+use crate::comprehend_client::{error_code, error_message, Comprehend, ACCOUNT_ID, REGION};
+
+/// The text `InvalidRequestException` carries when the mode that redacts is
+/// submitted without a `RedactionConfig`.
+///
+/// Amazon Comprehend's own fixed sentence for the `INPUT_CONFIG_INVALID_FOR_MODE`
+/// reason code, remediation clause included: nothing in it is derived from the
+/// request, so every refused row below carries exactly this. Written out here rather
+/// than imported from the service, so the suite pins the documented text instead of
+/// whatever the code currently believes.
+const REDACTION_CONFIG_REQUIRED_MESSAGE: &str = "INPUT_CONFIG_INVALID_FOR_MODE: A \
+    RedactionConfig definition is required for PII detection requests that set the Mode \
+    parameter to ONLY_REDACTION. Add a RedactionConfig definition to your request, \
+    including a non-empty list of PII entity types to redact, and try again.";
 
 /// Longest a suite waits for the clock to owe a job its terminal status. The spans
 /// in `crate::state` total 600 ms; this leaves ample head-room on a loaded machine.
@@ -156,6 +169,12 @@ async fn the_mode_decides_whether_a_redaction_configuration_is_required() {
             error_code(&response),
             "InvalidRequestException",
             "case {case:?}: expected InvalidRequestException, got {response}"
+        );
+        assert_eq!(
+            error_message(&response),
+            REDACTION_CONFIG_REQUIRED_MESSAGE,
+            "case {case:?}: expected the service's fixed INPUT_CONFIG_INVALID_FOR_MODE \
+             text, got {response}"
         );
 
         // No job was minted: the token is still free, so a compliant submission

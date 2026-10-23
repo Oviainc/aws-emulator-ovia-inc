@@ -671,3 +671,127 @@ async fn the_definition_store_is_bounded_across_every_region() {
         "expected the refused call to have stored nothing"
     );
 }
+
+/// RULE: `GetActionType` REPORTS — it never writes. A read answers the same definition
+/// however often it is repeated, and a read of an identity no definition was stored for
+/// does not bring one into existence.
+#[tokio::test]
+async fn reading_a_definition_leaves_the_store_as_it_was() {
+    let emulator = Emulator::new();
+    let defined = BUILT_IN_ACTION_TYPES[0];
+    let defined_id = identifier(
+        defined.category,
+        defined.owner,
+        defined.provider,
+        defined.version,
+    );
+    let declaration = definition(&defined_id, 2);
+    let (status, answered) = update_in(&emulator, HOME_REGION, &declaration).await;
+    assert_eq!(
+        status, 200,
+        "expected UpdateActionType to store the definition, got {status} {answered}"
+    );
+
+    // The identity nothing defined: a catalog entry in the same Region, so the only
+    // thing separating the two reads is whether a definition was stored.
+    let undefined = BUILT_IN_ACTION_TYPES[1];
+    let undefined_id = identifier(
+        undefined.category,
+        undefined.owner,
+        undefined.provider,
+        undefined.version,
+    );
+
+    let count = || {
+        emulator
+            .engine()
+            .state::<ServiceState>()
+            .lock()
+            .declared_action_type_count()
+    };
+    let stored_before = count();
+
+    for round in 0..3 {
+        let (status, read) = get_in(&emulator, HOME_REGION, &defined_id).await;
+        assert_eq!(
+            status, 200,
+            "round {round}: expected the stored definition to stay readable, got {status} {read}"
+        );
+        assert!(
+            contains(&declaration, &read["actionType"]),
+            "round {round}: expected {declaration}, got {read}"
+        );
+
+        let (status, response) = get_in(&emulator, HOME_REGION, &undefined_id).await;
+        assert_eq!(
+            refusal("GetActionType", "a repeated miss", status, &response),
+            (400, "ActionTypeNotFoundException".to_string()),
+            "round {round}: a repeated miss must stay a miss, got {status} {response}"
+        );
+
+        assert_eq!(
+            count(),
+            stored_before,
+            "round {round}: reading must not change how many definitions the store holds"
+        );
+    }
+}
+
+/// RULE: only an owner `ActionTypeIdentifier$owner` admits can be named at all, so the
+/// `Custom` action types `CreateCustomActionType` mints have no definition to ask for:
+/// the request is refused on the modelled pattern rather than answered, and nothing is
+/// stored.
+#[tokio::test]
+async fn a_custom_owned_action_type_cannot_be_named() {
+    let emulator = Emulator::new();
+    // An action type the account really does hold — `CreateCustomActionType` mints it
+    // under the `Custom` owner — so what the refusal turns on is the OWNER and not the
+    // action type's existence.
+    {
+        let state = emulator.engine().state::<ServiceState>();
+        state.lock().register_action_type(
+            ActionTypeKey {
+                category: "Build".to_string(),
+                owner: "Custom".to_string(),
+                provider: "ExampleCustom".to_string(),
+                version: "1".to_string(),
+            },
+            ActionTypeRecord {
+                input_artifact_details: ArtifactDetails {
+                    minimum_count: 0,
+                    maximum_count: 1,
+                },
+                output_artifact_details: ArtifactDetails {
+                    minimum_count: 0,
+                    maximum_count: 1,
+                },
+                region: Some(HOME_REGION.to_string()),
+                ..ActionTypeRecord::default()
+            },
+        );
+    }
+    let custom_id = identifier("Build", "Custom", "ExampleCustom", "1");
+
+    let (status, response) = get_in(&emulator, HOME_REGION, &custom_id).await;
+    assert_eq!(
+        refusal("GetActionType", "a Custom owner", status, &response),
+        (400, "ValidationException".to_string()),
+        "expected a 400 ValidationException for a Custom owner, got {status} {response}"
+    );
+
+    let (status, response) = update_in(&emulator, HOME_REGION, &definition(&custom_id, 0)).await;
+    assert_eq!(
+        refusal("UpdateActionType", "a Custom owner", status, &response),
+        (400, "ValidationException".to_string()),
+        "expected a 400 ValidationException for a Custom owner, got {status} {response}"
+    );
+    assert_eq!(
+        emulator
+            .engine()
+            .state::<ServiceState>()
+            .lock()
+            .declared_action_type_count(),
+        0,
+        "expected the refused calls to have stored nothing"
+    );
+}

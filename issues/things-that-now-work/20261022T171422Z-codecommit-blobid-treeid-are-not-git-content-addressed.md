@@ -51,3 +51,34 @@ The hex values differ per run; the requirement is the derivation, not the litera
 5. Compute the git root-tree id for {'src/app.py': (100644, blob)} and compare with out['treeId'] -> expect equality; observe an unrelated id.
 6. Re-put the same path with fileMode='EXECUTABLE' and observe whether treeId changes as git requires.
 7. Re-replay the check ids in trace_ids.
+
+## Resolution
+
+The derivation named in "Fix" is in place: object ids are computed by
+`src/state/git_object.rs`'s object-name function, which hashes the git object encoding
+`"<kind> <len>\0" + payload` with **SHA-1**, so `blobId`, `treeId` and `commitId` are the
+object names `git hash-object` / `git write-tree` produce for the same content. The
+encoding is git's own (real nested tree objects, `100644`/`100755`/`120000`/`40000` modes,
+git's entry order with a subtree's name compared as if it ended in `/`, the commit object
+layout). Every operation that mints an id goes through the `state` helpers over it —
+`PutFile` and `CreateCommit` call `state::blob_id`/`state::tree_id`/`state::commit_id`, and
+`GetFolder` reports `state::tree_id` of the folder it lists — and every reader (`GetFile`,
+`GetBlob`, `GetCommit`, `ListFileCommitHistory`, `GetBranch`) reports the ids the writer
+persisted, so all of them follow the rule through state. The id function arrived with the
+git smart-HTTP transport (issue
+`20261022T171422Z-codecommit-serves-no-git-smart-http-transport-and.md`), which needs the
+same object names on the wire; what this change adds is the test that PINS the rule for the
+control-plane responses this issue was filed about.
+
+Covered by `tests/all/git_object_ids.rs`, which checks blob, tree, file-mode, entry-order
+and commit ids over the wire against an encoder written independently of the service and
+against the object names git itself publishes.
+
+Still 501 scaffolds, each left to its own stub issue: `DeleteFile`, `CreateBranch` and the
+merge operations. So of this issue's seven trace ids, every one's object-id assertion (each
+is an assertion on a `PutFile` response) is answered here; the checks that go on to call
+`DeleteFile` (`delete-file-restores-prior-tree-id`) or a merge with a supplied conflict
+resolution (`supplied-conflict-resolution-produces-the-resolved-blob`) will next diverge on
+those scaffolds' `NotImplemented`, not on an object id. Treat the object-id derivation as
+fixed and those later steps as blocked on those operations' own issues.
+

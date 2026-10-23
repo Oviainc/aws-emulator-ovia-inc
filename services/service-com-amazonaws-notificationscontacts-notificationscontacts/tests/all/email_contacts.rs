@@ -107,7 +107,7 @@ pub(crate) async fn call(
 }
 
 /// The modelled error shape a failed call reported.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or("<no __type>")
@@ -125,7 +125,7 @@ pub(crate) fn label(value: &str) -> String {
     value.replace('/', "%2F")
 }
 
-async fn create(em: &Emulator, body: &Value) -> (u16, Value) {
+pub(crate) async fn create(em: &Emulator, body: &Value) -> (u16, Value) {
     call(em, "POST", "/2022-09-19/emailcontacts", Some(body)).await
 }
 
@@ -178,7 +178,7 @@ pub(crate) async fn activate(em: &Emulator, arn: &str, code: &str) -> (u16, Valu
     .await
 }
 
-async fn delete(em: &Emulator, arn: &str) -> (u16, Value) {
+pub(crate) async fn delete(em: &Emulator, arn: &str) -> (u16, Value) {
     call(em, "DELETE", &format!("/emailcontacts/{}", label(arn)), None).await
 }
 
@@ -254,7 +254,7 @@ pub(crate) fn as_millis(contact: &Value, member: &str) -> i64 {
 
 /// A well-formed ARN of this service that names nothing: the id is 27 lowercase
 /// alphanumerics, so the modelled pattern admits it and only the store can refuse it.
-fn unknown_arn(seed: char) -> String {
+pub(crate) fn unknown_arn(seed: char) -> String {
     format!(
         "arn:aws:notifications-contacts::{ACCOUNT}:emailcontact/{}",
         std::iter::repeat_n(seed, CONTACT_ID_LEN).collect::<String>()
@@ -963,14 +963,9 @@ async fn the_tagging_operations_are_still_honest_501s() {
     let arn = create_ok(&em, "tagged", "tagged@example.com").await;
 
     // Out of scope for this slice: each still answers the scaffold's 501 rather than
-    // a hollow success.
+    // a hollow success. `ListTagsForResource` is implemented and covered by
+    // `tests/all/resource_tags.rs`, so it is no longer one of them.
     for (case, method, uri, body) in [
-        (
-            "ListTagsForResource",
-            "GET",
-            format!("/tags/{}", label(&arn)),
-            None,
-        ),
         (
             "TagResource",
             "POST",

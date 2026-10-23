@@ -78,6 +78,8 @@ mod modify_subnet_attribute;
 mod network_performance_data;
 #[path = "all/placement_groups.rs"]
 mod placement_groups;
+#[path = "all/regions.rs"]
+mod regions;
 #[path = "all/secondary_networks.rs"]
 mod secondary_networks;
 #[path = "all/secondary_subnets.rs"]

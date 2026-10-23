@@ -71,13 +71,12 @@ const PERSISTED_MEMBERS: &[&str] = &[
 
 /// The lifecycle order a job's status may only move forward along.
 ///
-/// The terminal status of a started job of these two families is `FAILED`, not
-/// `COMPLETED`: running the job means reading the documents from the Amazon S3
-/// location `InputDataConfig` names and writing analysed output back, and this
-/// emulator does not perform that batch run for either of them
-/// (`StartDominantLanguageDetectionJob` is the family whose run it does perform —
-/// see `dominant_language_jobs`). The suites below assert that modelled failure and
-/// the `Message` that names what was not performed.
+/// A started job of either family ends `FAILED` in THIS suite, whose emulator mounts
+/// no object storage: running the job means reading the documents from the Amazon S3
+/// location `InputDataConfig` names and writing analysed output back, and nothing
+/// answers those calls here, so the run reports what it could not read.
+/// `key_phrases_job_run` is the suite that mounts object storage and asserts the
+/// COMPLETED run and the archive it wrote.
 const LIFECYCLE: &[&str] = &["SUBMITTED", "IN_PROGRESS", "FAILED"];
 
 /// The terminal status a started job reaches, as `JOB_STATUS_VALUES` spells it.
@@ -539,13 +538,16 @@ async fn a_job_status_only_moves_forward_and_ends_in_the_modelled_failure() {
                      {properties}",
                     family.describe
                 );
-                // The reason the batch run could not be performed, naming both S3
-                // locations the submission pointed at.
+                // The reason the run could not be carried out, naming the location
+                // the input documents were to be read from. No object storage
+                // answers this suite's emulator, so the run's own listing is what
+                // failed: the job reports that, rather than a COMPLETED run nothing
+                // performed. `key_phrases_job_run` is the suite that mounts object
+                // storage and asserts the COMPLETED run.
                 let message = properties["Message"].as_str().unwrap_or_default();
                 for expected in [
                     body["InputDataConfig"]["S3Uri"].as_str().unwrap_or_default(),
-                    body["OutputDataConfig"]["S3Uri"].as_str().unwrap_or_default(),
-                    "was not performed",
+                    "Could not list the input documents",
                 ] {
                     assert!(
                         message.contains(expected),

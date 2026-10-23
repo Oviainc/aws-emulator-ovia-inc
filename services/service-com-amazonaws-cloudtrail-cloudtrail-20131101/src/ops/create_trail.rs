@@ -417,10 +417,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.trails.contains_key(&key) {
             return Err(CreateTrailErrorModeled::TrailAlreadyExistsException(
                 TrailAlreadyExistsException {
-                    message: Some(format!(
-                        "Trail {} already exists in {region}",
-                        input.name
-                    )),
+                    // The refusal names the trail the request asked for and the
+                    // account that already holds one of that name
+                    // (`crate::state::trail_already_exists_message`).
+                    message: Some(crate::state::trail_already_exists_message(&input.name)),
                 },
             )
             .into());
