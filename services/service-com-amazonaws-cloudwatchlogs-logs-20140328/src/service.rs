@@ -41,9 +41,145 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The error code this service answers an input-constraint violation with.
+///
+/// The modeled `ValidationException` (`com.amazonaws.cloudwatchlogs#ValidationException`,
+/// `@error("client")`, HTTP 400), which is also the code the framework's own refusal
+/// renderer picks. Restated here because [`Service::override_refusal`] replaces the code
+/// and the message together, and a message without its matching code is worse than
+/// leaving both alone.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// How CloudWatch Logs names the subject of a constraint clause when a value WAS
+/// submitted: the POSITION in the input that failed, and never the value sitting there.
+///
+/// A caller's own data — a delivery id, a delivery-source name, an integration-source
+/// identifier, a page size — is not reflected back into an error body a client may log or
+/// match on.
+const SUBJECT: &str = "Value at";
+
+/// How the subject reads when the member was ABSENT, which is the cross-service rule
+/// `services/common/src/validation.rs` states ("an ABSENT member keeps
+/// `Value null at '<path>' …`"): there is no submitted value to withhold, and the `null`
+/// is a fact of the request's SHAPE rather than a rendering of anything the caller sent.
+const ABSENT_SUBJECT: &str = "Value null at";
+
+/// The requirement one violation states: the modeled constraint the value failed.
+///
+/// Read off the violation's structural [`ViolationKind`] — the bound, the pattern, the
+/// value set the MODEL declares — so a clause states the constraint rather than anything
+/// about the request beyond which member it names.
+///
+/// THE PATTERN RENDERING RULE, stated once for the whole service (the handler-side
+/// refusal in `crate::state` words its clause through [`one_violation_message`], so both
+/// refusal paths read alike): a `@pattern` is reported as the MODEL spells it, anchors
+/// included. The model is this emulator's only source for that expression, and the
+/// recorded refusals of this service disagree with each other about the anchors — the
+/// three recorded `DeliveryId` refusals print the model's `^[0-9A-Za-z]+$` anchored,
+/// while the recorded `DeliverySourceName` one prints the model's `^[\w-]*$` as
+/// `[\w-]*` — so no rule over the model can produce both and the expression is rendered
+/// rather than rewritten.
+///
+/// Returns `None` for a violation class this service has no wording for, which lets
+/// [`constraint_envelope`] decline the whole refusal and keep the framework's wording
+/// rather than invent a sentence for it ([`ViolationKind`] is `#[non_exhaustive]`, so a
+/// class can be added upstream).
+fn requirement(kind: &ViolationKind) -> Option<String> {
+    Some(match kind {
+        ViolationKind::MissingRequiredMember => "Member must not be null".to_string(),
+        ViolationKind::MinLength(min) => {
+            format!("Member must have length greater than or equal to {min}")
+        }
+        ViolationKind::MaxLength(max) => {
+            format!("Member must have length less than or equal to {max}")
+        }
+        ViolationKind::MinValue(min) => {
+            format!("Member must have value greater than or equal to {min}")
+        }
+        ViolationKind::MaxValue(max) => {
+            format!("Member must have value less than or equal to {max}")
+        }
+        ViolationKind::Pattern(pattern) => {
+            format!("Member must satisfy regular expression pattern: {pattern}")
+        }
+        // A "value set" is just that: the requirement is WHICH values the model allows,
+        // listed in the order the model declares them — the only order this emulator has
+        // a source for.
+        ViolationKind::EnumValue(allowed) => format!(
+            "Member must satisfy enum value set: [{}]",
+            allowed
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        ViolationKind::UniqueItems => "Member must have unique values".to_string(),
+        _ => return None,
+    })
+}
+
+/// Render one constraint violation the way this service states it: the input position and
+/// the constraint it failed, and NOTHING of the value that was rejected.
+///
+/// The absent-member subject is chosen by whether a value reached the member at all
+/// (`Violation::value`), not by the violation's class: `null` reports that the request
+/// carried no value there, which is the one case where there is nothing to withhold.
+fn constraint_clause(violation: &Violation) -> Option<String> {
+    let requirement = requirement(&violation.kind)?;
+    Some(match violation.value {
+        Some(_) => present_value_clause(&violation.path, &requirement),
+        None => format!(
+            "{ABSENT_SUBJECT} '{}' failed to satisfy constraint: {requirement}",
+            violation.path
+        ),
+    })
+}
+
+/// The clause a present-but-invalid value at `path` is refused with: the position and the
+/// requirement, with the value withheld.
+fn present_value_clause(path: &str, requirement: &str) -> String {
+    format!("{SUBJECT} '{path}' failed to satisfy constraint: {requirement}")
+}
+
+/// The envelope one clause is wrapped in.
+fn one_error_envelope(clause: &str) -> String {
+    format!("1 validation error detected: {clause}")
+}
+
+/// The whole `ValidationException` message for ONE refused member, for a violation a
+/// HANDLER found itself at a member the framework's validating walk no longer sees (a
+/// member carrying `skip_validation`, which `crate::state` judges).
+///
+/// Built from the same subject, the same envelope and the same pattern rendering as a
+/// refusal the framework raised, so one violation reads as one message whichever of the
+/// two refused the request, and the submitted value is withheld either way.
+pub(crate) fn one_violation_message(member: &str, requirement: &str) -> String {
+    one_error_envelope(&present_value_clause(member, requirement))
+}
+
+/// The `ValidationException` message for a refusal: the AWS envelope
+/// (`N validation error(s) detected: `) over one clause per violation, in the order the
+/// validating walk found them.
+///
+/// `None` declines the whole refusal — see [`requirement`].
+fn constraint_envelope(violations: &[Violation]) -> Option<String> {
+    let clauses: Vec<String> = violations
+        .iter()
+        .map(constraint_clause)
+        .collect::<Option<Vec<_>>>()?;
+    match clauses.len() {
+        0 => None,
+        1 => Some(one_error_envelope(&clauses[0])),
+        n => Some(format!(
+            "{n} validation errors detected: {}",
+            clauses.join("; ")
+        )),
+    }
+}
 
 /// The `com-amazonaws-cloudwatchlogs-logs-20140328` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -98,15 +234,28 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // CloudWatch Logs states a member-constraint failure against the INPUT POSITION
+        // that failed and the constraint it failed — never the value that was submitted
+        // there, so a delivery id, a source name or a page size a caller sent is not
+        // reflected back into a 400 body. The code stays the modeled
+        // `ValidationException` (HTTP 400), which is what the framework would have
+        // answered; only the wording changes.
+        //
+        // A `@pattern` keeps the anchors the model spells it with — the rule stated once
+        // on `requirement` above, and shared with the handler-side refusal through
+        // `one_violation_message`.
+        //
+        // An authentication refusal keeps the framework's wording: it is not an
+        // input-constraint failure.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: VALIDATION_EXCEPTION.to_string(),
+                message: constraint_envelope(violations)?,
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(
