@@ -23,11 +23,11 @@ use super::inference_deployment_lifecycle::{error_code, str_field, Emulator, ACC
 const PAST_REMOVAL_DUE: Duration = Duration::from_millis(600);
 
 /// The only pipeline-definition schema version SageMaker Pipelines publishes.
-const DEFINITION_VERSION: &str = "2020-12-01";
+pub(crate) const DEFINITION_VERSION: &str = "2020-12-01";
 
 /// A `ClientRequestToken` built from `seed`, padded to the modelled minimum length of
 /// 32 characters (`IdempotencyToken`, len 32..128).
-fn token(seed: &str) -> String {
+pub(crate) fn token(seed: &str) -> String {
     format!("{seed:-<32}")
 }
 
@@ -37,7 +37,7 @@ fn definition(steps: Value) -> String {
 }
 
 /// A `Fail` step named `name`, depending on `depends_on`.
-fn step(name: &str, depends_on: &[&str]) -> Value {
+pub(crate) fn step(name: &str, depends_on: &[&str]) -> Value {
     let mut built = json!({
         "Name": name,
         "Type": "Fail",
@@ -64,7 +64,7 @@ fn condition_step(name: &str, if_steps: Value, else_steps: Value) -> Value {
 }
 
 /// A minimal `CreatePipeline` request body.
-fn create_body(name: &str, definition: &str, request_token: &str) -> Value {
+pub(crate) fn create_body(name: &str, definition: &str, request_token: &str) -> Value {
     json!({
         "PipelineName": name,
         "PipelineDefinition": definition,
