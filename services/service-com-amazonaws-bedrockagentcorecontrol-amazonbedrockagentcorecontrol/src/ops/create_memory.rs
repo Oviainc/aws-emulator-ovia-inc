@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMemory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMemory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMemory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints an AgentCore Memory and PERSISTS it in [`crate::state`]: the
+//! configuration the caller supplied, a `MemoryStrategy` (with its own minted
+//! `strategyId`) per strategy the request asked for, and the `CREATING` ->
+//! `ACTIVE` transition the clock owes it. Every later read of the memory comes
+//! from that record.
 //!
 //! ## Shape of an operation
 //!
@@ -105,6 +102,408 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// `MemoryStrategyType`, one value per member of the `MemoryStrategyInput` union
+/// a request carries. The enum's full value list is `SEMANTIC | SUMMARIZATION |
+/// USER_PREFERENCE | CUSTOM | EPISODIC` (`smithy_query shape=MemoryStrategyType`).
+const STRATEGY_TYPE_SEMANTIC: &str = "SEMANTIC";
+const STRATEGY_TYPE_SUMMARIZATION: &str = "SUMMARIZATION";
+const STRATEGY_TYPE_USER_PREFERENCE: &str = "USER_PREFERENCE";
+const STRATEGY_TYPE_CUSTOM: &str = "CUSTOM";
+const STRATEGY_TYPE_EPISODIC: &str = "EPISODIC";
+
+/// `StrategyConfiguration.type` for a custom strategy, one value per member of
+/// the `CustomConfigurationInput` union the request carries. The enum's full
+/// value list is `SEMANTIC_OVERRIDE | SUMMARY_OVERRIDE | USER_PREFERENCE_OVERRIDE
+/// | SELF_MANAGED | EPISODIC_OVERRIDE` (`smithy_query shape=OverrideType`).
+const OVERRIDE_TYPE_SEMANTIC: &str = "SEMANTIC_OVERRIDE";
+const OVERRIDE_TYPE_SUMMARY: &str = "SUMMARY_OVERRIDE";
+const OVERRIDE_TYPE_USER_PREFERENCE: &str = "USER_PREFERENCE_OVERRIDE";
+const OVERRIDE_TYPE_EPISODIC: &str = "EPISODIC_OVERRIDE";
+const OVERRIDE_TYPE_SELF_MANAGED: &str = "SELF_MANAGED";
+
+/// The `fieldList` member name a strategy's record-expiry specification is
+/// reported under: the path to it through the request, so a caller sees which
+/// member of the nested union failed.
+const RECORD_EXPIRY_MEMBER: &str = "memoryStrategies.recordExpirySpecification.action";
+const RECORD_EXPIRY_DAYS_MEMBER: &str =
+    "memoryStrategies.recordExpirySpecification.recordExpiryDurationDays";
+
+/// The shortest record expiry a strategy may be given: `RecordExpiryDurationDays`
+/// is `range 31..`, which the model also states in prose ("The minimum is 31
+/// days", `smithy_query shape=RecordExpirySpecification`). The constraint sits on
+/// a member of a union nested in a list, which the framework's boundary walk does
+/// not descend into, so the handler refuses it — and `MemoryStrategy` reports the
+/// same shape, so a shorter duration could not be rendered back either.
+const MIN_RECORD_EXPIRY_DURATION_DAYS: i32 = 31;
+
+/// What one requested strategy asked for, read off whichever member of the
+/// `MemoryStrategyInput` union the request carried: the type that member names,
+/// and the members every one of them declares.
+struct RequestedStrategy {
+    strategy_type: &'static str,
+    name: String,
+    description: Option<String>,
+    /// The legacy `namespaces` member ("Use namespaceTemplates instead").
+    namespaces: Option<Vec<String>>,
+    namespace_templates: Option<Vec<String>>,
+    configuration: Option<StrategyConfiguration>,
+    memory_record_schema: Option<MemoryRecordSchema>,
+    record_expiry: Option<RecordExpirySpecification>,
+}
+
+/// The namespace template a strategy gets when the caller supplies neither
+/// `namespaceTemplates` nor the legacy `namespaces`, which `MemoryStrategy`
+/// reports as `@required` (exactly one entry) either way.
+///
+/// The three namespace variables the service defines itself are
+/// `memoryStrategyId`, `actorId` and `sessionId` — exactly the names
+/// `NamespaceVariableKey`'s pattern forbids a caller to redefine
+/// (`^(?!memoryStrategyId$|actorId$|sessionId$)[a-z][a-z0-9]*$`,
+/// `smithy_query shape=NamespaceKeyEntry`). A strategy whose records summarise
+/// or recount ONE conversation (summarization, episodic) is therefore scoped
+/// down to the session; one whose records are facts about the actor (semantic,
+/// user preference, and a custom strategy, which overrides one of those) is
+/// scoped to the actor.
+fn default_namespace_template(strategy_type: &str) -> String {
+    if strategy_type == STRATEGY_TYPE_SUMMARIZATION || strategy_type == STRATEGY_TYPE_EPISODIC {
+        "/strategies/{memoryStrategyId}/actors/{actorId}/sessions/{sessionId}".to_string()
+    } else {
+        "/strategies/{memoryStrategyId}/actors/{actorId}".to_string()
+    }
+}
+
+/// The namespace list a strategy is stored with: the caller's
+/// `namespaceTemplates`, else the legacy `namespaces` they supplied instead,
+/// else [`default_namespace_template`]. `MemoryStrategy` declares both members
+/// `@required` with exactly one entry, so the stored strategy carries one list
+/// under both names rather than an empty one the wire cannot render.
+fn effective_namespaces(requested: &RequestedStrategy) -> Vec<String> {
+    for namespaces in [&requested.namespace_templates, &requested.namespaces]
+        .into_iter()
+        .flatten()
+    {
+        if !namespaces.is_empty() {
+            return namespaces.clone();
+        }
+    }
+    vec![default_namespace_template(requested.strategy_type)]
+}
+
+/// `MemoryStrategy.recordExpiryDurationDays` for a strategy's requested
+/// `recordExpirySpecification`.
+///
+/// The union carries either a duration or an `action`, and the model says of
+/// `action`: "Set to REMOVE to remove a previously configured time-to-live …
+/// This value is not applicable on create paths" — there is no previously
+/// configured expiry on a create, so it is refused with this operation's
+/// modelled validation error.
+fn record_expiry_duration_days(
+    requested: Option<RecordExpirySpecification>,
+) -> Result<Option<i32>, CreateMemoryError> {
+    match requested {
+        None => Ok(None),
+        Some(RecordExpirySpecification::recordExpiryDurationDays(days)) => {
+            if days < MIN_RECORD_EXPIRY_DURATION_DAYS {
+                return Err(CreateMemoryErrorModeled::ValidationException(
+                    crate::state::field_validation_failed(
+                        RECORD_EXPIRY_DAYS_MEMBER,
+                        &format!(
+                            "must be at least {MIN_RECORD_EXPIRY_DURATION_DAYS} days, got {days}"
+                        ),
+                    ),
+                )
+                .into());
+            }
+            Ok(Some(days))
+        }
+        Some(RecordExpirySpecification::Action(action)) => {
+            Err(CreateMemoryErrorModeled::ValidationException(
+                crate::state::field_validation_failed(
+                    RECORD_EXPIRY_MEMBER,
+                    &format!("{action} is not applicable on create paths"),
+                ),
+            )
+            .into())
+        }
+    }
+}
+
+/// One requested strategy, read off the union member the request carried.
+fn requested_strategy(requested: MemoryStrategyInput) -> RequestedStrategy {
+    match requested {
+        MemoryStrategyInput::semanticMemoryStrategy(strategy) => RequestedStrategy {
+            strategy_type: STRATEGY_TYPE_SEMANTIC,
+            name: strategy.name,
+            description: strategy.description,
+            namespaces: strategy.namespaces,
+            namespace_templates: strategy.namespace_templates,
+            // A built-in strategy carries no configuration of its own: the
+            // overrides `StrategyConfiguration` reports are what a CUSTOM
+            // strategy supplies.
+            configuration: None,
+            memory_record_schema: strategy.memory_record_schema,
+            record_expiry: strategy.record_expiry_specification,
+        },
+        MemoryStrategyInput::summaryMemoryStrategy(strategy) => RequestedStrategy {
+            strategy_type: STRATEGY_TYPE_SUMMARIZATION,
+            name: strategy.name,
+            description: strategy.description,
+            namespaces: strategy.namespaces,
+            namespace_templates: strategy.namespace_templates,
+            configuration: None,
+            memory_record_schema: strategy.memory_record_schema,
+            record_expiry: strategy.record_expiry_specification,
+        },
+        MemoryStrategyInput::userPreferenceMemoryStrategy(strategy) => RequestedStrategy {
+            strategy_type: STRATEGY_TYPE_USER_PREFERENCE,
+            name: strategy.name,
+            description: strategy.description,
+            namespaces: strategy.namespaces,
+            namespace_templates: strategy.namespace_templates,
+            configuration: None,
+            memory_record_schema: strategy.memory_record_schema,
+            record_expiry: strategy.record_expiry_specification,
+        },
+        MemoryStrategyInput::episodicMemoryStrategy(strategy) => RequestedStrategy {
+            strategy_type: STRATEGY_TYPE_EPISODIC,
+            name: strategy.name,
+            description: strategy.description,
+            namespaces: strategy.namespaces,
+            namespace_templates: strategy.namespace_templates,
+            // The one built-in strategy with a configuration member of its own:
+            // the reflections it creates.
+            configuration: strategy.reflection_configuration.map(|reflection| {
+                StrategyConfiguration {
+                    r#type: None,
+                    extraction: None,
+                    consolidation: None,
+                    reflection: Some(ReflectionConfiguration::episodicReflectionConfiguration(
+                        EpisodicReflectionConfiguration {
+                            namespaces: reflection.namespaces,
+                            namespace_templates: reflection.namespace_templates,
+                            memory_record_schema: reflection.memory_record_schema,
+                        },
+                    )),
+                    self_managed_configuration: None,
+                }
+            }),
+            memory_record_schema: strategy.memory_record_schema,
+            record_expiry: strategy.record_expiry_specification,
+        },
+        MemoryStrategyInput::customMemoryStrategy(strategy) => RequestedStrategy {
+            strategy_type: STRATEGY_TYPE_CUSTOM,
+            name: strategy.name,
+            description: strategy.description,
+            namespaces: strategy.namespaces,
+            namespace_templates: strategy.namespace_templates,
+            configuration: strategy.configuration.map(custom_configuration),
+            memory_record_schema: strategy.memory_record_schema,
+            record_expiry: strategy.record_expiry_specification,
+        },
+    }
+}
+
+/// A custom strategy's requested `CustomConfigurationInput` as the
+/// `StrategyConfiguration` every operation that reports a strategy carries:
+/// `type` names the override the request chose, and each prompt/model override
+/// lands under the member of that shape which reports it.
+fn custom_configuration(requested: CustomConfigurationInput) -> StrategyConfiguration {
+    let mut configuration = StrategyConfiguration::default();
+    match requested {
+        CustomConfigurationInput::semanticOverride(override_input) => {
+            configuration.r#type = Some(OVERRIDE_TYPE_SEMANTIC.to_string());
+            configuration.extraction = override_input.extraction.map(|extraction| {
+                ExtractionConfiguration::customExtractionConfiguration(
+                    CustomExtractionConfiguration::semanticExtractionOverride(
+                        SemanticExtractionOverride {
+                            append_to_prompt: extraction.append_to_prompt,
+                            model_id: extraction.model_id,
+                        },
+                    ),
+                )
+            });
+            configuration.consolidation = override_input.consolidation.map(|consolidation| {
+                ConsolidationConfiguration::customConsolidationConfiguration(
+                    CustomConsolidationConfiguration::semanticConsolidationOverride(
+                        SemanticConsolidationOverride {
+                            append_to_prompt: consolidation.append_to_prompt,
+                            model_id: consolidation.model_id,
+                        },
+                    ),
+                )
+            });
+        }
+        CustomConfigurationInput::summaryOverride(override_input) => {
+            configuration.r#type = Some(OVERRIDE_TYPE_SUMMARY.to_string());
+            configuration.consolidation = override_input.consolidation.map(|consolidation| {
+                ConsolidationConfiguration::customConsolidationConfiguration(
+                    CustomConsolidationConfiguration::summaryConsolidationOverride(
+                        SummaryConsolidationOverride {
+                            append_to_prompt: consolidation.append_to_prompt,
+                            model_id: consolidation.model_id,
+                        },
+                    ),
+                )
+            });
+        }
+        CustomConfigurationInput::userPreferenceOverride(override_input) => {
+            configuration.r#type = Some(OVERRIDE_TYPE_USER_PREFERENCE.to_string());
+            configuration.extraction = override_input.extraction.map(|extraction| {
+                ExtractionConfiguration::customExtractionConfiguration(
+                    CustomExtractionConfiguration::userPreferenceExtractionOverride(
+                        UserPreferenceExtractionOverride {
+                            append_to_prompt: extraction.append_to_prompt,
+                            model_id: extraction.model_id,
+                        },
+                    ),
+                )
+            });
+            configuration.consolidation = override_input.consolidation.map(|consolidation| {
+                ConsolidationConfiguration::customConsolidationConfiguration(
+                    CustomConsolidationConfiguration::userPreferenceConsolidationOverride(
+                        UserPreferenceConsolidationOverride {
+                            append_to_prompt: consolidation.append_to_prompt,
+                            model_id: consolidation.model_id,
+                        },
+                    ),
+                )
+            });
+        }
+        CustomConfigurationInput::episodicOverride(override_input) => {
+            configuration.r#type = Some(OVERRIDE_TYPE_EPISODIC.to_string());
+            configuration.extraction = override_input.extraction.map(|extraction| {
+                ExtractionConfiguration::customExtractionConfiguration(
+                    CustomExtractionConfiguration::episodicExtractionOverride(
+                        EpisodicExtractionOverride {
+                            append_to_prompt: extraction.append_to_prompt,
+                            model_id: extraction.model_id,
+                        },
+                    ),
+                )
+            });
+            configuration.consolidation = override_input.consolidation.map(|consolidation| {
+                ConsolidationConfiguration::customConsolidationConfiguration(
+                    CustomConsolidationConfiguration::episodicConsolidationOverride(
+                        EpisodicConsolidationOverride {
+                            append_to_prompt: consolidation.append_to_prompt,
+                            model_id: consolidation.model_id,
+                        },
+                    ),
+                )
+            });
+            configuration.reflection = override_input.reflection.map(|reflection| {
+                ReflectionConfiguration::customReflectionConfiguration(
+                    CustomReflectionConfiguration::episodicReflectionOverride(
+                        EpisodicReflectionOverride {
+                            append_to_prompt: reflection.append_to_prompt,
+                            model_id: reflection.model_id,
+                            namespaces: reflection.namespaces,
+                            namespace_templates: reflection.namespace_templates,
+                            memory_record_schema: reflection.memory_record_schema,
+                        },
+                    ),
+                )
+            });
+        }
+        CustomConfigurationInput::selfManagedConfiguration(self_managed) => {
+            configuration.r#type = Some(OVERRIDE_TYPE_SELF_MANAGED.to_string());
+            configuration.self_managed_configuration = Some(SelfManagedConfiguration {
+                trigger_conditions: self_managed
+                    .trigger_conditions
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(trigger_condition)
+                    .collect(),
+                invocation_configuration: InvocationConfiguration {
+                    topic_arn: self_managed.invocation_configuration.topic_arn,
+                    payload_delivery_bucket_name: self_managed
+                        .invocation_configuration
+                        .payload_delivery_bucket_name,
+                },
+                historical_context_window_size: self_managed.historical_context_window_size,
+            });
+        }
+    }
+    configuration
+}
+
+/// One requested strategy after everything that does NOT need the store has
+/// been resolved: the type and members to report, the namespace list the rule
+/// gives it, and its validated record expiry.
+///
+/// Prepared BEFORE the state guard is taken, so none of the caller-sized work a
+/// strategy list implies runs while this service's one store is locked.
+struct PreparedStrategy {
+    strategy_type: &'static str,
+    name: String,
+    description: Option<String>,
+    configuration: Option<StrategyConfiguration>,
+    memory_record_schema: Option<MemoryRecordSchema>,
+    namespaces: Vec<String>,
+    record_expiry_duration_days: Option<i32>,
+}
+
+/// Every requested strategy, read off its union member and validated.
+///
+/// A list longer than [`crate::state::MAX_STRATEGIES_PER_MEMORY`] is refused
+/// with the operation's modelled quota error BEFORE any entry is processed, so
+/// the per-request work (and the strategies a stored memory retains) is bounded
+/// by that ceiling rather than by the request body's size.
+fn prepared_strategies(
+    requested: Option<Vec<MemoryStrategyInput>>,
+) -> Result<Vec<PreparedStrategy>, CreateMemoryError> {
+    let requested = requested.unwrap_or_default();
+    if requested.len() > crate::state::MAX_STRATEGIES_PER_MEMORY {
+        return Err(CreateMemoryErrorModeled::ServiceQuotaExceededException(
+            ServiceQuotaExceededException {
+                message: Some(format!(
+                    "a memory holds at most {} strategies, and this request asked for {}",
+                    crate::state::MAX_STRATEGIES_PER_MEMORY,
+                    requested.len()
+                )),
+            },
+        )
+        .into());
+    }
+    let mut prepared = Vec::with_capacity(requested.len());
+    for one in requested {
+        let one = requested_strategy(one);
+        let namespaces = effective_namespaces(&one);
+        prepared.push(PreparedStrategy {
+            strategy_type: one.strategy_type,
+            name: one.name,
+            description: one.description,
+            configuration: one.configuration,
+            memory_record_schema: one.memory_record_schema,
+            namespaces,
+            record_expiry_duration_days: record_expiry_duration_days(one.record_expiry)?,
+        });
+    }
+    Ok(prepared)
+}
+
+/// One requested `TriggerConditionInput` as the `TriggerCondition` a stored
+/// self-managed configuration reports.
+fn trigger_condition(requested: TriggerConditionInput) -> TriggerCondition {
+    match requested {
+        TriggerConditionInput::messageBasedTrigger(trigger) => {
+            TriggerCondition::messageBasedTrigger(MessageBasedTrigger {
+                message_count: Some(trigger.message_count),
+            })
+        }
+        TriggerConditionInput::tokenBasedTrigger(trigger) => {
+            TriggerCondition::tokenBasedTrigger(TokenBasedTrigger {
+                token_count: Some(trigger.token_count),
+            })
+        }
+        TriggerConditionInput::timeBasedTrigger(trigger) => {
+            TriggerCondition::timeBasedTrigger(TimeBasedTrigger {
+                idle_session_timeout: Some(trigger.idle_session_timeout),
+            })
+        }
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -179,18 +578,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMemory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMemoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMemory"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateMemoryErrorModeled::ServiceException(ServiceException {
+                message: Some("the memory store is unavailable".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // Everything a requested strategy needs that the store does not: read off
+        // its union member, filled with what the model requires a reported
+        // strategy to carry, refused here if the list is longer than one memory
+        // holds or a member of it is invalid. Done before the guard below, so no
+        // caller-sized work runs under it, and nothing is written until every
+        // strategy is accepted — a refused one leaves no half-created memory.
+        let prepared = prepared_strategies(input.memory_strategies)?;
+
+        let mut store = state.lock();
+
+        // A replayed request carrying the same `clientToken` answers with the
+        // memory that token first produced, rather than minting a second one:
+        // "If this token matches a previous request, Amazon Bedrock ignores the
+        // request but does not return an error."
+        if let Some(memory_id) =
+            store.replayed_memory_result(Self::NAME, input.client_token.as_deref())
+        {
+            // `replayed_memory_result` answers only for a memory the store still
+            // holds, so this lookup cannot miss.
+            if let Some(record) = store.memories.get(&memory_id) {
+                return Ok(CreateMemoryOutput {
+                    memory: Some(record.memory(now)),
+                });
+            }
+        }
+
+        // "The name must be unique within your account", so a repeated name is a
+        // conflict, not a second memory that later reads cannot tell apart.
+        if let Some(existing) = store.memory_names.get(&input.name) {
+            return Err(CreateMemoryErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "a memory named {} already exists (memoryId {existing})",
+                    input.name
+                )),
+            })
+            .into());
+        }
+
+        // The store this request would grow is bounded, so a caller looping on
+        // create meets the modelled quota instead of this process's memory limit.
+        if store.memories.len() >= crate::state::MAX_MEMORIES {
+            return Err(CreateMemoryErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {} memories",
+                        crate::state::MAX_MEMORIES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Each prepared strategy gets its own `strategyId`, minted against the
+        // ids already minted for this memory so no two of them collide. The list
+        // is capped above, so this is the only caller-sized work under the guard
+        // and it is bounded.
+        let mut minted_ids: ::std::collections::BTreeSet<String> =
+            ::std::collections::BTreeSet::new();
+        let mut strategies: Vec<MemoryStrategy> = Vec::with_capacity(prepared.len());
+        for one in prepared {
+            let strategy_id = store.mint_memory_strategy_id(&one.name, now, &minted_ids);
+            minted_ids.insert(strategy_id.clone());
+            strategies.push(MemoryStrategy {
+                strategy_id,
+                name: one.name,
+                description: one.description,
+                configuration: one.configuration,
+                r#type: one.strategy_type.to_string(),
+                namespaces: one.namespaces.clone(),
+                namespace_templates: one.namespaces,
+                created_at: Some(crate::state::timestamp(now)),
+                updated_at: Some(crate::state::timestamp(now)),
+                // The clock's, so it is computed on every read of the memory.
+                status: None,
+                memory_record_schema: one.memory_record_schema,
+                record_expiry_duration_days: one.record_expiry_duration_days,
+            });
+        }
+
+        let memory_id = store.mint_memory_id(&input.name, now);
+        let record = crate::state::MemoryRecord {
+            arn: crate::state::memory_arn(&region, &memory_id),
+            id: memory_id.clone(),
+            name: input.name,
+            description: input.description,
+            encryption_key_arn: input.encryption_key_arn,
+            memory_execution_role_arn: input.memory_execution_role_arn,
+            event_expiry_duration: input.event_expiry_duration,
+            created_at: now,
+            updated_at: now,
+            // A new memory is created, not active: the transition to ACTIVE is
+            // owed by the clock, not by this call.
+            transient_status: crate::state::MEMORY_STATUS_CREATING.to_string(),
+            settled_status: crate::state::MEMORY_STATUS_ACTIVE.to_string(),
+            settles_at: now + crate::state::MEMORY_SETTLE_DELAY,
+            strategies,
+            indexed_keys: input.indexed_keys,
+            namespace_keys: input.namespace_keys,
+            stream_delivery_resources: input.stream_delivery_resources,
+            tags: crate::state::sorted_map(input.tags),
+        };
+        let output = CreateMemoryOutput {
+            memory: Some(record.memory(now)),
+        };
+
+        store
+            .memory_names
+            .insert(record.name.clone(), memory_id.clone());
+        store.remember_memory_client_token(Self::NAME, input.client_token, &memory_id);
+        store.memories.insert(memory_id, record);
+
+        Ok(output)
     }
 }
