@@ -8,12 +8,17 @@
 //! see, and how a stored trail projects onto the modelled `Trail` / `TrailInfo`
 //! shapes. It lives here, not in one handler, because seven operations apply the same
 //! rules and two copies of them would drift.
+//!
+//! It owns the CloudTrail Lake **dashboard** registry on the same terms: a dashboard
+//! identifier is a bare name or a dashboard ARN, the refresh-schedule and widget
+//! rules are the ones the model documents, and both are applied by every dashboard
+//! operation rather than copied into each.
 
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
-use crate::ops::types::{Tag, Trail, TrailInfo};
+use crate::ops::types::{RefreshSchedule, RequestWidget, Tag, Trail, TrailInfo, Widget};
 
 /// The Region a request is served in when it carries no SigV4 credential scope to
 /// read one from. It matches the Region the emulator writes into the AWS shared
@@ -346,6 +351,18 @@ pub fn iso8601(at: SystemTime) -> Option<String> {
         .ok()
 }
 
+/// The first tag key that appears more than once in `tags`, if any.
+///
+/// `InvalidTagParameterException` covers duplicate tags, and a tag set is a map on
+/// the wire even though the model carries it as a list — so the rule holds for every
+/// taggable resource, not just one of them.
+pub fn first_duplicate_tag_key(tags: &[Tag]) -> Option<&str> {
+    let mut seen = ::std::collections::BTreeSet::new();
+    tags.iter()
+        .find(|tag| !seen.insert(tag.key.as_str()))
+        .map(|tag| tag.key.as_str())
+}
+
 /// The registry key: a trail name and the Region the trail is homed in.
 ///
 /// AWS scopes a trail name to the Region it was created in, so the name alone is
@@ -360,6 +377,8 @@ pub type TrailKey = (String, String);
 pub struct ComAmazonawsCloudtrailCloudtrail20131101State {
     /// Every trail in the account, keyed by [`TrailKey`].
     pub trails: BTreeMap<TrailKey, TrailRecord>,
+    /// Every CloudTrail Lake dashboard in the account, keyed by [`DashboardKey`].
+    pub dashboards: BTreeMap<DashboardKey, DashboardRecord>,
 }
 
 /// What a mutating operation found for the identifier it was given.
@@ -441,6 +460,345 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
                 None => TrailForMutation::Absent,
             }),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CloudTrail Lake dashboards
+// ---------------------------------------------------------------------------
+
+/// The resource prefix of a dashboard ARN:
+/// `arn:aws:cloudtrail:<region>:<account>:dashboard/<name>`.
+const DASHBOARD_RESOURCE_PREFIX: &str = "dashboard/";
+
+/// Dashboard-name length bounds, from the `DashboardName` length constraint in the
+/// model (`smithy_query(query="operation", operation="CreateDashboard")` reports
+/// `Name` as `len 3..128, pattern ^[a-zA-Z0-9_\-]+$`).
+pub const DASHBOARD_NAME_MIN_LEN: usize = 3;
+/// See [`DASHBOARD_NAME_MIN_LEN`].
+pub const DASHBOARD_NAME_MAX_LEN: usize = 128;
+
+/// The one name that names the CloudTrail-managed Highlights dashboard, from the
+/// model doc for `CreateDashboardRequest$Name`: "To create the Highlights dashboard,
+/// the name must be AWSCloudTrail-Highlights."
+pub const HIGHLIGHTS_DASHBOARD_NAME: &str = "AWSCloudTrail-Highlights";
+
+/// `DashboardType` as the model enumerates it (`MANAGED | CUSTOM`): the dashboard a
+/// caller composes out of its own widgets.
+pub const DASHBOARD_TYPE_CUSTOM: &str = "CUSTOM";
+/// See [`DASHBOARD_TYPE_CUSTOM`]: the Highlights dashboard, which CloudTrail owns.
+pub const DASHBOARD_TYPE_MANAGED: &str = "MANAGED";
+
+/// `DashboardStatus` as the model enumerates it (`CREATING | CREATED | UPDATING |
+/// UPDATED | DELETING`): a dashboard CloudTrail is still loading.
+pub const DASHBOARD_STATUS_CREATING: &str = "CREATING";
+/// See [`DASHBOARD_STATUS_CREATING`]: a dashboard that has finished loading.
+pub const DASHBOARD_STATUS_CREATED: &str = "CREATED";
+
+/// From the `CreateDashboard` model doc: "You can add up to 10 widgets to a custom
+/// dashboard."
+pub const CUSTOM_DASHBOARD_WIDGET_LIMIT: usize = 10;
+
+/// How many dashboards the registry holds before `CreateDashboard` refuses with the
+/// modelled `ServiceQuotaExceededException`.
+///
+/// CloudTrail publishes an adjustable per-account dashboard quota, and this emulator
+/// models neither Service Quotas nor an account's adjustments — so this is the
+/// emulator's OWN bound on the store rather than a claim about any account's limit.
+/// Every record it holds is released by `DeleteDashboard`, and it sits far above any
+/// workflow an emulator serves.
+pub const DASHBOARD_QUOTA: usize = 1_000;
+
+/// How long a new dashboard reads [`DASHBOARD_STATUS_CREATING`] before the clock
+/// settles it into [`DASHBOARD_STATUS_CREATED`].
+///
+/// The model carries a `CREATING` status and a `ConflictException` documented as
+/// "the specified resource is not ready for an operation … before CloudTrail has
+/// time to fully load the resource", so a new dashboard IS loaded asynchronously.
+/// CloudTrail publishes no duration for that load, so this span is the emulator's
+/// own: short enough not to stall a workflow, non-zero so a caller that reads the
+/// dashboard straight after creating it still sees the transient status.
+pub const DASHBOARD_SETTLE_AFTER: Duration = Duration::from_millis(500);
+
+/// `RefreshScheduleFrequencyUnit` as the model enumerates it (`HOURS | DAYS`).
+pub const REFRESH_FREQUENCY_UNIT_HOURS: &str = "HOURS";
+/// See [`REFRESH_FREQUENCY_UNIT_HOURS`].
+pub const REFRESH_FREQUENCY_UNIT_DAYS: &str = "DAYS";
+
+/// From the model doc for `RefreshScheduleFrequency$Value`: "For custom dashboards,
+/// the following values are valid when the unit is HOURS: 1, 6, 12, 24".
+pub const REFRESH_FREQUENCY_HOURS_VALUES: [i32; 4] = [1, 6, 12, 24];
+
+/// From the same doc: "For custom dashboards, the only valid value when the unit is
+/// DAYS is 1."
+pub const REFRESH_FREQUENCY_DAYS_VALUE: i32 = 1;
+
+/// From the model doc for `CreateDashboardRequest$RefreshSchedule`: "To create the
+/// Highlights dashboard, you must set a refresh schedule and set the Status to
+/// ENABLED. The Unit for the refresh schedule must be HOURS and the Value must be 6."
+pub const HIGHLIGHTS_REFRESH_FREQUENCY_VALUE: i32 = 6;
+
+/// `RefreshScheduleStatus` as the model enumerates it (`ENABLED | DISABLED`).
+pub const REFRESH_SCHEDULE_ENABLED: &str = "ENABLED";
+
+/// From the model doc for `RefreshSchedule$TimeOfDay`: "The time of day in UTC to
+/// run the schedule; for hourly only refer to minutes; default is 00:00."
+pub const DEFAULT_REFRESH_TIME_OF_DAY: &str = "00:00";
+
+/// The registry key: a dashboard name and the Region the dashboard lives in.
+///
+/// A dashboard ARN carries a Region, so a dashboard is a regional resource and its
+/// name alone is not a key. The name comes FIRST so the `BTreeMap` iterates
+/// name-ordered, which is the order `ListDashboards` pages through.
+pub type DashboardKey = (String, String);
+
+/// One persisted CloudTrail Lake dashboard: everything the create/update request was
+/// given, plus the values the service mints (the ARN, the type, the status and the
+/// timestamps).
+#[derive(Debug, Clone)]
+pub struct DashboardRecord {
+    pub name: String,
+    pub dashboard_arn: String,
+    /// [`DASHBOARD_TYPE_CUSTOM`] or [`DASHBOARD_TYPE_MANAGED`].
+    pub dashboard_type: String,
+    /// A `DashboardStatus` value; see [`DashboardRecord::settle`].
+    pub status: String,
+    /// When `CREATING` is due to settle into `CREATED`.
+    pub settles_at: SystemTime,
+    pub widgets: Vec<Widget>,
+    pub refresh_schedule: Option<RefreshSchedule>,
+    pub termination_protection_enabled: bool,
+    pub tags: Vec<Tag>,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+    pub home_region: String,
+    /// Set by `StartDashboardRefresh`, which is not implemented yet, so a dashboard
+    /// has never been refreshed.
+    pub last_refresh_id: Option<String>,
+    /// See [`DashboardRecord::last_refresh_id`].
+    pub last_refresh_failure_reason: Option<String>,
+}
+
+impl DashboardRecord {
+    /// Materialise the `CREATING` -> `CREATED` transition the clock already owes.
+    ///
+    /// A reporting operation may call this: the transition was due at `settles_at`
+    /// whether or not anybody read the dashboard, so applying it changes nothing a
+    /// later caller would otherwise have seen.
+    pub fn settle(&mut self, now: SystemTime) {
+        if self.status == DASHBOARD_STATUS_CREATING && now >= self.settles_at {
+            self.status = DASHBOARD_STATUS_CREATED.to_string();
+        }
+    }
+
+    /// Whether this is the CloudTrail-managed Highlights dashboard.
+    pub fn is_managed(&self) -> bool {
+        self.dashboard_type == DASHBOARD_TYPE_MANAGED
+    }
+}
+
+/// A caller-supplied dashboard identifier, in either of the two forms the model
+/// documents for `GetDashboardRequest$DashboardId` ("The name or ARN for the
+/// dashboard").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DashboardIdentifier {
+    /// A bare dashboard name, which names a dashboard in the caller's own Region.
+    Name(String),
+    /// A dashboard ARN, which also names the Region the dashboard lives in.
+    Arn { region: String, name: String },
+}
+
+impl DashboardIdentifier {
+    /// The dashboard name this identifier names — the registry's key.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Name(name) => name,
+            Self::Arn { name, .. } => name,
+        }
+    }
+
+    /// The Region this identifier pins the dashboard to, if it pins one.
+    pub fn region(&self) -> Option<&str> {
+        match self {
+            Self::Name(_) => None,
+            Self::Arn { region, .. } => Some(region),
+        }
+    }
+}
+
+/// The ARN of the dashboard called `name` in `region`.
+pub fn dashboard_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(
+        SERVICE_NAMESPACE,
+        region,
+        &format!("{DASHBOARD_RESOURCE_PREFIX}{name}"),
+    )
+}
+
+/// Whether `name` satisfies the modelled `DashboardName` constraints: between
+/// [`DASHBOARD_NAME_MIN_LEN`] and [`DASHBOARD_NAME_MAX_LEN`] characters of
+/// `^[a-zA-Z0-9_\-]+$`.
+pub fn is_valid_dashboard_name(name: &str) -> bool {
+    let length = name.chars().count();
+    (DASHBOARD_NAME_MIN_LEN..=DASHBOARD_NAME_MAX_LEN).contains(&length)
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Read a caller-supplied dashboard identifier as either a dashboard ARN or a bare
+/// dashboard name. `None` is an identifier that can name no dashboard at all.
+///
+/// A value that starts with `arn:` is read as an ARN — the modelled `DashboardArn`
+/// pattern admits both forms — and anything else as a bare name.
+pub fn parse_dashboard_identifier(value: &str) -> Option<DashboardIdentifier> {
+    if let Some(rest) = value.strip_prefix("arn:") {
+        let fields: Vec<&str> = rest.split(':').collect();
+        let [partition, service, region, account, resource] = fields.as_slice() else {
+            return None;
+        };
+        if partition.is_empty()
+            || *service != SERVICE_NAMESPACE
+            || region.is_empty()
+            || account.is_empty()
+        {
+            return None;
+        }
+        let name = resource.strip_prefix(DASHBOARD_RESOURCE_PREFIX)?;
+        if !is_valid_dashboard_name(name) {
+            return None;
+        }
+        return Some(DashboardIdentifier::Arn {
+            region: (*region).to_string(),
+            name: name.to_string(),
+        });
+    }
+    if !is_valid_dashboard_name(value) {
+        return None;
+    }
+    Some(DashboardIdentifier::Name(value.to_string()))
+}
+
+/// Check a caller-supplied refresh schedule against the frequencies the model
+/// documents, and hand back the schedule as it will be STORED — which is the request's
+/// own schedule with `TimeOfDay` defaulted to [`DEFAULT_REFRESH_TIME_OF_DAY`].
+///
+/// `Err` carries the refusal text, built from the request so a caller can fix it from
+/// the message alone. Every dashboard operation that takes a `RefreshSchedule` applies
+/// this, so the create and the update paths cannot drift.
+pub fn normalize_refresh_schedule(schedule: &RefreshSchedule) -> Result<RefreshSchedule, String> {
+    let time_of_day = schedule
+        .time_of_day
+        .clone()
+        .unwrap_or_else(|| DEFAULT_REFRESH_TIME_OF_DAY.to_string());
+    // The modelled pattern `^[0-9]{2}:[0-9]{2}$` fixes the shape; what it cannot say
+    // is that the two fields are a UTC time of day.
+    let (hours, minutes) = time_of_day
+        .split_once(':')
+        .ok_or_else(|| time_of_day_rejection(&time_of_day))?;
+    let valid_time = match (hours.parse::<u32>(), minutes.parse::<u32>()) {
+        (Ok(hours), Ok(minutes)) => hours < 24 && minutes < 60,
+        _ => false,
+    };
+    if !valid_time {
+        return Err(time_of_day_rejection(&time_of_day));
+    }
+
+    if let Some(frequency) = schedule.frequency.as_ref() {
+        let (Some(unit), Some(value)) = (frequency.unit.as_deref(), frequency.value) else {
+            return Err(
+                "RefreshSchedule.Frequency must carry both Unit and Value: a refresh \
+                 frequency is a unit and a value together"
+                    .to_string(),
+            );
+        };
+        let valid_value = match unit {
+            REFRESH_FREQUENCY_UNIT_HOURS => REFRESH_FREQUENCY_HOURS_VALUES.contains(&value),
+            REFRESH_FREQUENCY_UNIT_DAYS => value == REFRESH_FREQUENCY_DAYS_VALUE,
+            // `RefreshScheduleFrequencyUnit` is a modelled enum, so the boundary
+            // validator has already refused anything else.
+            _ => false,
+        };
+        if !valid_value {
+            return Err(format!(
+                "RefreshSchedule.Frequency.Value {value} is not valid for Unit {unit}: the \
+                 valid values are {:?} for {REFRESH_FREQUENCY_UNIT_HOURS} and \
+                 {REFRESH_FREQUENCY_DAYS_VALUE} for {REFRESH_FREQUENCY_UNIT_DAYS}",
+                REFRESH_FREQUENCY_HOURS_VALUES
+            ));
+        }
+    }
+
+    Ok(RefreshSchedule {
+        frequency: schedule.frequency.clone(),
+        status: schedule.status.clone(),
+        time_of_day: Some(time_of_day),
+    })
+}
+
+/// The refusal text for a `TimeOfDay` that is not a UTC time of day.
+fn time_of_day_rejection(time_of_day: &str) -> String {
+    format!(
+        "RefreshSchedule.TimeOfDay '{time_of_day}' is not valid: the time of day is UTC \
+         HH:MM, with HH between 00 and 23 and MM between 00 and 59"
+    )
+}
+
+/// Whether `schedule` is the one the Highlights dashboard requires: enabled, and
+/// refreshing every [`HIGHLIGHTS_REFRESH_FREQUENCY_VALUE`] hours.
+pub fn is_highlights_refresh_schedule(schedule: &RefreshSchedule) -> bool {
+    let enabled = schedule.status.as_deref() == Some(REFRESH_SCHEDULE_ENABLED);
+    let frequency = schedule.frequency.as_ref().is_some_and(|frequency| {
+        frequency.unit.as_deref() == Some(REFRESH_FREQUENCY_UNIT_HOURS)
+            && frequency.value == Some(HIGHLIGHTS_REFRESH_FREQUENCY_VALUE)
+    });
+    enabled && frequency
+}
+
+/// Project a requested widget onto the modelled `Widget` shape, as a dashboard
+/// reports it back.
+///
+/// `QueryAlias` names a CloudTrail-managed query; a widget the caller composed
+/// carries its own `QueryStatement` instead, so no alias is minted for it.
+pub fn request_widget_to_widget(widget: RequestWidget) -> Widget {
+    Widget {
+        query_alias: None,
+        query_statement: Some(widget.query_statement),
+        query_parameters: widget.query_parameters,
+        view_properties: Some(widget.view_properties),
+    }
+}
+
+impl ComAmazonawsCloudtrailCloudtrail20131101State {
+    /// The registry key a caller-supplied dashboard identifier addresses: the
+    /// dashboard of that name in the Region the identifier pins — the ARN's own
+    /// Region, or, for a bare name, the Region the call was made in.
+    ///
+    /// `None` is an identifier that can name no dashboard at all.
+    pub fn addressed_dashboard_key(
+        &self,
+        identifier: &str,
+        request_region: &str,
+    ) -> Option<DashboardKey> {
+        let parsed = parse_dashboard_identifier(identifier)?;
+        Some((
+            parsed.name().to_string(),
+            parsed.region().unwrap_or(request_region).to_string(),
+        ))
+    }
+
+    /// Resolve a caller-supplied dashboard identifier to the stored dashboard,
+    /// materialising the transition its clock already owes.
+    pub fn resolve_dashboard_mut(
+        &mut self,
+        identifier: &str,
+        request_region: &str,
+        now: SystemTime,
+    ) -> Option<&mut DashboardRecord> {
+        let key = self.addressed_dashboard_key(identifier, request_region)?;
+        let record = self.dashboards.get_mut(&key)?;
+        record.settle(now);
+        Some(record)
     }
 }
 
