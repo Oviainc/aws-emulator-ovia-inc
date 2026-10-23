@@ -21,26 +21,26 @@ use crate::wire::{call, error_code, error_message, medialive};
 /// `MultiplexProgramSettings` reaches (`smithy_query(query="shape",
 /// shape="PreferredChannelPipeline")`: CURRENTLY_ACTIVE | PIPELINE_0 |
 /// PIPELINE_1).
-const PREFERRED_CHANNEL_PIPELINES: [&str; 3] = ["CURRENTLY_ACTIVE", "PIPELINE_0", "PIPELINE_1"];
+pub(crate) const PREFERRED_CHANNEL_PIPELINES: [&str; 3] = ["CURRENTLY_ACTIVE", "PIPELINE_0", "PIPELINE_1"];
 
 /// The published bounds of `MultiplexProgramSettings$ProgramNumber`, from its
 /// target shape `__integerMin0Max65535` (`smithy_query(query="shape",
 /// shape="MultiplexProgramSettings")`).
-const PROGRAM_NUMBER: (i64, i64) = (0, 65_535);
+pub(crate) const PROGRAM_NUMBER: (i64, i64) = (0, 65_535);
 
 /// The published bounds of `MultiplexVideoSettings$ConstantBitrate` and of both
 /// `MultiplexStatmuxVideoSettings` bitrates, from the shape all three target,
 /// `__integerMin100000Max100000000`.
-const VIDEO_BITRATE: (i64, i64) = (100_000, 100_000_000);
+pub(crate) const VIDEO_BITRATE: (i64, i64) = (100_000, 100_000_000);
 
 /// The published bounds of `MultiplexStatmuxVideoSettings$Priority`, from its
 /// target shape `__integerMinNegative5Max5`.
-const STATMUX_PRIORITY: (i64, i64) = (-5, 5);
+pub(crate) const STATMUX_PRIORITY: (i64, i64) = (-5, 5);
 
 /// Every ranged member a `MultiplexProgramSettings` reaches, by the wire path
 /// the refusal names it at, with the inclusive bounds the model publishes for
 /// it — the whole class the range rule covers.
-const RANGED_PROGRAM_SETTINGS: [(&str, (i64, i64)); 5] = [
+pub(crate) const RANGED_PROGRAM_SETTINGS: [(&str, (i64, i64)); 5] = [
     ("programNumber", PROGRAM_NUMBER),
     ("videoSettings.constantBitrate", VIDEO_BITRATE),
     ("videoSettings.statmuxSettings.maximumBitrate", VIDEO_BITRATE),
@@ -57,7 +57,7 @@ pub(crate) fn program_settings(program_number: i64) -> Value {
 /// `settings` with the member at the dot-separated wire `path` set to `value`,
 /// creating the nested objects that path needs — so a table row names a member
 /// exactly as the refusal does.
-fn with_member(mut settings: Value, path: &str, value: i64) -> Value {
+pub(crate) fn with_member(mut settings: Value, path: &str, value: i64) -> Value {
     let segments: Vec<&str> = path.split('.').collect();
     let (last, parents) = segments.split_last().expect("a non-empty member path");
     let mut cursor = &mut settings;
@@ -115,7 +115,7 @@ pub(crate) async fn create_program(
 
 /// `DescribeMultiplexProgram`: its status and body. The description is the
 /// response itself, not a wrapper member.
-async fn describe_program(
+pub(crate) async fn describe_program(
     router: &MultiServiceRouter,
     multiplex_id: &str,
     program_name: &str,

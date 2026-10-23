@@ -59,6 +59,9 @@ mod input_update;
 #[path = "all/multiplex_lifecycle.rs"]
 mod multiplex_lifecycle;
 
+#[path = "all/multiplex_program_update.rs"]
+mod multiplex_program_update;
+
 #[path = "all/multiplex_programs.rs"]
 mod multiplex_programs;
 
