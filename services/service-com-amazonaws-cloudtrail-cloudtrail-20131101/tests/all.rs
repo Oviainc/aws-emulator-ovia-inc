@@ -35,6 +35,8 @@ mod import_list;
 mod import_reads;
 #[path = "all/import_stop.rs"]
 mod import_stop;
+#[path = "all/insight_selectors.rs"]
+mod insight_selectors;
 #[path = "all/insights_metric_data.rs"]
 mod insights_metric_data;
 #[path = "all/lake_queries.rs"]

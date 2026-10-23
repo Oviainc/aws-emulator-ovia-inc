@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetInsightSelectors
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetInsightSelectors`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetInsightSelectors::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the Insights selectors configured on ONE resource. `TrailName` and
+//! `EventDataStore` name resources of different kinds and are both optional in the
+//! model, so exactly one of them addresses the call
+//! ([`crate::state::event_configuration_target`]) — the same pair rule
+//! `PutInsightSelectors` reads.
+//!
+//! The answer is the STORED configuration, so it is exactly what the last
+//! `PutInsightSelectors` wrote; a resource whose stored statement is empty has Insights
+//! event logging off, which "throws the exception InsightNotEnabledException". Reading
+//! changes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -202,18 +204,160 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetInsightSelectors` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetInsightSelectorsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetInsightSelectors"))
+        let region = crate::state::request_region(ctx.parts());
+
+        // Which resource this call reports on. Read BEFORE the registry is reached: a
+        // request that addresses no single resource is refused whatever the registry
+        // holds.
+        let target = crate::state::event_configuration_target(
+            input.trail_name.as_deref(),
+            input.event_data_store.as_deref(),
+        )
+        .map_err(|rejection| {
+            GetInsightSelectorsErrorModeled::InvalidParameterCombinationException(
+                InvalidParameterCombinationException {
+                    message: Some(rejection.message()),
+                },
+            )
+        })?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetInsightSelectorsErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "GetInsightSelectors needs the CloudTrail trail and event data store \
+                         registries, which this engine does not carry"
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+        let store = state.lock();
+
+        match target {
+            crate::state::EventConfigurationTarget::Trail(identifier) => {
+                report_trail(&store, &identifier, &region)
+            }
+            crate::state::EventConfigurationTarget::EventDataStore(identifier) => {
+                report_event_data_store(&store, &identifier, &region)
+            }
+        }
     }
+}
+
+/// `InsightNotEnabledException` (HTTP 400): "If you run GetInsightSelectors on a trail
+/// or event data store that does not have Insights events enabled, the operation throws
+/// the exception InsightNotEnabledException."
+fn insight_not_enabled(resource: &str) -> GetInsightSelectorsError {
+    GetInsightSelectorsErrorModeled::InsightNotEnabledException(InsightNotEnabledException {
+        message: Some(format!(
+            "Insights event logging is not enabled on {resource}: enable it with \
+             PutInsightSelectors."
+        )),
+    })
+    .into()
+}
+
+/// Report the Insights selectors configured on the trail `identifier` names.
+///
+/// The identifier is a bare trail name or a trail ARN; a malformed one is refused as
+/// whichever form it was written in. Reading selectors does not change the trail, so it
+/// is resolved the way the other reads resolve it — which is also why a shadow trail's
+/// configuration is readable by ARN from another Region.
+fn report_trail(
+    store: &crate::state::ComAmazonawsCloudtrailCloudtrail20131101State,
+    identifier: &str,
+    region: &str,
+) -> Result<GetInsightSelectorsOutput, GetInsightSelectorsError> {
+    let record = store
+        .resolve(identifier, region)
+        .map_err(|rejection| match rejection {
+            crate::state::IdentifierRejection::InvalidArn(message) => {
+                GetInsightSelectorsErrorModeled::CloudTrailARNInvalidException(
+                    CloudTrailARNInvalidException {
+                        message: Some(message),
+                    },
+                )
+            }
+            crate::state::IdentifierRejection::InvalidName(message) => {
+                GetInsightSelectorsErrorModeled::InvalidTrailNameException(
+                    InvalidTrailNameException {
+                        message: Some(message),
+                    },
+                )
+            }
+        })?
+        .ok_or_else(|| {
+            // The model says 404 for a not-found trail; CloudTrail answers 400
+            // (`crate::state::TRAIL_NOT_FOUND_STATUS`). The recorded response for THIS
+            // operation carries the identifier as the request sent it, plus the account
+            // the lookup ran in (issue
+            // `20261022T230533Z-cloudtrail-getinsightselectors-stub.md`: "Unknown trail:
+            // … for the user: …"), which is [`crate::state::unknown_trail_message`].
+            crate::scaffolded::Scaffolded::modeled_with_status(
+                GetInsightSelectorsErrorModeled::TrailNotFoundException(TrailNotFoundException {
+                    message: Some(crate::state::unknown_trail_message(identifier)),
+                }),
+                crate::state::TRAIL_NOT_FOUND_STATUS,
+            )
+        })?;
+
+    if record.insight_selectors.is_empty() {
+        return Err(insight_not_enabled(&record.trail_arn));
+    }
+    Ok(GetInsightSelectorsOutput {
+        // "The Amazon Resource Name (ARN) of a trail for which you want to get Insights
+        // selectors" — the stored ARN, so a call by bare name and one by ARN report the
+        // same trail.
+        trail_arn: Some(record.trail_arn.clone()),
+        insight_selectors: Some(record.insight_selectors.clone()),
+        // Both members belong to the event data store form: a trail's Insights events
+        // are delivered to the trail itself, not to a destination store.
+        event_data_store_arn: None,
+        insights_destination: None,
+    })
+}
+
+/// Report the Insights selectors configured on the event data store `identifier` names.
+///
+/// The identifier is an ARN or the bare id suffix of one, and a store is reachable only
+/// from the Region it lives in. This operation's model declares neither
+/// `EventDataStoreARNInvalidException` nor `EventDataStoreNotFoundException`, so an
+/// unreadable identifier is the modelled `CloudTrailARNInvalidException` — whose doc
+/// gives the event data store ARN format — and a readable one naming no store is
+/// `InvalidParameterException` ("The request includes a parameter that is not valid").
+fn report_event_data_store(
+    store: &crate::state::ComAmazonawsCloudtrailCloudtrail20131101State,
+    identifier: &str,
+    region: &str,
+) -> Result<GetInsightSelectorsOutput, GetInsightSelectorsError> {
+    let parsed = crate::state::parse_event_data_store_identifier(identifier).map_err(|rejection| {
+        GetInsightSelectorsErrorModeled::CloudTrailARNInvalidException(
+            CloudTrailARNInvalidException {
+                message: Some(rejection.message(region)),
+            },
+        )
+    })?;
+    let addressed_arn = parsed.arn(region);
+    let record = store
+        .addressed_event_data_store(&parsed, region)
+        .ok_or_else(|| {
+            GetInsightSelectorsErrorModeled::InvalidParameterException(InvalidParameterException {
+                message: Some(format!(
+                    "EventDataStore {addressed_arn} does not name an event data store."
+                )),
+            })
+        })?;
+
+    if record.insight_selectors.is_empty() {
+        return Err(insight_not_enabled(&record.arn()));
+    }
+    Ok(GetInsightSelectorsOutput {
+        trail_arn: None,
+        insight_selectors: Some(record.insight_selectors.clone()),
+        // "The ARN of the source event data store that enabled Insights events" and
+        // "The ARN of the destination event data store that logs Insights events".
+        event_data_store_arn: Some(record.arn()),
+        insights_destination: record.insights_destination.clone(),
+    })
 }

@@ -506,7 +506,19 @@ pub struct ImportNotFoundException {
     pub message: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.cloudtrail#InsightSelector")]
+// `skip_validation = ["InsightType"]`: the member targets the modelled `InsightType`
+// enum, and CloudTrail does NOT answer a value outside that set with the boundary's
+// generic `ValidationException` — "For PutInsightSelectors, this exception is thrown
+// when … the specified InsightType in the InsightSelectors statement is not valid"
+// names `InvalidInsightSelectorsException`, the modelled shape, whose `Message` member
+// is what a client reads. A boundary refusal can carry neither that shape nor that
+// member, so the value set is kept off the generated schema and
+// `put_insight_selectors` enforces it itself. `EventCategories` keeps its own enum
+// trait: nothing records CloudTrail answering that one with a shape of its own.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.cloudtrail#InsightSelector",
+    skip_validation = ["InsightType"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct InsightSelector {
     pub insight_type: Option<String>,
