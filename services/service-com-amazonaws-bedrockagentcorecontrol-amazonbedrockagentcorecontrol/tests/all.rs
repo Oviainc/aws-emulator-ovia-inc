@@ -17,6 +17,8 @@ mod agent_runtime_lifecycle;
 mod gateway_lifecycle;
 #[path = "all/gateway_wire_shape.rs"]
 mod gateway_wire_shape;
+#[path = "all/harness_lifecycle.rs"]
+mod harness_lifecycle;
 #[path = "all/memory_lifecycle.rs"]
 mod memory_lifecycle;
 #[path = "all/service_claim.rs"]
