@@ -269,11 +269,14 @@ async fn every_change_this_service_makes_is_reported_as_an_event() {
             steps: &[
                 Step::Cluster("evt-modify", &[]),
                 Step::Settle,
+                // A member the modelled `PendingModifiedValues` carries is work
+                // ElastiCache does asynchronously, so an immediate one leaves
+                // the cluster transient and the clock owes it `available`.
                 Step::Modify(
                     "evt-modify",
                     &[
                         ("ApplyImmediately", "true"),
-                        ("PreferredMaintenanceWindow", "tue:05:00-tue:06:00"),
+                        ("CacheNodeType", "cache.m7g.large"),
                     ],
                 ),
                 Step::Settle,
@@ -291,6 +294,34 @@ async fn every_change_this_service_makes_is_reported_as_an_event() {
                     "evt-modify",
                     "Cache cluster status changed from modifying to available",
                 ),
+            ],
+        },
+        Scenario {
+            name: "an immediate settings modify records the change and no transition",
+            steps: &[
+                Step::Cluster("evt-settings", &[]),
+                Step::Settle,
+                // A change confined to the members `PendingModifiedValues` does
+                // NOT carry is applied synchronously, so the cluster never
+                // leaves `available` and there is no transition to record: the
+                // applied value and a usable cluster become visible together.
+                Step::Modify(
+                    "evt-settings",
+                    &[
+                        ("ApplyImmediately", "true"),
+                        ("PreferredMaintenanceWindow", "tue:05:00-tue:06:00"),
+                    ],
+                ),
+                Step::Settle,
+            ],
+            expected: &[
+                ("cache-cluster", "evt-settings", "Cache cluster created"),
+                (
+                    "cache-cluster",
+                    "evt-settings",
+                    "Cache cluster status changed from creating to available",
+                ),
+                ("cache-cluster", "evt-settings", "Cache cluster modified"),
             ],
         },
         Scenario {

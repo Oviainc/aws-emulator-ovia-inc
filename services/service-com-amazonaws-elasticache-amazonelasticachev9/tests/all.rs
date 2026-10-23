@@ -43,6 +43,8 @@ mod snapshot_copies;
 mod snapshots;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_actions.rs"]
+mod update_actions;
 
 // Declared after the list above rather than inside it: suites land in this file
 // concurrently, and every insertion into the sorted run collides with another

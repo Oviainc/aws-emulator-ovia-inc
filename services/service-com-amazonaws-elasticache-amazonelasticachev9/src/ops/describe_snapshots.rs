@@ -210,29 +210,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `SnapshotSource` selects by how a snapshot came about: "If set to
         // system, the output shows snapshots that were automatically created by
         // ElastiCache. If set to user the output shows snapshots that were
-        // manually created. If omitted, the output shows both" — and the filter
-        // is matched against the stored source, which `Snapshot$SnapshotSource`
-        // reports under its own spellings (`automated` / `manual`).
+        // manually created. If omitted, the output shows both". The member
+        // carries no modelled enum, and a snapshot reports its own source under
+        // the other pair of spellings (`automated` / `manual`), so both name
+        // the same source and only a value in neither vocabulary is refused —
+        // see `crate::state::snapshot_source_filter`.
         let source_filter = match input.snapshot_source.as_deref() {
             None => None,
-            Some(crate::state::SNAPSHOT_SOURCE_FILTER_SYSTEM) => {
-                Some(crate::state::SNAPSHOT_SOURCE_AUTOMATED)
-            }
-            Some(crate::state::SNAPSHOT_SOURCE_FILTER_USER) => {
-                Some(crate::state::SNAPSHOT_SOURCE_MANUAL)
-            }
-            Some(other) => {
-                return Err(DescribeSnapshotsErrorModeled::InvalidParameterValueException(
-                    InvalidParameterValueException {
-                        message: Some(format!(
-                            "Invalid value {other} for SnapshotSource: must be {} or {}.",
-                            crate::state::SNAPSHOT_SOURCE_FILTER_SYSTEM,
-                            crate::state::SNAPSHOT_SOURCE_FILTER_USER
-                        )),
-                    },
-                )
-                .into())
-            }
+            Some(value) => match crate::state::snapshot_source_filter(value) {
+                Ok(source) => Some(source),
+                Err(message) => {
+                    return Err(DescribeSnapshotsErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(message),
+                        },
+                    )
+                    .into())
+                }
+            },
         };
         // `ShowNodeGroupConfig`: "A Boolean value which if true, the node group
         // (shard) configuration is included in the snapshot description", so it
@@ -269,30 +264,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
         // `SnapshotName`: "If this parameter is specified, only this snapshot
-        // are described" — and a name the store does not hold is the modelled
-        // not-found rather than an empty page. The stored name is the lowercased
-        // one, so the lookup lowercases too.
-        let name_filter = match input.snapshot_name.as_deref() {
-            Some(name) => {
-                let key = name.to_ascii_lowercase();
-                if !store.snapshots.contains_key(&key) {
-                    return Err(DescribeSnapshotsErrorModeled::SnapshotNotFoundFault(
-                        SnapshotNotFoundFault {
-                            message: Some(format!("Snapshot {name} not found.")),
-                        },
-                    )
-                    .into());
-                }
-                Some(key)
-            }
-            None => None,
-        };
+        // are described" — the member NARROWS the page. A snapshot name is not
+        // a resource this reporting operation acts on, so a name the store does
+        // not hold selects no record and the answer is an empty page; the
+        // modelled `SnapshotNotFoundFault` is what the operations that DO act
+        // on a named snapshot (`CopySnapshot`, `DeleteSnapshot`) answer. The
+        // stored name is the lowercased one, so the filter lowercases too.
+        let name_filter = input.snapshot_name.as_deref().map(str::to_ascii_lowercase);
         // `ReplicationGroupId` selects "only snapshots associated with that
-        // specific replication group". No stored snapshot has one — every
-        // replication-group operation is a scaffolded 501, so no group can be
-        // snapshotted — and this operation models no not-found for a group, so
-        // the id filters the stored value rather than refusing the request, and
-        // it keeps working when that slice lands.
+        // specific replication group". This operation models no not-found for a
+        // group, so the id filters the stored value rather than refusing the
+        // request: a group this account does not hold simply owns no snapshot,
+        // and a group it does hold reports the snapshots stored against it.
         let group_filter = input.replication_group_id.as_deref();
 
         let mut page: Vec<Snapshot> = Vec::new();
