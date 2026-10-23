@@ -15,6 +15,8 @@
 mod client_rejections;
 #[path = "all/client_token_store.rs"]
 mod client_token_store;
+#[path = "all/custom_detection_rules.rs"]
+mod custom_detection_rules;
 #[path = "all/detector_data_sources_projection.rs"]
 mod detector_data_sources_projection;
 #[path = "all/detector_lifecycle.rs"]
