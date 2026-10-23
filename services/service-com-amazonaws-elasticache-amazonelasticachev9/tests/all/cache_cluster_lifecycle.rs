@@ -160,9 +160,6 @@ fn form_encode(value: &str) -> String {
 /// `pub(crate)` for the same reason as [`Reply`]: one harness per test target.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
-    /// The one engine the mounted service keeps its state in — the same handle
-    /// `router/src/lib.rs` hands every service.
-    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -173,18 +170,8 @@ impl Emulator {
         // by the SigV4 credential scope below, which is also where an ARN's
         // region comes from.
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(Arc::clone(&engine)));
-        Self { router, engine }
-    }
-
-    /// The store this emulator's service reads and writes — for a suite that has
-    /// to put a record in the store that no implemented operation can create
-    /// yet.
-    pub(crate) fn store(
-        &self,
-    ) -> engine::ServiceState<state::ComAmazonawsElasticacheAmazonelasticachev9State> {
-        self.engine
-            .state::<state::ComAmazonawsElasticacheAmazonelasticachev9State>()
+        router.register_service(EmulatedService::new(engine));
+        Self { router }
     }
 
     /// Send one `awsQuery` call: `Action`, `Version` and the given form pairs.
@@ -335,7 +322,8 @@ async fn a_created_cluster_is_read_back_from_persisted_state() {
             port: "6379",
             num_cache_nodes: 1,
             // Redis OSS 6 is the one published family whose version line is
-            // `<major>.x` rather than `<major>`.
+            // `<major>.x` rather than `<major>`
+            // (`state::PARAMETER_GROUP_FAMILIES`).
             parameter_group: "default.redis6.x",
         },
         ClusterCase {
