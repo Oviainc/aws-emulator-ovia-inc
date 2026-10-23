@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRepositorySyncDefinitions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRepositorySyncDefinitions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRepositorySyncDefinitions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +148,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRepositorySyncDefinitions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRepositorySyncDefinitionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRepositorySyncDefinitions"))
+        // A pure report over the stored sync configurations of one repository link: a
+        // `RepositorySyncDefinition` is, in the shape's own words, "the definition for a
+        // repository with a sync configuration", so each one is projected from a stored
+        // configuration of that link and sync type.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListRepositorySyncDefinitionsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "The CodeConnections resource store is unavailable. Try again."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let store = state.lock();
+        // The report is "the sync definitions OF a repository link", so the link id is
+        // RESOLVED against the repository-link store first: a well-formed id naming no
+        // link is not the same answer as "this link syncs nothing". A link id that
+        // resolves to nothing makes THIS request invalid rather than naming a missing
+        // report, so it is refused with the modeled `InvalidInputException` (400) and the
+        // request-built message every other operation of this service that resolves a
+        // repository link applies (`GetRepositorySyncStatus`, `ListSyncConfigurations`,
+        // `CreateSyncConfiguration`).
+        if !store.repository_links.contains_key(&input.repository_link_id) {
+            return Err(
+                ListRepositorySyncDefinitionsErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(format!(
+                            "Repository Link with id {} was not found",
+                            input.repository_link_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Walked in `(SyncType, ResourceName)` key order; with the sync type fixed by the
+        // request that is `ResourceName` order, so the report has one total, stable order.
+        let repository_sync_definitions: Vec<RepositorySyncDefinition> = store
+            .sync_configurations
+            .values()
+            .filter(|configuration| {
+                configuration.sync_type == input.sync_type
+                    && configuration.repository_link_id == input.repository_link_id
+            })
+            .map(|configuration| configuration.to_sync_definition())
+            .collect();
+
+        Ok(ListRepositorySyncDefinitionsOutput {
+            repository_sync_definitions,
+            // This operation's input models NEITHER a `NextToken` NOR a `MaxResults`
+            // member (`smithy_query(query="operation",
+            // operation="ListRepositorySyncDefinitions")`), so no caller can resume a
+            // position and no caller asks for a page size: the whole selection is the
+            // response, and a token would name a position nothing could ever supply.
+            // That is why this report does not go through `state::page_of`, which the
+            // service's token-carrying reports share.
+            next_token: None,
+        })
     }
 }

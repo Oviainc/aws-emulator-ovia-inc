@@ -19,6 +19,8 @@ mod connection_lifecycle;
 mod git_sync;
 #[path = "all/host_association.rs"]
 mod host_association;
+#[path = "all/list_repository_sync_definitions.rs"]
+mod list_repository_sync_definitions;
 #[path = "all/list_sync_configurations.rs"]
 mod list_sync_configurations;
 #[path = "all/modeled_input_refusals.rs"]

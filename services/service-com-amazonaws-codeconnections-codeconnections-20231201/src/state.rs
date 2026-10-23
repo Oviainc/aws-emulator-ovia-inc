@@ -8,8 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    Connection, Host, RepositoryLinkInfo, ResourceSyncAttempt, Revision, SyncBlocker,
-    SyncBlockerContext, SyncBlockerSummary, SyncConfiguration, Tag, VpcConfiguration,
+    Connection, Host, RepositoryLinkInfo, RepositorySyncDefinition, ResourceSyncAttempt, Revision,
+    SyncBlocker, SyncBlockerContext, SyncBlockerSummary, SyncConfiguration, Tag, VpcConfiguration,
 };
 
 /// The region an ARN carries when the request is unsigned, so no SigV4 credential
@@ -242,6 +242,34 @@ impl StoredSyncConfiguration {
             publish_deployment_status: self.publish_deployment_status.clone(),
             trigger_resource_update_on: self.trigger_resource_update_on.clone(),
             pull_request_comment: self.pull_request_comment.clone(),
+        }
+    }
+
+    /// Render the stored row as the modeled `RepositorySyncDefinition` structure: the
+    /// definition of the repository branch this configuration syncs, which is what
+    /// `ListRepositorySyncDefinitions` reports.
+    ///
+    /// Every member is read off the SAME stored row `to_modeled` renders, so the two
+    /// reports of one configuration can never disagree:
+    ///
+    /// * `Branch` is the configuration's branch — the `RepositorySyncDefinition` shape's
+    ///   own documentation calls it "the branch specified for a repository sync
+    ///   definition".
+    /// * `Directory` is the configuration's config file: "This value comes from creating
+    ///   or updating the `config-file` field of a `sync-configuration`". The member is
+    ///   modeled required while `SyncConfiguration.ConfigFile` is optional, so a
+    ///   configuration created without one reports the empty string rather than a value
+    ///   nothing supplied.
+    /// * `Parent` and `Target` are the synced resource, and they are EQUAL: the `Target`
+    ///   member's documentation says "In some cases, such as CFN_STACK_SYNC, the parent
+    ///   and target resource are the same", and `CFN_STACK_SYNC` is the only value the
+    ///   modeled `SyncConfigurationType` enum admits.
+    pub fn to_sync_definition(&self) -> RepositorySyncDefinition {
+        RepositorySyncDefinition {
+            branch: self.branch.clone(),
+            directory: self.config_file.clone().unwrap_or_default(),
+            parent: self.resource_name.clone(),
+            target: self.resource_name.clone(),
         }
     }
 }
