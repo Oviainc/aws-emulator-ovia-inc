@@ -24,7 +24,8 @@ tracing = { workspace = true }
 # Secret version ids are UUIDs (SecretVersionIdType, len 32..64), and the six
 # random characters that end a secret's ARN are drawn from a random UUID too.
 uuid = { version = "1", features = ["v4"] }
-# Hex-encodes the ListSecrets pagination cursor into an opaque NextToken.
+# Hex-encodes a pagination cursor (ListSecrets, ListSecretVersionIds) into an
+# opaque NextToken.
 hex = { workspace = true }
 
 [build-dependencies]

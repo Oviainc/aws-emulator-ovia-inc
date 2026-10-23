@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSecretVersionIds
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSecretVersionIds`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSecretVersionIds::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the versions one secret holds, in the order they were created, paged
+//! by `MaxResults`/`NextToken`. A version carrying no staging label is deprecated
+//! and is left out unless `IncludeDeprecated` asks for it. This is a REPORTING
+//! operation: the only write it performs is dropping secrets whose recovery
+//! window has already elapsed, which the clock made due whether or not anybody
+//! called.
 //!
 //! ## Shape of an operation
 //!
@@ -166,20 +164,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSecretVersionIds` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSecretVersionIdsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSecretVersionIds"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        let mut store = state.lock();
+        // The only write a read performs: dropping secrets whose recovery window
+        // has already elapsed, which the clock made due whether or not anybody
+        // called.
+        store.expire_due(::std::time::SystemTime::now());
+
+        let Some(secret) = store.get(&input.secret_id) else {
+            return Err(ListSecretVersionIdsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Secrets Manager can't find the specified secret: {}",
+                        input.secret_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "Specifies whether to include versions of secrets that don't have any
+        // staging labels attached to them. Versions without staging labels are
+        // considered deprecated ... By default, versions without staging labels
+        // aren't included." (`ListSecretVersionIdsRequest$IncludeDeprecated`,
+        // this service's Smithy model.)
+        let include_deprecated = input.include_deprecated.unwrap_or(false);
+        let listed: Vec<&crate::state::SecretVersion> = secret
+            .versions
+            .iter()
+            .filter(|version| include_deprecated || !version.version_stages.is_empty())
+            .collect();
+
+        // The cursor names the first version of the page to return, so the next
+        // page resumes exactly where the previous one ended. A token this service
+        // did not mint, or one naming a version this listing does not hold, is
+        // the modelled `InvalidNextTokenException`.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let resume = crate::state::decode_next_token(token).and_then(|version_id| {
+                    listed
+                        .iter()
+                        .position(|version| version.version_id == version_id)
+                });
+                match resume {
+                    Some(index) => index,
+                    None => {
+                        return Err(
+                            ListSecretVersionIdsErrorModeled::InvalidNextTokenException(
+                                InvalidNextTokenException {
+                                    message: Some(
+                                        "The NextToken you provided is not valid for this \
+                                         request."
+                                            .to_string(),
+                                    ),
+                                },
+                            )
+                            .into(),
+                        );
+                    }
+                }
+            }
+        };
+        // `MaxResults` is "the number of results to include in the response";
+        // absent, the whole remainder is one page. `MaxResultsType` is modelled
+        // with a range of 1..100, so the boundary has already refused 0 — the
+        // floor of 1 keeps a page non-empty whatever reaches here, since an
+        // empty page beside a `NextToken` would never terminate for a client.
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(listed.len())
+            .max(1);
+        let page: Vec<&crate::state::SecretVersion> =
+            listed.iter().skip(start).take(page_size).copied().collect();
+        let next_token = listed
+            .get(start + page.len())
+            .map(|version| crate::state::encode_next_token(&version.version_id));
+
+        Ok(ListSecretVersionIdsOutput {
+            arn: Some(secret.arn.clone()),
+            name: Some(secret.name.clone()),
+            versions: Some(
+                page.into_iter()
+                    .map(|version| entry_for(secret, version))
+                    .collect(),
+            ),
+            next_token,
+        })
     }
+}
+
+/// One `SecretVersionsListEntry`, built from the stored version.
+fn entry_for(
+    secret: &crate::state::Secret,
+    version: &crate::state::SecretVersion,
+) -> SecretVersionsListEntry {
+    SecretVersionsListEntry {
+        version_id: Some(version.version_id.clone()),
+        // `SecretVersionStagesType` is modelled with a minimum length of 1, so a
+        // deprecated version reports no list rather than an empty one.
+        version_stages: version.stages_out(),
+        created_date: Some(crate::state::timestamp(version.created_date)),
+        // "The date that this version of the secret was last accessed." No
+        // operation in this emulator records an access, so nothing has ever set
+        // one — the same reason `DescribeSecret` reports no `LastAccessedDate`.
+        last_accessed_date: None,
+        // "The KMS keys used to encrypt the secret version." A version is
+        // encrypted under the key the secret carries, which is the one
+        // `CreateSecret` recorded, in the form the caller gave it; a secret left
+        // on the Amazon-managed key records none and reports none here.
+        kms_key_ids: secret
+            .kms_key_id
+            .clone()
+            .map(|kms_key_id| vec![kms_key_id]),
+    }
+}
+
+/// The modelled server error for a request that cannot reach this service's
+/// store. `service_state` answers `None` only when the engine is not the shared
+/// in-memory one, which is a server-side fault, never a bad request.
+fn state_unavailable() -> ListSecretVersionIdsError {
+    ListSecretVersionIdsErrorModeled::InternalServiceError(InternalServiceError {
+        message: Some("the Secrets Manager emulator's state store is unavailable".to_string()),
+    })
+    .into()
 }

@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/secret_lifecycle.rs"]
 mod secret_lifecycle;
+#[path = "all/secret_version_ids.rs"]
+mod secret_version_ids;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
