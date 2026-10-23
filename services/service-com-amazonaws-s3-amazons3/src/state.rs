@@ -1465,6 +1465,28 @@ pub fn content_md5(body: &[u8]) -> String {
     ::aws_smithy_types::base64::encode(Md5::digest(body))
 }
 
+/// The canonical user id of the one account this emulator serves — what an S3 response
+/// reports as the `Owner$ID` of the account's buckets and objects.
+///
+/// S3 names an owner by its CANONICAL USER ID, not by its account id: "a 64-digit
+/// hexadecimal encoded, 256-bit value" (AWS General Reference, *AWS account identifiers*),
+/// so [`::engine::emulator_account_id`] itself is the wrong shape for the member. This
+/// derives one from that account id by SHA-256, which makes it deterministic (every read
+/// reports the same owner, whatever the clock or the request does), of the documented
+/// shape, and a disclosure of nothing: it is a hash of the canonical placeholder account
+/// `000000000000`.
+///
+/// Service-wide rather than per-operation, because every reader that reports an owner —
+/// `ListBuckets`, and the ACL and object-listing operations when they are implemented —
+/// owes the SAME id for this account.
+pub fn canonical_user_id() -> String {
+    use ::sha2::Digest;
+    let mut digest = ::sha2::Sha256::new();
+    digest.update(::engine::emulator_account_id().as_bytes());
+    // 32 digest bytes render as the 64 lowercase hex digits a canonical user id carries.
+    ::hex::encode(digest.finalize())
+}
+
 /// The version id a write into a versioning-enabled bucket is stored under.
 ///
 /// S3's version ids are OPAQUE: `ObjectVersionId` is a plain string in the model

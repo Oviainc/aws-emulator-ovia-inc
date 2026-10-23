@@ -35,6 +35,8 @@ mod bucket_versioning;
 mod error_message_envelope;
 #[path = "all/head_object_read_back.rs"]
 mod head_object_read_back;
+#[path = "all/list_buckets.rs"]
+mod list_buckets;
 #[path = "all/object_and_policy.rs"]
 mod object_and_policy;
 #[path = "all/object_and_tagging_roundtrip.rs"]

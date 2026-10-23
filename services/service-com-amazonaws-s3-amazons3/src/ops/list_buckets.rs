@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBuckets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListBuckets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListBuckets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports every general purpose bucket this account holds, computed from the bucket map
+//! in [`crate::state`] — the same map `CreateBucket` writes and `HeadBucket` reads — in
+//! bucket-name order, narrowed by the request's `prefix` and `bucket-region` and cut into
+//! pages by `max-buckets` with an opaque continuation token that resumes the next one.
+//! A pure READ: nothing here writes to the store.
 //!
 //! ## Shape of an operation
 //!
@@ -132,6 +129,53 @@ impl From<ListBucketsErrorModeled> for ListBucketsError {
     }
 }
 
+/// The most buckets one page carries when the request names no `max-buckets`.
+///
+/// The documented default: "If you specify the bucket-region, prefix, or
+/// continuation-token query parameters without using max-buckets to set the maximum
+/// number of buckets returned in the response, Amazon S3 applies a default page size of
+/// 10,000 and provides a continuation token if there are more buckets"
+/// (`ListBucketsRequest$ContinuationToken`). It is also the ceiling `MaxBuckets` itself
+/// carries (`range {min 1, max 10000}`) and the account bucket quota
+/// [`crate::state::MAX_BUCKETS_PER_ACCOUNT`], so one default page can name every bucket an
+/// account is allowed to hold — which is what makes an UNPAGINATED `ListBuckets` correct
+/// for this emulator ("Unpaginated ListBuckets requests are only supported for Amazon Web
+/// Services accounts set to the default general purpose bucket quota of 10,000").
+const DEFAULT_PAGE_SIZE: usize = crate::state::MAX_BUCKETS_PER_ACCOUNT;
+
+/// The most buckets one page may carry however large a `max-buckets` asks for
+/// (`MaxBuckets`'s own `range {min 1, max 10000}`,
+/// `smithy_query(query="operation",operation="ListBuckets")`).
+const MAX_BUCKETS_PER_PAGE: i32 = 10_000;
+
+/// The marker a continuation token this operation issued carries, so a token it did not
+/// issue is refused rather than silently read as a cursor.
+///
+/// Distinct from the object-listing marker in [`super::list_objects_v2`]: a token minted
+/// for one listing is not a cursor into the other.
+const CONTINUATION_TOKEN_MARKER: &str = "s3lb1 ";
+
+/// Encode the resume point of a truncated page as the response's `ContinuationToken`.
+///
+/// "ContinuationToken is obfuscated and is not a real bucket"
+/// (`ListBucketsOutput$ContinuationToken`) — hex of a marker plus the first bucket name
+/// NOT returned, so the token a page hands back resumes exactly where it stopped without
+/// storing per-caller cursor state. Obfuscated, NOT confidential: hex is trivially
+/// reversible, and the token is only opaque in the sense that a client must not read a
+/// bucket name out of it or mint one of its own.
+fn encode_continuation_token(first_bucket_not_returned: &str) -> String {
+    hex::encode(format!("{CONTINUATION_TOKEN_MARKER}{first_bucket_not_returned}").as_bytes())
+}
+
+/// The bucket name a `ContinuationToken` resumes at (inclusive), or `None` when the token
+/// is not one this operation issued.
+fn decode_continuation_token(token: &str) -> Option<String> {
+    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    decoded
+        .strip_prefix(CONTINUATION_TOKEN_MARKER)
+        .map(str::to_string)
+}
+
 /// The `ListBuckets` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -166,20 +210,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListBuckets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListBucketsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListBuckets"))
+        // How many buckets this page may carry. `MaxBuckets` is modeled
+        // `range {min 1, max 10000}`, so the boundary validator has already refused
+        // anything outside it; the clamp is what keeps this handler total rather than a
+        // second statement of that bound.
+        let page_limit = match input.max_buckets {
+            Some(requested) => requested.clamp(1, MAX_BUCKETS_PER_PAGE) as usize,
+            None => DEFAULT_PAGE_SIZE,
+        };
+
+        // `Token` is `length {min 0}`, so an EMPTY continuation token is a legal value
+        // that names no cursor — the first page, exactly as if none had been sent.
+        let resume_at = match input.continuation_token.as_deref() {
+            Some(token) if !token.is_empty() => {
+                Some(decode_continuation_token(token).ok_or_else(|| {
+                    crate::scaffolded::Scaffolded::unmodeled(
+                        "InvalidArgument",
+                        400,
+                        "The continuation token provided is incorrect",
+                    )
+                })?)
+            }
+            _ => None,
+        };
+
+        // "BucketRegion indicates the Amazon Web Services region where the bucket is
+        // located. If the request contains at least one valid parameter, it is included
+        // in the response" (`Bucket$BucketRegion`): a bare `ListBuckets` reports each
+        // bucket's name and creation date alone.
+        let reports_region = input.max_buckets.is_some()
+            || input.continuation_token.is_some()
+            || input.prefix.is_some()
+            || input.bucket_region.is_some();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::unmodeled(
+                "InternalError",
+                500,
+                "the shared S3 store is unreachable from this engine",
+            )
+        })?;
+        let store = state.lock();
+
+        let prefix = input.prefix.clone().unwrap_or_default();
+
+        let mut buckets: Vec<Bucket> = Vec::new();
+        let mut next_continuation_token: Option<String> = None;
+
+        // `state::buckets()` walks the store's `BTreeMap`, so this is already in
+        // ascending bucket-name order and a page's resume point is simply the next name
+        // in it.
+        for (name, bucket) in store.buckets() {
+            // "Limits the response to bucket names that begin with the specified bucket
+            // name prefix" (`ListBucketsRequest$Prefix`).
+            if !name.starts_with(&prefix) {
+                continue;
+            }
+            // "Limits the response to buckets that are located in the specified Amazon
+            // Web Services Region" (`ListBucketsRequest$BucketRegion`), compared against
+            // the Region the store recorded when the bucket was created.
+            if input
+                .bucket_region
+                .as_deref()
+                .is_some_and(|wanted| bucket.region != wanted)
+            {
+                continue;
+            }
+            // The token's name is the first one this page owes, inclusive.
+            if resume_at.as_deref().is_some_and(|from| name < from) {
+                continue;
+            }
+
+            // Out of slots: this bucket starts the NEXT page, and its name is what the
+            // token hands back.
+            if buckets.len() >= page_limit {
+                next_continuation_token = Some(encode_continuation_token(name));
+                break;
+            }
+
+            buckets.push(Bucket {
+                name: Some(name.to_string()),
+                // "Date the bucket was created" — the instant the store recorded, not the
+                // instant of this read, so two listings report the same date.
+                creation_date: bucket.created_at().map(::aws_smithy_types::DateTime::from),
+                bucket_region: reports_region.then(|| bucket.region.clone()),
+                // "This parameter is only supported for S3 directory buckets"
+                // (`Bucket$BucketArn`), and this store holds general purpose buckets —
+                // which is why `CreateBucket` reports no ARN for one either.
+                bucket_arn: None,
+            });
+        }
+
+        Ok(ListBucketsOutput {
+            // The `<Buckets>` container is always present, holding one entry per bucket
+            // this page reports; an account with no buckets lists an empty one rather
+            // than omitting it.
+            buckets: Some(buckets),
+            // "The owner of the buckets listed" — this emulator serves one account, whose
+            // canonical user id the store names once (`state::canonical_user_id`). No
+            // `DisplayName`: that member is an account's friendly name, which this
+            // emulator has no source for, and inventing one would report a fact about the
+            // account that nothing recorded.
+            owner: Some(Owner {
+                id: Some(crate::state::canonical_user_id()),
+                display_name: None,
+            }),
+            // "ContinuationToken is included in the response when there are more buckets
+            // that can be listed with pagination" — the NEXT page's cursor, so it is
+            // absent exactly when this page reported the last bucket.
+            continuation_token: next_continuation_token,
+            // "If Prefix was sent with the request, it is included in the response."
+            prefix: input.prefix.clone(),
+        })
     }
 }
+
