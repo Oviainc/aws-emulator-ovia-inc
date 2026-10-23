@@ -19,6 +19,8 @@ mod create_deployment_strategy;
 mod environment_update;
 #[path = "all/extensions.rs"]
 mod extensions;
+#[path = "all/list_configuration_profiles.rs"]
+mod list_configuration_profiles;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

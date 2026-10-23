@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListConfigurationProfiles
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListConfigurationProfiles`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListConfigurationProfiles::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the configuration profiles stored under one application, read out of this
+//! service's state: every summary member is the value the profile was created or
+//! updated with, never a value computed from the listing request. The listing is a
+//! REPORT — it writes nothing — ordered by profile id so that a `NextToken` walk is
+//! stable, cut into pages by [`crate::state::paginate`].
 //!
 //! ## Shape of an operation
 //!
@@ -148,20 +145,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListConfigurationProfiles` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListConfigurationProfilesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListConfigurationProfiles"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListConfigurationProfilesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("AppConfig state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let store = state.lock();
+
+        // A profile only exists under an application, so an unresolvable application is
+        // not an empty listing: it is the 404 this operation models.
+        let Some(application) = store.applications.get(&input.application_id) else {
+            return Err(ListConfigurationProfilesErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No application with id {} exists.",
+                        input.application_id
+                    )),
+                    resource_name: Some(input.application_id),
+                },
+            )
+            .into());
+        };
+
+        // `Type` is "a filter based on the type of configurations that the configuration
+        // profile contains", so it selects the profiles whose stored `Type` is that
+        // value; a profile created without a `Type` carries none and so matches no
+        // filter value.
+        let mut ordered: Vec<(String, ConfigurationProfileSummary)> = application
+            .profiles
+            .values()
+            .filter(|profile| {
+                input
+                    .r#type
+                    .as_deref()
+                    .is_none_or(|wanted| profile.profile_type.as_deref() == Some(wanted))
+            })
+            .map(|profile| (profile.id.clone(), summary_of(profile)))
+            .collect();
+        // Profile ids are unique across this service, so ordering by id is a TOTAL
+        // order — which is what a pagination cursor needs to resume exactly once.
+        ordered.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        let Some(page) = crate::state::paginate(
+            ordered,
+            crate::state::LISTING_CONFIGURATION_PROFILES,
+            input.next_token.as_deref(),
+            input.max_results,
+        ) else {
+            return Err(ListConfigurationProfilesErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(
+                        "NextToken is not a pagination token this operation issued.".to_string(),
+                    ),
+                    reason: None,
+                    details: None,
+                },
+            )
+            .into());
+        };
+
+        Ok(ListConfigurationProfilesOutput {
+            // Reported even when empty: "the elements from this collection" is an
+            // answer about an application holding no matching profile, not a missing
+            // member.
+            items: Some(page.items),
+            next_token: page.next_token,
+        })
     }
 }
+
+/// The summary this operation reports for one stored profile.
+///
+/// Every member is read off the stored record. `ValidatorTypes` is "the types of
+/// validators in the configuration profile"
+/// (`smithy_query(query="shape",shape="ConfigurationProfileSummary")`), so it reports
+/// the `Type` of each validator the profile holds — each type once, in the order the
+/// profile's validators carry them, since the member is a list of TYPES and the model
+/// bounds it at 2.
+fn summary_of(profile: &crate::state::ConfigurationProfile) -> ConfigurationProfileSummary {
+    let mut validator_types: Vec<String> = Vec::new();
+    for validator in &profile.validators {
+        if !validator_types.contains(&validator.r#type) {
+            validator_types.push(validator.r#type.clone());
+        }
+    }
+    ConfigurationProfileSummary {
+        application_id: Some(profile.application_id.clone()),
+        id: Some(profile.id.clone()),
+        name: Some(profile.name.clone()),
+        location_uri: Some(profile.location_uri.clone()),
+        // Left unset for a profile with no validators, the way `GetConfigurationProfile`
+        // leaves `Validators` unset for that same profile.
+        validator_types: (!validator_types.is_empty()).then_some(validator_types),
+        r#type: profile.profile_type.clone(),
+    }
+}
+

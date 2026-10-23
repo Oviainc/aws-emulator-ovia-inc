@@ -1348,6 +1348,92 @@ fn encode_id(sequence: u64) -> String {
     id
 }
 
+/// The largest page a list operation answers, and the page it answers when the caller
+/// names no `MaxResults`.
+///
+/// Every `MaxResults` member this service models is bound at `range 1..50`
+/// (`smithy_query(query="operation",operation="ListConfigurationProfiles")`), so 50
+/// items is the most one call can carry and the most a caller can ask for.
+pub const MAX_LIST_PAGE_SIZE: usize = 50;
+
+/// The `kind` a `ListConfigurationProfiles` cursor is stamped with, so a token minted
+/// by another listing cannot resume this one. See [`paginate`].
+pub const LISTING_CONFIGURATION_PROFILES: &str = "ListConfigurationProfiles";
+
+/// One page of a list operation: the items on it, and the token that resumes the walk
+/// after them (`None` on the last page).
+#[derive(Debug)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub next_token: Option<String>,
+}
+
+/// Encode an opaque pagination cursor: `kind` names the listing the token belongs to,
+/// and `key` is the key the NEXT page starts at.
+///
+/// An AppConfig `NextToken` is opaque, so the cursor is hex-encoded rather than handed
+/// to the caller in the clear: a client that treats it as anything but a token to hand
+/// back is reading structure the service does not publish. The encoding is
+/// OBFUSCATION, not authentication — it carries no integrity tag, so a caller that
+/// decodes it can mint another token for the same listing, which can only resume that
+/// caller's own listing at a key of its choosing. `hex` is the maintained crate for the
+/// codec.
+fn encode_cursor(kind: &str, key: &str) -> String {
+    hex::encode(format!("{kind}\u{1f}{key}"))
+}
+
+/// The inverse of [`encode_cursor`]: the key the page resumes at, or `None` for a token
+/// this service did not mint for `kind`.
+fn decode_cursor(kind: &str, token: &str) -> Option<String> {
+    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    let (token_kind, key) = decoded.split_once('\u{1f}')?;
+    (token_kind == kind).then(|| key.to_string())
+}
+
+/// Cut `ordered` — a listing's items, each beside the unique key it is ordered by, in
+/// ascending key order — into the page that resumes at `next_token` and carries at most
+/// `max_results` items.
+///
+/// `None` means `next_token` is not a token this service minted for `kind`, which the
+/// calling operation refuses with the error it models for a bad request. Keying the
+/// cursor on an item's own key rather than on an offset is what makes a walk stable:
+/// an item created or deleted between two calls shifts no later page.
+pub fn paginate<T>(
+    ordered: Vec<(String, T)>,
+    kind: &str,
+    next_token: Option<&str>,
+    max_results: Option<i32>,
+) -> Option<Page<T>> {
+    let resume_at = match next_token {
+        Some(token) => Some(decode_cursor(kind, token)?),
+        None => None,
+    };
+    // `MaxResults` is a maximum, not a demand. The modelled range (1..50) is enforced
+    // by the schema walk BEFORE any handler runs, so the clamp is unreachable on the
+    // wire path and is here only so that an in-process caller cannot ask for an
+    // unbounded page; the assertion is what makes a value outside the range loud in a
+    // debug build rather than quietly answered as a different page size.
+    debug_assert!(
+        max_results.is_none_or(|requested| (1..=MAX_LIST_PAGE_SIZE as i32).contains(&requested)),
+        "MaxResults {max_results:?} is outside the modelled range 1..{MAX_LIST_PAGE_SIZE}"
+    );
+    let page_size = max_results.map_or(MAX_LIST_PAGE_SIZE, |requested| {
+        requested.clamp(1, MAX_LIST_PAGE_SIZE as i32) as usize
+    });
+    let mut remaining = ordered
+        .into_iter()
+        .filter(|(key, _)| resume_at.as_deref().is_none_or(|at| key.as_str() >= at));
+    let items: Vec<T> = remaining
+        .by_ref()
+        .take(page_size)
+        .map(|(_, item)| item)
+        .collect();
+    Some(Page {
+        next_token: remaining.next().map(|(key, _)| encode_cursor(kind, &key)),
+        items,
+    })
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.
