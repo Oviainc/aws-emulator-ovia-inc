@@ -15,6 +15,8 @@
 mod application_status;
 #[path = "all/availability_zones.rs"]
 mod availability_zones;
+#[path = "all/capacity_blocks.rs"]
+mod capacity_blocks;
 #[path = "all/copy_volumes.rs"]
 mod copy_volumes;
 #[path = "all/create_security_group.rs"]
