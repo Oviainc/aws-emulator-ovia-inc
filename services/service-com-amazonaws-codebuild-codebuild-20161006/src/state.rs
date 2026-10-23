@@ -1530,6 +1530,12 @@ pub enum AuditOutcome {
     /// An account quota — the service's, or this emulator's own ceiling — was met
     /// (400 `AccountLimitExceededException`).
     QuotaExceeded,
+    /// A build project was minted and stored.
+    ProjectCreated,
+    /// A build project's settings were changed and stored.
+    ProjectUpdated,
+    /// No resource of that name exists (400 `ResourceNotFoundException`).
+    NotFound,
 }
 
 impl AuditOutcome {
@@ -1541,6 +1547,9 @@ impl AuditOutcome {
             Self::ValidationRefused => "validation-refused",
             Self::AlreadyExists => "already-exists",
             Self::QuotaExceeded => "quota-exceeded",
+            Self::ProjectCreated => "project-created",
+            Self::ProjectUpdated => "project-updated",
+            Self::NotFound => "not-found",
         }
     }
 }
@@ -1956,4 +1965,42 @@ pub fn page_limited(
     let end = (start + size).min(items.len());
     let next = items.get(end).cloned();
     Some((items[start..end].to_vec(), next))
+}
+
+/// The `ProjectSource$type` value of a project that has no input source code. One of
+/// `SourceType`'s modelled values (see `crate::ops::types::SOURCE_TYPE_VALUES`); the
+/// same value [`RUNNER_WEBHOOK_SOURCE_TYPE`] names for the unrelated webhook rule.
+pub const NO_SOURCE_TYPE: &str = "NO_SOURCE";
+
+/// Why `source` cannot be a build project's source configuration, as the message the
+/// modelled `InvalidInputException` carries — or `None` when it can.
+///
+/// The model documents `NO_SOURCE` as "The project does not have input source code",
+/// and `ProjectSource$buildspec` as: "If this value is not provided or is set to an
+/// empty string, the source code must contain a buildspec file in its root directory."
+/// A project with no input source code has no root directory for that file to live in,
+/// so its buildspec has to be declared inline: the combination is refused wherever a
+/// project's source is SET — `CreateProject` and `UpdateProject` alike.
+///
+/// A buildspec of nothing but whitespace counts as empty here. That is this emulator's
+/// reading, not the model's wording (which names "not provided or [...] an empty
+/// string"): such a value declares no build commands either, so treating it as provided
+/// would store a project nothing could be built from.
+///
+/// Only a PRIMARY source is checked. A secondary source is checked out beside the
+/// primary one and never supplies the project's buildspec, so `NO_SOURCE` there is not
+/// this configuration.
+pub fn inline_buildspec_violation(
+    source: &crate::ops::types::ProjectSource,
+) -> Option<String> {
+    let no_inline_buildspec = source
+        .buildspec
+        .as_ref()
+        .is_none_or(|buildspec| buildspec.trim().is_empty());
+    (source.r#type == NO_SOURCE_TYPE && no_inline_buildspec).then(|| {
+        format!(
+            "A buildspec must be provided when the project source type is {NO_SOURCE_TYPE}, \
+             which has no source code to hold a buildspec file"
+        )
+    })
 }
