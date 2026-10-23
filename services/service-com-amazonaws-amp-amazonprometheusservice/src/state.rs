@@ -290,6 +290,15 @@ pub const SCRAPER_PAGE_LIMIT: i32 = 1_000;
 /// See [`SCRAPER_PAGE_LIMIT`].
 pub const SCRAPER_PAGE_DEFAULT: i32 = 100;
 
+/// The largest page `ListRuleGroupsNamespaces` serves, and the page size it uses when
+/// the request names no `maxResults`: `ListRuleGroupsNamespacesRequest$maxResults` is
+/// modelled `@range(min: 1, max: 1000)` and documented "The maximum number of results to
+/// return. The default is 100." Clamped by the handler rather than trusted from the
+/// request, exactly as [`WORKSPACE_PAGE_LIMIT`] is.
+pub const RULE_GROUPS_NAMESPACE_PAGE_LIMIT: i32 = 1_000;
+/// See [`RULE_GROUPS_NAMESPACE_PAGE_LIMIT`].
+pub const RULE_GROUPS_NAMESPACE_PAGE_DEFAULT: i32 = 100;
+
 /// The filter keys `ListScrapers` honours, as `ListScrapersRequest$filters` documents
 /// them: "Keys include `status`, `sourceArn`, `destinationArn`, and `alias`."
 ///

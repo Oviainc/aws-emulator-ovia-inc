@@ -23,6 +23,8 @@ mod query_logging_configuration;
 mod resource_policy_lifecycle;
 #[path = "all/rule_groups_namespace_lifecycle.rs"]
 mod rule_groups_namespace_lifecycle;
+#[path = "all/rule_groups_namespace_listing.rs"]
+mod rule_groups_namespace_listing;
 #[path = "all/scraper_listing.rs"]
 mod scraper_listing;
 #[path = "all/state_roundtrip.rs"]
