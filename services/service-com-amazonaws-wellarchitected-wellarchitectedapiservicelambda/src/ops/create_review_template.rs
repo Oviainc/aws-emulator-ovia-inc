@@ -241,7 +241,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // stub; handled here so the create stays well defined once it lands.)
             store
                 .create_review_template_tokens
-                .remove(&input.client_request_token);
+                .forget(&input.client_request_token);
         }
 
         // Review templates are metered, and this operation models
@@ -288,7 +288,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         store.review_templates.insert(template_arn.clone(), record);
-        store.create_review_template_tokens.insert(
+        // Written through the ledger's bounded `remember`, which holds the remembered
+        // tokens at `MAX_REMEMBERED_REQUEST_TOKENS` by forgetting the oldest: the token is
+        // caller-chosen, so the ledger cannot be allowed to grow with the stream of them.
+        store.create_review_template_tokens.remember(
             input.client_request_token,
             crate::state::CreateReviewTemplateToken {
                 template_arn: template_arn.clone(),

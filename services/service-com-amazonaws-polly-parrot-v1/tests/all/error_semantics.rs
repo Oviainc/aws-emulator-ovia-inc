@@ -570,6 +570,10 @@ fn the_fixed_messages_are_the_sentences_amazon_polly_sends() {
             Some("Speech marks are not supported for this format"),
         ),
         (
+            "MaxLexemeLengthExceededException",
+            Some("Lexeme rule length has been exceeded"),
+        ),
+        (
             "MaxLexiconsNumberExceededException",
             Some("Max lexicon number has been exceeded"),
         ),

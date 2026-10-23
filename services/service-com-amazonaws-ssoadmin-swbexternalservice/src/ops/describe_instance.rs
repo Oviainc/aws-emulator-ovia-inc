@@ -7,7 +7,11 @@
 //! records `ListInstances` enumerates, so a client that picks an instance out of the list
 //! and describes it by ARN sees the same instance.
 //!
-//! This is a REPORTING operation: it writes nothing. An `InstanceArn` the store does not
+//! This is a REPORTING operation: the only thing it writes is a transition the CLOCK
+//! already owes — an instance created `CREATE_IN_PROGRESS` whose activation instant has
+//! passed is `ACTIVE` whether or not anybody described it
+//! (`crate::state::ComAmazonawsSsoadminSwbexternalserviceState::materialize_due`). An
+//! `InstanceArn` the store does not
 //! hold is refused with the modelled `AccessDeniedException` (403), the only not-found
 //! channel this operation's model declares (it declares no `ResourceNotFoundException`,
 //! and the operation's own documentation gives `AccessDeniedException` as the answer for
@@ -194,9 +198,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // A read, so the store is only READ: the instance is reported exactly as it is
-        // held, and an ARN the store does not hold is refused rather than created.
-        let guard = state.lock();
+        // A READ, except for what the CLOCK already owes: an instance whose activation
+        // instant has passed is ACTIVE whether or not anybody called, so
+        // `materialize_due` applies that and nothing else. The instance is otherwise
+        // reported exactly as it is held, and an ARN the store does not hold is refused
+        // rather than created.
+        let mut guard = state.lock();
+        guard.materialize_due(::std::time::SystemTime::now());
         let Some(instance) = guard.instance(&input.instance_arn) else {
             return Err(DescribeInstanceErrorModeled::AccessDeniedException(
                 AccessDeniedException {
@@ -215,11 +223,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             identity_store_id: Some(instance.identity_store_id.clone()),
             identity_store_arn: Some(instance.identity_store_arn.clone()),
             owner_account_id: Some(instance.owner_account_id.clone()),
-            name: Some(instance.name.clone()),
+            name: instance.name.clone(),
             created_date: Some(instance.created_date),
             status: Some(instance.status.clone()),
             // "Provides additional context about the current status … particularly useful
-            // when an instance is in a non-ACTIVE state": an ACTIVE instance has none.
+            // when an instance is in a non-ACTIVE state": there is none to give — a
+            // CREATE_IN_PROGRESS instance is on its way to ACTIVE, which the status
+            // already says, and nothing here fails a creation.
             status_reason: None,
             primary_region: Some(instance.primary_region.clone()),
             regions: Some(
@@ -230,11 +240,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .collect(),
             ),
             // Nothing in this emulator configures a customer-managed KMS key for the
-            // instance (`CreateInstance`/`UpdateInstance` are still scaffolded), so there
-            // is no encryption configuration to report and the optional member is absent
-            // rather than carrying an invented key type or ARN.
+            // instance (`UpdateInstance` is still scaffolded and `CreateInstance` takes
+            // no encryption configuration), so there is no encryption configuration to
+            // report and the optional member is absent rather than carrying an invented
+            // key type or ARN.
             encryption_configuration_details: None,
-            permission_sets_enabled: Some(instance.permission_sets_enabled),
+            // A property of the INSTANCE: permission sets are a feature of an
+            // organization instance, and an account instance serves none of that
+            // surface.
+            permission_sets_enabled: Some(instance.permission_sets_enabled()),
         })
     }
 }

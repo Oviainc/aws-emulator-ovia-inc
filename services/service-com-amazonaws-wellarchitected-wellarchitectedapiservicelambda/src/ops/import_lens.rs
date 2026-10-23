@@ -331,10 +331,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // Written through the store's bounded ledger, which holds the remembered tokens
-        // at `MAX_REMEMBERED_IMPORT_TOKENS` by forgetting the oldest: the token is
+        // Written through the ledger's bounded `remember`, which holds the remembered
+        // tokens at `MAX_REMEMBERED_REQUEST_TOKENS` by forgetting the oldest: the token is
         // caller-chosen, and an update adds no lens for the lens quota to bound.
-        store.remember_import_token(
+        store.import_lens_tokens.remember(
             input.client_request_token,
             crate::state::ImportLensToken {
                 lens_id: lens_id.clone(),

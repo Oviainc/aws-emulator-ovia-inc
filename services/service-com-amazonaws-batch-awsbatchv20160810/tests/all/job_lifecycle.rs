@@ -117,6 +117,15 @@ pub(crate) fn arn(resource: &str) -> String {
     )
 }
 
+/// The `message` of an error response. Shared by every suite in this target.
+pub(crate) fn error_message(body: &Value) -> String {
+    body.get("message")
+        .or_else(|| body.get("Message"))
+        .and_then(Value::as_str)
+        .unwrap_or("<none>")
+        .to_string()
+}
+
 /// An `UNMANAGED`, `ENABLED` compute environment called `name`; answers its ARN.
 pub(crate) async fn compute_environment(batch: &Batch, name: &str) -> String {
     let body = batch

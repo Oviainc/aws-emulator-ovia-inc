@@ -15,8 +15,8 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_iotjobsdataplane_iotlaserthingjobmanagerexternalservice::ops::types::JOB_EXECUTION_STATUS_VALUES;
 use service_com_amazonaws_iotjobsdataplane_iotlaserthingjobmanagerexternalservice::state::{
-    MAX_PENDING_EXECUTIONS_PER_THING, MAX_STATUS_DETAIL_NAME_LEN, MAX_STATUS_DETAIL_PAIRS,
-    MAX_STATUS_DETAIL_VALUE_LEN, MAX_TERMINAL_EXECUTIONS_PER_THING,
+    command_registry, MAX_PENDING_EXECUTIONS_PER_THING, MAX_STATUS_DETAIL_NAME_LEN,
+    MAX_STATUS_DETAIL_PAIRS, MAX_STATUS_DETAIL_VALUE_LEN, MAX_TERMINAL_EXECUTIONS_PER_THING,
 };
 use service_com_amazonaws_iotjobsdataplane_iotlaserthingjobmanagerexternalservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -55,6 +55,17 @@ struct Emulator {
 impl Emulator {
     fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        // `StartCommandExecution` starts an execution only for a command that
+        // EXISTS. Commands are control-plane resources (`iot:CreateCommand`, a
+        // scaffold in its own crate under its own issue), so the shared index
+        // they are registered in is seeded here with the one command these tests
+        // start — the same write that create makes. The refusal an unregistered
+        // command gets is asserted in `command_execution_validation.rs`.
+        command_registry(&*engine)
+            .expect("the shared IoT command index")
+            .lock()
+            .register(COMMAND_ARN)
+            .expect("register the command these tests start");
         let mut router = MultiServiceRouter::new();
         // These tests exercise handler behaviour, not request signing.
         router.set_request_authentication(false);

@@ -26,7 +26,7 @@ pub(crate) const ROLE_ARN: &str = "arn:aws:iam::123456789012:role/service-role/c
 
 /// The canonical emulator account id every ARN carries
 /// (`emulator_server::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT_ID: &str = "000000000000";
+pub(crate) const ACCOUNT_ID: &str = "000000000000";
 
 /// One emulator: the shared engine, the service mounted on it, and the router that
 /// dispatches to it — exactly how `core/router` assembles the production emulator.

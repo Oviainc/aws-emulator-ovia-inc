@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListInvoiceSummaries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListInvoiceSummaries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListInvoiceSummaries::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the invoices in [`crate::state`] that the request's `Selector` names and its
+//! `Filter` admits, one page of at most `MaxResults` at a time, with an opaque
+//! `NextToken` that resumes the walk where the page stopped.
+//!
+//! The registry it reads is the one copy of the invoices this emulator holds
+//! ([`crate::state::ComAmazonawsInvoicingInvoicingState::invoices`]). An invoice is
+//! ISSUED by AWS out of a billing period's activity and no operation of this service's
+//! API creates one, so the registry is empty until something puts an invoice there, and
+//! this reporting operation answers exactly what it holds: the empty list for an
+//! account with no invoices, never a synthesised invoice for charges nothing incurred.
+//! It writes nothing, so a later caller sees what the previous one saw.
 //!
 //! ## Shape of an operation
 //!
@@ -84,6 +87,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use smithy_server_runtime::{Violation, ViolationKind};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -117,6 +122,205 @@ pub type ListInvoiceSummariesError = crate::scaffolded::Scaffolded<ListInvoiceSu
 impl From<ListInvoiceSummariesErrorModeled> for ListInvoiceSummariesError {
     fn from(modeled: ListInvoiceSummariesErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
+    }
+}
+
+/// `InvoiceSummariesMaxResults` carries `@range(min: 1, max: 100)`
+/// (`smithy_query(query="operation", operation="ListInvoiceSummaries")`), so a page
+/// never holds more than this many invoice summaries. The request member carries no
+/// `@default`, so an omitted `MaxResults` asks for a full page of this many.
+const MAX_PAGE_SIZE: usize = 100;
+
+/// What an opaque `NextToken` this operation minted decodes to, before the invoice id
+/// the next page resumes at. It makes a token this operation did not mint recognisable
+/// rather than silently resuming from arbitrary bytes, and it is this operation's own
+/// prefix, so a token minted by another paginated operation of this service is not
+/// taken for one of these.
+const NEXT_TOKEN_PREFIX: &str = "invoice-summaries:";
+
+/// The `NextToken` that resumes the walk at `invoice_id`.
+fn encode_next_token(invoice_id: &str) -> String {
+    hex::encode(format!("{NEXT_TOKEN_PREFIX}{invoice_id}"))
+}
+
+/// The invoice id a caller's `NextToken` resumes at, or `None` when it asked for the
+/// first page. A token this operation did not mint is refused with the model's own
+/// `invalidNextToken` reason.
+fn decode_next_token(
+    token: Option<&str>,
+) -> Result<Option<String>, ListInvoiceSummariesErrorModeled> {
+    let Some(token) = token else {
+        return Ok(None);
+    };
+    let resume = hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|plain| plain.strip_prefix(NEXT_TOKEN_PREFIX).map(str::to_string));
+    resume.map(Some).ok_or_else(|| {
+        // `invalidNextToken` is one of the model's `ValidationExceptionReason` values.
+        ListInvoiceSummariesErrorModeled::ValidationException(ValidationException {
+            message: Some("The NextToken provided is not valid".to_string()),
+            reason: Some("invalidNextToken".to_string()),
+            ..Default::default()
+        })
+    })
+}
+
+/// A member that targets an ENUM shape admits only the values that shape declares, and
+/// nothing else; a request carrying any other value is refused.
+///
+/// The check belongs here rather than at the boundary: the generated input type carries
+/// such a member as a plain `String`, and the boundary validator enforces the legacy
+/// `@enum` string trait only, so an unmodelled value reaches this handler. The refusal
+/// is worded through the one formatter every refusal of this service is worded by
+/// (`crate::service::validation`), so an enum violation found here reads exactly like a
+/// constraint violation found at the boundary — the member path and the requirement,
+/// never the rejected value.
+fn modelled_enum_value(
+    path: &str,
+    value: &str,
+    allowed: &'static [&'static str],
+) -> Result<(), ListInvoiceSummariesErrorModeled> {
+    if allowed.contains(&value) {
+        return Ok(());
+    }
+    Err(ListInvoiceSummariesErrorModeled::ValidationException(
+        crate::service::validation::field_validation_failed(&[Violation {
+            path: path.to_string(),
+            kind: ViolationKind::EnumValue(allowed.iter().map(|value| (*value).to_string()).collect()),
+            // The wording never renders the rejected value, so it is not carried here
+            // either.
+            value: None,
+        }]),
+    ))
+}
+
+/// What the request's `Selector` selects: ONE invoice by its id, or every invoice linked
+/// to one account (`smithy_query(query="doc", shape="ListInvoiceSummariesRequest",
+/// member="Selector")`: "details for a specific invoice by providing its unique ID …
+/// or … all invoices linked to the account by providing an account ID").
+#[derive(Debug, Clone, Copy)]
+enum Selected<'s> {
+    /// `ResourceType: ACCOUNT_ID` — the invoices linked to this account id.
+    Account(&'s str),
+    /// `ResourceType: INVOICE_ID` — the invoice with this id.
+    Invoice(&'s str),
+}
+
+impl<'s> Selected<'s> {
+    /// The selector a request carries, or the refusal of a `ResourceType` the model's
+    /// `ListInvoiceSummariesResourceType` does not declare.
+    fn new(
+        selector: &'s InvoiceSummariesSelector,
+    ) -> Result<Self, ListInvoiceSummariesErrorModeled> {
+        modelled_enum_value(
+            "selector.resourceType",
+            &selector.resource_type,
+            LIST_INVOICE_SUMMARIES_RESOURCE_TYPE_VALUES,
+        )?;
+        // The two values `LIST_INVOICE_SUMMARIES_RESOURCE_TYPE_VALUES` declares, which
+        // the check above has already narrowed the member to.
+        match selector.resource_type.as_str() {
+            "INVOICE_ID" => Ok(Self::Invoice(&selector.value)),
+            _ => Ok(Self::Account(&selector.value)),
+        }
+    }
+
+}
+
+/// Whether `invoice` is LINKED to `account_id`: the invoice that account was issued
+/// (`AccountId`), or one billing that account's charges (`BillSourceAccounts` — "the
+/// list of Amazon Web Services account IDs that are the bill source of the invoice").
+fn linked_to_account(invoice: &InvoiceSummary, account_id: &str) -> bool {
+    invoice.account_id.as_deref() == Some(account_id)
+        || invoice
+            .bill_source_accounts
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|source| source == account_id)
+}
+
+/// The caller's `Filter`, decoded ONCE per request into what each member tests.
+///
+/// Decoded up front so the walk over the registry costs one comparison per filter per
+/// invoice — no re-reading of the request's optional members, and no work at all for a
+/// filter the caller did not supply.
+#[derive(Debug, Default)]
+struct SummaryFilter<'f> {
+    /// `TimeInterval`, as the ordered instants an `IssuedDate` must fall between:
+    /// `StartDate` INCLUSIVE and `EndDate` EXCLUSIVE, as both members document
+    /// (`smithy_query(query="doc", shape="DateInterval", member="StartDate")`:
+    /// "the start date is inclusive"; `member="EndDate"`: "up to, but not including").
+    time_interval: Option<((i64, u32), (i64, u32))>,
+    /// `BillingPeriod`, as the `(Month, Year)` an invoice's own billing period must be.
+    billing_period: Option<(i32, i32)>,
+    /// `InvoicingEntity`, which an invoice's `Entity.InvoicingEntity` must equal.
+    invoicing_entity: Option<&'f str>,
+    /// `ReceiverRole`, which an invoice's own `ReceiverRole` must equal.
+    receiver_role: Option<&'f str>,
+}
+
+impl<'f> SummaryFilter<'f> {
+    /// The filter a request carries, or the refusal of a `ReceiverRole` the model's
+    /// `ReceiverRole` enum does not declare.
+    fn new(
+        filter: Option<&'f InvoiceSummariesFilter>,
+    ) -> Result<Self, ListInvoiceSummariesErrorModeled> {
+        let Some(filter) = filter else {
+            return Ok(Self::default());
+        };
+        if let Some(role) = filter.receiver_role.as_deref() {
+            modelled_enum_value("filter.receiverRole", role, RECEIVER_ROLE_VALUES)?;
+        }
+        Ok(Self {
+            time_interval: filter.time_interval.as_ref().map(|interval| {
+                (
+                    crate::state::instant_key(&interval.start_date),
+                    crate::state::instant_key(&interval.end_date),
+                )
+            }),
+            billing_period: filter
+                .billing_period
+                .as_ref()
+                .map(|period| (period.month, period.year)),
+            invoicing_entity: filter.invoicing_entity.as_deref(),
+            receiver_role: filter.receiver_role.as_deref(),
+        })
+    }
+
+    /// Whether `invoice` satisfies every filter member the caller supplied. Members of
+    /// different types are AND-ed: a filter narrows the answer, so each one the caller
+    /// states has to hold.
+    ///
+    /// An invoice that does not carry the member a filter tests cannot satisfy that
+    /// filter: there is nothing to match the asked-for value against, so it is not part
+    /// of the answer.
+    fn admits(&self, invoice: &InvoiceSummary) -> bool {
+        let issued_in_interval = self.time_interval.is_none_or(|(start, end)| {
+            invoice.issued_date.as_ref().is_some_and(|issued| {
+                let issued = crate::state::instant_key(issued);
+                issued >= start && issued < end
+            })
+        });
+        let billing_period_matches = self.billing_period.is_none_or(|(month, year)| {
+            invoice
+                .billing_period
+                .as_ref()
+                .is_some_and(|period| period.month == month && period.year == year)
+        });
+        let entity_matches = self.invoicing_entity.is_none_or(|entity| {
+            invoice
+                .entity
+                .as_ref()
+                .and_then(|invoice_entity| invoice_entity.invoicing_entity.as_deref())
+                == Some(entity)
+        });
+        let role_matches = self
+            .receiver_role
+            .is_none_or(|role| invoice.receiver_role.as_deref() == Some(role));
+
+        issued_in_interval && billing_period_matches && entity_matches && role_matches
     }
 }
 
@@ -156,18 +360,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListInvoiceSummaries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListInvoiceSummariesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListInvoiceSummaries"))
+        let _ = ctx;
+
+        let selected = Selected::new(&input.selector)?;
+        let filter = SummaryFilter::new(input.filter.as_ref())?;
+        let resume_at = decode_next_token(input.next_token.as_deref())?;
+        // The boundary validator already refused a `MaxResults` outside
+        // `@range(1..100)`; the member has no `@default`, so an omitted one asks for a
+        // full page.
+        let page_size = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListInvoiceSummariesErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+        let store = state.lock();
+
+        // A selector naming ONE invoice is answered about that invoice alone, looked up
+        // by the id the registry keys it under: an id the registry does not hold is the
+        // modelled 404, because the request names a resource rather than describing a
+        // set. A `Filter` the caller supplied beside it still applies, so an invoice
+        // that does not satisfy it is reported by neither selector. An account id
+        // describes a set, so an account with no invoices is the empty list instead.
+        let account_id = match selected {
+            Selected::Account(account_id) => account_id,
+            Selected::Invoice(invoice_id) => {
+                let Some(invoice) = store.invoices.get(invoice_id) else {
+                    return Err(ListInvoiceSummariesErrorModeled::ResourceNotFoundException(
+                        crate::state::no_such_resource_unnamed(),
+                    )
+                    .into());
+                };
+                return Ok(ListInvoiceSummariesOutput {
+                    invoice_summaries: if filter.admits(invoice) {
+                        vec![invoice.clone()]
+                    } else {
+                        Vec::new()
+                    },
+                    next_token: None,
+                });
+            }
+        };
+
+        let mut invoice_summaries = Vec::new();
+        let mut next_token = None;
+        // `invoices` is a BTreeMap keyed by invoice id, so this walk is in one stable
+        // order and a token (the id the next page starts at) stays meaningful: the token
+        // is a POSITION in that order, so the resumed page seeks straight to it rather
+        // than re-walking the invoices the earlier pages already reported.
+        let page = match resume_at.as_deref() {
+            Some(from) => store.invoices.range(from.to_string()..),
+            None => store.invoices.range::<String, _>(..),
+        };
+        for (invoice_id, invoice) in page {
+            if !linked_to_account(invoice, account_id) || !filter.admits(invoice) {
+                continue;
+            }
+            if invoice_summaries.len() == page_size {
+                next_token = Some(encode_next_token(invoice_id));
+                break;
+            }
+            invoice_summaries.push(invoice.clone());
+        }
+
+        Ok(ListInvoiceSummariesOutput {
+            invoice_summaries,
+            next_token,
+        })
     }
 }

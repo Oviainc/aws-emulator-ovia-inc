@@ -3,10 +3,10 @@
 //! Engine state for the com-amazonaws-batch-awsbatchv20160810 service.
 //!
 //! Every implemented operation computes its answer from the records below: the
-//! compute environments, job queues, job definition revisions and jobs this
-//! service has been asked to create, keyed the way AWS Batch keys them (by name,
-//! with an ARN index beside it so anything the model documents as "name or ARN"
-//! resolves both ways).
+//! compute environments, job queues, job definition revisions, consumable
+//! resources and jobs this service has been asked to create, keyed the way AWS
+//! Batch keys them (by name, with an ARN index beside it so anything the model
+//! documents as "name or ARN" resolves both ways).
 //!
 //! # The job lifecycle is driven by the CLOCK, never by a read
 //!
@@ -91,6 +91,11 @@ pub mod limits {
     /// first evicts the jobs that have been terminal longest, and is refused only when
     /// there is nothing evictable left.
     pub const MAX_JOBS: usize = 500;
+
+    /// Consumable resources kept at once. An EMULATOR-CHOSEN ceiling, not an AWS quota:
+    /// `CreateConsumableResource` is a request anyone can repeat, so the store answers the
+    /// modelled `ClientException` past this point rather than growing without bound.
+    pub const MAX_CONSUMABLE_RESOURCES: usize = 500;
 }
 
 /// The `ClientException` message a request past one of [`limits`] answers with.
@@ -192,6 +197,22 @@ pub const MAX_DESCRIBE_PAGE_SIZE: i32 = 100;
 /// per-account job-definition quota of its own.
 pub const MAX_JOB_DEFINITIONS: usize = 5_000;
 
+/// `ConsumableResource$resourceType` of a resource that is handed back when a job that
+/// held it completes — the default, from the `resourceType` member's own doc:
+/// "`REPLENISHABLE` (default)".
+pub const RESOURCE_TYPE_REPLENISHABLE: &str = "REPLENISHABLE";
+
+/// `ConsumableResource$resourceType` of a resource a completed job does NOT hand back,
+/// from the same doc's list.
+pub const RESOURCE_TYPE_NON_REPLENISHABLE: &str = "NON_REPLENISHABLE";
+
+/// Every `resourceType` a consumable resource may carry, from the `resourceType` member's
+/// doc ("Can be one of: `REPLENISHABLE` (default), `NON_REPLENISHABLE`"). The model types
+/// the member as a plain `String`, so the framework admits anything and the handler
+/// applies this list.
+pub const CONSUMABLE_RESOURCE_TYPES: [&str; 2] =
+    [RESOURCE_TYPE_REPLENISHABLE, RESOURCE_TYPE_NON_REPLENISHABLE];
+
 /// `CEType` value whose compute resources AWS Batch manages.
 pub const CE_TYPE_MANAGED: &str = "MANAGED";
 
@@ -285,6 +306,11 @@ pub fn job_definition_arn(region: &str, name: &str, revision: i32) -> String {
 /// `arn:aws:batch:<region>:<account>:job/<job id>`.
 pub fn job_arn(region: &str, job_id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("job/{job_id}"))
+}
+
+/// `arn:aws:batch:<region>:<account>:consumable-resource/<name>`.
+pub fn consumable_resource_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("consumable-resource/{name}"))
 }
 
 /// `arn:aws:batch:<region>:<account>:service-environment/<name>`.
@@ -420,6 +446,39 @@ pub struct Job {
     pub platform_capabilities: Option<Vec<String>>,
     pub consumable_resource_properties: Option<ConsumableResourceProperties>,
     pub tags: Option<HashMap<String, String>>,
+}
+
+/// A consumable resource, exactly as `CreateConsumableResource` stored it.
+///
+/// AWS Batch hands a created consumable resource back ready — the create response carries
+/// no status and `DescribeConsumableResource` models none — so this record owes the clock
+/// no transition.
+#[derive(Debug, Clone)]
+pub struct ConsumableResource {
+    pub name: String,
+    pub arn: String,
+    /// `totalQuantity`: how much of the resource exists. Non-negative (the member's doc:
+    /// "Must be non-negative"), and 0 for a create that named none.
+    pub total_quantity: i64,
+    /// `inUseQuantity`: how much of the resource the jobs holding it have taken. 0 for a
+    /// resource nothing has taken yet; the operations that reserve and release quantity
+    /// maintain it.
+    pub in_use_quantity: i64,
+    /// One of [`CONSUMABLE_RESOURCE_TYPES`].
+    pub resource_type: String,
+    /// `createdAt`: the instant this record was stored, in epoch milliseconds.
+    pub created_at: i64,
+    pub tags: Option<HashMap<String, String>>,
+}
+
+impl ConsumableResource {
+    /// `availableQuantity` — "The amount of the consumable resource that is currently
+    /// available to use": what is left of [`Self::total_quantity`] once the quantity in
+    /// use is taken off. Derived on every read, never stored, so it cannot drift from the
+    /// two quantities it is computed from.
+    pub fn available_quantity(&self) -> i64 {
+        self.total_quantity.saturating_sub(self.in_use_quantity).max(0)
+    }
 }
 
 /// Whether a `JobStatus` is one a job never leaves.
@@ -599,6 +658,12 @@ pub struct ComAmazonawsBatchAwsbatchv20160810State {
     pub job_definitions: BTreeMap<(String, i32), JobDefinition>,
     /// Jobs by job id.
     pub jobs: HashMap<String, Job>,
+    /// Consumable resources by name — the name `CreateConsumableResource` must keep
+    /// unique ("The name of the consumable resource. Must be unique."). Bounded by
+    /// [`limits::MAX_CONSUMABLE_RESOURCES`].
+    pub consumable_resources: HashMap<String, ConsumableResource>,
+    /// Consumable resource ARN -> name, so `name or ARN` members resolve both ways.
+    pub consumable_resources_by_arn: HashMap<String, String>,
     /// Job ids per queue ARN, in submission order, backing `ListJobs`.
     pub jobs_by_queue: HashMap<String, Vec<String>>,
     /// The jobs with a clock-owed transition still pending, ordered by the instant it
@@ -656,6 +721,28 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         }
         let id = arn_resource_id(name_or_arn, "job-queue")?;
         self.job_queues.contains_key(id).then(|| id.to_string())
+    }
+
+    /// The consumable resource `name_or_arn` names, resolved by name or by ARN — the two
+    /// forms every `consumableResource` member documents ("The name or ARN of the
+    /// consumable resource").
+    pub fn consumable_resource(&self, name_or_arn: &str) -> Option<&ConsumableResource> {
+        let name = self.consumable_resource_name(name_or_arn)?;
+        self.consumable_resources.get(&name)
+    }
+
+    /// The NAME of the consumable resource `name_or_arn` names.
+    pub fn consumable_resource_name(&self, name_or_arn: &str) -> Option<String> {
+        if let Some(name) = self.consumable_resources_by_arn.get(name_or_arn) {
+            return Some(name.clone());
+        }
+        if self.consumable_resources.contains_key(name_or_arn) {
+            return Some(name_or_arn.to_string());
+        }
+        let id = arn_resource_id(name_or_arn, "consumable-resource")?;
+        self.consumable_resources
+            .contains_key(id)
+            .then(|| id.to_string())
     }
 
     /// The service environment `name_or_arn` names, resolved by name or by ARN.

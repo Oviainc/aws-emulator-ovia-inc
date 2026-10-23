@@ -2,7 +2,13 @@
 
 //! @op StartCommandExecution
 //!
-//! Mints and persists a job execution for the thing named by `targetArn`, with
+//! Validates the request FIRST — `targetArn` must name an IoT thing (any other
+//! resource type is refused 400 naming the type the request passed) and
+//! `commandArn` must name a command that EXISTS in the shared command index the
+//! IoT control plane owns (`service_common::iot_commands`), or the call is refused
+//! 400 `ValidationException` naming the missing command rather than accepting an
+//! execution that could never run. Then it mints and persists a job execution for
+//! the thing named by `targetArn`, with
 //! status `QUEUED` and a job document built from `commandArn` + `parameters`, and
 //! returns its id. `clientToken` makes the call idempotent: the same token with the
 //! same parameters returns the same `executionId` and creates nothing, the same
@@ -97,30 +103,98 @@ use crate::state::JobExecutionRecord;
 /// `JobDocument`'s modeled maximum length (len 0..32768).
 const MAX_JOB_DOCUMENT_LEN: usize = 32_768;
 
+/// This service's ARN namespace: the `vendor` field of every ARN it reads
+/// (`smithy_query(query="service_info")`: `awsService.arnNamespace`).
+const IOT_ARN_SERVICE: &str = "iot";
+
+/// The resource type of a thing ARN (`arn:<partition>:iot:<region>:<account>:thing/<name>`),
+/// the ONE type a command execution can be targeted at.
+const THING_RESOURCE_TYPE: &str = "thing";
+
+/// The resource type of a command ARN
+/// (`arn:<partition>:iot:<region>:<account>:command/<commandId>`).
+const COMMAND_RESOURCE_TYPE: &str = "command";
+
+/// The resource type this service can read out of `value`, or `None` when the value
+/// names no IoT resource at all — it is not a resource ARN, or it is another
+/// vendor's.
+///
+/// The parse is the shared one every service reads a caller-supplied ARN with
+/// (`service_common::arn`), so the six-field form and the two resource forms are
+/// read in one place rather than once per service.
+fn iot_resource_type(value: &str) -> Option<&str> {
+    ::service_common::arn::is_resource_arn_of(value, IOT_ARN_SERVICE)
+        .then(|| ::service_common::arn::resource_type(value))
+        .flatten()
+}
+
+/// The 400 message the service builds for a `targetArn` it cannot target: it says
+/// how the service READ the supplied value, then that the value is not a target.
+///
+/// Both halves come FROM THE REQUEST, so a caller (or an operator reading a log)
+/// can see what it passed, and two rejections of two different values are
+/// distinguishable rather than one fixed template. The reading is the resource
+/// TYPE when the value names an IoT resource ([`unsupported_target_type_message`])
+/// and the value itself when no IoT resource type can be read out of it
+/// ([`invalid_target_arn_message`]).
+fn unsupported_target_message(reading: &str) -> String {
+    format!("{reading} not supported as a target")
+}
+
+/// [`unsupported_target_message`] for a value that names an IoT resource of
+/// another type: the resource type it names (`arn:…:job/upgrade-42` -> "Resource
+/// type job …").
+fn unsupported_target_type_message(resource_type: &str) -> String {
+    unsupported_target_message(&format!("Resource type {resource_type}"))
+}
+
+/// [`unsupported_target_message`] for a value no IoT resource type can be read out
+/// of — not an ARN, an ARN of another service, or an ARN with an empty resource
+/// field: the value itself (`not-an-arn` -> "Invalid target arn not-an-arn …"). The
+/// echoed value is bounded by `TargetArn`'s own modeled maximum (len 0..2048).
+fn invalid_target_arn_message(target_arn: &str) -> String {
+    unsupported_target_message(&format!("Invalid target arn {target_arn}"))
+}
+
+/// A refusal of this operation's request as the modeled `ValidationException`
+/// (HTTP 400), carrying `message`.
+fn invalid_request(message: String) -> StartCommandExecutionError {
+    StartCommandExecutionErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
 /// The thing name `target_arn` names, as the device whose queue the execution is
 /// enqueued on. `targetArn` is documented as "the ARN of the device where the
 /// command execution is occurring", i.e. `arn:<partition>:iot:<region>:<account>:thing/<name>`;
-/// anything that is not a well-formed thing ARN is refused with the modeled
-/// `ValidationException`.
+/// anything else is refused with the modeled `ValidationException`, whose message
+/// reads the supplied value back ([`unsupported_target_message`]).
 fn thing_name_from_target_arn(target_arn: &str) -> Result<String, StartCommandExecutionError> {
     let invalid = |why: &str| -> StartCommandExecutionError {
-        StartCommandExecutionErrorModeled::ValidationException(ValidationException {
-            message: Some(format!("targetArn {why}")),
-        })
-        .into()
+        invalid_request(format!("targetArn {why}"))
     };
 
-    // 6 fields: arn:<partition>:<service>:<region>:<account-id>:<resource>. The
-    // resource keeps any colon of its own, so the split is bounded at 6.
-    let fields: Vec<&str> = target_arn.splitn(6, ':').collect();
-    let ["arn", _partition, service, _region, _account, resource] = fields.as_slice() else {
-        return Err(invalid("is not an Amazon Resource Name"));
+    // A target is a resource of THIS service: another vendor's ARN, or a value that
+    // is not a resource ARN at all, names no IoT resource type, so it is read back as
+    // the value it is — saying "Resource type thing not supported" for
+    // `arn:aws:s3:…:thing/x` would name a type that IS supported.
+    let Some(resource_type) = iot_resource_type(target_arn) else {
+        return Err(invalid_request(invalid_target_arn_message(target_arn)));
     };
-    if *service != "iot" {
-        return Err(invalid("must name an iot resource"));
-    }
-    let Some(thing_name) = resource.strip_prefix("thing/") else {
-        return Err(invalid("must name a thing, as arn:<partition>:iot:<region>:<account>:thing/<name>"));
+    // An IoT THING is the only resource type an execution can target, so every other
+    // type of this service is refused with the type the request named. A `thing` ARN
+    // that carries no name after the type — neither `thing` nor `thing/` names a
+    // thing — is read back as the value it is rather than as an unsupported type.
+    let Some(thing_name) =
+        ::service_common::arn::resource_id_of_type(target_arn, THING_RESOURCE_TYPE)
+            .filter(|thing_name| !thing_name.is_empty())
+    else {
+        return Err(invalid_request(if resource_type == THING_RESOURCE_TYPE {
+            invalid_target_arn_message(target_arn)
+        } else {
+            unsupported_target_type_message(resource_type)
+        }));
     };
     // The ARN's resource segment has to satisfy `ThingName` for the execution to be
     // reachable through the `/things/{thingName}` operations. The rule is the shared
@@ -136,27 +210,27 @@ fn thing_name_from_target_arn(target_arn: &str) -> Result<String, StartCommandEx
     Ok(thing_name.to_string())
 }
 
-/// `commandArn` is documented as `arn:aws:iot:<region>:<accountid>:command/<commandName>`;
-/// refuse anything else with the modeled `ValidationException`.
-fn validate_command_arn(command_arn: &str) -> Result<(), StartCommandExecutionError> {
-    let fields: Vec<&str> = command_arn.splitn(6, ':').collect();
-    let valid = match fields.as_slice() {
-        ["arn", _partition, "iot", _region, _account, resource] => resource
-            .strip_prefix("command/")
-            .is_some_and(|name| !name.is_empty()),
-        _ => false,
-    };
-    if valid {
-        Ok(())
-    } else {
-        Err(StartCommandExecutionErrorModeled::ValidationException(ValidationException {
-            message: Some(
+/// The command name `command_arn` names. `commandArn` is documented as
+/// `arn:aws:iot:<region>:<accountid>:command/<commandName>`, so anything else is
+/// refused with the modeled `ValidationException`.
+fn command_name_from_arn(command_arn: &str) -> Result<&str, StartCommandExecutionError> {
+    iot_resource_type(command_arn)
+        .filter(|resource_type| *resource_type == COMMAND_RESOURCE_TYPE)
+        .and_then(|_| ::service_common::arn::resource_id_of_type(command_arn, COMMAND_RESOURCE_TYPE))
+        .filter(|command_name| !command_name.is_empty())
+        .ok_or_else(|| {
+            invalid_request(
                 "commandArn must name a command, as arn:<partition>:iot:<region>:<account>:command/<name>"
                     .to_string(),
-            ),
+            )
         })
-        .into())
-    }
+}
+
+/// The 400 message the service builds when `commandArn` names a command that does
+/// not exist. Request-derived, like every other refusal here: it names the command
+/// the ARN named.
+fn command_not_found_message(command_name: &str) -> String {
+    format!("The command {command_name} was not found.")
 }
 
 /// One command parameter as JSON, keyed by the member the model names on the wire
@@ -314,17 +388,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `ctx` carries request metadata only; this operation needs none of it.
         let _ = ctx;
+        let unavailable = |what: &str| -> StartCommandExecutionError {
+            StartCommandExecutionErrorModeled::InternalServerException(InternalServerException {
+                message: Some(format!("the {what} is unavailable")),
+            })
+            .into()
+        };
         let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(StartCommandExecutionErrorModeled::InternalServerException(
-                InternalServerException {
-                    message: Some("the job execution store is unavailable".to_string()),
-                },
-            )
-            .into());
+            return Err(unavailable("job execution store"));
         };
 
         let thing_name = thing_name_from_target_arn(&input.target_arn)?;
-        validate_command_arn(&input.command_arn)?;
+        let command_name = command_name_from_arn(&input.command_arn)?;
+
+        // An execution can only be started for a command that EXISTS: "using the
+        // command created with the CreateCommand API, start a command execution on
+        // a specific device". Commands are owned by the IoT control plane, so the
+        // store that answers it is the shared command index — never this
+        // operation's own guess from the ARN's form, which says nothing about
+        // whether the command was ever created.
+        let Some(commands) = crate::state::command_registry(&*self.engine) else {
+            return Err(unavailable("command registry"));
+        };
+        let command_exists = commands.lock().contains(&input.command_arn);
+        if !command_exists {
+            return Err(invalid_request(command_not_found_message(command_name)));
+        }
 
         let parameters = parameters_json(input.parameters.as_ref());
         let document = job_document(&input.command_arn, &parameters);

@@ -34,11 +34,20 @@ pub(crate) const ACCOUNT: &str = "000000000000";
 /// A fresh emulator holding only this service, with request authentication off (these
 /// tests exercise behaviour, not signing).
 pub(crate) fn emulator() -> MultiServiceRouter {
+    emulator_with_engine().0
+}
+
+/// [`emulator`], plus the shared engine the service was built from.
+///
+/// A suite that has to read or write what the emulator itself stored — the instant a
+/// transition the clock owes falls due, say — needs that handle; this is the one router
+/// builder, so the two forms cannot drift apart.
+pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    (router, engine)
 }
 
 /// A SigV4 `Authorization` whose credential scope routes the request to `mediapackage`

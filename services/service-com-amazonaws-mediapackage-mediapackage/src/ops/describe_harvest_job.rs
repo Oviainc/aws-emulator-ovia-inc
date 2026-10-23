@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeHarvestJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeHarvestJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the stored HarvestJob the request's `Id` names, rendered from that one record;
+//! an id this service holds no job for is `NotFoundException` (404).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeHarvestJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reporting only: the one write it makes is through `settle_harvest_jobs`, which
+//! materialises the status transition the clock had already made due — owed at the same
+//! instant whether or not anybody read the job.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +158,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeHarvestJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeHarvestJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeHarvestJob"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeHarvestJobErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the mediapackage state store is unavailable".into()),
+                },
+            )
+        })?;
+        let mut state = state.lock();
+        // Reporting only: this materialises the status transitions the clock had already
+        // made due, so a read reports what the clock decided and advances nothing itself.
+        state.settle_harvest_jobs(std::time::SystemTime::now());
+
+        let Some(record) = state.harvest_jobs.get(&input.id) else {
+            return Err(crate::state::harvest_job_not_found(&input.id).into());
+        };
+
+        let job = record.to_harvest_job();
+        Ok(DescribeHarvestJobOutput {
+            arn: job.arn,
+            channel_id: job.channel_id,
+            created_at: job.created_at,
+            end_time: job.end_time,
+            id: job.id,
+            origin_endpoint_id: job.origin_endpoint_id,
+            s3_destination: job.s3_destination,
+            start_time: job.start_time,
+            status: job.status,
+        })
     }
 }

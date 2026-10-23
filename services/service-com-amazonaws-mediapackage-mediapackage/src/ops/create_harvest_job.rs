@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateHarvestJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateHarvestJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Submits a HarvestJob: it resolves `OriginEndpointId` against the stored origin
+//! endpoints, mints the job's ARN, and persists the record `DescribeHarvestJob` and
+//! `ListHarvestJobs` then report. The job's `ChannelId` is read off the STORED endpoint
+//! (the request carries none), so it is computed from state rather than echoed.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateHarvestJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The submitted job starts `IN_PROGRESS` and leaves it only when the clock makes that
+//! transition due — see [`crate::state::HARVEST_SETTLE_AFTER`] and
+//! [`crate::state::HARVEST_OUTCOME`] for the span and the terminal status, and
+//! `settle_harvest_jobs` on the state struct for where it is materialised.
+//!
+//! ## What this handler deliberately does NOT decide about the harvest window
+//!
+//! `StartTime` and `EndTime` are modelled as plain `__string` with no `@pattern`, no
+//! `@timestampFormat` and no relation between them
+//! (`smithy_query(query="operation",operation="CreateHarvestJob",…)`), so this handler
+//! length-bounds them and stores them as sent. Whether MediaPackage refuses an
+//! unparseable instant, an inverted window (`EndTime` before `StartTime`) or a window
+//! outside the endpoint's startover period — and with which of its modelled 422 reasons —
+//! is a NEGATIVE-class rule about accepted input, which this service tracks in its own
+//! issue (`mediapackage-control-plane-negative-class-rejections-missing-…`) for every
+//! operation at once rather than per handler: one handler guessing a rejection the others
+//! do not apply is the drift that issue exists to remove. Nothing downstream here depends
+//! on the window being ordered — no harvest runs (see `HARVEST_OUTCOME`) — so storing it
+//! verbatim reports exactly what the caller submitted.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +184,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateHarvestJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateHarvestJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateHarvestJob"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateHarvestJobErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the mediapackage state store is unavailable".into()),
+                },
+            )
+        })?;
+        let mut state = state.lock();
+        // The clock, not this call, moves a submitted job's status: materialise first
+        // what was already due, so the duplicate-id rule below and the response are
+        // decided against the jobs as the clock has left them.
+        let now = std::time::SystemTime::now();
+        state.settle_harvest_jobs(now);
+
+        // Bound what the caller may make this record cost, before anything is stored: the
+        // store copies these strings verbatim, so one request must not decide how much
+        // memory its record occupies. Each refusal is this service's own envelope, keyed
+        // by the member path the wire names.
+        for (member, value) in [
+            ("id", &input.id),
+            ("originEndpointId", &input.origin_endpoint_id),
+            ("startTime", &input.start_time),
+            ("endTime", &input.end_time),
+            ("s3Destination.bucketName", &input.s3_destination.bucket_name),
+            ("s3Destination.manifestKey", &input.s3_destination.manifest_key),
+            ("s3Destination.roleArn", &input.s3_destination.role_arn),
+        ] {
+            crate::state::bound_chars(member, value, crate::state::MAX_STRING_CHARS)?;
+        }
+
+        // A HarvestJob harvests ONE origin endpoint: an `OriginEndpointId` naming no
+        // stored endpoint has nothing to harvest, so the job is not created. This is a
+        // value in the REQUEST the caller has to fix — not a resource the request
+        // addressed — so it is `UnprocessableEntityException` (422) keyed by the member,
+        // exactly as `CreateOriginEndpoint` answers an unresolvable `channelId`.
+        let Some(endpoint) = state.origin_endpoints.get(&input.origin_endpoint_id) else {
+            return Err(crate::state::member_not_found("originEndpointId").into());
+        };
+        // The channel harvested is the one the STORED endpoint packages; the request does
+        // not carry it and the response must not invent it.
+        let channel_id = endpoint.channel_id.clone();
+
+        // "The ID must be unique within the region and it cannot be changed after the
+        // HarvestJob is submitted": a second submit on an id already in use is refused,
+        // never an overwrite.
+        if state.harvest_jobs.contains_key(&input.id) {
+            return Err(crate::state::resource_already_exists(
+                crate::state::HARVEST_JOB_KIND,
+                &input.id,
+            )
+            .into());
+        }
+
+        // The store lives for the life of the process and only a submit adds to it, so it
+        // is capped by entry count; past the cap the resource limit is reported.
+        if state.harvest_jobs.len() >= crate::state::MAX_HARVEST_JOBS {
+            return Err(crate::state::resource_limit_reached(
+                crate::state::HARVEST_JOB_KIND,
+                crate::state::MAX_HARVEST_JOBS,
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let record = crate::state::HarvestJobRecord {
+            id: input.id.clone(),
+            arn: crate::state::harvest_job_arn(&region, &input.id),
+            channel_id,
+            origin_endpoint_id: input.origin_endpoint_id.clone(),
+            s3_destination: input.s3_destination.clone(),
+            start_time: input.start_time.clone(),
+            end_time: input.end_time.clone(),
+            created_at: crate::state::now_iso8601(),
+            status: crate::state::HARVEST_IN_PROGRESS.to_string(),
+            // The transition the clock owes the submitted job, stored as the instant it
+            // falls due; nothing sleeps for it and no read brings it forward.
+            next_status_due: Some((
+                now + crate::state::HARVEST_SETTLE_AFTER,
+                crate::state::HARVEST_OUTCOME,
+            )),
+        };
+        // `insert` + the read back below: the record returned is always the STORED one,
+        // and the id is free (refused as a duplicate above), so nothing is replaced.
+        let id = input.id.clone();
+        state.harvest_jobs.insert(id.clone(), record);
+        let stored = state
+            .harvest_jobs
+            .get(&id)
+            .expect("the record just inserted under this id");
+
+        // Rendered from the STORED record, so this response and every later
+        // DescribeHarvestJob/ListHarvestJobs are the same bytes.
+        let job = stored.to_harvest_job();
+        Ok(CreateHarvestJobOutput {
+            arn: job.arn,
+            channel_id: job.channel_id,
+            created_at: job.created_at,
+            end_time: job.end_time,
+            id: job.id,
+            origin_endpoint_id: job.origin_endpoint_id,
+            s3_destination: job.s3_destination,
+            start_time: job.start_time,
+            status: job.status,
+        })
     }
 }

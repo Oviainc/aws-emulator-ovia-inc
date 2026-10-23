@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
+use service_com_amazonaws_iotjobsdataplane_iotlaserthingjobmanagerexternalservice::state::command_registry;
 use service_com_amazonaws_iotjobsdataplane_iotlaserthingjobmanagerexternalservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -48,6 +49,16 @@ struct Emulator {
 impl Emulator {
     fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        // `StartCommandExecution` starts an execution only for a command that
+        // EXISTS. Commands are control-plane resources (`iot:CreateCommand`, a
+        // scaffold in its own crate under its own issue), so the shared index they
+        // are registered in is seeded here with the one command these tests start
+        // — the same write that create makes.
+        command_registry(&*engine)
+            .expect("the shared IoT command index")
+            .lock()
+            .register(COMMAND_ARN)
+            .expect("register the command these tests start");
         let mut router = MultiServiceRouter::new();
         // These tests exercise handler behaviour, not request signing.
         router.set_request_authentication(false);

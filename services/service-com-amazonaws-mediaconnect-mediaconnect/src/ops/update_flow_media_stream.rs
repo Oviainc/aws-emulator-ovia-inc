@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateFlowMediaStream
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateFlowMediaStream`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Applies the settings the request carries to ONE stored media stream of an existing flow
+//! and answers with that stored record read back, so DescribeFlow reports exactly what this
+//! operation wrote.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateFlowMediaStream::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The operation is a PARTIAL update (`@idempotent`, every input member but `FlowArn` and
+//! `MediaStreamName` optional): a member the request carries replaces that setting on the
+//! stored media stream and a member it omits leaves the stored setting untouched — the same
+//! rule UpdateFlow applies to a flow's own settings and UpdateFlowOutput to an output's.
+//! `Attributes` arrives as the request-only `MediaStreamAttributesRequest` wrapper and is
+//! merged member by member into the media stream's `MediaStreamAttributes` through
+//! [`crate::state::merged_media_stream_attributes`], the crate's one merge of that shape.
+//!
+//! The media stream is addressed by its `MediaStreamName` WITHIN the flow the request names
+//! — the name is its identity inside the flow and no two media streams of one flow share
+//! one ([`crate::state::media_stream_rejection`]) — so a name no media stream of that flow
+//! carries resolves nothing and is refused with the modelled `NotFoundException`.
+//!
+//! `Fmt`, `MediaStreamId` and `MediaStreamName` are the stream's service-assigned or
+//! addressing identity and no input member names them, so an update never moves them. The
+//! clock rate a stream reports when no request has ever named one follows the type, through
+//! [`crate::state::default_clock_rate`], so a stream whose type this call changes reports
+//! the rate the model documents for its new type.
 //!
 //! ## Shape of an operation
 //!
@@ -91,6 +104,17 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// Refuse the request with `NotFoundException` (HTTP 404): "one or more of the resources
+/// in the request does not exist in the system" — the flow or the media stream
+/// `identifier` addressed, in this service's not-found envelope
+/// ([`crate::state::not_found_message`]).
+fn not_found(identifier: &str) -> UpdateFlowMediaStreamError {
+    UpdateFlowMediaStreamErrorModeled::NotFoundException(NotFoundException {
+        message: crate::state::not_found_message(identifier),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -164,18 +188,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateFlowMediaStream` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFlowMediaStreamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateFlowMediaStream"))
+        // Nothing in this operation's answer depends on request metadata: every setting
+        // comes off `input`, and the response is the stored record read back.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateFlowMediaStreamErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: "the mediaconnect flow store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The only write this operation owes beyond the request: a status change the clock
+        // already made due is materialised before the flow is read or written.
+        store.settle_due_transitions(now);
+
+        // The media stream updated is the one of THIS flow's media streams that carries the
+        // requested name — the flow first, so a flow the store does not hold is answered
+        // for the flow it named rather than for the media stream.
+        let Some(flow) = store.flows.get_mut(&input.flow_arn) else {
+            return Err(not_found(&input.flow_arn));
+        };
+        // The ARN the flow is stored under, read before the stream below borrows the flow:
+        // the response names the flow out of the STORE rather than out of the request.
+        let flow_arn = flow.flow_arn.clone();
+        let Some(stored) = flow
+            .media_streams
+            .iter_mut()
+            .find(|stream| stream.stream.media_stream_name == input.media_stream_name)
+        else {
+            return Err(not_found(&input.media_stream_name));
+        };
+
+        // What each setting becomes once this request is applied: the request's value where
+        // it carries one, the stored value where it does not. The stream's `Fmt`, its
+        // `MediaStreamId` and its name are its identity and no input member names them, so
+        // an update never moves them; the flow's status is left to the clock, exactly as
+        // UpdateFlow and UpdateFlowOutput leave it.
+        if let Some(media_stream_type) = input.media_stream_type.clone() {
+            stored.stream.media_stream_type = media_stream_type;
+        }
+        if let Some(description) = input.description.clone() {
+            stored.stream.description = Some(description);
+        }
+        if let Some(video_format) = input.video_format.clone() {
+            stored.stream.video_format = Some(video_format);
+        }
+        if let Some(attributes) = input.attributes.as_ref() {
+            stored.stream.attributes = Some(crate::state::merged_media_stream_attributes(
+                stored.stream.attributes.as_ref(),
+                attributes,
+            ));
+        }
+        // The rate the request names, else the one the stream already reports, else the one
+        // the model documents for the type it now has — so a stream that has never carried
+        // a rate reports its type's documented rate, and one that has keeps it.
+        stored.stream.clock_rate = input.clock_rate.or(stored.stream.clock_rate).or_else(|| {
+            crate::state::default_clock_rate(&stored.stream.media_stream_type)
+        });
+
+        // "The media stream that you updated" — read back out of the STORE, never echoed
+        // from the request, so the response is what DescribeFlow will report.
+        Ok(UpdateFlowMediaStreamOutput {
+            media_stream: Some(stored.to_media_stream()),
+            flow_arn: Some(flow_arn),
+        })
     }
 }

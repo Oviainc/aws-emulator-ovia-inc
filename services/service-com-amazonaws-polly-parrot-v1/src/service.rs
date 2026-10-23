@@ -183,6 +183,11 @@ pub mod errors {
     /// OBSERVED: `MarksNotSupportedForFormatException`.
     pub const MARKS_NOT_SUPPORTED_FOR_FORMAT: &str =
         "Speech marks are not supported for this format";
+    /// OBSERVED: `MaxLexemeLengthExceededException`. Amazon Polly words this one about
+    /// the LEXEME RULE, not about "the maximum size of the lexeme" the model's
+    /// documentation prose for the shape uses: the documentation of an error shape is
+    /// not the sentence the service puts on the wire for that code.
+    pub const MAX_LEXEME_LENGTH_EXCEEDED: &str = "Lexeme rule length has been exceeded";
     /// OBSERVED: `MaxLexiconsNumberExceededException`.
     pub const MAX_LEXICONS_NUMBER_EXCEEDED: &str = "Max lexicon number has been exceeded";
     /// OBSERVED: `SsmlMarksNotSupportedForTextTypeException`.
@@ -192,9 +197,6 @@ pub mod errors {
     pub const TEXT_LENGTH_EXCEEDED: &str = "Maximum text length has been exceeded";
     /// OBSERVED: `UnsupportedPlsLanguageException`.
     pub const UNSUPPORTED_PLS_LANGUAGE: &str = "Unsupported PLS language";
-    /// The model's own sentence for `MaxLexemeLengthExceededException`.
-    pub const MAX_LEXEME_LENGTH_EXCEEDED: &str =
-        "The maximum size of the lexeme would be exceeded by this operation.";
     /// The model's own sentence for `LanguageNotSupportedException`.
     pub const LANGUAGE_NOT_SUPPORTED: &str =
         "The language specified is not currently supported by Amazon Polly in this capacity.";

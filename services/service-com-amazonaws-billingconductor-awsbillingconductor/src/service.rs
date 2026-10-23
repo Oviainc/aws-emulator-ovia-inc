@@ -21,7 +21,7 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — EDITED HERE. The key and the handler stay the generated
-//!   table's; the operation is served through [`ModelledValidation`], which states a
+//!   table's; the operation is served through [`PreHandlerChecks`], which states a
 //!   request refused for violating a modelled constraint in THIS service's own
 //!   `ValidationException`. See "Why this file validates input" below.
 //! - `override_refusal` — EDITED HERE. A refusal the framework still renders (one with
@@ -59,7 +59,7 @@
 //! string and cannot tell which constrained member it got wrong — a bad ARN from a bad
 //! account id.
 //!
-//! [`ModelledValidation`] closes that gap: `override_operation` routes every modelled
+//! [`PreHandlerChecks`] closes that gap: `override_operation` routes every modelled
 //! operation through it, it asks the framework's OWN boundary walk — read the request
 //! into the operation's input shape, then run the model's constraint traits over what
 //! was read (`aws_smithy_schema_server::constraints::validate`, the same call the
@@ -73,6 +73,44 @@
 //! `<N> validation error(s) detected: ` over one clause per failing member, joined with
 //! `; `. The clause rules, the clause ORDER and the envelope live in [`validation`], so
 //! this file holds the seam and that module holds the words.
+//!
+//! ## Why this file authorizes the caller
+//!
+//! Billing Conductor is a PAYER-ACCOUNT-ONLY API: its control plane is authorized for
+//! the payer (management) account of the consolidated billing family alone, and a call
+//! from any other account is refused HTTP 403 `AccessDeniedException` — the shape the
+//! model lists as a COMMON error of every operation of this service, with a `@required
+//! Message` built from the request (the calling account and the operation name, see
+//! [`crate::state::not_payer_account`]).
+//!
+//! The decision is reached from the CALLER alone, so it precedes everything the request
+//! SAYS: the operation's own semantic validation (a grouping it will not accept), its
+//! resource lookups (a plan or a group that exists nowhere) and its dispatch — an
+//! operation nobody has implemented yet is denied rather than answered with the
+//! scaffold's 501.
+//!
+//! One refusal still comes BEFORE it: the boundary's modelled-constraint refusal above.
+//! That is the recorded order, not a convenience — the same recorded callers that are
+//! denied 403 on a conforming request are answered 400 `ValidationException` when a
+//! member breaks its modelled `@pattern` (`UpdateBillingGroup`, `DeleteBillingGroup`,
+//! `AssociateAccounts`, `DisassociateAccounts`, `GetBillingGroupCostReport` and the
+//! batch association operations are all recorded both ways), because a constraint the
+//! model declares is refused by the front door, ahead of the service code that reads who
+//! is calling. So this file runs the two checks in that order, in ONE place every
+//! operation shares rather than in 34 handlers: constraint refusal (400), then caller
+//! authorization (403), then the operation.
+//!
+//! The decision itself lives in state beside the resources, as
+//! [`crate::state::ComAmazonawsBillingconductorAwsbillingconductorState::payer_account_id`]:
+//! this emulator records no organization, so no account is the payer and the control
+//! plane is reachable by nobody — which is exactly what AWS answers the non-payer
+//! callers every recorded response was taken from.
+//!
+//! The TAGGING operations are not on that gate (`PAYER_UNGATED_OPERATIONS`): a
+//! recorded `TagResource` call from a non-payer account against a billing-group ARN
+//! that names no resource is answered by resource resolution (HTTP 404), not by the
+//! payer gate, so this service's tag operations resolve their `ResourceArn` and answer
+//! from the store like any other read or write.
 
 pub mod validation;
 
@@ -80,8 +118,10 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use aws_smithy_runtime_api::http::{Response as RtResponse, StatusCode};
 use aws_smithy_schema::serde::SerdeError;
 use aws_smithy_schema_server::constraints::{self, Violation, ViolationKind};
+use aws_smithy_types::body::SdkBody;
 use smithy_server_runtime::{
     http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, OperationContext, Refusal,
     Refused, ServerHttpProtocol, Service,
@@ -100,6 +140,32 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 /// `ValidationException`'s own `@httpError(400)`.
 const VALIDATION_EXCEPTION_STATUS: u16 = 400;
 
+/// The wire error code (`__type` / `x-amzn-errortype`) of this service's
+/// caller-authorization refusal: the shape the model lists as a COMMON error of every
+/// operation for "You do not have sufficient access to perform this action", and the
+/// same name a handler-returned `AccessDeniedException` carries.
+const ACCESS_DENIED_EXCEPTION: &str = "AccessDeniedException";
+
+/// The status an authorization refusal is served on: `AccessDeniedException`'s own
+/// `@httpError(403)`.
+const ACCESS_DENIED_EXCEPTION_STATUS: u16 = 403;
+
+/// The operations of this service that are NOT gated on the payer account.
+///
+/// The tag operations address their target by ARN and are answered by resolving it:
+/// a recorded `TagResource` from a non-payer account naming a billing-group ARN that
+/// exists nowhere is answered 404 "Resource was not found", which a payer gate ahead of
+/// resolution could never produce. Everything else — every create, update, delete,
+/// association and list of the control plane — is gated.
+pub const PAYER_UNGATED_OPERATIONS: &[&str] =
+    &["ListTagsForResource", "TagResource", "UntagResource"];
+
+/// Whether AWS gates `operation` on the caller being the payer account. See
+/// [`PAYER_UNGATED_OPERATIONS`].
+fn is_payer_gated(operation: &str) -> bool {
+    !PAYER_UNGATED_OPERATIONS.contains(&operation)
+}
+
 /// The `com-amazonaws-billingconductor-awsbillingconductor` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -107,10 +173,11 @@ const VALIDATION_EXCEPTION_STATUS: u16 = 400;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
-    /// One [`ModelledValidation`] per modelled operation, keyed by the routing key the
+    /// One [`PreHandlerChecks`] per modelled operation, keyed by the routing key the
     /// model names that operation by ([`Operation::NAME`], the same key the generated
-    /// routing table uses). Built once here, never per request; each entry is
-    /// zero-sized, so this is a table of names, not a second set of operations.
+    /// routing table uses). Built once here, never per request; each entry holds the
+    /// shared engine and the operation's TYPE, so this is a table of names, not a second
+    /// set of operations and not a second store.
     refusals: HashMap<&'static str, Box<dyn ErasedOperation>>,
 }
 
@@ -120,13 +187,15 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
+            refusals: pre_handler_check_table::<Eng>(&engine),
             entry: crate::ServiceDefinition::new(engine),
-            refusals: modelled_validation_table::<Eng>(),
         }
     }
 }
 
-/// The modelled-refusal wrapper for EVERY operation this service serves.
+/// The PRE-HANDLER checks of this service, keyed by the routing key the model names each
+/// operation by: one wrapper per operation, each running the modelled-constraint refusal
+/// and then the payer-account authorization gate ahead of the operation itself.
 ///
 /// A constraint is a property of the INPUT SHAPE and `ValidationException` is a common
 /// error of every operation of this service, so the wrapper goes in front of all of
@@ -134,23 +203,34 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 /// serve and the modelled 400 for one no operation could, which is the order the real
 /// service evaluates them in.
 ///
-/// An operation left out of this list keeps the framework's generic envelope — the defect
-/// this wrapper removes — so the list is not left to review: the
-/// `every_modelled_operation_is_validated_in_the_modelled_shape` test in
+/// `AccessDeniedException` is a common error of every operation too, and the gate that
+/// raises it is decided from the CALLER, so it is wired from the same one list of
+/// operations ([`is_payer_gated`] names the exceptions) rather than from a second list
+/// that could drift from it.
+///
+/// An operation left out of this list keeps the framework's generic envelope and no gate
+/// at all — the defects these checks remove — so the list is not left to review:
+/// `every_modelled_operation_is_validated_in_the_modelled_shape` in
 /// `tests/all/validation_messages.rs` drives every operation the model declares and fails
-/// when one of them is not served through the wrapper.
-fn modelled_validation_table<Eng: Send + Sync + 'static>(
+/// when one of them is not served through the wrapper, and
+/// `every_payer_gated_operation_denies_a_caller_that_is_not_the_payer_account` in
+/// `tests/all/payer_account_gate.rs` fails when one of them is not gated.
+fn pre_handler_check_table<Eng: Send + Sync + 'static>(
+    engine: &Arc<Eng>,
 ) -> HashMap<&'static str, Box<dyn ErasedOperation>> {
     let mut refusals: HashMap<&'static str, Box<dyn ErasedOperation>> = HashMap::new();
     macro_rules! register {
         ($($module:ident :: $operation:ident),+ $(,)?) => {
-            $(
+            $({
+                let name = <crate::ops::$module::$operation<Eng> as Operation>::NAME;
                 refusals.insert(
-                    <crate::ops::$module::$operation<Eng> as Operation>::NAME,
-                    Box::new(ModelledValidation::<crate::ops::$module::$operation<Eng>>::new())
-                        as Box<dyn ErasedOperation>,
+                    name,
+                    Box::new(PreHandlerChecks::<crate::ops::$module::$operation<Eng>, Eng>::new(
+                        Arc::clone(engine),
+                        is_payer_gated(name),
+                    )) as Box<dyn ErasedOperation>,
                 );
-            )+
+            })+
         };
     }
     register!(
@@ -214,19 +294,24 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Serve every modelled operation through its [`ModelledValidation`] wrapper, so
-        // a request refused before the handler runs is stated in this service's OWN
-        // modelled `ValidationException` — whose `@required Message` member is what puts
-        // `$.Message` in the body — instead of the framework's generic envelope. The
-        // wrapper delegates a request the model accepts to the generated operation in
-        // the routing table, which stays the only thing that serves it.
+        // Serve every modelled operation through its [`PreHandlerChecks`] wrapper, so a
+        // request refused before the handler runs is stated in this service's OWN
+        // modelled shapes — the `ValidationException` whose `@required Message` member
+        // puts `$.Message` in the body, and the `AccessDeniedException` the
+        // payer-account gate raises — instead of the framework's generic envelope or no
+        // refusal at all. The wrapper delegates a request that passes both checks to the
+        // generated operation in the routing table, which stays the only thing that
+        // serves it.
+        //
+        // A request that names no modelled operation has nothing to validate and nothing
+        // to authorize: the routing failure is the answer it gets.
         let key = self.entry.protocol().routing_key(req).ok()?;
         self.refusals.get(key).map(|wrapper| &**wrapper)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The FALLBACK path: a refusal of a request that named a modelled operation is
-        // answered by [`ModelledValidation`] above, in the modelled shape. What still
+        // answered by [`PreHandlerChecks`] above, in the modelled shape. What still
         // arrives here is a refusal with no modelled operation to read the request
         // against — a body the codec could not read at all, say. It is still this
         // service's `ValidationException` (HTTP 400) and still carries the clause that
@@ -275,28 +360,38 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 }
 
-/// One modelled operation, wrapped so a request this service refuses BEFORE the handler
-/// runs is answered in its own modelled `ValidationException` rather than the
-/// framework's generic envelope.
+/// One modelled operation, wrapped so the two checks that precede its handler are run
+/// where every operation shares them: the modelled-constraint refusal, answered in this
+/// service's own `ValidationException` rather than the framework's generic envelope, and
+/// then the payer-account authorization gate, answered in its modelled
+/// `AccessDeniedException`.
 ///
-/// Zero-sized: the wrapper holds no engine and no operation. It carries the operation
-/// TYPE, which is all it needs — the input shape to read the request into and the input
-/// `Schema` to validate it against — and delegates a request the model accepts to the
-/// one operation instance the generated routing table built from the shared engine.
-/// There is therefore no second instance of any operation and no second store.
-struct ModelledValidation<Op> {
+/// Holds no operation: it carries the operation TYPE, which is all the first check needs
+/// (the input shape to read the request into and the input `Schema` to validate it
+/// against), and delegates a request that passes both to the one operation instance the
+/// generated routing table built from the shared engine. There is therefore no second
+/// instance of any operation. The `engine` field is the SAME `Arc` the generated entry
+/// holds — never a second store — and is what lets the gate read the payer account out
+/// of this service's state before the handler runs.
+struct PreHandlerChecks<Op, Eng> {
+    engine: Arc<Eng>,
+    /// Whether AWS gates this operation on the caller being the payer account
+    /// ([`is_payer_gated`]), decided once at construction from the operation's name.
+    payer_gated: bool,
     operation: PhantomData<fn() -> Op>,
 }
 
-impl<Op> ModelledValidation<Op> {
-    const fn new() -> Self {
+impl<Op, Eng> PreHandlerChecks<Op, Eng> {
+    const fn new(engine: Arc<Eng>, payer_gated: bool) -> Self {
         Self {
+            engine,
+            payer_gated,
             operation: PhantomData,
         }
     }
 }
 
-impl<Op: Operation> ErasedOperation for ModelledValidation<Op> {
+impl<Op: Operation, Eng: Send + Sync + 'static> ErasedOperation for PreHandlerChecks<Op, Eng> {
     fn run<'r>(
         &'r self,
         svc: &'r dyn Service,
@@ -318,7 +413,13 @@ impl<Op: Operation> ErasedOperation for ModelledValidation<Op> {
                     VALIDATION_EXCEPTION_STATUS,
                 ) {
                     Ok(response) => {
-                        record_refusal::<Op>(ctx, started.elapsed());
+                        record_refusal(
+                            ctx,
+                            Op::NAME,
+                            VALIDATION_EXCEPTION,
+                            VALIDATION_EXCEPTION_STATUS,
+                            started.elapsed(),
+                        );
                         return response;
                     }
                     // A modelled error that will not serialize leaves the request to
@@ -333,9 +434,22 @@ impl<Op: Operation> ErasedOperation for ModelledValidation<Op> {
                     ),
                 }
             }
-            // Nothing to reword: the request is served by the generated operation,
-            // which runs the whole framework sequence (deserialize, validate, handle,
-            // serialize) over the same bytes.
+            // THE AUTHORIZATION GATE, after the boundary's constraint refusal and ahead
+            // of everything the operation does (see the module docs): Billing
+            // Conductor's control plane is the payer account's, so a conforming request
+            // from any other caller is denied 403 `AccessDeniedException` before the
+            // operation's own semantic checks, its resource lookups, and its dispatch —
+            // including the scaffold's 501.
+            //
+            // The request's auth schemes are unaffected: the router reads them off the
+            // MODELLED operation the routing key names, so a denial here is still only
+            // reached by a request whose signature verified.
+            if self.payer_gated && !crate::state::caller_is_payer_account(&*self.engine) {
+                return payer_account_denial(protocol, ctx, Op::NAME, started);
+            }
+            // Nothing to reword and nobody to deny: the request is served by the
+            // generated operation, which runs the whole framework sequence (deserialize,
+            // validate, handle, serialize) over the same bytes.
             match svc.definition().routing_table().get(Op::NAME) {
                 Some(operation) => operation.run(svc, req, ctx).await,
                 // Unreachable in practice: this wrapper is only reachable under the key
@@ -354,24 +468,97 @@ impl<Op: Operation> ErasedOperation for ModelledValidation<Op> {
     }
 }
 
-/// Record the refusal answered above as the operation row the framework sequence would
+/// The payer-account denial of one operation: HTTP 403 `AccessDeniedException` whose
+/// `Message` is built from the calling account and `operation`.
+///
+/// Reached only for a request already judged unauthorized by
+/// [`crate::state::caller_is_payer_account`].
+fn payer_account_denial(
+    protocol: &dyn ServerHttpProtocol,
+    ctx: &OperationContext<'_>,
+    operation: &'static str,
+    started: std::time::Instant,
+) -> aws_smithy_runtime_api::http::Response {
+    let exception = crate::state::not_payer_account(operation);
+    // Serialized through the service's own protocol, exactly as a handler-returned
+    // `AccessDeniedException` is: the same body member name (`Message`), the same
+    // `__type`, the same `x-amzn-errortype` header restJson1 resolves an error shape
+    // from, and the status the model declares for it.
+    match protocol.serialize_error(
+        &exception,
+        &crate::ops::types::SCHEMA_ACCESS_DENIED_EXCEPTION,
+        ACCESS_DENIED_EXCEPTION,
+        ACCESS_DENIED_EXCEPTION_STATUS,
+    ) {
+        Ok(response) => {
+            record_refusal(
+                ctx,
+                operation,
+                ACCESS_DENIED_EXCEPTION,
+                ACCESS_DENIED_EXCEPTION_STATUS,
+                started.elapsed(),
+            );
+            response
+        }
+        // An authorization decision never fails OPEN: a modelled error that will not
+        // serialize is still a denial, answered in this protocol's own envelope
+        // (`restJson1`: the 403, the error-type header and a JSON body) rather than by
+        // letting the request through to the operation.
+        Err(error) => {
+            tracing::warn!(
+                operation,
+                %error,
+                "the modelled AccessDeniedException would not serialize; this denial \
+                 falls back to a hand-built 403"
+            );
+            unserialized_denial(&exception.message)
+        }
+    }
+}
+
+/// The 403 a denial falls back to when the modelled shape will not serialize: the same
+/// status, the same wire error code and the same `Message`, in `restJson1`'s own
+/// envelope.
+fn unserialized_denial(message: &str) -> aws_smithy_runtime_api::http::Response {
+    let body = ::serde_json::json!({
+        "__type": ACCESS_DENIED_EXCEPTION,
+        "Message": message,
+    })
+    .to_string();
+    let status = StatusCode::try_from(ACCESS_DENIED_EXCEPTION_STATUS)
+        .expect("the modelled 403 is a valid HTTP status");
+    let mut response = RtResponse::new(status, SdkBody::from(body));
+    let headers = response.headers_mut();
+    headers.insert("content-type", "application/json");
+    headers.insert("x-amzn-errortype", ACCESS_DENIED_EXCEPTION);
+    response
+}
+
+/// Record a refusal answered above as the operation row the framework sequence would
 /// have recorded, so a refused request is not a hole in the telemetry series: the same
 /// classification (from this response's status and error shape), the same folded handle
 /// (this service's signing name and the operation's own name), and the same already
 /// sanitized request metadata. Everything is gated on a client collecting, exactly as
 /// the framework gates it.
-fn record_refusal<Op: Operation>(ctx: &OperationContext<'_>, latency: std::time::Duration) {
+fn record_refusal(
+    ctx: &OperationContext<'_>,
+    operation: &'static str,
+    error_code: &'static str,
+    status: u16,
+    latency: std::time::Duration,
+) {
     if !emulator_telemetry::recording_active() {
         return;
     }
-    let handle =
-        emulator_telemetry::OperationHandle::folded(ctx.identity().signing_name_static(), Op::NAME);
+    let handle = emulator_telemetry::OperationHandle::folded(
+        ctx.identity().signing_name_static(),
+        operation,
+    );
     emulator_telemetry::record_generated_operation_with_handle(
         &handle,
         latency,
         Some(emulator_telemetry::OperationFailure::classify(
-            VALIDATION_EXCEPTION_STATUS,
-            VALIDATION_EXCEPTION,
+            status, error_code,
         )),
         smithy_server_runtime::RequestTelemetry::from_headers(&ctx.parts().headers).into_metadata(),
     );

@@ -7,7 +7,14 @@
 //! them answer the same map.
 //!
 //! A `ResourceArn` naming no resource this service holds is answered 404 through
-//! [`crate::state::tagging_not_found`], the same way `TagResource` answers it.
+//! [`crate::state::tagging_not_found`], the same way `TagResource` answers it, and that
+//! member's `@pattern` is off the boundary (`skip_validation` on
+//! `ListTagsForResourceInput`) for the same recorded reason.
+//!
+//! This operation is NOT payer-account-gated
+//! (`crate::service::PAYER_UNGATED_OPERATIONS`). The response is BOUNDED by what the
+//! store holds, which `TagResource` caps at `crate::state::MAX_TAGS_PER_RESOURCE` pairs
+//! per resource.
 //!
 //! ## Shape of an operation
 //!
@@ -147,7 +154,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The modelled `ResourceArn` pattern is refused by the boundary before this runs.
+        // The `ResourceArn` pattern is NOT refused by the boundary (see this module's
+        // header), so the ARN is resolved here.
         let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListTagsForResourceErrorModeled::InternalServerException(

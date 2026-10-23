@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeApplicationProvider
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeApplicationProvider`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the built-in application provider an `ApplicationProviderArn`
+//! names, and refuses every other ARN. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeApplicationProvider::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An application provider is AWS's own, never a caller's: the model's
+//! `ApplicationProviderArn` pattern pins the owner segment to `aws`
+//! (`arn:aws…:sso::aws:applicationProvider/<id>`) and no operation of this service
+//! creates or deletes one. The set of them is therefore the fixed catalogue
+//! [`crate::state::BUILT_IN_APPLICATION_PROVIDERS`], which this read answers from; an
+//! ARN outside it names nothing, which is the modelled `ResourceNotFoundException`
+//! (404). The lookup is by provider ID, so the same provider resolves in every
+//! partition the pattern admits, and the ARN reported back is the one asked for.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +161,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeApplicationProvider` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeApplicationProviderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeApplicationProvider"))
+        let _ = (ctx, &self.engine);
+        // A pure READ of a fixed catalogue: there is no per-account state to reach, and
+        // nothing here writes.
+        let Some(provider) =
+            crate::state::built_in_application_provider(&input.application_provider_arn)
+        else {
+            return Err(
+                DescribeApplicationProviderErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "No application provider with arn '{}' was found",
+                            input.application_provider_arn
+                        )),
+                        // The model's `ResourceNotFoundExceptionReason` enum carries only
+                        // `KMS_NotFoundException`, which this is not.
+                        reason: None,
+                    },
+                )
+                .into(),
+            );
+        };
+        Ok(DescribeApplicationProviderOutput {
+            // The ARN as ASKED FOR: the catalogue is keyed by provider id, so the
+            // partition the caller named is the partition reported back.
+            application_provider_arn: input.application_provider_arn,
+            federation_protocol: Some(provider.federation_protocol.to_string()),
+            display_data: Some(provider.display_data()),
+            // `ResourceServerConfig` describes "the application provider's resource
+            // server" and its access scopes. The catalogue holds none, and inventing
+            // scope names would put values on the wire that no AWS rule produces, so
+            // the optional member is absent.
+            resource_server_config: None,
+        })
     }
 }

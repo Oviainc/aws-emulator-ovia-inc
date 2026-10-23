@@ -22,7 +22,11 @@ use crate::application_lifecycle::{Emulator, Reply};
 
 /// The modelled error code and status a constraint failure is answered with
 /// (`smithy_query(query="shape", shape="ValidationException")`: `@httpError 400`).
-const VALIDATION_EXCEPTION: &str = "ValidationException";
+///
+/// `pub(crate)` because `tests/all/pattern_violation_messages.rs` pins the SAME rule on
+/// the application-lookup operations: the two suites read one set of constants so they
+/// cannot drift on the expression each expects.
+pub(crate) const VALIDATION_EXCEPTION: &str = "ValidationException";
 
 // The patterns the model declares on the members exercised below, written out as
 // AWS reports them: the modelled expression with its OUTER anchors removed. Source:
@@ -34,7 +38,14 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 const NEXT_TOKEN_PATTERN: &str = ".{16,2048}";
 
 /// `ApplicationId`: modelled `^[\w\d\.-]+$`.
-const APPLICATION_ID_PATTERN: &str = r"[\w\d\.-]+";
+pub(crate) const APPLICATION_ID_PATTERN: &str = r"[\w\d\.-]+";
+
+/// `ComponentId`: modelled `^[\w\d-]+$`.
+pub(crate) const COMPONENT_ID_PATTERN: &str = r"[\w\d-]+";
+
+/// `DatabaseId`: modelled `[\w\d]+$` — a shape that spells only the END anchor, which is
+/// an outer one all the same.
+pub(crate) const DATABASE_ID_PATTERN: &str = r"[\w\d]+";
 
 /// `OperationId`: modelled `^[{]?[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}[}]?$`.
 const OPERATION_ID_PATTERN: &str =
@@ -57,7 +68,10 @@ const VALID_ARN: &str = "arn:aws:ssm-sap:us-east-1:123456789012:application/HDB-
 
 /// The `message` of a failure body: the framework's pre-dispatch envelope writes the
 /// member as `message`, a handler-raised modelled `ValidationException` as `Message`.
-fn message(reply: &Reply) -> String {
+///
+/// `pub(crate)` for the same reason as the constants above: one reading of a refusal's
+/// message for every suite of this target.
+pub(crate) fn message(reply: &Reply) -> String {
     reply
         .body
         .get("message")

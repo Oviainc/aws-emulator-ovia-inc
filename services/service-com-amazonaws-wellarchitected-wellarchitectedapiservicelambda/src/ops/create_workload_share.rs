@@ -312,7 +312,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .entry(input.workload_id.clone())
             .or_default()
             .insert(share_id.clone(), record);
-        store.create_workload_share_tokens.insert(
+        // Written through the ledger's bounded `remember`, which holds the remembered
+        // tokens at `MAX_REMEMBERED_REQUEST_TOKENS` by forgetting the oldest: the token is
+        // caller-chosen, so the ledger cannot be allowed to grow with the stream of them.
+        store.create_workload_share_tokens.remember(
             input.client_request_token,
             crate::state::CreateWorkloadShareToken {
                 workload_id: input.workload_id.clone(),

@@ -6,15 +6,22 @@
 //! Center instance, its permission sets and its account assignments. Handlers read and
 //! write them through [`service_state`] and project them onto the modeled shapes in
 //! `crate::ops::types`.
+//!
+//! An instance carries its KIND ([`InstanceType`]): an ACCOUNT instance (what
+//! `CreateInstance` creates, for a standalone account) serves no permission sets, so the
+//! whole permission-set / account-assignment surface is withdrawn on it — see
+//! [`ComAmazonawsSsoadminSwbexternalserviceState::permission_set_surface_withdrawn`] and
+//! [`ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE`], which every operation of that surface asks
+//! before looking anything up.
 
 use std::collections::BTreeMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    AccountAssignment, AccountAssignmentOperationStatus, InstanceMetadata, PermissionSet,
-    RegionMetadata, Tag, TrustedTokenIssuerConfiguration,
+    AccountAssignment, AccountAssignmentOperationStatus, DisplayData, InstanceMetadata,
+    PermissionSet, RegionMetadata, Tag, TrustedTokenIssuerConfiguration,
 };
 
 /// The identity-store instance every `InstanceArn`-taking operation resolves against.
@@ -45,13 +52,86 @@ pub const SEED_INSTANCE_NAME: &str = "IdentityCenter";
 /// ACTIVE`, and a seeded instance is ready, so it is `ACTIVE` and stays `ACTIVE`.
 pub const STATUS_ACTIVE: &str = "ACTIVE";
 
-/// Whether permission sets are enabled on the seeded instance.
+/// `InstanceStatus::CREATE_IN_PROGRESS` — the status a freshly created instance carries
+/// until the clock makes its activation due (see [`INSTANCE_ACTIVATION_SPAN`]).
+pub const STATUS_CREATE_IN_PROGRESS: &str = "CREATE_IN_PROGRESS";
+
+/// How long after `CreateInstance` the new instance's move from `CREATE_IN_PROGRESS` to
+/// `ACTIVE` falls due.
 ///
-/// They are: this service implements `CreatePermissionSet`, `DescribePermissionSet`,
-/// `ListPermissionSets` and the account-assignment operations against that instance, so
-/// reporting anything else from `DescribeInstance` would contradict what the instance
-/// actually serves.
-pub const SEED_PERMISSION_SETS_ENABLED: bool = true;
+/// AWS documents no duration for it, so this span is the emulator's own CHOSEN one: it
+/// is never zero, so a caller that reads the instance straight after creating it still
+/// observes the transient status the model declares, and it is short enough that the
+/// instance is usable within one test. It is stored as a due instant and materialised by
+/// [`ComAmazonawsSsoadminSwbexternalserviceState::materialize_due`] — nothing sleeps.
+pub const INSTANCE_ACTIVATION_SPAN: Duration = Duration::from_millis(500);
+
+/// Which KIND of IAM Identity Center instance a record is.
+///
+/// The distinction is AWS's: `CreateInstance` is documented as creating "an instance of
+/// IAM Identity Center for a standalone Amazon Web Services account that is not managed
+/// by Organizations or a member Amazon Web Services account in an organization" — an
+/// ACCOUNT instance — while the instance of an AWS Organizations organization is enabled
+/// through Organizations and not through this API. Multi-account permissions (permission
+/// sets, and the account assignments built from them) are a feature of the organization
+/// instance only, so the whole permission-set / account-assignment surface is withdrawn
+/// on an account instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstanceType {
+    /// An instance of a single standalone account: what `CreateInstance` creates.
+    Account,
+    /// The instance of an AWS Organizations organization.
+    Organization,
+}
+
+impl InstanceType {
+    /// Whether the permission-set / account-assignment surface is served on an instance
+    /// of this kind — which is exactly what `DescribeInstance$PermissionSetsEnabled`
+    /// ("Indicates whether permission sets are enabled for this Identity Center
+    /// instance") reports.
+    pub fn permission_sets_enabled(self) -> bool {
+        matches!(self, Self::Organization)
+    }
+}
+
+/// The kind of instance this emulator's account holds.
+///
+/// It is an ACCOUNT instance: nothing in this emulator models an AWS Organizations
+/// organization, so the account is the standalone account `CreateInstance`'s
+/// documentation describes, and the instance of such an account is an account instance.
+pub const SEED_INSTANCE_TYPE: InstanceType = InstanceType::Account;
+
+/// The refusal every operation of the permission-set / account-assignment surface
+/// answers with when the instance it resolves is an ACCOUNT instance, as the message of
+/// the modelled `ValidationException` (HTTP 400).
+///
+/// The 400/`ValidationException` classification is the requirement — a client that
+/// branches on the error must be able to tell "this instance type can never do
+/// assignments" from "the permission set is merely missing" (404) — and this is AWS's
+/// own wording for the restriction.
+pub const ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE: &str =
+    "This operation is not supported for account instances of IAM Identity Center.";
+
+/// The refusal `CreateInstance` answers with when the account already holds an
+/// instance, as the message of the modelled `ServiceQuotaExceededException` (HTTP 402).
+///
+/// The rule is the operation's own documentation: "You can create only one instance per
+/// account and across all Amazon Web Services Regions", and "The CreateInstance request
+/// is rejected if … An instance already exists in the same account".
+pub const INSTANCE_QUOTA_EXCEEDED_MESSAGE: &str =
+    "An instance of IAM Identity Center already exists in this account. Only one \
+     instance can be created per account, across all Amazon Web Services Regions.";
+
+/// The refusal a repeated `ClientToken` earns when the rest of the `CreateInstance`
+/// request differs from the call that token belongs to, as the message of the modelled
+/// `ConflictException` (HTTP 409).
+///
+/// The rule is the `ClientToken` member's own documentation: "Passing the same value to
+/// a later call to an operation requires that you also pass the same value for all other
+/// parameters".
+pub const CLIENT_TOKEN_MISMATCH_MESSAGE: &str =
+    "The ClientToken was already used for a CreateInstance request with different \
+     parameters.";
 
 /// `StatusValues::SUCCEEDED` — the terminal status of an assignment operation this
 /// emulator has already applied in full.
@@ -114,31 +194,120 @@ pub struct Instance {
     pub identity_store_id: String,
     pub identity_store_arn: String,
     pub owner_account_id: String,
-    pub name: String,
+    /// `InstanceMetadata$Name` — optional in the model, so an instance created without
+    /// one carries none rather than a name the service invented.
+    pub name: Option<String>,
     pub created_date: DateTime,
     pub status: String,
     pub primary_region: String,
     pub regions: Vec<Region>,
-    /// `DescribeInstance$PermissionSetsEnabled` — "Indicates whether permission sets
-    /// are enabled for this Identity Center instance". It is a property of the
-    /// instance, not of the request, so it is held here rather than decided per read;
-    /// `InstanceMetadata` (what `ListInstances` projects) carries no such member, so
-    /// only `DescribeInstance` reports it.
-    pub permission_sets_enabled: bool,
+    /// Account instance or organization instance: what decides whether the
+    /// permission-set / account-assignment surface is served on this instance, and
+    /// what `DescribeInstance$PermissionSetsEnabled` reports.
+    pub instance_type: InstanceType,
+    /// The `ClientToken` of the `CreateInstance` call that minted this instance, when
+    /// it sent one. The model marks that member `@idempotencyToken`, so a retry of the
+    /// same call must answer with this instance rather than refusing it as a duplicate.
+    pub client_token: Option<String>,
+    /// The tags `CreateInstance` attached to the instance.
+    pub tags: Vec<Tag>,
+    /// When the clock owes this instance its move out of `CREATE_IN_PROGRESS`, or `None`
+    /// for an instance that is already in a terminal status. Stored as a due INSTANT and
+    /// applied by [`Instance::materialize_due`]; nothing sleeps for it.
+    pub active_due: Option<SystemTime>,
 }
 
 impl Instance {
+    /// An instance in its terminal `ACTIVE` status, owned by the emulator's account and
+    /// enabled in [`SEED_REGION`] alone — what an instance looks like once its creation
+    /// has finished.
+    pub fn active(
+        instance_id: &str,
+        identity_store_id: &str,
+        instance_type: InstanceType,
+        name: Option<String>,
+        created_date: DateTime,
+    ) -> Self {
+        Self {
+            instance_arn: instance_arn(instance_id),
+            identity_store_id: identity_store_id.to_string(),
+            identity_store_arn: identity_store_arn(identity_store_id),
+            owner_account_id: ::engine::emulator_account_id().to_string(),
+            name,
+            created_date,
+            status: STATUS_ACTIVE.to_string(),
+            primary_region: SEED_REGION.to_string(),
+            regions: vec![Region {
+                region_name: SEED_REGION.to_string(),
+                status: STATUS_ACTIVE.to_string(),
+                added_date: created_date,
+                is_primary_region: true,
+            }],
+            instance_type,
+            client_token: None,
+            tags: Vec::new(),
+            active_due: None,
+        }
+    }
+
+    /// A just-created instance: `CREATE_IN_PROGRESS`, with its activation owed
+    /// [`INSTANCE_ACTIVATION_SPAN`] after `now`.
+    pub fn creating(
+        instance_id: &str,
+        identity_store_id: &str,
+        instance_type: InstanceType,
+        name: Option<String>,
+        now: SystemTime,
+    ) -> Self {
+        let mut instance = Self::active(
+            instance_id,
+            identity_store_id,
+            instance_type,
+            name,
+            DateTime::from(now),
+        );
+        instance.status = STATUS_CREATE_IN_PROGRESS.to_string();
+        for region in &mut instance.regions {
+            region.status = STATUS_CREATE_IN_PROGRESS.to_string();
+        }
+        instance.active_due = Some(now + INSTANCE_ACTIVATION_SPAN);
+        instance
+    }
+
+    /// Whether the permission-set / account-assignment surface is served on this
+    /// instance. `false` for an account instance, whose refusal is
+    /// [`ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE`].
+    pub fn permission_sets_enabled(&self) -> bool {
+        self.instance_type.permission_sets_enabled()
+    }
+
+    /// Apply what the CLOCK already owes this instance: an instance whose activation
+    /// instant has passed is `ACTIVE`, in every Region it holds. Idempotent, and it
+    /// changes nothing before the instant falls due, so a read that calls it answers
+    /// exactly what a read at the same instant would have answered without it.
+    pub fn materialize_due(&mut self, now: SystemTime) {
+        if self.active_due.is_some_and(|due| due <= now) {
+            self.active_due = None;
+            self.status = STATUS_ACTIVE.to_string();
+            for region in &mut self.regions {
+                region.status = STATUS_ACTIVE.to_string();
+            }
+        }
+    }
+
     /// This instance as the modeled `InstanceMetadata` shape.
     ///
     /// `StatusReason` is left absent: the model documents it as additional context for
-    /// an instance in a non-ACTIVE state, and there is none to give for an ACTIVE one.
+    /// an instance in a non-ACTIVE state, and there is none to give — a
+    /// `CREATE_IN_PROGRESS` instance is on its way to ACTIVE, which the status already
+    /// says.
     pub fn to_metadata(&self) -> InstanceMetadata {
         InstanceMetadata {
             instance_arn: Some(self.instance_arn.clone()),
             identity_store_id: Some(self.identity_store_id.clone()),
             identity_store_arn: Some(self.identity_store_arn.clone()),
             owner_account_id: Some(self.owner_account_id.clone()),
-            name: Some(self.name.clone()),
+            name: self.name.clone(),
             created_date: Some(self.created_date),
             status: Some(self.status.clone()),
             status_reason: None,
@@ -310,31 +479,17 @@ pub struct ComAmazonawsSsoadminSwbexternalserviceState {
 impl Default for ComAmazonawsSsoadminSwbexternalserviceState {
     /// Seeds the one ACTIVE instance, so the very first `ListInstances` of a process
     /// reports a usable target and no handler has to write on a read to create one.
+    ///
+    /// It is an ACCOUNT instance ([`SEED_INSTANCE_TYPE`]): the emulator's account is a
+    /// standalone account, not an Organizations-managed one.
     fn default() -> Self {
-        let created_date = DateTime::from(SystemTime::now());
-        let instance = Instance {
-            instance_arn: instance_arn(SEED_INSTANCE_ID),
-            identity_store_id: SEED_IDENTITY_STORE_ID.to_string(),
-            identity_store_arn: format!(
-                "arn:aws:identitystore::{}:identitystore/{SEED_IDENTITY_STORE_ID}",
-                ::engine::emulator_account_id()
-            ),
-            owner_account_id: ::engine::emulator_account_id().to_string(),
-            name: SEED_INSTANCE_NAME.to_string(),
-            created_date,
-            status: STATUS_ACTIVE.to_string(),
-            primary_region: SEED_REGION.to_string(),
-            regions: vec![Region {
-                region_name: SEED_REGION.to_string(),
-                status: STATUS_ACTIVE.to_string(),
-                added_date: created_date,
-                is_primary_region: true,
-            }],
-            // The seeded instance is the one `CreatePermissionSet` /
-            // `ListPermissionSets` / `CreateAccountAssignment` operate against, so
-            // permission sets ARE enabled on it.
-            permission_sets_enabled: SEED_PERMISSION_SETS_ENABLED,
-        };
+        let instance = Instance::active(
+            SEED_INSTANCE_ID,
+            SEED_IDENTITY_STORE_ID,
+            SEED_INSTANCE_TYPE,
+            Some(SEED_INSTANCE_NAME.to_string()),
+            DateTime::from(SystemTime::now()),
+        );
         let mut instances = BTreeMap::new();
         instances.insert(instance.instance_arn.clone(), instance);
         Self {
@@ -351,6 +506,40 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
     /// The instance `instance_arn` names, or `None` when no such instance exists.
     pub fn instance(&self, instance_arn: &str) -> Option<&Instance> {
         self.instances.get(instance_arn)
+    }
+
+    /// Apply every transition the CLOCK already owes: see [`Instance::materialize_due`].
+    pub fn materialize_due(&mut self, now: SystemTime) {
+        for instance in self.instances.values_mut() {
+            instance.materialize_due(now);
+        }
+    }
+
+    /// Whether the permission-set / account-assignment surface is WITHDRAWN on the
+    /// instance `instance_arn` names, i.e. it is an account instance.
+    ///
+    /// `false` for an ARN this account holds no instance for: that request is a missing
+    /// resource, which each operation answers with its own
+    /// `ResourceNotFoundException`/`AccessDeniedException` — the restriction belongs to a
+    /// RESOLVED instance, not to an unknown ARN. Every operation of the surface asks
+    /// this BEFORE looking a permission set or an assignment up, because the refusal
+    /// does not depend on whether that resource exists: on an account instance none ever
+    /// can.
+    pub fn permission_set_surface_withdrawn(&self, instance_arn: &str) -> bool {
+        self.instance(instance_arn)
+            .is_some_and(|instance| !instance.permission_sets_enabled())
+    }
+
+    /// The instance a previous `CreateInstance` minted under `client_token`, if that
+    /// token was ever used. A retry of the same call answers from it instead of being
+    /// refused as a duplicate, which is what `@idempotencyToken` asks of the member.
+    pub fn instance_by_client_token(&self, client_token: &str) -> Option<&Instance> {
+        self.instances.values().find(|instance| {
+            instance
+                .client_token
+                .as_deref()
+                .is_some_and(|stored| stored == client_token)
+        })
     }
 
     /// The permission set `permission_set_arn` names WITHIN `instance_arn`.
@@ -413,6 +602,110 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
     }
 }
 
+/// One of the application providers IAM Identity Center publishes ITSELF.
+///
+/// An application provider is not a caller-created resource: the model's
+/// `ApplicationProviderArn` pattern pins the owner segment to `aws`
+/// (`^arn:aws(-[a-z]{1,5}){0,3}:sso::aws:applicationProvider/[a-zA-Z0-9-/]+$`), so every
+/// provider belongs to AWS and no operation of this service creates or deletes one.
+/// They are therefore a FIXED catalog ([`BUILT_IN_APPLICATION_PROVIDERS`]) rather than a
+/// store: `DescribeApplicationProvider` reports an entry of it and refuses every other
+/// ARN, and `ListApplicationProviders` (still scaffolded) enumerates the same entries.
+#[derive(Debug, Clone, Copy)]
+pub struct BuiltInApplicationProvider {
+    /// The last segment of the provider's ARN, e.g. `custom`.
+    pub id: &'static str,
+    /// `ApplicationProvider$FederationProtocol` — "The protocol that the application
+    /// provider uses to perform federation", one of the model's `FederationProtocol`
+    /// enum values `SAML | OAUTH`.
+    pub federation_protocol: &'static str,
+    /// `DisplayData$DisplayName` — "The name of the application provider that appears in
+    /// the portal".
+    pub display_name: &'static str,
+}
+
+impl BuiltInApplicationProvider {
+    /// This provider's `DisplayData`.
+    ///
+    /// Only the display NAME is reported: `IconUrl` and `Description` are optional, and
+    /// an invented icon URL or blurb would be a value no AWS rule produces, so they are
+    /// absent rather than made up.
+    pub fn display_data(&self) -> DisplayData {
+        DisplayData {
+            display_name: Some(self.display_name.to_string()),
+            icon_url: None,
+            description: None,
+        }
+    }
+}
+
+/// The built-in application providers of IAM Identity Center.
+///
+/// SOURCE: the Smithy model carries no list of them — `ApplicationProviderArn` is only a
+/// pattern (`smithy_query(query="shape",shape="ApplicationProviderArn")`) and
+/// `ApplicationProvider` only the per-entry structure — so the catalog is written out
+/// here: `custom`, the provider for a customer-managed SAML 2.0 application, and the AWS
+/// services IAM Identity Center ships an OAuth provider for so they can receive a
+/// propagated identity (trusted identity propagation). The `id` of each is the lowercase
+/// service slug its `arn:aws:sso::aws:applicationProvider/<id>` ARN carries.
+///
+/// A provider exists in every partition the ARN pattern admits, so the lookup
+/// ([`built_in_application_provider`]) matches on the id and not on the whole ARN.
+pub const BUILT_IN_APPLICATION_PROVIDERS: &[BuiltInApplicationProvider] = &[
+    BuiltInApplicationProvider {
+        id: "custom",
+        federation_protocol: "SAML",
+        display_name: "Custom SAML 2.0 application",
+    },
+    BuiltInApplicationProvider {
+        id: "athena",
+        federation_protocol: "OAUTH",
+        display_name: "Amazon Athena",
+    },
+    BuiltInApplicationProvider {
+        id: "emr",
+        federation_protocol: "OAUTH",
+        display_name: "Amazon EMR",
+    },
+    BuiltInApplicationProvider {
+        id: "lakeformation",
+        federation_protocol: "OAUTH",
+        display_name: "AWS Lake Formation",
+    },
+    BuiltInApplicationProvider {
+        id: "quicksight",
+        federation_protocol: "OAUTH",
+        display_name: "Amazon QuickSight",
+    },
+    BuiltInApplicationProvider {
+        id: "redshift",
+        federation_protocol: "OAUTH",
+        display_name: "Amazon Redshift",
+    },
+];
+
+/// The provider id an `ApplicationProviderArn` names, or `None` when the ARN is not an
+/// application-provider ARN at all.
+///
+/// Everything before `:sso::aws:applicationProvider/` is the `arn:<partition>` prefix,
+/// which the model's pattern already constrained, so only the id has to be read out.
+pub fn application_provider_id(application_provider_arn: &str) -> Option<&str> {
+    let (prefix, id) = application_provider_arn.split_once(":sso::aws:applicationProvider/")?;
+    prefix.starts_with("arn:").then_some(id)
+}
+
+/// The built-in provider `application_provider_arn` names, or `None` for any other
+/// syntactically valid ARN — which `DescribeApplicationProvider` answers with the
+/// modelled `ResourceNotFoundException`.
+pub fn built_in_application_provider(
+    application_provider_arn: &str,
+) -> Option<&'static BuiltInApplicationProvider> {
+    let id = application_provider_id(application_provider_arn)?;
+    BUILT_IN_APPLICATION_PROVIDERS
+        .iter()
+        .find(|provider| provider.id == id)
+}
+
 /// The ARN of the instance whose id is `instance_id`.
 ///
 /// `arn:aws:sso:::instance/<id>` — an IAM Identity Center instance ARN carries NO
@@ -421,6 +714,30 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
 /// reported separately as `InstanceMetadata$OwnerAccountId`.
 pub fn instance_arn(instance_id: &str) -> String {
     format!("arn:aws:sso:::instance/{instance_id}")
+}
+
+/// The ARN of the identity store whose id is `identity_store_id`, inside the modelled
+/// `InstanceIdentityStoreArn` pattern
+/// `^arn:aws(-[a-z]{1,5}){0,3}:identitystore::\d{12}:identitystore/(d-[0-9a-f]{10}|…)$`.
+pub fn identity_store_arn(identity_store_id: &str) -> String {
+    format!(
+        "arn:aws:identitystore::{}:identitystore/{identity_store_id}",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// Mint a fresh instance id: `ssoins-` + 16 characters, the form the model's
+/// `InstanceArn` pattern accepts
+/// (`^arn:aws(-[a-z]{1,5}){0,3}:sso:::instance/(sso)?ins-[a-zA-Z0-9-.]{16}$`).
+pub fn mint_instance_id() -> String {
+    format!("ssoins-{}", &mint_digest()[..16])
+}
+
+/// Mint a fresh identity-store id: `d-` + 10 hex digits, the form
+/// `InstanceIdentityStoreArn` accepts and which keeps that ARN inside its modelled
+/// 62..93 length.
+pub fn mint_identity_store_id() -> String {
+    format!("d-{}", &mint_digest()[..10])
 }
 
 /// Mint a fresh `PermissionSetArn` under `instance_arn`.

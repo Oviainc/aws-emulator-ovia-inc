@@ -27,7 +27,10 @@ const LIMIT: usize = mc::MAX_FLOW_MEDIA_STREAMS;
 
 /// Create a flow named `name`, optionally already carrying `media_streams`, and return
 /// its ARN.
-async fn create_flow(emulator: &Emulator, name: &str, media_streams: Value) -> String {
+///
+/// `pub(crate)` because `tests/all/update_flow_media_stream.rs` sets up its flows the same
+/// way.
+pub(crate) async fn create_flow(emulator: &Emulator, name: &str, media_streams: Value) -> String {
     let mut body = json!({
         "name": name,
         "source": { "name": "src", "protocol": "rtp", "whitelistCidr": "10.0.0.0/16" }
@@ -65,7 +68,10 @@ async fn add_media_streams(
 }
 
 /// The media streams DescribeFlow reports for `flow_arn`.
-async fn described_media_streams(emulator: &Emulator, flow_arn: &str) -> Vec<Value> {
+///
+/// `pub(crate)` because `tests/all/update_flow_media_stream.rs` reads a flow's media
+/// streams back through the same reader.
+pub(crate) async fn described_media_streams(emulator: &Emulator, flow_arn: &str) -> Vec<Value> {
     let (status, code, described) = emulator.describe_flow(flow_arn).await;
     assert_eq!(
         (status, code.as_deref()),
@@ -76,7 +82,7 @@ async fn described_media_streams(emulator: &Emulator, flow_arn: &str) -> Vec<Val
 }
 
 /// The `MediaStreams` member of a response body (or of a reported flow), as a list.
-fn media_streams(body: &Value) -> Vec<Value> {
+pub(crate) fn media_streams(body: &Value) -> Vec<Value> {
     body["mediaStreams"].as_array().cloned().unwrap_or_default()
 }
 

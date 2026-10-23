@@ -15,6 +15,14 @@ Issue-Commit: dbb62b31e7ded4dc3fd01bf9d9c68db3eae6690c
 
 # GetEstimatedWaterAllocation rejected with 403 AccessDenied instead of being handled
 
+> **CLOSED WITH BOTH CAUSES DECLINED — THE REPLAYED SYMPTOM REMAINS.** This report sits
+> under `things-that-now-work/` because it has been worked and needs no further fixer, not
+> because the recorded fixture passes: a SigV4A-signed request is STILL answered 403 (now
+> as the modelled `AccessDeniedException`). What the emulator owns was verified correct and
+> pinned by test; what remains needs a change to the read-only core library, stated under
+> "## Resolution" at the end of this file as **Required core change**. Re-open it there, not
+> in this service.
+
 > _Note: this issue was identified against the code base at commit `dbb62b31e7ded4dc3fd01bf9d9c68db3eae6690c`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation
@@ -68,3 +76,48 @@ AccessDeniedException is a modeled error for this operation, so 403 is a legal s
 3. Step task#1 POSTs GetEstimatedWaterAllocation to /v1/estimated-water-allocation with AllocationTypes containing the non-enum value NOT_A_REAL_ALLOCATION_TYPE. Expected: 400 ValidationException whose message names the 'allocationTypes' member and its enum constraint. Observed: 403, x-amzn-errortype: AccessDenied, message 'Sign the request with the emulator credentials'.
 4. Step task#2 POSTs the same operation with a well-formed input. Expected: 200 with the required Results member present (empty list). Observed: 403 AccessDenied with no Results member.
 5. Confirm the fix by re-replaying both steps of that fixture: task#1 must be 400/ValidationException and task#2 must be 200 with Results present.
+
+## Resolution
+
+Measured, not inferred: the replayed request is **SigV4A-signed**. A diagnostic run of the
+fixture through this service's `override_refusal` reported the request's own
+`Authorization` algorithm as `AWS4-ECDSA-P256-SHA256` (credential scope region-less, host
+the emulator's loopback address) — which is what an SDK sends for this service, because
+its model lists `aws.auth#sigv4a` AHEAD of `aws.auth#sigv4`
+(`smithy.api#auth: ["aws.auth#sigv4a", "aws.auth#sigv4"]`; it is the only service in this
+repo that orders them that way).
+
+The emulator's ONLY request authenticator is `SigV4Authenticator` in
+`vendor/server/src/request_authentication.rs`, whose `recognizes` accepts
+`AWS4-HMAC-SHA256` alone and whose `verify` requires the five-field, region-bearing
+credential scope; it is registered in `vendor/smithy-server-runtime/src/multi_service_router.rs`
+(`MultiServiceRouter::new` / `set_request_authentication`). When no registered
+authenticator recognizes a request, `authenticator_for` refuses it with `ACCESS_DENIED`
+before the operation is ever named — uniformly, independent of the body, which is exactly
+the symptom reported above. There is no service-level seam that can admit it: the auth
+schemes come from the model via the generated `ErasedOperation::auth_schemes`, the
+authenticator set is a private field of the router built in vendored code, and `vendor/`
+is read-only here.
+
+**Required core change** (serves every `aws.auth#sigv4a` service, not just this one): a
+`RequestAuthenticator` for `aws.auth#sigv4a` in `vendor/server/src/request_authentication.rs`
+— recognizing `AWS4-ECDSA-P256-SHA256`, reading the region-less
+`<key>/<date>/<service>/aws4_request` scope plus `X-Amz-Region-Set`, and verifying the
+ECDSA-P256 signature from the key pair SigV4A derives from the credential's secret —
+registered beside the SigV4 one in `MultiServiceRouter::new`.
+
+What was verified and fixed inside the emulator instead
+(`services/service-com-amazonaws-sustainability-awssustainabilityapiservice/tests/all/signed_request_refusals.rs`,
+which drives the `MultiServiceRouter` front door with request authentication ON and signs
+each request with the emulator's own credentials):
+
+* Cause 1's rule holds once the request is admitted: an `AllocationTypes` member outside
+  `WaterAllocationType` — and every other value outside a declared value set or range,
+  over all four routes — is answered `400 ValidationException` whose message is the AWS
+  validation envelope naming the member and the constraint it failed.
+* Cause 2's rule holds: a well-formed request is answered `200` with the required
+  `Results` list always present, empty when the request selects nothing.
+* A request this emulator cannot authenticate is now refused with the error SHAPE this
+  model declares — `AccessDeniedException` (403) with its documented message — instead of
+  the framework's `AccessDenied`, a code the model does not carry and which a `restJson1`
+  client cannot resolve to a modelled error.

@@ -12,12 +12,13 @@
 
 use crate::ops::types::{
     Authorization, Channel, CmafPackage, CmafPackageCreateOrUpdateParameters, DashPackage,
-    EgressAccessLogs, HlsIngest, HlsManifest, HlsPackage, IngestEndpoint, IngressAccessLogs,
-    MssPackage, OriginEndpoint,
+    EgressAccessLogs, HarvestJob, HlsIngest, HlsManifest, HlsPackage, IngestEndpoint,
+    IngressAccessLogs, MssPackage, OriginEndpoint, S3Destination,
 };
 use crate::scaffolded::ServiceError;
 use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
 use std::collections::BTreeMap;
+use std::time::{Duration, SystemTime};
 
 /// This service's SigV4 signing name and ARN namespace (`OPERATIONS.md`, "Wire protocol").
 pub const SERVICE_NAME: &str = "mediapackage";
@@ -97,6 +98,11 @@ pub const MAX_CHANNELS: usize = 5_000;
 /// entry count is the bound available, and why the number is the emulator's own.
 pub const MAX_ORIGIN_ENDPOINTS: usize = 20_000;
 
+/// The most harvest jobs this store holds — see [`MAX_CHANNELS`]. `CreateHarvestJob` is
+/// the only thing that adds one and `DescribeHarvestJob` must still answer what it
+/// created, so the bound is an entry count, refused past with `TooManyRequestsException`.
+pub const MAX_HARVEST_JOBS: usize = 20_000;
+
 /// AWS's tagging limit of 50 tags per resource.
 pub const MAX_TAGS: usize = 50;
 
@@ -144,6 +150,9 @@ pub const ORIGIN_ENDPOINT_KIND: &str = "originEndpoint";
 /// below names the children blocking a delete.
 pub const ORIGIN_ENDPOINT_SHAPE: &str = "OriginEndpoint";
 
+/// How a MediaPackage error names a HarvestJob in `errors`.
+pub const HARVEST_JOB_KIND: &str = "harvestJob";
+
 /// `NotFoundException` (404) for a resource the request addressed BY ID that this service
 /// does not hold: keyed by the resource type, because what is missing is the resource and
 /// not a value in the request.
@@ -159,6 +168,11 @@ pub fn channel_not_found(id: &str) -> ServiceError {
 /// [`resource_not_found`] for an OriginEndpoint.
 pub fn origin_endpoint_not_found(id: &str) -> ServiceError {
     resource_not_found(ORIGIN_ENDPOINT_KIND, id)
+}
+
+/// [`resource_not_found`] for a HarvestJob.
+pub fn harvest_job_not_found(id: &str) -> ServiceError {
+    resource_not_found(HARVEST_JOB_KIND, id)
 }
 
 /// `UnprocessableEntityException` (422) for a create whose id is already in use: the
@@ -761,15 +775,122 @@ impl OriginEndpointRecord {
     }
 }
 
+// ---------------------------------------------------------------------------
+// A harvest job's status, and the clock that moves it
+//
+// `CreateHarvestJob` submits a job that exports a window of an origin endpoint's
+// packaged content to an S3 bucket. The submitted job is `IN_PROGRESS` — a NON-TERMINAL
+// status — so the service owes it a later status without anybody calling again. That
+// owed transition is stored as a DUE INSTANT on the record and materialised by
+// [`ComAmazonawsMediapackageMediapackageState::settle_harvest_jobs`], which every
+// harvest-job handler calls first: a read reports what the clock has already made due
+// and never advances a job because it was polled.
+// ---------------------------------------------------------------------------
+
+/// The `Status` values the model declares for a HarvestJob, so no handler spells one as a
+/// bare literal. The full set is `ops::types::STATUS_VALUES`
+/// (`smithy_query(query="shape",shape="com.amazonaws.mediapackage#Status",…)` reports
+/// `IN_PROGRESS | SUCCEEDED | FAILED`).
+pub const HARVEST_IN_PROGRESS: &str = "IN_PROGRESS";
+/// See [`HARVEST_IN_PROGRESS`].
+pub const HARVEST_SUCCEEDED: &str = "SUCCEEDED";
+/// See [`HARVEST_IN_PROGRESS`].
+pub const HARVEST_FAILED: &str = "FAILED";
+
+/// The statuses a harvest job never leaves: the harvest finished, or it failed.
+pub const HARVEST_TERMINAL_STATUSES: &[&str] = &[HARVEST_SUCCEEDED, HARVEST_FAILED];
+
+/// How long after `CreateHarvestJob` the clock owes the submitted job its terminal
+/// status.
+///
+/// AWS documents no duration — how long a harvest takes depends on the window harvested
+/// — so this span is CHOSEN, not modelled: 500 ms, inside the project's 250-750 ms band
+/// for a transition the clock owes. It is deliberately non-zero, so a caller reading
+/// straight after the create still observes the submitted job `IN_PROGRESS`. Nothing
+/// sleeps for it: the due instant is stored and compared against the clock.
+pub const HARVEST_SETTLE_AFTER: Duration = Duration::from_millis(500);
+
+/// The terminal status a harvest job submitted to THIS emulator reaches.
+///
+/// A harvest exports the packaged content of an origin endpoint to the caller's S3
+/// bucket. This emulator serves no MediaPackage data plane — a channel ingests nothing
+/// and an endpoint's playback URL answers no segments — and it writes nothing to the
+/// caller's bucket, so no harvest runs and `SUCCEEDED` would claim content that is not
+/// there. The job therefore ends in the service's own modelled failure status, which is
+/// what the API has to say about a harvest that produced nothing (the explanation AWS
+/// publishes for a failure travels as a CloudWatch event, not as a member of this
+/// service's `HarvestJob` shape, so there is no field to carry a reason).
+pub const HARVEST_OUTCOME: &str = HARVEST_FAILED;
+
+/// A HarvestJob, exactly as `CreateHarvestJob` stored it.
+#[derive(Debug, Clone, Default)]
+pub struct HarvestJobRecord {
+    pub id: String,
+    pub arn: String,
+    /// The channel the harvested endpoint packages, read from the STORED endpoint at
+    /// submission time rather than from the request, which carries no channel id.
+    pub channel_id: String,
+    pub origin_endpoint_id: String,
+    pub s3_destination: S3Destination,
+    pub start_time: String,
+    pub end_time: String,
+    /// ISO-8601, minted once at submission and never recomputed on a read.
+    pub created_at: String,
+    /// One of [`HARVEST_IN_PROGRESS`] or [`HARVEST_TERMINAL_STATUSES`].
+    pub status: String,
+    /// The status the clock owes this job, and the instant it falls due. `None` for a job
+    /// that has reached a terminal status, which owes nothing.
+    pub next_status_due: Option<(SystemTime, &'static str)>,
+}
+
+impl HarvestJobRecord {
+    /// Whether this job has reached a status it never leaves.
+    pub fn is_terminal(&self) -> bool {
+        HARVEST_TERMINAL_STATUSES.contains(&self.status.as_str())
+    }
+
+    /// The modelled `HarvestJob` shape for this record. Every harvest-job-returning
+    /// operation renders its output from this one projection, so they cannot disagree.
+    pub fn to_harvest_job(&self) -> HarvestJob {
+        HarvestJob {
+            arn: Some(self.arn.clone()),
+            channel_id: Some(self.channel_id.clone()),
+            created_at: Some(self.created_at.clone()),
+            end_time: Some(self.end_time.clone()),
+            id: Some(self.id.clone()),
+            origin_endpoint_id: Some(self.origin_endpoint_id.clone()),
+            s3_destination: Some(self.s3_destination.clone()),
+            start_time: Some(self.start_time.clone()),
+            status: Some(self.status.clone()),
+        }
+    }
+
+    /// Apply the owed status transition when the clock has already made it due, and
+    /// nothing else: the job moves at the instant it was owed whether or not anybody
+    /// called.
+    fn settle(&mut self, now: SystemTime) {
+        let Some((due, next)) = self.next_status_due else {
+            return;
+        };
+        if now < due {
+            return;
+        }
+        self.status = next.to_string();
+        self.next_status_due = None;
+    }
+}
+
 /// Per-service state for com-amazonaws-mediapackage-mediapackage. A handler reaches it through [`service_state`].
 ///
-/// Both collections are `BTreeMap`s keyed by the resource id the API itself keys on, so
+/// Every collection is a `BTreeMap` keyed by the resource id the API itself keys on, so
 /// `List*` output and its paging tokens are in a stable, caller-independent order. Each
-/// is bounded by an entry count — [`MAX_CHANNELS`] and [`MAX_ORIGIN_ENDPOINTS`].
+/// is bounded by an entry count — [`MAX_CHANNELS`], [`MAX_ORIGIN_ENDPOINTS`] and
+/// [`MAX_HARVEST_JOBS`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsMediapackageMediapackageState {
     pub channels: BTreeMap<String, ChannelRecord>,
     pub origin_endpoints: BTreeMap<String, OriginEndpointRecord>,
+    pub harvest_jobs: BTreeMap<String, HarvestJobRecord>,
     /// How many ids this store has minted. Part of every minted id's seed, so no two
     /// minted ids collide even when two calls land in the same nanosecond.
     pub minted: u64,
@@ -875,6 +996,18 @@ impl ComAmazonawsMediapackageMediapackageState {
             .values()
             .filter(|record| record.channel_id == channel_id)
             .count()
+    }
+
+    /// Materialise every harvest-job status transition the clock has already made due,
+    /// and nothing else.
+    ///
+    /// Called FIRST by every harvest-job handler, a read included: it applies only a
+    /// change that was owed at `now` whether or not anybody called, so what a reader sees
+    /// is decided by the clock and never by the read itself.
+    pub fn settle_harvest_jobs(&mut self, now: SystemTime) {
+        for job in self.harvest_jobs.values_mut() {
+            job.settle(now);
+        }
     }
 }
 
@@ -1007,6 +1140,14 @@ pub fn channel_arn(region: &str, id: &str) -> String {
 /// `arn:aws:mediapackage:<region>:<account>:origin_endpoints/<id>`.
 pub fn origin_endpoint_arn(region: &str, id: &str) -> String {
     ::emulator_server::emulator_arn(SERVICE_NAME, region, &format!("origin_endpoints/{id}"))
+}
+
+/// `arn:aws:mediapackage:<region>:<account>:harvest_jobs/<id>` — the ARN form
+/// MediaPackage assigns a HarvestJob, whose resource segment is the operation's own URI
+/// collection (`smithy_query(query="operation",operation="CreateHarvestJob",…)` binds
+/// `POST /harvest_jobs`), as `channels` and `origin_endpoints` are above.
+pub fn harvest_job_arn(region: &str, id: &str) -> String {
+    ::emulator_server::emulator_arn(SERVICE_NAME, region, &format!("harvest_jobs/{id}"))
 }
 
 /// A stable, opaque 32-hex-character label derived from `parts`, used for the

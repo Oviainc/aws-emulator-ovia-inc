@@ -15,6 +15,8 @@
 mod channel_lifecycle;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
+#[path = "all/harvest_jobs.rs"]
+mod harvest_jobs;
 #[path = "all/ingest_credentials.rs"]
 mod ingest_credentials;
 #[path = "all/mutation_persistence.rs"]

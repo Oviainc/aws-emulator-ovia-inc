@@ -25,13 +25,13 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request below signs for, so the ARNs the emulator mints are
 /// predictable.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The account segment of every emulated ARN (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// An emulator holding only this service, over one shared engine.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // These requests carry an unverifiable placeholder signature: this suite tests
@@ -43,16 +43,16 @@ fn emulator() -> MultiServiceRouter {
 
 /// What a dispatched request answered.
 #[derive(Debug)]
-struct Reply {
-    status: u16,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
     /// The restJson1 error shape name, from `x-amzn-errortype`; empty on success.
-    error_code: String,
-    body: Value,
+    pub(crate) error_code: String,
+    pub(crate) body: Value,
 }
 
 impl Reply {
     /// The response body, asserting the call succeeded.
-    fn ok(&self, case: &str) -> &Value {
+    pub(crate) fn ok(&self, case: &str) -> &Value {
         assert_eq!(
             self.status, 200,
             "case {case:?}: expected HTTP 200, got {} {:?} {:?}",
@@ -62,7 +62,7 @@ impl Reply {
     }
 
     /// Assert the call was refused with `status` and `code`.
-    fn refused(&self, case: &str, status: u16, code: &str) {
+    pub(crate) fn refused(&self, case: &str, status: u16, code: &str) {
         assert_eq!(
             (self.status, self.error_code.as_str()),
             (status, code),
@@ -123,16 +123,16 @@ async fn call(
     }
 }
 
-async fn post(router: &MultiServiceRouter, path: &str, body: &Value) -> Reply {
+pub(crate) async fn post(router: &MultiServiceRouter, path: &str, body: &Value) -> Reply {
     call(router, REGION, "POST", path, Some(body)).await
 }
 
-async fn get(router: &MultiServiceRouter, target: &str) -> Reply {
+pub(crate) async fn get(router: &MultiServiceRouter, target: &str) -> Reply {
     call(router, REGION, "GET", target, None).await
 }
 
 /// A resiliency policy to point applications at, and its ARN.
-async fn create_a_policy(router: &MultiServiceRouter, policy_name: &str) -> String {
+pub(crate) async fn create_a_policy(router: &MultiServiceRouter, policy_name: &str) -> String {
     let reply = post(
         router,
         "/create-resiliency-policy",

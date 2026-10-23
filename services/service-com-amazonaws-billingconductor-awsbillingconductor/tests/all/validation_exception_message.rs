@@ -27,7 +27,9 @@ use serde_json::{json, Value};
 use service_com_amazonaws_billingconductor_awsbillingconductor::ops::types::{
     BILLING_GROUP_STATUS_VALUES, PRICING_RULE_SCOPE_VALUES,
 };
-use service_com_amazonaws_billingconductor_awsbillingconductor::EmulatedService;
+use service_com_amazonaws_billingconductor_awsbillingconductor::{
+    ComAmazonawsBillingconductorAwsbillingconductorState as BillingConductorState, EmulatedService,
+};
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
 
@@ -40,8 +42,19 @@ struct Emulator {
 }
 
 impl Emulator {
+    /// A router over ONE shared engine, with the emulated account designated the
+    /// organization's PAYER account — see the note on `billing_group_core_loop`'s
+    /// harness for why a payer-gated service needs one designated, and
+    /// `tests/all/payer_account_gate.rs` for the denial every other caller gets. The
+    /// designation does not affect the refusals this suite is about: a modelled
+    /// constraint is refused at the boundary AHEAD of that gate. It is what makes the
+    /// rows that assert a CONFORMING request is served reachable.
     fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        engine
+            .state::<BillingConductorState>()
+            .lock()
+            .payer_account_id = Some(::engine::emulator_account_id().to_string());
         let mut router = MultiServiceRouter::new();
         router.register_service(EmulatedService::new(engine));
         Self { router }

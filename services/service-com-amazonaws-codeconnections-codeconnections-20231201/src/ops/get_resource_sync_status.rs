@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResourceSyncStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetResourceSyncStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetResourceSyncStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +147,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetResourceSyncStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetResourceSyncStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetResourceSyncStatus"))
+        // A pure report: it resolves the `(SyncType, ResourceName)` pair in state and
+        // reports the sync attempt recorded against that resource.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetResourceSyncStatusErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The CodeConnections resource store is unavailable. Try again.".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        // The RESOURCE is resolved first. A resource with no sync configuration of this
+        // type is not tracked against any repository, so the request names a sync target
+        // that does not exist: that makes THIS REQUEST invalid rather than naming a
+        // status that is merely missing, and it is refused with the modeled
+        // `InvalidInputException` (400) — the code this API uses throughout for an
+        // unresolvable sync reference (`GetRepositorySyncStatus` for a repository link
+        // id it does not hold, `UpdateSyncConfiguration` and `CreateSyncConfiguration`
+        // for a resource or link that is not there), as against the
+        // `ResourceNotFoundException` `GetSyncConfiguration` answers when the
+        // CONFIGURATION ITSELF is the resource being read. The message is built from the
+        // request, naming the pair that resolved to nothing.
+        let key = crate::state::sync_configuration_key(&input.sync_type, &input.resource_name);
+        let configured = store.sync_configurations.contains_key(&key);
+        drop(store);
+        if !configured {
+            return Err(GetResourceSyncStatusErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Sync Configuration for Resource {} was not found",
+                        input.resource_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The output's `LatestSync` is a REQUIRED `ResourceSyncAttempt`: the record of a
+        // sync the SERVICE performed, carrying the revision it started from, the
+        // revision it drove the resource to, and the events it produced. Driving a
+        // resource from a tracked repository means fetching that remote repository's
+        // commits, which this emulator does not do — nothing here ever performs a Git
+        // sync, so no attempt is recorded for any resource and there is no revision or
+        // commit sha to report. Rather than synthesise a status, a revision and an event
+        // list for work nothing ran, the report is refused with the modeled
+        // `ResourceNotFoundException` (404): there is no sync attempt to return. This is
+        // the same answer `GetRepositorySyncStatus` gives for a link that IS there.
+        Err(
+            GetResourceSyncStatusErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No {} sync attempt was found for resource {}",
+                        input.sync_type, input.resource_name
+                    )),
+                },
+            )
+            .into(),
+        )
     }
 }

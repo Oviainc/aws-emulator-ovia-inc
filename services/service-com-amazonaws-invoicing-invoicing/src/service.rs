@@ -164,7 +164,7 @@ struct FrontDoor<Eng>(::std::marker::PhantomData<Eng>);
 impl<Eng: Send + Sync + 'static> FrontDoor<Eng> {
     /// Every operation this seam serves. Each entry names the operation through its own
     /// `Operation` impl, so the routing key and the input schema come from the model.
-    fn operations() -> [ServedOperation; 8] {
+    fn operations() -> [ServedOperation; 9] {
         use crate::ops;
         [
             ServedOperation {
@@ -218,6 +218,17 @@ impl<Eng: Send + Sync + 'static> FrontDoor<Eng> {
                         protocol,
                         req,
                         <ops::delete_invoice_unit::DeleteInvoiceUnit<Eng> as Operation>::INPUT_SCHEMA,
+                    )
+                },
+                media_type: None,
+            },
+            ServedOperation {
+                name: <ops::list_invoice_summaries::ListInvoiceSummaries<Eng> as Operation>::NAME,
+                violations: |protocol, req| {
+                    Self::violations::<ops::types::ListInvoiceSummariesInput>(
+                        protocol,
+                        req,
+                        <ops::list_invoice_summaries::ListInvoiceSummaries<Eng> as Operation>::INPUT_SCHEMA,
                     )
                 },
                 media_type: None,

@@ -18,6 +18,11 @@
 //!    `ResourceNotFoundException` (404) — never a 200;
 //! 4. an assignment's identity is its (instance, account, permission set, principal
 //!    type, principal id) tuple, so creating it twice grants it once.
+//!
+//! The permission-set / account-assignment surface is served on an ORGANIZATION instance
+//! of IAM Identity Center, so the tests of those rules run against one ([`
+//! organization_router`]); the account-instance restriction that withdraws the same
+//! surface is `account_instance_restriction.rs`.
 
 use std::sync::Arc;
 
@@ -41,7 +46,13 @@ const ACCOUNT_A: &str = "123456789012";
 /// A one-service router over a fresh engine: the same assembly the production router
 /// performs, minus the other services.
 pub(crate) fn router() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    router_over(Arc::new(engine::InMemoryEngine::new()))
+}
+
+/// The same router, over an engine the caller already holds (so a test can seed state
+/// through [`service_com_amazonaws_ssoadmin_swbexternalservice::state`] the way the
+/// service's own `Default` does).
+pub(crate) fn router_over(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     // Signatures are the emulator's business, not this service's; this test drives the
     // wire format, so authentication is off and the request carries an unsigned scope
@@ -51,6 +62,45 @@ pub(crate) fn router() -> MultiServiceRouter {
         engine,
     ));
     router
+}
+
+/// The instance id the organization instance below is held under: `ssoins-` + 16 of
+/// `[a-zA-Z0-9-.]`, as the model's `InstanceArn` pattern requires.
+const ORGANIZATION_INSTANCE_ID: &str = "ssoins-0a1b2c3d4e5f6071";
+
+/// Its identity store: `d-` + 10 hex digits, per `InstanceIdentityStoreArn`.
+const ORGANIZATION_IDENTITY_STORE_ID: &str = "d-1a2b3c4d5e";
+
+/// A router whose account holds an ORGANIZATION instance, and that instance's ARN.
+///
+/// The permission-set / account-assignment surface is a feature of the organization
+/// instance, and an organization instance is enabled through AWS Organizations rather
+/// than through this API (`CreateInstance` creates the account instance of a standalone
+/// account), so the test seeds one into state exactly as the service's own `Default`
+/// seeds the account instance — through the SAME `state::Instance` constructor the
+/// handlers use — and the calls below all go over the wire.
+pub(crate) fn organization_router() -> (MultiServiceRouter, String) {
+    use service_com_amazonaws_ssoadmin_swbexternalservice::state;
+
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let instance_arn = {
+        let service_state = state::service_state(&*engine).expect("the SSO Admin state store");
+        let mut store = service_state.lock();
+        let instance = state::Instance::active(
+            ORGANIZATION_INSTANCE_ID,
+            ORGANIZATION_IDENTITY_STORE_ID,
+            state::InstanceType::Organization,
+            Some("Organization".to_string()),
+            aws_smithy_types::DateTime::from(std::time::SystemTime::now()),
+        );
+        let instance_arn = instance.instance_arn.clone();
+        // One instance per account: the organization instance REPLACES the seeded
+        // account instance rather than joining it.
+        store.instances.clear();
+        store.instances.insert(instance_arn.clone(), instance);
+        instance_arn
+    };
+    (router_over(engine), instance_arn)
 }
 
 /// Call one operation and return `(http status, parsed body)`.
@@ -238,8 +288,7 @@ impl PermissionSetCase {
 /// answers from that record, for every input shape the model admits.
 #[tokio::test]
 async fn create_stores_a_permission_set_that_every_reader_answers_from() {
-    let router = router();
-    let instance_arn = seeded_instance_arn(&router).await;
+    let (router, instance_arn) = organization_router();
 
     for case in permission_set_cases() {
         let (status, created) =
@@ -320,8 +369,7 @@ async fn create_stores_a_permission_set_that_every_reader_answers_from() {
 /// different names never share one.
 #[tokio::test]
 async fn each_create_mints_its_own_permission_set_arn() {
-    let router = router();
-    let instance_arn = seeded_instance_arn(&router).await;
+    let (router, instance_arn) = organization_router();
 
     let mut arns = Vec::new();
     for case in permission_set_cases() {
@@ -347,8 +395,7 @@ async fn each_create_mints_its_own_permission_set_arn() {
 /// request looks like.
 #[tokio::test]
 async fn a_second_permission_set_with_the_same_name_conflicts() {
-    let router = router();
-    let instance_arn = seeded_instance_arn(&router).await;
+    let (router, instance_arn) = organization_router();
 
     for case in permission_set_cases() {
         let (status, _) = call(&router, "CreatePermissionSet", &case.request(&instance_arn)).await;
@@ -379,8 +426,7 @@ async fn a_second_permission_set_with_the_same_name_conflicts() {
 /// maximum cases), which is stronger than sampling it.
 #[tokio::test]
 async fn list_permission_sets_pages_the_whole_stored_set_for_any_page_size() {
-    let router = router();
-    let instance_arn = seeded_instance_arn(&router).await;
+    let (router, instance_arn) = organization_router();
 
     let mut expected = Vec::new();
     for index in 0..7 {
@@ -458,8 +504,7 @@ async fn list_permission_sets_pages_the_whole_stored_set_for_any_page_size() {
 /// silently empty page, for every paginated read in this slice.
 #[tokio::test]
 async fn an_unissued_next_token_is_refused() {
-    let router = router();
-    let instance_arn = seeded_instance_arn(&router).await;
+    let (router, instance_arn) = organization_router();
     let (_, created) = call(
         &router,
         "CreatePermissionSet",
@@ -640,8 +685,7 @@ async fn an_unissued_next_token_is_refused() {
 /// `ResourceNotFoundException` (404) when that resource does not exist.
 #[tokio::test]
 async fn an_unknown_resource_is_a_404_for_every_operation_that_names_one() {
-    let router = router();
-    let instance_arn = seeded_instance_arn(&router).await;
+    let (router, instance_arn) = organization_router();
     let (_, created) = call(
         &router,
         "CreatePermissionSet",
@@ -797,8 +841,7 @@ fn assignment_cases() -> Vec<AssignmentCase> {
 /// the (account, permission set) filter it belongs to, and never under another.
 #[tokio::test]
 async fn account_assignments_are_persisted_once_per_identity_and_read_back_by_filter() {
-    let router = router();
-    let instance_arn = seeded_instance_arn(&router).await;
+    let (router, instance_arn) = organization_router();
     let (_, created) = call(
         &router,
         "CreatePermissionSet",
@@ -994,8 +1037,7 @@ async fn account_assignments_are_persisted_once_per_identity_and_read_back_by_fi
 /// second delete has nothing left to remove.
 #[tokio::test]
 async fn deleting_a_permission_set_is_observable_to_every_later_reader() {
-    let router = router();
-    let instance_arn = seeded_instance_arn(&router).await;
+    let (router, instance_arn) = organization_router();
 
     // Several permission sets, so a delete has to remove exactly one of them.
     let mut arns = Vec::new();
@@ -1101,11 +1143,11 @@ async fn deleting_a_permission_set_is_observable_to_every_later_reader() {
     }
 }
 
-/// The seeded instance is a real, ACTIVE record the other operations resolve against,
-/// and reading it does not change it.
+/// The account's one instance is a real, ACTIVE record the other operations resolve
+/// against, and reading it does not change it.
 #[tokio::test]
-async fn the_seeded_instance_is_active_and_stable_across_reads() {
-    let router = router();
+async fn the_one_instance_is_active_and_stable_across_reads() {
+    let (router, _) = organization_router();
 
     let (status, first) = call(&router, "ListInstances", &json!({})).await;
     assert_eq!(status, 200, "ListInstances expected 200, got {status} {first}");
@@ -1115,7 +1157,7 @@ async fn the_seeded_instance_is_active_and_stable_across_reads() {
     assert_eq!(
         instances.len(),
         1,
-        "expected the one seeded instance, got {instances:?}"
+        "expected the account's one instance, got {instances:?}"
     );
     let instance = &instances[0];
     let arn = instance["InstanceArn"].as_str().unwrap_or_default();
@@ -1172,8 +1214,7 @@ async fn the_seeded_instance_is_active_and_stable_across_reads() {
 /// match its pattern is a bad request rather than a missing resource.
 #[tokio::test]
 async fn requests_outside_the_modeled_constraints_are_refused() {
-    let router = router();
-    let instance_arn = seeded_instance_arn(&router).await;
+    let (router, instance_arn) = organization_router();
 
     let cases: Vec<(&str, Value)> = vec![
         // One past the upper length bound of `Name`.
@@ -1240,8 +1281,7 @@ async fn requests_outside_the_modeled_constraints_are_refused() {
 async fn a_caller_cannot_grow_a_store_past_its_ceiling() {
     use service_com_amazonaws_ssoadmin_swbexternalservice::state::MAX_RECORDS_PER_STORE;
 
-    let router = router();
-    let instance_arn = seeded_instance_arn(&router).await;
+    let (router, instance_arn) = organization_router();
 
     // Fill the permission-set store to the ceiling with distinct names, which is the
     // dimension a caller controls (the name-uniqueness check is not a count bound).

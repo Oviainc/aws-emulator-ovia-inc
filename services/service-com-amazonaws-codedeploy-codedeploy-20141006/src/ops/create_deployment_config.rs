@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDeploymentConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDeploymentConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Stores a new deployment configuration under the name the request names, and
+//! answers the `deploymentConfigId` it minted for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDeploymentConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -138,6 +133,185 @@ impl From<CreateDeploymentConfigErrorModeled> for CreateDeploymentConfigError {
     }
 }
 
+/// The compute platform whose deployments run on an EC2/on-premises instance
+/// fleet — the platform a `minimumHealthyHosts` (a number of healthy instances)
+/// and a `zonalConfig` (one Availability Zone of instances at a time) describe.
+///
+/// The model's `ComputePlatform` carries exactly three values —
+/// `Server | Lambda | ECS` (`super::types::COMPUTE_PLATFORM_VALUES`) — and the
+/// other two deploy by shifting traffic from one function version or task set to
+/// the next, which is what `trafficRoutingConfig` describes. So each of the three
+/// optional members applies to one side of that split and is refused on the
+/// other.
+const FLEET_COMPUTE_PLATFORM: &str = "Server";
+
+/// The two values `MinimumHealthyHostsType` and `MinimumHealthyHostsPerZoneType`
+/// carry (`super::types::MINIMUM_HEALTHY_HOSTS_TYPE_VALUES`). The boundary
+/// already refused anything else, so a stated type is one of these.
+const HOST_COUNT: &str = "HOST_COUNT";
+/// See [`HOST_COUNT`].
+const FLEET_PERCENT: &str = "FLEET_PERCENT";
+
+/// The members of `TrafficRoutingType`
+/// (`super::types::TRAFFIC_ROUTING_TYPE_VALUES`).
+const TIME_BASED_CANARY: &str = "TimeBasedCanary";
+/// See [`TIME_BASED_CANARY`].
+const TIME_BASED_LINEAR: &str = "TimeBasedLinear";
+/// See [`TIME_BASED_CANARY`].
+const ALL_AT_ONCE: &str = "AllAtOnce";
+
+/// Why a `minimumHealthyHosts`-shaped pair is not one CodeDeploy accepts, or
+/// `None` when it is.
+///
+/// Both `minimumHealthyHosts` and `zonalConfig.minimumHealthyHostsPerZone` are a
+/// (type, value) pair over the same two types, so both are checked here. The
+/// operation documents that "there are two parameters expected in the input: type
+/// and value" — the generated shape carries `value` as a plain `i32`, so an
+/// omitted one is indistinguishable from the modelled default of 0 and only the
+/// type's presence can be checked here — and the type says what the value counts:
+/// `HOST_COUNT` an absolute number of instances, which cannot be negative, and
+/// `FLEET_PERCENT` "a percentage of the total number of instances in the
+/// deployment", which cannot fall outside 0–100.
+fn healthy_hosts_fault(member: &str, kind: Option<&str>, value: i32) -> Option<String> {
+    match kind {
+        None => Some(format!(
+            "{member} requires a type: one of {}",
+            MINIMUM_HEALTHY_HOSTS_TYPE_VALUES.join(", ")
+        )),
+        Some(FLEET_PERCENT) if !(0..=100).contains(&value) => Some(format!(
+            "{member} value {value} is not a percentage: a {FLEET_PERCENT} value must be between \
+             0 and 100"
+        )),
+        Some(HOST_COUNT) if value < 0 => Some(format!(
+            "{member} value {value} is not a number of instances: a {HOST_COUNT} value cannot be \
+             negative"
+        )),
+        Some(HOST_COUNT | FLEET_PERCENT) => None,
+        // Unreachable through the boundary, which refuses a type outside the
+        // modelled value set. Stated rather than accepted so a value the enum
+        // gains later is refused instead of stored with no range check — the same
+        // backstop [`traffic_routing_fault`] keeps.
+        Some(other) => Some(format!(
+            "{member} type {other} is not a minimum healthy hosts type: one of {}",
+            MINIMUM_HEALTHY_HOSTS_TYPE_VALUES.join(", ")
+        )),
+    }
+}
+
+/// Why a `trafficRoutingConfig` is not one CodeDeploy accepts, or `None` when it
+/// is.
+///
+/// The increment configuration has to be the one the stated type describes:
+/// `TimeBasedCanary` shifts traffic "in two increments" and so carries
+/// `timeBasedCanary`, `TimeBasedLinear` shifts it "in equal increments" and so
+/// carries `timeBasedLinear`, and `AllAtOnce` shifts it in a single step and so
+/// carries neither.
+fn traffic_routing_fault(config: &TrafficRoutingConfig) -> Option<String> {
+    let Some(kind) = config.r#type.as_deref() else {
+        return Some(format!(
+            "trafficRoutingConfig requires a type: one of {}",
+            TRAFFIC_ROUTING_TYPE_VALUES.join(", ")
+        ));
+    };
+    match kind {
+        TIME_BASED_CANARY => match (&config.time_based_canary, &config.time_based_linear) {
+            (_, Some(_)) => Some(format!(
+                "trafficRoutingConfig type {kind} is configured by timeBasedCanary, not by \
+                 timeBasedLinear"
+            )),
+            (None, None) => Some(format!(
+                "trafficRoutingConfig type {kind} requires a timeBasedCanary configuration"
+            )),
+            (Some(canary), None) => increment_fault(
+                "timeBasedCanary",
+                canary.canary_percentage,
+                canary.canary_interval,
+            ),
+        },
+        TIME_BASED_LINEAR => match (&config.time_based_linear, &config.time_based_canary) {
+            (_, Some(_)) => Some(format!(
+                "trafficRoutingConfig type {kind} is configured by timeBasedLinear, not by \
+                 timeBasedCanary"
+            )),
+            (None, None) => Some(format!(
+                "trafficRoutingConfig type {kind} requires a timeBasedLinear configuration"
+            )),
+            (Some(linear), None) => increment_fault(
+                "timeBasedLinear",
+                linear.linear_percentage,
+                linear.linear_interval,
+            ),
+        },
+        // `AllAtOnce`: one shift, so neither incremental configuration applies.
+        ALL_AT_ONCE => (config.time_based_canary.is_some()
+            || config.time_based_linear.is_some())
+        .then(|| {
+            format!(
+                "trafficRoutingConfig type {kind} shifts all traffic in one step, so it takes \
+                 neither timeBasedCanary nor timeBasedLinear"
+            )
+        }),
+        // Unreachable through the boundary, which refuses a `type` outside the
+        // modelled value set. Stated rather than folded into `AllAtOnce` so a
+        // value the enum gains later is refused instead of silently routed as a
+        // single shift.
+        _ => Some(format!(
+            "trafficRoutingConfig type {kind} is not a type of traffic shifting: one of {}",
+            TRAFFIC_ROUTING_TYPE_VALUES.join(", ")
+        )),
+    }
+}
+
+/// Why one traffic-shifting increment is not one CodeDeploy accepts, or `None`
+/// when it is.
+///
+/// The percentage is the share of traffic one increment shifts, so it has to
+/// leave something on each side of the shift: 0 shifts nothing and 100 is not an
+/// increment but the whole move. The interval is a number of minutes between two
+/// shifts, which cannot be negative.
+fn increment_fault(member: &str, percentage: i32, interval: i32) -> Option<String> {
+    if !(1..=99).contains(&percentage) {
+        return Some(format!(
+            "{member} percentage {percentage} is not a traffic increment: it must be between 1 \
+             and 99"
+        ));
+    }
+    (interval < 0).then(|| {
+        format!("{member} interval {interval} is not a number of minutes: it cannot be negative")
+    })
+}
+
+/// Why a `zonalConfig` is not one CodeDeploy accepts, or `None` when it is.
+///
+/// Both monitor durations are "a period of time, in seconds, that CodeDeploy must
+/// wait", so neither can be negative, and the per-zone minimum is the same (type,
+/// value) pair as `minimumHealthyHosts`.
+fn zonal_config_fault(config: &ZonalConfig) -> Option<String> {
+    for (member, seconds) in [
+        (
+            "firstZoneMonitorDurationInSeconds",
+            config.first_zone_monitor_duration_in_seconds,
+        ),
+        (
+            "monitorDurationInSeconds",
+            config.monitor_duration_in_seconds,
+        ),
+    ] {
+        if let Some(value) = seconds.filter(|value| *value < 0) {
+            return Some(format!(
+                "{member} {value} is not a period of time in seconds: it cannot be negative"
+            ));
+        }
+    }
+    config.minimum_healthy_hosts_per_zone.as_ref().and_then(|per_zone| {
+        healthy_hosts_fault(
+            "minimumHealthyHostsPerZone",
+            per_zone.r#type.as_deref(),
+            per_zone.value,
+        )
+    })
+}
+
 /// The `CreateDeploymentConfig` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -174,18 +348,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDeploymentConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDeploymentConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDeploymentConfig"))
+        let _ = ctx;
+        // `deploymentConfigName`'s length and pattern, `computePlatform`'s value
+        // set and both healthy-host types' value sets are MODELLED constraints the
+        // boundary already refused, in the words `crate::service` picks for
+        // CodeDeploy. What is left here is the part the model cannot state: which
+        // optional member applies to the compute platform the request names, what
+        // each member's value may be, and that the name is not already taken.
+        let name = input.deployment_config_name;
+        let compute_platform = input
+            .compute_platform
+            .unwrap_or_else(|| crate::state::DEFAULT_COMPUTE_PLATFORM.to_string());
+        let on_instance_fleet = compute_platform == FLEET_COMPUTE_PLATFORM;
+
+        // Every request-only refusal is answered BEFORE the store is reached, so a
+        // refused request mints nothing and persists nothing.
+        if let Some(hosts) = &input.minimum_healthy_hosts {
+            let fault = if on_instance_fleet {
+                healthy_hosts_fault("minimumHealthyHosts", hosts.r#type.as_deref(), hosts.value)
+            } else {
+                Some(format!(
+                    "minimumHealthyHosts counts healthy instances, so it does not apply to a \
+                     {compute_platform} deployment configuration"
+                ))
+            };
+            if let Some(message) = fault {
+                return Err(
+                    CreateDeploymentConfigErrorModeled::InvalidMinimumHealthyHostValueException(
+                        InvalidMinimumHealthyHostValueException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+        if let Some(routing) = &input.traffic_routing_config {
+            let fault = if on_instance_fleet {
+                Some(format!(
+                    "trafficRoutingConfig shifts traffic between function versions or task sets, \
+                     so it does not apply to a {compute_platform} deployment configuration"
+                ))
+            } else {
+                traffic_routing_fault(routing)
+            };
+            if let Some(message) = fault {
+                return Err(
+                    CreateDeploymentConfigErrorModeled::InvalidTrafficRoutingConfigurationException(
+                        InvalidTrafficRoutingConfigurationException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+        if let Some(zonal) = &input.zonal_config {
+            let fault = if on_instance_fleet {
+                zonal_config_fault(zonal)
+            } else {
+                Some(format!(
+                    "zonalConfig deploys to one Availability Zone of instances at a time, so it \
+                     does not apply to a {compute_platform} deployment configuration"
+                ))
+            };
+            if let Some(message) = fault {
+                return Err(
+                    CreateDeploymentConfigErrorModeled::InvalidZonalDeploymentConfigurationException(
+                        InvalidZonalDeploymentConfigurationException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let minted = crate::state::with_state(&*self.engine, |state| {
+            // The `CodeDeployDefault.*` built-ins are in this same store, so one of
+            // their names is taken too.
+            if state.deployment_configs.contains_key(&name) {
+                return Err(
+                    CreateDeploymentConfigErrorModeled::DeploymentConfigAlreadyExistsException(
+                        DeploymentConfigAlreadyExistsException {
+                            message: Some(format!(
+                                "A deployment configuration named {name} already exists with this \
+                                 account"
+                            )),
+                        },
+                    ),
+                );
+            }
+            // The deployment configuration quota, which also bounds the store.
+            if state.deployment_configs.len() >= crate::state::MAX_DEPLOYMENT_CONFIGS {
+                return Err(
+                    CreateDeploymentConfigErrorModeled::DeploymentConfigLimitExceededException(
+                        DeploymentConfigLimitExceededException {
+                            message: Some(format!(
+                                "The maximum number of deployment configurations was exceeded: {} \
+                                 are allowed per account in this Region",
+                                crate::state::MAX_DEPLOYMENT_CONFIGS
+                            )),
+                        },
+                    ),
+                );
+            }
+
+            let deployment_config_id =
+                crate::state::mint_uuid_from(&mut state.next_id, "deployment-config");
+            state.deployment_configs.insert(
+                name.clone(),
+                crate::state::DeploymentConfig {
+                    deployment_config_id: deployment_config_id.clone(),
+                    deployment_config_name: name.clone(),
+                    minimum_healthy_hosts: input.minimum_healthy_hosts,
+                    traffic_routing_config: input.traffic_routing_config,
+                    zonal_config: input.zonal_config,
+                    compute_platform,
+                    create_time_ms: crate::state::now_ms(),
+                },
+            );
+            Ok(deployment_config_id)
+        })
+        .ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        Ok(CreateDeploymentConfigOutput {
+            deployment_config_id: Some(minted?),
+        })
     }
 }
