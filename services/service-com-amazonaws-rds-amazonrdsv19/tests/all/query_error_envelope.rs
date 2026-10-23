@@ -119,8 +119,8 @@ struct ErrorCase {
 /// (`smithy_query(query="operation", operation="DescribeOptionGroups,DescribeDBInstances,
 /// DescribeDBSnapshots")`: `OptionGroupNotFoundFault` 404, `DBInstanceNotFound` 404,
 /// `DBSnapshotNotFound` 404); `MaxRecords` is documented "Minimum 20, maximum 100", so 19
-/// is one past its published bound; `DescribeDBClusters` is one of the operations still
-/// carrying the scaffold header, so it answers the 501 channel.
+/// is one past its published bound; `DescribeDBClusterEndpoints` is one of the operations
+/// still carrying the scaffold header, so it answers the 501 channel.
 ///
 /// The codes of the rows that are NOT modelled errors are the ones this service already
 /// answers with — `ValidationException` from the scaffold's refusal channel,
