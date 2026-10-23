@@ -109,12 +109,12 @@ const UNOWNED_DETECTOR_IDS: [(&str, &str); 3] = [
 ];
 
 /// The message a value that cannot be a value of `member` is refused with.
-fn invalid_parameter(member: &str) -> String {
+pub(crate) fn invalid_parameter(member: &str) -> String {
     format!("The request is rejected because the parameter {member} has an invalid value.")
 }
 
 /// The message a well-formed id this account does not own is refused with.
-fn not_owned(member: &str) -> String {
+pub(crate) fn not_owned(member: &str) -> String {
     format!(
         "The request is rejected because the input {member} is not owned by the current account."
     )

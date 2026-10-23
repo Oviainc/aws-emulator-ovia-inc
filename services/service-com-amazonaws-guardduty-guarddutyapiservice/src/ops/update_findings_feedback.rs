@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateFindingsFeedback
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateFindingsFeedback`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateFindingsFeedback::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Marks the specified GuardDuty findings as useful or not useful"
+//! (`smithy_query(query="doc",shape="UpdateFindingsFeedback")`): a MUTATION that
+//! records, on each named finding of the named detector, the `Feedback` value the
+//! caller submitted and the `Comments` it came with. The feedback is read back
+//! through `GetFindings` as `Service.UserFeedback`; the `Comments` member is
+//! `@sensitive` and the `Service` shape has no member for it, so it is persisted with
+//! the finding and reported by nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +139,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateFindingsFeedback` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFindingsFeedbackErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateFindingsFeedback"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateFindingsFeedbackErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+
+        // `Feedback` is a modelled enum and `FindingIds` a modelled list
+        // (`len 0..50`, each entry `len 1..300`), so the boundary validator has
+        // already refused anything outside those constraints: reaching here means the
+        // request carries one of the `Feedback` values.
+        let mut state = state.lock();
+        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+            // Classified from the REQUEST: a value that cannot be a detector id at
+            // all is a parameter failure, a well-formed one this account and Region
+            // do not hold an ownership failure.
+            return Err(invalid_input(crate::state::detector_id_rejection(
+                &input.detector_id,
+            )));
+        };
+
+        // The submission REPLACES whatever was recorded before, for every finding the
+        // request names: the feedback is one value per finding, not a log, so the
+        // latest call is what a later read reports. A `findingIds` entry the detector
+        // does not hold is not written and is not an error — the same reading of an
+        // unheld finding id that `GetFindings` takes, where such an id is simply
+        // absent from the result.
+        for finding_id in &input.finding_ids {
+            if let Some(finding) = detector.findings.get_mut(finding_id) {
+                finding.user_feedback = Some(input.feedback.clone());
+                finding.feedback_comments = input.comments.clone();
+            }
+        }
+
+        // `Finding.UpdatedAt` is deliberately NOT moved here. In this service it is
+        // the clock of the DETECTED ACTIVITY — `CreateSampleFindings` advances it when
+        // it aggregates another occurrence of a finding type, `GetFindings` renders
+        // `Service.EventLastSeen` from it, and `findingCriteria`/`sortCriteria` order
+        // findings by it (`updatedAt`, "Timestamp in Unix Epoch millisecond format",
+        // `smithy_query(query="doc",shape="ListFindings",member="FindingCriteria")`).
+        // Feedback is a caller's opinion about a finding, not a further observation of
+        // the activity, so it must not make the finding look freshly seen.
+        Ok(UpdateFindingsFeedbackOutput {})
     }
+}
+
+/// Refuse the request the way GuardDuty does: HTTP 400 under the
+/// `InvalidInputException` class, in both the body's `__type` and its `type` member.
+fn invalid_input(message: impl Into<String>) -> UpdateFindingsFeedbackError {
+    crate::scaffolded::Scaffolded::invalid_input(message)
 }
