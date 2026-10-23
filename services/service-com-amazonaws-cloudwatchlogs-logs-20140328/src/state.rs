@@ -113,6 +113,94 @@ pub const MAX_ACCOUNT_RESOURCE_POLICIES: usize = 10;
 /// over-long document before the handler runs.
 pub const MAX_DATA_PROTECTION_POLICY_DOCUMENT_CHARS: usize = 30_720;
 
+/// The account-level policy type that protects sensitive data, from the model's
+/// `PolicyType` enum (`DATA_PROTECTION_POLICY` | `SUBSCRIPTION_FILTER_POLICY` |
+/// `FIELD_INDEX_POLICY` | `TRANSFORMER_POLICY` | `METRIC_EXTRACTION_POLICY`, the same
+/// five listed as [`crate::ops::types::POLICY_TYPE_VALUES`]). `policyType` targets that
+/// enum, so the boundary validator has already held it to those five by the time a
+/// handler runs.
+pub const POLICY_TYPE_DATA_PROTECTION: &str = "DATA_PROTECTION_POLICY";
+
+/// The account-level policy type that feeds log events to another service. See
+/// [`POLICY_TYPE_DATA_PROTECTION`] for where these five values come from.
+pub const POLICY_TYPE_SUBSCRIPTION_FILTER: &str = "SUBSCRIPTION_FILTER_POLICY";
+
+/// The account-level policy type that indexes fields. See
+/// [`POLICY_TYPE_DATA_PROTECTION`].
+pub const POLICY_TYPE_FIELD_INDEX: &str = "FIELD_INDEX_POLICY";
+
+/// The account-level policy type that transforms ingested log events. See
+/// [`POLICY_TYPE_DATA_PROTECTION`].
+pub const POLICY_TYPE_TRANSFORMER: &str = "TRANSFORMER_POLICY";
+
+/// The account-level policy type that controls EMF metric creation. See
+/// [`POLICY_TYPE_DATA_PROTECTION`].
+pub const POLICY_TYPE_METRIC_EXTRACTION: &str = "METRIC_EXTRACTION_POLICY";
+
+/// The scope an account-level policy carries when the put naming it specified none, from
+/// `PutAccountPolicy$scope`: "Currently the only valid value for this parameter is ALL,
+/// which specifies that the data protection policy applies to all log groups in the
+/// account. If you omit this parameter, the default of ALL is used." It is the only value
+/// of the model's `Scope` enum, so every stored account policy reports it.
+pub const DEFAULT_ACCOUNT_POLICY_SCOPE: &str = "ALL";
+
+/// The longest `policyDocument` `PutAccountPolicy` admits, from that member's own
+/// documentation: "The JSON specified in policyDocument can be up to 30,720 characters
+/// long." The model puts no `@length` on `AccountPolicyDocument`, so nothing refuses an
+/// over-long document before the handler runs.
+///
+/// It is the same bound the log-group-level
+/// [`MAX_DATA_PROTECTION_POLICY_DOCUMENT_CHARS`] states, named separately because it is a
+/// different member's sentence; an account-level data protection document is held to both,
+/// which is one bound either way.
+pub const MAX_ACCOUNT_POLICY_DOCUMENT_CHARS: usize = MAX_DATA_PROTECTION_POLICY_DOCUMENT_CHARS;
+
+/// The longest `selectionCriteria` `PutAccountPolicy` admits, from that member's own
+/// documentation: "The selectionCriteria string can be up to 25KB in length. The length is
+/// determined by using its UTF-8 bytes."
+pub const MAX_SELECTION_CRITERIA_BYTES: usize = 25 * 1024;
+
+/// The policy types a `selectionCriteria` may be put with.
+/// `PutAccountPolicy$selectionCriteria` names three — "Specifying selectionCriteria is
+/// valid only when you specify SUBSCRIPTION_FILTER_POLICY, FIELD_INDEX_POLICY or
+/// TRANSFORMER_POLICY for policyType" — and the operation's own documentation adds the
+/// fourth, describing metric extraction policies "that are each scoped to a subset of log
+/// groups with the selectionCriteria parameter", so a put of one is accepted rather than
+/// refused on the member sentence alone. A data protection policy is the one type neither
+/// sentence admits: it "applies to all log groups in the account".
+pub const SELECTION_CRITERIA_POLICY_TYPES: [&str; 4] = [
+    POLICY_TYPE_SUBSCRIPTION_FILTER,
+    POLICY_TYPE_FIELD_INDEX,
+    POLICY_TYPE_TRANSFORMER,
+    POLICY_TYPE_METRIC_EXTRACTION,
+];
+
+/// How many account-level policies of one type the account may hold when the policy being
+/// put is "scoped to a subset of log groups with the selectionCriteria parameter": for a
+/// transformer policy, "you can create as many as 20 account-level transformer policies",
+/// and for a field index policy, "as many as 20 account-level field index policies".
+pub const MAX_SCOPED_ACCOUNT_POLICIES: usize = 20;
+
+/// The same quota for a metric extraction policy, which has its own number: "Each account
+/// can have either one account-level metric extraction policy that applies to all log
+/// groups, or up to 5 policies that are each scoped to a subset of log groups with the
+/// selectionCriteria parameter."
+pub const MAX_SCOPED_METRIC_EXTRACTION_ACCOUNT_POLICIES: usize = 5;
+
+/// How many account-level policies of one type the account may hold when the policy being
+/// put applies to EVERY log group — the "one account-level transformer policy that applies
+/// to all log groups in the account" half of each quota sentence, and the whole quota for
+/// the two types that have no scoped form: "Each account can have only one account-level
+/// data protection policy" and "Each account can have one account-level subscription filter
+/// policy per Region."
+pub const MAX_UNSCOPED_ACCOUNT_POLICIES: usize = 1;
+
+/// The prefix a `policyName` may not start with, from `PutAccountPolicy$policyName`: "A
+/// name for the policy. This must be unique within the account and cannot start with
+/// `aws/`." The model puts no `@pattern` on `PolicyName`, so nothing refuses such a name
+/// before the handler runs.
+pub const RESERVED_POLICY_NAME_PREFIX: &str = "aws/";
+
 /// The `dataProtectionStatus` of a log group that has a data protection policy right
 /// now, from the model's `DataProtectionStatus` enum (`ACTIVATED` | `DELETED` |
 /// `ARCHIVED` | `DISABLED`).
@@ -250,6 +338,16 @@ pub struct ComAmazonawsCloudwatchlogsLogs20140328State {
     /// operations in the account"). `None` until one is associated, and `None` again
     /// after `DisassociateKmsKey`.
     pub query_results_kms_key_id: Option<String>,
+    /// The account-level policies of `PutAccountPolicy`, keyed by `(policyType,
+    /// policyName)`: the two members `DeleteAccountPolicy` identifies one by, so policies
+    /// of different types may share a name and a put under a pair already stored updates
+    /// that policy in place. A `BTreeMap` so `DescribeAccountPolicies` enumerates one
+    /// type's policies in policy-name order without re-sorting.
+    ///
+    /// Account-level policies are not attached to any log group — they "apply to all log
+    /// groups in the account", including ones created later — so they live here rather
+    /// than on [`LogGroupRecord`].
+    pub account_policies: BTreeMap<(String, String), AccountPolicyRecord>,
     /// Every import task of this account — the resource `CreateImportTask` starts and
     /// `DescribeImportTasks` reports — keyed by `importId`. A `BTreeMap` so
     /// `DescribeImportTasks` enumerates in import-id order without re-sorting, which is
@@ -312,6 +410,50 @@ impl ResourcePolicyRecord {
             POLICY_SCOPE_RESOURCE
         } else {
             POLICY_SCOPE_ACCOUNT
+        }
+    }
+}
+
+/// One account-level policy — what `PutAccountPolicy` stores — as it is stored.
+///
+/// The document is kept VERBATIM, exactly the bytes the request carried, for the same
+/// reason as [`DataProtectionPolicyRecord::policy_document`]: AWS reports it back through
+/// `DescribeAccountPolicies` unchanged.
+#[derive(Debug, Clone)]
+pub struct AccountPolicyRecord {
+    /// `AccountPolicy$policyName` — "The name of the account policy."
+    pub policy_name: String,
+    /// `AccountPolicy$policyDocument` — "The policy document for this account policy."
+    pub policy_document: String,
+    /// `AccountPolicy$policyType` — "The type of policy for this account policy."
+    pub policy_type: String,
+    /// `AccountPolicy$scope` — "The scope of the account policy."
+    pub scope: String,
+    /// `AccountPolicy$selectionCriteria` — "The log group selection criteria that is used
+    /// for this policy." `None` for a policy that applies to all log groups.
+    pub selection_criteria: Option<String>,
+    /// `AccountPolicy$lastUpdatedTime` — "The date and time that this policy was most
+    /// recently updated."
+    pub last_updated_time_ms: i64,
+}
+
+impl AccountPolicyRecord {
+    /// This policy as the model's `AccountPolicy` structure, which is what both
+    /// `PutAccountPolicy` and `DescribeAccountPolicies` report, so one record renders the
+    /// same way through either.
+    ///
+    /// `accountId` is "The Amazon Web Services account ID that the policy applies to" —
+    /// this emulator's own account, because an account-level policy applies to the account
+    /// that created it.
+    pub fn reported(&self) -> crate::ops::types::AccountPolicy {
+        crate::ops::types::AccountPolicy {
+            policy_name: Some(self.policy_name.clone()),
+            policy_document: Some(self.policy_document.clone()),
+            last_updated_time: Some(self.last_updated_time_ms),
+            policy_type: Some(self.policy_type.clone()),
+            scope: Some(self.scope.clone()),
+            selection_criteria: self.selection_criteria.clone(),
+            account_id: Some(::engine::emulator_account_id().to_string()),
         }
     }
 }
@@ -434,6 +576,227 @@ impl ImportTaskRecord {
             self.completion_due_ms = None;
         }
     }
+}
+
+/// How many account-level policies of `policy_type` the account may hold IN TOTAL once a
+/// policy whose scoped-ness is `scoped` is added: each quota sentence is an either/or —
+/// "either one account-level metric extraction policy that applies to all log groups, or up
+/// to 5 policies that are each scoped to a subset of log groups with the selectionCriteria
+/// parameter" — so the number the account is held to is the one for the policy being put,
+/// and every policy of that type counts against it. Every number is one
+/// `PutAccountPolicy`'s own documentation states — see the constants it returns.
+pub fn max_account_policies(policy_type: &str, scoped: bool) -> usize {
+    if !scoped {
+        return MAX_UNSCOPED_ACCOUNT_POLICIES;
+    }
+    match policy_type {
+        POLICY_TYPE_TRANSFORMER | POLICY_TYPE_FIELD_INDEX => MAX_SCOPED_ACCOUNT_POLICIES,
+        POLICY_TYPE_METRIC_EXTRACTION => MAX_SCOPED_METRIC_EXTRACTION_ACCOUNT_POLICIES,
+        // A data protection policy and a subscription filter policy have no scoped half:
+        // the account holds one of each, whatever it is scoped to.
+        _ => MAX_UNSCOPED_ACCOUNT_POLICIES,
+    }
+}
+
+/// What an accepted account-level policy document says: the parts a handler acts on after
+/// [`check_account_policy_document`] accepts it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccountPolicyShape {
+    /// The log groups a data protection policy's Audit action sends findings to, as
+    /// [`DataProtectionPolicyShape::findings_destination_log_groups`] reports them. Empty
+    /// for every other policy type, none of which names a destination log group.
+    pub findings_destination_log_groups: Vec<String>,
+}
+
+/// Judge a `PutAccountPolicy$policyDocument` against the rules that member's own
+/// documentation states for the `policyType` it is put with, answering the message to
+/// refuse it with, or what the accepted document says.
+///
+/// Every type's document is "the policy, in JSON" and can be "up to 30,720 characters
+/// long". Beyond that each type has its own documented shape, and only the rules the
+/// documentation states are enforced: which data identifiers, processors or fields exist
+/// is a catalogue that lives outside this service, and the grammar of `selectionCriteria`
+/// is judged by the caller of this function rather than here.
+pub fn check_account_policy_document(
+    policy_type: &str,
+    document: &str,
+) -> Result<AccountPolicyShape, String> {
+    if document.chars().count() > MAX_ACCOUNT_POLICY_DOCUMENT_CHARS {
+        return Err(format!(
+            "policyDocument can be up to {MAX_ACCOUNT_POLICY_DOCUMENT_CHARS} characters"
+        ));
+    }
+    match policy_type {
+        // "A data protection policy must include two JSON blocks" — the same document the
+        // log-group-level `PutDataProtectionPolicy` takes, so it is held to the same rule.
+        POLICY_TYPE_DATA_PROTECTION => {
+            let shape = check_data_protection_policy_document(document)?;
+            Ok(AccountPolicyShape {
+                findings_destination_log_groups: shape.findings_destination_log_groups,
+            })
+        }
+        POLICY_TYPE_SUBSCRIPTION_FILTER => {
+            check_subscription_filter_policy_document(document).map(|()| AccountPolicyShape::default())
+        }
+        POLICY_TYPE_FIELD_INDEX => {
+            check_field_index_policy_document(document).map(|()| AccountPolicyShape::default())
+        }
+        POLICY_TYPE_TRANSFORMER => {
+            check_transformer_policy_document(document).map(|()| AccountPolicyShape::default())
+        }
+        // A metric extraction policy "controls whether CloudWatch Metrics can be created
+        // through the Embedded Metrics Format (EMF)"; the documentation states no members
+        // for its document, so the one rule left is that it is a policy in JSON.
+        _ => policy_object(document).map(|_| AccountPolicyShape::default()),
+    }
+}
+
+/// The document as the JSON object every policy type but a transformer policy is
+/// expressed as ("Specify the policy, in JSON").
+fn policy_object(document: &str) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    serde_json::from_str::<serde_json::Value>(document)
+        .ok()
+        .and_then(|parsed| match parsed {
+            serde_json::Value::Object(members) => Some(members),
+            _ => None,
+        })
+        .filter(|members| !members.is_empty())
+        .ok_or_else(|| "policyDocument must be the policy in JSON (a non-empty JSON object)".to_string())
+}
+
+/// Judge a `SUBSCRIPTION_FILTER_POLICY` document. The attributes are the ones
+/// `PutAccountPolicy$policyDocument` lists for one: "DestinationArn The ARN of the
+/// destination to deliver log events to", "RoleArn The ARN of an IAM role that grants
+/// CloudWatch Logs permissions to deliver ingested log events to the destination stream",
+/// "FilterPattern A filter pattern for subscribing to a filtered stream of log events" and
+/// "Distribution The method used to distribute log data to the destination". Each is held
+/// to the rule the log-group-level `PutSubscriptionFilter` holds the member of the same
+/// name to, so one destination is as acceptable account-wide as it is per group.
+fn check_subscription_filter_policy_document(document: &str) -> Result<(), String> {
+    let members = policy_object(document)?;
+    let string = |name: &str| members.get(name).and_then(serde_json::Value::as_str);
+    let Some(destination_arn) = string("DestinationArn") else {
+        return Err(
+            "policyDocument for a subscription filter policy must include a DestinationArn"
+                .to_string(),
+        );
+    };
+    if let Some(message) = unparsable_arn_message("DestinationArn", destination_arn) {
+        return Err(message);
+    }
+    // The same ordering as `PutSubscriptionFilter`: a destination that needs a role is
+    // refused for the missing role before the kind of resource its ARN names is judged.
+    if string("RoleArn").is_none() {
+        if let Some(vendor) = subscription_role_required_vendor(destination_arn) {
+            return Err(format!(
+                "DestinationArn for vendor {vendor} cannot be used without RoleArn"
+            ));
+        }
+    }
+    if !is_subscription_destination_arn(destination_arn) {
+        return Err(format!(
+            "DestinationArn must be the ARN of a {} resource",
+            SUBSCRIPTION_DESTINATIONS
+                .iter()
+                .map(|(service, _)| *service)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Some(filter_pattern) = string("FilterPattern") {
+        validate_filter_pattern(filter_pattern)?;
+    }
+    // "the grouping can be set to Random for a more even distribution": the two values of
+    // the model's `Distribution` enum, which no boundary validator holds a JSON document
+    // to.
+    if let Some(distribution) = string("Distribution") {
+        if !crate::ops::types::DISTRIBUTION_VALUES.contains(&distribution) {
+            return Err(invalid_value_message(
+                "Distribution",
+                crate::ops::types::DISTRIBUTION_VALUES.iter().copied(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Judge a `FIELD_INDEX_POLICY` document. From `PutAccountPolicy$policyDocument`: the
+/// attributes are "Fields The array of field indexes to create" and "FieldsV2 The object
+/// of field indexes to create along with it's type"; "It must contain at least one field
+/// index"; "Supported types are FIELD_INDEX and FACET" (the model's `IndexType` enum);
+/// and "Field names within Fields and FieldsV2 must be mutually exclusive."
+fn check_field_index_policy_document(document: &str) -> Result<(), String> {
+    let members = policy_object(document)?;
+    let fields = match members.get("Fields") {
+        Some(fields) => fields
+            .as_array()
+            .ok_or_else(|| "Fields in policyDocument must be an array of field names".to_string())?
+            .iter()
+            .map(|field| {
+                field.as_str().map(str::to_string).ok_or_else(|| {
+                    "Fields in policyDocument must be an array of field names".to_string()
+                })
+            })
+            .collect::<Result<Vec<String>, String>>()?,
+        None => Vec::new(),
+    };
+    let fields_v2 = match members.get("FieldsV2") {
+        Some(fields_v2) => fields_v2
+            .as_object()
+            .ok_or_else(|| {
+                "FieldsV2 in policyDocument must be an object of field names and their types"
+                    .to_string()
+            })?
+            .clone(),
+        None => serde_json::Map::new(),
+    };
+    for (name, configuration) in &fields_v2 {
+        let index_type = configuration
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("the FieldsV2 entry '{name}' in policyDocument must carry a type"))?;
+        if !crate::ops::types::INDEX_TYPE_VALUES.contains(&index_type) {
+            return Err(invalid_value_message(
+                &format!("FieldsV2 '{name}' type"),
+                crate::ops::types::INDEX_TYPE_VALUES.iter().copied(),
+            ));
+        }
+    }
+    if fields.is_empty() && fields_v2.is_empty() {
+        return Err(
+            "policyDocument for a field index policy must contain at least one field index"
+                .to_string(),
+        );
+    }
+    if let Some(name) = fields.iter().find(|field| fields_v2.contains_key(*field)) {
+        return Err(format!(
+            "the field '{name}' is listed in both Fields and FieldsV2 in policyDocument; field names within Fields and FieldsV2 must be mutually exclusive"
+        ));
+    }
+    Ok(())
+}
+
+/// Judge a `TRANSFORMER_POLICY` document: "A transformer policy must include one JSON
+/// block with the array of processors and their configurations." Which processors exist,
+/// and how each is configured, is the catalogue `PutTransformer` owns, so what is judged
+/// here is that the document carries a non-empty array of processor blocks — written
+/// either as that array itself or as an object holding it.
+fn check_transformer_policy_document(document: &str) -> Result<(), String> {
+    let expected =
+        "policyDocument for a transformer policy must include an array of processors".to_string();
+    let parsed = serde_json::from_str::<serde_json::Value>(document).map_err(|_| expected.clone())?;
+    let processors = match &parsed {
+        serde_json::Value::Array(processors) => processors.clone(),
+        serde_json::Value::Object(members) => members
+            .values()
+            .find_map(|value| value.as_array().cloned())
+            .ok_or_else(|| expected.clone())?,
+        _ => return Err(expected),
+    };
+    if processors.is_empty() || !processors.iter().all(serde_json::Value::is_object) {
+        return Err(expected);
+    }
+    Ok(())
 }
 
 /// One log group's data protection policy — what `PutDataProtectionPolicy` stores — as
@@ -678,8 +1041,9 @@ impl LogGroupRecord {
     /// has never held one — the member "displays whether this log group has a protection
     /// policy, or whether it had one in the past", so a group with neither has nothing to
     /// report. The other two values of the `DataProtectionStatus` enum belong to the
-    /// account-level policies of `PutAccountPolicy`, which no operation of this service
-    /// stores yet.
+    /// account-level policies of `PutAccountPolicy`
+    /// ([`ComAmazonawsCloudwatchlogsLogs20140328State::account_policies`]), which no
+    /// operation of this service moves a per-group status for yet.
     pub fn data_protection_status(&self) -> Option<&'static str> {
         if self.data_protection_policy.is_some() {
             Some(DATA_PROTECTION_STATUS_ACTIVATED)
