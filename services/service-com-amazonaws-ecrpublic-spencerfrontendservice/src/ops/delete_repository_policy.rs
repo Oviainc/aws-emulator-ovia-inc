@@ -171,12 +171,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     DeleteRepositoryPolicyErrorModeled::InvalidParameterException(
                         InvalidParameterException {
-                            message: Some(format!(
-                                "Invalid parameter at 'registryId' failed to satisfy \
-                                 constraint: 'Member must name the public registry of this \
-                                 account ({})'",
-                                store.registry_id
-                            )),
+                            message: Some(store.foreign_registry_message()),
                         },
                     )
                     .into(),
@@ -184,20 +179,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
         let registry_id = store.registry_id.clone();
+        // The two 400s this operation distinguishes: the repository itself is absent, or
+        // it exists and carries no policy. Checked in that order, because the second
+        // question is only meaningful once the repository is known to exist.
         let Some(repository) = store.repositories.get_mut(&input.repository_name) else {
+            let message = store.repository_not_found_message(&input.repository_name);
             return Err(
                 DeleteRepositoryPolicyErrorModeled::RepositoryNotFoundException(
                     RepositoryNotFoundException {
-                        message: Some(format!(
-                            "The repository with name '{}' does not exist in the registry \
-                             with id '{registry_id}'",
-                            input.repository_name
-                        )),
+                        message: Some(message),
                     },
                 )
                 .into(),
             );
         };
+        // `take()` is the deletion: the policy leaves the repository and is reported back
+        // as `policyText`, which the model documents as "the JSON repository policy that
+        // was deleted from the repository".
         let Some(policy_text) = repository.policy_text.take() else {
             return Err(
                 DeleteRepositoryPolicyErrorModeled::RepositoryPolicyNotFoundException(

@@ -82,6 +82,10 @@ pub mod provisioning;
 /// declares.
 pub mod template;
 
+/// One entry per resource type this emulator really creates: which service owns it, and
+/// the create and delete calls that make its resources exist.
+mod provisioner;
+
 /// The extension registry: the registered and activated extensions this account and
 /// Region holds, and the versions of each.
 pub mod registry;
@@ -415,6 +419,9 @@ pub struct StoredEvent {
 #[derive(Debug, Clone)]
 pub struct PendingStatus {
     pub status: String,
+    /// The `StackStatusReason` that status carries, for an operation that is headed for a
+    /// FAILED one: a failure has to say what failed, and a success states no reason.
+    pub status_reason: Option<String>,
     pub due_at: SystemTime,
     pub operation_id: Option<String>,
     pub client_request_token: Option<String>,
@@ -719,7 +726,7 @@ impl StoredStack {
         }
         let pending = self.pending.take().expect("checked just above");
         self.status = pending.status;
-        self.status_reason = None;
+        self.status_reason = pending.status_reason.clone();
         if self.status == status::DELETE_COMPLETE {
             self.deletion_time = Some(pending.due_at);
             // The deletion completed, so every resource of the stack was deleted as of
@@ -740,10 +747,11 @@ impl StoredStack {
             self.outputs = deployed.outputs;
         }
         let status = self.status.clone();
+        let reason = pending.status_reason;
         self.record_event(
             pending.due_at,
             &status,
-            None,
+            reason,
             pending.operation_id,
             pending.client_request_token,
         );
@@ -782,6 +790,7 @@ impl StoredStack {
         );
         self.pending = Some(PendingStatus {
             status: settles_to.to_string(),
+            status_reason: None,
             due_at: now + STATUS_TRANSITION_DELAY,
             operation_id,
             client_request_token,

@@ -192,12 +192,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An image's identity is the sha256 digest of its manifest, so a digest the
         // caller supplied is a claim about the bytes it sent and is checked against them.
         let digest = crate::state::manifest_digest(&input.image_manifest);
-        // The manifest carries its own media types: `mediaType` is the manifest's, and
-        // `config.mediaType` is the artifact's. A request that declares
-        // `imageManifestMediaType` overrides the former; neither is invented when the
-        // manifest does not state it.
-        let manifest_json: Option<serde_json::Value> =
-            serde_json::from_str(&input.image_manifest).ok();
+        // The manifest is a JSON document ("The image manifest that corresponds to the
+        // image to be uploaded"), so a body that is not parseable JSON is not a manifest:
+        // it is refused here, BEFORE the store is reached, so the repository is left
+        // exactly as it was. The manifest then carries its own media types: `mediaType`
+        // is the manifest's, and `config.mediaType` is the artifact's. A request that
+        // declares `imageManifestMediaType` overrides the former; neither is invented
+        // when the manifest does not state it.
+        let manifest_json = match crate::state::json_document("ImageManifest", &input.image_manifest)
+        {
+            Ok(document) => document,
+            Err(message) => {
+                return Err(PutImageErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into())
+            }
+        };
         let media_type_of = |value: Option<&serde_json::Value>| -> Option<String> {
             value
                 .and_then(|value| value.get("mediaType"))
@@ -207,16 +220,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let manifest_media_type = input
             .image_manifest_media_type
             .clone()
-            .or_else(|| media_type_of(manifest_json.as_ref()));
-        let artifact_media_type = media_type_of(manifest_json.as_ref().and_then(|m| m.get("config")));
+            .or_else(|| media_type_of(Some(&manifest_json)));
+        let artifact_media_type = media_type_of(manifest_json.get("config"));
 
         // What this manifest references, read from the document already parsed above so
-        // one push parses one manifest exactly once. A document that is not JSON
-        // references nothing this service can size.
-        let references = manifest_json
-            .as_ref()
-            .map(crate::state::manifest_content_of)
-            .unwrap_or(crate::state::ManifestContent::Opaque);
+        // one push parses one manifest exactly once. (A body that is not JSON never
+        // reaches here: it was refused above.)
+        let references = crate::state::manifest_content_of(&manifest_json);
 
         let image_tag = input.image_tag.as_deref().filter(|tag| !tag.is_empty());
         let pushed_at = ::std::time::SystemTime::now();
@@ -260,13 +270,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
         let Some(repository) = store.repositories.get_mut(&input.repository_name) else {
+            let message = store.repository_not_found_message(&input.repository_name);
             return Err(PutImageErrorModeled::RepositoryNotFoundException(
                 RepositoryNotFoundException {
-                    message: Some(format!(
-                        "The repository with name '{}' does not exist in the registry with id \
-                         '{registry_id}'",
-                        input.repository_name
-                    )),
+                    message: Some(message),
                 },
             )
             .into());

@@ -163,16 +163,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A pure read: nothing below writes to the store.
         let store = state.lock();
         if let Some(registry_id) = input.registry_id.as_deref() {
             if !store.is_this_registry(registry_id) {
                 return Err(GetRepositoryPolicyErrorModeled::InvalidParameterException(
                     InvalidParameterException {
-                        message: Some(format!(
-                            "Invalid parameter at 'registryId' failed to satisfy constraint: \
-                             'Member must name the public registry of this account ({})'",
-                            store.registry_id
-                        )),
+                        message: Some(store.foreign_registry_message()),
                     },
                 )
                 .into());
@@ -180,16 +177,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let registry_id = store.registry_id.clone();
         let Some(repository) = store.repositories.get(&input.repository_name) else {
-            return Err(GetRepositoryPolicyErrorModeled::RepositoryNotFoundException(
-                RepositoryNotFoundException {
-                    message: Some(format!(
-                        "The repository with name '{}' does not exist in the registry with id \
-                         '{registry_id}'",
-                        input.repository_name
-                    )),
-                },
-            )
-            .into());
+            return Err(
+                GetRepositoryPolicyErrorModeled::RepositoryNotFoundException(
+                    RepositoryNotFoundException {
+                        message: Some(
+                            store.repository_not_found_message(&input.repository_name),
+                        ),
+                    },
+                )
+                .into(),
+            );
         };
         let Some(policy_text) = repository.policy_text.clone() else {
             return Err(

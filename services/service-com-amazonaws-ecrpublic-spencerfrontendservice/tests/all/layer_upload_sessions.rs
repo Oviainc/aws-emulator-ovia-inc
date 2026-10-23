@@ -46,13 +46,13 @@ const MAX_LAYER_PART_BYTES: i64 = state::MAX_LAYER_PART_BYTES;
 pub(crate) fn service_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
-    // The signature itself is not what these cases are about; the credential scope in
-    // `call` below still routes the request to `ecr-public`.
+    // The signature itself is not what these cases are about; the credential scope the
+    // shared `call` sends still routes the request to `ecr-public`.
     router.set_request_authentication(false);
     router.register_service(
-        service_com_amazonaws_ecrpublic_spencerfrontendservice::EmulatedService::new(
-            Arc::clone(&engine),
-        ),
+        service_com_amazonaws_ecrpublic_spencerfrontendservice::EmulatedService::new(Arc::clone(
+            &engine,
+        )),
     );
     (router, engine)
 }

@@ -1261,17 +1261,20 @@ fn database_port(
 /// it wraps, and a few APIs spell that member with the resource's full noun: the Bedrock
 /// AgentCore control plane's `CreateAgentRuntime` takes `agentRuntimeName`, so
 /// `AWS::BedrockAgentCore::Runtime` takes `AgentRuntimeName` — the type's last segment is
-/// `Runtime`, so neither `RuntimeName` nor `Name` finds it.
+/// `Runtime`, so neither `RuntimeName` nor `Name` finds it. The same for
+/// `AWS::ECR::PublicRepository`, whose property is `RepositoryName` ("The name to use for
+/// the public repository") while the type's last segment is `PublicRepository`.
 ///
 /// This is the OTHER HALF of the per-type catalogue [`return_values`] below keys: a type
 /// whose name property is unconventional has to be registered here AND there. The two are
 /// separate functions only because the name is needed BEFORE the return values are
 /// computed from it ([`provision`] calls [`physical_name`] first), so they cannot share one
-/// `match`; keep them adjacent, and when a second entry appears here, fold both into one
-/// per-type descriptor returned by a single lookup.
+/// `match`; keep them adjacent, and fold both into one per-type descriptor returned by a
+/// single lookup when this list grows enough to make that worth it.
 fn declared_name_property(resource_type: &str) -> Option<&'static str> {
     match resource_type {
         "AWS::BedrockAgentCore::Runtime" => Some("AgentRuntimeName"),
+        ECR_PUBLIC_REPOSITORY => Some("RepositoryName"),
         _ => None,
     }
 }
@@ -1358,6 +1361,7 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     "AWS::BedrockAgentCore::WorkloadIdentity",
     "AWS::DynamoDB::Table",
     "AWS::EC2::SecurityGroup",
+    ECR_PUBLIC_REPOSITORY,
     "AWS::IAM::Role",
     FIREHOSE_DELIVERY_STREAM,
     "AWS::Lambda::Function",
@@ -1495,6 +1499,17 @@ fn return_values(
             attributes.insert(
                 "Arn".to_string(),
                 ::emulator_server::emulator_arn("iam", "", &format!("role/{name}")),
+            );
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the repository name"; Fn::GetAtt: Arn. Amazon ECR Public is a
+        // partition-wide service, so the ARN carries no region — the same form the
+        // `ecr-public` service mints for the repository this stack provisions, which is
+        // what lets the two be compared.
+        ECR_PUBLIC_REPOSITORY => {
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn("ecr-public", "", &format!("repository/{name}")),
             );
             (name.to_string(), attributes)
         }
@@ -1741,6 +1756,14 @@ fn return_values(
 /// The middle segment is the Firehose model's own `awsService.cloudFormationName`
 /// (`smithy_query(query="service_info")` on that service's model).
 pub const FIREHOSE_DELIVERY_STREAM: &str = "AWS::KinesisFirehose::DeliveryStream";
+
+/// The `AWS::ECR::PublicRepository` resource type: an Amazon ECR Public repository.
+///
+/// Spelled as AWS's own CloudFormation resource reference publishes it, under the `ECR`
+/// namespace beside the private registry's `AWS::ECR::Repository`, rather than from the
+/// ECR Public model's `awsService.cloudFormationName` (`ECRPUBLIC`): the type is what a
+/// template spells.
+pub const ECR_PUBLIC_REPOSITORY: &str = "AWS::ECR::PublicRepository";
 
 /// Fill in each resource's evaluated `Properties`, against the whole set of resources the
 /// template declares.

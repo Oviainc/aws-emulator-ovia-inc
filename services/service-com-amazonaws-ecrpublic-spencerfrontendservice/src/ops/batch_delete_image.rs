@@ -175,15 +175,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
         }
-        let registry_id = store.registry_id.clone();
         let Some(repository) = store.repositories.get_mut(&input.repository_name) else {
+            let message = store.repository_not_found_message(&input.repository_name);
             return Err(BatchDeleteImageErrorModeled::RepositoryNotFoundException(
                 RepositoryNotFoundException {
-                    message: Some(format!(
-                        "The repository with name '{}' does not exist in the registry with id \
-                         '{registry_id}'",
-                        input.repository_name
-                    )),
+                    message: Some(message),
                 },
             )
             .into());

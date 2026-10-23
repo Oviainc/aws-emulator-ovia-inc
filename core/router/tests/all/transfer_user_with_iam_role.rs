@@ -73,7 +73,7 @@ async fn iam(
 
 /// Percent-encode one `application/x-www-form-urlencoded` component, leaving only
 /// RFC 3986's unreserved characters literal.
-fn form_encode(value: &str) -> String {
+pub(crate) fn form_encode(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {

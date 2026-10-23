@@ -13,6 +13,12 @@
 // points it into `tests/all/`.
 #[path = "all/client_error_message_templates.rs"]
 mod client_error_message_templates;
+#[path = "all/harness.rs"]
+mod harness;
+#[path = "all/invalid_parameter_messages.rs"]
+mod invalid_parameter_messages;
+#[path = "all/json_document_members.rs"]
+mod json_document_members;
 #[path = "all/layer_part_uploads.rs"]
 mod layer_part_uploads;
 #[path = "all/layer_upload_sessions.rs"]
@@ -27,6 +33,8 @@ mod repository_catalog_data;
 mod repository_image_lifecycle;
 #[path = "all/repository_policy.rs"]
 mod repository_policy;
+#[path = "all/repository_policy_and_catalog_data.rs"]
+mod repository_policy_and_catalog_data;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/response_field_fidelity.rs"]

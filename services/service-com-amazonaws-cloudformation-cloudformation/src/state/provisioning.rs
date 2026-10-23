@@ -28,15 +28,42 @@
 //! A typed SDK builder cannot carry a document through — it would need every member of
 //! every destination configuration mapped by hand here, which is precisely the mapping
 //! that would drift from the model as the service grows. The one thing CloudFormation
-//! itself decides, the resource's name, is the one member set on the way out.
+//! itself decides, the resource's name, is the one member set on the way out. It also
+//! keeps this crate naming no other service's crate: every call goes out on the wire the
+//! router already serves.
+//!
+//! ## What this module owns, and what [`super::provisioner`] owns
+//!
+//! This module is the part that is the SAME for every resource type: reconciling what a
+//! deployment declares against what the stack already has ([`reconcile`]), deleting what
+//! it replaced or what the stack's own deletion owes ([`delete`]), and the in-process,
+//! signed transport each of those calls rides on ([`call_json_rpc`]). The part that is
+//! per type — which service owns it, and the create and delete calls that make its
+//! resources exist — is [`super::provisioner`], reached only through
+//! [`provisioner_for`](super::provisioner::provisioner_for), so adding a resource type
+//! never touches the algorithm here.
 //!
 //! ## What a resource type needs before a stack can create it
 //!
-//! [`provisioner_for`] maps a template resource type to the operations of the service that
-//! owns it. The type names that service itself: its middle segment is the service model's
-//! own `awsService.cloudFormationName` (Amazon Data Firehose's model carries
-//! `cloudFormationName: KinesisFirehose`, so its streams are
-//! `AWS::KinesisFirehose::DeliveryStream`).
+//! [`provisioner_for`](super::provisioner::provisioner_for) maps a template resource type
+//! to the operations of the service that owns it. The type usually names that service
+//! itself: its middle segment is the service model's own `awsService.cloudFormationName`
+//! (Amazon Data Firehose's model carries `cloudFormationName: KinesisFirehose`, so its
+//! streams are `AWS::KinesisFirehose::DeliveryStream`). Where CloudFormation's own
+//! resource reference publishes a different name the published one wins — Amazon ECR
+//! Public's model carries `cloudFormationName: ECRPUBLIC`, but its repositories are
+//! published as `AWS::ECR::PublicRepository`, beside the private registry's
+//! `AWS::ECR::Repository` — because the type is what a template spells, not what a model
+//! suggests.
+//!
+//! What a type's PROPERTIES are decides how its create call is built, which is why that
+//! half lives per type in [`super::provisioner`]: for
+//! `AWS::KinesisFirehose::DeliveryStream` the properties ARE the request's members, so the
+//! evaluated document is passed through verbatim; for `AWS::ECR::PublicRepository` they are
+//! not (`RepositoryName` / `RepositoryCatalogData.RepositoryDescription` against
+//! `repositoryName` / `catalogData.description`), so that arm maps the members the resource
+//! reference publishes one by one, and sends nothing for a property the template leaves
+//! out.
 //!
 //! A type with no entry there is left DECLARED-ONLY: [`StoredResource::materialised`]
 //! stays `false` and nothing is created in any service. Such a resource still carries the
@@ -48,8 +75,9 @@
 //! DECLARED it, with the status of the deployment that recorded it — this emulator's
 //! inherited scope for a resource type no service here creates yet, not a claim that the
 //! resource exists in that service. Adding a provisioner for another type is a local
-//! change: one arm in [`provisioner_for`] and the create/delete pair it names, and that
-//! type's resources then really are created and deleted.
+//! change: one arm in [`provisioner_for`](super::provisioner::provisioner_for) and the
+//! create/delete pair it names, and that type's resources then really are created and
+//! deleted.
 //!
 //! A type that DOES have an entry is never passed off as created: whatever its owning
 //! service answers — a modelled refusal, or the 501 of an operation this emulator has not
@@ -90,9 +118,9 @@
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 
-use serde_json::{Map, Value};
+use serde_json::Value;
 
-use super::template::FIREHOSE_DELIVERY_STREAM;
+use super::provisioner::provisioner_for;
 use super::StoredResource;
 
 // The stack whose resources are being created or deleted is identified by its Region
@@ -164,9 +192,7 @@ pub async fn reconcile(
             continue;
         }
         let created = match provisioner_for(&resource.resource_type) {
-            Some(Provisioner::FirehoseDeliveryStream) => {
-                create_delivery_stream(ctx, region, &resource).await
-            }
+            Some(provisioner) => provisioner.create(ctx, region, &resource).await,
             None => Ok(BTreeMap::new()),
         };
         match created {
@@ -307,8 +333,10 @@ pub async fn delete(
         }
         let resource = &outcome.resources[index];
         let deleted = match provisioner_for(&resource.resource_type) {
-            Some(Provisioner::FirehoseDeliveryStream) => {
-                delete_delivery_stream(ctx, region, &resource.physical_resource_id).await
+            Some(provisioner) => {
+                provisioner
+                    .delete(ctx, region, &resource.physical_resource_id)
+                    .await
             }
             None => Ok(()),
         };
@@ -324,88 +352,6 @@ pub async fn delete(
         }
     }
     outcome
-}
-
-/// The services whose resources this emulator creates. One arm per resource type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Provisioner {
-    FirehoseDeliveryStream,
-}
-
-fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
-    match resource_type {
-        FIREHOSE_DELIVERY_STREAM => Some(Provisioner::FirehoseDeliveryStream),
-        _ => None,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The owning services' own APIs, called in-process through the handler's callback.
-// ---------------------------------------------------------------------------
-
-/// Amazon Data Firehose's signing name and `X-Amz-Target` prefix, from its model
-/// (`sigv4Name: firehose`, service shape `Firehose_20150804`).
-const FIREHOSE_SIGNING_NAME: &str = "firehose";
-const FIREHOSE_TARGET_PREFIX: &str = "Firehose_20150804";
-
-/// Create the stream an `AWS::KinesisFirehose::DeliveryStream` declares.
-///
-/// The type's properties are the `CreateDeliveryStream` request's own members — the
-/// destination configurations, the source configuration, `DeliveryStreamType`,
-/// `DeliveryStreamEncryptionConfigurationInput` and `Tags` are named identically on both
-/// sides — so the resolved properties ARE the request, with the one member CloudFormation
-/// decides (the stream's name, which is this resource's physical id) set to it.
-async fn create_delivery_stream(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
-    region: &str,
-    resource: &StoredResource,
-) -> Result<BTreeMap<String, String>, Refusal> {
-    let mut request = match &resource.properties {
-        Value::Object(object) => object.clone(),
-        _ => Map::new(),
-    };
-    request.insert(
-        "DeliveryStreamName".to_string(),
-        Value::String(resource.physical_resource_id.clone()),
-    );
-    let reported = call_json_rpc(
-        ctx,
-        FIREHOSE_SIGNING_NAME,
-        region,
-        &format!("{FIREHOSE_TARGET_PREFIX}.CreateDeliveryStream"),
-        &Value::Object(request),
-    )
-    .await?;
-    let mut attributes = BTreeMap::new();
-    if let Some(arn) = reported.get("DeliveryStreamARN").and_then(Value::as_str) {
-        attributes.insert("Arn".to_string(), arn.to_string());
-    }
-    Ok(attributes)
-}
-
-/// Delete the stream a stack created. A stream Firehose no longer has
-/// (`ResourceNotFoundException`) is already in the state the delete asks for.
-async fn delete_delivery_stream(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
-    region: &str,
-    physical_resource_id: &str,
-) -> Result<(), String> {
-    let request = serde_json::json!({ "DeliveryStreamName": physical_resource_id });
-    match call_json_rpc(
-        ctx,
-        FIREHOSE_SIGNING_NAME,
-        region,
-        &format!("{FIREHOSE_TARGET_PREFIX}.DeleteDeliveryStream"),
-        &request,
-    )
-    .await
-    {
-        Ok(_) => Ok(()),
-        // The stream is already in the state the delete asks for. Judged on the error
-        // CODE, never on the message, which carries the request's own resource name.
-        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => Ok(()),
-        Err(refusal) => Err(refusal.to_string()),
-    }
 }
 
 /// A refusal another service answered with: its error CODE and its message, kept apart so
@@ -428,19 +374,16 @@ impl ::std::fmt::Display for Refusal {
     }
 }
 
-/// The error code a service answers for a resource it does not have, which a delete asking
-/// for exactly that state treats as success.
-const RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
-
 /// Call one `awsJson1_1` operation of another emulated service in-process and read its
 /// answer document. `Err(refusal)` is the service's own refusal: its code, and the message
 /// it worded.
 ///
 /// A 501 — the owning operation is still one of this emulator's stubs — is a refusal like
-/// any other, so a resource of a type this module DOES provision is never passed off as
-/// created when nothing created it; the type's own entry in [`provisioner_for`] is what
-/// decides whether a create is attempted at all.
-async fn call_json_rpc(
+/// any other, so a resource of a type this emulator DOES provision is never passed off as
+/// created when nothing created it; the type's own entry in
+/// [`provisioner_for`](super::provisioner::provisioner_for) is what decides whether a
+/// create is attempted at all.
+pub(super) async fn call_json_rpc(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     signing_name: &str,
     region: &str,
