@@ -208,12 +208,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // `TableError$TableName`: "For Hive compatibility, this must be
                     // entirely lowercase" — the folded name the catalog stores.
                     table_name: Some(folded.clone()),
-                    error_detail: Some(ErrorDetail {
-                        error_code: Some("EntityNotFoundException".into()),
-                        error_message: Some(format!(
-                            "Table {folded} not found in database {database_name}"
-                        )),
-                    }),
+                    // The per-item message names the table the request asked for, and
+                    // nothing else: it is built from that one name, so a client matching
+                    // the wording to tell a missing table from another per-item failure
+                    // sees the same sentence the Data Catalog writes. The containing
+                    // database is NOT part of it — the request already named one
+                    // database, so naming it again says nothing about which item failed.
+                    error_detail: Some(crate::state::catalog_error_detail(
+                        "EntityNotFoundException",
+                        format!("Table {folded} not found"),
+                    )),
                 });
             }
         }
