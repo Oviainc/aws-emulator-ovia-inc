@@ -6,6 +6,10 @@
 //! exactly ONE wins — and `ListLocations` reports each stored location exactly once,
 //! beside the Amazon Web Services locations this store hosts in.
 //!
+//! Beside those, the three bounds a create is subject to, each asserted to store nothing
+//! when it refuses: the modelled constraint on `LocationName`, the key-value-map rule its
+//! `Tags` obey, and the account's custom-location quota.
+//!
 //! The harness (`GameLift`, `REGION`, `gamelift_arn`, `ec2_fleet`, `create_fleet`) is the
 //! one `hosting_loop` already drives the production dispatch path with.
 
@@ -51,6 +55,39 @@ async fn listed_names(gamelift: &GameLift, request: Value) -> Vec<String> {
 /// the filter rows below are drawn from the modelled catalog rather than from one
 /// example.
 const LOCATION_FILTERS: [&str; 2] = ["AWS", "CUSTOM"];
+
+/// The lowest and highest `LocationName` length a create may carry, from
+/// `CustomInputLocationStringModel` (`smithy_query shape=CustomInputLocationStringModel`:
+/// len 8..64).
+const LOCATION_NAME_LENGTH: (usize, usize) = (8, 64);
+
+/// The largest `Tags` list a create may carry, from `TagList` (`smithy_query
+/// shape=TagList`: len 0..200).
+const MAX_TAGS: usize = 200;
+
+/// A name of exactly `length` characters that satisfies the modelled pattern
+/// (`^custom-[A-Za-z0-9\-]+$`).
+fn name_of_length(length: usize) -> String {
+    format!("custom-{}", "a".repeat(length - "custom-".len()))
+}
+
+/// `count` tags, each carrying a distinct key, as `Tag` models them (`Key` len 1..128,
+/// `Value` len 0..256).
+fn tag_list(count: usize) -> Value {
+    Value::Array(
+        (0..count)
+            .map(|index| json!({"Key": format!("key-{index}"), "Value": format!("value-{index}")}))
+            .collect(),
+    )
+}
+
+/// Whether `ListLocations` reports a custom location named `name`.
+async fn location_exists(gamelift: &GameLift, name: &str) -> bool {
+    listed_names(gamelift, json!({"Filters": ["CUSTOM"], "Limit": 200}))
+        .await
+        .iter()
+        .any(|listed| listed == name)
+}
 
 /// A created custom location is reported as stored by the create and by every later
 /// list, and the name it holds cannot be taken a second time.
@@ -384,4 +421,293 @@ async fn the_list_pages_the_collection_and_refuses_a_foreign_token() {
              got {status} {code}"
         );
     }
+}
+
+/// A create carries a `LocationName` the model accepts or it is refused and stores
+/// nothing: the name's length sits inside `CustomInputLocationStringModel`'s published
+/// bounds and its characters satisfy that shape's pattern.
+///
+/// The rows differ along what the constraint generalises over: the LENGTH, at each
+/// published bound and one past it, and the FORM — the required `custom-` prefix, its
+/// case, and the character classes the pattern allows and excludes.
+#[tokio::test]
+async fn a_create_takes_only_a_location_name_the_model_accepts() {
+    let (shortest, longest) = LOCATION_NAME_LENGTH;
+    struct Case {
+        label: &'static str,
+        name: Option<String>,
+        /// The wire error code the create must answer with, or `None` when it is served.
+        refused_with: Option<&'static str>,
+    }
+
+    let cases = vec![
+        Case {
+            label: "a name on the lowest published length bound",
+            name: Some(name_of_length(shortest)),
+            refused_with: None,
+        },
+        Case {
+            label: "a name on the highest published length bound",
+            name: Some(name_of_length(longest)),
+            refused_with: None,
+        },
+        Case {
+            label: "digits, upper case and inner hyphens, which the pattern allows",
+            name: Some("custom-Rack-7-B".to_string()),
+            refused_with: None,
+        },
+        Case {
+            label: "the prefix alone: one character below the lowest published length bound, \
+                    and nothing for the pattern's + to match",
+            name: Some("custom-".to_string()),
+            refused_with: Some("ValidationException"),
+        },
+        Case {
+            label: "one character past the highest published length bound",
+            name: Some(name_of_length(longest + 1)),
+            refused_with: Some("ValidationException"),
+        },
+        Case {
+            label: "an underscore, which the pattern's character class excludes",
+            name: Some("custom-rack_7".to_string()),
+            refused_with: Some("ValidationException"),
+        },
+        Case {
+            label: "a space, which the pattern's character class excludes",
+            name: Some("custom-rack 7".to_string()),
+            refused_with: Some("ValidationException"),
+        },
+        Case {
+            label: "no custom- prefix at all",
+            name: Some("my-own-location".to_string()),
+            refused_with: Some("ValidationException"),
+        },
+        Case {
+            label: "the prefix in the wrong case",
+            name: Some("Custom-rack-7".to_string()),
+            refused_with: Some("ValidationException"),
+        },
+        Case {
+            label: "no LocationName at all, which the model makes required",
+            name: None,
+            refused_with: Some("ValidationException"),
+        },
+    ];
+
+    let gamelift = GameLift::new();
+    for case in &cases {
+        let label = case.label;
+        let mut request = json!({});
+        if let Some(name) = &case.name {
+            request["LocationName"] = json!(name);
+        }
+
+        match case.refused_with {
+            None => {
+                let name = case.name.clone().expect("an accepted row names a location");
+                let created = gamelift.ok("CreateLocation", request).await;
+                assert_eq!(
+                    created["Location"]["LocationName"],
+                    json!(&name),
+                    "case {label:?}: the create must report the stored location, got {}",
+                    created["Location"]
+                );
+                assert!(
+                    location_exists(&gamelift, &name).await,
+                    "case {label:?}: the accepted location must be stored, got no {name} in the \
+                     list"
+                );
+            }
+            Some(expected) => {
+                let (status, code) = gamelift.err("CreateLocation", request).await;
+                assert_eq!(
+                    (status, code.as_str()),
+                    (400, expected),
+                    "case {label:?}: a name outside the modelled constraint must be refused, got \
+                     {status} {code}"
+                );
+                if let Some(name) = &case.name {
+                    assert!(
+                        !location_exists(&gamelift, name).await,
+                        "case {label:?}: a refused create must store nothing, got {name} in the \
+                         list"
+                    );
+                }
+            }
+        }
+    }
+
+    // Only the accepted rows are stored, so a refusal left the collection untouched.
+    let accepted: usize = cases
+        .iter()
+        .filter(|case| case.refused_with.is_none())
+        .count();
+    let listed = listed_names(&gamelift, json!({"Filters": ["CUSTOM"], "Limit": 200})).await;
+    assert_eq!(
+        listed.len(),
+        accepted,
+        "exactly the accepted names must be stored, got {listed:?}"
+    );
+}
+
+/// A resource's tags are a key-value MAP ("Tags are developer-defined key-value pairs"),
+/// so a create that assigns one key twice is refused with the modelled
+/// `TaggingFailedException` ("This may be due to invalid tag format") and stores nothing;
+/// a list longer than `TagList`'s published maximum is refused one step earlier, by the
+/// boundary walk.
+///
+/// The rows differ along where the repeated key sits and how many tags surround it, and
+/// along which published bound of the list the row sits on.
+#[tokio::test]
+async fn a_create_whose_tags_are_not_a_key_value_map_is_refused_and_stores_nothing() {
+    struct Case {
+        label: &'static str,
+        tags: Value,
+        /// The wire error code the create must answer with, or `None` when it is served.
+        refused_with: Option<&'static str>,
+    }
+
+    let mut repeated_among_many: Vec<Value> = (0..MAX_TAGS - 1)
+        .map(|index| json!({"Key": format!("key-{index}"), "Value": format!("value-{index}")}))
+        .collect();
+    repeated_among_many.push(json!({"Key": "key-0", "Value": "again"}));
+
+    let cases = [
+        Case {
+            label: "no tags at all, the lowest published bound of the list",
+            tags: json!([]),
+            refused_with: None,
+        },
+        Case {
+            label: "one tag",
+            tags: tag_list(1),
+            refused_with: None,
+        },
+        Case {
+            label: "a tag whose value is empty, which the model allows",
+            tags: json!([{"Key": "empty-value", "Value": ""}]),
+            refused_with: None,
+        },
+        Case {
+            label: "two keys that differ only in case, which are two keys",
+            tags: json!([{"Key": "stage", "Value": "test"}, {"Key": "Stage", "Value": "prod"}]),
+            refused_with: None,
+        },
+        Case {
+            label: "as many tags as the published maximum allows",
+            tags: tag_list(MAX_TAGS),
+            refused_with: None,
+        },
+        Case {
+            label: "one key assigned two different values",
+            tags: json!([{"Key": "stage", "Value": "test"}, {"Key": "stage", "Value": "prod"}]),
+            refused_with: Some("TaggingFailedException"),
+        },
+        Case {
+            label: "one key assigned the same value twice",
+            tags: json!([{"Key": "stage", "Value": "test"}, {"Key": "stage", "Value": "test"}]),
+            refused_with: Some("TaggingFailedException"),
+        },
+        Case {
+            label: "a repeated key at the end of a full tag list",
+            tags: Value::Array(repeated_among_many),
+            refused_with: Some("TaggingFailedException"),
+        },
+        Case {
+            label: "one tag past the published maximum",
+            tags: tag_list(MAX_TAGS + 1),
+            refused_with: Some("ValidationException"),
+        },
+    ];
+
+    let gamelift = GameLift::new();
+    for (index, case) in cases.iter().enumerate() {
+        let label = case.label;
+        let name = format!("custom-tag-row-{index}");
+        let request = json!({"LocationName": &name, "Tags": case.tags.clone()});
+
+        match case.refused_with {
+            None => {
+                let created = gamelift.ok("CreateLocation", request).await;
+                assert_eq!(
+                    created["Location"],
+                    json!({"LocationName": &name, "LocationArn": location_arn(&name)}),
+                    "case {label:?}: the create must report the stored location, got {}",
+                    created["Location"]
+                );
+                assert!(
+                    location_exists(&gamelift, &name).await,
+                    "case {label:?}: the accepted location must be stored, got no {name} in the \
+                     list"
+                );
+            }
+            Some(expected) => {
+                let (status, code) = gamelift.err("CreateLocation", request).await;
+                assert_eq!(
+                    (status, code.as_str()),
+                    (400, expected),
+                    "case {label:?}: the create must be refused, got {status} {code}"
+                );
+                assert!(
+                    !location_exists(&gamelift, &name).await,
+                    "case {label:?}: a refused create must store nothing, got {name} in the list"
+                );
+            }
+        }
+    }
+}
+
+/// The account's custom-location quota bounds the stored collection: once it is reached
+/// the next create answers the modelled `LimitExceededException` and stores nothing,
+/// while a create of a name that is already taken stays the `ConflictException` it is at
+/// any size of the collection.
+#[tokio::test]
+async fn the_custom_location_quota_is_the_bound_on_the_stored_collection() {
+    let quota = service_com_amazonaws_gamelift_gamelift::state::MAX_CUSTOM_LOCATIONS_PER_ACCOUNT;
+    let gamelift = GameLift::new();
+    for index in 0..quota {
+        gamelift
+            .ok(
+                "CreateLocation",
+                json!({"LocationName": format!("custom-quota-{index}")}),
+            )
+            .await;
+    }
+
+    let (status, code) = gamelift
+        .err(
+            "CreateLocation",
+            json!({"LocationName": "custom-one-too-many"}),
+        )
+        .await;
+    assert_eq!(
+        (status, code.as_str()),
+        (400, "LimitExceededException"),
+        "a create past the quota must be refused, got {status} {code}"
+    );
+
+    // A name that is taken conflicts whatever the size of the collection: the uniqueness
+    // of the name is decided before the quota is.
+    let (status, code) = gamelift
+        .err("CreateLocation", json!({"LocationName": "custom-quota-0"}))
+        .await;
+    assert_eq!(
+        (status, code.as_str()),
+        (400, "ConflictException"),
+        "a name that is taken must conflict even at the quota, got {status} {code}"
+    );
+
+    // Neither refused create changed the collection: it still holds exactly the
+    // locations that filled the quota, each once.
+    let mut listed = listed_names(&gamelift, json!({"Filters": ["CUSTOM"], "Limit": 200})).await;
+    listed.sort();
+    let mut expected: Vec<String> = (0..quota)
+        .map(|index| format!("custom-quota-{index}"))
+        .collect();
+    expected.sort();
+    assert_eq!(
+        listed, expected,
+        "the refused creates must leave the collection as it was, got {} locations",
+        listed.len()
+    );
 }
