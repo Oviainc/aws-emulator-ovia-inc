@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAggregateLogGroupSummaries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAggregateLogGroupSummaries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: counts the log groups in the shared store that each data-source
+//! characteristic is shared by, honouring the name-pattern, class, data-source and
+//! account filters and the page bounds. This is the ONLY file to touch for this
+//! operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`ListAggregateLogGroupSummaries::handle`] with real behaviour and
@@ -145,6 +146,134 @@ impl From<ListAggregateLogGroupSummariesErrorModeled> for ListAggregateLogGroupS
     }
 }
 
+/// The kind tag this operation's pagination cursor carries, so a token minted by
+/// another paginated operation is refused rather than misread.
+const CURSOR_KIND: &str = "ListAggregateLogGroupSummaries";
+
+/// The `groupBy` value that groups by data source name and type, from
+/// `ListAggregateLogGroupSummariesGroupBy`.
+const GROUP_BY_NAME_AND_TYPE: &str = "DATA_SOURCE_NAME_AND_TYPE";
+
+/// The `groupBy` value that groups by data source name, type and format, from
+/// `ListAggregateLogGroupSummariesGroupBy`.
+const GROUP_BY_NAME_TYPE_AND_FORMAT: &str = "DATA_SOURCE_NAME_TYPE_AND_FORMAT";
+
+/// The `groupingIdentifiers` keys, in the dot notation `GroupingIdentifier$key`
+/// documents: "The format of the key uses dot notation. Examples are,
+/// `dataSource.Name`, `dataSource.Type`, and `dataSource.Format`."
+const GROUPING_KEY_NAME: &str = "dataSource.Name";
+const GROUPING_KEY_TYPE: &str = "dataSource.Type";
+const GROUPING_KEY_FORMAT: &str = "dataSource.Format";
+
+/// One aggregation group: the `(key, value)` identifiers the log groups in it share, in
+/// the order `groupBy` names them. Ordered, so the enumeration — and therefore the page
+/// a token resumes — is stable across calls.
+type GroupingKey = Vec<(String, String)>;
+
+/// Where the next page resumes: the last grouping key returned, plus the filters of the
+/// aggregation it belongs to. A continuation that changes a filter is refused, because
+/// the token is only a position within one aggregation.
+#[derive(Debug, Clone)]
+struct Cursor {
+    filters: ::serde_json::Value,
+    after: GroupingKey,
+}
+
+impl Cursor {
+    fn encode(&self) -> String {
+        crate::state::encode_token(&::serde_json::json!({
+            "kind": CURSOR_KIND,
+            "filters": self.filters,
+            "after": self.after,
+        }))
+    }
+
+    fn decode(token: &str) -> Option<Self> {
+        let value = crate::state::decode_token(token)?;
+        if value.get("kind")?.as_str()? != CURSOR_KIND {
+            return None;
+        }
+        Some(Self {
+            filters: value.get("filters")?.clone(),
+            after: ::serde_json::from_value(value.get("after")?.clone()).ok()?,
+        })
+    }
+}
+
+/// Every member of the request that shapes the aggregation, as one comparable value: a
+/// page token is a position within THIS aggregation, so a continuation that changes any
+/// of them is a different one.
+fn filters_of(input: &ListAggregateLogGroupSummariesInput) -> ::serde_json::Value {
+    ::serde_json::json!({
+        "groupBy": input.group_by,
+        "logGroupNamePattern": input.log_group_name_pattern,
+        "logGroupClass": input.log_group_class,
+        "includeLinkedAccounts": input.include_linked_accounts,
+        "accountIdentifiers": input.account_identifiers,
+        "dataSources": input.data_sources.as_ref().map(|filters| {
+            // `DataSourceFilter` models exactly these two members, so this is the whole
+            // filter value and cannot drift from what the selection reads.
+            filters
+                .iter()
+                .map(|filter| ::serde_json::json!({"name": filter.name, "type": filter.r#type}))
+                .collect::<Vec<_>>()
+        }),
+    })
+}
+
+/// The identifiers one data source is grouped under, for the requested `groupBy`: its
+/// name and type always, its format as well when `groupBy` names the format. An
+/// identifier the data source does not carry is left out rather than reported empty.
+fn grouping_key(source: &crate::state::DataSourceRecord, group_by: &str) -> GroupingKey {
+    let mut key = vec![(GROUPING_KEY_NAME.to_string(), source.name.clone())];
+    if let Some(source_type) = &source.source_type {
+        key.push((GROUPING_KEY_TYPE.to_string(), source_type.clone()));
+    }
+    if group_by == GROUP_BY_NAME_TYPE_AND_FORMAT {
+        if let Some(format) = &source.format {
+            key.push((GROUPING_KEY_FORMAT.to_string(), format.clone()));
+        }
+    }
+    key
+}
+
+/// Count, per grouping key, the log groups whose data sources share it: "The operation
+/// aggregates log groups by data source name and type and optionally format, providing
+/// counts of log groups that share these characteristics."
+///
+/// One log group counts ONCE towards each DISTINCT key among the data sources that
+/// ingest into it, so a group with two data sources that group to the same key is not
+/// counted twice. `data_source_filters` narrows which of a group's data sources count
+/// ("Filters the results by data source characteristics to include only log groups
+/// associated with the specified data sources"). The result is ordered by grouping key,
+/// which is what a page token is a position in.
+fn aggregate_counts<'a>(
+    groups: impl Iterator<Item = &'a crate::state::LogGroupRecord>,
+    group_by: &str,
+    data_source_filters: Option<&[DataSourceFilter]>,
+) -> Vec<(GroupingKey, i32)> {
+    let mut counts: ::std::collections::BTreeMap<GroupingKey, i32> =
+        ::std::collections::BTreeMap::new();
+    for group in groups {
+        let mut keys: Vec<GroupingKey> = group
+            .data_sources
+            .iter()
+            .filter(|source| {
+                data_source_filters.is_none_or(|filters| {
+                    crate::state::data_source_matches_filters(source, filters)
+                })
+            })
+            .map(|source| grouping_key(source, group_by))
+            .collect();
+        keys.sort();
+        keys.dedup();
+        for key in keys {
+            *counts.entry(key).or_default() += 1;
+        }
+    }
+    counts.into_iter().collect()
+}
+
 /// The `ListAggregateLogGroupSummaries` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -181,18 +310,363 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAggregateLogGroupSummaries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAggregateLogGroupSummariesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAggregateLogGroupSummaries"))
+        // `ctx` carries only request metadata.
+        let _ = ctx;
+
+        let invalid = |message: String| {
+            ListAggregateLogGroupSummariesError::from(
+                ListAggregateLogGroupSummariesErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                ),
+            )
+        };
+
+        // `logGroupNamePattern` carries `skip_validation` (see
+        // `types::list_aggregate_log_group_summaries_types`), so this operation applies
+        // the member's constraints itself — all but the per-alternative 24-character
+        // maximum the service does not apply. The refusal is this operation's
+        // `InvalidParameterException` ("A parameter is specified incorrectly"), which is
+        // the code the recordings show CloudWatch Logs answering for an input-constraint
+        // violation on this very operation, not the `ValidationException` it also models.
+        if let Some(pattern) = input.log_group_name_pattern.as_deref() {
+            crate::state::check_log_group_name_pattern(pattern).map_err(invalid)?;
+        }
+
+        // `groupBy` is a modelled `@required` enum, so the boundary validator has
+        // already refused an absent or out-of-set value; only the two values below can
+        // reach here, and the one that is not the format grouping is the name-and-type
+        // grouping.
+        debug_assert!(
+            input.group_by == GROUP_BY_NAME_AND_TYPE
+                || input.group_by == GROUP_BY_NAME_TYPE_AND_FORMAT
+        );
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAggregateLogGroupSummariesError::from(
+                ListAggregateLogGroupSummariesErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let store = state.lock();
+
+        // "When includeLinkedAccounts is set to true, use this parameter
+        // [accountIdentifiers] to specify the list of accounts to search"; otherwise the
+        // search is the caller's own account. This emulator serves exactly one account,
+        // so a request that searches only other accounts aggregates nothing here rather
+        // than being answered with this account's log groups.
+        let searches_this_account = !input.include_linked_accounts.unwrap_or(false)
+            || input.account_identifiers.as_ref().is_none_or(|accounts| {
+                accounts.is_empty()
+                    || accounts
+                        .iter()
+                        .any(|account| account == ::engine::emulator_account_id())
+            });
+
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => {
+                let Some(cursor) = Cursor::decode(token) else {
+                    return Err(invalid("nextToken is not a valid token".to_string()));
+                };
+                if cursor.filters != filters_of(&input) {
+                    return Err(invalid(
+                        "nextToken was issued for a different ListAggregateLogGroupSummaries \
+                         request"
+                            .to_string(),
+                    ));
+                }
+                Some(cursor)
+            }
+            None => None,
+        };
+
+        // This emulator serves one account, so a request that searches only other
+        // accounts aggregates nothing — decided once, before the scan.
+        if !searches_this_account {
+            return Ok(ListAggregateLogGroupSummariesOutput {
+                aggregate_log_group_summaries: Some(Vec::new()),
+                next_token: None,
+            });
+        }
+
+        let selected = store
+            .log_groups
+            .values()
+            // "Use this parameter to limit the returned log groups to only those with
+            // names that match the pattern that you specify."
+            .filter(|group| {
+                input
+                    .log_group_name_pattern
+                    .as_deref()
+                    .is_none_or(|pattern| {
+                        crate::state::log_group_name_matches_pattern(&group.name, pattern)
+                    })
+            })
+            // "Filters the results by log group class to include only log groups of the
+            // specified class."
+            .filter(|group| {
+                input
+                    .log_group_class
+                    .as_deref()
+                    .is_none_or(|class| group.log_group_class == class)
+            });
+        let groups = aggregate_counts(selected, &input.group_by, input.data_sources.as_deref());
+        let first = match &cursor {
+            Some(cursor) => groups.partition_point(|(key, _)| *key <= cursor.after),
+            None => 0,
+        };
+        // `limit` is modelled `range 1..50`, so the boundary validator has already
+        // refused a value outside it; `max(1)` only keeps the page bounds sane.
+        let limit = usize::try_from(input.limit.unwrap_or(crate::state::DEFAULT_LIST_LIMIT))
+            .unwrap_or(0)
+            .max(1);
+        let last = first.saturating_add(limit).min(groups.len());
+        let page = &groups[first..last];
+
+        // A token only where a page follows this one: "The token for the next set of
+        // items to return."
+        let next_token = page.last().filter(|_| last < groups.len()).map(|(key, _)| {
+            Cursor {
+                filters: filters_of(&input),
+                after: key.clone(),
+            }
+            .encode()
+        });
+
+        Ok(ListAggregateLogGroupSummariesOutput {
+            aggregate_log_group_summaries: Some(
+                page.iter()
+                    .map(|(key, count)| AggregateLogGroupSummary {
+                        log_group_count: Some(*count),
+                        grouping_identifiers: Some(
+                            key.iter()
+                                .map(|(name, value)| GroupingIdentifier {
+                                    key: Some(name.clone()),
+                                    value: Some(value.clone()),
+                                })
+                                .collect(),
+                        ),
+                    })
+                    .collect(),
+            ),
+            next_token,
+        })
+    }
+}
+
+/// Unit tests for the aggregation itself.
+///
+/// [`aggregate_counts`] is the part of this operation no end-to-end test can drive yet:
+/// a log group's data sources are what AWS's own vended-log ingestion creates, and this
+/// model exposes no operation that associates one with a log group (see
+/// [`crate::state::DataSourceRecord`]), so over the wire every aggregation is empty. The
+/// table below seeds the records directly and spans what the rule generalises over: how
+/// many groups share a key, how many data sources one group carries, a duplicate data
+/// source, both `groupBy` values, a data source carrying no type or no format, and the
+/// `dataSources` filter.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{DataSourceRecord, LogGroupRecord};
+
+    /// The region a record's ARNs are built from; immaterial to the aggregation.
+    const REGION: &str = "eu-west-2";
+
+    /// One log group carrying `sources`.
+    fn group(name: &str, sources: &[(&str, Option<&str>, Option<&str>)]) -> LogGroupRecord {
+        let mut record = LogGroupRecord::new(REGION, name, 0);
+        record.data_sources = sources
+            .iter()
+            .map(|(source_name, source_type, format)| DataSourceRecord {
+                name: (*source_name).to_string(),
+                source_type: source_type.map(ToString::to_string),
+                format: format.map(ToString::to_string),
+            })
+            .collect();
+        record
+    }
+
+    /// The identifiers and count of each aggregated group, as `(key, value)` pairs.
+    fn counted(
+        groups: &[LogGroupRecord],
+        group_by: &str,
+        filters: Option<&[DataSourceFilter]>,
+    ) -> Vec<(Vec<(String, String)>, i32)> {
+        aggregate_counts(groups.iter(), group_by, filters)
+    }
+
+    #[test]
+    fn log_groups_sharing_a_data_source_are_counted_together() {
+        let groups = [
+            group("a", &[("amazon_vpc", Some("flow"), Some("OCSF"))]),
+            group("b", &[("amazon_vpc", Some("flow"), Some("OCSF"))]),
+            group("c", &[("amazon_route53", Some("query"), None)]),
+        ];
+        let counts = counted(&groups, GROUP_BY_NAME_AND_TYPE, None);
+        assert_eq!(
+            counts,
+            vec![
+                (
+                    vec![
+                        (GROUPING_KEY_NAME.to_string(), "amazon_route53".to_string()),
+                        (GROUPING_KEY_TYPE.to_string(), "query".to_string()),
+                    ],
+                    1
+                ),
+                (
+                    vec![
+                        (GROUPING_KEY_NAME.to_string(), "amazon_vpc".to_string()),
+                        (GROUPING_KEY_TYPE.to_string(), "flow".to_string()),
+                    ],
+                    2
+                ),
+            ],
+            "case two groups on one data source and one on another: got {counts:?}"
+        );
+    }
+
+    #[test]
+    fn one_group_counts_once_per_distinct_key() {
+        // Two data sources that group to the same key under DATA_SOURCE_NAME_AND_TYPE,
+        // and to two keys once the format joins the key.
+        let groups = [group(
+            "a",
+            &[
+                ("amazon_vpc", Some("flow"), Some("OCSF")),
+                ("amazon_vpc", Some("flow"), Some("PARQUET")),
+                ("amazon_vpc", Some("flow"), Some("OCSF")),
+            ],
+        )];
+
+        let counts = counted(&groups, GROUP_BY_NAME_AND_TYPE, None);
+        assert_eq!(
+            counts.len(),
+            1,
+            "case grouped by name and type: the three data sources share one key, got {counts:?}"
+        );
+        assert_eq!(
+            counts[0].1, 1,
+            "case grouped by name and type: one log group counts once, got {counts:?}"
+        );
+
+        let counts = counted(&groups, GROUP_BY_NAME_TYPE_AND_FORMAT, None);
+        assert_eq!(
+            counts.len(),
+            2,
+            "case grouped by name, type and format: the two formats are two keys, and the \
+             repeated data source is not a third, got {counts:?}"
+        );
+        for (key, count) in &counts {
+            assert_eq!(
+                *count, 1,
+                "case grouped by name, type and format: one log group counts once per key, got \
+                 {counts:?}"
+            );
+            assert_eq!(
+                key.len(),
+                3,
+                "case grouped by name, type and format: the key carries all three identifiers, \
+                 got {key:?}"
+            );
+            assert_eq!(
+                key[2].0, GROUPING_KEY_FORMAT,
+                "case grouped by name, type and format: the third identifier is the format, got \
+                 {key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_identifier_the_data_source_does_not_carry_is_left_out() {
+        let groups = [group("a", &[("custom", None, None)])];
+        for group_by in [GROUP_BY_NAME_AND_TYPE, GROUP_BY_NAME_TYPE_AND_FORMAT] {
+            let counts = counted(&groups, group_by, None);
+            assert_eq!(
+                counts,
+                vec![(
+                    vec![(GROUPING_KEY_NAME.to_string(), "custom".to_string())],
+                    1
+                )],
+                "case {group_by} with neither a type nor a format: only the name identifies the \
+                 group, got {counts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_data_source_filter_narrows_what_is_counted() {
+        let groups = [
+            group("a", &[("amazon_vpc", Some("flow"), None)]),
+            group(
+                "b",
+                &[
+                    ("amazon_vpc", Some("flow"), None),
+                    ("amazon_route53", Some("query"), None),
+                ],
+            ),
+        ];
+
+        // Filtering by name alone keeps every type under that name.
+        let by_name = [DataSourceFilter {
+            name: "amazon_vpc".to_string(),
+            r#type: None,
+        }];
+        let counts = counted(&groups, GROUP_BY_NAME_AND_TYPE, Some(&by_name));
+        assert_eq!(
+            counts.len(),
+            1,
+            "case a name filter: only the matching data source counts, got {counts:?}"
+        );
+        assert_eq!(
+            counts[0].1, 2,
+            "case a name filter: both groups carry it, got {counts:?}"
+        );
+
+        // A type that no data source under that name carries selects nothing.
+        let mismatched = [DataSourceFilter {
+            name: "amazon_vpc".to_string(),
+            r#type: Some("query".to_string()),
+        }];
+        let counts = counted(&groups, GROUP_BY_NAME_AND_TYPE, Some(&mismatched));
+        assert!(
+            counts.is_empty(),
+            "case a name and a type no data source pairs: nothing is counted, got {counts:?}"
+        );
+
+        // Two filters: the names are OR'd, the types are OR'd, and the two dimensions
+        // are AND'd, so both data sources of group `b` count.
+        let both = [
+            DataSourceFilter {
+                name: "amazon_vpc".to_string(),
+                r#type: Some("flow".to_string()),
+            },
+            DataSourceFilter {
+                name: "amazon_route53".to_string(),
+                r#type: Some("query".to_string()),
+            },
+        ];
+        let counts = counted(&groups, GROUP_BY_NAME_AND_TYPE, Some(&both));
+        assert_eq!(
+            counts.len(),
+            2,
+            "case two filters: each named data source is its own group, got {counts:?}"
+        );
+    }
+
+    #[test]
+    fn a_store_with_no_data_source_aggregates_nothing() {
+        let groups = [group("a", &[]), group("b", &[])];
+        for group_by in [GROUP_BY_NAME_AND_TYPE, GROUP_BY_NAME_TYPE_AND_FORMAT] {
+            let counts = counted(&groups, group_by, None);
+            assert!(
+                counts.is_empty(),
+                "case {group_by}: log groups with no data source share no characteristic to \
+                 count, got {counts:?}"
+            );
+        }
     }
 }

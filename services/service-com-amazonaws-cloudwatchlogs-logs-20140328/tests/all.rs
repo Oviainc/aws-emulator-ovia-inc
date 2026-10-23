@@ -17,6 +17,8 @@ mod deletion_protection;
 mod harness;
 #[path = "all/log_core_loop.rs"]
 mod log_core_loop;
+#[path = "all/log_group_name_pattern_lists.rs"]
+mod log_group_name_pattern_lists;
 #[path = "all/log_stream_removal.rs"]
 mod log_stream_removal;
 #[path = "all/resource_policies.rs"]

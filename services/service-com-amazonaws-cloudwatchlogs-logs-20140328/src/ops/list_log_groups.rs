@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListLogGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListLogGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: enumerates the log groups in the shared store, honouring the
+//! name-pattern, class, tag, data-source and field-index filters and the page bounds.
+//! This is the ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`ListLogGroups::handle`] with real behaviour and
@@ -147,6 +147,141 @@ impl From<ListLogGroupsErrorModeled> for ListLogGroupsError {
     }
 }
 
+/// The kind tag this operation's pagination cursor carries, so a token minted by
+/// another paginated operation is refused rather than misread.
+const CURSOR_KIND: &str = "ListLogGroups";
+
+/// Where the next page resumes: the last log group name returned, plus the filters of
+/// the scan it belongs to. A continuation that changes a filter is refused, because the
+/// token is only a position within one filtered enumeration.
+#[derive(Debug, Clone)]
+struct Cursor {
+    filters: ::serde_json::Value,
+    after: String,
+}
+
+impl Cursor {
+    fn encode(&self) -> String {
+        crate::state::encode_token(&::serde_json::json!({
+            "kind": CURSOR_KIND,
+            "filters": self.filters,
+            "after": self.after,
+        }))
+    }
+
+    fn decode(token: &str) -> Option<Self> {
+        let value = crate::state::decode_token(token)?;
+        if value.get("kind")?.as_str()? != CURSOR_KIND {
+            return None;
+        }
+        Some(Self {
+            filters: value.get("filters")?.clone(),
+            after: value.get("after")?.as_str()?.to_string(),
+        })
+    }
+}
+
+/// Every member of the request that narrows the enumeration, as one comparable value:
+/// the page token is a position within THIS filtered scan, so a continuation that
+/// changes any of them is a different enumeration.
+fn filters_of(input: &ListLogGroupsInput) -> ::serde_json::Value {
+    ::serde_json::json!({
+        "logGroupNamePattern": input.log_group_name_pattern,
+        "logGroupClass": input.log_group_class,
+        "includeLinkedAccounts": input.include_linked_accounts,
+        "accountIdentifiers": input.account_identifiers,
+        "fieldIndexNames": input.field_index_names,
+        "dataSources": input.data_sources.as_ref().map(|filters| {
+            // `DataSourceFilter` models exactly these two members, so this is the whole
+            // filter value and cannot drift from what the selection reads.
+            filters
+                .iter()
+                .map(|filter| ::serde_json::json!({"name": filter.name, "type": filter.r#type}))
+                .collect::<Vec<_>>()
+        }),
+        "logGroupTags": input.log_group_tags.as_ref().map(|filters| {
+            filters
+                .iter()
+                .map(|filter| ::serde_json::json!({"key": filter.key, "values": filter.values}))
+                .collect::<Vec<_>>()
+        }),
+    })
+}
+
+/// Whether one tag value satisfies one term of a `TagFilter`'s `values` list.
+///
+/// The member documents the whole syntax: "Use `*` for wildcard matching. For example,
+/// `prod*` matches values that start with `prod`. Use `!` as a prefix for negation. For
+/// example, `!prod` matches values that are not `prod`. Exact matching and negation are
+/// case-sensitive. Wildcard matching is case-insensitive."
+///
+/// The negation prefixes are stripped in a LOOP, never by recursing. The member's own
+/// modelled `@pattern` (`^!?\*?([\p{L}\p{Z}\p{N}_.:/=+\-@]*)\*?$`) already bounds a term
+/// to ONE `!` and a wildcard at either end, and that member keeps its boundary
+/// validation — only `logGroupNamePattern` carries `skip_validation` — so a longer run is
+/// refused before this runs. The loop keeps the cost of a request-derived string one
+/// iteration per character even so, rather than one stack frame.
+fn tag_value_matches(value: &str, term: &str) -> bool {
+    let mut term = term;
+    let mut negated = false;
+    while let Some(rest) = term.strip_prefix('!') {
+        negated = !negated;
+        term = rest;
+    }
+    let matches = if term.contains('*') {
+        wildcard_matches(&value.to_lowercase(), &term.to_lowercase())
+    } else {
+        value == term
+    };
+    matches != negated
+}
+
+/// Whether `value` matches a term containing `*` wildcards, each standing for any run of
+/// characters (`prod*`, `*prod`, `a*b*c`). Both arguments arrive case-folded, because
+/// "Wildcard matching is case-insensitive".
+fn wildcard_matches(value: &str, term: &str) -> bool {
+    let mut literals = term.split('*');
+    // The run before the first `*` is anchored at the start, the run after the last `*`
+    // at the end, and every run between them is matched in order.
+    let Some(first) = literals.next() else {
+        return true;
+    };
+    let Some(mut rest) = value.strip_prefix(first) else {
+        return false;
+    };
+    let remaining: Vec<&str> = literals.collect();
+    let Some((last, middle)) = remaining.split_last() else {
+        // No `*` at all: the term is literal.
+        return rest.is_empty();
+    };
+    for literal in middle {
+        match rest.find(literal) {
+            Some(at) => rest = &rest[at + literal.len()..],
+            None => return false,
+        }
+    }
+    rest.ends_with(last)
+}
+
+/// Whether one log group's tags satisfy one `TagFilter`.
+///
+/// From `TagFilter$values`: "If you specify a filter that contains more than one value
+/// for a key, the response returns log groups that match any of the specified values for
+/// that key"; "If you don't specify values, the response returns all log groups that are
+/// tagged with that key, with any or no value."
+fn group_matches_tag_filter(
+    tags: &::std::collections::BTreeMap<String, String>,
+    filter: &TagFilter,
+) -> bool {
+    let Some(value) = tags.get(&filter.key) else {
+        return false;
+    };
+    match filter.values.as_deref() {
+        None | Some([]) => true,
+        Some(terms) => terms.iter().any(|term| tag_value_matches(value, term)),
+    }
+}
+
 /// The `ListLogGroups` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -183,18 +318,159 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListLogGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListLogGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListLogGroups"))
+        // `ctx` carries only request metadata.
+        let _ = ctx;
+
+        let invalid = |message: String| {
+            ListLogGroupsError::from(ListLogGroupsErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            ))
+        };
+
+        // `logGroupNamePattern` carries `skip_validation` (see
+        // `types::list_log_groups_types`), so this operation applies the member's
+        // constraints itself — all but the per-alternative 24-character maximum the
+        // service does not apply. `InvalidParameterException` is what this operation
+        // models for "a parameter is specified incorrectly"; it models no
+        // `ValidationException` at all.
+        if let Some(pattern) = input.log_group_name_pattern.as_deref() {
+            crate::state::check_log_group_name_pattern(pattern).map_err(invalid)?;
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListLogGroupsError::from(ListLogGroupsErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the log store is unavailable".to_string()),
+                },
+            ))
+        })?;
+        let store = state.lock();
+
+        // "When includeLinkedAccounts is set to true, use this parameter
+        // [accountIdentifiers] to specify the list of accounts to search"; otherwise the
+        // search is the caller's own account. This emulator serves exactly one account,
+        // so a request that searches only other accounts matches nothing here rather
+        // than being answered with this account's log groups.
+        let searches_this_account = !input.include_linked_accounts.unwrap_or(false)
+            || input.account_identifiers.as_ref().is_none_or(|accounts| {
+                accounts.is_empty()
+                    || accounts
+                        .iter()
+                        .any(|account| account == ::engine::emulator_account_id())
+            });
+
+        // "Only log groups containing all specified field indexes are returned." A log
+        // group's field indexes come from the index policy `PutIndexPolicy` puts on it,
+        // and that operation is still a 501 stub, so this store holds no field index for
+        // any log group: a request that requires one matches nothing.
+        let requires_field_index = input
+            .field_index_names
+            .as_ref()
+            .is_some_and(|names| !names.is_empty());
+
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => {
+                let Some(cursor) = Cursor::decode(token) else {
+                    return Err(invalid("nextToken is not a valid token".to_string()));
+                };
+                if cursor.filters != filters_of(&input) {
+                    return Err(invalid(
+                        "nextToken was issued for a different ListLogGroups request".to_string(),
+                    ));
+                }
+                Some(cursor)
+            }
+            None => None,
+        };
+
+        // Both of these are request-level constants, decided once before the scan: this
+        // emulator serves one account, so a request that searches only other accounts
+        // matches nothing, and no log group here carries a field index, so a request
+        // that requires one matches nothing either.
+        if !searches_this_account || requires_field_index {
+            return Ok(ListLogGroupsOutput {
+                log_groups: Some(Vec::new()),
+                next_token: None,
+            });
+        }
+
+        // The store keys groups by name, so iteration is already in name order.
+        let matching: Vec<&crate::state::LogGroupRecord> = store
+            .log_groups
+            .values()
+            // "Use this parameter to limit the returned log groups to only those with
+            // names that match the pattern that you specify."
+            .filter(|group| {
+                input
+                    .log_group_name_pattern
+                    .as_deref()
+                    .is_none_or(|pattern| {
+                        crate::state::log_group_name_matches_pattern(&group.name, pattern)
+                    })
+            })
+            // "Use this parameter to limit the results to only those log groups in the
+            // specified log group class."
+            .filter(|group| {
+                input
+                    .log_group_class
+                    .as_deref()
+                    .is_none_or(|class| group.log_group_class == class)
+            })
+            // "An array of tag filters to return only log groups that have specific
+            // tags. Multiple filters are combined with AND logic."
+            .filter(|group| {
+                input.log_group_tags.as_deref().is_none_or(|filters| {
+                    filters
+                        .iter()
+                        .all(|filter| group_matches_tag_filter(&group.tags, filter))
+                })
+            })
+            // "An array of data source filters to filter log groups by their associated
+            // data sources."
+            .filter(|group| {
+                input.data_sources.as_deref().is_none_or(|filters| {
+                    crate::state::log_group_matches_data_source_filters(group, filters)
+                })
+            })
+            .collect();
+
+        let first = match &cursor {
+            Some(cursor) => matching.partition_point(|group| group.name <= cursor.after),
+            None => 0,
+        };
+        // `limit` is modelled `range 1..1000`, so the boundary validator has already
+        // refused a value outside it; `max(1)` only keeps the page bounds sane.
+        let limit = usize::try_from(input.limit.unwrap_or(crate::state::DEFAULT_LIST_LIMIT))
+            .unwrap_or(0)
+            .max(1);
+        let last = first.saturating_add(limit).min(matching.len());
+        let page = &matching[first..last];
+
+        // A token only where a page follows this one: "The token for the next set of
+        // items to return."
+        let next_token = page.last().filter(|_| last < matching.len()).map(|group| {
+            Cursor {
+                filters: filters_of(&input),
+                after: group.name.clone(),
+            }
+            .encode()
+        });
+
+        Ok(ListLogGroupsOutput {
+            log_groups: Some(
+                page.iter()
+                    .map(|group| LogGroupSummary {
+                        log_group_name: Some(group.name.clone()),
+                        // `LogGroupSummary$logGroupArn` is the ARN version without the
+                        // trailing `:*`.
+                        log_group_arn: Some(group.log_group_arn.clone()),
+                        log_group_class: Some(group.log_group_class.clone()),
+                    })
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }
