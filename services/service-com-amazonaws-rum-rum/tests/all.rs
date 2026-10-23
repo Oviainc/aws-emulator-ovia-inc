@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/app_monitor_lifecycle.rs"]
 mod app_monitor_lifecycle;
+#[path = "all/list_tags_for_resource.rs"]
+mod list_tags_for_resource;
 #[path = "all/metrics_destinations.rs"]
 mod metrics_destinations;
 #[path = "all/resource_policy.rs"]
@@ -21,3 +23,5 @@ mod resource_policy;
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/support.rs"]
+mod support;
