@@ -8014,6 +8014,7 @@ dependencies = [
  "http",
  "serde_json",
  "service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10",
+ "service-common",
  "sha2 0.10.9",
  "tokio",
  "tracing",
@@ -8037,6 +8038,8 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-com-amazonaws-elasticloadbalancing-elasticloadbalancing-v7",
+ "service-common",
  "sha2 0.10.9",
  "tokio",
  "tracing",
@@ -14711,6 +14714,7 @@ dependencies = [
  "http",
  "serde_json",
  "sha2 0.10.9",
+ "uuid",
 ]
 
 [[package]]
