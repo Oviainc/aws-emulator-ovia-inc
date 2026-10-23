@@ -161,27 +161,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = &mut *guard;
 
         // An identifier that names no stored connection is a 404: an update never
-        // brings a connection into existence.
+        // brings a connection into existence. The message is built from the request's
+        // own identifier, in this operation's own construction.
         let Some(stored) = store.connections.get_mut(&input.identifier) else {
             return Err(UpdateConnectionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "no connection with identifier '{}'",
-                        input.identifier
-                    )),
+                    message: Some(crate::state::connection_absent_message(&input.identifier)),
                 },
             )
             .into());
         };
 
-        // A connection on its way out, or already gone, has nothing left to modify.
-        if stored.connection.state == "deleting" || stored.connection.state == "deleted" {
+        // An update is permitted only FROM the states the service permits it from
+        // (`crate::state::UPDATABLE_CONNECTION_STATES`): a connection whose circuit is
+        // mid-flight (`pending`, `updating`, `deleting`), impaired (`down`, `failed`)
+        // or gone (`deleted`) has nothing a description or bandwidth change can be
+        // applied to. The refusal states that rule, naming the requested identifier.
+        if !crate::state::is_updatable_state(&stored.connection.state) {
             return Err(UpdateConnectionErrorModeled::InterconnectClientException(
                 InterconnectClientException {
-                    message: format!(
-                        "connection '{}' is {} and cannot be modified",
-                        stored.connection.id, stored.connection.state
-                    ),
+                    message: crate::state::connection_not_updatable_message(&input.identifier),
                 },
             )
             .into());

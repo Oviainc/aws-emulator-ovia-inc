@@ -75,6 +75,7 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-interconnect-interconne
 #[smithy_macros::operation_error(
     "com.amazonaws.interconnect#ListAttachPoints",
     extra_errors = [
+        "InterconnectClientException",
         "ResourceNotFoundException",
         "InterconnectValidationException",
         "InterconnectServerException"
@@ -82,6 +83,7 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-interconnect-interconne
 )]
 #[derive(Debug)]
 pub enum ListAttachPointsErrorModeled {
+    InterconnectClientException(InterconnectClientException),
     ResourceNotFoundException(ResourceNotFoundException),
     InterconnectValidationException(InterconnectValidationException),
     InterconnectServerException(InterconnectServerException),
@@ -150,20 +152,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The attach points are listed FOR an Environment, so an `environmentId` the
-        // catalog does not hold has no attach points to be valid for: it is the same
-        // 404 `GetEnvironment` answers for that id, never an empty page, which a
-        // caller could not tell from "this environment offers none". @readonly: this
-        // handler only reads, and Environments are AWS-managed (the model binds no
-        // CreateEnvironment), so there is nothing the clock owes here either.
-        let descriptors: Vec<AttachPointDescriptor> = {
+        // catalog does not hold has nothing to list them for. An unresolvable
+        // environment is this service's own client fault — the caller named an
+        // environment model that does not exist — so it is the 400
+        // `InterconnectClientException` every environment-resolving operation gives,
+        // never the connection-scoped 404 and never an empty page, which a caller
+        // could not tell from "this environment offers none". @readonly: nothing here
+        // writes to this service's store, and Environments are AWS-managed (the model
+        // binds no CreateEnvironment), so there is nothing the clock owes either.
+        let seeded: Vec<AttachPointDescriptor> = {
             let store = state.lock();
             if !store.environments.contains_key(&input.environment_id) {
-                return Err(ListAttachPointsErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "no environment with id '{}'",
-                            input.environment_id
-                        )),
+                return Err(ListAttachPointsErrorModeled::InterconnectClientException(
+                    InterconnectClientException {
+                        message: crate::state::environment_not_found_message(
+                            &input.environment_id,
+                        ),
                     },
                 )
                 .into());
@@ -174,15 +178,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .cloned()
                 .unwrap_or_default()
         };
-
-        // Keyed by `identifier`, which is what identifies an attach point within an
-        // environment, and ordered by it so paging walks one stable sequence: a page
-        // cursor is the last identifier handed out, so no page is repeated or skipped.
-        let mut keyed: Vec<(String, AttachPointDescriptor)> = descriptors
-            .into_iter()
-            .map(|descriptor| (descriptor.identifier.clone(), descriptor))
-            .collect();
-        keyed.sort_by(|(left, _), (right, _)| left.cmp(right));
 
         // A cursor this operation did not issue is refused, rather than answered
         // with an empty page the caller cannot tell from "no more results".
@@ -204,6 +199,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             None => None,
         };
+
+        // The Environment's own attach points, as the catalog holds them. (A Direct
+        // Connect gateway the CALLER owns is also a valid attach point for an
+        // Environment — "Lists all Attach Points the caller has access to", and
+        // `AttachPointType`'s only modelled value is `DirectConnectGateway` — but
+        // reading Direct Connect's gateways from here needs that service's SDK client
+        // on this crate, which is a change to the workspace lockfile this emulator's
+        // merge gate cannot currently land; it is left to its own change.)
+        let descriptors = seeded;
+
+        // Keyed by `identifier`, which is what identifies an attach point within an
+        // environment, and ordered by it so paging walks one stable sequence: a page
+        // cursor is the last identifier handed out, so no page is repeated or skipped.
+        let mut keyed: Vec<(String, AttachPointDescriptor)> = descriptors
+            .into_iter()
+            .map(|descriptor| (descriptor.identifier.clone(), descriptor))
+            .collect();
+        keyed.sort_by(|(left, _), (right, _)| left.cmp(right));
 
         let (attach_points, next_token) = crate::state::paginate(
             keyed,

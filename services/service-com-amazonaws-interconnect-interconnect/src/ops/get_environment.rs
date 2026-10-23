@@ -67,10 +67,15 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-interconnect-interconne
 // to construct until the model says otherwise.
 #[smithy_macros::operation_error(
     "com.amazonaws.interconnect#GetEnvironment",
-    extra_errors = ["ResourceNotFoundException", "InterconnectServerException"]
+    extra_errors = [
+        "InterconnectClientException",
+        "ResourceNotFoundException",
+        "InterconnectServerException"
+    ]
 )]
 #[derive(Debug)]
 pub enum GetEnvironmentErrorModeled {
+    InterconnectClientException(InterconnectClientException),
     ResourceNotFoundException(ResourceNotFoundException),
     InterconnectServerException(InterconnectServerException),
 }
@@ -138,13 +143,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The SAME record ListEnvironments returns for this id, looked up in the
-        // seeded catalog. An id the catalog does not hold is a 404: there is nothing
-        // to synthesize, because no operation creates an Environment.
+        // seeded catalog. There is nothing to synthesize for an id the catalog does
+        // not hold, because no operation creates an Environment: an unresolvable
+        // environment is this service's own client fault, so it is the 400
+        // `InterconnectClientException` every environment-resolving operation gives,
+        // with the message built from the requested id.
         let found = state.lock().environments.get(&input.id).cloned();
         let Some(environment) = found else {
-            return Err(GetEnvironmentErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!("no environment with id '{}'", input.id)),
+            return Err(GetEnvironmentErrorModeled::InterconnectClientException(
+                InterconnectClientException {
+                    message: crate::state::environment_not_found_message(&input.id),
                 },
             )
             .into());

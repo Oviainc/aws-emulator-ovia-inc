@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end suite for `ListAttachPoints`, driven over the wire the way a client
-//! drives it: `POST /` with `X-Amz-Target: Interconnect.<Operation>` on `awsJson1_0`,
-//! through the same `MultiServiceRouter::dispatch` the socket front door uses.
+//! End-to-end suite for `ListAttachPoints`, driven over the wire through the shared
+//! `crate::emulator` harness (Interconnect and Direct Connect on one engine, as the
+//! assembled emulator mounts them).
 //!
 //! Every assertion here is about a RULE, checked over a table built from the LIVE
 //! seeded Environment catalog rather than from a copy of it: a row differs in the
@@ -10,113 +10,15 @@
 //! the page size, and the shape of the identifier the caller sends.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
-use bytes::Bytes;
 use serde_json::{json, Map, Value};
-use smithy_server_runtime::MultiServiceRouter;
 
-/// The signing name the model gives this service; also its ARN namespace.
-const SIGNING_NAME: &str = "interconnect";
-
-/// The ONLY value `AttachPointType` models
-/// (`smithy_query(query="shape",shape="AttachPointType")` -> values:
-/// ["DirectConnectGateway"]), so it is the only `type` a descriptor can report.
-const ATTACH_POINT_TYPE: &str = "DirectConnectGateway";
+use crate::emulator::{text, Emulator, ATTACH_POINT_TYPE};
 
 /// `MaxResults` is modelled `@range(min: 1, max: 100)`, so these are the published
 /// bounds a page size may take, and 0 / 101 are the first values past them.
 const MAX_RESULTS_BOUNDS: [i64; 2] = [1, 100];
 const MAX_RESULTS_PAST_BOUNDS: [i64; 2] = [0, 101];
-
-/// One emulator: a router with only this service mounted, over one shared engine.
-struct Emulator {
-    router: MultiServiceRouter,
-}
-
-impl Emulator {
-    fn new() -> Self {
-        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-        let mut router = MultiServiceRouter::new();
-        // Pinned off so the suite does not depend on the process-wide default; the
-        // Authorization header below is still what carries the credential scope.
-        router.set_request_authentication(false);
-        router.register_service(
-            service_com_amazonaws_interconnect_interconnect::EmulatedService::new(engine),
-        );
-        Self { router }
-    }
-
-    /// Call `operation` with `body`. Returns the status and the decoded JSON body.
-    async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
-        let authorization = format!(
-            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/{SIGNING_NAME}/aws4_request, \
-             SignedHeaders=host;x-amz-date;x-amz-target, Signature=00"
-        );
-        let request = http::Request::builder()
-            .method("POST")
-            .uri("/")
-            .header("host", "interconnect.localhost")
-            .header("content-type", "application/x-amz-json-1.0")
-            .header("x-amz-target", format!("Interconnect.{operation}"))
-            .header("authorization", authorization)
-            .body(Bytes::from(
-                serde_json::to_vec(&body).expect("the request body serializes"),
-            ))
-            .expect("a well-formed request");
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let decoded = if response.body().is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-        };
-        (status, decoded)
-    }
-
-    /// Call `operation` and require a 200, reporting the body when it is not.
-    async fn ok(&self, operation: &str, body: Value) -> Value {
-        let (status, decoded) = self.call(operation, body).await;
-        assert_eq!(
-            status, 200,
-            "{operation}: expected HTTP 200, got {status} with body {decoded:?}"
-        );
-        decoded
-    }
-
-    /// Every seeded Environment, as `ListEnvironments` reports it.
-    async fn environments(&self) -> Vec<Value> {
-        let listed = self.ok("ListEnvironments", json!({})).await;
-        listed["environments"]
-            .as_array()
-            .expect("environments is a list")
-            .clone()
-    }
-
-    /// Every attach point of `environment_id`, in one page.
-    async fn attach_points(&self, environment_id: &str) -> Vec<Value> {
-        let listed = self
-            .ok(
-                "ListAttachPoints",
-                json!({ "environmentId": environment_id, "maxResults": 100 }),
-            )
-            .await;
-        assert!(
-            listed["nextToken"].is_null(),
-            "case {environment_id:?}: expected the largest page to be the last one, got {listed:?}"
-        );
-        listed["attachPoints"]
-            .as_array()
-            .expect("attachPoints is a list")
-            .clone()
-    }
-}
-
-/// A string member, or `""` when absent — so a missing member fails an assertion
-/// rather than panicking the harness.
-fn text(value: &Value, member: &str) -> String {
-    value[member].as_str().unwrap_or_default().to_string()
-}
 
 /// `DirectConnectGatewayAttachPoint`: length exactly 36 and
 /// `^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`.
@@ -157,6 +59,26 @@ async fn every_environment_reports_descriptors_the_model_allows() {
         assert!(
             !listed.is_empty(),
             "case {id:?}: expected the environment's attach points, got {listed:?}"
+        );
+
+        // The largest page a caller may ask for is the last one: `nextToken` comes back
+        // only when results remain, so at `MaxResults`' published ceiling there is none
+        // and the single page is the whole listing.
+        let one_page = emulator
+            .ic_ok(
+                "ListAttachPoints",
+                json!({ "environmentId": id, "maxResults": MAX_RESULTS_BOUNDS[1] }),
+            )
+            .await;
+        assert!(
+            one_page["nextToken"].is_null(),
+            "case {id:?}: expected the largest page to be the last one, got {one_page:?}"
+        );
+        assert_eq!(
+            one_page["attachPoints"].as_array().cloned().unwrap_or_default(),
+            listed,
+            "case {id:?}: expected the largest page to carry the whole listing, got {:?}",
+            one_page["attachPoints"]
         );
 
         let mut identifiers = BTreeSet::new();
@@ -243,7 +165,9 @@ async fn attach_point_pages_walk_each_environment_without_repeats_or_gaps() {
                 if let Some(token) = &token {
                     request.insert("nextToken".to_string(), json!(token));
                 }
-                let listed = emulator.ok("ListAttachPoints", Value::Object(request)).await;
+                let listed = emulator
+                    .ic_ok("ListAttachPoints", Value::Object(request))
+                    .await;
                 let page = listed["attachPoints"]
                     .as_array()
                     .cloned()
@@ -274,7 +198,7 @@ async fn attach_point_pages_walk_each_environment_without_repeats_or_gaps() {
         // bound is refused by the modelled range rather than silently clamped.
         for max_results in MAX_RESULTS_BOUNDS {
             let listed = emulator
-                .ok(
+                .ic_ok(
                     "ListAttachPoints",
                     json!({ "environmentId": id, "maxResults": max_results }),
                 )
@@ -291,7 +215,7 @@ async fn attach_point_pages_walk_each_environment_without_repeats_or_gaps() {
         }
         for max_results in MAX_RESULTS_PAST_BOUNDS {
             let (status, body) = emulator
-                .call(
+                .ic(
                     "ListAttachPoints",
                     json!({ "environmentId": id, "maxResults": max_results }),
                 )
@@ -313,7 +237,7 @@ async fn attach_point_pages_walk_each_environment_without_repeats_or_gaps() {
             "ap:",
         ] {
             let (status, body) = emulator
-                .call(
+                .ic(
                     "ListAttachPoints",
                     json!({ "environmentId": id, "nextToken": token }),
                 )
@@ -331,8 +255,8 @@ async fn attach_point_pages_walk_each_environment_without_repeats_or_gaps() {
 }
 
 /// RULE: attach points are listed FOR an Environment, so an `environmentId` the
-/// catalog does not hold is a 404 — the same refusal `GetEnvironment` gives — never an
-/// empty page.
+/// catalog does not hold is refused — `InterconnectClientException` (HTTP 400), the
+/// same classification `GetEnvironment` gives that id — never an empty page.
 #[tokio::test]
 async fn unknown_environment_is_refused_rather_than_answered_empty() {
     let emulator = Emulator::new();
@@ -354,22 +278,22 @@ async fn unknown_environment_is_refused_rather_than_answered_empty() {
 
     for case in cases {
         let (status, body) = emulator
-            .call("ListAttachPoints", json!({ "environmentId": case }))
+            .ic("ListAttachPoints", json!({ "environmentId": case }))
             .await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected HTTP 404 for an environment the catalog does not hold, got {status} with {body:?}"
+            status, 400,
+            "case {case:?}: expected HTTP 400 for an environment the catalog does not hold, got {status} with {body:?}"
         );
         assert!(
-            text(&body, "__type").contains("ResourceNotFoundException"),
-            "case {case:?}: expected ResourceNotFoundException, got {body:?}"
+            text(&body, "__type").contains("InterconnectClientException"),
+            "case {case:?}: expected InterconnectClientException, got {body:?}"
         );
         // And the same id is still refused by GetEnvironment, so the two reads agree.
         let (get_status, get_body) = emulator
-            .call("GetEnvironment", json!({ "id": case }))
+            .ic("GetEnvironment", json!({ "id": case }))
             .await;
         assert_eq!(
-            get_status, 404,
+            get_status, 400,
             "case {case:?}: expected GetEnvironment to agree the environment is absent, got {get_status} with {get_body:?}"
         );
     }
@@ -378,7 +302,7 @@ async fn unknown_environment_is_refused_rather_than_answered_empty() {
     // (`@length(min: 1, max: 64)`), one past each published bound.
     for case in ["".to_string(), "e".repeat(65)] {
         let (status, body) = emulator
-            .call("ListAttachPoints", json!({ "environmentId": case }))
+            .ic("ListAttachPoints", json!({ "environmentId": case }))
             .await;
         assert_eq!(
             status, 400,
@@ -418,7 +342,7 @@ async fn a_listed_attach_point_creates_a_connection_that_reports_it_back() {
             let bandwidth = &available[index % available.len()];
             let attach_point = json!({ "directConnectGateway": identifier });
             let created = emulator
-                .ok(
+                .ic_ok(
                     "CreateConnection",
                     json!({
                         "environmentId": id,
@@ -437,7 +361,7 @@ async fn a_listed_attach_point_creates_a_connection_that_reports_it_back() {
 
             // Round trip: the reader reports the same attach point the listing gave.
             let fetched = emulator
-                .ok(
+                .ic_ok(
                     "GetConnection",
                     json!({ "identifier": text(connection, "id") }),
                 )
@@ -451,7 +375,7 @@ async fn a_listed_attach_point_creates_a_connection_that_reports_it_back() {
             // And the connection is found by filtering on that attach point, so one
             // record backs the listing, the get and the filter.
             let filtered = emulator
-                .ok(
+                .ic_ok(
                     "ListConnections",
                     json!({ "environmentId": id, "attachPoint": attach_point }),
                 )

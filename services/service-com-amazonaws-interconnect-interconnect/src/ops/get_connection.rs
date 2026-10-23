@@ -153,9 +153,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(connection) = found else {
             return Err(GetConnectionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "no connection with identifier '{}'",
-                        input.identifier
+                    message: Some(crate::state::connection_not_retrievable_message(
+                        &input.identifier,
                     )),
                 },
             )

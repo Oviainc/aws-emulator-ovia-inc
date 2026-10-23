@@ -158,8 +158,10 @@ impl IdempotentCreate {
 pub struct ComAmazonawsInterconnectInterconnectState {
     /// The seeded Environment catalog, keyed by `environmentId`.
     pub environments: BTreeMap<String, Environment>,
-    /// The attach points each Environment offers, keyed by `environmentId`.
-    /// `ListAttachPoints` reads this.
+    /// The attach points the CATALOG gives each Environment, keyed by
+    /// `environmentId`. `ListAttachPoints` reads this and merges the Direct Connect
+    /// gateways the caller owns into it, so a gateway the caller creates becomes a
+    /// valid attach point without this seed being rewritten.
     pub attach_points: BTreeMap<String, Vec<AttachPointDescriptor>>,
     /// The live connections, keyed by `id`. A deleted connection is kept in the
     /// `deleted` state rather than dropped straight away, so a later
@@ -379,6 +381,68 @@ pub fn summary_of(connection: &Connection) -> ConnectionSummary {
         shared_id: connection.shared_id.clone(),
         billing_tier: connection.billing_tier,
     }
+}
+
+/// The envelope this service puts on the client-facing refusals it words itself.
+///
+/// Every recorded Interconnect rejection message starts with it ("Unable to process
+/// request: This environment model with id … could not be found", "Unable to process
+/// request: Connection does not exist for …"), so the refusals below are built from
+/// this one constant rather than each spelling the prefix out.
+pub const REFUSAL_ENVELOPE: &str = "Unable to process request: ";
+
+/// How the service words an `environmentId` (or `GetEnvironment$id`) that resolves to
+/// no Environment.
+///
+/// An unresolvable environment is a CLIENT fault for this service — the caller named
+/// a model that does not exist — so it is reported as `InterconnectClientException`
+/// (HTTP 400), not as the connection-scoped `ResourceNotFoundException` (404), and the
+/// message is built from the id the request carried.
+pub fn environment_not_found_message(environment_id: &str) -> String {
+    format!("{REFUSAL_ENVELOPE}This environment model with id {environment_id} could not be found")
+}
+
+/// How a connection READ (`GetConnection`, `DeleteConnection`) words an identifier
+/// that names no stored connection: the retrieval could not be served.
+pub fn connection_not_retrievable_message(identifier: &str) -> String {
+    format!("{REFUSAL_ENVELOPE}Unable to retrieve connection {identifier}, as it does not exist")
+}
+
+/// How `UpdateConnection` words an identifier that names no stored connection.
+///
+/// A distinct construction from [`connection_not_retrievable_message`]: the update
+/// path states that the connection does not exist for the identifier it was asked to
+/// modify, which is the wording this operation is recorded answering.
+pub fn connection_absent_message(identifier: &str) -> String {
+    format!("{REFUSAL_ENVELOPE}Connection does not exist for {identifier}")
+}
+
+/// The `ConnectionState` values an `UpdateConnection` is permitted FROM.
+///
+/// The service states the rule in its own refusal ("only connections in 'requested'
+/// or 'available' state can be updated"), so it is an allowlist: every other modelled
+/// state — `pending`, `down`, `deleting`, `deleted`, `failed`, `updating` — is a
+/// connection whose circuit is mid-flight or gone, and an update on it is refused.
+pub const UPDATABLE_CONNECTION_STATES: [&str; 2] = ["requested", "available"];
+
+/// Whether a connection in `state` may be updated at all.
+pub fn is_updatable_state(state: &str) -> bool {
+    UPDATABLE_CONNECTION_STATES.contains(&state)
+}
+
+/// How `UpdateConnection` words a refusal on a connection whose state does not permit
+/// an update: the identifier from the request plus the permitted-state rule itself,
+/// rendered from [`UPDATABLE_CONNECTION_STATES`] so the message cannot drift from the
+/// guard that produced it.
+pub fn connection_not_updatable_message(identifier: &str) -> String {
+    let permitted: Vec<String> = UPDATABLE_CONNECTION_STATES
+        .iter()
+        .map(|state| format!("'{state}'"))
+        .collect();
+    format!(
+        "{REFUSAL_ENVELOPE}Cannot update connection {identifier}: only connections in {} state can be updated",
+        permitted.join(" or ")
+    )
 }
 
 /// The tag `ListEnvironments` stamps on the cursors it issues.

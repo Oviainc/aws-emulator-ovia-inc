@@ -207,14 +207,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The Environment dictates the partner, the location and the product type,
         // none of which the request carries. An unknown environment has nothing to
-        // create a connection across.
+        // create a connection across, and naming one is this service's own client
+        // fault: the 400 `InterconnectClientException` every environment-resolving
+        // operation gives, with the message built from the requested id.
         let Some(environment) = store.environments.get(&input.environment_id).cloned() else {
-            return Err(CreateConnectionErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "no environment with id '{}'",
-                        input.environment_id
-                    )),
+            return Err(CreateConnectionErrorModeled::InterconnectClientException(
+                InterconnectClientException {
+                    message: crate::state::environment_not_found_message(&input.environment_id),
                 },
             )
             .into());

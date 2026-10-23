@@ -394,12 +394,12 @@ async fn get_environment_returns_the_record_the_list_returned() {
     for case in ["env-does-not-exist", "0", &"e".repeat(64)] {
         let (status, body) = emulator.call("GetEnvironment", json!({ "id": case })).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected HTTP 404 for an unknown environment, got {status} with {body:?}"
+            status, 400,
+            "case {case:?}: expected HTTP 400 for an unknown environment, got {status} with {body:?}"
         );
         assert!(
-            text(&body, "__type").contains("ResourceNotFoundException"),
-            "case {case:?}: expected ResourceNotFoundException, got {body:?}"
+            text(&body, "__type").contains("InterconnectClientException"),
+            "case {case:?}: expected InterconnectClientException, got {body:?}"
         );
     }
 }
@@ -807,7 +807,7 @@ async fn create_connection_refuses_what_the_environment_does_not_offer() {
         }
     }
 
-    // An environment that does not exist is a 404, and creates nothing.
+    // An environment that does not exist is a 400 client refusal, and creates nothing.
     let (status, body) = emulator
         .call(
             "CreateConnection",
@@ -819,8 +819,8 @@ async fn create_connection_refuses_what_the_environment_does_not_offer() {
         )
         .await;
     assert_eq!(
-        status, 404,
-        "case \"unknown environment\": expected HTTP 404, got {status} with {body:?}"
+        status, 400,
+        "case \"unknown environment\": expected HTTP 400, got {status} with {body:?}"
     );
     let listed = emulator
         .ok(
