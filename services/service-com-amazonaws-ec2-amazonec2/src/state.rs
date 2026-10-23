@@ -164,6 +164,17 @@
 //! default VPC reads all three before it can name a network. The store holds the modelled
 //! [`SecurityGroup`] shape itself, keyed by `GroupId` in a [`BTreeMap`], for the same
 //! reasons the VPC and subnet stores do.
+//!
+//! ## Application status is DERIVED, never stored
+//!
+//! [`ComAmazonawsEc2Amazonec2State::application_status`] holds, per `InstanceId`, the
+//! per-check results an instance's application status checks reported and the suppression
+//! in force for it — not the instance-level status itself, which
+//! `ApplicationStatus$Status` defines as a function of those results
+//! ([`aggregated_application_status`]). So an instance nothing has reported a check for is
+//! `not-applicable`, the value the model documents for "no checks with `Aggregation` set
+//! to `included` apply to the instance", and no two operations can disagree about one
+//! instance's status.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -171,9 +182,11 @@ use std::net::Ipv6Addr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    Address, AvailabilityZone, AvailabilityZoneMessage, BlockDeviceMapping, BlockPublicAccessStates,
+    Address, ApplicationStatus, ApplicationStatusDetail, AvailabilityZone,
+    AvailabilityZoneMessage, BlockDeviceMapping, BlockPublicAccessStates,
     CreateVolumeOutput, DescribeFastLaunchImagesSuccessItem, DisableFastLaunchOutput,
     EbsBlockDevice, EnableFastLaunchOutput, GroupIdentifier, INSTANCE_TYPE_VALUES, Image, Instance,
+    InstanceApplicationStatus,
     InstanceState, InstanceTypeOffering, IpPermission, IpRange, LOCATION_TYPE_VALUES,
     LaunchTemplate, Monitoring, OperatorResponse, Placement, PrivateDnsNameOptionsOnLaunch,
     DnsEntry, PayerResponsibilityEntry,
@@ -839,6 +852,11 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// A `CreateVolume` `ClientToken` and the volume id it minted, so a repeat of the
     /// same request answers with that volume instead of creating a second one.
     pub volume_client_tokens: HashMap<String, String>,
+    /// What each instance's application health status is derived from, by `InstanceId` —
+    /// see [`InstanceApplicationStatusRecord`] and the module docs. An instance with no
+    /// entry has had no application status check reported for it, which is exactly the
+    /// `not-applicable` instance-level status `DescribeApplicationStatus` answers with.
+    pub application_status: BTreeMap<String, InstanceApplicationStatusRecord>,
     /// The Windows fast launch configuration of every image that has one, by `ImageId` —
     /// see the module docs. Ordered by id, which is the order
     /// `DescribeFastLaunchImages` reports and pages over.
@@ -885,6 +903,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             id_counter: 0,
             volumes: BTreeMap::new(),
             volume_client_tokens: HashMap::new(),
+            application_status: BTreeMap::new(),
             fast_launch_images: BTreeMap::new(),
             addresses: BTreeMap::new(),
             next_elastic_ip: 0,
@@ -3872,6 +3891,293 @@ pub fn published_image_specs() -> Vec<ImageSpec> {
             )
         },
     ]
+}
+
+// ---------------------------------------------------------------------------
+// Application status: what `DescribeApplicationStatus` aggregates
+// ---------------------------------------------------------------------------
+
+/// `ApplicationStatusEnum`'s `ok` member. The full catalog is the generated
+/// `crate::ops::types::APPLICATION_STATUS_ENUM_VALUES`; these constants name the members
+/// the aggregation below chooses between, so one value is spelled one way wherever it is
+/// read or written.
+pub const APPLICATION_STATUS_OK: &str = "ok";
+
+/// `ApplicationStatusEnum`'s `impaired` member (see [`APPLICATION_STATUS_OK`]).
+pub const APPLICATION_STATUS_IMPAIRED: &str = "impaired";
+
+/// `ApplicationStatusEnum`'s `initializing` member (see [`APPLICATION_STATUS_OK`]).
+pub const APPLICATION_STATUS_INITIALIZING: &str = "initializing";
+
+/// `ApplicationStatusEnum`'s `insufficient-data` member (see [`APPLICATION_STATUS_OK`]).
+pub const APPLICATION_STATUS_INSUFFICIENT_DATA: &str = "insufficient-data";
+
+/// `ApplicationStatusEnum`'s `not-applicable` member (see [`APPLICATION_STATUS_OK`]).
+pub const APPLICATION_STATUS_NOT_APPLICABLE: &str = "not-applicable";
+
+/// `ApplicationStatusEnum`'s `suppressed` member (see [`APPLICATION_STATUS_OK`]).
+pub const APPLICATION_STATUS_SUPPRESSED: &str = "suppressed";
+
+/// `ApplicationStatusCheckEnum`'s `passed` member: one CHECK's own status, which is a
+/// different enum from the instance-level [`APPLICATION_STATUS_OK`] above. The full
+/// catalog is `crate::ops::types::APPLICATION_STATUS_CHECK_ENUM_VALUES`.
+pub const APPLICATION_STATUS_CHECK_PASSED: &str = "passed";
+
+/// `ApplicationStatusCheckEnum`'s `failed` member (see
+/// [`APPLICATION_STATUS_CHECK_PASSED`]).
+pub const APPLICATION_STATUS_CHECK_FAILED: &str = "failed";
+
+/// `ApplicationStatusCheckEnum`'s `initializing` member (see
+/// [`APPLICATION_STATUS_CHECK_PASSED`]).
+pub const APPLICATION_STATUS_CHECK_INITIALIZING: &str = "initializing";
+
+/// `ApplicationStatusCheckEnum`'s `insufficient-data` member (see
+/// [`APPLICATION_STATUS_CHECK_PASSED`]).
+pub const APPLICATION_STATUS_CHECK_INSUFFICIENT_DATA: &str = "insufficient-data";
+
+/// `ApplicationStatusCheckEnum`'s `not-applicable` member (see
+/// [`APPLICATION_STATUS_CHECK_PASSED`]): a check that does not apply to the instance, so
+/// it is not one of the checks the instance-level status is derived from.
+pub const APPLICATION_STATUS_CHECK_NOT_APPLICABLE: &str = "not-applicable";
+
+/// `AggregationStatusEnum`'s `included` member: a check whose result "determines the
+/// instance-level application status returned by DescribeApplicationStatus"
+/// (`CreateApplicationStatusCheckRequest$Aggregation`). The full catalog is
+/// `crate::ops::types::AGGREGATION_STATUS_ENUM_VALUES`.
+pub const AGGREGATION_INCLUDED: &str = "included";
+
+/// `AggregationStatusEnum`'s `excluded` member (see [`AGGREGATION_INCLUDED`]): "Checks
+/// with `Aggregation` set to `excluded` do not affect this value"
+/// (`ApplicationStatus$Status`).
+pub const AGGREGATION_EXCLUDED: &str = "excluded";
+
+/// A suppression of application status reporting for one instance.
+///
+/// `EnableApplicationStatusCheckSuppression` puts one in force and
+/// `DisableApplicationStatusCheckSuppression` lifts it; while it is in force the
+/// instance-level status is [`APPLICATION_STATUS_SUPPRESSED`] whatever the checks report.
+#[derive(Debug, Clone)]
+pub struct ApplicationStatusSuppression {
+    /// When the suppression took effect: the `StatusSince` of the `suppressed` status it
+    /// produces ("The date and time when the current status started",
+    /// `ApplicationStatus$StatusSince`).
+    pub since: SystemTime,
+    /// When reporting resumes, reported as `ApplicationStatus$ResumeAt` ("The date and
+    /// time when application status reporting resumes after suppression"). `None` when
+    /// the request named no duration, which "suppresses health check results
+    /// indefinitely until you call DisableApplicationStatusCheckSuppression"
+    /// (`EnableApplicationStatusCheckSuppressionRequest$DurationSeconds`) — so there is
+    /// no instant to report.
+    pub resume_at: Option<SystemTime>,
+}
+
+impl ApplicationStatusSuppression {
+    /// Whether this suppression is still in force at `now`.
+    ///
+    /// A suppression with an end stops suppressing once the clock has passed it, whether
+    /// or not anybody called in the meantime, so a reader DERIVES that from the stored
+    /// instant instead of writing the expiry back.
+    pub fn in_force_at(&self, now: SystemTime) -> bool {
+        self.resume_at.is_none_or(|resume_at| now < resume_at)
+    }
+}
+
+/// What one instance's application health status is derived from.
+///
+/// The per-check results are stored as the MODELLED [`ApplicationStatusDetail`] the
+/// describe reports, keyed by `ApplicationStatusCheckId`, so one check holds exactly one
+/// result per instance and no projection can drop a member of it. The instance-level
+/// status is NOT stored: it is a function of these details and of the suppression
+/// ([`aggregated_application_status`]), so two operations cannot disagree about it.
+#[derive(Debug, Clone, Default)]
+pub struct InstanceApplicationStatusRecord {
+    /// The result of every application status check associated with this instance, by
+    /// `ApplicationStatusCheckId`.
+    pub details: BTreeMap<String, ApplicationStatusDetail>,
+    /// The suppression in force for this instance, if any.
+    pub suppression: Option<ApplicationStatusSuppression>,
+}
+
+/// A modelled timestamp as a sortable key, so two of them can be ordered without
+/// assuming anything about the timestamp type's own comparison traits.
+fn date_time_key(at: ::aws_smithy_types::DateTime) -> (i64, u32) {
+    (at.secs(), at.subsec_nanos())
+}
+
+/// When one check's current result started: its `StatusSince` ("The date and time when
+/// the current status started"), falling back to its `StatusTimeStamp` for a result that
+/// carries no `StatusSince`.
+fn detail_since(detail: &ApplicationStatusDetail) -> Option<::aws_smithy_types::DateTime> {
+    detail.status_since.or(detail.status_time_stamp)
+}
+
+/// "The date and time of the last status update" (`ApplicationStatus$StatusTimeStamp`)
+/// for an instance whose checks reported `details`: the most recent update any of them
+/// carries, included or excluded — every check of the instance is one of its status
+/// updates, while only the included ones decide the instance-level status.
+pub fn last_application_status_update(
+    details: &[ApplicationStatusDetail],
+) -> Option<::aws_smithy_types::DateTime> {
+    details
+        .iter()
+        .filter_map(|detail| detail.status_time_stamp.or(detail.check_update_time))
+        .max_by_key(|at| date_time_key(*at))
+}
+
+/// The instance-level application status, and the instant it started, derived from the
+/// per-check `details` of ONE instance.
+///
+/// `ApplicationStatus$Status`'s own documentation is the whole rule: `impaired` when "at
+/// least one included check failed", `initializing` when "at least one included check is
+/// initializing, and no included check is impaired", `insufficient-data` when "at least
+/// one included check has insufficient data, and no included check is impaired or
+/// initializing", `ok` when "all included checks passed", and `not-applicable` when "no
+/// checks with `Aggregation` set to `included` apply to the instance" — a check reporting
+/// `not-applicable` being one that does not apply, and "checks with `Aggregation` set to
+/// `excluded` do not affect this value".
+///
+/// The instant is when that predicate began to hold, read off the per-check
+/// `StatusSince`: the EARLIEST of the checks that satisfy an "at least one" predicate,
+/// and for `ok` the LATEST of them, which is when the last check turned `passed`. For
+/// `not-applicable` no check carries one, so the answer is `None` and the caller supplies
+/// the instant the instance has had no applicable check since.
+pub fn aggregated_application_status(
+    details: &[ApplicationStatusDetail],
+) -> (&'static str, Option<::aws_smithy_types::DateTime>) {
+    let with_status = |status: &'static str| -> Vec<&ApplicationStatusDetail> {
+        details
+            .iter()
+            .filter(|detail| detail.aggregation.as_deref() == Some(AGGREGATION_INCLUDED))
+            .filter(|detail| detail.status.as_deref() == Some(status))
+            .collect()
+    };
+
+    // The precedence the member documents, worst first: one failed check impairs the
+    // instance however many others pass, and an initializing one outranks a check with
+    // insufficient data.
+    for (check_status, instance_status) in [
+        (APPLICATION_STATUS_CHECK_FAILED, APPLICATION_STATUS_IMPAIRED),
+        (
+            APPLICATION_STATUS_CHECK_INITIALIZING,
+            APPLICATION_STATUS_INITIALIZING,
+        ),
+        (
+            APPLICATION_STATUS_CHECK_INSUFFICIENT_DATA,
+            APPLICATION_STATUS_INSUFFICIENT_DATA,
+        ),
+    ] {
+        let matching = with_status(check_status);
+        if !matching.is_empty() {
+            let started = matching
+                .iter()
+                .filter_map(|detail| detail_since(detail))
+                .min_by_key(|at| date_time_key(*at));
+            return (instance_status, started);
+        }
+    }
+
+    // "ok – All included checks passed", which the instance has been only since the last
+    // of them turned `passed`.
+    let passed = with_status(APPLICATION_STATUS_CHECK_PASSED);
+    if !passed.is_empty() {
+        let started = passed
+            .iter()
+            .filter_map(|detail| detail_since(detail))
+            .max_by_key(|at| date_time_key(*at));
+        return (APPLICATION_STATUS_OK, started);
+    }
+
+    // No included check applies: the instance has none, or every one it has reports
+    // `not-applicable` (or a status this emulator does not read), and an excluded check
+    // is not one that applies either.
+    (APPLICATION_STATUS_NOT_APPLICABLE, None)
+}
+
+/// The `ZoneId` of the Availability Zone named `zone_name`.
+///
+/// A zone's name and its id are the SAME derived pair ([`availability_zones_in_region`]),
+/// so the id is read back out of the Region the name belongs to rather than stored a
+/// second time beside it. `None` for a name no Region of that form has a zone for.
+pub fn zone_id_for_zone_name(zone_name: &str) -> Option<String> {
+    let region = zone_name.strip_suffix(|letter: char| letter.is_ascii_lowercase())?;
+    availability_zones_in_region(region)
+        .into_iter()
+        .find(|zone| zone.zone_name == zone_name)
+        .map(|zone| zone.zone_id)
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// The modelled `InstanceApplicationStatus` for one stored instance, as of `now`.
+    ///
+    /// Everything in it is derived from what the store holds — the instance's zone and
+    /// tags, the per-check results written for it, and the suppression in force — so this
+    /// is a READ: an instance nothing has reported a check for is reported
+    /// `not-applicable`, which is the status the model documents for exactly that case,
+    /// rather than given one here.
+    pub fn instance_application_status(
+        &self,
+        instance: &InstanceRecord,
+        now: SystemTime,
+    ) -> InstanceApplicationStatus {
+        let record = self.application_status.get(&instance.instance_id);
+        let details: Vec<ApplicationStatusDetail> = record
+            .map(|record| record.details.values().cloned().collect())
+            .unwrap_or_default();
+        // A suppression whose end the clock has passed suppresses nothing any more.
+        let suppression = record
+            .and_then(|record| record.suppression.as_ref())
+            .filter(|suppression| suppression.in_force_at(now));
+
+        let application_status = match suppression {
+            // "suppressed – Application status reporting is suppressed for the
+            // instance": the suppression, not the checks, is what the instance-level
+            // status reports while it is in force, and `ResumeAt` is when reporting
+            // resumes (absent while the suppression has no end).
+            Some(suppression) => {
+                let suppressed_since = system_time_to_date_time(suppression.since);
+                ApplicationStatus {
+                    status: Some(APPLICATION_STATUS_SUPPRESSED.to_string()),
+                    // "The date and time of the last status update" is the latest of them
+                    // whichever side it came from: a check that reported while the
+                    // instance was suppressed is still a status update of it.
+                    status_time_stamp: Some(
+                        last_application_status_update(&details)
+                            .filter(|updated| {
+                                date_time_key(*updated) > date_time_key(suppressed_since)
+                            })
+                            .unwrap_or(suppressed_since),
+                    ),
+                    status_since: Some(suppressed_since),
+                    resume_at: suppression.resume_at.map(system_time_to_date_time),
+                    details: Some(details),
+                }
+            }
+            None => {
+                let (status, started) = aggregated_application_status(&details);
+                // While no check has reported anything, the instance has had no
+                // applicable check — and so this status — since it came into being.
+                let launched_at = system_time_to_date_time(instance.launch_time);
+                ApplicationStatus {
+                    status: Some(status.to_string()),
+                    status_time_stamp: Some(
+                        last_application_status_update(&details).unwrap_or(launched_at),
+                    ),
+                    status_since: Some(started.unwrap_or(launched_at)),
+                    // Reporting is not suppressed, so nothing is waiting to resume.
+                    resume_at: None,
+                    details: Some(details),
+                }
+            }
+        };
+
+        InstanceApplicationStatus {
+            instance_id: Some(instance.instance_id.clone()),
+            availability_zone: Some(instance.placement_az.clone()),
+            availability_zone_id: zone_id_for_zone_name(&instance.placement_az),
+            application_status: Some(application_status),
+            tags: Some(tag_list(&instance.tags)),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
