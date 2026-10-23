@@ -290,6 +290,11 @@ pub struct MethodEntry {
     pub method_responses: BTreeMap<String, GetMethodResponseOutput>,
     /// Written by `PutIntegration` and reported by `GetIntegration` and a `Method`
     /// body's `methodIntegration`; absent until an integration is put on the method.
+    ///
+    /// Its `integrationResponses` map is where `PutIntegrationResponse` writes and
+    /// `GetIntegrationResponse` reads, keyed by the response's `statusCode`: an
+    /// integration response hangs off the INTEGRATION, so the one record lives on the
+    /// integration that owns it rather than in a second map beside it.
     pub integration: Option<GetIntegrationOutput>,
 }
 
@@ -1437,8 +1442,10 @@ pub const NO_SUCH_METHOD: &str = "Invalid Method identifier specified";
 /// The `NotFoundException` message for a method that carries no integration.
 pub const NO_SUCH_INTEGRATION: &str = "Invalid Integration identifier specified";
 
-/// The `NotFoundException` message for a `statusCode` that names no method response of
-/// the method.
+/// The `NotFoundException` message for a `statusCode` that names no response of the
+/// method at that code — the method response `GetMethodResponse` resolves, or the
+/// integration response `GetIntegrationResponse` resolves on the method's integration.
+/// Both are keyed by the same `StatusCode`, so both say the same thing about it.
 pub const NO_SUCH_METHOD_RESPONSE: &str = "Invalid Response status code specified";
 
 /// The `NotFoundException` message for a `stageName` that names no stage of the API.
