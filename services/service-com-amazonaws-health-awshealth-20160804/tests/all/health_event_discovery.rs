@@ -26,8 +26,35 @@ use service_com_amazonaws_health_awshealth_20160804::ops::types::{
 };
 
 /// A router serving only this service, over one shared engine.
+///
+/// The account holds [`SUBSCRIBED_PLAN`], because the Health API is served only to an
+/// account whose Amazon Web Services Support plan qualifies (see
+/// `subscription_gate.rs` for that rule) and these suites exercise the operations
+/// behind that gate.
 fn health_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    set_support_plan(&engine, Some(SUBSCRIBED_PLAN));
+    health_router_over(engine)
+}
+
+/// An Amazon Web Services Support plan that may use this API. Recorded in the store
+/// rather than read from the environment, so one suite's account cannot change
+/// another's.
+pub(crate) const SUBSCRIBED_PLAN: &str = "enterprise";
+
+/// Record `plan` as the account's Support plan on `engine` — `None` for an account
+/// with no Support plan at all. Takes effect on a running emulator, leaving every
+/// stored event where it is.
+pub(crate) fn set_support_plan(engine: &engine::InMemoryEngine, plan: Option<&str>) {
+    service_com_amazonaws_health_awshealth_20160804::state::service_state(engine)
+        .expect("the health store is reachable from the shared in-memory engine")
+        .lock()
+        .support_plan = plan.map(str::to_string);
+}
+
+/// A router serving only this service over `engine`, built the way the production
+/// router builds it.
+pub(crate) fn health_router_over(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     // Pin the harness independent of the process-wide switch: these tests exercise
     // the operations, not SigV4 verification.
@@ -59,7 +86,11 @@ fn health_request(operation: &str, body: &Value) -> http::Request<bytes::Bytes> 
 }
 
 /// Call one operation and return its HTTP status and parsed body.
-async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+) -> (u16, Value) {
     let response = router.dispatch(health_request(operation, &body)).await;
     let status = response.status().as_u16();
     let bytes = response.into_body();
@@ -77,7 +108,7 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16
 }
 
 /// Call one operation, requiring a 200.
-async fn call_ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
+pub(crate) async fn call_ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
     let (status, parsed) = call(router, operation, body).await;
     assert_eq!(
         status, 200,
@@ -87,7 +118,7 @@ async fn call_ok(router: &MultiServiceRouter, operation: &str, body: Value) -> V
 }
 
 /// The wire error code of an error response (`__type`, possibly namespace-qualified).
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body["__type"]
         .as_str()
         .unwrap_or("<no __type>")
