@@ -2,8 +2,8 @@
 
 //! End-to-end tests for AppFabric's ingestion-destination operations
 //! (`CreateIngestionDestination`, `GetIngestionDestination`,
-//! `UpdateIngestionDestination`), driven over the wire (restJson1) through the
-//! same router the emulator boots.
+//! `UpdateIngestionDestination`, `DeleteIngestionDestination`), driven over the
+//! wire (restJson1) through the same router the emulator boots.
 //!
 //! Each test states a RULE over a TABLE of inputs rather than one recorded call:
 //!
@@ -15,7 +15,13 @@
 //! * a WRITE naming an ingestion-chain child that does not exist is refused with
 //!   HTTP 400 `ValidationException`, while the READ path answers HTTP 404
 //!   `ResourceNotFoundException` for the same identifier;
-//! * a value outside a modelled bound is refused with HTTP 400.
+//! * a value outside a modelled bound is refused with HTTP 400;
+//! * a DELETE removes exactly the destination it resolves to and leaves every
+//!   sibling and every parent in place; it is `@idempotent` below the app bundle
+//!   (a destination the store cannot hold — including one whose owning ingestion
+//!   is gone — is the same HTTP 204 with nothing written) and answers HTTP 404
+//!   `ResourceNotFoundException` for an app bundle that names nothing stored,
+//!   while the READ path answers HTTP 404 for a destination that is gone.
 
 use std::sync::Arc;
 
@@ -166,6 +172,53 @@ impl Emulator {
     async fn get_destination(&self, bundle: &str, ingestion: &str, destination: &str) -> Answer {
         self.call("GET", &destination_uri(bundle, ingestion, destination), None)
             .await
+    }
+
+    async fn delete_destination(&self, bundle: &str, ingestion: &str, destination: &str) -> Answer {
+        self.call(
+            "DELETE",
+            &destination_uri(bundle, ingestion, destination),
+            None,
+        )
+        .await
+    }
+
+    /// `DELETE /appbundles/{appBundleIdentifier}/ingestions/{ingestionIdentifier}`
+    /// — used to put a row of the delete table under an ingestion that existed
+    /// and is now gone.
+    async fn delete_ingestion(&self, bundle: &str, ingestion: &str) -> Answer {
+        self.call(
+            "DELETE",
+            &format!(
+                "/appbundles/{}/ingestions/{}",
+                encode(bundle),
+                encode(ingestion)
+            ),
+            None,
+        )
+        .await
+    }
+
+    /// `GET /appbundles/{appBundleIdentifier}` — the parent two levels up, read
+    /// back to show a destination delete left it alone.
+    async fn get_app_bundle(&self, bundle: &str) -> Answer {
+        self.call("GET", &format!("/appbundles/{}", encode(bundle)), None)
+            .await
+    }
+
+    /// `GET /appbundles/{appBundleIdentifier}/ingestions/{ingestionIdentifier}` —
+    /// the destination's own parent.
+    async fn get_ingestion(&self, bundle: &str, ingestion: &str) -> Answer {
+        self.call(
+            "GET",
+            &format!(
+                "/appbundles/{}/ingestions/{}",
+                encode(bundle),
+                encode(ingestion)
+            ),
+            None,
+        )
+        .await
     }
 
     async fn update_destination(
@@ -784,4 +837,417 @@ async fn a_replayed_client_token_replays_the_created_destination() {
             refused.body
         );
     }
+}
+
+/// The `destinationConfiguration` destination number `index` of a table row
+/// carries, so each destination under one ingestion is distinguishable by what
+/// it stored.
+fn numbered_destination(index: usize) -> Value {
+    s3_destination("audit-logs-bucket", Some(&format!("slack/{index}/")))
+}
+
+/// RULE: a delete of a nested resource removes exactly the record its identifier
+/// chain resolves to — by either modelled `Identifier` form at every level —
+/// answers the modelled HTTP 204 with an empty body, and leaves that record's
+/// siblings and every parent above it exactly as they were; afterwards every
+/// reader reports the deleted resource absent.
+///
+/// The table spans what the rule generalises over: how many destinations the
+/// ingestion holds, which position in that set is deleted, and which identifier
+/// form names each of the three levels.
+#[tokio::test]
+async fn a_delete_removes_exactly_the_named_destination() {
+    let emulator = Emulator::new();
+
+    // (case, destinations held, index deleted, bundle as ARN?, ingestion as
+    //  ARN?, destination as ARN?)
+    let cases: Vec<(&str, usize, usize, bool, bool, bool)> = vec![
+        (
+            "the only destination, every level by ARN",
+            1,
+            0,
+            true,
+            true,
+            true,
+        ),
+        (
+            "the only destination, every level by bare UUID",
+            1,
+            0,
+            false,
+            false,
+            false,
+        ),
+        (
+            "the first of three, destination by bare UUID",
+            3,
+            0,
+            true,
+            true,
+            false,
+        ),
+        (
+            "the middle of three, every level by bare UUID",
+            3,
+            1,
+            false,
+            false,
+            false,
+        ),
+        (
+            "the last of three, bundle by bare UUID",
+            3,
+            2,
+            false,
+            true,
+            true,
+        ),
+        (
+            "the second of two, ingestion by bare UUID",
+            2,
+            1,
+            true,
+            false,
+            true,
+        ),
+    ];
+
+    for (case, held, deleted_index, bundle_as_arn, ingestion_as_arn, destination_as_arn) in cases {
+        let (bundle_arn, ingestion_arn) = emulator.bundle_with_ingestion().await;
+        let mut destinations: Vec<String> = Vec::new();
+        for index in 0..held {
+            let created = emulator
+                .create_destination(
+                    &bundle_arn,
+                    &ingestion_arn,
+                    json!({
+                        "processingConfiguration": processing("ocsf", "json"),
+                        "destinationConfiguration": numbered_destination(index),
+                    }),
+                )
+                .await;
+            assert_eq!(
+                created.status, 201,
+                "case {case:?} destination {index}: expected HTTP 201 from \
+                 CreateIngestionDestination, got {} with body {}",
+                created.status, created.body
+            );
+            destinations.push(arn_of(&created.body, "ingestionDestination"));
+        }
+        let doomed = destinations[deleted_index].clone();
+
+        let pick = |arn: &str, as_arn: bool| {
+            if as_arn {
+                arn.to_string()
+            } else {
+                uuid_of(arn)
+            }
+        };
+        let deleted = emulator
+            .delete_destination(
+                &pick(&bundle_arn, bundle_as_arn),
+                &pick(&ingestion_arn, ingestion_as_arn),
+                &pick(&doomed, destination_as_arn),
+            )
+            .await;
+        assert_eq!(
+            deleted.status, 204,
+            "case {case:?}: expected HTTP 204 from DeleteIngestionDestination, got {} \
+             with body {}",
+            deleted.status, deleted.body
+        );
+        // The modelled response has no members, so the 204 carries none either.
+        assert!(
+            deleted.body.is_null()
+                || deleted
+                    .body
+                    .as_object()
+                    .is_some_and(serde_json::Map::is_empty),
+            "case {case:?}: expected a 204 carrying no members, got {}",
+            deleted.body
+        );
+
+        // The deleted destination is absent for every reader, named either way.
+        for identifier in [doomed.clone(), uuid_of(&doomed)] {
+            let read = emulator
+                .get_destination(&bundle_arn, &ingestion_arn, &identifier)
+                .await;
+            assert_eq!(
+                read.status, 404,
+                "case {case:?} read by {identifier:?}: expected HTTP 404 after the delete, \
+                 got {} with body {}",
+                read.status, read.body
+            );
+            assert_eq!(
+                read.error_code(),
+                "ResourceNotFoundException",
+                "case {case:?} read by {identifier:?}: expected ResourceNotFoundException, got {}",
+                read.body
+            );
+        }
+
+        // Every sibling still carries what its own create stored.
+        for (index, sibling) in destinations.iter().enumerate() {
+            if index == deleted_index {
+                continue;
+            }
+            let read = emulator
+                .get_destination(&bundle_arn, &ingestion_arn, sibling)
+                .await;
+            assert_eq!(
+                read.status, 200,
+                "case {case:?} sibling {index}: expected HTTP 200 after the delete, got {} \
+                 with body {}",
+                read.status, read.body
+            );
+            assert_eq!(
+                read.member("destinationConfiguration"),
+                &numbered_destination(index),
+                "case {case:?} sibling {index}: expected the configuration its create stored, \
+                 got {}",
+                read.body
+            );
+        }
+
+        // And both parents above it survive the delete.
+        let parent = emulator.get_ingestion(&bundle_arn, &ingestion_arn).await;
+        assert_eq!(
+            parent.status, 200,
+            "case {case:?}: expected the owning ingestion to survive, got {} with body {}",
+            parent.status, parent.body
+        );
+        let grandparent = emulator.get_app_bundle(&bundle_arn).await;
+        assert_eq!(
+            grandparent.status, 200,
+            "case {case:?}: expected the app bundle to survive, got {} with body {}",
+            grandparent.status, grandparent.body
+        );
+    }
+}
+
+/// RULE: a delete is `@idempotent` below the app bundle and strict about the
+/// bundle itself: a destination the store cannot hold — one a previous delete
+/// removed, one no create minted, one belonging to another ingestion, or one
+/// whose owning ingestion is itself gone — already satisfies the postcondition,
+/// so the call reports HTTP 204 and writes nothing; an app bundle identifier that
+/// names nothing stored is instead the HTTP 404 `ResourceNotFoundException` the
+/// operation models, as it is on every other path under `/appbundles/{id}`.
+/// Either way, nothing else is removed.
+///
+/// The ingestion rows are the recorded behaviour of
+/// `appfabric.create-ingestion-destination-s3-active`: after it deletes a
+/// destination and then the ingestion that owned it, AWS answers a repeat of this
+/// call 204.
+#[tokio::test]
+async fn a_delete_is_idempotent_below_the_bundle_and_not_found_for_a_missing_bundle() {
+    let emulator = Emulator::new();
+    let (bundle, ingestion) = emulator.bundle_with_ingestion().await;
+    // A second ingestion under the same bundle: a destination belongs only to
+    // the ingestion that owns it, so its identifier names nothing under another.
+    let other_ingestion = arn_of(&emulator.create_ingestion(&bundle).await.body, "ingestion");
+    let create_body = json!({
+        "processingConfiguration": processing("ocsf", "json"),
+        "destinationConfiguration": s3_destination("audit-logs-bucket", None),
+    });
+    let kept = arn_of(
+        &emulator
+            .create_destination(&bundle, &ingestion, create_body.clone())
+            .await
+            .body,
+        "ingestionDestination",
+    );
+    let already_deleted = arn_of(
+        &emulator
+            .create_destination(&bundle, &ingestion, create_body.clone())
+            .await
+            .body,
+        "ingestionDestination",
+    );
+    let first = emulator
+        .delete_destination(&bundle, &ingestion, &already_deleted)
+        .await;
+    assert_eq!(
+        first.status, 204,
+        "expected the first delete to succeed, got {} with body {}",
+        first.status, first.body
+    );
+
+    let unknown = unknown_uuid();
+    let unknown_arn = format!("arn:aws:appfabric:{REGION}:{ACCOUNT}:appbundle/{unknown}");
+
+    // A third ingestion, created with no destination of its own and then deleted,
+    // so one row can name an ingestion that DID exist and is now gone.
+    let deleted_ingestion = arn_of(&emulator.create_ingestion(&bundle).await.body, "ingestion");
+    let removed = emulator.delete_ingestion(&bundle, &deleted_ingestion).await;
+    assert_eq!(
+        removed.status, 204,
+        "expected an ingestion with no destinations to be deletable, got {} with body {}",
+        removed.status, removed.body
+    );
+
+    // (case, expected status, expected error code — `""` for a success, answer)
+    let cases = vec![
+        (
+            "a target destination uuid no create minted",
+            204,
+            "",
+            emulator
+                .delete_destination(&bundle, &ingestion, &unknown)
+                .await,
+        ),
+        (
+            "a target a previous delete already removed",
+            204,
+            "",
+            emulator
+                .delete_destination(&bundle, &ingestion, &already_deleted)
+                .await,
+        ),
+        (
+            "a target belonging to another ingestion",
+            204,
+            "",
+            emulator
+                .delete_destination(&bundle, &other_ingestion, &kept)
+                .await,
+        ),
+        (
+            "an owning ingestion no create minted",
+            204,
+            "",
+            emulator.delete_destination(&bundle, &unknown, &kept).await,
+        ),
+        (
+            "an owning ingestion a delete removed",
+            204,
+            "",
+            emulator
+                .delete_destination(&bundle, &deleted_ingestion, &kept)
+                .await,
+        ),
+        (
+            "a parent app bundle no create minted, by uuid",
+            404,
+            "ResourceNotFoundException",
+            emulator.delete_destination(&unknown, &ingestion, &kept).await,
+        ),
+        (
+            "a parent app bundle no create minted, by arn",
+            404,
+            "ResourceNotFoundException",
+            emulator
+                .delete_destination(&unknown_arn, &ingestion, &kept)
+                .await,
+        ),
+    ];
+
+    for (case, status, code, answer) in cases {
+        assert_eq!(
+            answer.status, status,
+            "case {case:?}: expected HTTP {status}, got {} with body {}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.error_code(),
+            code,
+            "case {case:?}: expected error code {code:?}, got {}",
+            answer.body
+        );
+    }
+
+    // None of those calls removed anything: the destination none of them
+    // resolved to is still readable, with what its create stored.
+    let read = emulator.get_destination(&bundle, &ingestion, &kept).await;
+    assert_eq!(
+        read.status, 200,
+        "expected a delete that resolved no target to leave the stored destination alone, \
+         got {} with body {}",
+        read.status, read.body
+    );
+    assert_eq!(
+        read.member("destinationConfiguration"),
+        &s3_destination("audit-logs-bucket", None),
+        "expected the configuration the create stored, got {}",
+        read.body
+    );
+    // The reporting path still answers 404 for the destination that IS gone.
+    let gone = emulator
+        .get_destination(&bundle, &ingestion, &already_deleted)
+        .await;
+    assert_eq!(
+        gone.status, 404,
+        "expected the read path to report the deleted destination absent, got {} with body {}",
+        gone.status, gone.body
+    );
+    assert_eq!(
+        gone.error_code(),
+        "ResourceNotFoundException",
+        "expected ResourceNotFoundException from the read path, got {}",
+        gone.body
+    );
+}
+
+/// RULE: a delete really removes the record rather than hiding it, so an
+/// `@idempotencyToken` spent on a destination that has since been deleted replays
+/// nothing: the next call carrying that token mints a new destination, with a new
+/// ARN, and the deleted one stays absent.
+#[tokio::test]
+async fn a_token_spent_on_a_deleted_destination_mints_a_new_destination() {
+    let emulator = Emulator::new();
+    let (bundle, ingestion) = emulator.bundle_with_ingestion().await;
+    let body = json!({
+        "clientToken": client_token(2),
+        "processingConfiguration": processing("ocsf", "json"),
+        "destinationConfiguration": s3_destination("audit-logs-bucket", None),
+    });
+
+    let first = emulator
+        .create_destination(&bundle, &ingestion, body.clone())
+        .await;
+    assert_eq!(
+        first.status, 201,
+        "expected HTTP 201 from the first create, got {} with body {}",
+        first.status, first.body
+    );
+    let first_arn = arn_of(&first.body, "ingestionDestination");
+
+    let deleted = emulator
+        .delete_destination(&bundle, &ingestion, &first_arn)
+        .await;
+    assert_eq!(
+        deleted.status, 204,
+        "expected HTTP 204 from the delete, got {} with body {}",
+        deleted.status, deleted.body
+    );
+
+    let again = emulator
+        .create_destination(&bundle, &ingestion, body.clone())
+        .await;
+    assert_eq!(
+        again.status, 201,
+        "expected the same token to create again after the delete, got {} with body {}",
+        again.status, again.body
+    );
+    let second_arn = arn_of(&again.body, "ingestionDestination");
+    assert_ne!(
+        second_arn, first_arn,
+        "expected a new destination rather than the deleted one replayed, got {second_arn:?}"
+    );
+
+    let gone = emulator
+        .get_destination(&bundle, &ingestion, &first_arn)
+        .await;
+    assert_eq!(
+        gone.status, 404,
+        "expected the deleted destination to stay absent, got {} with body {}",
+        gone.status, gone.body
+    );
+    let fresh = emulator
+        .get_destination(&bundle, &ingestion, &second_arn)
+        .await;
+    assert_eq!(
+        fresh.status, 200,
+        "expected the newly created destination to be readable, got {} with body {}",
+        fresh.status, fresh.body
+    );
 }
