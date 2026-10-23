@@ -91,9 +91,20 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::sync::LazyLock;
 use std::time::SystemTime;
 
-use crate::state::{checksum_base64_sha256, CHECKSUM_ALGORITHM_SHA256};
+use ::aws_smithy_schema::serde::ShapeSerializer as _;
+use ::aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
+use ::aws_smithy_schema_server::constraints::{
+    LengthTrait, PatternTrait, ValidatingSerializer,
+};
+
+use crate::state::{
+    checksum_base64_sha256, invalid_block_token_message, is_well_formed_snapshot_id,
+    malformed_snapshot_id_message, snapshot_not_found_message, BLOCK_TOKEN_LENGTH,
+    BLOCK_TOKEN_PATTERN, CHECKSUM_ALGORITHM_SHA256,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -169,41 +180,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // `BlockToken` is judged HERE rather than at the boundary (the member carries
+        // `skip_validation` on `GetSnapshotBlockInput`), because the expression the
+        // service enforces is WIDER than the one the on-disk model declares: a
+        // service-issued URL-safe-base64 token containing `_` or `-` is accepted. The
+        // refusal is the framework's own constraint report, worded from the expression
+        // actually enforced — see [`block_token_refusal`].
+        if let Some(message) = block_token_refusal(&input.block_token) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(no_state)?;
         let now = SystemTime::now();
         let mut store = state.lock();
-        // The only write a read performs: materialising a `Timeout` the clock had
+        // The only write a read performs: materialising a transition the clock had
         // already made due, which was owed whether or not anybody read.
-        store.expire_due_snapshots(now);
+        store.apply_due_transitions(now);
 
         let Some(snapshot) = store.snapshots.get(&input.snapshot_id) else {
-            return Err(not_found(format!(
-                "snapshot {} does not exist",
-                input.snapshot_id
-            )));
-        };
-        let Some(entry) = snapshot.blocks.get(&input.block_index) else {
-            // `ResourceNotFoundExceptionReason` carries no block-specific value, so the
-            // closest modeled reason is used for a block of a snapshot that does exist.
-            return Err(not_found(format!(
-                "snapshot {} has no block at index {}",
-                input.snapshot_id, input.block_index
-            )));
+            // A value that is not even shaped like a snapshot id is a malformed
+            // parameter, not a snapshot the service does not hold.
+            if !is_well_formed_snapshot_id(&input.snapshot_id) {
+                return Err(validation(
+                    "INVALID_SNAPSHOT_ID",
+                    malformed_snapshot_id_message("snapshotId", &input.snapshot_id),
+                ));
+            }
+            return Err(not_found(snapshot_not_found_message(&input.snapshot_id)));
         };
 
-        // The token is resolved against the stored block itself — the request already
-        // carries the `SnapshotId` and `BlockIndex` the token names — so a token that was
-        // superseded or whose block expired simply stops resolving, with no side table of
-        // live tokens to keep in step.
-        if entry.block_token != input.block_token {
+        // A `BlockToken` is what NAMES the block to read, and the request already carries
+        // the `SnapshotId` and `BlockIndex` the token was minted for, so the token is
+        // resolved against the stored block at that index: a token this service never
+        // minted, one minted for another block, and one whose block was superseded or
+        // released all alike fail to name a block, and all are the one refusal — an
+        // invalid block token. There is no side table of live tokens to keep in step, and
+        // no second refusal for "the index holds nothing": without a token that names it,
+        // a block index is not something the caller can be told about.
+        let resolved = snapshot
+            .blocks
+            .get(&input.block_index)
+            .filter(|entry| entry.block_token == input.block_token);
+        let Some(entry) = resolved else {
             return Err(validation(
                 "INVALID_BLOCK_TOKEN",
-                format!(
-                    "BlockToken does not name block {} of snapshot {}",
-                    input.block_index, input.snapshot_id
-                ),
+                invalid_block_token_message(&input.block_token),
             ));
-        }
+        };
 
         // Everything on the wire is derived from the persisted bytes.
         let data = entry.data.clone();
@@ -215,6 +238,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             block_data: data,
         })
     }
+}
+
+/// The constraint traits the service enforces on a `blockToken`: the expression
+/// [`BLOCK_TOKEN_PATTERN`] and the modelled `BlockToken` `@length`
+/// ([`BLOCK_TOKEN_LENGTH`]).
+///
+/// Declared here because `skip_validation` takes them off the generated member schema,
+/// so there is none left at the boundary to read them from.
+static BLOCK_TOKEN_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(PatternTrait::new(BLOCK_TOKEN_PATTERN)));
+    traits.insert(Box::new(LengthTrait::new(
+        Some(BLOCK_TOKEN_LENGTH.0),
+        Some(BLOCK_TOKEN_LENGTH.1),
+    )));
+    traits
+});
+
+/// `blockToken` as a MEMBER schema carrying [`BLOCK_TOKEN_TRAITS`], so the check itself
+/// is the framework's walk rather than this module's and the violation it reports — its
+/// kind, its path and its ceiling on how much of the rejected value is echoed — is the
+/// framework's too. The member name is what the path is built from, lower-camelled to
+/// `blockToken` exactly as the boundary does it.
+static BLOCK_TOKEN_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
+    Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.ebs#GetSnapshotBlockRequest$BlockToken",
+            "com.amazonaws.ebs",
+            "BlockToken",
+        ),
+        ShapeType::String,
+        "BlockToken",
+        0,
+    )
+    .with_traits(&BLOCK_TOKEN_TRAITS)
+});
+
+/// The message refusing `block_token`, or `None` when it satisfies what the service
+/// enforces.
+///
+/// The sentence is the framework's `ValidationException` report — `1 validation error
+/// detected: Value '<v>' at 'blockToken' failed to satisfy constraint: <requirement>` —
+/// rendered by the same envelope the boundary uses, so the refusal a caller reads states
+/// the expression this operation really enforces and cannot drift from the boundary's
+/// wording for every other member.
+fn block_token_refusal(block_token: &str) -> Option<String> {
+    let mut validator = ValidatingSerializer::new();
+    // Infallible: the validator accumulates violations instead of failing.
+    let _ = validator.write_string(&BLOCK_TOKEN_SCHEMA, block_token);
+    ::aws_smithy_schema_server::envelope(&validator.into_violations())
 }
 
 /// The modelled server error for an engine that holds no state for this service.

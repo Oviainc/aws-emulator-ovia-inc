@@ -42,3 +42,5 @@ mod resource_tagging;
 mod security_hub_core_loop;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_findings.rs"]
+mod update_findings;

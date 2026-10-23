@@ -211,7 +211,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into_iter()
                     .map(|schema| SchemaSummary {
                         last_modified: Some(schema.last_modified.into()),
-                        schema_arn: Some(registry.schema_arn_in(&region, schema)),
+                        // A summary carries only the members the schema HAS: a schema
+                        // of a service-owned registry is not a customer resource and
+                        // has no ARN, so the member is left out for one.
+                        schema_arn: registry.schema_arn_in(&region, schema),
                         schema_name: Some(schema.name.clone()),
                         tags: crate::state::tags_to_output(&schema.tags),
                         // "The number of versions available for the schema" —

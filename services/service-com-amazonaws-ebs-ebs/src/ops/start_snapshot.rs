@@ -147,8 +147,10 @@ use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use crate::state::{
-    expiry_from_timeout, fingerprint_hex_sha256, BlockEntry, Snapshot, SnapshotStatus, SseType,
-    StartSnapshotIdempotencyRecord, StoredTag, DEFAULT_SNAPSHOT_TIMEOUT_MINUTES,
+    expiry_from_timeout, fingerprint_hex_sha256, invalid_volume_size_message,
+    is_well_formed_snapshot_id, malformed_snapshot_id_message, snapshot_not_found_message,
+    BlockEntry, Snapshot, SnapshotStatus, SseType, StartSnapshotIdempotencyRecord, StoredTag,
+    CLIENT_TOKEN_CONFLICT_MESSAGE, DEFAULT_SNAPSHOT_TIMEOUT_MINUTES,
     MAX_STORED_BLOCKS_PER_SNAPSHOT, MAX_STORED_BLOCKS_TOTAL, MAX_STORED_SNAPSHOTS,
     MAX_VOLUME_SIZE_GIB, SNAPSHOT_BLOCK_SIZE_BYTES,
 };
@@ -232,17 +234,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(no_state)?;
         let now = SystemTime::now();
         let mut store = state.lock();
-        store.expire_due_snapshots(now);
+        store.apply_due_transitions(now);
 
         // `VolumeSize`: "The maximum size is 65536 GiB (64 TiB)." The model carries only
-        // the minimum, so the documented maximum is refused here.
+        // the minimum, so the documented maximum is refused here, with the service's own
+        // request-derived template for the refusal.
         if input.volume_size > MAX_VOLUME_SIZE_GIB {
             return Err(validation(
                 "INVALID_VOLUME_SIZE",
-                format!(
-                    "VolumeSize {} exceeds the maximum snapshot volume size of {MAX_VOLUME_SIZE_GIB} GiB",
-                    input.volume_size
-                ),
+                invalid_volume_size_message(input.volume_size),
             ));
         }
 
@@ -265,9 +265,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if record.request_fingerprint != fingerprint {
                     return Err(StartSnapshotErrorModeled::ConflictException(
                         ConflictException {
-                            message: Some(format!(
-                                "ClientToken {token} was already used for a different StartSnapshot request"
-                            )),
+                            // Fixed and request-independent: the refusal echoes neither
+                            // the token nor the operation.
+                            message: Some(CLIENT_TOKEN_CONFLICT_MESSAGE.to_string()),
                         },
                     )
                     .into());
@@ -282,20 +282,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // `ParentSnapshotId` must name a snapshot that exists and is sealed; the new
-        // snapshot starts from a copy of its blocks.
+        // `ParentSnapshotId` must name a snapshot that is stored and whose content is
+        // final; the new snapshot starts from a copy of its blocks. The two ways that can
+        // fail are DIFFERENT refusals: an id that resolves to nothing is the snapshot
+        // not-found 404, while a snapshot that exists but is still being written is a
+        // `ValidationException` naming that state.
         let (parent_blocks, parent_sse) = match input.parent_snapshot_id.as_deref() {
             Some(parent_id) => {
-                let parent = store
-                    .snapshots
-                    .get(parent_id)
-                    .filter(|snapshot| snapshot.status == SnapshotStatus::Completed)
-                    .ok_or_else(|| {
-                        not_found(format!(
-                            "no completed snapshot {parent_id} exists to use as ParentSnapshotId"
-                        ))
-                    })?;
-                (Some(parent.blocks.clone()), Some(parent.sse_type))
+                let parent = store.snapshots.get(parent_id).ok_or_else(|| {
+                    // A value that is not even shaped like a snapshot id is a malformed
+                    // parameter, not a snapshot the service does not hold. The parameter
+                    // named is the one it arrived in.
+                    if is_well_formed_snapshot_id(parent_id) {
+                        not_found(snapshot_not_found_message(parent_id))
+                    } else {
+                        validation(
+                            "INVALID_SNAPSHOT_ID",
+                            malformed_snapshot_id_message("parentSnapshotId", parent_id),
+                        )
+                    }
+                })?;
+                if !parent.is_sealed() {
+                    return Err(validation(
+                        "INVALID_SNAPSHOT_ID",
+                        format!(
+                            "snapshot {parent_id} is {} and cannot be used as ParentSnapshotId",
+                            parent.status.as_wire()
+                        ),
+                    ));
+                }
+                (Some(parent.blocks.clone()), parent.sse_type)
             }
             None => (None, None),
         };
@@ -325,17 +341,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // here rather than cloned a second time.
         for (block_index, entry) in parent_blocks.into_iter().flatten() {
             let block_token = store.mint_block_token(&snapshot_id, block_index);
-            blocks.insert(block_index, BlockEntry { block_token, ..entry });
+            // Inherited, not written: `CompleteSnapshot`'s `ChangedBlocksCount` counts
+            // only what a caller writes into THIS snapshot.
+            blocks.insert(
+                block_index,
+                BlockEntry {
+                    block_token,
+                    written: false,
+                    ..entry
+                },
+            );
         }
 
         let encrypted = input.encrypted == Some(true) || input.kms_key_arn.is_some();
         let sse_type = if input.kms_key_arn.is_some() {
-            SseType::SseKms
+            Some(SseType::SseKms)
         } else if encrypted {
-            SseType::SseEbs
+            Some(SseType::SseEbs)
         } else {
-            // An unencrypted request inherits whatever the parent carried.
-            parent_sse.unwrap_or(SseType::None)
+            // An unencrypted request inherits whatever the parent carried, which for an
+            // unencrypted parent is no SSE type at all.
+            parent_sse
         };
         let timeout_minutes = input.timeout.unwrap_or(DEFAULT_SNAPSHOT_TIMEOUT_MINUTES);
 
@@ -364,10 +390,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             encrypted,
             sse_type,
             timeout_minutes,
+            // No completion has been asked for yet: `CompleteSnapshot` sets this.
+            completion_due: None,
             blocks,
         };
         store.snapshots.insert(snapshot_id.clone(), snapshot);
-        store.refresh_expiry_schedule();
+        store.refresh_transition_schedule();
         if let Some(token) = input.client_token.as_deref() {
             store.client_tokens.insert(
                 token.to_string(),
@@ -463,6 +491,12 @@ fn request_fingerprint(input: &StartSnapshotInput) -> String {
 }
 
 /// Render the stored snapshot as this operation's output.
+///
+/// An optional member the stored snapshot does NOT have is left absent rather than
+/// materialised as a placeholder: restJson1 omits an absent member, and `SseType` and
+/// `Tags` are optional with no `@default`, so an unencrypted snapshot reports no
+/// `SseType` and an untagged one reports no `Tags` — a caller can tell "the service did
+/// not report one" from "the service reported this value".
 fn response_for(snapshot: &Snapshot) -> StartSnapshotOutput {
     StartSnapshotOutput {
         description: snapshot.description.clone(),
@@ -472,7 +506,7 @@ fn response_for(snapshot: &Snapshot) -> StartSnapshotOutput {
         start_time: Some(::aws_smithy_types::DateTime::from(snapshot.start_time)),
         volume_size: Some(snapshot.volume_size),
         block_size: Some(snapshot.block_size),
-        tags: Some(
+        tags: (!snapshot.tags.is_empty()).then(|| {
             snapshot
                 .tags
                 .iter()
@@ -480,10 +514,12 @@ fn response_for(snapshot: &Snapshot) -> StartSnapshotOutput {
                     key: tag.key.clone(),
                     value: tag.value.clone(),
                 })
-                .collect(),
-        ),
+                .collect()
+        }),
         parent_snapshot_id: snapshot.parent_snapshot_id.clone(),
         kms_key_arn: snapshot.kms_key_arn.clone(),
-        sse_type: Some(snapshot.sse_type.as_wire().to_string()),
+        sse_type: snapshot
+            .sse_type
+            .map(|sse_type| sse_type.as_wire().to_string()),
     }
 }

@@ -40,9 +40,7 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
-};
+use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
 
 /// The `com-amazonaws-bedrockagentruntime-amazonbedrockagentruntimeservice` emulated service: the generated [`ServiceDefinition`] plus
@@ -123,8 +121,27 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // for the rest. Replace BOTH the code and the message: a client branches
         // on the code, so a message without its matching code is worse than
         // leaving both alone.
-        let _ = refusal;
-        None
+        //
+        // This service restates a `@pattern` failure with the expression UNANCHORED — the
+        // `^`/`$` a model writes to demand a whole-string match are not part of the
+        // expression a value has to satisfy, and a caller that compiles or compares the
+        // quoted pattern must see the one the member's constraint publishes. Of the two
+        // renderings the shared home offers this service states the GROUPING one
+        // (`service_common::validation::unanchored_grouping_alternation`), which keeps a
+        // top-level alternation grouped so the quoted expression still matches what the
+        // anchored one matched.
+        //
+        // That choice is the ONLY thing decided here: which refusals are restated, the
+        // modelled `ValidationException` code, the envelope, the member paths and every
+        // other requirement are the shared
+        // `service_common::validation_message::aws_validation_refusal_with`'s and the
+        // framework's, so this service cannot drift from them. Every other violation class
+        // keeps the framework's wording, and an authentication refusal keeps it too: it is
+        // not an input-constraint failure.
+        service_common::validation_message::aws_validation_refusal_with(
+            refusal,
+            service_common::validation::unanchored_grouping_alternation,
+        )
     }
 
     fn override_routing_error(

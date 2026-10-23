@@ -15,6 +15,10 @@
 mod listener_tls_certificates;
 #[path = "all/provisioning_loop.rs"]
 mod provisioning_loop;
+#[path = "all/query_error_envelope.rs"]
+mod query_error_envelope;
+#[path = "all/shared_endpoint_routing.rs"]
+mod shared_endpoint_routing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/trust_stores.rs"]

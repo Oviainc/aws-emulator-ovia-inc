@@ -21,21 +21,21 @@ use ssooidc::state::{
 };
 
 /// The region most cases sign for; the region table below varies it.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 /// The portal a device flow starts from.
-const START_URL: &str = "https://my-sso-portal.awsapps.com/start";
+pub(crate) const START_URL: &str = "https://my-sso-portal.awsapps.com/start";
 /// Long enough for the approval the clock owes a pending authorization to come due.
-const PAST_APPROVAL: Duration = APPROVAL_DELAY.saturating_add(Duration::from_millis(250));
+pub(crate) const PAST_APPROVAL: Duration = APPROVAL_DELAY.saturating_add(Duration::from_millis(250));
 
 /// One emulator: the shared engine plus the router that serves this service, the
 /// same pair `core/router` builds in production.
-struct Emulator {
+pub(crate) struct Emulator {
     engine: Arc<engine::InMemoryEngine>,
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -44,7 +44,7 @@ impl Emulator {
     }
 
     /// POST `path` in `region` and return the status and the parsed JSON body.
-    async fn post(&self, path: &str, region: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn post(&self, path: &str, region: &str, body: &Value) -> (u16, Value) {
         let authorization = format!(
             "AWS4-HMAC-SHA256 Credential=EMULATORAKTEST/20260101/{region}/sso-oauth/aws4_request, \
              SignedHeaders=host;x-amz-date, Signature=0123456789abcdef"
@@ -75,17 +75,17 @@ impl Emulator {
         self.post("/client/register", REGION, body).await
     }
 
-    async fn start_device_authorization(&self, body: &Value) -> (u16, Value) {
+    pub(crate) async fn start_device_authorization(&self, body: &Value) -> (u16, Value) {
         self.post("/device_authorization", REGION, body).await
     }
 
-    async fn create_token(&self, body: &Value) -> (u16, Value) {
+    pub(crate) async fn create_token(&self, body: &Value) -> (u16, Value) {
         self.post("/token", REGION, body).await
     }
 
     /// Register a client with `extra` merged over the minimal registration, and
     /// return its `clientId`/`clientSecret`.
-    async fn registered_client(&self, extra: Value) -> (String, String) {
+    pub(crate) async fn registered_client(&self, extra: Value) -> (String, String) {
         let mut body = json!({"clientName": "emulator-test", "clientType": "public"});
         for (key, value) in extra.as_object().cloned().unwrap_or_default() {
             body[key] = value;
@@ -97,13 +97,15 @@ impl Emulator {
 
     /// This service's persisted state, for the cases that have to age a record the
     /// wall clock cannot be moved for.
-    fn state(&self) -> engine::ServiceState<ssooidc::ComAmazonawsSsooidcAwsssooidcserviceState> {
+    pub(crate) fn state(
+        &self,
+    ) -> engine::ServiceState<ssooidc::ComAmazonawsSsooidcAwsssooidcserviceState> {
         ssooidc::state::service_state(&*self.engine).expect("the service state is reachable")
     }
 }
 
 /// A string member of a response body, with the body in the failure message.
-fn text(body: &Value, member: &str) -> String {
+pub(crate) fn text(body: &Value, member: &str) -> String {
     body[member]
         .as_str()
         .unwrap_or_else(|| panic!("expected a string `{member}` in {body}"))
@@ -111,7 +113,7 @@ fn text(body: &Value, member: &str) -> String {
 }
 
 /// The modeled error shape a failure response names (`__type`).
-fn error_shape(body: &Value) -> String {
+pub(crate) fn error_shape(body: &Value) -> String {
     body["__type"]
         .as_str()
         .unwrap_or_else(|| panic!("expected a `__type` in {body}"))
@@ -129,13 +131,17 @@ fn now_epoch_seconds() -> i64 {
 }
 
 /// A modeled `expiresIn` as whole seconds, for ageing a stored record by it.
-fn seconds(expires_in: i32) -> u64 {
+pub(crate) fn seconds(expires_in: i32) -> u64 {
     u64::try_from(expires_in).expect("a modeled lifetime is positive")
 }
 
 /// Run the device flow for an already-registered client and return the token
 /// response: register -> start -> wait for the approval the clock owes -> poll.
-async fn device_flow_token(emulator: &Emulator, client_id: &str, client_secret: &str) -> Value {
+pub(crate) async fn device_flow_token(
+    emulator: &Emulator,
+    client_id: &str,
+    client_secret: &str,
+) -> Value {
     let (status, started) = emulator
         .start_device_authorization(&json!({
             "clientId": client_id,
@@ -159,7 +165,7 @@ async fn device_flow_token(emulator: &Emulator, client_id: &str, client_secret: 
 
 /// Assert a failure: the HTTP status, the modeled shape, and the OAuth 2.0 `error`
 /// code the model documents for that shape.
-fn assert_failure(
+pub(crate) fn assert_failure(
     case: &str,
     status: u16,
     body: &Value,
@@ -1285,24 +1291,6 @@ async fn a_refresh_cannot_widen_the_scope_it_was_granted() {
     );
 }
 
-/// `CreateTokenWithIAM` is a separate gap: it still answers the scaffold's 501
-/// rather than an empty success, so a client can tell it apart from this slice.
-#[tokio::test]
-async fn create_token_with_iam_is_still_scaffolded() {
-    let emulator = Emulator::new();
-    let (status, response) = emulator
-        .post(
-            "/token?aws_iam=t",
-            REGION,
-            &json!({
-                "clientId": "any",
-                "grantType": GRANT_TYPE_REFRESH_TOKEN,
-                "refreshToken": "any",
-            }),
-        )
-        .await;
-    assert_eq!(
-        status, 501,
-        "CreateTokenWithIAM must still answer 501, got {status} with {response}"
-    );
-}
+// `CreateTokenWithIAM` has its own suite (`tests/all/create_token_with_iam.rs`): it is
+// served on the same `/token` path with `?aws_iam=t`, and no longer answers the
+// scaffold's 501, so the case that pinned that 501 moved there as the real contract.

@@ -407,6 +407,27 @@
 //! `TransitGatewayOptions$AssociationDefaultRouteTableId` and
 //! `$PropagationDefaultRouteTableId` report name that record.
 //!
+//! ## Transit gateway policy tables and their associations
+//!
+//! [`ComAmazonawsEc2Amazonec2State::transit_gateway_policy_tables`] holds the account's
+//! policy tables as [`TransitGatewayPolicyTableRecord`]s, keyed by
+//! `TransitGatewayPolicyTableId` in a [`BTreeMap`]: the modelled [`TransitGatewayPolicyTable`]
+//! every operation that reports one answers with, plus the thing that shape carries no
+//! member for — the attachments associated with the table, keyed by
+//! `TransitGatewayAttachmentId`, each as the modelled
+//! [`TransitGatewayPolicyTableAssociation`] its own report answers with beside the
+//! [`PendingStateMove`] the clock owes it. An association is per (table, attachment), so
+//! that is what the key is, and the order it gives is the order
+//! `GetTransitGatewayPolicyTableAssociations` reports and pages over.
+//!
+//! `AssociateTransitGatewayPolicyTable` answers an association in the non-terminal
+//! `associating` state, so the clock owes it `associated` one [`TRANSITION_DELAY`] later,
+//! on the same monotonic clock as every other move this store owes, and
+//! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies it. An attachment
+//! is associated with at most ONE policy table
+//! ([`ComAmazonawsEc2Amazonec2State::policy_table_of_attachment`]), so a second association
+//! of the same attachment is refused rather than stored beside the first.
+//!
 //! Which attachment propagates its routes into which of those route tables is a resource of
 //! its own too — "Enables the specified attachment to propagate routes to the specified
 //! propagation route table" (`EnableTransitGatewayRouteTablePropagation`) — so
@@ -529,7 +550,9 @@ use crate::ops::types::{
     TagSpecification,
     TransitGateway, TransitGatewayClientVpnAttachment,
     TransitGatewayMulticastDomainAssociation, TransitGatewayOptions,
-    TransitGatewayPeeringAttachment, TransitGatewayPropagation, TransitGatewayRequestOptions,
+    TransitGatewayPeeringAttachment, TransitGatewayPolicyTable,
+    TransitGatewayPolicyTableAssociation, TransitGatewayPropagation,
+    TransitGatewayRequestOptions,
     TransitGatewayRouteTable, TransitGatewayRouteTableAnnouncement,
     TransitGatewayRouteTablePropagation,
     TransitGatewayVpcAttachment,
@@ -1452,6 +1475,17 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// `TransitGatewayRouteTableAnnouncementId`.
     pub transit_gateway_route_table_announcements:
         BTreeMap<String, TransitGatewayRouteTableAnnouncementRecord>,
+    /// Every transit gateway policy table the account holds, by
+    /// `TransitGatewayPolicyTableId`, each with the attachments associated with it — see
+    /// [`TransitGatewayPolicyTableRecord`] and the module docs. Ordered by id, the stable
+    /// order every reader of it reports in.
+    ///
+    /// `CreateTransitGatewayPolicyTable` is the operation that adds one and
+    /// `DeleteTransitGatewayPolicyTable` the one that removes it; both are still scaffolds,
+    /// so a fresh account holds none — which is why `AssociateTransitGatewayPolicyTable`
+    /// answers `InvalidTransitGatewayPolicyTableId.NotFound` for every id until one of them
+    /// is written, exactly as the real service does for a table that does not exist.
+    pub transit_gateway_policy_tables: BTreeMap<String, TransitGatewayPolicyTableRecord>,
     /// Every IPAM pool the account holds, by `IpamPoolId`, as the modelled [`IpamPool`]
     /// shape itself.
     pub ipam_pools: BTreeMap<String, IpamPool>,
@@ -1552,6 +1586,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             transit_gateway_attachments: BTreeMap::new(),
             transit_gateway_multicast_domains: BTreeMap::new(),
             transit_gateway_route_table_announcements: BTreeMap::new(),
+            transit_gateway_policy_tables: BTreeMap::new(),
             ipam_pools: BTreeMap::new(),
             vpc_block_public_access_exclusions: BTreeMap::new(),
             import_image_tasks: BTreeMap::new(),
@@ -2754,6 +2789,23 @@ impl ComAmazonawsEc2Amazonec2State {
             {
                 record.view.state = Some(state);
                 record.pending = None;
+            }
+        }
+        // One attachment's association with a policy table, which
+        // `AssociateTransitGatewayPolicyTable` leaves in the transient `associating` state
+        // with `associated` owed: the same contract as the multicast domain associations
+        // above.
+        for table in self.transit_gateway_policy_tables.values_mut() {
+            for association in table.associations.values_mut() {
+                if let Some(state) = association
+                    .pending
+                    .as_ref()
+                    .and_then(|pending| pending.due_by(now))
+                    .map(str::to_string)
+                {
+                    association.view.state = Some(state);
+                    association.pending = None;
+                }
             }
         }
         for record in self.byoip_cidrs.values_mut() {
@@ -11204,6 +11256,245 @@ pub const ANNOUNCEMENT_STATE_DELETING: &str = "deleting";
 
 /// An announcement a delete has finished with: that enum's `deleted` member.
 pub const ANNOUNCEMENT_STATE_DELETED: &str = "deleted";
+
+// =============================================================================
+// Transit gateway policy tables, and the attachments associated with them
+// =============================================================================
+
+/// The id prefix a transit gateway policy table is minted with.
+pub const TRANSIT_GATEWAY_POLICY_TABLE_ID_PREFIX: &str = "tgw-ptb";
+
+/// A policy table association being carried out: the `TransitGatewayAssociationState`
+/// enum's `associating` member
+/// (`smithy_query(query="shape",shape="TransitGatewayAssociationState")`, whose members are
+/// `associating`, `associated`, `disassociating`, `disassociated`).
+pub const TRANSIT_GATEWAY_ASSOCIATION_STATE_ASSOCIATING: &str = "associating";
+
+/// An association in force: that enum's `associated` member.
+pub const TRANSIT_GATEWAY_ASSOCIATION_STATE_ASSOCIATED: &str = "associated";
+
+/// A policy table in service: the `TransitGatewayPolicyTableState` enum's `available`
+/// member (that enum being `pending`, `available`, `deleting`, `deleted`).
+pub const TRANSIT_GATEWAY_POLICY_TABLE_STATE_AVAILABLE: &str = "available";
+
+/// One attachment's association with a transit gateway policy table: the modelled
+/// [`TransitGatewayPolicyTableAssociation`] every operation that reports one answers with,
+/// plus the move the clock owes it.
+///
+/// The modelled shape itself rather than a parallel record, for the reason every other
+/// store here holds one: a member a writer sets round-trips through
+/// `GetTransitGatewayPolicyTableAssociations` without a field-by-field copy that can
+/// silently drop one.
+#[derive(Debug, Clone)]
+pub struct TransitGatewayPolicyTableAssociationRecord {
+    /// The association as the model shapes it, carrying the state reached so far.
+    pub view: TransitGatewayPolicyTableAssociation,
+    /// The move to `associated` an association owes while it is still `associating`;
+    /// `None` for one that owes none.
+    pub pending: Option<PendingStateMove>,
+}
+
+/// One transit gateway policy table and the attachments associated with it.
+///
+/// The associations are keyed by `TransitGatewayAttachmentId`, because an association IS
+/// per (table, attachment): one attachment cannot be associated with one table twice, and
+/// the key order is the stable order a report of them pages over.
+#[derive(Debug, Clone)]
+pub struct TransitGatewayPolicyTableRecord {
+    /// The policy table itself, as the modelled shape its own operations report.
+    pub view: TransitGatewayPolicyTable,
+    /// The attachments associated with this table, by `TransitGatewayAttachmentId`.
+    pub associations: BTreeMap<String, TransitGatewayPolicyTableAssociationRecord>,
+}
+
+/// `InvalidTransitGatewayPolicyTableId.NotFound` (HTTP 400): the request named a transit
+/// gateway policy table id this account holds no policy table for.
+pub const INVALID_TRANSIT_GATEWAY_POLICY_TABLE_ID_NOT_FOUND: &str =
+    "InvalidTransitGatewayPolicyTableId.NotFound";
+
+/// `InvalidTransitGatewayPolicyTableId.Malformed` (HTTP 400): the request named something
+/// that is not a transit gateway policy table id at all.
+pub const INVALID_TRANSIT_GATEWAY_POLICY_TABLE_ID_MALFORMED: &str =
+    "InvalidTransitGatewayPolicyTableId.Malformed";
+
+/// Refuse a request that named a transit gateway policy table id no policy table of the
+/// account has: HTTP 400 `InvalidTransitGatewayPolicyTableId.NotFound`, worded the way
+/// [`invalid_transit_gateway_id_not_found`] words the transit gateway's own.
+pub fn invalid_transit_gateway_policy_table_id_not_found<E>(
+    transit_gateway_policy_table_id: &str,
+) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_TRANSIT_GATEWAY_POLICY_TABLE_ID_NOT_FOUND,
+        400,
+        format!(
+            "Transit Gateway Policy Table {transit_gateway_policy_table_id} was deleted or does \
+             not exist."
+        ),
+    )
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// The transit gateway policy table `transit_gateway_policy_table_id` names, refusing a
+    /// malformed id first and an unknown one second — the order
+    /// [`require_well_formed_id`] documents, so "not an id of this kind" is never reported
+    /// as "no such policy table".
+    ///
+    /// The ONE place a `TransitGatewayPolicyTableId` is resolved, so every operation that
+    /// takes one refuses the same id the same way.
+    pub fn require_transit_gateway_policy_table<E>(
+        &self,
+        transit_gateway_policy_table_id: &str,
+    ) -> Result<&TransitGatewayPolicyTableRecord, Scaffolded<E>> {
+        require_well_formed_id(
+            TRANSIT_GATEWAY_POLICY_TABLE_ID_PREFIX,
+            transit_gateway_policy_table_id,
+            INVALID_TRANSIT_GATEWAY_POLICY_TABLE_ID_MALFORMED,
+        )?;
+        self.transit_gateway_policy_tables
+            .get(transit_gateway_policy_table_id)
+            .ok_or_else(|| {
+                invalid_transit_gateway_policy_table_id_not_found(transit_gateway_policy_table_id)
+            })
+    }
+
+    /// The policy table `transit_gateway_attachment_id` is already associated with, if any.
+    ///
+    /// An attachment is associated with at most one policy table, so this answers at most
+    /// one id; it is a scan of the tables the account holds, which is bounded by
+    /// [`MAX_STORED_RECORDS_PER_STORE`] like every other store here.
+    pub fn policy_table_of_attachment(&self, transit_gateway_attachment_id: &str) -> Option<&str> {
+        self.transit_gateway_policy_tables
+            .iter()
+            .find(|(_, table)| {
+                table
+                    .associations
+                    .contains_key(transit_gateway_attachment_id)
+            })
+            .map(|(policy_table_id, _)| policy_table_id.as_str())
+    }
+
+    /// Store a transit gateway policy table and answer the `TransitGatewayPolicyTableId` it
+    /// was given — or `None` when the store is full.
+    ///
+    /// The id is minted here rather than taken from `view`, exactly as
+    /// [`Self::insert_transit_gateway_attachment`] mints an attachment id, and the
+    /// caller-chosen bytes the table holds (its tags) are charged here on top of the fixed
+    /// [`STORED_RECORD_OVERHEAD_BYTES`] every stored record costs, so no path can store one
+    /// uncharged. A table is stored with no associations: every association is made by a
+    /// request.
+    pub fn insert_transit_gateway_policy_table(
+        &mut self,
+        mut view: TransitGatewayPolicyTable,
+    ) -> Option<String> {
+        if self.transit_gateway_policy_tables.len() >= MAX_STORED_RECORDS_PER_STORE {
+            return None;
+        }
+        let policy_table_id = self.next_id(TRANSIT_GATEWAY_POLICY_TABLE_ID_PREFIX);
+        view.transit_gateway_policy_table_id = Some(policy_table_id.clone());
+        self.add_stored_bytes(
+            STORED_RECORD_OVERHEAD_BYTES + tag_list_bytes(view.tags.as_deref().unwrap_or_default()),
+        );
+        self.transit_gateway_policy_tables.insert(
+            policy_table_id.clone(),
+            TransitGatewayPolicyTableRecord {
+                view,
+                associations: BTreeMap::new(),
+            },
+        );
+        Some(policy_table_id)
+    }
+}
+
+/// Associate the transit gateway attachment `transit_gateway_attachment_id` with the
+/// transit gateway policy table `transit_gateway_policy_table_id`, and answer the
+/// association as it now stands.
+///
+/// The rule `AssociateTransitGatewayPolicyTable` follows, in one place so a later
+/// disassociation and report cannot disagree with it: both resources must exist, an
+/// attachment already associated with a policy table cannot be associated with another, and
+/// a new association starts in the TRANSIENT `associating` state with the clock owing it
+/// `associated` — the span is never zero, so a caller acting straight after this call still
+/// sees `associating`.
+///
+/// The association's `ResourceId` and `ResourceType` are read off the stored attachment
+/// ("The resource ID of the transit gateway attachment" /  "The resource type for the
+/// transit gateway policy table association",
+/// `TransitGatewayPolicyTableAssociation$ResourceId` / `$ResourceType`), never off the
+/// request, which names neither. The CALLER refuses a malformed id of either kind first, so
+/// nothing here depends on the request's form.
+pub fn associate_transit_gateway_policy_table<E>(
+    store: &mut ComAmazonawsEc2Amazonec2State,
+    transit_gateway_policy_table_id: &str,
+    transit_gateway_attachment_id: &str,
+) -> Result<TransitGatewayPolicyTableAssociation, Scaffolded<E>> {
+    // The clock first: an association whose move has fallen due is already `associated`, so
+    // what this call is asked against is the state the store is ACTUALLY in.
+    store.materialize_due_transitions();
+
+    // The policy table the request names, before the attachment: the operation's members
+    // name the table first, and a request naming two unknown resources is told about the
+    // first one.
+    store.require_transit_gateway_policy_table(transit_gateway_policy_table_id)?;
+
+    // "The ID of the transit gateway attachment to associate with the policy table"
+    // (`AssociateTransitGatewayPolicyTableRequest$TransitGatewayAttachmentId`): an id
+    // naming no attachment of the account is refused with the attachment's own NotFound
+    // code rather than silently associating nothing.
+    let attachment = store
+        .transit_gateway_attachments
+        .get(transit_gateway_attachment_id)
+        .ok_or_else(|| {
+            id_not_found(
+                INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND,
+                "transit gateway attachment ID",
+                transit_gateway_attachment_id,
+            )
+        })?;
+    let resource_id = attachment.view.resource_id().map(str::to_string);
+    let resource_type = attachment.view.resource_type().to_string();
+
+    // One attachment, at most one policy table — so a second association is refused with
+    // EC2's own `Resource.AlreadyAssociated` and NOTHING is written, whether the table it
+    // already belongs to is this one or another.
+    if let Some(holder) = store.policy_table_of_attachment(transit_gateway_attachment_id) {
+        return Err(resource_already_associated(format!(
+            "The transit gateway attachment '{transit_gateway_attachment_id}' is already \
+             associated with the transit gateway policy table '{holder}'"
+        )));
+    }
+
+    let view = TransitGatewayPolicyTableAssociation {
+        transit_gateway_policy_table_id: Some(transit_gateway_policy_table_id.to_string()),
+        transit_gateway_attachment_id: Some(transit_gateway_attachment_id.to_string()),
+        resource_id,
+        resource_type: Some(resource_type),
+        state: Some(TRANSIT_GATEWAY_ASSOCIATION_STATE_ASSOCIATING.to_string()),
+    };
+    // An association retains no caller-chosen text at all — every string on it is either a
+    // word this module chose or an id read back out of another store, and an attachment is
+    // associated at most once, so the table cannot hold more associations than the
+    // attachment store holds attachments ([`MAX_STORED_RECORDS_PER_STORE`]). No byte charge
+    // is made for one, for the reason a Windows fast launch configuration makes none.
+    let table = store
+        .transit_gateway_policy_tables
+        .get_mut(transit_gateway_policy_table_id)
+        .ok_or_else(|| {
+            internal_error(format!(
+                "the transit gateway policy table '{transit_gateway_policy_table_id}' resolved a \
+                 moment ago is not in the store any more"
+            ))
+        })?;
+    table.associations.insert(
+        transit_gateway_attachment_id.to_string(),
+        TransitGatewayPolicyTableAssociationRecord {
+            view: view.clone(),
+            pending: Some(PendingStateMove::starting_now(
+                TRANSIT_GATEWAY_ASSOCIATION_STATE_ASSOCIATED,
+            )),
+        },
+    );
+    Ok(view)
+}
 
 // =============================================================================
 // IPAM pools, and the one BYOIP state the release path has no word for

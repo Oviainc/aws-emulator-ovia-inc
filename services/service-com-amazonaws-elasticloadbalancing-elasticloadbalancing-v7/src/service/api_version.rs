@@ -257,8 +257,10 @@ impl ErasedOperation for UnsupportedApiVersionOperation {
 /// none: a request that states no version is served as the model's own API version (see
 /// [`serving_model`]), so that is the version it was not found for. The envelope itself is
 /// the framework's own `awsQuery` error document
-/// (`aws_smithy_schema_server::query_error_body`), so a routing refusal raised here and
-/// one raised by either generated definition cannot answer in different shapes.
+/// (`aws_smithy_schema_server::query_error_body`) with the `<RequestId>` that envelope
+/// carries added by the one writer every error of this endpoint passes through
+/// (`service_common::query_error_envelope`), so a routing refusal raised here and one
+/// raised by either generated definition cannot answer in different shapes.
 pub fn unresolved_pair_response(req: &RtRequest, served_as: &str) -> RtResponse {
     let action = req
         .body()
@@ -276,5 +278,5 @@ pub fn unresolved_pair_response(req: &RtRequest, served_as: &str) -> RtResponse 
         SdkBody::from(body),
     );
     resp.headers_mut().insert("content-type", "text/xml");
-    resp
+    service_common::query_error_envelope::with_request_id(resp)
 }
