@@ -32,6 +32,11 @@ use crate::ops::types::{
 // staying out of it keeps this change from colliding with theirs.
 use crate::ops::types::ScopeConfiguration;
 
+// `BaseConfigurationItem` is named separately for the same reason as
+// `ScopeConfiguration` above: it is what the aggregate read paths report a discovered
+// resource's current configuration as.
+use crate::ops::types::BaseConfigurationItem;
+
 /// The ARN namespace of this service (`awsService.arnNamespace` in the model), used
 /// for every ARN this emulator mints.
 pub const ARN_SERVICE: &str = "config";
@@ -85,6 +90,31 @@ pub const RECORDING_STRATEGY_INCLUSION: &str = "INCLUSION_BY_RESOURCE_TYPES";
 /// `RecordingMode`: "Config supports Continuous recording and Daily recording", and
 /// continuous recording is the recorder's default).
 pub const RECORDING_FREQUENCY_CONTINUOUS: &str = "CONTINUOUS";
+
+/// The other `RecordingFrequency` a recorder can record a resource type at
+/// (`com.amazonaws.configservice#RecordingFrequency`, whose values are `CONTINUOUS`
+/// and `DAILY`). A configuration item reports its `recordingFrequency` only under
+/// this one (`BaseConfigurationItem$recordingFrequency`: "This field only appears in
+/// the API response when DAILY recording is enabled for a resource type. If this
+/// field is not present, CONTINUOUS recording is enabled for that resource type").
+pub const RECORDING_FREQUENCY_DAILY: &str = "DAILY";
+
+/// `ConfigurationItemStatus` values
+/// (`com.amazonaws.configservice#ConfigurationItemStatus`): the configuration of the
+/// resource has been recorded (`OK`), the resource has been discovered but its
+/// configuration was not recorded (`ResourceDiscovered`), and the resource has been
+/// deleted (`ResourceDeleted`).
+pub const CONFIGURATION_ITEM_STATUS_OK: &str = "OK";
+/// See [`CONFIGURATION_ITEM_STATUS_OK`].
+pub const CONFIGURATION_ITEM_STATUS_RESOURCE_DISCOVERED: &str = "ResourceDiscovered";
+/// See [`CONFIGURATION_ITEM_STATUS_OK`].
+pub const CONFIGURATION_ITEM_STATUS_RESOURCE_DELETED: &str = "ResourceDeleted";
+
+/// The only published `AggregatorFilterType` value
+/// (`com.amazonaws.configservice#AggregatorFilterType`): an aggregator filter lists
+/// the values it takes IN, so a filter that lists resource types aggregates those
+/// types and no others.
+pub const AGGREGATOR_FILTER_TYPE_INCLUDE: &str = "INCLUDE";
 
 /// The `RecordingScope` of a CUSTOMER MANAGED configuration recorder
 /// (`com.amazonaws.configservice#RecordingScope`: `INTERNAL` when the recorded
@@ -1446,6 +1476,88 @@ impl DiscoveredResourceEntry {
             resource_deletion_time: self.deleted_at.map(timestamp),
         }
     }
+
+    /// The resource's CURRENT configuration item, as the configuration-item read paths
+    /// report it: this account's data in `aws_region`, recorded at
+    /// `recording_frequency` (see [`ComAmazonawsConfigserviceStarlingdoveserviceState::recording_frequency_of`]).
+    ///
+    /// A `BaseConfigurationItem` is the configuration item WITHOUT the resource's tags
+    /// and relationships (`BatchGetAggregateResourceConfig`: "The API does not return
+    /// tags and relationships"), so the tags the inventory holds are deliberately not
+    /// reported here, and `supplementaryConfiguration` — the extra configuration
+    /// blocks a recorder captures beside the configuration itself — carries nothing
+    /// this emulator records.
+    ///
+    /// Three members stay unset because nothing in this emulator knows them: the
+    /// resource's own `arn` and `availabilityZone` belong to the service that owns the
+    /// resource, and `resourceCreationTime` is the instant that service created it,
+    /// none of which a recorded configuration item carries
+    /// (`PutResourceConfig` records the type, the id, the name, the schema version and
+    /// the configuration document, and nothing else).
+    pub fn to_base_configuration_item(
+        &self,
+        aws_region: &str,
+        recording_frequency: &str,
+    ) -> BaseConfigurationItem {
+        // Daily recording delivers a configuration item separately from capturing it,
+        // which is the only frequency that reports either member
+        // (`BaseConfigurationItem$configurationItemDeliveryTime`: "if you are using
+        // daily recording, this field will be populated. However, if you are using
+        // continuous recording, this field will be omitted since the delivery time is
+        // instantaneous as the CI is available right away").
+        let daily = recording_frequency == RECORDING_FREQUENCY_DAILY;
+        BaseConfigurationItem {
+            // "The version number of the resource configuration" — the schema version
+            // the configuration document was recorded under
+            // (`PutResourceConfigRequest$SchemaVersionId`).
+            version: self.schema_version_id.clone(),
+            account_id: Some(::emulator_server::emulator_account_id().to_string()),
+            configuration_item_capture_time: self.last_recorded_at.map(timestamp),
+            configuration_item_status: Some(self.configuration_item_status().to_string()),
+            configuration_state_id: self.configuration_state_id(),
+            arn: None,
+            resource_type: Some(self.resource_type.clone()),
+            resource_id: Some(self.resource_id.clone()),
+            resource_name: self.resource_name.clone(),
+            aws_region: Some(aws_region.to_string()),
+            availability_zone: None,
+            resource_creation_time: None,
+            configuration: self.configuration.clone(),
+            supplementary_configuration: None,
+            recording_frequency: daily.then(|| recording_frequency.to_string()),
+            configuration_item_delivery_time: daily
+                .then(|| self.last_recorded_at.map(timestamp))
+                .flatten(),
+        }
+    }
+
+    /// The `ConfigurationItemStatus` of the resource's current configuration item: the
+    /// resource has been deleted, its configuration has been recorded, or it has been
+    /// discovered without its configuration being recorded.
+    pub fn configuration_item_status(&self) -> &'static str {
+        if self.deleted_at.is_some() {
+            CONFIGURATION_ITEM_STATUS_RESOURCE_DELETED
+        } else if self.configuration.is_some() {
+            CONFIGURATION_ITEM_STATUS_OK
+        } else {
+            CONFIGURATION_ITEM_STATUS_RESOURCE_DISCOVERED
+        }
+    }
+
+    /// The `configurationStateId` of the current configuration item — "an identifier
+    /// that indicates the ordering of the configuration items of a resource" — which
+    /// is therefore DERIVED from the instant the item was captured, in milliseconds,
+    /// so recording the resource again moves it forward and two reads of the same
+    /// recorded state report the same id. A resource no configuration item has been
+    /// recorded for has no state to order, so it carries none.
+    pub fn configuration_state_id(&self) -> Option<String> {
+        self.last_recorded_at.map(|at| {
+            at.duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .to_string()
+        })
+    }
 }
 
 /// One persisted retention configuration: the name Config gave the object and the
@@ -1563,6 +1675,61 @@ impl ConfigurationAggregatorEntry {
             last_updated_time: Some(timestamp(self.last_updated_at)),
             created_by: None,
             aggregator_filters: self.aggregator_filters.clone(),
+        }
+    }
+
+    /// Whether this aggregator aggregates the Config data of `account_id` in `region`.
+    ///
+    /// An aggregator aggregates either listed source accounts, each naming the Regions
+    /// it takes in — every Region (`AllAwsRegions`) or the listed `AwsRegions` — or an
+    /// organization, which takes in every account of that organization over the same
+    /// choice of Regions. An account or a Region no source names is outside the
+    /// aggregator's scope, so it holds nothing for it.
+    pub fn aggregates_source(&self, account_id: &str, region: &str) -> bool {
+        let takes_region = |all_aws_regions: bool, aws_regions: Option<&[String]>| {
+            all_aws_regions
+                || aws_regions.is_some_and(|regions| regions.iter().any(|named| named == region))
+        };
+        let listed_account = self.account_aggregation_sources.iter().any(|source| {
+            source.account_ids.iter().any(|named| named == account_id)
+                && takes_region(source.all_aws_regions, source.aws_regions.as_deref())
+        });
+        listed_account
+            || self
+                .organization_aggregation_source
+                .as_ref()
+                .is_some_and(|source| {
+                    takes_region(source.all_aws_regions, source.aws_regions.as_deref())
+                })
+    }
+
+    /// Whether this aggregator aggregates resources of `resource_type`: every type it
+    /// discovers, unless its `AggregatorFilters` carry a resource-type filter, and
+    /// then only the types that filter lists.
+    ///
+    /// A filter lists the values it takes IN ([`AGGREGATOR_FILTER_TYPE_INCLUDE`] is
+    /// the only published `AggregatorFilterType`), so a filter that lists no type at
+    /// all narrows nothing. The `ServicePrincipal` filter selects which SERVICE-LINKED
+    /// recorders' data the aggregator takes in, and a resource in this store's
+    /// inventory carries no service principal to match it against, so it narrows
+    /// nothing here.
+    pub fn aggregates_resource_type(&self, resource_type: &str) -> bool {
+        let Some(filter) = self
+            .aggregator_filters
+            .as_ref()
+            .and_then(|filters| filters.resource_type.as_ref())
+        else {
+            return true;
+        };
+        let listed = filter.value.as_deref().unwrap_or_default();
+        if listed.is_empty() {
+            return true;
+        }
+        match filter.r#type.as_deref() {
+            // A filter type this emulator does not know cannot be read as a narrowing,
+            // so it takes in every type rather than silently hiding resources.
+            Some(kind) if kind != AGGREGATOR_FILTER_TYPE_INCLUDE => true,
+            _ => listed.iter().any(|named| named == resource_type),
         }
     }
 }
@@ -1885,6 +2052,35 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
             .values()
             .filter(|status| status.recording)
             .find_map(|status| self.recorders.get(&status.name))
+    }
+
+    /// The `RecordingFrequency` Config records `resource_type` at: the frequency the
+    /// recording recorder's recording mode OVERRIDES for that resource type, else that
+    /// mode's own frequency, and continuous recording while no recorder is recording
+    /// (`RecordingMode`: "Config supports Continuous recording and Daily recording",
+    /// with `RecordingModeOverride` setting "a specific recording frequency ... for
+    /// all supported resource types in this override").
+    pub fn recording_frequency_of(&self, resource_type: &str) -> &str {
+        let Some(mode) = self
+            .recording_recorder()
+            .and_then(|recorder| recorder.recording_mode.as_ref())
+        else {
+            return RECORDING_FREQUENCY_CONTINUOUS;
+        };
+        let overridden = mode
+            .recording_mode_overrides
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .find(|rule| {
+                !rule.recording_frequency.is_empty()
+                    && rule.resource_types.iter().any(|named| named == resource_type)
+            })
+            .map(|rule| rule.recording_frequency.as_str());
+        overridden
+            .or(Some(mode.recording_frequency.as_str()))
+            .filter(|frequency| !frequency.is_empty())
+            .unwrap_or(RECORDING_FREQUENCY_CONTINUOUS)
     }
 
     /// How many discovered resources Config holds of each resource type it is
