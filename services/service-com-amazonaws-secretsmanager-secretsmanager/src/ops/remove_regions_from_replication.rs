@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveRegionsFromReplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveRegionsFromReplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveRegionsFromReplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the secret's replicas in the Regions the caller names and reports the
+//! replication view that is left. Idempotent: a Region that holds no replica of
+//! this secret leaves the view unchanged.
 //!
 //! ## Shape of an operation
 //!
@@ -154,20 +148,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveRegionsFromReplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveRegionsFromReplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveRegionsFromReplication"))
+        // Bound the request's own list FIRST, before anything walks it and
+        // before the store lock is taken: `RemoveReplicaRegionListType` declares
+        // no maximum length, and a secret is replicated to at most
+        // `REPLICAS_PER_SECRET` Regions, so no request needs to name more.
+        if input.remove_replica_regions.len() > crate::state::REPLICAS_PER_SECRET {
+            return Err(
+                RemoveRegionsFromReplicationErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "Invalid RemoveReplicaRegions. A secret is replicated to at most {} \
+                             Regions, so at most that many can be removed.",
+                            crate::state::REPLICAS_PER_SECRET
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        store.expire_due(now);
+        // Settle the replicas the clock already owes a move to `InSync`, so the
+        // view left after the removals is current.
+        store.settle_replicas_due(now);
+
+        let Some(secret) = store.get_mut(&input.secret_id) else {
+            return Err(
+                RemoveRegionsFromReplicationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            "Secrets Manager can't find the specified secret.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "A parameter value is not valid for the current state of the resource.
+        // Possible causes: The secret is scheduled for deletion."
+        if secret.scheduled_for_deletion() {
+            return Err(
+                RemoveRegionsFromReplicationErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(
+                            "You can't perform this operation on the secret because it was marked \
+                             for deletion."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The Regions of the replicas to remove": a Region that holds no
+        // replica of this secret has nothing to delete, which is not an error,
+        // and once the last replica goes the secret stops participating in
+        // replication — so `ReplicationStatus` and `PrimaryRegion` both go away.
+        for region in &input.remove_replica_regions {
+            secret.remove_replica(region);
+        }
+
+        Ok(RemoveRegionsFromReplicationOutput {
+            arn: Some(secret.arn.clone()),
+            // "The status of replicas for this secret after you remove
+            // Regions": an EMPTY list is that status once the last replica is
+            // gone, which is not the same answer as reporting nothing.
+            replication_status: Some(secret.replication_status()),
+        })
     }
+}
+
+/// The modelled server error for a request that cannot reach this service's
+/// store. `service_state` answers `None` only when the engine is not the shared
+/// in-memory one, which is a server-side fault, never a bad request.
+fn state_unavailable() -> RemoveRegionsFromReplicationError {
+    RemoveRegionsFromReplicationErrorModeled::InternalServiceError(InternalServiceError {
+        message: Some("the Secrets Manager emulator's state store is unavailable".to_string()),
+    })
+    .into()
 }

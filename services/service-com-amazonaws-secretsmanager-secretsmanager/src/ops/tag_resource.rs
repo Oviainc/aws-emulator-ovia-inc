@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Attaches tags to a stored secret: a key the secret does not carry yet is
+//! appended, and a key it already carries has its value replaced. The attached
+//! tags are what `DescribeSecret` and `ListSecrets` report, and what the
+//! `tag-key` / `tag-value` filters of `ListSecrets` match on.
 //!
 //! ## Shape of an operation
 //!
@@ -179,20 +174,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // Bound the request's own list FIRST, before anything walks it and
+        // before the store lock is taken: `TagListType` declares no maximum
+        // length, and no secret carries more than `TAGS_PER_SECRET` tags anyway,
+        // so a longer list cannot be served at all.
+        if input.tags.len() > crate::state::TAGS_PER_SECRET {
+            return Err(TagResourceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "Invalid Tags. A secret carries at most {} tags.",
+                        crate::state::TAGS_PER_SECRET
+                    )),
+                },
+            )
+            .into());
+        }
+        // A tag's key is its identity ("The key identifier, or name, of the
+        // tag", `Tag$Key`), so a tag carrying none names nothing to attach. The
+        // member is modelled optional, so the boundary lets it through.
+        if input.tags.iter().any(|tag| tag.key.is_none()) {
+            return Err(TagResourceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some("Invalid Tags. Every tag must have a Key.".to_string()),
+                },
+            )
+            .into());
+        }
+        // AWS reserves the `aws:` prefix for its own tags; a caller may neither
+        // create nor modify one.
+        if let Some(reserved) = input
+            .tags
+            .iter()
+            .filter_map(|tag| tag.key.as_deref())
+            .find(|key| key.starts_with(crate::state::RESERVED_TAG_PREFIX))
+        {
+            return Err(TagResourceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "Invalid Tags. The prefix {} is reserved for Amazon Web Services tags; \
+                         got key {reserved:?}.",
+                        crate::state::RESERVED_TAG_PREFIX
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        store.expire_due(now);
+
+        let Some(secret) = store.get_mut(&input.secret_id) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some("Secrets Manager can't find the specified secret.".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "A parameter value is not valid for the current state of the resource.
+        // Possible causes: The secret is scheduled for deletion."
+        if secret.scheduled_for_deletion() {
+            return Err(TagResourceErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(
+                        "You can't perform this operation on the secret because it was marked \
+                         for deletion."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // Bound the tags one secret carries before they grow: the AWS tagging
+        // quota (see `state::TAGS_PER_SECRET`). A key already attached is
+        // replaced rather than added, so re-tagging it never trips this.
+        if secret.tag_count_after(&input.tags) > crate::state::TAGS_PER_SECRET {
+            return Err(TagResourceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "Invalid Tags. A secret carries at most {} tags.",
+                        crate::state::TAGS_PER_SECRET
+                    )),
+                },
+            )
+            .into());
+        }
+
+        secret.attach_tags(&input.tags, now);
+        Ok(TagResourceOutput)
     }
+}
+
+/// The modelled server error for a request that cannot reach this service's
+/// store. `service_state` answers `None` only when the engine is not the shared
+/// in-memory one, which is a server-side fault, never a bad request.
+fn state_unavailable() -> TagResourceError {
+    TagResourceErrorModeled::InternalServiceError(InternalServiceError {
+        message: Some("the Secrets Manager emulator's state store is unavailable".to_string()),
+    })
+    .into()
 }

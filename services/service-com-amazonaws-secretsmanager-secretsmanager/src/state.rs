@@ -13,10 +13,10 @@
 //! Everything a handler needs to resolve, mutate or project a secret is a method
 //! here, so the per-operation files hold only that operation's own rules.
 
-use std::collections::{BTreeMap, HashMap};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::ops::types::Tag;
+use crate::ops::types::{ReplicationStatusType, Tag};
 
 /// The staging label on the current value of a secret.
 pub const STAGE_CURRENT: &str = "AWSCURRENT";
@@ -73,6 +73,59 @@ pub const VERSIONS_PER_SECRET: usize = 100;
 /// The region a resource is placed in when the request carries no SigV4
 /// credential scope to read one from.
 pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// How many tags one secret carries before a further `TagResource` is refused.
+///
+/// The AWS tagging quota is 50 tags per resource ("Service quotas for Tagging",
+/// Amazon Web Services General Reference, referenced from `TagResource`'s own
+/// documentation in this service's Smithy model). It is what stops a loop of
+/// `TagResource` calls against one secret from growing the store without end.
+pub const TAGS_PER_SECRET: usize = 50;
+
+/// The prefix AWS reserves for its own tags: a caller may neither create nor
+/// modify a tag whose key starts with it ("Service quotas for Tagging", Amazon
+/// Web Services General Reference).
+pub const RESERVED_TAG_PREFIX: &str = "aws:";
+
+/// How many replica Regions one secret holds before a further replication
+/// request is refused, and the longest `AddReplicaRegions` list a request may
+/// carry.
+///
+/// A replica lives in an AWS Region, and the set of Regions is finite and
+/// published — but `RegionType` is only a length-bounded pattern
+/// (`^([a-z]+-)+\d+$`), and this emulator validates no Region catalogue, so a
+/// caller could otherwise mint unbounded distinct Region strings and grow one
+/// secret's replica list without end. This bound is therefore the emulator's
+/// OWN, chosen above the number of Regions AWS publishes, and it is what keeps
+/// the resident state (and the per-request walk in [`settle_replicas`]) finite.
+/// `AddReplicaRegionListType` declares no maximum length, so the request's own
+/// list is bounded by the same constant before anything is counted or stored.
+///
+/// [`settle_replicas`]: Secret::settle_replicas
+pub const REPLICAS_PER_SECRET: usize = 64;
+
+/// The KMS key a replica is encrypted with when the request names none: "The
+/// ARN, key ID, or alias of the KMS key to encrypt the secret. If you don't
+/// include this field, Secrets Manager uses `aws/secretsmanager`."
+/// (`ReplicaRegionType$KmsKeyId`, this service's Smithy model.) The alias form
+/// is what the service reports back in a `ReplicationStatusType`.
+pub const DEFAULT_KMS_KEY_ALIAS: &str = "alias/aws/secretsmanager";
+
+/// `ReplicationStatusType$Status` while the replica is being created
+/// (`StatusType`, this service's Smithy model).
+pub const REPLICA_STATUS_IN_PROGRESS: &str = "InProgress";
+
+/// `ReplicationStatusType$Status` once the replica exists.
+pub const REPLICA_STATUS_IN_SYNC: &str = "InSync";
+
+/// How long a fresh replica stays `InProgress` before the clock owes it the move
+/// to `InSync`.
+///
+/// Secrets Manager documents no duration for creating a replica, so this span is
+/// the emulator's OWN: long enough that a caller polling straight after
+/// `ReplicateSecretToRegions` still observes `InProgress`, short enough that a
+/// client waiting for `InSync` does not wait on a human timescale.
+pub const REPLICA_SYNC_DELAY: Duration = Duration::from_millis(750);
 
 /// The characters a secret name may carry besides ASCII letters and digits:
 /// "The secret name can contain ASCII letters, numbers, and the following
@@ -168,6 +221,68 @@ impl StoredTag {
     }
 }
 
+/// One replica of a secret: the Region it is in, the KMS key it is encrypted
+/// with, and the `StatusType` its creation has reached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Replica {
+    pub region: String,
+    pub kms_key_id: String,
+    /// One of [`REPLICA_STATUS_IN_PROGRESS`] or [`REPLICA_STATUS_IN_SYNC`].
+    pub status: String,
+    /// The instant the `InProgress` -> `InSync` move the clock owes this replica
+    /// becomes due; `None` once it has been made. Stored rather than slept on,
+    /// so nothing blocks a request.
+    pub in_sync_due: Option<SystemTime>,
+}
+
+impl Replica {
+    /// A replica whose creation has just started in `region`.
+    fn creating(region: String, kms_key_id: String, at: SystemTime) -> Self {
+        Self {
+            region,
+            kms_key_id,
+            status: REPLICA_STATUS_IN_PROGRESS.to_string(),
+            in_sync_due: at.checked_add(REPLICA_SYNC_DELAY),
+        }
+    }
+
+    /// Materialise the move to `InSync` once the clock has made it due. Returns
+    /// whether anything changed, so a caller can tell a settled replica from an
+    /// untouched one.
+    fn settle(&mut self, now: SystemTime) -> bool {
+        if self.in_sync_due.is_none_or(|due| due > now) {
+            return false;
+        }
+        self.status = REPLICA_STATUS_IN_SYNC.to_string();
+        self.in_sync_due = None;
+        true
+    }
+}
+
+/// How many tags a secret already carrying `existing` would carry once `tags`
+/// were attached, which is what [`TAGS_PER_SECRET`] bounds: a key already
+/// attached is replaced, not added, so it does not grow the list.
+///
+/// Linear in both lists: the keys go into a set rather than being rescanned per
+/// input tag, so counting a long request list costs no more than reading it.
+pub fn tag_count_after_attaching(existing: &[StoredTag], tags: &[Tag]) -> usize {
+    let mut keys: BTreeSet<Option<&String>> = existing.iter().map(|tag| tag.key.as_ref()).collect();
+    keys.extend(tags.iter().map(|tag| tag.key.as_ref()));
+    keys.len()
+}
+
+/// How many replicas a secret already holding `existing` would hold once
+/// `regions` were replicated to, which is what [`REPLICAS_PER_SECRET`] bounds: a
+/// Region already replicated to is replaced, not added.
+pub fn replica_count_after_adding(existing: &[Replica], regions: &[&str]) -> usize {
+    let mut seen: BTreeSet<&str> = existing
+        .iter()
+        .map(|replica| replica.region.as_str())
+        .collect();
+    seen.extend(regions.iter().copied());
+    seen.len()
+}
+
 /// One version of a secret: its value, and the staging labels pointing at it.
 #[derive(Debug, Clone)]
 pub struct SecretVersion {
@@ -223,6 +338,10 @@ pub struct Secret {
     /// `Some(..)` means it is scheduled for deletion.
     pub deleted_date: Option<SystemTime>,
     pub rotation_enabled: bool,
+    /// The replicas of this secret, in the order their Regions were first
+    /// replicated to. Empty for a secret that does not participate in
+    /// cross-region replication.
+    pub replicas: Vec<Replica>,
     /// Versions in the order they were created.
     pub versions: Vec<SecretVersion>,
 }
@@ -244,6 +363,7 @@ impl Secret {
             last_accessed_date: None,
             deleted_date: None,
             rotation_enabled: false,
+            replicas: Vec::new(),
             versions: Vec::new(),
         }
     }
@@ -287,6 +407,160 @@ impl Secret {
                 })
                 .collect()
         })
+    }
+
+    /// Attach `tags` to the secret, appending the keys it does not carry yet and
+    /// replacing the value of each key it does.
+    ///
+    /// `TagResource` "appends tags to the existing list of tags", and a tag's
+    /// key is its identity ("The key identifier, or name, of the tag",
+    /// `Tag$Key`), so a key that is already attached is updated in place rather
+    /// than attached twice. Tagging modifies the secret's metadata, which is
+    /// what `LastChangedDate` reports ("The last date and time that this secret
+    /// was modified in any way").
+    pub fn attach_tags(&mut self, tags: &[Tag], at: SystemTime) {
+        for tag in tags {
+            let stored = StoredTag::from_modeled(tag);
+            match self
+                .tags
+                .iter_mut()
+                .find(|existing| existing.key == stored.key)
+            {
+                Some(existing) => existing.value = stored.value,
+                None => self.tags.push(stored),
+            }
+        }
+        self.last_changed_date = at;
+    }
+
+    /// Detach every tag whose key is named, leaving the rest in place.
+    ///
+    /// `UntagResource` "is idempotent. If a requested tag is not attached to the
+    /// secret, no error is returned and the secret metadata is unchanged", so a
+    /// key that matches nothing is not an error — and when nothing matches,
+    /// `LastChangedDate` does not move either.
+    pub fn detach_tags(&mut self, keys: &[String], at: SystemTime) {
+        let before = self.tags.len();
+        self.tags
+            .retain(|tag| tag.key.as_ref().is_none_or(|key| !keys.contains(key)));
+        if self.tags.len() != before {
+            self.last_changed_date = at;
+        }
+    }
+
+    /// How many tags this secret would carry once `tags` were attached, which is
+    /// what [`TAGS_PER_SECRET`] bounds.
+    pub fn tag_count_after(&self, tags: &[Tag]) -> usize {
+        tag_count_after_attaching(&self.tags, tags)
+    }
+
+    /// The replica held for `region`, if any.
+    pub fn replica(&self, region: &str) -> Option<&Replica> {
+        self.replicas.iter().find(|replica| replica.region == region)
+    }
+
+    /// How many replicas this secret would hold once `regions` were replicated
+    /// to, which is what [`REPLICAS_PER_SECRET`] bounds.
+    pub fn replica_count_after(&self, regions: &[&str]) -> usize {
+        replica_count_after_adding(&self.replicas, regions)
+    }
+
+    /// Record a replication attempt into `region`.
+    ///
+    /// The replica starts `InProgress`, which the clock moves to `InSync` (see
+    /// [`settle_replicas`]); a Region that already holds a replica OF THIS
+    /// SECRET is replicated again, which starts its creation over rather than
+    /// adding a second entry for the same Region.
+    ///
+    /// Nothing here reports `Failed`: that status is for a replica the service
+    /// could not create, and the conflict
+    /// `ReplicateSecretToRegionsRequest$ForceOverwriteReplicaSecret` resolves
+    /// ("whether to overwrite a secret with the same name in the destination
+    /// Region") is a DIFFERENT secret of this name in the destination Region,
+    /// which this store cannot hold — a name identifies at most one secret in
+    /// it. A status for a failure nothing suffered would be fabricated, so the
+    /// emulator reports none.
+    ///
+    /// [`settle_replicas`]: Secret::settle_replicas
+    pub fn replicate_to(&mut self, region: &str, kms_key_id: Option<&str>, at: SystemTime) {
+        let key = kms_key_id
+            .filter(|key| !key.is_empty())
+            .unwrap_or(DEFAULT_KMS_KEY_ALIAS)
+            .to_string();
+        let fresh = Replica::creating(region.to_string(), key, at);
+        match self
+            .replicas
+            .iter_mut()
+            .find(|replica| replica.region == region)
+        {
+            Some(existing) => *existing = fresh,
+            None => self.replicas.push(fresh),
+        }
+    }
+
+    /// Stop replicating to `region`, reporting whether a replica was held there.
+    pub fn remove_replica(&mut self, region: &str) -> bool {
+        let before = self.replicas.len();
+        self.replicas.retain(|replica| replica.region != region);
+        self.replicas.len() != before
+    }
+
+    /// Materialise every replica transition the clock has already made due,
+    /// reporting whether any moved. This is the move from `InProgress` to
+    /// `InSync` that was owed at this instant whether or not anybody called, so
+    /// a reporting operation may perform it before it answers.
+    pub fn settle_replicas(&mut self, now: SystemTime) -> bool {
+        let mut settled = false;
+        for replica in &mut self.replicas {
+            settled |= replica.settle(now);
+        }
+        settled
+    }
+
+    /// The secret's replication view for the wire — one `ReplicationStatusType`
+    /// per replica — omitted while the secret has no replicas.
+    ///
+    /// `StatusMessage` is "Status message such as 'Secret with this name already
+    /// exists in this region'" — the reason a replica was not created, which
+    /// nothing in this emulator produces (see [`replicate_to`]), so it is
+    /// omitted. `LastAccessedDate` is "the date that the secret was last
+    /// accessed in the Region. This field is omitted if the secret has never
+    /// been retrieved in the Region": this emulator serves `GetSecretValue` from
+    /// the primary, so no call has ever retrieved a replica in its own Region.
+    ///
+    /// [`replicate_to`]: Secret::replicate_to
+    pub fn replication_status_out(&self) -> Option<Vec<ReplicationStatusType>> {
+        (!self.replicas.is_empty()).then(|| self.replication_status())
+    }
+
+    /// The same view, as a list that is EMPTY rather than absent for a secret
+    /// with no replicas — what `RemoveRegionsFromReplication` answers with,
+    /// since its `ReplicationStatus` is "the status of replicas for this secret
+    /// after you remove Regions" and "none left" is that status.
+    pub fn replication_status(&self) -> Vec<ReplicationStatusType> {
+        self.replicas
+            .iter()
+            .map(|replica| ReplicationStatusType {
+                region: Some(replica.region.clone()),
+                kms_key_id: Some(replica.kms_key_id.clone()),
+                status: Some(replica.status.clone()),
+                status_message: None,
+                last_accessed_date: None,
+            })
+            .collect()
+    }
+
+    /// The secret's `PrimaryRegion` for the wire.
+    ///
+    /// `PrimaryRegion` is part of the replication view — "The Region the secret
+    /// is in. If a secret is replicated to other Regions, the replicas are
+    /// listed in ReplicationStatus" — and Secrets Manager "only returns fields
+    /// that have a value in the response", so a secret that is not a replication
+    /// primary has no primary Region to report and the member is omitted. It
+    /// comes back as soon as the secret has a replica, and goes away again once
+    /// the last one is removed.
+    pub fn primary_region_out(&self) -> Option<String> {
+        (!self.replicas.is_empty()).then(|| self.region.clone())
     }
 
     /// Whether another version fits under [`VERSIONS_PER_SECRET`], given the
@@ -373,11 +647,11 @@ impl Secret {
 /// Per-service state for com-amazonaws-secretsmanager-secretsmanager. A handler reaches it through [`service_state`].
 ///
 /// Secrets are held in ONE store rather than one per region: the region a secret
-/// is homed in is recorded on it (and reported as `PrimaryRegion`), but a
-/// `SecretId` resolves across the whole store, so a secret created under one
-/// signed region is visible to a caller signing for another. That is a
-/// simplification — the real service's namespace is per-region — and it is the
-/// same store the quota in [`SECRET_QUOTA`] bounds.
+/// is homed in is recorded on it (and reported as `PrimaryRegion` once the
+/// secret has a replica), but a `SecretId` resolves across the whole store, so a
+/// secret created under one signed region is visible to a caller signing for
+/// another. That is a simplification — the real service's namespace is
+/// per-region — and it is the same store the quota in [`SECRET_QUOTA`] bounds.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSecretsmanagerSecretsmanagerState {
     /// Secrets by name, in name order so `ListSecrets` pages deterministically.
@@ -456,6 +730,20 @@ impl ComAmazonawsSecretsmanagerSecretsmanagerState {
             .collect();
         for name in due {
             self.remove(&name);
+        }
+    }
+
+    /// Materialise every replica transition the clock has already made due,
+    /// across every secret the store holds. Like [`expire_due`], this is a
+    /// change that was owed at this instant whether or not anybody called, so an
+    /// operation that reports a replication view performs it before it answers
+    /// and never reports a replica as still being created once its span has
+    /// elapsed.
+    ///
+    /// [`expire_due`]: ComAmazonawsSecretsmanagerSecretsmanagerState::expire_due
+    pub fn settle_replicas_due(&mut self, now: SystemTime) {
+        for secret in self.secrets.values_mut() {
+            secret.settle_replicas(now);
         }
     }
 }

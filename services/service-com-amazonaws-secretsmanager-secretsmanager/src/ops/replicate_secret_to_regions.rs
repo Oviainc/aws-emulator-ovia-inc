@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ReplicateSecretToRegions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ReplicateSecretToRegions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ReplicateSecretToRegions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records a replica of a stored secret in each requested Region and reports the
+//! secret's replication view. A fresh replica starts `InProgress` and the clock
+//! moves it to `InSync`; a Region that already holds a secret of this name fails
+//! unless the caller asks for it to be overwritten.
 //!
 //! ## Shape of an operation
 //!
@@ -159,20 +154,152 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ReplicateSecretToRegions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ReplicateSecretToRegionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ReplicateSecretToRegions"))
+        // Bound the request itself before anything walks or stores it:
+        // `AddReplicaRegionListType` declares no maximum length, and no secret
+        // may hold more replicas than `REPLICAS_PER_SECRET` anyway, so a longer
+        // list cannot be served at all and is refused whole rather than
+        // partially applied.
+        if input.add_replica_regions.len() > crate::state::REPLICAS_PER_SECRET {
+            return Err(
+                ReplicateSecretToRegionsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "Invalid AddReplicaRegions. A secret is replicated to at most {} \
+                             Regions.",
+                            crate::state::REPLICAS_PER_SECRET
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        store.expire_due(now);
+        // Settle the replicas the clock already owes a move to `InSync` before
+        // this call's own changes, so the view this answers with is current.
+        store.settle_replicas_due(now);
+
+        let Some(secret) = store.get_mut(&input.secret_id) else {
+            return Err(
+                ReplicateSecretToRegionsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            "Secrets Manager can't find the specified secret.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "A parameter value is not valid for the current state of the resource.
+        // Possible causes: The secret is scheduled for deletion."
+        if secret.scheduled_for_deletion() {
+            return Err(ReplicateSecretToRegionsErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(
+                        "You can't perform this operation on the secret because it was marked \
+                         for deletion."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // Every requested Region is checked BEFORE any replica is recorded, so a
+        // request naming one Region this service cannot replicate to changes
+        // nothing at all.
+        for replica in &input.add_replica_regions {
+            // `ReplicaRegionType$Region` is modelled optional, so the boundary
+            // lets a replica through that names no destination.
+            let Some(region) = replica.region.as_deref() else {
+                return Err(
+                    ReplicateSecretToRegionsErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(
+                                "Invalid AddReplicaRegions. Every replica must name a Region."
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            // A replica lives in a Region OTHER than the one the secret is in:
+            // the primary is not a replica of itself.
+            if region == secret.region {
+                return Err(
+                    ReplicateSecretToRegionsErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(format!(
+                                "Invalid AddReplicaRegions. The secret is already in {region}, so \
+                                 it can't be replicated there."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // `ForceOverwriteReplicaSecret` governs overwriting "a secret with the
+        // same name in the destination Region" — a DIFFERENT secret of this
+        // name, which this store cannot hold, so there is nothing for it to
+        // decide here (see `state::Secret::replicate_to`). Replicating again
+        // into a Region this secret already has a replica in starts that
+        // replica's creation over either way.
+        let _ = input.force_overwrite_replica_secret;
+        let requested: Vec<&str> = input
+            .add_replica_regions
+            .iter()
+            .filter_map(|replica| replica.region.as_deref())
+            .collect();
+        // Bound the replicas one secret holds before they grow: a Region already
+        // replicated to is replaced rather than added, so re-replicating never
+        // trips this (see `state::REPLICAS_PER_SECRET`).
+        if secret.replica_count_after(&requested) > crate::state::REPLICAS_PER_SECRET {
+            return Err(
+                ReplicateSecretToRegionsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "Invalid AddReplicaRegions. A secret is replicated to at most {} \
+                             Regions.",
+                            crate::state::REPLICAS_PER_SECRET
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        for replica in &input.add_replica_regions {
+            let Some(region) = replica.region.as_deref() else {
+                continue;
+            };
+            secret.replicate_to(region, replica.kms_key_id.as_deref(), now);
+        }
+
+        Ok(ReplicateSecretToRegionsOutput {
+            arn: Some(secret.arn.clone()),
+            // The secret's whole replication view, which is what a later
+            // `DescribeSecret` reports: every replica the secret now has,
+            // including any this call did not touch.
+            replication_status: secret.replication_status_out(),
+        })
     }
+}
+
+/// The modelled server error for a request that cannot reach this service's
+/// store. `service_state` answers `None` only when the engine is not the shared
+/// in-memory one, which is a server-side fault, never a bad request.
+fn state_unavailable() -> ReplicateSecretToRegionsError {
+    ReplicateSecretToRegionsErrorModeled::InternalServiceError(InternalServiceError {
+        message: Some("the Secrets Manager emulator's state store is unavailable".to_string()),
+    })
+    .into()
 }

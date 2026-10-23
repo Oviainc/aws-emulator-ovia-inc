@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopReplicationToReplica
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopReplicationToReplica`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Promotes the replica of a secret in the Region this request is signed for to
+//! a secret of its own. Region-scoped by its own documentation: "You must call
+//! this operation from the Region in which you want to promote the replica to a
+//! primary secret", so what a request may do depends on whether the signed
+//! Region holds the secret's primary or one of its replicas.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopReplicationToReplica::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The promotion ITSELF is answered with the scaffold's 501: it would leave the
+//! primary and the promoted replica as two independent secrets of the same name
+//! in two Regions, and this emulator's store holds one secret per name (see
+//! `crate::state::ComAmazonawsSecretsmanagerSecretsmanagerState`), so there is
+//! no faithful way to store the result. Every Region-scoped refusal around it is
+//! real.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +159,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopReplicationToReplica` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopReplicationToReplicaErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopReplicationToReplica"))
+        // "You must call this operation from the Region in which you want to
+        // promote the replica to a primary secret": the Region the caller signed
+        // for is what decides this request.
+        let region = crate::state::request_region(ctx.parts());
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        store.expire_due(now);
+        store.settle_replicas_due(now);
+
+        let Some(secret) = store.get(&input.secret_id) else {
+            return Err(
+                StopReplicationToReplicaErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            "Secrets Manager can't find the specified secret.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "A parameter value is not valid for the current state of the resource.
+        // Possible causes: The secret is scheduled for deletion."
+        if secret.scheduled_for_deletion() {
+            return Err(
+                StopReplicationToReplicaErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(
+                            "You can't perform this operation on the secret because it was marked \
+                             for deletion."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        if secret.replica(&region).is_some() {
+            // The one path this store cannot represent: promoting the replica
+            // would leave the primary and the promoted secret as two
+            // independent secrets of the same name, in two Regions. Answering
+            // 501 is honest; reporting the primary's ARN back and storing
+            // nothing would not be.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "StopReplicationToReplica promoting a replica to a secret of its own",
+            ));
+        }
+
+        if secret.region == region {
+            // The secret in this Region is the PRIMARY, not a replica, so there
+            // is no link to the primary to remove here.
+            return Err(
+                StopReplicationToReplicaErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            "Operation not permitted on a primary secret. Call must be made in \
+                             replica secret's region."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The Region this request is signed for holds neither the secret nor a
+        // replica of it, so there is nothing of this secret in it to promote.
+        Err(
+            StopReplicationToReplicaErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some("Secrets Manager can't find the specified secret.".to_string()),
+                },
+            )
+            .into(),
+        )
     }
+}
+
+/// The modelled server error for a request that cannot reach this service's
+/// store. `service_state` answers `None` only when the engine is not the shared
+/// in-memory one, which is a server-side fault, never a bad request.
+fn state_unavailable() -> StopReplicationToReplicaError {
+    StopReplicationToReplicaErrorModeled::InternalServiceError(InternalServiceError {
+        message: Some("the Secrets Manager emulator's state store is unavailable".to_string()),
+    })
+    .into()
 }

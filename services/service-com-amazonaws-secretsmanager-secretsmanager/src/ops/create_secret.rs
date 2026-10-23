@@ -261,18 +261,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Cross-region replication is not emulated: there is no second Region to
-        // place a replica in. Answering 501 for the request that asks for one is
-        // honest, where creating an unreplicated secret and reporting success
-        // would not be. `ReplicateSecretToRegions` carries its own stub issue.
+        // "A list of tags to attach to the secret. Each tag is a key and value
+        // pair": a tag's key is its identity, and the `aws:` prefix is reserved
+        // for AWS's own tags — the same rules `TagResource` applies.
+        let tags = input.tags.as_deref().unwrap_or(&[]);
+        // The request's own list is bounded FIRST, before anything walks it:
+        // `TagListType` declares no maximum length, and no secret carries more
+        // than `TAGS_PER_SECRET` tags anyway.
+        if tags.len() > crate::state::TAGS_PER_SECRET {
+            return Err(CreateSecretErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "Invalid Tags. A secret carries at most {} tags.",
+                        crate::state::TAGS_PER_SECRET
+                    )),
+                },
+            )
+            .into());
+        }
+        if tags.iter().any(|tag| tag.key.is_none()) {
+            return Err(CreateSecretErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some("Invalid Tags. Every tag must have a Key.".to_string()),
+                },
+            )
+            .into());
+        }
+        if let Some(reserved) = tags
+            .iter()
+            .filter_map(|tag| tag.key.as_deref())
+            .find(|key| key.starts_with(crate::state::RESERVED_TAG_PREFIX))
+        {
+            return Err(CreateSecretErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "Invalid Tags. The prefix {} is reserved for Amazon Web Services tags; \
+                         got key {reserved:?}.",
+                        crate::state::RESERVED_TAG_PREFIX
+                    )),
+                },
+            )
+            .into());
+        }
+        if crate::state::tag_count_after_attaching(&[], tags) > crate::state::TAGS_PER_SECRET {
+            return Err(CreateSecretErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "Invalid Tags. A secret carries at most {} tags.",
+                        crate::state::TAGS_PER_SECRET
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The same bound on the replica list, for the same reason:
+        // `AddReplicaRegionListType` declares no maximum length, and a secret is
+        // replicated to at most `REPLICAS_PER_SECRET` Regions.
         if input
             .add_replica_regions
-            .as_ref()
-            .is_some_and(|regions| !regions.is_empty())
+            .as_deref()
+            .is_some_and(|regions| regions.len() > crate::state::REPLICAS_PER_SECRET)
         {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "CreateSecret with AddReplicaRegions",
-            ));
+            return Err(CreateSecretErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "Invalid AddReplicaRegions. A secret is replicated to at most {} Regions.",
+                        crate::state::REPLICAS_PER_SECRET
+                    )),
+                },
+            )
+            .into());
         }
 
         // "The secret name can contain ASCII letters, numbers, and the following
@@ -341,7 +400,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     arn: Some(existing.arn.clone()),
                     name: Some(existing.name.clone()),
                     version_id: Some(version.version_id.clone()),
-                    replication_status: None,
+                    replication_status: existing.replication_status_out(),
                 });
             }
             return Err(CreateSecretErrorModeled::ResourceExistsException(
@@ -372,7 +431,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let region = crate::state::request_region(ctx.parts());        let arn = ::engine::emulator_arn(
+        let region = crate::state::request_region(ctx.parts());
+        // "A list of Regions and KMS keys to replicate secrets": a replica lives
+        // in a Region OTHER than the one the secret is created in, and every
+        // requested Region is checked before the secret is stored, so a request
+        // naming an impossible one creates nothing.
+        let replica_regions = input.add_replica_regions.as_deref().unwrap_or(&[]);
+        for replica in replica_regions {
+            let Some(replica_region) = replica.region.as_deref() else {
+                return Err(CreateSecretErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            "Invalid AddReplicaRegions. Every replica must name a Region."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            };
+            if replica_region == region {
+                return Err(CreateSecretErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "Invalid AddReplicaRegions. The secret is created in \
+                             {replica_region}, so it can't be replicated there."
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let arn = ::engine::emulator_arn(
             "secretsmanager",
             &region,
             &format!("secret:{}-{}", input.name, crate::state::new_arn_suffix()),
@@ -381,12 +471,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         secret.description = input.description.clone();
         secret.kms_key_id = input.kms_key_id.clone();
         secret.secret_type = input.r#type.clone();
-        secret.tags = input
-            .tags
-            .iter()
-            .flatten()
-            .map(crate::state::StoredTag::from_modeled)
-            .collect();
+        secret.tags = tags.iter().map(crate::state::StoredTag::from_modeled).collect();
+        // Each requested replica starts being created, exactly as
+        // `ReplicateSecretToRegions` records it; the clock moves it to `InSync`.
+        // `ForceOverwriteReplicaSecret` decides nothing here for the same reason
+        // it decides nothing there (see `state::Secret::replicate_to`).
+        let _ = input.force_overwrite_replica_secret;
+        for replica in replica_regions {
+            if let Some(replica_region) = replica.region.as_deref() {
+                secret.replicate_to(replica_region, replica.kms_key_id.as_deref(), now);
+            }
+        }
 
         // "If you include SecretString or SecretBinary then Secrets Manager
         // creates an initial secret version and automatically attaches the
@@ -421,7 +516,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             version_id: stored
                 .version_with_stage(crate::state::STAGE_CURRENT)
                 .map(|version| version.version_id.clone()),
-            replication_status: None,
+            replication_status: stored.replication_status_out(),
         })
     }
 }

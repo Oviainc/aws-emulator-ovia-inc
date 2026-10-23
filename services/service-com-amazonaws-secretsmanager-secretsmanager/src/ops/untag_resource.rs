@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the named tag keys from a stored secret, with both halves of each
+//! tag. Idempotent: a key the secret does not carry leaves its metadata
+//! unchanged.
 //!
 //! ## Shape of an operation
 //!
@@ -176,20 +170,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // Bound the request's own list FIRST, before anything walks it and
+        // before the store lock is taken: `TagKeyListType` declares no maximum
+        // length, and a secret carries at most `TAGS_PER_SECRET` tags, so no
+        // request needs to name more keys than that.
+        if input.tag_keys.len() > crate::state::TAGS_PER_SECRET {
+            return Err(UntagResourceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "Invalid TagKeys. A secret carries at most {} tags, so at most that many \
+                         keys can be removed.",
+                        crate::state::TAGS_PER_SECRET
+                    )),
+                },
+            )
+            .into());
+        }
+        // AWS reserves the `aws:` prefix for its own tags; a caller may neither
+        // create nor remove one.
+        if let Some(reserved) = input
+            .tag_keys
+            .iter()
+            .find(|key| key.starts_with(crate::state::RESERVED_TAG_PREFIX))
+        {
+            return Err(UntagResourceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "Invalid TagKeys. The prefix {} is reserved for Amazon Web Services \
+                         tags; got key {reserved:?}.",
+                        crate::state::RESERVED_TAG_PREFIX
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        store.expire_due(now);
+
+        let Some(secret) = store.get_mut(&input.secret_id) else {
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some("Secrets Manager can't find the specified secret.".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "A parameter value is not valid for the current state of the resource.
+        // Possible causes: The secret is scheduled for deletion."
+        if secret.scheduled_for_deletion() {
+            return Err(UntagResourceErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(
+                        "You can't perform this operation on the secret because it was marked \
+                         for deletion."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // "Both the key and its associated value are removed", and a key that is
+        // not attached is not an error: the operation is idempotent.
+        secret.detach_tags(&input.tag_keys, now);
+        Ok(UntagResourceOutput)
     }
+}
+
+/// The modelled server error for a request that cannot reach this service's
+/// store. `service_state` answers `None` only when the engine is not the shared
+/// in-memory one, which is a server-side fault, never a bad request.
+fn state_unavailable() -> UntagResourceError {
+    UntagResourceErrorModeled::InternalServiceError(InternalServiceError {
+        message: Some("the Secrets Manager emulator's state store is unavailable".to_string()),
+    })
+    .into()
 }

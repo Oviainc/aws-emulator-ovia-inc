@@ -214,10 +214,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
         let mut store = state.lock();
-        // The only write a read performs: dropping secrets whose recovery window
-        // has already elapsed, which the clock made due whether or not anybody
-        // called.
-        store.expire_due(::std::time::SystemTime::now());
+        // The only writes a read performs, both of them changes the clock has
+        // already made due whether or not anybody called: dropping secrets whose
+        // recovery window has elapsed, and moving a replica whose creation span
+        // has elapsed from `InProgress` to `InSync`.
+        let now = ::std::time::SystemTime::now();
+        store.expire_due(now);
+        store.settle_replicas_due(now);
 
         let Some(secret) = store.get(&input.secret_id) else {
             return Err(DescribeSecretErrorModeled::ResourceNotFoundException(
@@ -255,10 +258,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             version_ids_to_stages: secret.versions_to_stages(),
             owning_service: secret.owning_service.clone(),
             created_date: Some(crate::state::timestamp(secret.created_date)),
-            // "The Region the secret is in."
-            primary_region: Some(secret.region.clone()),
-            // Replication is not emulated, so this secret has no replicas.
-            replication_status: None,
+            // Both members of the replication view: reported from the secret's
+            // own replica state, and omitted together while it has none.
+            primary_region: secret.primary_region_out(),
+            replication_status: secret.replication_status_out(),
         })
     }
 }

@@ -330,9 +330,16 @@ async fn a_created_secret_reads_back_byte_for_byte_through_get_and_describe() {
             "case {case:?}: a live secret must report no DeletedDate, got {described}"
         );
         assert_eq!(
-            described.get("PrimaryRegion").and_then(Value::as_str),
-            Some(REGION),
-            "case {case:?}: expected the signed region back, got {described}"
+            described.get("PrimaryRegion"),
+            None,
+            "case {case:?}: PrimaryRegion is part of the replication view, so an unreplicated \
+             secret must not report one, got {described}"
+        );
+        assert_eq!(
+            described.get("ReplicationStatus"),
+            None,
+            "case {case:?}: an unreplicated secret must report no ReplicationStatus, got \
+             {described}"
         );
     }
 }
@@ -1629,33 +1636,49 @@ async fn a_reporting_operation_does_not_change_what_a_later_caller_sees() {
 }
 
 #[tokio::test]
-async fn cross_region_replication_is_refused_rather_than_silently_skipped() {
+async fn a_secret_created_with_replica_regions_is_stored_with_them() {
     let router = emulator();
-    let (status, parsed) = call(
+    let created = ok(
         &router,
         "CreateSecret",
-        &json!({
+        json!({
             "Name": "replicated",
             "SecretString": "v",
             "AddReplicaRegions": [{"Region": "eu-west-1"}],
         }),
+        "create with one replica region",
     )
     .await;
     assert_eq!(
-        status, 501,
-        "expected 501 for a replication request this emulator cannot serve, got {status} with \
-         body {parsed}"
+        created
+            .get("ReplicationStatus")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1),
+        "expected one ReplicationStatus entry for the requested Region, got {created}"
     );
-    // And nothing was stored for it.
-    let code = err(
+    // And the secret is stored, with the replica a later read reports. The
+    // per-Region status rules have their own suite (`secret_tags_and_replication`).
+    let described = ok(
         &router,
         "DescribeSecret",
         json!({"SecretId": "replicated"}),
-        "describe after the refused replication",
+        "describe after creating with a replica region",
     )
     .await;
     assert_eq!(
-        code, "ResourceNotFoundException",
-        "expected the refused request to have stored nothing, got {code}"
+        described
+            .get("ReplicationStatus")
+            .and_then(Value::as_array)
+            .and_then(|entries| entries.first())
+            .and_then(|entry| entry.get("Region"))
+            .and_then(Value::as_str),
+        Some("eu-west-1"),
+        "expected the replica Region back from DescribeSecret, got {described}"
+    );
+    assert_eq!(
+        described.get("PrimaryRegion").and_then(Value::as_str),
+        Some(REGION),
+        "a replicated secret reports the Region it is in, got {described}"
     );
 }
