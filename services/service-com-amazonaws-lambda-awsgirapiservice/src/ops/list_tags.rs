@@ -15,7 +15,8 @@
 //! [`crate::state::resolve_function`], which materialises the lifecycle transition the
 //! clock already owed.
 //!
-//! Tags are held per function on [`crate::state::FunctionRecord::tags`], which is where
+//! Tags are held per resource on the record the store keeps for it —
+//! [`crate::state::FunctionRecord::tags`] for a function, which is where
 //! `CreateFunction` persists the `Tags` of its request and where `GetFunction` reads the
 //! `Tags` it reports ("You can also view function tags with GetFunction"), so all three
 //! answer from one record. A capacity provider's tags are held the same way, on

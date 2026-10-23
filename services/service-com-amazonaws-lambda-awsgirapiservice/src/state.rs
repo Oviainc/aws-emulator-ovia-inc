@@ -55,6 +55,17 @@
 //! those records reserve (see
 //! [`ComAmazonawsLambdaAwsgirapiserviceState::account_usage`] and
 //! [`ComAmazonawsLambdaAwsgirapiserviceState::account_limit`]).
+//!
+//! The capacity-provider slice is the account's other top-level resource:
+//! [`ComAmazonawsLambdaAwsgirapiserviceState::capacity_providers`] holds one
+//! [`CapacityProviderRecord`] per provider, keyed by its bare name, so every operation
+//! that reports a provider answers from the single record `CreateCapacityProvider`
+//! persisted. A provider has a lifetime of its own in exactly the way a function does:
+//! the model's `CapacityProviderState` enum carries `Pending` beside `Active`, so a
+//! freshly created provider is `Pending` and the move to `Active` is owed by the CLOCK
+//! rather than by anybody calling — the record stores the instant that move becomes due
+//! and [`CapacityProviderRecord::materialize`] brings it up to whatever the clock has
+//! already made due.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, SystemTime};
