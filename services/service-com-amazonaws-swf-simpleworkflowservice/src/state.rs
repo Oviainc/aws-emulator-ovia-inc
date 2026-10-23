@@ -133,6 +133,25 @@ impl WorkflowTypeRecord {
         }
     }
 
+    /// Whether this type is deprecated, i.e. whether its stored `RegistrationStatus`
+    /// is [`STATUS_DEPRECATED`].
+    pub fn is_deprecated(&self) -> bool {
+        self.status == STATUS_DEPRECATED
+    }
+
+    /// Move this type off `REGISTERED` as of `at`: the one-way status move every
+    /// deprecation of a workflow type makes, whether `DeprecateWorkflowType` addressed
+    /// this record directly or [`Domain::deprecate`] cascaded to it. A record that is
+    /// already deprecated keeps the `deprecationDate` its own deprecation gave it, so
+    /// no later call can rewrite an instant that already happened.
+    pub fn deprecate(&mut self, at: DateTime) {
+        if self.is_deprecated() {
+            return;
+        }
+        self.status = STATUS_DEPRECATED.to_string();
+        self.deprecation_date = Some(at);
+    }
+
     /// The `WorkflowTypeInfo` every workflow-type reader returns, built from what is
     /// stored.
     pub fn info(&self) -> WorkflowTypeInfo {
@@ -563,10 +582,7 @@ impl Domain {
     pub fn deprecate(&mut self, at: DateTime) {
         self.status = STATUS_DEPRECATED.to_string();
         for workflow_type in self.workflow_types.values_mut() {
-            if workflow_type.status != STATUS_DEPRECATED {
-                workflow_type.status = STATUS_DEPRECATED.to_string();
-                workflow_type.deprecation_date = Some(at);
-            }
+            workflow_type.deprecate(at);
         }
         for activity_type in self.activity_types.values_mut() {
             if activity_type.status != STATUS_DEPRECATED {

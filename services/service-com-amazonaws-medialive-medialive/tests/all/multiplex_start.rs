@@ -52,7 +52,12 @@ pub(crate) async fn multiplex_with_settings(
 
 /// Create `count` programs in `multiplex_id`, each with its own name and its own
 /// `ProgramNumber`, asserting every create succeeded.
-pub(crate) async fn add_programs(router: &MultiServiceRouter, case: &str, multiplex_id: &str, count: i64) {
+pub(crate) async fn add_programs(
+    router: &MultiServiceRouter,
+    case: &str,
+    multiplex_id: &str,
+    count: i64,
+) {
     for index in 0..count {
         let name = format!("program-{index}");
         let (status, program) = create_program(
