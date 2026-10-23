@@ -1,15 +1,41 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! MUTATES the one IAM Identity Center instance its `InstanceArn` names, in
+//! [`crate::state::ComAmazonawsSsoadminSwbexternalserviceState::instances`] — the same
+//! record `DescribeInstance` reports and `ListInstances` enumerates, so an update is
+//! visible to the very next read.
+//!
+//! The documented rules this handler applies. The request's OWN rules are checked first,
+//! so a malformed request is refused (400) whether or not its `InstanceArn` resolves, and
+//! the resource rule follows:
+//!
+//! * "In a single UpdateInstance request, you can perform only one of the following
+//!   operations … A request that specifies both EncryptionConfiguration and
+//!   PermissionSetsEnabled returns a ValidationException";
+//! * `PermissionSetsEnabled` — "Enables permission sets for this Identity Center
+//!   instance. The only accepted value is true. After permission sets are enabled, they
+//!   cannot be disabled", so `true` turns the instance's
+//!   [`crate::state::Instance::permission_sets_enabled`] ON — which is what opens the
+//!   permission-set / account-assignment surface an account instance withdraws — and
+//!   `false` is refused (`ValidationException`) rather than written;
+//! * `EncryptionConfiguration$KmsKeyArn` — "Required when KeyType is
+//!   CUSTOMER_MANAGED_KEY. Cannot be specified when KeyType is AWS_OWNED_KMS_KEY", so
+//!   each half of that pairing is refused (`ValidationException`) when it is missed;
+//! * an `InstanceArn` this account holds no instance for is a missing resource:
+//!   `ResourceNotFoundException` (404), which this operation's model declares;
+//! * `Name` "Updates the instance name", independently of the other two members (the
+//!   one-of rule above names only `EncryptionConfiguration` and
+//!   `PermissionSetsEnabled`).
+//!
+//! A request that carries none of the three updatable members changes nothing and
+//! succeeds: there is no member to be wrong about.
+//!
+//! An accepted encryption change is ASYNCHRONOUS — the model carries
+//! `KmsKeyStatus::UPDATING` — so the configuration is stored with the instant it becomes
+//! effective ([`crate::state::ENCRYPTION_UPDATE_DELAY`]) and `DescribeInstance` derives
+//! `EncryptionStatus` from it, which keeps that read a read.
 //!
 //! ## Shape of an operation
 //!
@@ -132,6 +158,22 @@ impl From<UpdateInstanceErrorModeled> for UpdateInstanceError {
     }
 }
 
+/// The modelled refusal for a request this operation's documented rules reject.
+///
+/// This operation's model declares its own `ValidationException` ("The request failed
+/// because it contains a syntax error", HTTP 400), so a refusal uses THAT shape rather
+/// than the scaffold's synthetic one. `Reason` is left absent: every value the model's
+/// `ValidationExceptionReason` enum carries reports a KMS key fault
+/// (`KMS_InvalidKeyUsageException`, `KMS_InvalidStateException`, `KMS_DisabledException`),
+/// and none of these refusals inspects a key.
+fn validation(message: impl Into<String>) -> UpdateInstanceError {
+    UpdateInstanceErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+        reason: None,
+    })
+    .into()
+}
+
 /// The `UpdateInstance` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -168,18 +210,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateInstance"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateInstanceErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the SSO Admin state store is unavailable".to_string()),
+            })
+        })?;
+
+        // "A request that specifies both EncryptionConfiguration and
+        // PermissionSetsEnabled returns a ValidationException. To perform both
+        // operations, call UpdateInstance separately for each."
+        if input.encryption_configuration.is_some() && input.permission_sets_enabled.is_some() {
+            return Err(validation(
+                "EncryptionConfiguration and PermissionSetsEnabled cannot be set in the same \
+                 UpdateInstance request; call UpdateInstance separately for each",
+            ));
+        }
+
+        // "The only accepted value is true. After permission sets are enabled, they
+        // cannot be disabled."
+        if input.permission_sets_enabled == Some(false) {
+            return Err(validation(
+                "PermissionSetsEnabled accepts only the value true: once permission sets are \
+                 enabled for an instance they cannot be disabled",
+            ));
+        }
+
+        // `EncryptionConfiguration$KmsKeyArn` pairs with `KeyType`: "Required when
+        // KeyType is CUSTOMER_MANAGED_KEY. Cannot be specified when KeyType is
+        // AWS_OWNED_KMS_KEY."
+        if let Some(configuration) = input.encryption_configuration.as_ref() {
+            match configuration.key_type.as_str() {
+                crate::state::KEY_TYPE_CUSTOMER_MANAGED => {
+                    if configuration.kms_key_arn.is_none() {
+                        return Err(validation(
+                            "EncryptionConfiguration.KmsKeyArn is required when KeyType is \
+                             CUSTOMER_MANAGED_KEY",
+                        ));
+                    }
+                }
+                crate::state::KEY_TYPE_AWS_OWNED => {
+                    if configuration.kms_key_arn.is_some() {
+                        return Err(validation(
+                            "EncryptionConfiguration.KmsKeyArn cannot be specified when KeyType \
+                             is AWS_OWNED_KMS_KEY",
+                        ));
+                    }
+                }
+                // `KmsKeyType` is a closed enum (`AWS_OWNED_KMS_KEY |
+                // CUSTOMER_MANAGED_KEY`), so anything else is a bad request — the same
+                // answer the boundary validator gives, kept here so this handler never
+                // stores a key type the model does not name.
+                other => {
+                    return Err(validation(format!(
+                        "EncryptionConfiguration.KeyType must be one of {} or {}, got {other:?}",
+                        crate::state::KEY_TYPE_AWS_OWNED,
+                        crate::state::KEY_TYPE_CUSTOMER_MANAGED,
+                    )));
+                }
+            }
+        }
+
+        let mut store = state.lock();
+        // A syntactically valid ARN for an instance this account does not hold is a
+        // MISSING RESOURCE, which this operation (unlike `DescribeInstance`) models.
+        let instance = store.instance_mut(&input.instance_arn).ok_or_else(|| {
+            UpdateInstanceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(format!(
+                    "No instance found with the ARN {}",
+                    input.instance_arn
+                )),
+                reason: None,
+            })
+        })?;
+
+        // Only the members the request CARRIES are written: an absent member leaves the
+        // stored value alone, so a caller updating the name cannot silently reset the
+        // instance's encryption configuration.
+        if let Some(name) = input.name {
+            instance.name = Some(name);
+        }
+        if input.permission_sets_enabled == Some(true) {
+            // "Enables permission sets for this Identity Center instance" — one way
+            // only, since they "cannot be disabled" once enabled, and `false` was
+            // already refused above.
+            instance.permission_sets_enabled = true;
+        }
+        if let Some(configuration) = input.encryption_configuration {
+            instance.encryption = Some(crate::state::EncryptionConfigurationRecord::new(
+                configuration.key_type,
+                configuration.kms_key_arn,
+                ::std::time::SystemTime::now(),
+            ));
+        }
+
+        // `UpdateInstanceResponse` models no members: the updated record is read back
+        // through `DescribeInstance`.
+        Ok(UpdateInstanceOutput {})
     }
 }

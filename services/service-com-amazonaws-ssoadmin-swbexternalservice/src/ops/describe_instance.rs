@@ -239,16 +239,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .map(crate::state::Region::to_shape)
                     .collect(),
             ),
-            // Nothing in this emulator configures a customer-managed KMS key for the
-            // instance (`UpdateInstance` is still scaffolded and `CreateInstance` takes
-            // no encryption configuration), so there is no encryption configuration to
-            // report and the optional member is absent rather than carrying an invented
-            // key type or ARN.
-            encryption_configuration_details: None,
+            // The encryption configuration `UpdateInstance` stored, if any: its
+            // `EncryptionStatus` is derived from the instant that update becomes
+            // effective, so this stays a pure READ. An instance nothing has configured
+            // reports no details rather than an invented key type or ARN.
+            encryption_configuration_details: instance
+                .encryption
+                .as_ref()
+                .map(|encryption| encryption.to_shape(::std::time::SystemTime::now())),
             // A property of the INSTANCE: permission sets are a feature of an
-            // organization instance, and an account instance serves none of that
-            // surface.
-            permission_sets_enabled: Some(instance.permission_sets_enabled()),
+            // organization instance, and an account instance serves none of that surface
+            // until an `UpdateInstance` enables them on it.
+            permission_sets_enabled: Some(instance.permission_sets_enabled),
         })
     }
 }
