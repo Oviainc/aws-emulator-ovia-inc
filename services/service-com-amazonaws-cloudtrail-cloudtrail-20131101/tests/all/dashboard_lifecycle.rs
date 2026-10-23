@@ -638,9 +638,14 @@ async fn an_identifier_naming_no_dashboard_is_not_found() {
         ),
     ];
     for (case, identifier) in rows {
-        emulator
-            .get(&identifier)
-            .await
-            .expect_error(case, 400, "ResourceNotFoundException");
+        let reply = emulator.get(&identifier).await;
+        reply.expect_error(case, 400, "ResourceNotFoundException");
+        // The refusal is CloudTrail's own fixed not-found text, the same for every
+        // identifier that names nothing: it reports no part of the request.
+        assert_eq!(
+            reply.body["Message"],
+            json!(state::DASHBOARD_NOT_FOUND_MESSAGE),
+            "case {case:?}: expected the not-found message, got {reply:?}"
+        );
     }
 }

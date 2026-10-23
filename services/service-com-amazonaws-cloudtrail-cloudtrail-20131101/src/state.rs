@@ -1250,6 +1250,14 @@ pub const REFRESH_SCHEDULE_ENABLED: &str = "ENABLED";
 /// run the schedule; for hourly only refer to minutes; default is 00:00."
 pub const DEFAULT_REFRESH_TIME_OF_DAY: &str = "00:00";
 
+/// The refusal text a dashboard operation answers with when the identifier it was
+/// given names no stored dashboard.
+///
+/// It is a FIXED service message — CloudTrail reports no part of the request in it,
+/// and it is the text the recorded `GetDashboard` miss carries — so every dashboard
+/// operation answers a miss with the same words rather than wording its own.
+pub const DASHBOARD_NOT_FOUND_MESSAGE: &str = "No matching dashboard found.";
+
 /// The registry key: a dashboard name and the Region the dashboard lives in.
 ///
 /// A dashboard ARN carries a Region, so a dashboard is a regional resource and its

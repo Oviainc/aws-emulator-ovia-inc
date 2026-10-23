@@ -120,3 +120,5 @@ mod lex_signing_name_routing;
 mod lex_models_v2_runtime_v2_cross_service;
 #[path = "all/wisdom_signing_name_routing.rs"]
 mod wisdom_signing_name_routing;
+#[path = "all/cloudtrail_sdk_target_routing.rs"]
+mod cloudtrail_sdk_target_routing;

@@ -27,6 +27,8 @@ mod lake_queries;
 mod state_roundtrip;
 #[path = "all/target_prefix_dispatch.rs"]
 mod target_prefix_dispatch;
+#[path = "all/target_prefix_routing.rs"]
+mod target_prefix_routing;
 #[path = "all/target_routing.rs"]
 mod target_routing;
 #[path = "all/trail_lifecycle.rs"]
