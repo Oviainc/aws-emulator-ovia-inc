@@ -111,7 +111,12 @@ impl Emulator {
         self.call_in_region(TEST_REGION, action, params).await
     }
 
-    pub(crate) async fn call_in_region(&self, region: &str, action: &str, params: &[(&str, &str)]) -> Answer {
+    pub(crate) async fn call_in_region(
+        &self,
+        region: &str,
+        action: &str,
+        params: &[(&str, &str)],
+    ) -> Answer {
         let mut form = vec![
             format!("Action={}", form_encoded(action)),
             format!("Version={}", form_encoded(API_VERSION)),
