@@ -394,6 +394,11 @@ pub(crate) fn is_modelled_profile_id(id: &str) -> bool {
     is_prefixed_lower_hex_id(id, "p-", 17)
 }
 
+/// `AgreementId` is modelled `len 19..19`, pattern `^a-([0-9a-f]{17})$`.
+pub(crate) fn is_modelled_agreement_id(id: &str) -> bool {
+    is_prefixed_lower_hex_id(id, "a-", 17)
+}
+
 /// `CertificateId` is modelled `len 22..22`, pattern `^cert-([0-9a-f]{17})$`.
 pub(crate) fn is_modelled_certificate_id(id: &str) -> bool {
     is_prefixed_lower_hex_id(id, "cert-", 17)
