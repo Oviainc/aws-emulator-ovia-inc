@@ -34,7 +34,10 @@ fn json_of(case: &str, name: &str, value: &str) -> serde_json::Value {
 
 /// Subscribe `endpoint` over `protocol` with `attributes`, asking for the ARN in every
 /// case, and answer the subscription ARN the call reports.
-async fn subscribe(
+///
+/// `pub(crate)` so a sibling suite that needs a persisted subscription to act on reuses
+/// this one rather than writing a second `Subscribe` caller.
+pub(crate) async fn subscribe(
     sns: &Sns,
     case: &str,
     topic: &str,
@@ -67,7 +70,9 @@ async fn subscribe(
 }
 
 /// A read of one subscription's attributes, asserting the call was answered.
-async fn read(sns: &Sns, case: &str, arn: &str) -> Answer {
+///
+/// `pub(crate)` for the same reason as [`subscribe`].
+pub(crate) async fn read(sns: &Sns, case: &str, arn: &str) -> Answer {
     let answer = sns
         .call("GetSubscriptionAttributes", &[("SubscriptionArn", arn)])
         .await;
