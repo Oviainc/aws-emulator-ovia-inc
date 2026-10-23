@@ -1462,12 +1462,7 @@ impl ApprovalRuleTemplateRecord {
         Self {
             template_id: approval_rule_template_id(name, created),
             name: name.to_string(),
-            // CodeCommit holds no empty description: a template created with one
-            // simply has none, so `approvalRuleTemplateDescription` is absent on
-            // every later read rather than reported as an empty string (the
-            // recorded behaviour the corpus names
-            // "approval-rule-template-empty-description-normalized-to-absent").
-            description: description.filter(|text| !text.is_empty()),
+            description: normalized_template_description(description),
             // The document is held canonicalized, never as the caller happened to
             // format it: whatever the submitted whitespace, the stored content,
             // `ruleContentSha256` and every later read agree.
@@ -1476,6 +1471,24 @@ impl ApprovalRuleTemplateRecord {
             last_modified_date: created,
             last_modified_user,
         }
+    }
+
+    /// Set this template's description to the one a request carried, and record
+    /// who changed it when.
+    ///
+    /// The description is normalized by [`normalized_template_description`], so a
+    /// template never holds an empty one however it was set, and the change moves
+    /// `lastModifiedDate` and `lastModifiedUser` onto this call: both report the
+    /// most recent change to the template, not its creation.
+    pub fn set_description(
+        &mut self,
+        description: Option<String>,
+        modified_by: String,
+        modified: SystemTime,
+    ) {
+        self.description = normalized_template_description(description);
+        self.last_modified_user = modified_by;
+        self.last_modified_date = modified;
     }
 
     /// This template as the modeled `ApprovalRuleTemplate` shape — the one place
@@ -1508,6 +1521,20 @@ impl ApprovalRuleTemplateRecord {
         self.last_modified_user = by;
         self.last_modified_date = at;
     }
+}
+
+/// An approval rule template's description as CodeCommit HOLDS it, whatever a
+/// request carried.
+///
+/// A template holds no empty description: one set to an empty string simply has
+/// none, so `approvalRuleTemplateDescription` is ABSENT on the answer and on every
+/// later read rather than reported as an empty string (the recorded behaviour the
+/// corpus names
+/// "approval-rule-template-empty-description-normalized-to-absent"). Every write
+/// of a description — the create and every update — goes through here, so they
+/// cannot disagree about what an empty one means.
+pub fn normalized_template_description(description: Option<String>) -> Option<String> {
+    description.filter(|text| !text.is_empty())
 }
 
 /// The SHA-256 hash signature CodeCommit reports for a template's content

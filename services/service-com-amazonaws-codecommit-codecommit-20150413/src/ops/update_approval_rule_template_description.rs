@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateApprovalRuleTemplateDescription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateApprovalRuleTemplateDescription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: sets the stored approval rule template's description to the one the
+//! request carried (an empty one leaving the template with no description at all) and
+//! reports the stored template back.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateApprovalRuleTemplateDescription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +149,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateApprovalRuleTemplateDescription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateApprovalRuleTemplateDescriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateApprovalRuleTemplateDescription"))
+        // Both members are required and both lengths are modelled
+        // (`approvalRuleTemplateName` 1..100, `approvalRuleTemplateDescription`
+        // 0..1000), so the boundary validator already refused anything outside them
+        // — as `ApprovalRuleTemplateNameRequiredException`,
+        // `InvalidApprovalRuleTemplateNameException` and
+        // `InvalidApprovalRuleTemplateDescriptionException` respectively
+        // (`crate::service::refusal_for`). What is left is the rule the model cannot
+        // express, the template's existence, and the write itself.
+
+        // "Template names must be between 1 and 100 valid characters in length." A
+        // name of nothing but whitespace names no template, and neither does one
+        // carrying a control character — the same rule `CreateApprovalRuleTemplate`
+        // applies to the name it mints.
+        if input.approval_rule_template_name.trim().is_empty()
+            || input
+                .approval_rule_template_name
+                .chars()
+                .any(char::is_control)
+        {
+            return Err(
+                UpdateApprovalRuleTemplateDescriptionErrorModeled::InvalidApprovalRuleTemplateNameException(
+                    InvalidApprovalRuleTemplateNameException {
+                        message: Some(format!(
+                            "the approval rule template name {} is not valid",
+                            input.approval_rule_template_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let mut store = state.lock();
+
+        let template = store
+            .approval_rule_templates
+            .get_mut(&input.approval_rule_template_name)
+            .ok_or_else(|| {
+                UpdateApprovalRuleTemplateDescriptionErrorModeled::ApprovalRuleTemplateDoesNotExistException(
+                    ApprovalRuleTemplateDoesNotExistException {
+                        message: Some(format!(
+                            "the approval rule template {} does not exist",
+                            input.approval_rule_template_name
+                        )),
+                    },
+                )
+            })?;
+
+        // "Updates the description for a specified approval rule template": the
+        // stored description becomes exactly what the request carried, and nothing
+        // else about the template changes — its id, name, content, content hash and
+        // creation date all carry over. The change moves `lastModifiedDate` to this
+        // call and `lastModifiedUser` to this caller, and an empty description
+        // leaves the template with none at all, which the store normalizes in the
+        // one place every description write goes through
+        // (`crate::state::normalized_template_description`).
+        template.set_description(
+            Some(input.approval_rule_template_description.clone()),
+            crate::state::caller_identity_arn(ctx.parts()),
+            std::time::SystemTime::now(),
+        );
+
+        Ok(UpdateApprovalRuleTemplateDescriptionOutput {
+            approval_rule_template: template.to_modeled(),
+        })
     }
 }

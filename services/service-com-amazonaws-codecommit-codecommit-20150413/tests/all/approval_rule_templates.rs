@@ -31,7 +31,10 @@ use crate::repository_lifecycle::{emulator, error, ok, string_at};
 /// structure (`Version`, `Statements` of `Type` `Approvers` with
 /// `NumberOfApprovalsNeeded` and `ApprovalPoolMembers`) is the one the CodeCommit
 /// User Guide documents for approval rule template content.
-fn document(approvals: u32) -> String {
+///
+/// `pub(crate)` so the sibling suite that updates a template's description creates
+/// its templates from this same definition of valid content.
+pub(crate) fn document(approvals: u32) -> String {
     serde_json::to_string(&json!({
         "Version": "2018-11-08",
         "Statements": [{
