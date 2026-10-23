@@ -91,7 +91,9 @@ pub struct ComAmazonawsS3vectorsS3vectorsState {
     /// Vector buckets by `vectorBucketName`. A `BTreeMap` so ListVectorBuckets
     /// order and its `nextToken` cursor are deterministic.
     pub buckets: BTreeMap<String, VectorBucketRecord>,
-    /// Resource tags by ARN, as written by a create request's `tags`.
+    /// Resource tags by ARN, as written by a create request's `tags` and read and
+    /// pruned by the `/tags/{resourceArn}` operations. A resource carrying no tags
+    /// holds NO entry, so an absent entry and an empty map mean the same thing.
     pub tags: BTreeMap<String, BTreeMap<String, String>>,
 }
 
@@ -235,6 +237,18 @@ impl LookupError {
         }
     }
 }
+
+/// The `NotFoundException` message for a vector bucket this account does not hold,
+/// as the service words it: ONE fixed sentence per resource kind, carrying no value
+/// from the request. A client branching on the resource that is missing reads the
+/// kind from the sentence, so the two kinds say different things. This one is the
+/// sentence the real service answered in the recorded response; the status (404) and
+/// the error code (`NotFoundException`) are the requirements either way.
+pub const BUCKET_NOT_FOUND: &str = "The specified vector bucket could not be found";
+
+/// See [`BUCKET_NOT_FOUND`]: the same sentence for the other resource kind, by
+/// analogy with it — no recording of this corpus carries the index wording.
+pub const INDEX_NOT_FOUND: &str = "The specified vector index could not be found";
 
 /// Wording for the one failure that is not about the request: the shared engine
 /// did not hand this service's store back. Every operation models
@@ -497,23 +511,22 @@ impl ComAmazonawsS3vectorsS3vectorsState {
     pub fn bucket(&self, name: &str) -> Result<&VectorBucketRecord, LookupError> {
         self.buckets
             .get(name)
-            .ok_or_else(|| LookupError::not_found(format!("vector bucket not found: {name}")))
+            .ok_or_else(|| LookupError::not_found(BUCKET_NOT_FOUND))
     }
 
     /// The bucket `name` for mutation, or `NotFoundException`.
     pub fn bucket_mut(&mut self, name: &str) -> Result<&mut VectorBucketRecord, LookupError> {
         self.buckets
             .get_mut(name)
-            .ok_or_else(|| LookupError::not_found(format!("vector bucket not found: {name}")))
+            .ok_or_else(|| LookupError::not_found(BUCKET_NOT_FOUND))
     }
 
     /// The index `index` of bucket `bucket`, or `NotFoundException`.
     pub fn index(&self, bucket: &str, index: &str) -> Result<&VectorIndexRecord, LookupError> {
-        self.bucket(bucket)?.indexes.get(index).ok_or_else(|| {
-            LookupError::not_found(format!(
-                "vector index not found: {index} in vector bucket {bucket}"
-            ))
-        })
+        self.bucket(bucket)?
+            .indexes
+            .get(index)
+            .ok_or_else(|| LookupError::not_found(INDEX_NOT_FOUND))
     }
 
     /// The index `index` of bucket `bucket` for mutation, or `NotFoundException`.
@@ -522,11 +535,37 @@ impl ComAmazonawsS3vectorsS3vectorsState {
         bucket: &str,
         index: &str,
     ) -> Result<&mut VectorIndexRecord, LookupError> {
-        self.bucket_mut(bucket)?.indexes.get_mut(index).ok_or_else(|| {
-            LookupError::not_found(format!(
-                "vector index not found: {index} in vector bucket {bucket}"
-            ))
-        })
+        self.bucket_mut(bucket)?
+            .indexes
+            .get_mut(index)
+            .ok_or_else(|| LookupError::not_found(INDEX_NOT_FOUND))
+    }
+
+    /// The STORED ARN of the vector bucket or vector index a tagging request's
+    /// `resourceArn` names, which is the key the tag map is held under.
+    ///
+    /// The tagging operations document that "the tagged resource can be a vector
+    /// bucket or a vector index", and `ResourceARN` itself carries no pattern —
+    /// `smithy_query(query="shape",shape="ResourceARN")` is a 1011-character
+    /// `@arnReference` string — so the two halves of the rule are enforced here: a
+    /// value that is neither a vector bucket ARN nor a vector index ARN is refused
+    /// as invalid (400), and a well-formed ARN whose resource this store does not
+    /// hold is the modelled `NotFoundException` (404), "the request was rejected
+    /// because the specified resource can't be found".
+    ///
+    /// The ARN grammar itself is not re-implemented: the two parsers every other
+    /// operation resolves an ARN through — [`index_from_arn`] and
+    /// [`bucket_from_arn`] — are what accept or refuse it, chosen by whether the
+    /// resource segment names an index.
+    pub fn tagged_resource_arn(&self, member: &str, arn: &str) -> Result<String, LookupError> {
+        let names_index = arn_resource(arn).is_some_and(|resource| resource.contains("/index/"));
+        if names_index {
+            let (bucket, index) = index_from_arn(member, arn)?;
+            Ok(self.index(&bucket, &index)?.arn.clone())
+        } else {
+            let bucket = bucket_from_arn(member, arn)?;
+            Ok(self.bucket(&bucket)?.arn.clone())
+        }
     }
 }
 
@@ -769,14 +808,23 @@ pub fn index_quota_exceeded(bucket: &VectorBucketRecord) -> Option<String> {
     })
 }
 
-/// The quota message for a `tags` map, or `None` when it is within the ceiling.
-pub fn tag_quota_exceeded(tags: &std::collections::HashMap<String, String>) -> Option<String> {
-    (tags.len() > MAX_TAGS_PER_RESOURCE).then(|| {
+/// The quota message for a resource that would end up carrying `count` tags, or
+/// `None` when that is within the ceiling. TagResource documents the same bound —
+/// "you can add up to 50 tags for each resource" — so a write that would cross it is
+/// refused however many tags the resource already carried.
+pub fn tag_count_exceeded(count: usize) -> Option<String> {
+    (count > MAX_TAGS_PER_RESOURCE).then(|| {
         format!(
-            "a resource carries at most {MAX_TAGS_PER_RESOURCE} tags, and the request names {}",
-            tags.len()
+            "a resource carries at most {MAX_TAGS_PER_RESOURCE} tags, and the request \
+             would leave it with {count}"
         )
     })
+}
+
+/// The quota message for a `tags` map on a resource that carries none yet, or `None`
+/// when it is within the ceiling.
+pub fn tag_quota_exceeded(tags: &std::collections::HashMap<String, String>) -> Option<String> {
+    tag_count_exceeded(tags.len())
 }
 
 /// The quota message for applying `batch` to `index`, or `None` when the index

@@ -901,7 +901,9 @@ async fn search_nearby_applies_the_category_filter_inside_the_radius() {
 
     for radius in [2_000_i64, 5_000, 21_000_000] {
         // Everything inside the radius, from a different operation over the same
-        // catalog: the reference set this filter is checked against.
+        // catalog: the reference set this filter is checked against. With an
+        // explicit radius ReverseGeocode answers over that radius too, so the two
+        // operations must agree on the set.
         let inside = emulator
             .post_ok(
                 "reference",

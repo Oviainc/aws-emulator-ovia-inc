@@ -89,6 +89,47 @@ pub fn virtual_interface_name_is_valid(name: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
+/// The dedicated port speeds a Direct Connect location can offer, ascending, in the
+/// `PortSpeed` form `Location$availablePortSpeeds` reports them in.
+///
+/// Source: `CreateLagRequest$connectionsBandwidth` — "The bandwidth of the individual
+/// physical dedicated connections bundled by the LAG. The possible values are 1Gbps,
+/// 10Gbps, 100Gbps, and 400Gbps." A `PortSpeed` names the same speeds in the short
+/// form (`1Gbps` -> `1G`).
+pub const DEDICATED_PORT_SPEEDS: [&str; 4] = ["1G", "10G", "100G", "400G"];
+
+/// The port speeds MAC Security (MACsec) is offered on, at a location that offers
+/// MACsec at all.
+///
+/// Source: `CreateConnectionRequest$requestMACSec` ("MAC Security (MACsec) is
+/// unavailable on hosted connections … see MAC Security in Direct Connect"), which
+/// offers MACsec on the dedicated 10 Gbps and 100 Gbps ports. `availableMacSecPortSpeeds`
+/// is therefore never an independent list: it is the location's own
+/// `availablePortSpeeds` narrowed to these, which is why it is computed by
+/// [`mac_sec_port_speeds`] rather than stored per location.
+pub const MAC_SEC_PORT_SPEEDS: [&str; 2] = ["10G", "100G"];
+
+/// The usage-based billing mode every Direct Connect location offers, one of the
+/// values `BillingMode` accepts on the wire
+/// ([`crate::ops::types::BILLING_MODE_VALUES`]).
+pub const USAGE_BILLING_MODE: &str = "PayAsYouGo";
+
+/// The MACsec port speeds a location offering `available` port speeds publishes.
+///
+/// The location's own speeds narrowed to [`MAC_SEC_PORT_SPEEDS`], in the location's
+/// order, so the two lists can never disagree; empty at a location that offers no
+/// MACsec at all.
+pub fn mac_sec_port_speeds(available: &[String], offers_mac_sec: bool) -> Vec<String> {
+    if !offers_mac_sec {
+        return Vec::new();
+    }
+    available
+        .iter()
+        .filter(|speed| MAC_SEC_PORT_SPEEDS.contains(&speed.as_str()))
+        .cloned()
+        .collect()
+}
+
 /// The number of records this emulator keeps in each caller-driven store.
 ///
 /// An EMULATOR memory ceiling, not an AWS quota: every successful create inserts
@@ -220,8 +261,39 @@ pub struct VirtualInterface {
     pub due: Option<DueTransition>,
 }
 
+/// A Direct Connect location in this service's catalog — the `Location` shape's
+/// data, owned by this service rather than rebuilt per response.
+///
+/// Facility data, not caller data: no operation creates or deletes a location, so
+/// the catalog is seeded once (see [`built_in_location_catalog`]) and only read.
+/// `availableMacSecPortSpeeds` and `availableBillingModes` are NOT stored: they are
+/// derived from the fields below ([`mac_sec_port_speeds`],
+/// [`ComAmazonawsDirectconnectOvertureserviceState::location_output`]), so a
+/// location's port speeds and the speeds its MACsec and billing modes name cannot
+/// drift apart.
+#[derive(Debug, Clone)]
+pub struct LocationRecord {
+    /// `Location$locationCode`: "the code for the location".
+    pub location_code: String,
+    /// `Location$locationName`: "the name of the location. This includes the name of
+    /// the colocation partner and the physical site of the building."
+    pub location_name: String,
+    /// `Location$region`: "the Amazon Web Services Region for the location."
+    pub region: String,
+    /// `Location$availablePortSpeeds`, ascending.
+    pub available_port_speeds: Vec<String>,
+    /// `Location$availableProviders`: the service providers present at the location.
+    pub available_providers: Vec<String>,
+    /// Whether the location offers MAC Security at all; which of its port speeds
+    /// carry it is [`mac_sec_port_speeds`].
+    pub offers_mac_sec: bool,
+    /// The flat-rate `BillingMode` the location offers beside the usage-based
+    /// [`USAGE_BILLING_MODE`], when it offers one.
+    pub flat_rate_billing_mode: Option<String>,
+}
+
 /// Per-service state for com-amazonaws-directconnect-overtureservice. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsDirectconnectOvertureserviceState {
     /// Stored connections, keyed by `connectionId`.
     ///
@@ -243,6 +315,29 @@ pub struct ComAmazonawsDirectconnectOvertureserviceState {
     /// Monotonic source of the `dxcon-`/`dxvif-` suffixes, so every minted id is
     /// unique and reproducible within a run.
     pub id_counter: u64,
+    /// The Direct Connect location catalog, keyed by `locationCode`.
+    ///
+    /// Seeded from [`built_in_location_catalog`] when this store is created, so
+    /// `DescribeLocations` is a pure read: no call creates, changes or removes a
+    /// location. A `BTreeMap`, so the catalog is answered in a stable order
+    /// (by location code) rather than a per-process-random one.
+    pub locations: BTreeMap<String, LocationRecord>,
+}
+
+impl Default for ComAmazonawsDirectconnectOvertureserviceState {
+    /// A fresh store: no caller-created records, and the location catalog already
+    /// seeded. Seeded HERE rather than on first read so a reporting operation never
+    /// has to write: every caller sees the same catalog from the first request on.
+    fn default() -> Self {
+        Self {
+            connections: BTreeMap::new(),
+            virtual_interfaces: BTreeMap::new(),
+            gateways: BTreeMap::new(),
+            gateway_order: Vec::new(),
+            id_counter: 0,
+            locations: built_in_location_catalog(),
+        }
+    }
 }
 
 impl ComAmazonawsDirectconnectOvertureserviceState {
@@ -387,6 +482,219 @@ impl ComAmazonawsDirectconnectOvertureserviceState {
             .filter(|interface| interface.connection_id == connection_id)
             .collect()
     }
+
+    /// The catalog locations in `region`, in location-code order.
+    ///
+    /// `DescribeLocations` "lists the Direct Connect locations in the current Amazon
+    /// Web Services Region", and `Location$region` is "the Amazon Web Services Region
+    /// for the location", so the Region the request is signed for is what selects
+    /// them. A Region the catalog holds no location in selects none, which is an
+    /// empty list, not an error.
+    pub fn locations_in_region(&self, region: &str) -> Vec<&LocationRecord> {
+        self.locations
+            .values()
+            .filter(|location| location.region == region)
+            .collect()
+    }
+
+    /// Render a stored [`LocationRecord`] into the generated `Location` output shape:
+    /// the ONE rendering of a catalog location, so every operation answers the same
+    /// field set.
+    ///
+    /// A method rather than a free function because `includedRegions` — "the Amazon
+    /// Web Services Regions included with the billing mode" — is a property of the
+    /// whole catalog, not of one location, so it is counted from the catalog rather
+    /// than kept as a second copy on each location.
+    pub fn location_output(&self, location: &LocationRecord) -> crate::ops::types::Location {
+        let mut billing_modes = vec![crate::ops::types::AvailableBillingMode {
+            // Every location offers the usage-based mode, on every port speed it
+            // offers; it includes no Region beyond the location's own, so it
+            // publishes no `includedRegions`.
+            billing_mode: Some(USAGE_BILLING_MODE.to_string()),
+            available_port_speeds: Some(location.available_port_speeds.clone()),
+            included_regions: None,
+        }];
+        if let Some(flat_rate) = &location.flat_rate_billing_mode {
+            billing_modes.push(crate::ops::types::AvailableBillingMode {
+                billing_mode: Some(flat_rate.clone()),
+                available_port_speeds: Some(location.available_port_speeds.clone()),
+                included_regions: Some(self.regions_offering_billing_mode(flat_rate)),
+            });
+        }
+
+        crate::ops::types::Location {
+            location_code: Some(location.location_code.clone()),
+            location_name: Some(location.location_name.clone()),
+            region: Some(location.region.clone()),
+            available_port_speeds: Some(location.available_port_speeds.clone()),
+            available_providers: Some(location.available_providers.clone()),
+            available_mac_sec_port_speeds: Some(mac_sec_port_speeds(
+                &location.available_port_speeds,
+                location.offers_mac_sec,
+            )),
+            available_billing_modes: Some(billing_modes),
+        }
+    }
+
+    /// The Regions a flat-rate billing mode covers: every Region the catalog offers
+    /// that mode in, ascending and without repeats.
+    fn regions_offering_billing_mode(&self, billing_mode: &str) -> Vec<String> {
+        let regions: std::collections::BTreeSet<&str> = self
+            .locations
+            .values()
+            .filter(|location| location.flat_rate_billing_mode.as_deref() == Some(billing_mode))
+            .map(|location| location.region.as_str())
+            .collect();
+        regions.into_iter().map(ToString::to_string).collect()
+    }
+}
+
+/// One row of the built-in location catalog: `locationCode`, `locationName`, the
+/// Region, the dedicated port speeds offered there, the service providers present,
+/// whether MAC Security is offered, and the flat-rate `BillingMode` offered beside
+/// [`USAGE_BILLING_MODE`].
+type CatalogRow = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static [&'static str],
+    &'static [&'static str],
+    bool,
+    Option<&'static str>,
+);
+
+/// The Direct Connect locations this emulator publishes.
+///
+/// CATALOG DATA, the emulator's own: AWS's location list is per-Region, per-account
+/// facility data that no model or request carries, and the recorded
+/// `DescribeLocations` response is one account's snapshot of it. The rows below are
+/// therefore EXAMPLES — colocation facilities AWS publishes Direct Connect locations
+/// in, with the port speeds `DEDICATED_PORT_SPEEDS` names and provider names drawn
+/// from the Direct Connect partner list. What is NOT example data is the shape and
+/// the derived members: every row renders a full `Location`
+/// ([`ComAmazonawsDirectconnectOvertureserviceState::location_output`]), its MACsec
+/// speeds are its own port speeds narrowed to [`MAC_SEC_PORT_SPEEDS`], and its
+/// flat-rate `includedRegions` are read back off the catalog.
+///
+/// The rows deliberately span the class: locations with and without 100G/400G, with
+/// and without MACsec, with and without a flat-rate mode, and several Regions, so a
+/// client that enumerates MACsec-capable or billing-mode-specific locations sees more
+/// than one answer.
+const BUILT_IN_LOCATIONS: &[CatalogRow] = &[
+    (
+        "EqDC2",
+        "Equinix DC2, Ashburn, VA",
+        "us-east-1",
+        &["1G", "10G", "100G"],
+        &["Equinix", "Megaport", "AT&T", "Verizon"],
+        true,
+        Some("FlatRateTier1"),
+    ),
+    (
+        "CSDC1",
+        "Coresite DC1, Reston, VA",
+        "us-east-1",
+        &["1G", "10G"],
+        &["Coresite", "Megaport"],
+        false,
+        Some("FlatRateTier1"),
+    ),
+    (
+        "EqCh2",
+        "Equinix CH2, Chicago, IL",
+        "us-east-2",
+        &["1G", "10G", "100G"],
+        &["Equinix", "Megaport", "Lumen"],
+        true,
+        Some("FlatRateTier1"),
+    ),
+    (
+        "EqSe2",
+        "Equinix SE2, Seattle, WA",
+        "us-west-2",
+        &["1G", "10G", "100G", "400G"],
+        &["Equinix", "Megaport", "Zayo"],
+        true,
+        Some("FlatRateTier1"),
+    ),
+    (
+        "EqSV5",
+        "Equinix SV5, San Jose, CA",
+        "us-west-1",
+        &["1G", "10G", "100G"],
+        &["Equinix", "Digital Realty"],
+        true,
+        None,
+    ),
+    (
+        "EqLD5",
+        "Equinix LD5, Slough, UK",
+        "eu-west-2",
+        &["1G", "10G", "100G"],
+        &["Equinix", "Megaport", "Colt"],
+        true,
+        Some("FlatRateTier2"),
+    ),
+    (
+        "EqFR5",
+        "Equinix FR5, Frankfurt, DE",
+        "eu-central-1",
+        &["1G", "10G", "100G"],
+        &["Equinix", "Interxion", "Colt"],
+        true,
+        Some("FlatRateTier2"),
+    ),
+    (
+        "EqSG2",
+        "Equinix SG2, Singapore",
+        "ap-southeast-1",
+        &["1G", "10G"],
+        &["Equinix", "Megaport"],
+        false,
+        Some("FlatRateTier3"),
+    ),
+    (
+        "EqTY2",
+        "Equinix TY2, Tokyo, JP",
+        "ap-northeast-1",
+        &["1G", "10G", "100G"],
+        &["Equinix", "Megaport", "NTT"],
+        true,
+        Some("FlatRateTier3"),
+    ),
+];
+
+/// The catalog [`BUILT_IN_LOCATIONS`] describes, keyed by `locationCode`.
+pub fn built_in_location_catalog() -> BTreeMap<String, LocationRecord> {
+    BUILT_IN_LOCATIONS
+        .iter()
+        .map(
+            |(code, name, region, speeds, providers, offers_mac_sec, flat_rate)| {
+                (
+                    (*code).to_string(),
+                    LocationRecord {
+                        location_code: (*code).to_string(),
+                        location_name: (*name).to_string(),
+                        region: (*region).to_string(),
+                        // Ascending by speed, which is the order
+                        // `DEDICATED_PORT_SPEEDS` lists them in, whatever order a
+                        // row happens to name them in.
+                        available_port_speeds: DEDICATED_PORT_SPEEDS
+                            .iter()
+                            .filter(|speed| speeds.contains(*speed))
+                            .map(|speed| (*speed).to_string())
+                            .collect(),
+                        available_providers: providers
+                            .iter()
+                            .map(|provider| (*provider).to_string())
+                            .collect(),
+                        offers_mac_sec: *offers_mac_sec,
+                        flat_rate_billing_mode: flat_rate.map(ToString::to_string),
+                    },
+                )
+            },
+        )
+        .collect()
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

@@ -5,6 +5,11 @@
 //! Reports the stored gateway the request names, or `NotFoundException` when no gateway
 //! has that ARN: the record comes from [`crate::state`].
 //!
+//! A gateway the store holds is reported whatever state it is in, including the terminal
+//! `DELETED` one a soft delete leaves behind (see `crate::ops::delete_gateway`): a client
+//! polls this operation to watch a gateway's deletion finish, so a retired gateway answers
+//! 200 with its state rather than a not-found.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

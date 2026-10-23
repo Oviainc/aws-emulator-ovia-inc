@@ -266,9 +266,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // sent; either way the channel starts unactivated.
             activation_status: NOT_ACTIVATED.to_string(),
             sequence,
+            activation_code: None,
             created_at: ::std::time::SystemTime::now(),
         };
         state.contact_channels.insert(arn.clone(), record);
+        // `DeferActivation`: "If you want to activate the channel at a later time, you can
+        // choose to defer activation." Absent or false means activation is not deferred, so
+        // the activation code is delivered to the channel now and
+        // `ActivateContactChannel` has a code to check the caller's against without a
+        // separate `SendActivationCode`. The code goes to the channel's own address, never
+        // into this response.
+        if !input.defer_activation.unwrap_or(false) {
+            state.deliver_activation_code(&arn);
+        }
         state.remember_idempotency_token(Self::NAME, input.idempotency_token.as_deref(), &arn);
 
         Ok(CreateContactChannelOutput {

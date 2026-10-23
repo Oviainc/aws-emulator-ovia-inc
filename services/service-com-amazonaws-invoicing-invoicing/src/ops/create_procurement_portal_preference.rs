@@ -3,9 +3,9 @@
 //! @op CreateProcurementPortalPreference
 //!
 //! Creates one procurement portal preference and persists it, so
-//! `ListProcurementPortalPreferences` (and the rest of the preference plane) reports
-//! exactly what this call stored. `@idempotent`: a replay of the same request answers
-//! with the ARN the first call minted.
+//! `GetProcurementPortalPreference` and `ListProcurementPortalPreferences` (and the rest
+//! of the preference plane) report exactly what this call stored. `@idempotent`: a replay
+//! of the same request answers with the ARN the first call minted.
 //!
 //! ## Shape of an operation
 //!

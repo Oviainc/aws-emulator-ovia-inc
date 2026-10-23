@@ -29,6 +29,16 @@ pub const ARN_SERVICE: &str = "appfabric";
 /// scope to read one from — the region every generated emulator defaults to.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
+/// The two values the model's `IngestionState` enum carries
+/// (`INGESTION_STATE_VALUES` in the generated types): an ingestion is created
+/// `disabled`, `StartIngestion` enables it and `StopIngestion` disables it again.
+/// Named here so the handlers that write the state and the ones that read it
+/// cannot drift apart over a bare literal.
+pub const INGESTION_STATE_ENABLED: &str = "enabled";
+
+/// The other one — see [`INGESTION_STATE_ENABLED`].
+pub const INGESTION_STATE_DISABLED: &str = "disabled";
+
 /// The largest page any `List*` operation returns, which is also the upper bound
 /// the model puts on `maxResults` (`@range(min: 1, max: 100)`), and the page size
 /// used when a caller names none.
@@ -778,6 +788,21 @@ pub const APP_BUNDLE_LISTING: &str = "appbundles";
 /// position in the other.
 pub fn ingestion_listing(bundle_id: &str) -> String {
     format!("ingestions-{bundle_id}")
+}
+
+/// A modelled `ValidationException` refusing the call because the STORED
+/// resource is not in the state the operation documents as its precondition.
+///
+/// `reason` is `other` rather than `fieldValidationFailed`, and there is no
+/// `fieldList`: every member of the request is valid (the boundary validator
+/// accepted them all) — it is the resource the request names that forbids the
+/// call — so naming a member would not be truthful.
+pub fn precondition_not_met(message: String) -> ValidationException {
+    ValidationException {
+        message,
+        reason: "other".to_string(),
+        field_list: None,
+    }
 }
 
 /// A modelled `ValidationException` refusing one member by name.

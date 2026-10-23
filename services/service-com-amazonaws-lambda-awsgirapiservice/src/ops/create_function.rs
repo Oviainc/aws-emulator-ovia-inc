@@ -436,6 +436,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => (0, None),
         };
 
+        // "A list of function layers to add to the function's execution environment.
+        // Specify each layer by its ARN, including the version." Each entry names a
+        // layer version `PublishLayerVersion` persisted, so the configuration holds
+        // what that record resolves to rather than what the request said.
+        let layers = crate::state::resolve_function_layers(
+            &store,
+            input.layers.as_deref().unwrap_or_default(),
+        )
+        .map_err(invalid_parameter)?;
+
         let config = crate::state::FunctionConfig {
             name: reference.name.clone(),
             role: input.role.clone(),
@@ -451,6 +461,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 vec![crate::state::DEFAULT_ARCHITECTURE.to_string()]
             }),
             environment: environment_variables(&input)?,
+            layers,
             ephemeral_storage_mb: input
                 .ephemeral_storage
                 .as_ref()

@@ -15,5 +15,7 @@
 mod connection_and_virtual_interface_lifecycle;
 #[path = "all/direct_connect_gateway_lifecycle.rs"]
 mod direct_connect_gateway_lifecycle;
+#[path = "all/location_catalog.rs"]
+mod location_catalog;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

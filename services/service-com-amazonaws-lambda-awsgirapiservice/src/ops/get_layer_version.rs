@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetLayerVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetLayerVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetLayerVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one version of a layer out of [`crate::state`] — the record
+//! [`crate::ops::publish_layer_version`] persisted — and answers the modelled 404 for a
+//! layer or a version the store does not hold. A pure read: nothing here writes.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +159,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetLayerVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetLayerVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetLayerVersion"))
+        // "Returns information about a version of an Lambda layer": a pure report, so
+        // the answer depends on the stored record alone and on no request metadata —
+        // the ARNs it carries are the ones the layer was published with.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetLayerVersionErrorModeled::ServiceException(ServiceException {
+                r#type: None,
+                message: Some("Lambda state is not reachable on this engine".to_string()),
+            })
+            .into());
+        };
+
+        // "The name or Amazon Resource Name (ARN) of the layer": both forms name the
+        // same record.
+        let name = crate::state::parse_layer_name(&input.layer_name).ok_or_else(|| {
+            invalid_parameter(format!(
+                "1 validation error detected: Value '{}' at 'layerName' failed to satisfy \
+                 constraint: Member must satisfy one of the documented layer name formats \
+                 (name or layer ARN)",
+                input.layer_name
+            ))
+        })?;
+
+        let store = state.lock();
+        let detail = store
+            .layers
+            .get(&name)
+            .and_then(|record| {
+                let version = record.versions.get(&input.version_number)?;
+                Some(record.version_detail(version))
+            })
+            .ok_or_else(|| {
+                GetLayerVersionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    r#type: None,
+                    message: Some(format!(
+                        "Layer version {name}:{} does not exist",
+                        input.version_number
+                    )),
+                })
+            })?;
+        Ok(detail)
     }
+}
+
+/// The modelled 400 this operation answers a request it cannot satisfy with.
+fn invalid_parameter(message: String) -> GetLayerVersionError {
+    GetLayerVersionErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+        r#type: None,
+        message: Some(message),
+    })
+    .into()
 }

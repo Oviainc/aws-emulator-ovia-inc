@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutServiceLinkedConfigurationRecorder
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutServiceLinkedConfigurationRecorder`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates the service-linked configuration recorder of ONE Amazon Web Services
+//! service, persisting it in [`crate::state`] alongside the account's other
+//! configuration recorders, so `DescribeConfigurationRecorders`,
+//! `ListConfigurationRecorders` and `DescribeConfigurationRecorderStatus` read back
+//! exactly what was stored — including the name and the ARN this operation mints and
+//! the service-linked role it records with.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutServiceLinkedConfigurationRecorder::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! One recorder per linked service, and at most
+//! [`crate::state::SERVICE_LINKED_RECORDERS_QUOTA`] of them per account and Region:
+//! past either bound the create is refused with the modelled `ConflictException` or
+//! `LimitExceededException` rather than stored.
 //!
 //! ## Shape of an operation
 //!
@@ -190,18 +192,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutServiceLinkedConfigurationRecorder` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutServiceLinkedConfigurationRecorderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutServiceLinkedConfigurationRecorder"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        let service_principal = input.service_principal;
+
+        // Config assigns the recorder's name itself, from the service the recorder is
+        // linked to; a value that names no service principal names no service to link
+        // to either.
+        let Some(name) = crate::state::service_linked_recorder_name(&service_principal) else {
+            return Err(
+                PutServiceLinkedConfigurationRecorderErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::invalid_service_principal_message(
+                            &service_principal,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // One service-linked recorder per linked service: a second create for the same
+        // service is a conflict rather than an update, and a recorder already carrying
+        // the name Config assigns that service can only be that service's own.
+        if store.recorders.contains_key(&name)
+            || store
+                .recorders
+                .values()
+                .any(|recorder| recorder.service_principal.as_deref() == Some(&*service_principal))
+        {
+            return Err(
+                PutServiceLinkedConfigurationRecorderErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(crate::state::service_linked_recorder_conflict_message(
+                            &service_principal,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The account can hold only so many service-linked configuration recorders, and
+        // a recorder's name comes from the service principal the request carries, so
+        // this bound is what keeps a caller inventing service principals from growing
+        // the store without end.
+        let service_linked = store
+            .recorders
+            .values()
+            .filter(|recorder| recorder.service_principal.is_some())
+            .count();
+        if service_linked >= crate::state::SERVICE_LINKED_RECORDERS_QUOTA {
+            return Err(
+                PutServiceLinkedConfigurationRecorderErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(crate::state::service_linked_recorders_quota_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let sequence = store.next_recorder_seq;
+        // A u64 counter cannot be exhausted by API calls, so it never reissues an id;
+        // saturating rather than wrapping keeps that true by construction.
+        store.next_recorder_seq = sequence.saturating_add(1);
+        let id = crate::state::mint_recorder_id(sequence);
+        let arn = crate::state::recorder_arn(&region, &name, &id);
+
+        store.recorders.insert(
+            name.clone(),
+            crate::state::RecorderEntry {
+                name: name.clone(),
+                id,
+                arn: arn.clone(),
+                // Config records with the service-linked role this API creates in the
+                // account, not with a role the caller names: this operation takes no
+                // `roleARN`.
+                role_arn: crate::state::config_service_linked_role_arn(),
+                // "The configuration recorder's name, recordingGroup, recordingMode,
+                // and recordingScope is set by the service that is linked to the
+                // configuration recorder": the linked service records every supported
+                // resource type, continuously, and the configuration items it records
+                // stay internal to that service rather than reaching this account's
+                // delivery channel ("If the recording scope is internal, you will not
+                // receive CIs in the delivery channel").
+                recording_group: Some(crate::state::materialised_recording_group(None)),
+                recording_mode: Some(crate::state::materialised_recording_mode(None)),
+                recording_scope: Some(crate::state::RECORDING_SCOPE_INTERNAL.to_string()),
+                service_principal: Some(service_principal.clone()),
+                // A provider names the third-party cloud a recorder records from, which
+                // only `PutThirdPartyServiceLinkedConfigurationRecorder` sets.
+                provider: None,
+                // "Tags are added at creation and cannot be updated with this
+                // operation. Use TagResource and UntagResource to update tags after
+                // creation."
+                tags: crate::state::tag_set(input.tags.as_deref().unwrap_or_default()),
+            },
+        );
+        // Unlike the customer managed recorder, which records only once the caller
+        // starts it, a service-linked recorder is turned on by the service that asked
+        // for it: the caller cannot start or stop one.
+        store.recorder_status.insert(
+            name.clone(),
+            crate::state::RecorderStatusEntry::started(&name, &arn, now),
+        );
+
+        Ok(PutServiceLinkedConfigurationRecorderOutput {
+            arn: Some(arn),
+            name: Some(name),
+        })
     }
 }

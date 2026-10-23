@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PublishLayerVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PublishLayerVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PublishLayerVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a new version of a layer from the archive the request carries, persists it
+//! in [`crate::state`] and answers with the record it stored. The version number, the
+//! ARNs and the archive's size and digest all come out of that record — nothing here is
+//! reported that was not computed from what the store holds.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +174,220 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PublishLayerVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PublishLayerVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PublishLayerVersion"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PublishLayerVersionErrorModeled::ServiceException(ServiceException {
+                r#type: None,
+                message: Some("Lambda state is not reachable on this engine".to_string()),
+            })
+            .into());
+        };
+
+        // "The name or Amazon Resource Name (ARN) of the layer": both forms name the
+        // same record, so each one is published under the bare name the value carries.
+        let name = crate::state::parse_layer_name(&input.layer_name).ok_or_else(|| {
+            invalid_parameter(format!(
+                "1 validation error detected: Value '{}' at 'layerName' failed to satisfy \
+                 constraint: Member must satisfy one of the documented layer name formats \
+                 (name or layer ARN)",
+                input.layer_name
+            ))
+        })?;
+
+        let archive = layer_archive(&input.content)?;
+        let (code_size, code_sha256) = match &archive.zip_bytes {
+            // The only bytes this emulator holds are the ones the caller uploaded
+            // inline, so they are the only ones a size and a digest can come from.
+            Some(bytes) => (
+                i64::try_from(bytes.len()).unwrap_or(i64::MAX),
+                Some(crate::state::code_sha256(bytes)),
+            ),
+            // An S3 object is a reference this emulator does not resolve: it reports no
+            // size it did not measure and no digest it did not compute.
+            None => (0, None),
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // "The amount of storage space, in bytes, that's being used by deployment
+        // packages and layer archives" is what the account's `TotalCodeSize` quota
+        // bounds, and `CodeStorageExceededException` ("Your Amazon Web Services account
+        // has exceeded its maximum total code size") is the modelled refusal once this
+        // archive would take the account past it.
+        let used_code_size = store.account_usage().total_code_size;
+        let code_size_limit = store.account_limit().total_code_size;
+        if used_code_size.saturating_add(code_size) > code_size_limit {
+            return Err(code_storage_exceeded(format!(
+                "Code storage limit exceeded: publishing this layer version would take the \
+                 account past its total code size limit of {code_size_limit} bytes."
+            )));
+        }
+        if !store.layers.contains_key(&name) && store.layers.len() >= crate::state::MAX_LAYERS {
+            return Err(code_storage_exceeded(format!(
+                "Code storage limit exceeded: this account already holds the maximum of {} \
+                 layers.",
+                crate::state::MAX_LAYERS
+            )));
+        }
+
+        let record = store
+            .layers
+            .entry(name.clone())
+            .or_insert_with(|| crate::state::LayerRecord {
+                arn: crate::state::layer_arn(&region, &name),
+                region,
+                name: name.clone(),
+                latest_version: 0,
+                versions: ::std::collections::BTreeMap::new(),
+            });
+        if record.versions.len() >= crate::state::MAX_LAYER_VERSIONS {
+            return Err(code_storage_exceeded(format!(
+                "Code storage limit exceeded: this layer already holds the maximum of {} \
+                 versions.",
+                crate::state::MAX_LAYER_VERSIONS
+            )));
+        }
+
+        // "Each time you call PublishLayerVersion with the same layer name, a new
+        // version is created." Versions are numbered from 1 upwards and a number is
+        // never reused, so the next one follows the highest ever published rather than
+        // the count held.
+        let Some(version_number) = record.latest_version.checked_add(1) else {
+            return Err(PublishLayerVersionErrorModeled::ServiceException(ServiceException {
+                r#type: None,
+                message: Some(
+                    "No further version number can be assigned to this layer".to_string(),
+                ),
+            })
+            .into());
+        };
+        record.versions.insert(
+            version_number,
+            crate::state::LayerVersionRecord {
+                version: version_number,
+                description: input.description.clone(),
+                license_info: input.license_info.clone(),
+                compatible_runtimes: input.compatible_runtimes.clone().unwrap_or_default(),
+                compatible_architectures: input
+                    .compatible_architectures
+                    .clone()
+                    .unwrap_or_default(),
+                archive,
+                code_size,
+                code_sha256,
+                created: crate::state::iso8601(now),
+            },
+        );
+        record.latest_version = version_number;
+
+        // Answered by reading the version back out of the store, so GetLayerVersion
+        // reports exactly what this call persisted.
+        let Some(published) = store
+            .layers
+            .get(&name)
+            .and_then(|record| Some((record, record.versions.get(&version_number)?)))
+            .map(|(record, published)| record.version_detail(published))
+        else {
+            return Err(PublishLayerVersionErrorModeled::ServiceException(ServiceException {
+                r#type: None,
+                message: Some("The published layer version could not be read back".to_string()),
+            })
+            .into());
+        };
+        Ok(layer_version(published))
+    }
+}
+
+/// The modelled 400 this operation answers a request it cannot satisfy with.
+fn invalid_parameter(message: String) -> PublishLayerVersionError {
+    PublishLayerVersionErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The modelled 400 this operation answers once no further archive can be stored.
+fn code_storage_exceeded(message: String) -> PublishLayerVersionError {
+    PublishLayerVersionErrorModeled::CodeStorageExceededException(CodeStorageExceededException {
+        r#type: None,
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The archive this version is published from, refused when the `Content` member names
+/// no archive this emulator can store.
+///
+/// The model's own `LayerVersionContentInput` documentation states the rule: "A ZIP
+/// archive that contains the contents of an Lambda layer. You can specify either an
+/// Amazon S3 location, or upload a layer archive directly." So exactly one of the two
+/// has to be named, and an S3 location is the bucket AND the key of one object.
+fn layer_archive(
+    content: &LayerVersionContentInput,
+) -> Result<crate::state::LayerArchiveRecord, PublishLayerVersionError> {
+    let names_s3 = content.s3_bucket.is_some()
+        || content.s3_key.is_some()
+        || content.s3_object_version.is_some();
+    match (&content.zip_file, names_s3) {
+        (Some(_), true) => Err(invalid_parameter(
+            "Content must name either an Amazon S3 location or an inline ZipFile, not both"
+                .to_string(),
+        )),
+        (None, false) => Err(invalid_parameter(
+            "Content must name an Amazon S3 location (S3Bucket and S3Key) or an inline ZipFile"
+                .to_string(),
+        )),
+        (Some(zip_file), false) => Ok(crate::state::LayerArchiveRecord {
+            zip_bytes: Some(zip_file.clone()),
+            // The archive this emulator holds is its own copy of the bytes the caller
+            // uploaded, which is what the default storage mode describes.
+            s3_object_storage_mode: crate::state::S3_OBJECT_STORAGE_MODE_COPY.to_string(),
+            ..crate::state::LayerArchiveRecord::default()
+        }),
+        (None, true) => {
+            let (Some(bucket), Some(key)) = (&content.s3_bucket, &content.s3_key) else {
+                return Err(invalid_parameter(
+                    "Content must name both S3Bucket and S3Key to publish from an Amazon S3 \
+                     location"
+                        .to_string(),
+                ));
+            };
+            Ok(crate::state::LayerArchiveRecord {
+                zip_bytes: None,
+                s3_bucket: Some(bucket.clone()),
+                s3_key: Some(key.clone()),
+                s3_object_version: content.s3_object_version.clone(),
+                // "`COPY` (default) – Uploads a copy of your layer archive to Lambda."
+                s3_object_storage_mode: content
+                    .s3_object_storage_mode
+                    .clone()
+                    .unwrap_or_else(|| crate::state::S3_OBJECT_STORAGE_MODE_COPY.to_string()),
+            })
+        }
+    }
+}
+
+/// The one layer-version report the model declares, in this operation's own generated
+/// shape of it.
+///
+/// [`crate::state::LayerRecord::version_detail`] builds the shared
+/// `GetLayerVersionResponse` every operation reporting a layer version answers with;
+/// this operation's output is generated as its own struct over the same members, so they
+/// are carried across one for one rather than rebuilt from state a second time.
+fn layer_version(detail: GetLayerVersionOutput) -> PublishLayerVersionOutput {
+    PublishLayerVersionOutput {
+        content: detail.content,
+        layer_arn: detail.layer_arn,
+        layer_version_arn: detail.layer_version_arn,
+        description: detail.description,
+        created_date: detail.created_date,
+        version: detail.version,
+        compatible_architectures: detail.compatible_architectures,
+        compatible_runtimes: detail.compatible_runtimes,
+        license_info: detail.license_info,
     }
 }

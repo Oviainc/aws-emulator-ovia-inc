@@ -241,7 +241,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The gateway store is bounded: nothing evicts a gateway and DescribeGateway must
         // still answer what this operation created, so the create refuses once the store
         // is full rather than growing it without limit. See `crate::state::MAX_GATEWAYS`.
-        if store.gateways.len() >= crate::state::MAX_GATEWAYS {
+        if store.live_gateway_count() >= crate::state::MAX_GATEWAYS {
             return Err(CreateGatewayErrorModeled::CreateGateway420Exception(
                 CreateGateway420Exception {
                     message: format!(
@@ -279,6 +279,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     status: crate::state::GATEWAY_STATE_ACTIVE.to_string(),
                     due_at: now + crate::state::TRANSITION_SPAN,
                 }),
+                // The gateway this call creates is live: only DeleteGateway retires a
+                // record (`StoredGateway::deleted_at`).
+                deleted_at: None,
             },
         );
 

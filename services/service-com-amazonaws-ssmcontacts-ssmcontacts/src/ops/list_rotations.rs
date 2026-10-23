@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRotations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRotations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRotations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the on-call rotations in
+//! [`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::rotations`], one page at a
+//! time, filtered by `RotationNamePrefix`.
+//!
+//! Unlike `ListContacts` — which the contact registry serves whatever the account's
+//! onboarding state — a rotation listing is gated on the ACCOUNT-level Incident Manager
+//! precondition
+//! ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`]):
+//! an account with no active replication set is refused with the modelled
+//! `ValidationException` (HTTP 400) before the store is read at all. A read refused this
+//! way reports nothing and writes nothing.
+//!
+//! The store is keyed by `RotationArn` and is a `BTreeMap`, so the enumeration order is
+//! stable and the opaque `NextToken` only has to carry the ARN the last page ended on
+//! ([`crate::state::encode_next_token`]); a token this list did not issue is refused with
+//! the modelled `ValidationException` rather than silently restarting the scan. The page
+//! size is the `MaxResults` the request names, else
+//! [`crate::state::DEFAULT_MAX_RESULTS`], and only a page with rotations after it carries
+//! a `NextToken`, so a client's loop ends.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +168,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRotations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRotationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRotations"))
+        use crate::state::{
+            decode_next_token, invalid_next_token_message, page_size, rotation_summary, take_page,
+            TOKEN_SCOPE_ROTATIONS,
+        };
+
+        // Nothing is read off the request envelope: the listing is account-wide.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListRotationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "this service is mounted on an engine that holds no state"
+                        .to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+
+        let state = state.lock();
+
+        // The account gate comes FIRST: before the token is decoded and before the store
+        // is read.
+        state
+            .require_active_replication_set()
+            .map_err(account_precondition_failed)?;
+
+        // The resume point: every rotation strictly after the ARN the last page ended on.
+        let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+            Some(token) => Some(
+                decode_next_token(TOKEN_SCOPE_ROTATIONS, token)
+                    .ok_or_else(|| validation(invalid_next_token_message(token)))?,
+            ),
+            None => None,
+        };
+
+        let matching: Vec<Rotation> = state
+            .rotations
+            .iter()
+            .filter(|(arn, _)| after.as_deref().is_none_or(|last| arn.as_str() > last))
+            .map(|(_, record)| record)
+            .filter(|record| {
+                input
+                    .rotation_name_prefix
+                    .as_deref()
+                    .is_none_or(|prefix| record.name.starts_with(prefix))
+            })
+            .map(rotation_summary)
+            .collect();
+
+        let (page, next_token) = take_page(
+            matching,
+            page_size(input.max_results),
+            TOKEN_SCOPE_ROTATIONS,
+            |rotation| rotation.rotation_arn.clone(),
+        );
+
+        Ok(ListRotationsOutput {
+            next_token,
+            rotations: page,
+        })
     }
+}
+
+/// The account precondition's refusal: this operation's modelled `ValidationException`,
+/// which the model classifies `client` with `httpError` 400.
+///
+/// `reason` carries `OTHER` and `fields` is present but EMPTY: the failure is account
+/// level, so no field of the request is at fault.
+fn account_precondition_failed(message: String) -> ListRotationsError {
+    ListRotationsErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some("OTHER".to_string()),
+        fields: Some(Vec::new()),
+    })
+    .into()
+}
+
+/// A member-level refusal: the same modelled `ValidationException`, carrying `message`.
+fn validation(message: impl Into<String>) -> ListRotationsError {
+    ListRotationsErrorModeled::ValidationException(ValidationException {
+        message: message.into(),
+        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+        fields: None,
+    })
+    .into()
 }

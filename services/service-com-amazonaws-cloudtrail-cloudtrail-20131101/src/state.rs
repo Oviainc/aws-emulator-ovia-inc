@@ -1434,6 +1434,17 @@ pub const CUSTOM_DASHBOARD_WIDGET_LIMIT: usize = 10;
 /// workflow an emulator serves.
 pub const DASHBOARD_QUOTA: usize = 1_000;
 
+/// The largest page `ListDashboards` reports, which is also the page size a request
+/// that names no `MaxResults` takes.
+///
+/// It is the modelled maximum of `ListDashboardsMaxResultsCount`
+/// (`smithy_query(query="operation", operation="ListDashboards")` reports `MaxResults`
+/// as `range 1..1000`), so a caller asking for more than the model admits is refused at
+/// the boundary rather than here, and a caller asking for nothing gets the whole
+/// Region's dashboards in one page unless the registry holds more than the model lets
+/// one page carry.
+pub const LIST_DASHBOARDS_MAX_PAGE_SIZE: usize = 1_000;
+
 /// How long a new dashboard reads [`DASHBOARD_STATUS_CREATING`] before the clock
 /// settles it into [`DASHBOARD_STATUS_CREATED`].
 ///

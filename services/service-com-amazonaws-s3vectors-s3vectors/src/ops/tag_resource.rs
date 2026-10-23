@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -91,9 +82,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3vectors-s3vectors.jso
 // here — hence the `TagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3vectors#TagResource")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3vectors#TagResource",
+    extra_errors = ["ValidationException"]
+)]
 #[derive(Debug)]
 pub enum TagResourceErrorModeled {
+    ValidationException(ValidationException),
     ConflictException(ConflictException),
     NotFoundException(NotFoundException),
     ServiceUnavailableException(ServiceUnavailableException),
@@ -150,18 +145,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // Nothing about the write depends on request metadata: the resource is named
+        // by an ARN, which already carries its region and account.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: crate::state::STATE_UNAVAILABLE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // The resource must exist to be tagged: an ARN naming a vector bucket or
+        // vector index this store does not hold is the modelled 404.
+        let arn = store
+            .tagged_resource_arn("resourceArn", &input.resource_arn)
+            .map_err(refusal)?;
+
+        // "You can add up to 50 tags for each resource", counted over what the
+        // resource would carry AFTER the write: a key it already holds is updated in
+        // place rather than added. The model declares no quota error here, so the
+        // refusal travels on the `ValidationException` channel.
+        let existing = store.tags.get(&arn);
+        let after = existing.map_or(input.tags.len(), |existing| {
+            existing.len()
+                + input
+                    .tags
+                    .keys()
+                    .filter(|key| !existing.contains_key(*key))
+                    .count()
+        });
+        if let Some(message) = crate::state::tag_count_exceeded(after) {
+            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                message,
+                field_list: None,
+            })
+            .into());
+        }
+
+        // "Applies one or more user-defined tags … or updates existing tags": a key
+        // the resource already carries takes the request's value, and the keys the
+        // request does not name are left as they were.
+        if !input.tags.is_empty() {
+            let tags = store.tags.entry(arn).or_default();
+            for (key, value) in input.tags {
+                tags.insert(key, value);
+            }
+        }
+
+        Ok(TagResourceOutput {})
+    }
+}
+
+/// Lift a refusal from `crate::state` into this operation's modelled error channel.
+fn refusal(error: crate::state::LookupError) -> TagResourceError {
+    if error.is_not_found() {
+        TagResourceErrorModeled::NotFoundException(error.not_found_exception()).into()
+    } else {
+        TagResourceErrorModeled::ValidationException(error.validation_exception()).into()
     }
 }

@@ -40,7 +40,8 @@ use sha2::Digest as _;
 
 use crate::ops::types::{
     AccountLimit, AccountUsage, Cors, CreateFunctionOutput, EnvironmentResponse, EphemeralStorage,
-    FunctionCodeLocation, PutFunctionConcurrencyOutput, ResolvedS3Object, TracingConfigResponse,
+    FunctionCodeLocation, GetLayerVersionOutput, Layer, LayerVersionContentOutput,
+    PutFunctionConcurrencyOutput, ResolvedS3Object, TracingConfigResponse,
 };
 
 /// The ARN namespace this service stamps into every ARN it mints
@@ -228,6 +229,19 @@ impl CodeRecord {
     }
 }
 
+/// One layer a function's execution environment holds.
+///
+/// `FunctionConfiguration$Layers` reports "The function's layers" as the layer version's
+/// ARN and "The size of the layer archive in bytes", so the resolution of a `Layers`
+/// entry against the published layer version is what is stored here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionLayer {
+    /// The ARN of the layer version, including its version number.
+    pub arn: String,
+    /// The size of that version's archive, in bytes.
+    pub code_size: i64,
+}
+
 /// The configuration of one function version — the members `FunctionConfiguration`
 /// reports that a published version freezes.
 ///
@@ -255,6 +269,9 @@ pub struct FunctionConfig {
     pub architectures: Vec<String>,
     /// The environment variables, ordered so a read reports them deterministically.
     pub environment: BTreeMap<String, String>,
+    /// The layer versions this configuration holds, in the order the caller named
+    /// them, each resolved against the layer the store holds.
+    pub layers: Vec<FunctionLayer>,
     /// The `/tmp` size, in MB.
     pub ephemeral_storage_mb: i32,
     /// The X-Ray tracing mode.
@@ -698,6 +715,20 @@ impl FunctionRecord {
                 mode: Some(config.tracing_mode.clone()),
             }),
             revision_id: Some(config.revision_id.clone()),
+            // A function the caller named no layer for carries no `Layers` member at
+            // all: the model gives it no default, so an empty list is not a value this
+            // configuration holds.
+            layers: (!config.layers.is_empty()).then(|| {
+                config
+                    .layers
+                    .iter()
+                    .map(|layer| Layer {
+                        arn: Some(layer.arn.clone()),
+                        code_size: layer.code_size,
+                        ..Layer::default()
+                    })
+                    .collect()
+            }),
             state: Some(self.state.clone()),
             state_reason: self.state_reason.clone(),
             state_reason_code: self.state_reason_code.clone(),
@@ -752,12 +783,170 @@ impl FunctionRecord {
     }
 }
 
+/// The `S3ObjectStorageMode` a layer archive is stored with when the caller names
+/// none, from the member's own documentation: "`COPY` (default) – Uploads a copy of
+/// your layer archive to Lambda."
+pub const S3_OBJECT_STORAGE_MODE_COPY: &str = "COPY";
+
+/// The `S3ObjectStorageMode` that leaves the archive where the caller put it:
+/// "`REFERENCE` – Lambda references the layer archive from the specified Amazon S3
+/// bucket."
+pub const S3_OBJECT_STORAGE_MODE_REFERENCE: &str = "REFERENCE";
+
+/// The most layers this emulator keeps.
+///
+/// An EMULATOR-CHOSEN ceiling for the same reason as [`MAX_FUNCTIONS`]: the store is in
+/// memory and every `PublishLayerVersion` adds to it, so past this point the slice
+/// answers the modelled `CodeStorageExceededException` rather than growing without
+/// bound. AWS bounds layers by the account's code-storage quota instead, and answers the
+/// same modelled error.
+pub const MAX_LAYERS: usize = 1_000;
+
+/// The most versions this emulator keeps for one layer, bounding the store exactly as
+/// [`MAX_FUNCTION_VERSIONS`] bounds a function's versions.
+pub const MAX_LAYER_VERSIONS: usize = 500;
+
+/// Where the archive of one layer version came from.
+///
+/// `zip_bytes` is the only variant whose bytes this emulator holds, so it is the only
+/// one a size and a digest can be computed from; an S3 object is a reference this
+/// emulator does not resolve, and nothing is reported for it that was not computed.
+#[derive(Debug, Clone, Default)]
+pub struct LayerArchiveRecord {
+    /// The layer archive bytes, when the caller uploaded them inline.
+    pub zip_bytes: Option<Vec<u8>>,
+    /// The S3 bucket holding the layer archive, when the caller named one.
+    pub s3_bucket: Option<String>,
+    /// The S3 key of the layer archive.
+    pub s3_key: Option<String>,
+    /// The S3 object version of the layer archive.
+    pub s3_object_version: Option<String>,
+    /// How the archive is stored: [`S3_OBJECT_STORAGE_MODE_COPY`] or
+    /// [`S3_OBJECT_STORAGE_MODE_REFERENCE`].
+    pub s3_object_storage_mode: String,
+}
+
+/// One version of a layer: the archive it was published from, the metadata the request
+/// carried and when it was published.
+///
+/// "Each time you call PublishLayerVersion with the same layer name, a new version is
+/// created" (the model's own `PublishLayerVersion` documentation), so a version is
+/// immutable once stored and keeps its own copy of everything a read reports.
+#[derive(Debug, Clone)]
+pub struct LayerVersionRecord {
+    /// The version number, counting from 1 upwards.
+    pub version: i64,
+    /// The description of the version, when the caller gave one.
+    pub description: Option<String>,
+    /// The layer's software license, when the caller gave one.
+    pub license_info: Option<String>,
+    /// The runtimes the version declares itself compatible with, in the order given.
+    pub compatible_runtimes: Vec<String>,
+    /// The architectures the version declares itself compatible with, in the order
+    /// given.
+    pub compatible_architectures: Vec<String>,
+    /// Where the archive came from.
+    pub archive: LayerArchiveRecord,
+    /// The size of the stored archive, in bytes; 0 when this emulator holds no bytes
+    /// for it (an S3 object it does not resolve).
+    pub code_size: i64,
+    /// The base64 SHA-256 of the stored archive bytes; absent when this emulator holds
+    /// no bytes to hash.
+    pub code_sha256: Option<String>,
+    /// ISO-8601 instant the version was published.
+    pub created: String,
+}
+
+impl LayerVersionRecord {
+    /// The `LayerVersionContentOutput` a read reports for this version's archive,
+    /// `location` being the link into the Lambda-held copy of it.
+    #[must_use]
+    pub fn content(&self, location: String) -> LayerVersionContentOutput {
+        LayerVersionContentOutput {
+            location: Some(location),
+            code_sha256: self.code_sha256.clone(),
+            code_size: self.code_size,
+            // "The resolved Amazon S3 object that contains the layer archive" — in
+            // `REFERENCE` mode that object is the caller's, because "Lambda references
+            // the layer archive from the specified Amazon S3 bucket". In the default
+            // `COPY` mode Lambda holds a copy of its own and the caller's object is no
+            // longer where the archive is served from, so none is reported.
+            resolved_s3_object: self
+                .archive
+                .s3_bucket
+                .clone()
+                .filter(|_| self.archive.s3_object_storage_mode == S3_OBJECT_STORAGE_MODE_REFERENCE)
+                .map(|bucket| ResolvedS3Object {
+                    s3_bucket: Some(bucket),
+                    s3_key: self.archive.s3_key.clone(),
+                    s3_object_version: self.archive.s3_object_version.clone(),
+                }),
+            ..LayerVersionContentOutput::default()
+        }
+    }
+}
+
+/// One layer and every version published under its name.
+#[derive(Debug, Clone)]
+pub struct LayerRecord {
+    /// The layer's own ARN, which carries no version.
+    pub arn: String,
+    /// The region the layer was published in, which its ARNs carry.
+    pub region: String,
+    /// The bare layer name (never an ARN).
+    pub name: String,
+    /// The highest version number ever published under this name; a number is never
+    /// reused, so the next version follows this one rather than the count held.
+    pub latest_version: i64,
+    /// Every version this emulator holds, keyed by version number so a read of a
+    /// layer's versions is ordered.
+    pub versions: BTreeMap<i64, LayerVersionRecord>,
+}
+
+impl LayerRecord {
+    /// The ARN of `version` of this layer: the layer ARN with the version appended, as
+    /// the model's `LayerVersionArn` pattern requires.
+    #[must_use]
+    pub fn version_arn(&self, version: i64) -> String {
+        format!("{}:{version}", self.arn)
+    }
+
+    /// The `GetLayerVersionResponse` the wire reports for one of this layer's versions,
+    /// built entirely out of what is stored.
+    #[must_use]
+    pub fn version_detail(&self, version: &LayerVersionRecord) -> GetLayerVersionOutput {
+        GetLayerVersionOutput {
+            content: Some(version.content(layer_archive_location(
+                &self.region,
+                &self.name,
+                version.version,
+            ))),
+            layer_arn: Some(self.arn.clone()),
+            layer_version_arn: Some(self.version_arn(version.version)),
+            description: version.description.clone(),
+            created_date: Some(version.created.clone()),
+            version: version.version,
+            // A list the caller named nothing in is absent from the answer rather than
+            // reported empty: the model gives neither member a default, so an unnamed
+            // one is a member this version carries no value for.
+            compatible_architectures: (!version.compatible_architectures.is_empty())
+                .then(|| version.compatible_architectures.clone()),
+            compatible_runtimes: (!version.compatible_runtimes.is_empty())
+                .then(|| version.compatible_runtimes.clone()),
+            license_info: version.license_info.clone(),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-lambda-awsgirapiservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsLambdaAwsgirapiserviceState {
     /// Every function this emulator holds, keyed by function name so `ListFunctions`
     /// pages through them in a stable order.
     pub functions: BTreeMap<String, FunctionRecord>,
+    /// Every layer this emulator holds, keyed by layer name so `ListLayers` pages
+    /// through them in a stable order.
+    pub layers: BTreeMap<String, LayerRecord>,
 }
 
 /// One entry of a `ListFunctions` page: the key it is addressed by in the flattened
@@ -824,11 +1013,11 @@ impl ComAmazonawsLambdaAwsgirapiserviceState {
     /// than their versions. `TotalCodeSize` is "The amount of storage space, in bytes,
     /// that's being used by deployment packages and layer archives": each published
     /// version keeps its own package, and AWS counts every one of them against the code
-    /// storage quota, so the sum covers `$LATEST` and each published version. Layer
-    /// archives add their own term here once `PublishLayerVersion` persists one.
+    /// storage quota, so the sum covers `$LATEST` and each published version. Every
+    /// published layer version's archive is the other term that sentence names.
     #[must_use]
     pub fn account_usage(&self) -> AccountUsage {
-        let total_code_size = self
+        let package_code_size = self
             .functions
             .values()
             .flat_map(|function| {
@@ -840,6 +1029,12 @@ impl ComAmazonawsLambdaAwsgirapiserviceState {
                 )
             })
             .fold(0i64, i64::saturating_add);
+        let archive_code_size = self
+            .layers
+            .values()
+            .flat_map(|layer| layer.versions.values().map(|version| version.code_size))
+            .fold(0i64, i64::saturating_add);
+        let total_code_size = package_code_size.saturating_add(archive_code_size);
         AccountUsage {
             total_code_size,
             function_count: i64::try_from(self.functions.len()).unwrap_or(i64::MAX),
@@ -907,6 +1102,144 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 #[must_use]
 pub fn function_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("function:{name}"))
+}
+
+/// The unqualified ARN of a layer: `arn:aws:lambda:<region>:<account>:layer:<name>`,
+/// as the model's `LayerArn` pattern requires.
+#[must_use]
+pub fn layer_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("layer:{name}"))
+}
+
+/// The download location a layer version's `Content$Location` reports ("A link to the
+/// layer archive in Amazon S3 that is valid for 10 minutes").
+///
+/// Lambda keeps the archive in its own per-region bucket and vends a URL into it. Every
+/// segment here comes from stored state — the layer's region, its name and the version
+/// number — so two reads of one published version report the same location, and no read
+/// changes what a later one sees.
+#[must_use]
+pub fn layer_archive_location(region: &str, name: &str, version: i64) -> String {
+    format!(
+        "https://awslambda-{region}-layers.s3.{region}.amazonaws.com/snapshots/{account}/{name}-{version}",
+        account = ::engine::emulator_account_id(),
+    )
+}
+
+/// The bare layer name a `LayerName` names.
+///
+/// The model documents the member as "The name or Amazon Resource Name (ARN) of the
+/// layer", and both forms name the same record, so a layer ARN resolves here to the name
+/// it carries. `None` when the value is neither form.
+#[must_use]
+pub fn parse_layer_name(value: &str) -> Option<String> {
+    let parts: Vec<&str> = value.split(':').collect();
+    let name = if parts.first() == Some(&"arn") {
+        // arn:<partition>:lambda:<region>:<account>:layer:<name>. The resource type is
+        // required, so an ARN of another Lambda resource is not read as a layer named
+        // after its resource type.
+        if parts.len() != 7 || parts[2] != ARN_NAMESPACE || parts[5] != "layer" {
+            return None;
+        }
+        parts[6]
+    } else if parts.len() == 1 {
+        parts[0]
+    } else {
+        return None;
+    };
+    is_layer_name(name).then(|| name.to_string())
+}
+
+/// Whether `name` is a layer name, which the model's `LayerName` pattern spells
+/// `[a-zA-Z0-9-_]+`.
+#[must_use]
+pub fn is_layer_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+/// What a `LayerVersionArn` names.
+///
+/// The model's pattern admits exactly two forms, and they name resources in two
+/// different places.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LayerVersionReference {
+    /// `arn:<partition>:lambda:<region>:<account>:layer:<name>:<version>` — a version
+    /// published into an account, which this store holds.
+    Published {
+        /// The layer's bare name.
+        name: String,
+        /// The version number the ARN qualifies it with.
+        version: i64,
+    },
+    /// `arn:<partition>:lambda:::awslayer:<name>` — a layer Lambda itself provides,
+    /// which belongs to no account and is held in no store.
+    AwsManaged,
+}
+
+/// Split a `LayerVersionArn` into the parts that identify a layer version, or `None`
+/// when the value is neither documented form.
+#[must_use]
+pub fn parse_layer_version_arn(value: &str) -> Option<LayerVersionReference> {
+    let parts: Vec<&str> = value.split(':').collect();
+    if parts.first() != Some(&"arn") || parts.get(2) != Some(&ARN_NAMESPACE) {
+        return None;
+    }
+    let resource_type = parts.get(5).copied().unwrap_or_default();
+    match (parts.len(), resource_type) {
+        (8, "layer") if is_layer_name(parts[6]) => {
+            let version = parts[7].parse::<i64>().ok().filter(|version| *version > 0)?;
+            Some(LayerVersionReference::Published {
+                name: parts[6].to_string(),
+                version,
+            })
+        }
+        (7, "awslayer") if is_layer_name(parts[6]) => Some(LayerVersionReference::AwsManaged),
+        _ => None,
+    }
+}
+
+/// Resolve a function's `Layers` — "A list of function layers to add to the function's
+/// execution environment. Specify each layer by its ARN, including the version" —
+/// against the layer versions this store holds.
+///
+/// The error carries the message of the refusal: an entry that is not a layer version
+/// ARN, or one naming a version this account has published no layer for. A layer
+/// Lambda itself provides belongs to no account, so it is taken as named: this emulator
+/// holds no archive for it and therefore reports the `CodeSize` member's own default for
+/// it, exactly as it does for a deployment package whose bytes it does not hold.
+pub fn resolve_function_layers(
+    store: &ComAmazonawsLambdaAwsgirapiserviceState,
+    layers: &[String],
+) -> Result<Vec<FunctionLayer>, String> {
+    layers
+        .iter()
+        .map(|arn| match parse_layer_version_arn(arn) {
+            None => Err(format!(
+                "1 validation error detected: Value '{arn}' at 'layers' failed to satisfy \
+                 constraint: Member must be the ARN of a layer version, including the version"
+            )),
+            Some(LayerVersionReference::AwsManaged) => Ok(FunctionLayer {
+                arn: arn.clone(),
+                code_size: 0,
+            }),
+            Some(LayerVersionReference::Published { name, version }) => {
+                let published = store
+                    .layers
+                    .get(&name)
+                    .and_then(|layer| Some((layer, layer.versions.get(&version)?)))
+                    .ok_or_else(|| format!("Layer version {arn} does not exist."))?;
+                // The ARN and the size both come out of the stored version, so nothing
+                // of the request is echoed back as a resolved layer.
+                Ok(FunctionLayer {
+                    arn: published.0.version_arn(version),
+                    code_size: published.1.code_size,
+                })
+            }
+        })
+        .collect()
 }
 
 /// The region this request's ARNs carry: the one the caller signed for, from the SigV4

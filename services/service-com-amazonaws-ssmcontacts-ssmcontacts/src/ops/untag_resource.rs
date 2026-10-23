@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the tags `TagKeys` names from the resource `ResourceARN` names, writing the
+//! remainder back into that resource's own record
+//! ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::tags_mut`]) so the next
+//! `ListTagsForResource` reports what this call left.
+//!
+//! Two things happen before the write, in this order:
+//!
+//! 1. The ACCOUNT-level Incident Manager precondition
+//!    ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`]):
+//!    until the account has an active replication set the call is refused with the modelled
+//!    `ValidationException` (HTTP 400) and NOTHING is removed.
+//! 2. The resource lookup: an onboarded account naming a resource the store does not hold
+//!    gets the modelled `ResourceNotFoundException` (HTTP 404). Contacts (including
+//!    escalation plans) and rotations are this service's taggable resources.
+//!
+//! Removal is by KEY and is idempotent: a key the resource does not carry removes nothing
+//! and is not an error — the model declares no error for it, and the request's outcome
+//! ("these keys are not on this resource") is the same either way — so repeating the call
+//! answers the same way.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +156,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // The resource is addressed by ARN; nothing is read off the request envelope.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "this service is mounted on an engine that holds no state"
+                        .to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+
+        let mut state = state.lock();
+
+        // The account gate comes FIRST: before `ResourceARN` is resolved, and before
+        // anything is removed.
+        state
+            .require_active_replication_set()
+            .map_err(account_precondition_failed)?;
+
+        let resource_arn = input.resource_arn.clone();
+        let Some(tags) = state.tags_mut(&resource_arn) else {
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Resource {resource_arn} not found"),
+                    resource_id: resource_arn.clone(),
+                    resource_type: RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        tags.retain(|tag| {
+            tag.key
+                .as_deref()
+                .is_none_or(|key| !input.tag_keys.iter().any(|named| named == key))
+        });
+
+        Ok(UntagResourceOutput {})
     }
+}
+
+/// The `resourceType` this operation's not-found error names. `ResourceARN` is an
+/// `AmazonResourceName`, not an `SsmContactsArn`, so the kind of resource it named is not
+/// known to be one this service holds — only that this service holds no such resource.
+const RESOURCE_TYPE: &str = "resource";
+
+/// The account precondition's refusal: this operation's modelled `ValidationException`,
+/// which the model classifies `client` with `httpError` 400.
+///
+/// `reason` carries `OTHER` and `fields` is present but EMPTY: the failure is account
+/// level, so no field of the request is at fault.
+fn account_precondition_failed(message: String) -> UntagResourceError {
+    UntagResourceErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some("OTHER".to_string()),
+        fields: Some(Vec::new()),
+    })
+    .into()
 }

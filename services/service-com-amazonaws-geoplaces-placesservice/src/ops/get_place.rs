@@ -256,7 +256,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A `PlaceId` is opaque: one this service never issued names no place, and
         // the operation models no not-found error, so it is a client-input failure.
         // The id is `@sensitive`, so the refusal names the member, not the value.
-        let Some(place) = state.place(input.place_id.trim()) else {
+        let place_id = input.place_id.trim();
+        let Some(place) = state.place(place_id) else {
             return Err(GetPlaceErrorModeled::ValidationException(
                 crate::state::validation_exception(
                     crate::state::REASON_CANNOT_PARSE,
@@ -301,7 +302,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             time_zone: wants(crate::state::FEATURE_TIME_ZONE)
                 .then(|| place.time_zone_modeled())
                 .flatten(),
-            political_view,
+            political_view: political_view.clone(),
             ..GetPlaceOutput::default()
         })
     }

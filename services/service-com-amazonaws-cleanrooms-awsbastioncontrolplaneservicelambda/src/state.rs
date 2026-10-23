@@ -26,6 +26,14 @@
 //! one of its members is absolute — plus the
 //! `privacy_budget_template_by_collaboration` index that makes "each collaboration can
 //! have only one privacy budget template" a lookup rather than a scan.
+//!
+//! A collaboration change request is likewise stored as the modelled
+//! [`CollaborationChangeRequest`]; what the service COMPUTES about one — the change
+//! types a specification asks for, whether the collaboration auto-approves them, and the
+//! parties whose approval it needs — is derived from the stored collaboration by
+//! [`change_types_for`], [`change_request_is_auto_approved`] and
+//! [`CleanRoomsState::change_request_approvals`], and a committed change is written back
+//! onto the collaboration by [`CleanRoomsState::apply_collaboration_change`].
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -33,18 +41,19 @@ use std::time::{Duration, SystemTime};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    AccessBudgetsPrivacyTemplateParametersOutput, Collaboration, CollaborationSummary,
-    ComputeConfiguration, ConfiguredTable, DataEncryptionMetadata,
-    DifferentialPrivacyTemplateParametersOutput, MLMemberAbilities, MemberSpecification,
-    Membership, MembershipJobComputePaymentConfig, MembershipMLPaymentConfig,
-    MembershipModelInferencePaymentConfig, MembershipModelTrainingPaymentConfig,
-    MembershipPaymentConfiguration, MembershipProtectedJobResultConfiguration,
-    MembershipProtectedQueryOutputConfiguration, MembershipProtectedQueryResultConfiguration,
-    MembershipQueryComputePaymentConfig, MembershipSummary,
-    MembershipSyntheticDataGenerationPaymentConfig, PaymentConfiguration, PrivacyBudgetTemplate,
-    PrivacyBudgetTemplateParametersInput, PrivacyBudgetTemplateParametersOutput, ProtectedQuery,
-    ProtectedQueryError, ProtectedQueryOutputConfiguration, ProtectedQueryResultConfiguration,
-    TableReference, WorkerComputeConfiguration,
+    AccessBudgetsPrivacyTemplateParametersOutput, Change, ChangeSpecification, Collaboration,
+    CollaborationChangeRequest, CollaborationSummary, ComputeConfiguration, ConfiguredTable,
+    DataEncryptionMetadata, DifferentialPrivacyTemplateParametersOutput, MLMemberAbilities,
+    MemberChangeSpecification, MemberSpecification, Membership, MembershipJobComputePaymentConfig,
+    MembershipMLPaymentConfig, MembershipModelInferencePaymentConfig,
+    MembershipModelTrainingPaymentConfig, MembershipPaymentConfiguration,
+    MembershipProtectedJobResultConfiguration, MembershipProtectedQueryOutputConfiguration,
+    MembershipProtectedQueryResultConfiguration, MembershipQueryComputePaymentConfig,
+    MembershipSummary, MembershipSyntheticDataGenerationPaymentConfig, PaymentConfiguration,
+    PrivacyBudgetTemplate, PrivacyBudgetTemplateParametersInput,
+    PrivacyBudgetTemplateParametersOutput, ProtectedQuery, ProtectedQueryError,
+    ProtectedQueryOutputConfiguration, ProtectedQueryResultConfiguration, TableReference,
+    WorkerComputeConfiguration,
 };
 
 /// The ARN service segment and the SigV4 signing name for Clean Rooms, from
@@ -137,6 +146,79 @@ pub const MEMBERSHIP_STATUS_COLLABORATION_DELETED: &str = "COLLABORATION_DELETED
 pub const ABILITY_CAN_QUERY: &str = "CAN_QUERY";
 /// See [`ABILITY_CAN_QUERY`].
 pub const ABILITY_CAN_RUN_JOB: &str = "CAN_RUN_JOB";
+
+/// `ChangeRequestStatus` values this slice produces (model shape `ChangeRequestStatus`:
+/// PENDING | APPROVED | CANCELLED | DENIED | COMMITTED).
+pub const CHANGE_REQUEST_STATUS_PENDING: &str = "PENDING";
+/// See [`CHANGE_REQUEST_STATUS_PENDING`].
+pub const CHANGE_REQUEST_STATUS_COMMITTED: &str = "COMMITTED";
+
+/// `ApprovalStatus` values this slice produces (model shape `ApprovalStatus`:
+/// APPROVED | DENIED | PENDING).
+pub const APPROVAL_STATUS_PENDING: &str = "PENDING";
+/// See [`APPROVAL_STATUS_PENDING`].
+pub const APPROVAL_STATUS_APPROVED: &str = "APPROVED";
+
+/// `ChangeSpecificationType` values (model shape `ChangeSpecificationType`: MEMBER |
+/// COLLABORATION) — one per member of the `ChangeSpecification` union, which is what
+/// makes a `specificationType` that names the other member detectable.
+pub const CHANGE_SPECIFICATION_TYPE_MEMBER: &str = "MEMBER";
+/// See [`CHANGE_SPECIFICATION_TYPE_MEMBER`].
+pub const CHANGE_SPECIFICATION_TYPE_COLLABORATION: &str = "COLLABORATION";
+
+/// The `ChangeType` a specification naming an account that is not yet part of the
+/// collaboration asks for (model shape `ChangeType`).
+pub const CHANGE_TYPE_ADD_MEMBER: &str = "ADD_MEMBER";
+/// The `ChangeType` a `CollaborationChangeSpecification` that moves the collaboration's
+/// `autoApprovedChangeTypes` asks for (model shape `ChangeType`).
+pub const CHANGE_TYPE_EDIT_AUTO_APPROVED_CHANGE_TYPES: &str = "EDIT_AUTO_APPROVED_CHANGE_TYPES";
+/// The `ChangeType` for a member that becomes responsible for a cost it was not
+/// responsible for (model shape `ChangeType`).
+pub const CHANGE_TYPE_ADD_PAYER_CANDIDATE: &str = "ADD_PAYER_CANDIDATE";
+/// The `ChangeType` for a member that stops being responsible for every cost (model
+/// shape `ChangeType`).
+pub const CHANGE_TYPE_REMOVE_PAYER_CANDIDATE: &str = "REMOVE_PAYER_CANDIDATE";
+
+/// Each `MemberAbility` the `ChangeType` catalog can grant or revoke, as
+/// `(ability, grant type, revoke type)`.
+///
+/// The `ChangeType` catalog (ADD_MEMBER | GRANT_RECEIVE_RESULTS_ABILITY |
+/// REVOKE_RECEIVE_RESULTS_ABILITY | EDIT_AUTO_APPROVED_CHANGE_TYPES |
+/// ADD_PAYER_CANDIDATE | REMOVE_PAYER_CANDIDATE | GRANT_CAN_RECEIVE_MODEL_OUTPUT |
+/// GRANT_CAN_RECEIVE_INFERENCE_OUTPUT | REVOKE_CAN_RECEIVE_MODEL_OUTPUT |
+/// REVOKE_CAN_RECEIVE_INFERENCE_OUTPUT | GRANT_EXPORT_QUERY_ANALYSIS_LOG_ABILITY |
+/// REVOKE_EXPORT_QUERY_ANALYSIS_LOG_ABILITY) names a grant/revoke pair for exactly two
+/// of the four `MemberAbility` values, so a change to CAN_QUERY or CAN_RUN_JOB has no
+/// change type to report and cannot be asked for through a change request.
+pub const MEMBER_ABILITY_CHANGE_TYPES: [(&str, &str, &str); 2] = [
+    (
+        "CAN_RECEIVE_RESULTS",
+        "GRANT_RECEIVE_RESULTS_ABILITY",
+        "REVOKE_RECEIVE_RESULTS_ABILITY",
+    ),
+    (
+        "CAN_EXPORT_QUERY_ANALYSIS_LOG",
+        "GRANT_EXPORT_QUERY_ANALYSIS_LOG_ABILITY",
+        "REVOKE_EXPORT_QUERY_ANALYSIS_LOG_ABILITY",
+    ),
+];
+
+/// Each `CustomMLMemberAbility` the `ChangeType` catalog can grant or revoke, as
+/// `(ability, grant type, revoke type)`. The catalog
+/// (CAN_RECEIVE_MODEL_OUTPUT | CAN_RECEIVE_INFERENCE_OUTPUT) has a grant and a revoke
+/// change type for both of its values. See [`MEMBER_ABILITY_CHANGE_TYPES`].
+pub const ML_MEMBER_ABILITY_CHANGE_TYPES: [(&str, &str, &str); 2] = [
+    (
+        "CAN_RECEIVE_MODEL_OUTPUT",
+        "GRANT_CAN_RECEIVE_MODEL_OUTPUT",
+        "REVOKE_CAN_RECEIVE_MODEL_OUTPUT",
+    ),
+    (
+        "CAN_RECEIVE_INFERENCE_OUTPUT",
+        "GRANT_CAN_RECEIVE_INFERENCE_OUTPUT",
+        "REVOKE_CAN_RECEIVE_INFERENCE_OUTPUT",
+    ),
+];
 
 /// `ResourceType` values this slice reports on a modelled error (model shape
 /// `ResourceType`: CONFIGURED_TABLE | COLLABORATION | MEMBERSHIP |
@@ -261,6 +343,20 @@ pub const MAX_PROTECTED_QUERIES: usize = 5_000;
 /// the template store needs its own maximum entry count like every other store here.
 pub const MAX_PRIVACY_BUDGET_TEMPLATES: usize = 5_000;
 
+/// See [`MAX_COLLABORATIONS`]: the same EMULATOR-enforced bound on the collaboration
+/// change request store, reported through the `ServiceQuotaExceededException` (HTTP 402)
+/// `CreateCollaborationChangeRequest` declares.
+pub const MAX_COLLABORATION_CHANGE_REQUESTS: usize = 5_000;
+
+/// The largest `approvals` map a change request can carry, from the MODEL: the
+/// `ApprovalStatuses` map is declared `len 1..50`. A change request records one approval
+/// entry per party to the collaboration (see
+/// [`CleanRoomsState::change_request_approvals`]), so a collaboration with more parties
+/// than this has no representable approvals map and the create refuses with the
+/// `ServiceQuotaExceededException` it declares.
+pub const MAX_CHANGE_REQUEST_APPROVALS: usize = 50;
+
+
 /// A collaboration exactly as its creator declared it.
 #[derive(Debug, Clone)]
 pub struct CollaborationRecord {
@@ -381,6 +477,16 @@ pub struct ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
     pub protected_queries: HashMap<String, ProtectedQueryRecord>,
     /// Protected query ids in start order — the order a listing pages in.
     pub protected_query_order: Vec<String>,
+    /// Collaboration change requests by `CollaborationChangeRequest.id`.
+    ///
+    /// The modelled shape is stored as-is, like [`Membership`]: every one of its members
+    /// is absolute (its `changes`, `status`, `approvals` and `isAutoApproved` describe
+    /// the request, not who is asking), so a read reports it without deriving anything.
+    /// The owning collaboration is on the record itself (`collaborationId`), which is
+    /// what scopes a lookup to one collaboration.
+    pub collaboration_change_requests: HashMap<String, CollaborationChangeRequest>,
+    /// Change request ids in creation order — the order a listing pages in.
+    pub collaboration_change_request_order: Vec<String>,
 }
 
 /// Shorthand for this service's state struct.
@@ -587,6 +693,253 @@ impl ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
             .get(query_id)
             .filter(|record| record.query.membership_id == membership_id)
     }
+
+    /// The change request `change_request_id`, but only when it was made against
+    /// `collaboration_id`: a change request is addressed under its collaboration
+    /// (`/collaborations/{collaborationIdentifier}/changeRequests/{changeRequestIdentifier}`),
+    /// so one collaboration never reads another's change request.
+    pub fn collaboration_change_request_in_collaboration(
+        &self,
+        collaboration_id: &str,
+        change_request_id: &str,
+    ) -> Option<&CollaborationChangeRequest> {
+        self.collaboration_change_requests
+            .get(change_request_id)
+            .filter(|request| request.collaboration_id == collaboration_id)
+    }
+
+    /// Every account whose approval a change request against `record` needs, in a
+    /// deterministic order: the creator first, then the declared members in the order
+    /// the collaboration was created with.
+    ///
+    /// `CollaborationChangeRequest$approvals` is documented as "approval details from
+    /// collaboration members, including approval status and multi-party approval
+    /// workflow information" and is keyed by `AccountId`. The model names no finer rule
+    /// for WHICH accounts those are, so this slice takes the parties to the
+    /// collaboration — the accounts whose grants the collaboration holds — as the
+    /// parties to a change of it. The account a change ADDS is not among them: it is the
+    /// subject of the change, not yet a party to the collaboration.
+    pub fn change_request_approvals(&self, record: &CollaborationRecord) -> Vec<String> {
+        let mut accounts = Vec::with_capacity(record.members.len() + 1);
+        accounts.push(record.creator_account_id.clone());
+        for member in &record.members {
+            if member.account_id != record.creator_account_id {
+                accounts.push(member.account_id.clone());
+            }
+        }
+        accounts
+    }
+
+    /// Apply one COMMITTED change to the collaboration it was made against.
+    ///
+    /// A `MemberChangeSpecification` carries the member's whole intended grant
+    /// (`memberAbilities` is required on it), so applying it REPLACES that account's
+    /// stored grant — creating it when the account was not a member yet — and applying a
+    /// `CollaborationChangeSpecification` replaces the collaboration's
+    /// `autoApprovedChangeTypes`. The collaboration's `updateTime` is restamped, and
+    /// when the affected account already holds a membership of this collaboration its
+    /// `memberAbilities`/`mlMemberAbilities` are restated too, because a membership
+    /// reports the same grant from the member's side.
+    pub fn apply_collaboration_change(
+        &mut self,
+        collaboration_id: &str,
+        change: &Change,
+        at: DateTime,
+    ) {
+        let Some(record) = self.collaborations.get_mut(collaboration_id) else {
+            return;
+        };
+        let member_spec = match &change.specification {
+            ChangeSpecification::Collaboration(spec) => {
+                record.auto_approved_change_types = spec.auto_approved_change_types.clone();
+                record.update_time = at;
+                return;
+            }
+            ChangeSpecification::Member(spec) => spec,
+        };
+
+        if member_spec.account_id == record.creator_account_id {
+            record.creator_member_abilities = member_spec.member_abilities.clone();
+            record.creator_ml_member_abilities = member_spec.ml_member_abilities.clone();
+            if member_spec.payment_configuration.is_some() {
+                record.creator_payment_configuration = member_spec.payment_configuration.clone();
+            }
+            if let Some(display_name) = &member_spec.display_name {
+                record.creator_display_name = display_name.clone();
+            }
+        } else if let Some(member) = record
+            .members
+            .iter_mut()
+            .find(|member| member.account_id == member_spec.account_id)
+        {
+            member.member_abilities = member_spec.member_abilities.clone();
+            member.ml_member_abilities = member_spec.ml_member_abilities.clone();
+            if member_spec.payment_configuration.is_some() {
+                member.payment_configuration = member_spec.payment_configuration.clone();
+            }
+            if let Some(display_name) = &member_spec.display_name {
+                member.display_name = display_name.clone();
+            }
+        } else if let Some(display_name) = &member_spec.display_name {
+            // `MemberSpecification$displayName` is required, so a member can only be
+            // materialized with the display name the specification carried;
+            // `CreateCollaborationChangeRequest` refuses an add without one, so the
+            // `else` case here is unreachable rather than silently guessed at.
+            record.members.push(MemberSpecification {
+                account_id: member_spec.account_id.clone(),
+                member_abilities: member_spec.member_abilities.clone(),
+                ml_member_abilities: member_spec.ml_member_abilities.clone(),
+                display_name: display_name.clone(),
+                payment_configuration: member_spec.payment_configuration.clone(),
+            });
+        }
+        record.update_time = at;
+
+        let membership_id = self
+            .membership_by_collaboration
+            .get(&(
+                collaboration_id.to_string(),
+                member_spec.account_id.clone(),
+            ))
+            .cloned();
+        if let Some(membership) = membership_id.and_then(|id| self.memberships.get_mut(&id)) {
+            membership.member_abilities = member_spec.member_abilities.clone();
+            membership.ml_member_abilities = member_spec.ml_member_abilities.clone();
+            membership.update_time = at;
+        }
+    }
+}
+
+/// The change types one specification asks of the collaboration as stored — the
+/// `Change$types` the service reports back ("the list of change types that were
+/// applied").
+///
+/// EMPTY means the specification asks for nothing the collaboration does not already
+/// have, or asks for something the `ChangeType` catalog cannot name (a CAN_QUERY or
+/// CAN_RUN_JOB ability change, say): `ChangeTypeList` is `len 1..`, so such a change is
+/// not representable and the create refuses it.
+pub fn change_types_for(
+    record: &CollaborationRecord,
+    specification: &ChangeSpecification,
+) -> Vec<String> {
+    match specification {
+        ChangeSpecification::Member(spec) => match record.grant_for(&spec.account_id) {
+            // An account the collaboration holds no grant for is being added.
+            None => vec![CHANGE_TYPE_ADD_MEMBER.to_string()],
+            Some(current) => member_change_types(&current, spec),
+        },
+        ChangeSpecification::Collaboration(spec) => {
+            let requested = spec.auto_approved_change_types.as_deref().unwrap_or(&[]);
+            let current = record.auto_approved_change_types.as_deref().unwrap_or(&[]);
+            if same_change_type_set(requested, current) {
+                Vec::new()
+            } else {
+                vec![CHANGE_TYPE_EDIT_AUTO_APPROVED_CHANGE_TYPES.to_string()]
+            }
+        }
+    }
+}
+
+/// The change types a specification asks for an account that is ALREADY a party to the
+/// collaboration: the difference between the grant it holds and the one the
+/// specification states, named from the `ChangeType` catalog. See
+/// [`MEMBER_ABILITY_CHANGE_TYPES`] and [`ML_MEMBER_ABILITY_CHANGE_TYPES`].
+fn member_change_types(current: &MemberGrant, requested: &MemberChangeSpecification) -> Vec<String> {
+    let mut types = Vec::new();
+    for (ability, grant, revoke) in MEMBER_ABILITY_CHANGE_TYPES {
+        let held = current.member_abilities.iter().any(|held| held == ability);
+        let wanted = requested
+            .member_abilities
+            .iter()
+            .any(|wanted| wanted == ability);
+        match (held, wanted) {
+            (false, true) => types.push(grant.to_string()),
+            (true, false) => types.push(revoke.to_string()),
+            _ => {}
+        }
+    }
+    for (ability, grant, revoke) in ML_MEMBER_ABILITY_CHANGE_TYPES {
+        let held = holds_ml_ability(current.ml_member_abilities.as_ref(), ability);
+        let wanted = holds_ml_ability(requested.ml_member_abilities.as_ref(), ability);
+        match (held, wanted) {
+            (false, true) => types.push(grant.to_string()),
+            (true, false) => types.push(revoke.to_string()),
+            _ => {}
+        }
+    }
+    // A member is a payer candidate while its payment configuration makes it
+    // responsible for any cost; the catalog's ADD_PAYER_CANDIDATE /
+    // REMOVE_PAYER_CANDIDATE name entering and leaving that set.
+    let was_payer = is_payer_candidate(current.payment_configuration.as_ref());
+    let is_payer = is_payer_candidate(requested.payment_configuration.as_ref());
+    match (was_payer, is_payer) {
+        (false, true) => types.push(CHANGE_TYPE_ADD_PAYER_CANDIDATE.to_string()),
+        (true, false) => types.push(CHANGE_TYPE_REMOVE_PAYER_CANDIDATE.to_string()),
+        _ => {}
+    }
+    types
+}
+
+/// Whether `abilities` carries the `CustomMLMemberAbility` `ability`.
+fn holds_ml_ability(abilities: Option<&MLMemberAbilities>, ability: &str) -> bool {
+    abilities.is_some_and(|abilities| {
+        abilities
+            .custom_ml_member_abilities
+            .iter()
+            .any(|held| held == ability)
+    })
+}
+
+/// Whether a payment configuration makes its member responsible for any cost: query
+/// compute, job compute, or one of the machine-learning costs.
+fn is_payer_candidate(configuration: Option<&PaymentConfiguration>) -> bool {
+    let Some(configuration) = configuration else {
+        return false;
+    };
+    let ml = configuration.machine_learning.as_ref();
+    configuration.query_compute.is_responsible
+        || configuration
+            .job_compute
+            .as_ref()
+            .is_some_and(|compute| compute.is_responsible)
+        || ml.is_some_and(|ml| {
+            ml.model_training
+                .as_ref()
+                .is_some_and(|cost| cost.is_responsible)
+                || ml
+                    .model_inference
+                    .as_ref()
+                    .is_some_and(|cost| cost.is_responsible)
+                || ml
+                    .synthetic_data_generation
+                    .as_ref()
+                    .is_some_and(|cost| cost.is_responsible)
+        })
+}
+
+/// Whether two `autoApprovedChangeTypes` lists name the same set — the lists are
+/// `uniqueItems`, so set equality is length plus containment, and ORDER is not a change.
+fn same_change_type_set(left: &[String], right: &[String]) -> bool {
+    left.len() == right.len() && left.iter().all(|value| right.contains(value))
+}
+
+/// Whether the collaboration's auto-approval settings cover every change type a request
+/// asks for — the `isAutoApproved` the created change request reports ("whether the
+/// change request was automatically approved based on the collaboration's auto-approval
+/// settings").
+///
+/// `AutoApprovedChangeType` is a 5-value subset of the 12-value `ChangeType` catalog, so
+/// a change type outside that subset can never be covered and such a request is never
+/// auto-approved.
+pub fn change_request_is_auto_approved(record: &CollaborationRecord, changes: &[Change]) -> bool {
+    let auto_approved = record.auto_approved_change_types.as_deref().unwrap_or(&[]);
+    !changes.is_empty()
+        && changes.iter().all(|change| {
+            change
+                .types
+                .iter()
+                .all(|change_type| auto_approved.contains(change_type))
+        })
 }
 
 /// The modelled `MembershipSummary` projection of a stored `Membership`.

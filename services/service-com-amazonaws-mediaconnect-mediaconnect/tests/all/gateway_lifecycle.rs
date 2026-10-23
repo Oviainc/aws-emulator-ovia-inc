@@ -93,6 +93,9 @@ fn seed_gateways(emulator: &Emulator, count: usize) {
                 }],
                 gateway_state: mc::GATEWAY_STATE_ACTIVE.to_string(),
                 pending: None,
+                // A seeded gateway is live, like a created one: only DeleteGateway
+                // retires a record.
+                deleted_at: None,
             },
         );
     }
@@ -300,10 +303,11 @@ async fn create_persists_the_gateway_describe_and_list_report() {
 
 /// A new gateway is answered in the non-terminal `CREATING` state and the CLOCK settles it
 /// into `ACTIVE`; both reads report the state the store holds, so the listed state moves
-/// with the described one. DeleteGateway then removes the record: DescribeGateway answers
-/// 404 and ListGateways no longer lists it.
+/// with the described one. DeleteGateway then RETIRES the record — `GatewayState` carries a
+/// terminal `DELETED` value, so the gateway stays readable — and the deletion lifecycle is
+/// observable the same way: `DELETING`, then the clock settles `DELETED`.
 #[tokio::test]
-async fn the_clock_settles_a_new_gateway_and_delete_removes_it() {
+async fn the_clock_settles_a_new_gateway_and_delete_retires_it() {
     let emulator = Emulator::new();
     let (status, _, created) = create_gateway(
         &emulator,
@@ -354,19 +358,54 @@ async fn the_clock_settles_a_new_gateway_and_delete_removes_it() {
     assert_eq!(
         deleted["gatewayArn"].as_str(),
         Some(gateway_arn.as_str()),
-        "delete reports the gateway it removed, got {deleted}"
+        "delete reports the gateway it retired, got {deleted}"
     );
 
-    let (status, code, body) = describe_gateway(&emulator, &gateway_arn).await;
+    // A caller reading straight after the delete still sees the transient state, and the
+    // record is still there: a deleted gateway is readable, never a 404.
+    let (status, code, described) = describe_gateway(&emulator, &gateway_arn).await;
     assert_eq!(
-        (status, code.as_deref()),
-        (404, Some("NotFoundException")),
-        "describe after delete expected 404 NotFoundException, got {status} {code:?}: {body}"
+        (status, code.as_deref(), described["gateway"]["gatewayState"].as_str()),
+        (200, None, Some(mc::GATEWAY_STATE_DELETING)),
+        "a gateway read straight after the delete is 200 DELETING, got {status} {code:?}: \
+         {described}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let (status, code, described) = describe_gateway(&emulator, &gateway_arn).await;
+    assert_eq!(
+        (status, code.as_deref(), described["gateway"]["gatewayState"].as_str()),
+        (200, None, Some(mc::GATEWAY_STATE_DELETED)),
+        "the clock settles the gateway into the terminal DELETED, got {status} {code:?}: \
+         {described}"
+    );
+    // The whole record is still projected, not a husk.
+    assert_eq!(
+        described["gateway"]["name"].as_str(),
+        Some("gw-lifecycle"),
+        "a retired gateway still reports its name, got {described}"
     );
     let (_, _, list) = list_gateways(&emulator, "").await;
     assert!(
-        listed(&list).is_empty(),
-        "a deleted gateway must not be listed, got {list}"
+        listed(&list)
+            .iter()
+            .any(|(arn, _, state)| arn == &gateway_arn && state == mc::GATEWAY_STATE_DELETED),
+        "ListGateways reports the record the store holds, DELETED state and all, got {list}"
+    );
+
+    // DeleteGateway is `@idempotent`: repeating it against the already-retired gateway
+    // succeeds again, with the same ARN, and leaves the terminal state where it was.
+    let (status, code, deleted_again) = delete_gateway(&emulator, &gateway_arn).await;
+    assert_eq!(
+        (status, code.as_deref(), deleted_again["gatewayArn"].as_str()),
+        (200, None, Some(gateway_arn.as_str())),
+        "a repeated delete succeeds again, got {status} {code:?}: {deleted_again}"
+    );
+    let (_, _, described) = describe_gateway(&emulator, &gateway_arn).await;
+    assert_eq!(
+        described["gateway"]["gatewayState"].as_str(),
+        Some(mc::GATEWAY_STATE_DELETED),
+        "a repeated delete does not restart the deletion, got {described}"
     );
 }
 
@@ -528,7 +567,9 @@ async fn list_gateways_pages_every_stored_gateway_exactly_once() {
     }
 
     // A token stays usable when the gateway it names is deleted between pages: it is the
-    // ARN the listing RESUMES AT, so the key it carries need not still exist.
+    // ARN the listing RESUMES AT. A gateway delete is a soft delete, so the retired record
+    // is still listed — at the same key, in the same order — and the resumed page starts
+    // with it.
     let (_, _, first_page) = list_gateways(&emulator, "?maxResults=3").await;
     let token = first_page["nextToken"]
         .as_str()
@@ -549,8 +590,8 @@ async fn list_gateways_pages_every_stored_gateway_exactly_once() {
     let resumed_arns: Vec<String> = listed(&resumed).into_iter().map(|(arn, ..)| arn).collect();
     assert_eq!(
         resumed_arns,
-        expected[4..].to_vec(),
-        "the listing resumes after the deleted key, got {resumed}"
+        expected[3..].to_vec(),
+        "the listing resumes at the key the token names, got {resumed}"
     );
 }
 
