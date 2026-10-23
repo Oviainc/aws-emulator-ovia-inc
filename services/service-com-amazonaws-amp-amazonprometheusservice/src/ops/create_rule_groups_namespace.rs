@@ -318,6 +318,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             transition_due: Some(now + crate::state::TRANSITION_DELAY),
             create_token: input.client_token,
+            // Nothing has updated the namespace yet, so no update is in flight.
+            update_token: None,
         };
 
         let response = response_for(&namespace);
