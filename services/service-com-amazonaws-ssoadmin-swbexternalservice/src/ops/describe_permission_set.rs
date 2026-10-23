@@ -151,13 +151,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DescribePermissionSetErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the SSO Admin state store is unavailable".to_string()),
             })
         })?;
-        let store = state.lock();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // A READ, except for what the CLOCK already owes the instances themselves, and
+        // the account's ambient instance if nothing has enabled one yet (`on_request`).
+        store.on_request(&region, ::std::time::SystemTime::now());
 
         // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup: permission
         // sets are a feature of an organization instance, so on an account instance no

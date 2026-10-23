@@ -23,6 +23,8 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Hex codec for the opaque `nextToken` GetRecommendationPreferences round-trips.
 hex = { workspace = true }
+# Digest for the selection fingerprint bound into the GetIdleRecommendations page token.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
