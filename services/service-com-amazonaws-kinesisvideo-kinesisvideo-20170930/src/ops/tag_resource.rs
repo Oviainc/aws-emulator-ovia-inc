@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds or replaces tags on the stored resource the `ResourceARN` names. The modeled
+//! `ResourceARN` leaves the resource TYPE open (`…:[a-z]+/[a-zA-Z0-9_.-]+/[0-9]+`) and
+//! this service mints two of them, so a `channel` ARN and a `stream` ARN both address
+//! their own record, through the one accessor in [`crate::state`]; an ARN that names
+//! neither is the modeled `ResourceNotFoundException`. A request that would take the
+//! resource past [`crate::state::MAX_TAGS_PER_RESOURCE`] is refused with the modeled
+//! `TagsPerResourceExceededLimitException` and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +151,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::ClientLimitExceededException(
+                ClientLimitExceededException {
+                    message: Some(
+                        "The signaling channel store is unavailable. Try again later.".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        store.settle_clock();
+
+        let stored = store
+            .resource_tags_mut(input.resource_arn.as_str())
+            .ok_or_else(|| {
+                TagResourceError::from(TagResourceErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::CHANNEL_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                ))
+            })?;
+
+        // A tag under a key the resource already carries REPLACES that key's value, so
+        // only the keys that are new count towards the ceiling. The whole request is
+        // refused before anything is written, so a refused call leaves the tag map as it
+        // was.
+        let mut merged = stored.clone();
+        for tag in input.tags {
+            merged.insert(tag.key, tag.value);
+        }
+        if merged.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(
+                TagResourceErrorModeled::TagsPerResourceExceededLimitException(
+                    TagsPerResourceExceededLimitException {
+                        message: Some(format!(
+                            "You have exceeded the limit of tags that you can associate with \
+                             the resource. A Kinesis video stream can support up to {} tags.",
+                            crate::state::MAX_TAGS_PER_RESOURCE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        *stored = merged;
+
+        Ok(TagResourceOutput {})
     }
 }
