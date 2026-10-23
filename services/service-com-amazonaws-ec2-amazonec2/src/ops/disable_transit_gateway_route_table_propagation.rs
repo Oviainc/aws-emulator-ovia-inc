@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisableTransitGatewayRouteTablePropagation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisableTransitGatewayRouteTablePropagation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisableTransitGatewayRouteTablePropagation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: stops the attachment the request names from propagating its routes into
+//! the propagation route table it names, leaving the propagation in the transient state of
+//! a disable with the clock owing its removal, and answers with the propagation as it now
+//! stands. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +133,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisableTransitGatewayRouteTablePropagation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisableTransitGatewayRouteTablePropagationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisableTransitGatewayRouteTablePropagation"))
+        // `ctx` carries request metadata only; this operation reads none of it — every
+        // resource it acts on is named by id. The store is reached through the engine held
+        // on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // The request's own form first: an id that is not an id of its kind at all is
+        // refused as malformed, so "not an id of this kind" never reads as "no such
+        // resource" and is never answered by the DryRun arm below either.
+        state::require_well_formed_id(
+            state::TRANSIT_GATEWAY_ROUTE_TABLE_ID_PREFIX,
+            &input.transit_gateway_route_table_id,
+            state::INVALID_ROUTE_TABLE_ID_MALFORMED,
+        )?;
+        if let Some(attachment_id) = input.transit_gateway_attachment_id.as_deref() {
+            state::require_well_formed_id(
+                state::TRANSIT_GATEWAY_ATTACHMENT_ID_PREFIX,
+                attachment_id,
+                state::INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_MALFORMED,
+            )?;
+        }
+        if let Some(announcement_id) = input
+            .transit_gateway_route_table_announcement_id
+            .as_deref()
+        {
+            state::require_well_formed_id(
+                state::TRANSIT_GATEWAY_ROUTE_TABLE_ANNOUNCEMENT_ID_PREFIX,
+                announcement_id,
+                state::INVALID_TRANSIT_GATEWAY_ROUTE_TABLE_ANNOUNCEMENT_ID_MALFORMED,
+            )?;
+        }
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`$DryRun`): the flag asks about PERMISSION, not about the
+        // named resources, so it is answered before anything is resolved and every caller
+        // of this emulator is permitted.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // "Disables the specified resource attachment from propagating routes to the
+        // specified propagation route table" — the rule this operation and the enabling one
+        // share, so it lives in `crate::state`.
+        let propagation = state::decide_transit_gateway_route_table_propagation(
+            &mut store,
+            state::PropagationRequest {
+                route_table_id: &input.transit_gateway_route_table_id,
+                attachment_id: input.transit_gateway_attachment_id.as_deref(),
+                announcement_id: input
+                    .transit_gateway_route_table_announcement_id
+                    .as_deref(),
+            },
+            state::PropagationDecision::Disable,
+        )?;
+
+        Ok(DisableTransitGatewayRouteTablePropagationOutput {
+            propagation: Some(propagation),
+        })
     }
 }

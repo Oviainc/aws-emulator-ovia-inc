@@ -123,6 +123,18 @@ use aws_smithy_schema_server::constraints::{self, path, Violation, ViolationKind
 use aws_smithy_types::{BigDecimal, BigInteger, DateTime, Document};
 use smithy_server_runtime::{DeserializableStruct, Operation, ServerHttpProtocol};
 
+/// The greatest number of violations one refusal states.
+///
+/// The framework's constraint walk stops collecting at this many
+/// (`MAX_VIOLATIONS` in [`aws_smithy_schema_server::constraints`], which is private), so a
+/// service rendering its own refusal from [`refusing_violations`] can never be handed
+/// more. It is restated here, once, because a refusal body renders each violation at least
+/// twice — as a clause of the message and, where the shape models one, as a field-list
+/// entry — so a service that bounds its own rendering needs the same number the walk used,
+/// rather than a literal of its own that can drift from it
+/// (`grep -rn 'MAX_VIOLATIONS' services/*/src` lists the copies left to migrate here).
+pub const MAX_VIOLATIONS: usize = 100;
+
 /// Every violation that refuses `req` before `O`'s handler runs — a `@required` member
 /// absent, or a value outside a declared constraint — with each value echo restored to the
 /// bytes the caller sent ([`with_submitted_values`]).

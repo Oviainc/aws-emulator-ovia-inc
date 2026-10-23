@@ -18,7 +18,7 @@
 //! mounts, reusing the harness in [`crate::cache_cluster_lifecycle`]; only the HTTP
 //! status and the XML body are inspected.
 
-use crate::cache_cluster_lifecycle::{params, Emulator, Reply};
+use crate::harness::{params, Emulator, Reply};
 
 /// One row of the error-envelope table: a request that must fail, and the status and
 /// wire code it must fail with.

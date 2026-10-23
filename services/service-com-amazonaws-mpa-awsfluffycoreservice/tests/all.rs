@@ -17,5 +17,7 @@ mod approval_team_lifecycle;
 mod authorization_gate;
 #[path = "all/policy_catalog.rs"]
 mod policy_catalog;
+#[path = "all/policy_versions.rs"]
+mod policy_versions;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

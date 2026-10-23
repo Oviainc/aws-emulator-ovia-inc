@@ -13,7 +13,10 @@
 //!    differing in either half is a DIFFERENT authorization;
 //! 3. the describe pages over a stable ordering (authorized account, then authorized
 //!    Region), at the `Limit` the request asks for or the modelled maximum when it asks
-//!    for none, and refuses a token it never issued;
+//!    for none; its `NextToken` holds the KEY the next page resumes at, so a walk
+//!    reports every authorization state holds at or after that key — whatever was
+//!    granted or revoked between the pages — and a token it never issued is refused;
+//!    reading changes nothing a later caller sees;
 //! 4. `DeleteAggregationAuthorization` revokes exactly the pair it names, leaves every
 //!    other authorization reported, succeeds on a pair that holds none (the model
 //!    declares no not-found error), and the revoked pair can be granted again;
@@ -47,6 +50,18 @@ const AWS_REGION_MAX_LENGTH: usize = 64;
 /// The maximum `Limit` `DescribeAggregationAuthorizations` allows
 /// (`smithy_query(query="shape", shape="Limit")`: `range 0..100`).
 const LIMIT_MAX: i64 = 100;
+
+/// `text` as the base64 the framework's page tokens are encoded with, so a case can
+/// hand the operation a token of its own choosing.
+fn base64(text: &str) -> String {
+    aws_smithy_types::base64::encode(text)
+}
+
+/// The key an authorization is reported under: the authorized account id, then the
+/// authorized Region (`DescribeAggregationAuthorizations` pages over this ordering).
+fn key_of(pair: &(String, String)) -> String {
+    format!("{}/{}", pair.0, pair.1)
+}
 
 /// The `AggregationAuthorization` a `PutAggregationAuthorization` response carries.
 fn put_authorization(response: &Value, case: &str) -> Value {
@@ -409,12 +424,61 @@ async fn describe_reports_the_authorizations_in_state_a_page_at_a_time() {
 #[tokio::test]
 async fn a_describe_outside_the_modelled_paging_contract_is_refused() {
     let emulator = Emulator::new();
-    // Rows differ along WHAT is wrong: a token this operation never issued, and a
-    // `Limit` past each end of the published 0..100 range.
-    let cases: [(&str, Value, &str); 4] = [
+    // One granted pair, so every refusal below can be shown to leave the store as it
+    // was for the next caller.
+    emulator
+        .ok(
+            "PutAggregationAuthorization",
+            &put_request(ACCOUNT_A, "us-east-1", &Value::Null),
+        )
+        .await;
+    let before = all_authorizations(&emulator).await;
+
+    let region_past_the_maximum = "r".repeat(AWS_REGION_MAX_LENGTH + 1);
+    // Rows differ along WHAT is wrong. For the token: not base64 at all, base64 of
+    // text carrying no key separator, base64 of a key whose halves are outside the
+    // modelled constraints on an authorized pair (`AccountId`'s `^\d{12}$` pattern,
+    // `AwsRegion`'s 1..64 length), and a token a sibling paged read of this service
+    // issues. For the page size: a `Limit` past each end of the published 0..100 range.
+    let cases: Vec<(&str, Value, &str)> = vec![
         (
             "a token this operation never issued",
             json!({ "NextToken": "not-a-token-!!" }),
+            "InvalidNextTokenException",
+        ),
+        (
+            "base64 of empty text",
+            json!({ "NextToken": base64("") }),
+            "InvalidNextTokenException",
+        ),
+        (
+            "base64 of text carrying no key separator",
+            json!({ "NextToken": base64(ACCOUNT_A) }),
+            "InvalidNextTokenException",
+        ),
+        (
+            "base64 of a key whose account id is eleven digits",
+            json!({ "NextToken": base64("11112222333/us-east-1") }),
+            "InvalidNextTokenException",
+        ),
+        (
+            "base64 of a key whose account id is not digits",
+            json!({ "NextToken": base64("abcdefghijkl/us-east-1") }),
+            "InvalidNextTokenException",
+        ),
+        (
+            "base64 of a key whose region is empty",
+            json!({ "NextToken": base64(&format!("{ACCOUNT_A}/")) }),
+            "InvalidNextTokenException",
+        ),
+        (
+            "base64 of a key whose region is one past the modelled maximum",
+            json!({ "NextToken": base64(&format!("{ACCOUNT_A}/{region_past_the_maximum}")) }),
+            "InvalidNextTokenException",
+        ),
+        (
+            "a token DescribeConfigRules would issue",
+            json!({ "NextToken": base64("some-config-rule") }),
             "InvalidNextTokenException",
         ),
         (
@@ -441,6 +505,256 @@ async fn a_describe_outside_the_modelled_paging_contract_is_refused() {
             (status, code.as_str()),
             (400, expected_code),
             "case {case:?}: expected HTTP 400 {expected_code}, got {status} {code}"
+        );
+        let after = all_authorizations(&emulator).await;
+        assert_eq!(
+            after, before,
+            "case {case:?}: a refused page must leave the store alone, got {after:?}"
+        );
+    }
+}
+
+/// Grant every pair in `pairs`, in the order given.
+async fn grant_all(emulator: &Emulator, pairs: &[(&str, &str)]) {
+    for (account, region) in pairs {
+        emulator
+            .ok(
+                "PutAggregationAuthorization",
+                &put_request(account, region, &Value::Null),
+            )
+            .await;
+    }
+}
+
+/// Revoke every pair in `pairs`, in the order given.
+async fn revoke_all(emulator: &Emulator, pairs: &[(&str, &str)]) {
+    for (account, region) in pairs {
+        emulator
+            .ok(
+                "DeleteAggregationAuthorization",
+                &json!({
+                    "AuthorizedAccountId": account,
+                    "AuthorizedAwsRegion": region,
+                }),
+            )
+            .await;
+    }
+}
+
+/// Every authorization a full paginated walk at `limit` reports, in the order the
+/// pages carried them.
+async fn walk_pages(emulator: &Emulator, limit: usize, case: &str) -> Vec<Value> {
+    let mut seen: Vec<Value> = Vec::new();
+    let mut next: Option<String> = None;
+    loop {
+        let mut request = json!({ "Limit": limit });
+        if let Some(token) = next.as_deref() {
+            request["NextToken"] = json!(token);
+        }
+        let (page, token) = describe_page(emulator, &request).await;
+        if token.is_some() && limit > 0 {
+            assert_eq!(
+                page.len(),
+                limit,
+                "case {case:?}: a page a NextToken follows must be full, got {page:?}"
+            );
+        }
+        seen.extend(page);
+        match token {
+            Some(token) => next = Some(token),
+            None => break,
+        }
+    }
+    seen
+}
+
+/// An authorized pair as a table row names it: the authorized account id and the
+/// authorized Region.
+type PairRow = (&'static str, &'static str);
+
+/// One row of [`a_page_token_resumes_in_key_order_across_grants_and_revocations`]: the
+/// case name, the pairs granted between the pages, and the pairs revoked between them.
+type MutationRow = (&'static str, &'static [PairRow], &'static [PairRow]);
+
+#[tokio::test]
+async fn a_page_token_resumes_in_key_order_across_grants_and_revocations() {
+    /// The page size every case walks at, small enough that two pages remain after the
+    /// first one.
+    const PAGE: usize = 2;
+    /// Account ids below and above every seeded one, so a grant between pages can land
+    /// on either side of the key the first page's token resumes at.
+    const ACCOUNT_LOWEST: &str = "000000000001";
+    /// See [`ACCOUNT_LOWEST`].
+    const ACCOUNT_HIGHEST: &str = "999999999999";
+
+    // Granted out of key order, so what is under test is the store's ordering.
+    let seeded: [PairRow; 6] = [
+        (ACCOUNT_B, "us-east-1"),
+        (ACCOUNT_A, "us-east-1"),
+        (ACCOUNT_C, "us-east-1"),
+        (ACCOUNT_A, "us-west-2"),
+        (ACCOUNT_B, "eu-west-1"),
+        (ACCOUNT_C, "ap-south-1"),
+    ];
+    // Rows differ along WHAT changes between the first page and the rest of the walk,
+    // and WHERE the change falls relative to the key the token resumes at: nothing,
+    // a revocation before it, of it, and after it, a grant before and after it, and a
+    // grant and a revocation at once.
+    let cases: [MutationRow; 7] = [
+        ("nothing changes between the pages", &[], &[]),
+        (
+            "a pair before the resume key is revoked",
+            &[],
+            &[(ACCOUNT_A, "us-east-1")],
+        ),
+        (
+            "the pair the token resumes at is revoked",
+            &[],
+            &[(ACCOUNT_B, "eu-west-1")],
+        ),
+        (
+            "a pair after the resume key is revoked",
+            &[],
+            &[(ACCOUNT_C, "us-east-1")],
+        ),
+        (
+            "a pair before the resume key is granted",
+            &[(ACCOUNT_LOWEST, "us-east-1")],
+            &[],
+        ),
+        (
+            "a pair after the resume key is granted",
+            &[(ACCOUNT_HIGHEST, "us-east-1")],
+            &[],
+        ),
+        (
+            "a grant and a revocation at once",
+            &[(ACCOUNT_HIGHEST, "eu-west-1")],
+            &[(ACCOUNT_B, "us-east-1")],
+        ),
+    ];
+
+    for (case, granted, revoked) in cases {
+        let emulator = Emulator::new();
+        grant_all(&emulator, &seeded).await;
+
+        // Every account id is twelve digits, so sorting the pairs orders them exactly
+        // as their keys (account, separator, Region) order.
+        let mut seeded_order: Vec<(String, String)> = seeded
+            .iter()
+            .map(|(account, region)| ((*account).to_string(), (*region).to_string()))
+            .collect();
+        seeded_order.sort();
+
+        let (first_page, token) = describe_page(&emulator, &json!({ "Limit": PAGE })).await;
+        let first_pairs: Vec<(String, String)> = first_page.iter().map(pair_of).collect();
+        assert_eq!(
+            first_pairs,
+            seeded_order[..PAGE],
+            "case {case:?}: expected the first page in key order, got {first_pairs:?}"
+        );
+        let token = token
+            .unwrap_or_else(|| panic!("case {case:?}: a NextToken must follow a full page"));
+
+        grant_all(&emulator, granted).await;
+        revoke_all(&emulator, revoked).await;
+
+        // The token holds the KEY the next page resumes at, so the rest of the walk
+        // reports exactly the authorizations state holds at or after that key once the
+        // grants and revocations above have landed.
+        let resume_key = key_of(&seeded_order[PAGE]);
+        let mut remaining: Vec<(String, String)> = seeded
+            .iter()
+            .chain(granted.iter())
+            .copied()
+            .filter(|pair| !revoked.contains(pair))
+            .map(|(account, region)| (account.to_string(), region.to_string()))
+            .collect();
+        remaining.sort();
+        remaining.dedup();
+        let expected: Vec<(String, String)> = remaining
+            .into_iter()
+            .filter(|pair| key_of(pair) >= resume_key)
+            .collect();
+
+        let mut seen: Vec<(String, String)> = Vec::new();
+        let mut next = Some(token);
+        while let Some(token) = next {
+            let request = json!({ "Limit": PAGE, "NextToken": token });
+            let (page, token_after) = describe_page(&emulator, &request).await;
+            assert!(
+                page.len() <= PAGE,
+                "case {case:?}: expected at most {PAGE} per page, got {page:?}"
+            );
+            assert!(
+                !page.is_empty() || token_after.is_none(),
+                "case {case:?}: an empty page must end the walk, got NextToken \
+                 {token_after:?}"
+            );
+            seen.extend(page.iter().map(pair_of));
+            next = token_after;
+        }
+        assert_eq!(
+            seen, expected,
+            "case {case:?}: expected the walk to resume at {resume_key:?} and report every \
+             authorization at or after it, got {seen:?}"
+        );
+
+        // Across the whole walk every reported key is strictly greater than the last,
+        // so nothing is reported twice and the ordering holds across the mutations.
+        let walked: Vec<(String, String)> = first_pairs.into_iter().chain(seen).collect();
+        assert!(
+            walked
+                .windows(2)
+                .all(|pairs| key_of(&pairs[0]) < key_of(&pairs[1])),
+            "case {case:?}: expected strictly increasing keys over the walk, got {walked:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn describing_authorizations_reports_state_without_changing_it() {
+    // Rows differ along how many authorizations the account holds and the page size, so
+    // the read is checked both when it pages and when it does not.
+    let cases: [(&str, usize, usize); 5] = [
+        ("an empty store", 0, 0),
+        ("a single authorization", 1, 0),
+        ("several on one page", 5, 0),
+        ("several over three pages", 5, 2),
+        ("several one page at a time", 5, 1),
+    ];
+    for (seed_case, count, limit) in cases {
+        let case = format!("{seed_case}, Limit {limit}");
+        let emulator = Emulator::new();
+        let pairs: Vec<(String, String)> = (0..count)
+            .map(|index| (format!("{index:012}"), "us-east-1".to_string()))
+            .collect();
+        for (account, region) in &pairs {
+            emulator
+                .ok(
+                    "PutAggregationAuthorization",
+                    &put_request(account, region, &Value::Null),
+                )
+                .await;
+        }
+
+        let first = walk_pages(&emulator, limit, &case).await;
+        let again = walk_pages(&emulator, limit, &case).await;
+        assert_eq!(
+            again, first,
+            "case {case:?}: a second read must report the same authorizations, got {again:?}"
+        );
+        assert_eq!(
+            first.iter().map(pair_of).collect::<Vec<_>>(),
+            pairs,
+            "case {case:?}: expected every granted pair in key order, got {first:?}"
+        );
+        // A paged walk leaves the unpaged read reporting the same authorizations, so
+        // paging consumed nothing.
+        let unpaged = all_authorizations(&emulator).await;
+        assert_eq!(
+            unpaged, first,
+            "case {case:?}: the default page must report what the walk did, got {unpaged:?}"
         );
     }
 }

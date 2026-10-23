@@ -391,17 +391,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // Same for cache security groups — the EC2-Classic mechanism whose
-        // `CreateCacheSecurityGroup` is a scaffolded 501.
-        if let Some(name) = input
+        // Cache security groups are the EC2-Classic mechanism, and the whole
+        // surface is closed for this account — see
+        // `crate::state::CACHE_SECURITY_GROUPS_UNSUPPORTED`. A request that
+        // names one is refused with the same account-wide closure the
+        // cache-security-group operations answer, rather than a per-name
+        // not-found: no such group can exist for any name.
+        if !input
             .cache_security_group_names
             .as_deref()
             .unwrap_or_default()
-            .first()
+            .is_empty()
         {
-            return Err(CreateCacheClusterErrorModeled::CacheSecurityGroupNotFoundFault(
-                CacheSecurityGroupNotFoundFault {
-                    message: Some(format!("Cache security group {name} not found.")),
+            return Err(CreateCacheClusterErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(crate::state::CACHE_SECURITY_GROUPS_UNSUPPORTED.to_string()),
                 },
             )
             .into());

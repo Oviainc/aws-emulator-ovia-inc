@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateUserPool
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateUserPool`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateUserPool::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! REPLACES the updatable configuration of a stored user pool: every member this
+//! operation's input models is written as sent, and a member the request leaves out
+//! goes back to the service default rather than keeping the value the pool held —
+//! "If you don't provide a value for an attribute, Amazon Cognito sets it to its
+//! default value" (this operation's own documentation, below). The pool's
+//! `LastModifiedDate` advances, and a later `DescribeUserPool` renders the STORED
+//! pool. `src/state.rs` owns the pool record and the configuration defaults; this
+//! file owns this request's own refusals.
 //!
 //! ## Shape of an operation
 //!
@@ -306,18 +305,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateUserPool` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateUserPoolErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateUserPool"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+        let pool = guard
+            .pool_mut(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+
+        // `PoolName` is "the updated name of your user pool" and a pool must carry a
+        // name — there is no default to fall back to — so an absent `PoolName` leaves
+        // the stored name alone. Every OTHER member below is REPLACED: the request's
+        // value when it carries one, the service default when it does not.
+        if let Some(pool_name) = input.pool_name {
+            pool.name = pool_name;
+        }
+
+        // Structures with documented defaults go back to those defaults, which
+        // `state.rs` owns, so a create and an update agree on what "unset" means.
+        pool.policies = crate::state::effective_policies(input.policies);
+        pool.admin_create_user_config =
+            crate::state::effective_admin_create_user_config(input.admin_create_user_config);
+        pool.user_pool_tier = crate::state::effective_user_pool_tier(input.user_pool_tier);
+        pool.mfa_configuration = crate::state::effective_mfa_configuration(input.mfa_configuration);
+        pool.deletion_protection =
+            crate::state::effective_deletion_protection(input.deletion_protection);
+
+        // Everything else is optional with no default but "absent", so an omitted
+        // member clears what the pool held.
+        pool.auto_verified_attributes = input.auto_verified_attributes.unwrap_or_default();
+        pool.lambda_config = input.lambda_config;
+        pool.device_configuration = input.device_configuration;
+        pool.email_configuration = input.email_configuration;
+        pool.sms_configuration = input.sms_configuration;
+        pool.verification_message_template = input.verification_message_template;
+        pool.account_recovery_setting = input.account_recovery_setting;
+        pool.user_attribute_update_settings = input.user_attribute_update_settings;
+        pool.user_pool_add_ons = input.user_pool_add_ons;
+        pool.key_configuration = input.key_configuration;
+        pool.issuer_configuration = input.issuer_configuration;
+        pool.acr_configuration = input.acr_configuration;
+        pool.sms_authentication_message = input.sms_authentication_message;
+        pool.tags = input.user_pool_tags.unwrap_or_default();
+
+        // `Schema`, `UsernameAttributes`, `AliasAttributes` and
+        // `UsernameConfiguration` are NOT members of this operation's input — they are
+        // fixed when the pool is created — so this update leaves them as they are. The
+        // input's `SmsVerificationMessage`, `EmailVerificationMessage` and
+        // `EmailVerificationSubject` are each documented as "no longer used", and the
+        // stored pool holds no such field, so they change nothing either.
+
+        // The pool changed, so its last-modified instant advances; its creation
+        // instant does not.
+        pool.last_modified_date = now;
+
+        // `UpdateUserPoolResponse` models no members: the updated pool is read back
+        // through `DescribeUserPool`.
+        Ok(UpdateUserPoolOutput {})
     }
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> UpdateUserPoolError {
+    UpdateUserPoolErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> UpdateUserPoolError {
+    UpdateUserPoolErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

@@ -28,6 +28,11 @@
 //! ([`Default`]) and `ListPolicies` reports whatever it then holds. See
 //! [`seeded_policy_catalog`].
 //!
+//! Each catalog entry carries its VERSIONS ([`CatalogPolicy::versions`]), one of which is
+//! the entry's default; `ListPolicyVersions` reports them for the policy its `PolicyArn`
+//! names. A version is as immutable as the policy that owns it — nothing in this model
+//! mints or retires one — so no reader of the catalog writes to it.
+//!
 //! # Authorization
 //!
 //! This module also owns this service's authorization rules, so every handler states
@@ -329,7 +334,44 @@ impl PolicyType {
     }
 }
 
-/// One policy in the catalog: everything `ListPolicies` reports for it.
+/// Status of one version of a policy, in the tokens `PolicyStatus` declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyStatus {
+    Attachable,
+    Deprecated,
+}
+
+impl PolicyStatus {
+    /// The wire token, as `PolicyStatus` spells it.
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Attachable => "ATTACHABLE",
+            Self::Deprecated => "DEPRECATED",
+        }
+    }
+}
+
+/// One version of a catalog policy: everything `ListPolicyVersions` reports for it that
+/// is the VERSION's rather than the policy's.
+///
+/// The members a version shares with its policy — the policy ARN, the name and the
+/// `PolicyType` — are not copied here: they live once on the owning
+/// [`CatalogPolicy`], so a reader cannot report a version whose name disagrees with
+/// its policy's.
+#[derive(Debug, Clone)]
+pub struct CatalogPolicyVersion {
+    /// This version's id, as `PolicyVersionSummary$VersionId` reports it. At least
+    /// [`FIRST_POLICY_VERSION`], from `PolicyVersionId`'s modelled `range(min: 1)`.
+    pub version_id: i32,
+    /// Whether this version may still be attached to a team.
+    pub status: PolicyStatus,
+    pub creation_time: SystemTime,
+    pub last_updated_time: SystemTime,
+}
+
+/// One policy in the catalog: everything `ListPolicies` reports for it, plus the
+/// versions `ListPolicyVersions` reports.
 #[derive(Debug, Clone)]
 pub struct CatalogPolicy {
     /// The policy's unqualified ARN, in the form [`policy_arn`] mints.
@@ -338,6 +380,59 @@ pub struct CatalogPolicy {
     pub policy_type: PolicyType,
     /// Version id that is this policy's default, as `Policy$DefaultVersion` reports it.
     pub default_version: i32,
+    /// Every version of this policy, keyed by its version id — the stable, ascending
+    /// ordering `ListPolicyVersions` pages over.
+    pub versions: BTreeMap<i32, CatalogPolicyVersion>,
+}
+
+impl CatalogPolicy {
+    /// A catalog policy holding one version, [`FIRST_POLICY_VERSION`], which is
+    /// therefore also its default: the shape every seeded entry starts in.
+    #[must_use]
+    pub fn with_first_version(
+        category: &str,
+        name: &str,
+        policy_type: PolicyType,
+        created: SystemTime,
+    ) -> Self {
+        let mut policy = Self {
+            arn: policy_arn(category, name),
+            name: name.to_string(),
+            policy_type,
+            default_version: FIRST_POLICY_VERSION,
+            versions: BTreeMap::new(),
+        };
+        policy.insert_version(CatalogPolicyVersion {
+            version_id: FIRST_POLICY_VERSION,
+            status: PolicyStatus::Attachable,
+            creation_time: created,
+            last_updated_time: created,
+        });
+        policy
+    }
+
+    /// Record a version of this policy, replacing any entry under the same id.
+    pub fn insert_version(&mut self, version: CatalogPolicyVersion) {
+        self.versions.insert(version.version_id, version);
+    }
+
+    /// This policy's version with id `version_id`.
+    #[must_use]
+    pub fn version(&self, version_id: i32) -> Option<&CatalogPolicyVersion> {
+        self.versions.get(&version_id)
+    }
+
+    /// Whether `version_id` names the version this policy attaches by default.
+    #[must_use]
+    pub fn is_default_version(&self, version_id: i32) -> bool {
+        version_id == self.default_version
+    }
+
+    /// The qualified ARN of this policy's version `version_id`.
+    #[must_use]
+    pub fn version_arn(&self, version_id: i32) -> String {
+        policy_version_arn(&self.arn, version_id)
+    }
 }
 
 /// Version id a policy's first version carries, from `PolicyVersionId`'s modelled
@@ -355,8 +450,16 @@ pub fn policy_arn(category: &str, name: &str) -> String {
     format!("arn:aws:mpa:::aws:policy/{category}/{name}")
 }
 
+/// ARN of ONE VERSION of a policy, in the form `QualifiedPolicyArn`'s pattern fixes:
+/// the policy's own unqualified ARN followed by the version id
+/// (`arn:aws:mpa:::aws:policy/<category>/<name>/<version id>`).
+#[must_use]
+pub fn policy_version_arn(policy_arn: &str, version_id: i32) -> String {
+    format!("{policy_arn}/{version_id}")
+}
+
 /// The policies this store holds when it is first touched, as
-/// `(category, name, type, default version)`.
+/// `(category, name, type)`.
 ///
 /// The model fixes the SHAPE of an entry, and that is what this emulator computes its
 /// answers from: the ARN form comes from `UnqualifiedPolicyArn`'s pattern (whose two
@@ -364,27 +467,21 @@ pub fn policy_arn(category: &str, name: &str) -> String {
 /// `PolicyType`'s enum, and the version from `PolicyVersionId`'s `range(min: 1)`. The
 /// entries themselves are AWS's own catalog, which no request can change and no model
 /// member enumerates: this seeds the AWS-managed approval-team policy and invents no
-/// others. Nothing is keyed to a particular entry — `ListPolicies` pages over whatever
-/// the store holds, so an entry recorded later is reported exactly like a seeded one.
-const SEEDED_POLICY_CATALOG: &[(&str, &str, PolicyType, i32)] = &[(
-    "IdentityCenter",
-    "MPAApprovalTeamPolicy",
-    PolicyType::AwsManaged,
-    FIRST_POLICY_VERSION,
-)];
+/// others, each with the one version `FIRST_POLICY_VERSION` names. Nothing is keyed to a
+/// particular entry — `ListPolicies` pages over whatever the store holds and
+/// `ListPolicyVersions` over whatever versions an entry holds, so an entry or a version
+/// recorded later is reported exactly like a seeded one.
+const SEEDED_POLICY_CATALOG: &[(&str, &str, PolicyType)] =
+    &[("IdentityCenter", "MPAApprovalTeamPolicy", PolicyType::AwsManaged)];
 
-/// The catalog a fresh store starts with, keyed by ARN.
+/// The catalog a fresh store starts with, keyed by ARN. `created` is the instant the
+/// store came into being, which is when its seeded policies and their versions did.
 #[must_use]
-pub fn seeded_policy_catalog() -> BTreeMap<String, CatalogPolicy> {
+pub fn seeded_policy_catalog(created: SystemTime) -> BTreeMap<String, CatalogPolicy> {
     SEEDED_POLICY_CATALOG
         .iter()
-        .map(|&(category, name, policy_type, default_version)| {
-            let policy = CatalogPolicy {
-                arn: policy_arn(category, name),
-                name: name.to_string(),
-                policy_type,
-                default_version,
-            };
+        .map(|&(category, name, policy_type)| {
+            let policy = CatalogPolicy::with_first_version(category, name, policy_type, created);
             (policy.arn.clone(), policy)
         })
         .collect()
@@ -416,8 +513,9 @@ pub struct ComAmazonawsMpaAwsfluffycoreserviceState {
     /// `ListPolicies` pages over.
     ///
     /// Seeded by [`Default`] from [`seeded_policy_catalog`]: a policy is AWS's, so no
-    /// operation in this model mints or removes one, and every reader answers out of
-    /// this one map.
+    /// operation in this model mints or removes one or one of its versions, and every
+    /// reader — `ListPolicies` and `ListPolicyVersions` alike — answers out of this one
+    /// map.
     pub policies: BTreeMap<String, CatalogPolicy>,
     /// Source of [`ApprovalTeam::seq`].
     next_team_seq: u64,
@@ -435,7 +533,7 @@ impl Default for ComAmazonawsMpaAwsfluffycoreserviceState {
             name_index: BTreeMap::new(),
             idempotency_tokens: BTreeMap::new(),
             organization_management_account_id: None,
-            policies: seeded_policy_catalog(),
+            policies: seeded_policy_catalog(SystemTime::now()),
             next_team_seq: 0,
             next_approver_seq: 0,
         }

@@ -169,3 +169,5 @@ mod cloudformation_provisions_ecr_public_repository;
 mod cloudformation_provisions_sqs_queues;
 #[path = "all/cloudformation_provisions_container_platform_resources.rs"]
 mod cloudformation_provisions_container_platform_resources;
+#[path = "all/kinesis_video_signing_name_routing.rs"]
+mod kinesis_video_signing_name_routing;

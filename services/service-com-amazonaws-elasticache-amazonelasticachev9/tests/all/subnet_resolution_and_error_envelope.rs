@@ -32,9 +32,8 @@
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::cache_cluster_lifecycle::{
-    account_subnet_ids, params, subnet_group_params, subnet_pairs, Emulator, Reply, REGION,
-};
+use crate::cache_cluster_lifecycle::{account_subnet_ids, subnet_group_params, subnet_pairs};
+use crate::harness::{params, Emulator, Reply, REGION};
 
 /// One envelope row: the case name, the `Action`, the request's form pairs, and
 /// the HTTP status plus awsQuery error code it must be answered with.

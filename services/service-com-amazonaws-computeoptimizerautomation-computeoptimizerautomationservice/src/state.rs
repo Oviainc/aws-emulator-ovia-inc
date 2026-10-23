@@ -145,6 +145,19 @@ pub const MAX_STORED_EVENTS: usize = 1_000;
 /// the largest page the model's `maxResults` allows.
 pub const MAX_RULES_PER_ACCOUNT: usize = 100;
 
+/// How many tags one resource of this service may carry.
+///
+/// DOCUMENTED, not chosen: the `tags` member of a rule create reads "A list of
+/// key-value pairs used to categorize and organize the automation rule. Maximum
+/// of 200 tags allowed."
+/// (`smithy_query(query="doc",shape="CreateAutomationRuleRequest",member="tags")`),
+/// and `TagList` — the shape every tag list of this service is, request and
+/// response alike — carries `@length(max: 200)`
+/// (`smithy_query(query="shape",shape="TagList")`). So the list a resource
+/// HOLDS is bounded exactly as the list a request carries is, and an addition
+/// that would push it past the bound is refused instead of applied.
+pub const MAX_TAGS_PER_RESOURCE: usize = 200;
+
 /// How many client tokens the idempotency ledger remembers. Reached only by
 /// distinct caller-supplied tokens; the oldest entry is evicted to make room, so
 /// the ledger cannot grow without bound. A replay window that has been evicted
@@ -285,6 +298,15 @@ pub const IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE: &str =
 /// ARN.
 pub fn revision_mismatch_message(current_revision: i64) -> String {
     format!("Rule revision does not match the current revision number {current_revision}")
+}
+
+/// The `InvalidParameterValueException` message for a tag addition that would
+/// leave the resource holding more than [`MAX_TAGS_PER_RESOURCE`] tags.
+///
+/// States the BOUND, which is the one fact a caller past it needs, and echoes
+/// neither a key, a value nor the resource.
+pub fn tag_limit_exceeded_message() -> String {
+    format!("The request would exceed the limit of {MAX_TAGS_PER_RESOURCE} tags per resource")
 }
 
 /// The `EnrollmentStatus` values `UpdateEnrollmentConfiguration` accepts from a

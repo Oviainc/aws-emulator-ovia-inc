@@ -12,7 +12,7 @@
 //! port, zone placement, keyspace partition, page size), and a single
 //! `CreateReplicationGroup` call is only one row.
 
-use crate::cache_cluster_lifecycle::{params, Emulator, RefusalCase, Reply, PAST_TRANSITION, REGION};
+use crate::harness::{params, Emulator, RefusalCase, Reply, PAST_TRANSITION, REGION};
 
 /// Create one replication group with `ReplicationGroupId`, a description, and
 /// whatever else `extra` names.

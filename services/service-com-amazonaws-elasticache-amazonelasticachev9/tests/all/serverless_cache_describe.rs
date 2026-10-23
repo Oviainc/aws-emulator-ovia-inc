@@ -16,10 +16,10 @@
 //! `cache_cluster_lifecycle` suite marks `pub(crate)`; nothing reaches into the
 //! service's state struct.
 
-use crate::cache_cluster_lifecycle::{params, Emulator};
+use crate::harness::{params, Emulator};
 
 /// Describe one serverless cache by name.
-async fn describe_cache(emulator: &Emulator, name: &str) -> crate::cache_cluster_lifecycle::Reply {
+async fn describe_cache(emulator: &Emulator, name: &str) -> crate::harness::Reply {
     emulator
         .call(
             "DescribeServerlessCaches",

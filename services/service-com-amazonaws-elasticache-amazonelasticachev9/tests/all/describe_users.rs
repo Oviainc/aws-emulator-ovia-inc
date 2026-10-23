@@ -12,7 +12,7 @@
 //! that same wire; the harness and the seeded users are the `users` suite's, so
 //! this target keeps one of each rather than a second copy that could drift.
 
-use crate::cache_cluster_lifecycle::{params, Emulator};
+use crate::harness::{params, Emulator};
 use crate::users::{all_users, describe, emulator_with_users};
 
 /// Walk every page of a describe, asserting each page holds at most

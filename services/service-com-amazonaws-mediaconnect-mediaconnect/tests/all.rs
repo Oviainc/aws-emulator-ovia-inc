@@ -55,3 +55,5 @@ mod update_flow_entitlement;
 mod update_flow_media_stream;
 #[path = "all/update_flow_output.rs"]
 mod update_flow_output;
+#[path = "all/update_flow_source.rs"]
+mod update_flow_source;
