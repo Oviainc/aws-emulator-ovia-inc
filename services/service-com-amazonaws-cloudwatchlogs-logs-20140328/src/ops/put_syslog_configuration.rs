@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutSyslogConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutSyslogConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: stores the syslog configuration for the log group its
+//! `logGroupIdentifier` names, keyed by the VPC endpoint it ingests through, so a put
+//! under an endpoint already configured updates that configuration in place.
+//! This is the ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`PutSyslogConfiguration::handle`] with real behaviour and
@@ -169,18 +170,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutSyslogConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutSyslogConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutSyslogConfiguration"))
+        // `ctx` carries only request metadata; this operation stamps no ARN of its own —
+        // a listed configuration is reported under the log group's stored ARN.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutSyslogConfigurationError::from(
+                PutSyslogConfigurationErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        // `logGroupIdentifier` is "the name or ARN of the log group", so an ARN resolves
+        // to the name the store is keyed by.
+        let log_group_name =
+            crate::state::log_group_name_from_identifier(&input.log_group_identifier).to_string();
+
+        let Some(group) = store.log_groups.get_mut(&log_group_name) else {
+            return Err(PutSyslogConfigurationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message("log group")),
+                },
+            )
+            .into());
+        };
+
+        // "This enables ingestion of syslog data through the specified VPC endpoint into
+        // the log group": the endpoint is what identifies the configuration within the
+        // group, and the only source type the model admits is the VPC endpoint one, so a
+        // request that names no endpoint names no configuration and is refused for that
+        // member (`crate::state::VPC_ENDPOINT_ID_REQUIRED`) even though the model leaves
+        // it optional.
+        let Some(vpc_endpoint_id) = input.vpc_endpoint_id else {
+            return Err(PutSyslogConfigurationErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(crate::state::VPC_ENDPOINT_ID_REQUIRED.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A put naming an endpoint already configured UPDATES that configuration
+        // ("Creates or updates a syslog configuration for a log group") and keeps the
+        // instant the first put created it, so only a put that would ADD one can reach
+        // this store's per-group ceiling
+        // (`crate::state::MAX_SYSLOG_CONFIGURATIONS_PER_GROUP`). This operation models no
+        // `LimitExceededException`, so the refusal is the `InvalidParameterException` it
+        // declares for a parameter it will not accept, naming the ceiling.
+        let stored = group.syslog_configurations.get(&vpc_endpoint_id);
+        if stored.is_none()
+            && group.syslog_configurations.len()
+                >= crate::state::MAX_SYSLOG_CONFIGURATIONS_PER_GROUP
+        {
+            return Err(PutSyslogConfigurationErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "a log group can have up to {} syslog configurations associated with it",
+                        crate::state::MAX_SYSLOG_CONFIGURATIONS_PER_GROUP
+                    )),
+                },
+            )
+            .into());
+        }
+        let created_at_ms = stored.map_or_else(crate::state::now_ms, |stored| stored.created_at_ms);
+        group.syslog_configurations.insert(
+            vpc_endpoint_id.clone(),
+            crate::state::SyslogConfigurationRecord {
+                vpc_endpoint_id,
+                source_type: crate::state::SYSLOG_SOURCE_TYPE.to_string(),
+                created_at_ms,
+            },
+        );
+
+        Ok(PutSyslogConfigurationOutput)
     }
 }

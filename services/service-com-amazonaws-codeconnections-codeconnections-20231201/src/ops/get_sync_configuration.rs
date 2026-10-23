@@ -146,7 +146,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // A pure report: it resolves the `(SyncType, ResourceName)` pair in state and
         // renders the stored row.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetSyncConfigurationErrorModeled::InternalServerException(
                 InternalServerException {
@@ -163,15 +162,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A resource with no configuration of this sync type holds no such resource, so
         // the report is refused with the modeled `ResourceNotFoundException` (404) — the
         // code a client uses to tell "nothing is configured" from a real failure. The
-        // message is built from the request, naming the pair that resolved to nothing.
+        // message is the service's template, built from the request: the sync type in
+        // prose, the account, and the `configTarget` locator of the resource (whose
+        // region is the one the caller addressed), plus the framework tail. See
+        // `state::sync_configuration_not_found_message`.
         let Some(record) = store.sync_configurations.get(&key) else {
             return Err(GetSyncConfigurationErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "{} configuration not found for accountId: {} and resourceName: {}",
-                        input.sync_type,
-                        ::engine::emulator_account_id(),
-                        input.resource_name
+                    message: Some(crate::state::sync_configuration_not_found_message(
+                        &input.sync_type,
+                        &input.resource_name,
+                        &crate::state::request_region(ctx.parts()),
                     )),
                 },
             )

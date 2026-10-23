@@ -434,6 +434,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // An attribute carries only the values SNS documents for it, and only on a
+        // subscription of a protocol SNS documents it for — the SAME two rules
+        // `SetSubscriptionAttributes` holds a write to, so an attribute this call
+        // accepts is one that call accepts too.
+        for (name, value) in &attributes {
+            let reason = state::subscription_attribute_value_reason(name, value).or_else(|| {
+                state::subscription_attribute_protocol_reason(name, value, &protocol)
+            });
+            if let Some(reason) = reason {
+                return Err(SubscribeErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!("Invalid parameter: Attributes Reason: {reason}")),
+                    },
+                )
+                .into());
+            }
+        }
 
         let (arn, pending_confirmation) = match existing {
             Some((arn, pending_confirmation)) => {

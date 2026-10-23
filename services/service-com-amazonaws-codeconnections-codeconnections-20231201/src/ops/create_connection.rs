@@ -190,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !store.hosts.contains_key(host_arn) {
                 return Err(CreateConnectionErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!("No host exists with the ARN: {host_arn}")),
+                        message: Some(crate::state::host_not_found_message(host_arn)),
                     },
                 )
                 .into());

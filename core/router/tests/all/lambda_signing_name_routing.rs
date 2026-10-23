@@ -34,23 +34,23 @@ use smithy_server_runtime::{MultiServiceRouter, Service};
 /// A SigV4 `Authorization` header whose credential scope names the signing name all four
 /// services share. The signature is never checked: the routers here run with request
 /// authentication off.
-const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
+pub(crate) const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIDTESTLAMBDA/20260101/us-east-1/lambda/aws4_request, \
      SignedHeaders=host, Signature=0000000000000000000000000000000000000000000000000000000000000000";
 
 /// The region the credential scope above names, and so the region of every ARN the
 /// services below mint.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The account id every emulator ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// An execution role ARN satisfying the control plane's modelled `RoleArn` pattern.
-const ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambda-exec";
+pub(crate) const ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambda-exec";
 
 /// A `Code.ZipFile` payload: restJson1 carries a blob base64-encoded in the JSON body.
 /// This is the 22-byte empty-archive zip, base64-encoded.
-const ZIP_FILE: &str = "UEsFBgAAAAAAAAAAAAAAAAAAAAAAAA==";
+pub(crate) const ZIP_FILE: &str = "UEsFBgAAAAAAAAAAAAAAAAAAAAAAAA==";
 
 /// How a row names the service that must claim it. `MANY` and `NONE` are the two routing
 /// failures: `MANY` is the `500 AmbiguousService` this issue is about, `NONE` the router's
@@ -85,13 +85,20 @@ fn all_four() -> (ControlPlane, Core, Microvms, Web) {
 /// A router with all four mounted, so a request that two of them claim really is refused
 /// as `AmbiguousService`.
 fn router_with_all_four() -> MultiServiceRouter {
-    let (control_plane, core, microvms, web) = all_four();
+    router_with_all_four_on(&Arc::new(engine::InMemoryEngine::new()))
+}
+
+/// The same four services, over an engine the CALLER holds — so a suite that has to reach
+/// the stored state (`lambda_bundled_wire_operations.rs`, which materialises a clock-owed
+/// transition) mounts exactly the set this suite routes against, rather than a second one
+/// that could disagree with it.
+pub(crate) fn router_with_all_four_on(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
-    router.register_service(control_plane);
-    router.register_service(core);
-    router.register_service(microvms);
-    router.register_service(web);
+    router.register_service(ControlPlane::new(Arc::clone(engine)));
+    router.register_service(Core::new(Arc::clone(engine)));
+    router.register_service(Microvms::new(Arc::clone(engine)));
+    router.register_service(Web::new(Arc::clone(engine)));
     router
 }
 

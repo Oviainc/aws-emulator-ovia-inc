@@ -18,6 +18,10 @@
 //! * [`Cluster::verify_service_account_token`] is the other half: only a token THIS
 //!   cluster issued, for the audience pod identity tokens are issued to, and still
 //!   within its lifetime, names a service account.
+//! * [`parse_service_account_token`] is the step BEFORE either of those: whether the
+//!   value presented is a JSON Web Token at all. It reads nothing from state, so a
+//!   caller presenting a token that is not a JWT is answered the same way whichever
+//!   cluster the request names — including one that is not registered.
 //!
 //! ## Why the token is a record rather than a signature
 //!
@@ -29,6 +33,15 @@
 //! issue therefore names nobody, which is what the real service answers for a token
 //! signed by keys it does not hold, and no claim the caller writes can change who a token
 //! names.
+//!
+//! The token's FORM is still a JWT, because that part is observable: a projected
+//! Kubernetes service account token is three base64url segments — a JOSE header naming
+//! the signing algorithm and key (`alg`, `kid`), a claim set, and a signature — and the
+//! real service rejects a value that is not one before it looks anything up. So the
+//! tokens this module mints carry a real header and a real claim set (see
+//! [`Cluster::issue_service_account_token`]) and [`parse_service_account_token`] checks
+//! that form on a presented token. The claims are descriptive only: nothing in them is
+//! ever trusted, since who a token names comes from the issuing cluster's record.
 
 use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
@@ -36,6 +49,88 @@ use std::fmt::Write as _;
 use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Encode `bytes` as one segment of a JSON Web Token: base64url without padding
+/// (RFC 7515 §2, which is RFC 4648 §5 "with all trailing '=' characters omitted").
+///
+/// The codec is `aws_smithy_types::base64`, the standard-alphabet encoder the wire
+/// serializer already uses for every Smithy blob, plus the two alphabet substitutions
+/// (`+` -> `-`, `/` -> `_`) and the dropped padding that turn RFC 4648 §4 into §5 — the
+/// same translation the Amazon Cognito service applies to its own base64url values. No
+/// second encoder is introduced for it.
+pub fn encode_jwt_segment(bytes: impl AsRef<[u8]>) -> String {
+    ::aws_smithy_types::base64::encode(bytes.as_ref())
+        .replace('+', "-")
+        .replace('/', "_")
+        .trim_end_matches('=')
+        .to_string()
+}
+
+/// Read one segment of a JSON Web Token, whether or not the presenter padded it — the
+/// modelled `JwtToken` pattern admits `=`, and a padded token is one a client really
+/// sends. `None` when the segment is not base64url at all.
+///
+/// The inverse of [`encode_jwt_segment`]: the two substitutions back, then the padding
+/// §5 omits restored, so the standard-alphabet decoder reads it.
+pub fn decode_jwt_segment(segment: &str) -> Option<Vec<u8>> {
+    let mut standard = segment.replace('-', "+").replace('_', "/");
+    while !standard.len().is_multiple_of(4) {
+        standard.push('=');
+    }
+    ::aws_smithy_types::base64::decode(&standard).ok()
+}
+
+/// The JOSE header parameters a service account token must carry, in the order they are
+/// reported absent: `alg` names the signature algorithm (RFC 7515 §4.1.1, the one header
+/// JWS makes mandatory) and `kid` names the key it was signed with (§4.1.4), which a
+/// Kubernetes API server always sets because its OIDC provider publishes several.
+pub const REQUIRED_JOSE_HEADERS: &[&str] = &["alg", "kid"];
+
+/// The algorithm a cluster's Kubernetes API server signs projected service account
+/// tokens with, as the `alg` header of the tokens this module mints.
+pub const TOKEN_SIGNING_ALGORITHM: &str = "RS256";
+
+/// Bytes in the signature segment of a minted token.
+///
+/// The emulator holds no signing key — a token is authenticated by the issuing cluster's
+/// record, not by its signature — so the segment is random bytes of a plausible length
+/// rather than a signature over the other two segments.
+const TOKEN_SIGNATURE_BYTES: usize = 32;
+
+/// Bytes a signing key id is the digest of.
+///
+/// A Kubernetes API server derives a key's id from the key itself: the id is the
+/// base64url-encoded SHA-256 digest of the public key's DER encoding, which is why every
+/// kid in a cluster's JWKS is [`SIGNING_KEY_ID_LEN`] unpadded base64url characters. This
+/// emulator holds no key pair — a token is authenticated by the issuing cluster's record,
+/// not by a signature — so a cluster's key id is a digest-sized value of its own instead,
+/// rendered in exactly that form.
+const SIGNING_KEY_DIGEST_BYTES: usize = 32;
+
+/// Characters in a signing key id: base64url of [`SIGNING_KEY_DIGEST_BYTES`] without
+/// padding, which is 43.
+const SIGNING_KEY_ID_LEN: usize = 43;
+
+/// Whether `value` is a key id a service account token can name — the form a Kubernetes
+/// API server derives for every key it signs with: [`SIGNING_KEY_ID_LEN`] characters of
+/// unpadded base64url. A value of any other length or alphabet names no key in any
+/// cluster's JWKS, so it is not a key id at all, whichever cluster a request names.
+pub fn is_signing_key_id(value: &str) -> bool {
+    value.len() == SIGNING_KEY_ID_LEN
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// The greatest number of bytes a value this service will read as a token may carry.
+///
+/// CHOSEN, not modelled: `JwtToken` declares a `@length` minimum of 1 and no maximum, and
+/// the parse below base64-decodes two caller-controlled segments, so without a bound the
+/// bytes one request can make this service allocate are whatever the transport accepted.
+/// A projected Kubernetes service account token is a header, a claim set and one RSA
+/// signature — a couple of kilobytes — so this is far above any token a cluster issues
+/// and far below a request-sized allocation.
+const MAX_TOKEN_BYTES: usize = 16 * 1024;
 
 /// The identity a pod identity service account token is issued to, and the only value
 /// `AssumeRoleForPodIdentity` reports in its `audience` output member: the model
@@ -198,6 +293,17 @@ pub struct Cluster {
     pub arn: String,
     /// The region this cluster's ARNs are scoped to.
     pub region: String,
+    /// The issuer URL of this cluster's OIDC provider, which is what the tokens it issues
+    /// name in their `iss` claim. EKS gives every cluster one of the form
+    /// `https://oidc.eks.<region>.amazonaws.com/id/<cluster identity>`.
+    pub oidc_issuer: String,
+    /// The id of the key this cluster's Kubernetes API server signs service account
+    /// tokens with — the `kid` header of every token it issues.
+    ///
+    /// It identifies a key; it does not authenticate a token. A caller can copy it into a
+    /// token of its own and that token still names nobody, because the identity comes
+    /// from [`Self::issued_tokens`].
+    pub signing_key_id: String,
     /// Every projected service account token this cluster's Kubernetes API server issued,
     /// by the token itself: who it names, what it was issued to, and when it expires.
     ///
@@ -211,10 +317,15 @@ pub struct Cluster {
 impl Cluster {
     /// A cluster named `name` in `region`, with no issued tokens and no associations.
     fn new(name: &str, region: &str) -> Self {
+        // The cluster identity in the OIDC issuer URL is the 32 hex characters EKS puts
+        // there, minted per cluster like the rest of this cluster's identifiers.
+        let identity = random_hex(32).to_uppercase();
         Self {
             name: name.to_string(),
             arn: ::engine::emulator_arn("eks", region, &format!("cluster/{name}")),
             region: region.to_string(),
+            oidc_issuer: format!("https://oidc.eks.{region}.amazonaws.com/id/{identity}"),
+            signing_key_id: encode_jwt_segment(random_bytes(SIGNING_KEY_DIGEST_BYTES)),
             issued_tokens: HashMap::new(),
             associations: Vec::new(),
         }
@@ -283,9 +394,12 @@ impl Cluster {
     /// what this cluster's Kubernetes API server hands a pod, and what the EKS Pod
     /// Identity Agent presents to `AssumeRoleForPodIdentity`.
     ///
-    /// The token carries the three dot-separated segments the modelled `JwtToken` shape
-    /// requires; its value is opaque, because what it names lives in this cluster's
-    /// record rather than in anything the holder can read or rewrite.
+    /// The token is a JSON Web Token, as [`parse_service_account_token`] requires of any
+    /// token presented to this service: a JOSE header naming this cluster's signing
+    /// algorithm and key, the claim set a projected token carries, and a signature
+    /// segment. What the token NAMES, though, lives in this cluster's record and not in
+    /// its claims — the claims describe the token, and rewriting them changes nothing
+    /// about who it names, because the record is keyed by the whole token value.
     ///
     /// Returns `None` for a request a Kubernetes API server would not serve: one naming
     /// no service account it could issue for (a namespace that is not a DNS label or a
@@ -301,11 +415,35 @@ impl Cluster {
         {
             return None;
         }
+        let header = ::serde_json::json!({
+            "alg": TOKEN_SIGNING_ALGORITHM,
+            "kid": self.signing_key_id,
+            "typ": "JWT",
+        });
+        // The claims a projected service account token carries. `jti` is what makes two
+        // tokens of the same service account distinct values, so a token is never
+        // reissued under a record that is already there.
+        let claims = ::serde_json::json!({
+            "iss": self.oidc_issuer,
+            "aud": request.audience,
+            "sub": format!(
+                "system:serviceaccount:{}:{}",
+                request.namespace, request.service_account
+            ),
+            "iat": epoch_seconds(request.issued_at),
+            "exp": epoch_seconds(request.expires_at),
+            "jti": random_uuid(),
+            "kubernetes.io": {
+                "namespace": request.namespace,
+                "serviceaccount": { "name": request.service_account },
+                "pod": request.pod_name.as_ref().map(|name| ::serde_json::json!({ "name": name })),
+            },
+        });
         let token = format!(
             "{}.{}.{}",
-            random_hex(TOKEN_SEGMENT_LEN),
-            random_hex(TOKEN_SEGMENT_LEN),
-            random_hex(TOKEN_SEGMENT_LEN)
+            encode_jwt_segment(header.to_string()),
+            encode_jwt_segment(claims.to_string()),
+            encode_jwt_segment(random_bytes(TOKEN_SIGNATURE_BYTES))
         );
         self.issued_tokens.insert(
             token.clone(),
@@ -323,17 +461,26 @@ impl Cluster {
 
     /// Report whose service account `token` names, as of `now`.
     ///
-    /// A token is accepted only when THIS cluster issued it, it was issued to the pod
-    /// identity audience, and `now` lies inside the window it was issued for. Anything
-    /// else — a token another cluster issued, one no cluster issued, one whose characters
-    /// were changed, one issued to a different audience, one presented before its own
-    /// issue instant — names nobody, because only the issuing cluster's record can say
-    /// who a token belongs to.
+    /// A token is accepted only when it names this cluster's signing key, THIS cluster
+    /// issued it, it was issued to the pod identity audience, and `now` lies inside the
+    /// window it was issued for. Anything else — a token another cluster issued, one no
+    /// cluster issued, one whose characters were changed, one issued to a different
+    /// audience, one presented before its own issue instant — names nobody, because only
+    /// the issuing cluster's record can say who a token belongs to.
+    ///
+    /// `headers` is the already-parsed JOSE header of `token`, so a token signed by a key
+    /// this cluster does not publish is refused for that reason rather than for being
+    /// unknown. It is NOT what authenticates the token: the record lookup below is, which
+    /// is why copying a cluster's `kid` into a token of one's own gains nothing.
     pub fn verify_service_account_token(
         &self,
         token: &str,
+        headers: &JoseHeaders,
         now: SystemTime,
     ) -> Result<ServiceAccountIdentity, TokenRejection> {
+        if headers.key_id != self.signing_key_id {
+            return Err(TokenRejection::Invalid);
+        }
         let issued = self
             .issued_tokens
             .get(token)
@@ -490,10 +637,147 @@ pub struct IssuedToken {
     pub expires_at: SystemTime,
 }
 
-/// The characters in one segment of an issued token: 32 hex characters of
-/// [`random_hex`], which keeps the whole token inside the modelled `JwtToken` character
-/// set.
-const TOKEN_SEGMENT_LEN: usize = 32;
+/// The JOSE header of a presented service account token, as
+/// [`parse_service_account_token`] read it.
+///
+/// Only the headers JWS requires are kept: everything else a header may carry (`typ`,
+/// `x5t`, …) says nothing about which key signed the token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoseHeaders {
+    /// The `alg` header: the signature algorithm the token names.
+    pub algorithm: String,
+    /// The `kid` header: the key the token names.
+    pub key_id: String,
+}
+
+/// Which segment of a presented token could not be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JwtSegment {
+    /// The first segment: the JOSE header.
+    Header,
+    /// The second segment: the claim set.
+    Claims,
+    /// The third segment: the signature.
+    Signature,
+}
+
+/// Why a presented value is not a JSON Web Token at all.
+///
+/// Every variant is about the VALUE's form, so none of them needs state to decide — which
+/// is what lets this service answer a malformed token before it resolves the cluster the
+/// request names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenMalformation {
+    /// Longer than any token could be ([`MAX_TOKEN_BYTES`]), so it is not read at all.
+    Length,
+    /// Not three non-empty dot-separated segments.
+    Segments,
+    /// A segment is not base64url.
+    Encoding(JwtSegment),
+    /// A segment that must be JSON does not decode to a JSON object.
+    NotJson(JwtSegment),
+    /// A JOSE header JWS requires is not a member of the header object at all.
+    MissingHeader(&'static str),
+    /// A JOSE header JWS requires is a member of the header object but holds nothing it
+    /// could name: a header naming an algorithm or a key is a non-blank string, so every
+    /// other JSON value — a number, a boolean, `null`, an array, an object, the empty or
+    /// blank string — names neither; and a `kid` outside the form every key id takes
+    /// ([`is_signing_key_id`]) names no key either.
+    InvalidHeader(&'static str),
+}
+
+/// Read `token` as a JSON Web Token and report its JOSE header.
+///
+/// A JWT is three base64url segments joined by `.`: a header and a claim set, each
+/// base64url-encoded JSON, and a signature. This checks exactly that form and the header
+/// parameters JWS requires ([`REQUIRED_JOSE_HEADERS`]) — never who the token names, which
+/// is [`Cluster::verify_service_account_token`]'s question and is answered from state.
+///
+/// Reads NOTHING from state and nothing about any cluster, so the answer is the same for
+/// every cluster name a request could carry, registered or not.
+pub fn parse_service_account_token(token: &str) -> Result<JoseHeaders, TokenMalformation> {
+    if token.len() > MAX_TOKEN_BYTES {
+        return Err(TokenMalformation::Length);
+    }
+    let mut segments = token.split('.');
+    let (Some(header), Some(claims), Some(signature), None) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return Err(TokenMalformation::Segments);
+    };
+    if header.is_empty() || claims.is_empty() || signature.is_empty() {
+        return Err(TokenMalformation::Segments);
+    }
+
+    let header = json_segment(header, JwtSegment::Header)?;
+    // The claim set has to read as JSON too — a JWT whose payload is not a claim set is
+    // not a JWT — but nothing in it is trusted, so no claim is read out of it here.
+    let _ = json_segment(claims, JwtSegment::Claims)?;
+    decode_jwt_segment(signature).ok_or(TokenMalformation::Encoding(JwtSegment::Signature))?;
+
+    // Reported in the order `REQUIRED_JOSE_HEADERS` lists them, so a token missing
+    // several is always reported on the same one. A header that is not there at all is a
+    // different report from one that is there holding something it cannot be: the first
+    // tells the caller to add it, the second to fix it.
+    for name in REQUIRED_JOSE_HEADERS {
+        match header.get(*name) {
+            None => return Err(TokenMalformation::MissingHeader(name)),
+            Some(_)
+                if !string_header(&header, name)
+                    .is_some_and(|value| header_value_is_usable(name, value)) =>
+            {
+                return Err(TokenMalformation::InvalidHeader(name))
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(JoseHeaders {
+        algorithm: string_header(&header, "alg").unwrap_or_default().to_string(),
+        key_id: string_header(&header, "kid").unwrap_or_default().to_string(),
+    })
+}
+
+/// Whether `value` is something the JOSE header `name` can hold.
+///
+/// `kid` names a key, and a key id has a form every Kubernetes API server derives the
+/// same way ([`is_signing_key_id`]), so a value outside it names no key anywhere and is
+/// not a key id. `alg` only has to name an algorithm: WHICH algorithms a cluster signs
+/// with is a property of that cluster's keys rather than of the presented value, so it is
+/// not judged here.
+fn header_value_is_usable(name: &str, value: &str) -> bool {
+    match name {
+        "kid" => is_signing_key_id(value),
+        _ => true,
+    }
+}
+
+/// A JOSE header parameter that has to be a non-blank string. A parameter of any other
+/// JSON type names no algorithm and no key, and neither does one that is empty or all
+/// whitespace — a key id selects a key, and no key is selected by blank space.
+fn string_header<'a>(
+    header: &'a ::serde_json::Map<String, ::serde_json::Value>,
+    name: &str,
+) -> Option<&'a str> {
+    header
+        .get(name)
+        .and_then(::serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+}
+
+/// One base64url segment of a JWT read as a JSON object.
+fn json_segment(
+    segment: &str,
+    which: JwtSegment,
+) -> Result<::serde_json::Map<String, ::serde_json::Value>, TokenMalformation> {
+    let bytes = decode_jwt_segment(segment).ok_or(TokenMalformation::Encoding(which))?;
+    match ::serde_json::from_slice::<::serde_json::Value>(&bytes) {
+        Ok(::serde_json::Value::Object(members)) => Ok(members),
+        _ => Err(TokenMalformation::NotJson(which)),
+    }
+}
 
 /// The characters after the `a-` prefix of an EKS pod identity association id.
 const ASSOCIATION_ID_SUFFIX_LEN: usize = 17;

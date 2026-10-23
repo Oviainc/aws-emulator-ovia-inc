@@ -31,6 +31,8 @@ mod job_queue_updates;
 mod job_state_change_events;
 #[path = "all/refusal_contract.rs"]
 mod refusal_contract;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/scheduling_policies.rs"]
 mod scheduling_policies;
 #[path = "all/service_environment.rs"]

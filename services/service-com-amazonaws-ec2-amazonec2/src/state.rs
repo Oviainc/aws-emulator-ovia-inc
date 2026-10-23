@@ -38,6 +38,14 @@
 //! [`instance_type_offerings`] derives them from the Region and the modelled
 //! `InstanceType` catalog, and `DescribeInstanceTypeOfferings` writes nothing either.
 //!
+//! An instance TYPE itself is a fact of the same kind: nothing in the EC2 API creates a
+//! type, renames one or changes its vCPUs. So [`instance_type_record`] and
+//! [`instance_type_info`] derive everything about a type from its name — the family,
+//! generation, capability letters and size [`InstanceTypeName`] parses out of it, read
+//! against the per-family ratios AWS publishes — and `DescribeInstanceTypes` writes
+//! nothing: two calls describe one type identically, and the catalog cannot drift from
+//! the one `DescribeInstanceTypeOfferings` offers.
+//!
 //! The REGIONS themselves are facts of the account's partition in the same way — no EC2
 //! operation creates a Region, and opting one in or out is the Account API's job — so
 //! [`regions_for_request`] derives them from the Region catalog and the Region the request
@@ -581,6 +589,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::Ipv6Addr;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
@@ -590,18 +599,24 @@ use crate::ops::types::{
     CapacityBlock, ExportTask, FpgaImage, FpgaImageState, ImageUsageReport, LoadPermission,
     CapacityReservationFleet, FleetCapacityReservation,
     StorageLocation, VolumeRecycleBinInfo,
-    CreateVolumeOutput, DescribeFastLaunchImagesSuccessItem, DisableFastLaunchOutput,
+    CreateVolumeOutput, DefaultConnectionTrackingConfiguration,
+    DescribeFastLaunchImagesSuccessItem, DiskInfo, DisableFastLaunchOutput,
     VolumeModification,
-    EbsBlockDevice, EnableFastLaunchOutput, GroupIdentifier, Host, INSTANCE_TYPE_VALUES, Image,
-    ImageCriterion, Instance, InstanceApplicationStatus, IpamInternetRegistryAssociation,
-    IpamPool, IpamRoutingPolicyRegistration, IpamRoutingPolicyRegistrationDelta,
+    EbsBlockDevice,
+    EbsInfo, EfaInfo, EnableFastLaunchOutput, GroupIdentifier, Host, INSTANCE_TYPE_VALUES, Image,
+    ImageCriterion, Instance, InstanceApplicationStatus, InstanceStorageInfo, InstanceTypeInfo,
+    IpamInternetRegistryAssociation, IpamPool, IpamRoutingPolicyRegistration,
+    IpamRoutingPolicyRegistrationDelta,
+    MemoryInfo, NetworkInfo, NitroTpmInfo, PlacementGroupInfo, ProcessorInfo, VCpuInfo,
     InstanceState, InstanceTypeOffering, IpPermission, IpRange, LOCATION_TYPE_VALUES,
     LaunchTemplate, MacHost, Monitoring, NetworkInsightsAccessScope,
     NetworkInsightsAccessScopeAnalysis, OperatorResponse, PeeringAttachmentStatus, Placement,
     PlacementGroup,
     PrivateDnsNameOptionsOnLaunch,
     DnsEntry, PayerResponsibilityEntry, ProductCode,
-    Region, RequestLaunchTemplateData, RouteServer, RunInstancesOutput, SecondaryNetwork,
+    Region, RequestLaunchTemplateData, RouteServer, RouteServerBfdStatus,
+    RouteServerBgpOptions, RouteServerBgpStatus, RouteServerEndpoint, RouteServerPeer,
+    RunInstancesOutput, SecondaryNetwork,
     SecondaryNetworkIpv4CidrBlockAssociation, SecondarySubnet,
     SecondarySubnetIpv4CidrBlockAssociation, SecurityGroup, ServiceConfiguration,
     SpotPlacementScore, StateReason,
@@ -1501,6 +1516,20 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// module docs. Ordered by endpoint id, which is the order
     /// `DescribeVpcEndpointConnections` reports and pages over.
     pub vpc_endpoint_connections: BTreeMap<String, VpcEndpointConnection>,
+    /// Every route server endpoint the account holds, by `RouteServerEndpointId`, as the
+    /// modelled [`RouteServerEndpoint`] shape itself, keyed and ordered like
+    /// [`Self::route_servers`].
+    pub route_server_endpoints: BTreeMap<String, RouteServerEndpoint>,
+    /// When each route server endpoint's `pending` -> `available` transition falls due.
+    pub route_server_endpoint_available_at: BTreeMap<String, Instant>,
+    /// A `CreateRouteServerEndpoint` `ClientToken` and the `RouteServerEndpointId` that
+    /// request minted.
+    pub route_server_endpoint_client_tokens: HashMap<String, String>,
+    /// Every route server peer the account holds, by `RouteServerPeerId`, as the modelled
+    /// [`RouteServerPeer`] shape itself, keyed and ordered like [`Self::route_servers`].
+    pub route_server_peers: BTreeMap<String, RouteServerPeer>,
+    /// When each route server peer's `pending` -> `available` transition falls due.
+    pub route_server_peer_available_at: BTreeMap<String, Instant>,
     /// The account's Allowed AMIs setting in each Region a caller has configured it in, by
     /// Region name — see the module docs. A Region with no entry has the setting an account
     /// that never enabled the feature has ([`AllowedImagesSettings::default`]), so a read
@@ -1711,6 +1740,11 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             dedicated_hosts: BTreeMap::new(),
             dedicated_host_client_tokens: HashMap::new(),
             vpc_endpoint_connections: BTreeMap::new(),
+            route_server_endpoints: BTreeMap::new(),
+            route_server_endpoint_available_at: BTreeMap::new(),
+            route_server_endpoint_client_tokens: HashMap::new(),
+            route_server_peers: BTreeMap::new(),
+            route_server_peer_available_at: BTreeMap::new(),
             allowed_images_settings: BTreeMap::new(),
             fpga_images: BTreeMap::new(),
             fpga_image_client_tokens: HashMap::new(),
@@ -1958,7 +1992,13 @@ impl ComAmazonawsEc2Amazonec2State {
     /// same pool differently, exactly as [`Self::insert_subnet`] does for a subnet. The
     /// caller-chosen bytes of the pool's CIDRs and tags are charged against the store's
     /// byte budget here, so a writer cannot store them uncharged.
-    pub fn insert_coip_pool(&mut self, spec: CoipPoolSpec) -> String {
+    /// `None` means the store is at [`MAX_STORED_RECORDS_PER_STORE`] and NOTHING was stored: the
+    /// ceiling is enforced here, the way [`Self::insert_vpc_endpoint_connection`] enforces
+    /// its own, so a writer that forgets to ask cannot grow the store without bound.
+    pub fn insert_coip_pool(&mut self, spec: CoipPoolSpec) -> Option<String> {
+        if self.coip_pools.len() >= MAX_STORED_RECORDS_PER_STORE {
+            return None;
+        }
         // [`COIP_POOL_ID_PREFIX`] carries its own separator, the way
         // [`coip_pool_id_is_well_formed`] reads one, while [`Self::next_id`] adds one.
         let pool_id = self.next_id(COIP_POOL_ID_PREFIX.trim_end_matches('-'));
@@ -1974,11 +2014,15 @@ impl ComAmazonawsEc2Amazonec2State {
             )),
         };
         let cidr_bytes: usize = pool.pool_cidrs.iter().flatten().map(String::len).sum();
+        // [`STORED_RECORD_OVERHEAD_BYTES`] beside the caller-chosen bytes, so a pool with no CIDRs
+        // and no tags is not free against the byte budget either.
         self.add_stored_bytes(
-            cidr_bytes + tag_list_bytes(pool.tags.as_deref().unwrap_or_default()),
+            cidr_bytes
+                .saturating_add(tag_list_bytes(pool.tags.as_deref().unwrap_or_default()))
+                .saturating_add(STORED_RECORD_OVERHEAD_BYTES),
         );
         self.coip_pools.insert(pool_id.clone(), pool);
-        pool_id
+        Some(pool_id)
     }
 
     /// Give `vpc_id` the default subnet AWS creates in each Availability Zone of
@@ -2692,8 +2736,11 @@ impl ComAmazonawsEc2Amazonec2State {
     /// has one — an instance's next state, a `pending` VPC becoming `available` with
     /// its IPv6 association moving `associating` -> `associated`, a `pending` subnet
     /// becoming `available`, a `pending` transit gateway with the route tables that come up
-    /// with it, a VPC BPA exclusion reaching `create-complete`, a Windows fast launch
-    /// configuration reaching `enabled` or finishing the cleanup a disable started, a
+    /// with it, a `pending` route server endpoint or route server peer becoming
+    /// `available` (a route server's own two states are derived on read by
+    /// [`RouteServerRecord::view_at`] instead), a VPC BPA exclusion reaching
+    /// `create-complete`, a Windows fast
+    /// launch configuration reaching `enabled` or finishing the cleanup a disable started, a
     /// `pending-withdrawal` BYOIP range reaching the end of its withdrawal, and a
     /// `pending-deprovision` BYOIP range reaching the end of its release — leaving the
     /// account, or landing in `failed-deprovision` when addresses are still allocated from
@@ -2844,6 +2891,37 @@ impl ComAmazonawsEc2Amazonec2State {
                     }
                 }
                 // The transition is applied once; nothing is owed on this gateway any more.
+                false
+            });
+        // A route server, its endpoints and its peers come up the same way: each is
+        // answered in the non-terminal `pending` state its create hands back, so the clock
+        // owes it `available` one TRANSITION_DELAY later whether or not anybody calls
+        // again. A route server whose create asked for route persistence is `enabling` it
+        // over exactly that span, so it reaches `enabled` on the same instant.
+        let route_server_endpoints = &mut self.route_server_endpoints;
+        self.route_server_endpoint_available_at
+            .retain(|route_server_endpoint_id, due_at| {
+                if now < *due_at {
+                    return true;
+                }
+                if let Some(endpoint) = route_server_endpoints.get_mut(route_server_endpoint_id) {
+                    if endpoint.state.as_deref() == Some(ROUTE_SERVER_ENDPOINT_STATE_PENDING) {
+                        endpoint.state = Some(ROUTE_SERVER_ENDPOINT_STATE_AVAILABLE.to_string());
+                    }
+                }
+                false
+            });
+        let route_server_peers = &mut self.route_server_peers;
+        self.route_server_peer_available_at
+            .retain(|route_server_peer_id, due_at| {
+                if now < *due_at {
+                    return true;
+                }
+                if let Some(peer) = route_server_peers.get_mut(route_server_peer_id) {
+                    if peer.state.as_deref() == Some(ROUTE_SERVER_PEER_STATE_PENDING) {
+                        peer.state = Some(ROUTE_SERVER_PEER_STATE_AVAILABLE.to_string());
+                    }
+                }
                 false
             });
         self.fast_launch_images.retain(|_image_id, record| {
@@ -3826,6 +3904,1078 @@ pub fn offering_page_cursor(offering: &InstanceTypeOfferingRecord) -> String {
 }
 
 // =============================================================================
+// Instance types: what the catalog publishes about each type
+// =============================================================================
+
+/// The parts of an instance type name: `m5d.24xlarge` is the family `m5d` — the family
+/// letters `m`, the generation `5` and the capability letters `d` — at the size
+/// `24xlarge`.
+///
+/// AWS documents the form in "Instance type naming conventions" (Amazon EC2 User
+/// Guide): the instance family, the generation number, additional capability letters
+/// (`a` AMD, `g` AWS Graviton, `i` Intel, `d` instance store volumes, `n` network and
+/// EBS optimized, `b` block storage optimized, `e` extra capacity, `z` high frequency,
+/// `flex` flexible), then the size. A `-` inside the family introduces a sub-model
+/// rather than more capabilities (`m7i-flex`, `u7i-12tb`, `mac2-m2pro`, `p6-b200`), so
+/// the capability letters stop there.
+///
+/// Every fact this module derives about an instance type is derived from these parts
+/// and the published per-family ratios below, so one rule answers the whole catalog
+/// ([`offered_instance_types`]) rather than a table that covers the types somebody
+/// happened to list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstanceTypeName<'a> {
+    /// `m5d` — everything before the dot.
+    pub family: &'a str,
+    /// `m` — the family's leading letters, which name the family itself.
+    pub root: &'a str,
+    /// `5` — the generation number, absent in the families that carry none
+    /// (`u-6tb1`, `mac-m4`).
+    pub generation: Option<u32>,
+    /// `d` — the capability letters between the generation and any `-`.
+    pub attributes: &'a str,
+    /// `24xlarge`, `large`, `metal`, `metal-48xl` — everything after the dot.
+    pub size: &'a str,
+}
+
+impl<'a> InstanceTypeName<'a> {
+    /// `instance_type` split into its parts, or `None` when it is not of the form
+    /// `<family>.<size>`.
+    ///
+    /// The family is the one [`instance_family_of`] reports; this also needs the size,
+    /// and a value carrying none is not an instance type, so both are read here.
+    pub fn parse(instance_type: &'a str) -> Option<Self> {
+        let (family, size) = instance_type.split_once('.')?;
+        if family.is_empty() || size.is_empty() {
+            return None;
+        }
+        let letters = family
+            .find(|c: char| !c.is_ascii_alphabetic())
+            .unwrap_or(family.len());
+        let (root, rest) = family.split_at(letters);
+        let digits = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        let (generation, rest) = rest.split_at(digits);
+        Some(Self {
+            family,
+            root,
+            generation: generation.parse().ok(),
+            attributes: rest.split('-').next().unwrap_or_default(),
+            size,
+        })
+    }
+
+    /// Does the family carry the capability letter `letter`?
+    pub fn has_attribute(&self, letter: char) -> bool {
+        self.attributes.contains(letter)
+    }
+
+    /// Is this a bare metal size — `metal`, or one of the sized `metal-<N>xl` forms?
+    pub fn bare_metal(&self) -> bool {
+        self.size == "metal" || self.size.starts_with("metal-")
+    }
+
+    /// Is this a "burstable performance T instance type"
+    /// (`DescribeInstanceTypesRequest$Filters`), which is what the `t` family letter
+    /// names?
+    pub fn burstable(&self) -> bool {
+        self.root == BURSTABLE_ROOT
+    }
+
+    /// Is this an AWS Graviton instance type?
+    ///
+    /// The naming conventions define the `g` capability letter as "AWS Graviton
+    /// processor", and [`FIRST_GRAVITON_FAMILY`] is the first Graviton family, which
+    /// predates the letter. Every Graviton instance type runs on the Nitro System.
+    pub fn graviton(&self) -> bool {
+        self.has_attribute('g') || self.family == FIRST_GRAVITON_FAMILY
+    }
+
+    /// Is this instance type current generation — "the latest generation instance type
+    /// of an instance family" (`DescribeInstanceTypesRequest$Filters`)?
+    ///
+    /// AWS publishes the answer as a list of the families that are NOT:
+    /// [`PREVIOUS_GENERATION_FAMILIES`], its "Previous generation instances" page. The
+    /// generation NUMBER cannot stand in for that list — the modern families whose
+    /// ladder is still young (`z1d`, `inf1`, `trn1`, `x2gd`) carry a low one, and the
+    /// long-lived `t2` carries a lower one than families that page does list.
+    pub fn current_generation(&self) -> bool {
+        !PREVIOUS_GENERATION_FAMILIES.contains(&self.family)
+    }
+
+    /// Does this instance type run on the AWS Nitro System?
+    ///
+    /// The Nitro System carries every instance type from [`FIRST_NITRO_GENERATION`] on,
+    /// every Graviton type, every EC2 Mac, the burstable families from their third
+    /// generation ([`FIRST_NITRO_BURSTABLE_GENERATION`], the T3 generation that moved
+    /// them onto it), and the earlier families the EC2 User Guide's list of instances
+    /// built on the Nitro System names ([`EARLY_NITRO_FAMILIES`]).
+    ///
+    /// This is NOT the same line as [`Self::current_generation`]: `t2` is current and
+    /// runs on the Xen hypervisor, while `a1` runs on Nitro and is previous generation.
+    pub fn nitro(&self) -> bool {
+        if self.burstable() {
+            return self
+                .generation
+                .is_none_or(|generation| generation >= FIRST_NITRO_BURSTABLE_GENERATION);
+        }
+        self.graviton()
+            || self.root == MAC_INSTANCE_FAMILY_PREFIX
+            || EARLY_NITRO_FAMILIES.contains(&self.family)
+            || self
+                .generation
+                .is_none_or(|generation| generation >= FIRST_NITRO_GENERATION)
+    }
+}
+
+/// The first generation that runs on the AWS Nitro System: the fifth generation of each
+/// family moved onto it wholesale.
+pub const FIRST_NITRO_GENERATION: u32 = 5;
+
+/// The burstable generation that moved onto the AWS Nitro System: T3, two generations
+/// before the ladder's fifth, while T1 and T2 ran on the Xen hypervisor.
+pub const FIRST_NITRO_BURSTABLE_GENERATION: u32 = 3;
+
+/// The families AWS lists on its "Previous generation instances" page — the ones that are
+/// NOT current generation. Everything else is, including the fourth generation families
+/// (`c4`, `m4`, `r4`) and the modern families whose ladder has not reached a fifth
+/// generation yet.
+const PREVIOUS_GENERATION_FAMILIES: [&str; 16] = [
+    "a1", "c1", "c3", "cc1", "cc2", "cg1", "cr1", "g2", "hi1", "hs1", "i2", "m1", "m2", "m3",
+    "r3", "t1",
+];
+
+/// The families that run on the Nitro System from BEFORE their fifth generation, as the
+/// EC2 User Guide's list of "instances built on the Nitro System" names them. The
+/// Graviton families, the EC2 Macs and the burstable families from T3 on are answered by
+/// [`InstanceTypeName::nitro`] itself rather than listed here.
+const EARLY_NITRO_FAMILIES: [&str; 24] = [
+    "d3", "d3en", "dl1", "dl2q", "f2", "g4ad", "g4dn", "i3en", "i4g", "i4i", "im4gn", "inf1",
+    "inf2", "is4gen", "p3dn", "p4d", "p4de", "trn1", "trn1n", "vt1", "x2idn", "x2iedn",
+    "x2iezn", "z1d",
+];
+
+/// The first generation that can hibernate, among the families the hibernation
+/// prerequisites name (C, M, R and T): the prerequisites list those families from their
+/// third generation on, and the burstable ones from their second.
+const FIRST_HIBERNATION_GENERATION: u32 = 3;
+
+/// The first burstable generation the hibernation prerequisites name (T2).
+const FIRST_HIBERNATION_BURSTABLE_GENERATION: u32 = 2;
+
+/// The family of the first AWS Graviton instance type.
+const FIRST_GRAVITON_FAMILY: &str = "a1";
+
+/// The family letters of the burstable performance instance types.
+const BURSTABLE_ROOT: &str = "t";
+
+/// The family letters of the HPC instance types, which ship with simultaneous
+/// multithreading disabled and carry an Elastic Fabric Adapter at every size.
+const HPC_ROOT: &str = "hpc";
+
+/// One `large` size, in the sixteenths [`instance_size_sixteenths`] counts in.
+const SIZE_UNIT: u32 = 16;
+
+/// The vCPUs one `large` unit of size carries: AWS's `large` is a two-vCPU instance and
+/// the ladder doubles from there, so every size of every family follows from this.
+const VCPUS_PER_SIZE_UNIT: u32 = 2;
+
+/// The largest single local device an instance store is presented as; a bigger store is
+/// more devices of this size rather than one larger device (the disk counts published
+/// in "Instance store volumes", where a 15,200 GB store is 8 devices of 1,900 GB).
+const MAX_INSTANCE_STORE_DISK_GB: u64 = 1_900;
+
+/// The least vCPUs AWS Nitro Enclaves needs: "the instance type must have at least 4
+/// vCPUs" (Nitro Enclaves User Guide).
+const MIN_ENCLAVE_VCPUS: i32 = 4;
+
+/// The most memory an instance type may have and still hibernate: the hibernation
+/// prerequisites give "instance RAM size — must be less than 150 GiB".
+const MAX_HIBERNATION_MEMORY_MIB: i64 = 150 * 1024;
+
+/// The generation from which Amazon EBS encryption is supported; the oldest families
+/// predate it.
+const FIRST_EBS_ENCRYPTION_GENERATION: u32 = 3;
+
+/// The generation from which an NVMe instance store appears, on the storage optimized
+/// families: the I3 family and everything after it presents local NVMe devices, while
+/// the older families present SATA SSDs or magnetic disks.
+const FIRST_NVME_STORAGE_GENERATION: u32 = 3;
+
+/// The generation from which the AMD families support AMD SEV-SNP (the memory
+/// encryption feature `processor-info.supported-features` reports).
+const FIRST_SEV_SNP_GENERATION: u32 = 6;
+
+/// The smallest size, in sixteenths, that an Elastic Fabric Adapter is offered on: EFA
+/// is an option of the largest sizes of a family (EC2 User Guide, "Elastic Fabric
+/// Adapter"), which from the 16xlarge up is what this names.
+const EFA_MINIMUM_SIXTEENTHS: u32 = 16 * 2 * SIZE_UNIT;
+
+/// The NitroTPM version a Nitro instance type offers — "the supported NitroTPM version
+/// (2.0)" (`DescribeInstanceTypesRequest$Filters`).
+const NITRO_TPM_VERSION: &str = "2.0";
+
+/// The EBS attachments a Nitro instance type has, shared between its EBS volumes, its
+/// network interfaces and its NVMe instance store devices: "most Nitro instances
+/// support a maximum of 28 attachments" (EC2 User Guide, "Instance volume limits").
+const NITRO_ATTACHMENT_LIMIT: i32 = 28;
+
+/// The EBS volumes a pre-Nitro (Xen) instance type can have attached, a limit of its
+/// own rather than one shared with its interfaces (same page).
+const XEN_EBS_VOLUME_LIMIT: i32 = 27;
+
+/// The default connection tracking idle timeouts, in seconds, that a Nitro instance
+/// type reports — the values the EC2 User Guide publishes under "Connection tracking
+/// timeouts": 432,000 s for an established TCP connection, 30 s for UDP and 180 s for
+/// a UDP stream.
+const CONNECTION_TRACKING_TIMEOUTS: (i32, i32, i32) = (432_000, 30, 180);
+
+/// The instance types the Amazon Web Services Free Tier covers: "750 hours per month of
+/// Linux, RHEL or SLES t2.micro or t3.micro instance usage" (AWS Free Tier).
+const FREE_TIER_INSTANCE_TYPES: [&str; 2] = ["t2.micro", "t3.micro"];
+
+/// The instance types that run 32-bit AMIs, each of which also runs 64-bit ones: the
+/// four previous generation sizes the EC2 User Guide lists for `i386`.
+const I386_INSTANCE_TYPES: [&str; 4] = ["c1.medium", "m1.medium", "m1.small", "t1.micro"];
+
+/// The previous generation families whose AMIs are paravirtual and never HVM (EC2 User
+/// Guide, "Linux AMI virtualization types").
+const PARAVIRTUAL_ONLY_FAMILIES: [&str; 4] = ["c1", "m1", "m2", "t1"];
+
+/// The previous generation families that run both paravirtual and HVM AMIs (same page).
+const PARAVIRTUAL_AND_HVM_FAMILIES: [&str; 10] = [
+    "c3", "cc1", "cc2", "cg1", "cr1", "g2", "hi1", "hs1", "i2", "m3",
+];
+
+/// The family letters whose instance storage IS the family: the storage optimized
+/// families, which carry local devices at every size rather than only in their `d`
+/// sizes ("Instance store volumes").
+const LOCAL_STORAGE_ROOTS: [&str; 7] = ["d", "h", "hi", "hs", "i", "im", "is"];
+
+/// The families outside [`LOCAL_STORAGE_ROOTS`] whose names do not end in the `d`
+/// capability letter and that still ship local devices: the accelerated families with
+/// local NVMe and the previous generation families that came with instance store
+/// volumes (same page).
+const LOCAL_STORAGE_FAMILIES: [&str; 23] = [
+    "c1", "c3", "cc1", "cc2", "cg1", "cr1", "dl1", "dl2q", "f1", "f2", "g2", "g5", "g5g", "g6",
+    "g6e", "g7", "g7e", "m1", "m2", "m3", "r3", "x1", "x1e",
+];
+
+/// The families whose instance store is magnetic rather than solid state — the dense
+/// HDD storage families and the oldest general purpose and compute families (same
+/// page). Every other instance store is `ssd`.
+const HDD_STORAGE_FAMILIES: [&str; 9] =
+    ["c1", "d2", "d3", "d3en", "h1", "hs1", "m1", "m2", "m3"];
+
+/// The vCPUs and memory (GiB) of each EC2 Mac host, whose only size is `metal` so the
+/// size ladder gives neither: the configurations published in "Amazon EC2 Mac
+/// instances" — `mac1` an Intel Mac mini, the rest Apple silicon Macs.
+const MAC_HOSTS: [(&str, i32, i64); 9] = [
+    ("mac1", 12, 32),
+    ("mac2", 8, 16),
+    ("mac2-m2", 8, 24),
+    ("mac2-m2pro", 12, 32),
+    ("mac2-m1ultra", 20, 128),
+    ("mac-m3ultra", 28, 96),
+    ("mac-m4", 10, 24),
+    ("mac-m4pro", 14, 48),
+    ("mac-m4max", 16, 128),
+];
+
+/// The size component of an instance type name, in SIXTEENTHS of the family's `large`
+/// size.
+///
+/// AWS's size ladder doubles at each step — `large`, `xlarge`, `2xlarge`, … — and the
+/// sizes below `large` are fractions of it: `medium` a half, `small` a quarter, `micro`
+/// an eighth and `nano` a sixteenth. Counting in sixteenths is what lets ONE published
+/// per-family ratio describe every size of that family in whole numbers.
+///
+/// `metal-48xl` is the 48xlarge-sized bare metal size, so it is on the ladder. A plain
+/// `metal` names the whole host, whose size the name itself does not give, so it is
+/// answered `None` here and resolved by [`instance_size_sixteenths_of`].
+pub fn instance_size_sixteenths(size: &str) -> Option<u32> {
+    match size {
+        "nano" => Some(SIZE_UNIT / 16),
+        "micro" => Some(SIZE_UNIT / 8),
+        "small" => Some(SIZE_UNIT / 4),
+        "medium" => Some(SIZE_UNIT / 2),
+        "large" => Some(SIZE_UNIT),
+        "xlarge" => Some(2 * SIZE_UNIT),
+        "metal" => None,
+        _ => {
+            let multiple = size.strip_suffix("xlarge").or_else(|| {
+                size.strip_prefix("metal-")
+                    .and_then(|sized| sized.strip_suffix("xl"))
+            })?;
+            multiple
+                .parse::<u32>()
+                .ok()
+                .map(|multiple| multiple * 2 * SIZE_UNIT)
+        }
+    }
+}
+
+/// The size of `name`, in sixteenths of a `large`, with a plain `metal` resolved.
+///
+/// A bare metal instance is the WHOLE host its family's virtualized sizes are carved
+/// out of, so its size is the largest of those sizes; a family with none at all (an EC2
+/// Mac, whose vCPUs and memory come from [`MAC_HOSTS`] instead) falls back to one unit.
+fn instance_size_sixteenths_of(name: &InstanceTypeName<'_>) -> u32 {
+    if let Some(sixteenths) = instance_size_sixteenths(name.size) {
+        return sixteenths;
+    }
+    largest_virtualized_sixteenths(name.family).unwrap_or(SIZE_UNIT)
+}
+
+/// The size of the largest size of `family` that is not bare metal, in sixteenths.
+fn largest_virtualized_sixteenths(family: &str) -> Option<u32> {
+    largest_virtualized_sizes().get(family).copied()
+}
+
+/// The largest virtualized size of every family of the catalog, in sixteenths, computed
+/// ONCE.
+///
+/// The catalog is a constant, so this is too: without it, every bare metal type would
+/// re-scan and re-parse all of [`offered_instance_types`], making a describe of the whole
+/// catalog cost bare metal types x catalog instead of one pass.
+fn largest_virtualized_sizes() -> &'static HashMap<&'static str, u32> {
+    static SIZES: OnceLock<HashMap<&'static str, u32>> = OnceLock::new();
+    SIZES.get_or_init(|| {
+        let mut sizes: HashMap<&'static str, u32> = HashMap::new();
+        for instance_type in offered_instance_types().iter().copied() {
+            let Some(parsed) = InstanceTypeName::parse(instance_type) else {
+                continue;
+            };
+            let Some(sixteenths) = instance_size_sixteenths(parsed.size) else {
+                continue;
+            };
+            let largest = sizes.entry(parsed.family).or_default();
+            *largest = (*largest).max(sixteenths);
+        }
+        sizes
+    })
+}
+
+/// The memory, in MiB per `large` unit of size, of the families whose published
+/// memory-to-vCPU ratio differs from their family letter's — the Haswell and Broadwell
+/// era storage and accelerated families at 7.625 GiB per vCPU (so 15.25 GiB per unit),
+/// the X1 and X1e pair at 15.25 and 30.5, and the storage families a later generation
+/// moved off their letter's ratio. Each figure is the one that family's page in the EC2
+/// User Guide's "Instance types" chapter publishes.
+const MEMORY_MIB_PER_SIZE_UNIT: [(&str, i64); 9] = [
+    ("d2", 15_616),
+    ("d3en", 8_192),
+    ("f1", 31_232),
+    ("i2", 15_616),
+    ("i3", 15_616),
+    ("p2", 31_232),
+    ("p3", 15_616),
+    ("x1", 31_232),
+    ("x1e", 62_464),
+];
+
+/// The memory, in MiB per `large` unit of size, of the family `name` belongs to.
+///
+/// This is that family's published memory-to-vCPU ratio, with two vCPUs to a `large`
+/// unit: 4 GiB per vCPU for the general purpose families, 2 for the compute optimized
+/// ones, 8 for the memory optimized ones, and the ratio each storage and accelerated
+/// family publishes on its own page of the EC2 User Guide's "Instance types" chapter.
+/// It is applied to the size ladder, which is what makes `m5.large` 8 GiB and
+/// `m5.24xlarge` 384 GiB from one number.
+///
+/// A family whose published ratio is not its family letter's — including the ones that
+/// are not a whole number of GiB per unit — has its own entry in
+/// [`MEMORY_MIB_PER_SIZE_UNIT`], so `i3.large` is described with the published 15.25 GiB
+/// rather than its letter's 16.
+fn memory_mib_per_size_unit(name: &InstanceTypeName<'_>) -> i64 {
+    if let Some((_, mib_per_unit)) = MEMORY_MIB_PER_SIZE_UNIT
+        .iter()
+        .find(|(family, _)| *family == name.family)
+    {
+        return *mib_per_unit;
+    }
+    let gib_per_unit = match name.root {
+        "a" => 4,
+        "c" | HPC_ROOT => 4,
+        "vt" => 4,
+        "g" | "inf" | "trn" | "cc" | "cg" => 8,
+        "im" => 8,
+        "h" | "hi" | "hs" => 8,
+        "is" => 12,
+        "d" | "dl" | "f" | "gr" | "i" | "r" | "z" | "cr" => 16,
+        "p" => 24,
+        "x" => 32,
+        // The general purpose and burstable families, and anything a later model adds.
+        _ => 8,
+    };
+    gib_per_unit * 1024
+}
+
+/// The memory a High Memory family's name states, in GiB.
+///
+/// The `u-*` and `u7*` families are the ones whose name carries their memory size
+/// rather than deriving it from the size ladder — `u-6tb1` is a 6 TiB instance and
+/// `u7i-12tb` a 12 TiB one — and every size of one such family has the same memory.
+fn stated_memory_gib(family: &str) -> Option<i64> {
+    let token = family.split('-').nth(1)?;
+    let digits = token.find(|c: char| !c.is_ascii_digit())?;
+    if !token[digits..].starts_with("tb") {
+        return None;
+    }
+    token[..digits].parse::<i64>().ok().map(|tib| tib * 1024)
+}
+
+/// The vCPUs and memory of the EC2 Mac host `family` names, if it is one.
+fn mac_host(family: &str) -> Option<(i32, i64)> {
+    MAC_HOSTS
+        .iter()
+        .find(|(host, _, _)| *host == family)
+        .map(|(_, vcpus, memory_gib)| (*vcpus, *memory_gib))
+}
+
+/// The default vCPUs of one size of one family.
+fn default_vcpus(name: &InstanceTypeName<'_>, sixteenths: u32) -> i32 {
+    // The burstable sizes below `xlarge` do not follow the ladder: the T3 and later
+    // families are offered with two vCPUs from `nano` up to `large`, and the T1 and T2
+    // sizes below `medium` with one (the vCPU counts published in "Burstable
+    // performance instances").
+    if name.burstable() && sixteenths < 2 * SIZE_UNIT {
+        let smallest = sixteenths <= SIZE_UNIT / 4;
+        let single = smallest && name.generation.is_some_and(|generation| generation < 3);
+        return if single { 1 } else { 2 };
+    }
+    let mut vcpus = (sixteenths * VCPUS_PER_SIZE_UNIT / SIZE_UNIT).max(1);
+    // An HPC family ships with simultaneous multithreading DISABLED, so where the
+    // hardware has a second thread per core the ladder's threads arrive as half as many
+    // vCPUs: `hpc6a.48xlarge` has 96 vCPUs, not 192. A Graviton HPC family has no second
+    // thread to disable, so its ladder count is already its vCPU count.
+    if name.root == HPC_ROOT && !name.graviton() {
+        vcpus = (vcpus / 2).max(1);
+    }
+    i32::try_from(vcpus).unwrap_or(i32::MAX)
+}
+
+/// The threads per core one instance type runs.
+///
+/// AWS Graviton and Apple silicon processors have one thread per core, and the HPC
+/// families ship with simultaneous multithreading disabled ("Hpc instances ... have
+/// hyper-threading disabled"); every Intel and AMD family runs two — including the Intel
+/// `mac1`, which is why the single-thread rule is the ARM one rather than every Mac. A
+/// type with a single vCPU has a single thread on a single core whatever the processor.
+fn default_threads_per_core(
+    name: &InstanceTypeName<'_>,
+    architecture: &str,
+    default_vcpus: i32,
+) -> i32 {
+    let single =
+        default_vcpus < 2 || architecture.starts_with("arm64") || name.root == HPC_ROOT;
+    if single { 1 } else { 2 }
+}
+
+/// The memory of one size of one family, in MiB.
+fn memory_mib_of(name: &InstanceTypeName<'_>, sixteenths: u32) -> i64 {
+    if let Some(gib) = stated_memory_gib(name.family) {
+        return gib * 1024;
+    }
+    memory_mib_per_size_unit(name) * i64::from(sixteenths) / i64::from(SIZE_UNIT)
+}
+
+/// Does this instance type come with local instance storage?
+///
+/// The `d` capability letter means "instance store volumes" (the naming conventions),
+/// the storage optimized families carry devices at every size, and
+/// [`LOCAL_STORAGE_FAMILIES`] are the ones outside both that still ship them.
+fn has_instance_storage(name: &InstanceTypeName<'_>) -> bool {
+    name.has_attribute('d')
+        || LOCAL_STORAGE_ROOTS.contains(&name.root)
+        || LOCAL_STORAGE_FAMILIES.contains(&name.family)
+        || name.root == "trn"
+        || (name.root == "p" && name.generation.is_some_and(|generation| generation >= 5))
+}
+
+/// The local instance storage, in GB per `large` unit of size, of the family `name`
+/// belongs to — the published instance store size of that family's `large` size
+/// ("Instance store volumes"), applied to the size ladder the same way the memory ratio
+/// is.
+fn instance_storage_gb_per_size_unit(name: &InstanceTypeName<'_>) -> u64 {
+    match name.root {
+        "c" => 50,
+        "x" => 118,
+        "g" | "gr" => 125,
+        "vt" => 100,
+        "f" | "p" | "trn" => 250,
+        "h" | "dl" => 500,
+        "hi" | "hs" => 1_000,
+        "d" => 3_000,
+        "i" => 475,
+        "im" => 937,
+        "is" => 1_250,
+        // The general purpose, memory optimized and high frequency `d` sizes.
+        _ => 75,
+    }
+}
+
+/// Is this instance type's instance store NVMe?
+///
+/// NVMe instance stores arrive with the Nitro System and, before it, with the
+/// [`FIRST_NVME_STORAGE_GENERATION`] storage optimized family; the older families
+/// present SATA SSDs or magnetic disks.
+fn nvme_instance_storage(name: &InstanceTypeName<'_>) -> bool {
+    name.nitro()
+        || (name.root == "i"
+            && name
+                .generation
+                .is_some_and(|generation| generation >= FIRST_NVME_STORAGE_GENERATION))
+}
+
+/// Can this instance type hibernate?
+///
+/// The hibernation prerequisites name the supported families — the C, M and R families
+/// from their third generation on and the T families from their second — and bound the
+/// instance's RAM at [`MAX_HIBERNATION_MEMORY_MIB`]. Hibernation saves the instance's
+/// memory to its EBS root volume, which a bare metal instance has no hypervisor to do
+/// and which cannot preserve an instance store, so neither of those can hibernate.
+fn hibernation_supported(
+    name: &InstanceTypeName<'_>,
+    memory_mib: i64,
+    instance_storage: bool,
+) -> bool {
+    let first = if name.burstable() {
+        FIRST_HIBERNATION_BURSTABLE_GENERATION
+    } else {
+        FIRST_HIBERNATION_GENERATION
+    };
+    matches!(name.root, "c" | "m" | "r" | "t")
+        && name.generation.is_some_and(|generation| generation >= first)
+        && !name.bare_metal()
+        && !instance_storage
+        && memory_mib < MAX_HIBERNATION_MEMORY_MIB
+}
+
+/// The maximum network interfaces, and private IPv4 addresses per interface, of one
+/// size.
+///
+/// Both grow with the size of the instance, which is the shape of the published "IP
+/// addresses per network interface per instance type" table, read here one row per step
+/// of the size ladder: 2 interfaces of 2 addresses at `nano` and `micro`, 3 of 4 at
+/// `small`, 3 of 6 at `medium`, 3 of 10 at `large`, 4 of 15 through the
+/// `xlarge`–`3xlarge` sizes, 8 of 30 through the `4xlarge`–`12xlarge` sizes and 15 of
+/// 50 from the `16xlarge` up. The bounds are in the sixteenths
+/// [`instance_size_sixteenths`] counts in, so `large` is 16 and each arm covers the
+/// ladder steps up to the next row's size.
+fn network_limits(sixteenths: u32) -> (i32, i32) {
+    match sixteenths {
+        ..=2 => (2, 2),
+        3..=4 => (3, 4),
+        5..=8 => (3, 6),
+        9..=31 => (3, 10),
+        32..=127 => (4, 15),
+        128..=511 => (8, 30),
+        _ => (15, 50),
+    }
+}
+
+/// The Elastic Fabric Adapters one instance type may carry.
+///
+/// EFA is offered on the HPC families and on the largest sizes of the network optimized
+/// (`n`) and accelerated families (EC2 User Guide, "Elastic Fabric Adapter"), each of
+/// which carries one on its default network card. A type that is not offered one
+/// reports no EFA at all.
+fn efa_interfaces(name: &InstanceTypeName<'_>, sixteenths: u32) -> i32 {
+    let accelerated = matches!(name.root, "p" | "trn" | "dl" | "inf");
+    let offered = name.root == HPC_ROOT
+        || ((name.has_attribute('n') || accelerated) && sixteenths >= EFA_MINIMUM_SIXTEENTHS);
+    i32::from(offered)
+}
+
+/// The local instance storage of one instance type, as the describe reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstanceStorageFacts {
+    /// The total size of every local device, in GB.
+    pub total_size_gb: i64,
+    /// How many local devices the instance has.
+    pub disk_count: i32,
+    /// The size of each one, in GB.
+    pub disk_size_gb: i64,
+    /// `ssd` or `hdd`.
+    pub disk_type: &'static str,
+    /// Is the store presented as NVMe devices?
+    pub nvme: bool,
+}
+
+impl InstanceStorageFacts {
+    /// This instance store as the modelled `InstanceStorageInfo` shape.
+    ///
+    /// "Instance store volumes on Nitro-based instances are encrypted" with a key the
+    /// host holds and the caller never sees, so encryption is `required` exactly where
+    /// the devices are NVMe, and not offered at all on the older SATA and magnetic
+    /// stores.
+    pub fn to_instance_storage_info(&self) -> InstanceStorageInfo {
+        let support = if self.nvme { "required" } else { "unsupported" };
+        InstanceStorageInfo {
+            total_size_in_gb: Some(self.total_size_gb),
+            disks: Some(vec![DiskInfo {
+                size_in_gb: Some(self.disk_size_gb),
+                count: Some(self.disk_count),
+                r#type: Some(self.disk_type.to_string()),
+            }]),
+            nvme_support: Some(support.to_string()),
+            encryption_support: Some(support.to_string()),
+        }
+    }
+}
+
+/// The local instance storage of one size of one family, or `None` when the type has
+/// none.
+fn instance_storage_facts(
+    name: &InstanceTypeName<'_>,
+    sixteenths: u32,
+) -> Option<InstanceStorageFacts> {
+    if !has_instance_storage(name) {
+        return None;
+    }
+    let total_gb = (instance_storage_gb_per_size_unit(name) * u64::from(sixteenths)
+        / u64::from(SIZE_UNIT))
+    .max(1);
+    // AWS presents an instance store as equal-sized devices, each at most
+    // [`MAX_INSTANCE_STORE_DISK_GB`], so a bigger store is more devices rather than a
+    // bigger one — and the total is the sum of the devices the instance actually has.
+    let disk_count = total_gb.div_ceil(MAX_INSTANCE_STORE_DISK_GB).max(1);
+    let disk_size_gb = total_gb / disk_count;
+    Some(InstanceStorageFacts {
+        total_size_gb: i64::try_from(disk_size_gb * disk_count).unwrap_or(i64::MAX),
+        disk_count: i32::try_from(disk_count).unwrap_or(i32::MAX),
+        disk_size_gb: i64::try_from(disk_size_gb).unwrap_or(i64::MAX),
+        disk_type: if HDD_STORAGE_FAMILIES.contains(&name.family) {
+            "hdd"
+        } else {
+            "ssd"
+        },
+        nvme: nvme_instance_storage(name),
+    })
+}
+
+/// The facts about one instance type a caller sees or is held to: what a guest sees of
+/// its own CPU and memory, and what the service checks a request against.
+///
+/// Every field is derived from the type's name by [`instance_type_record`], so an
+/// instance type is described the same way wherever it is reached. Today the one reader
+/// is [`instance_type_info`], which projects it into the modelled `InstanceTypeInfo`;
+/// the split is what keeps the derived FACTS usable by an operation that has to validate
+/// a request against a type (CPU options, hibernation support, how many private
+/// addresses an interface may take) rather than report it, without that operation
+/// building a whole response shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceTypeRecord {
+    /// `m5.xlarge` — a value of the modelled `InstanceType` enum.
+    pub instance_type: String,
+    /// The vCPUs the instance type runs with when the request asks for no CPU options.
+    pub default_vcpus: i32,
+    /// Those vCPUs' cores: `default_vcpus / default_threads_per_core`.
+    pub default_cores: i32,
+    /// The threads each core runs.
+    pub default_threads_per_core: i32,
+    /// The instance type's memory, in MiB.
+    pub memory_mib: i64,
+    /// Is this a bare metal instance type?
+    pub bare_metal: bool,
+    /// Is this a burstable performance T instance type?
+    pub burstable: bool,
+    /// Is this the latest generation of its family?
+    pub current_generation: bool,
+    /// Does it run on the AWS Nitro System?
+    pub nitro: bool,
+    /// The processor architecture, one value of the modelled `ArchitectureValues`.
+    pub architecture: String,
+    /// Its local instance storage, if it has any.
+    pub instance_storage: Option<InstanceStorageFacts>,
+    /// Is On-Demand hibernation supported?
+    pub hibernation_supported: bool,
+    /// The most network interfaces it can have attached.
+    pub maximum_network_interfaces: i32,
+    /// The most private IPv4 addresses each of those interfaces can have.
+    pub ipv4_addresses_per_interface: i32,
+}
+
+impl InstanceTypeRecord {
+    /// The core counts a caller may ask this instance type for: "the number of cores
+    /// that can be configured for the instance type"
+    /// (`VCpuInfo$ValidCores`) — one core up to the type's own default.
+    pub fn valid_cores(&self) -> Vec<i32> {
+        (1..=self.default_cores).collect()
+    }
+
+    /// The threads-per-core counts a caller may ask for: one thread per core disables
+    /// simultaneous multithreading, which is possible exactly where the type runs more
+    /// than one thread per core to begin with.
+    pub fn valid_threads_per_core(&self) -> Vec<i32> {
+        (1..=self.default_threads_per_core).collect()
+    }
+}
+
+/// Everything this emulator knows about the instance type `instance_type`, or `None`
+/// when it is not one of the offered types ([`offered_instance_types`]).
+pub fn instance_type_record(instance_type: &str) -> Option<InstanceTypeRecord> {
+    if !instance_type_is_modelled(instance_type) {
+        return None;
+    }
+    let name = InstanceTypeName::parse(instance_type)?;
+    let sixteenths = instance_size_sixteenths_of(&name);
+    let architecture = architecture_for(instance_type);
+    let (default_vcpus, memory_mib) = match mac_host(name.family) {
+        Some((vcpus, memory_gib)) => (vcpus, memory_gib * 1024),
+        None => (
+            default_vcpus(&name, sixteenths),
+            memory_mib_of(&name, sixteenths),
+        ),
+    };
+    let default_threads_per_core = default_threads_per_core(&name, &architecture, default_vcpus);
+    let instance_storage = instance_storage_facts(&name, sixteenths);
+    let (maximum_network_interfaces, ipv4_addresses_per_interface) = network_limits(sixteenths);
+    Some(InstanceTypeRecord {
+        instance_type: instance_type.to_string(),
+        default_vcpus,
+        default_cores: default_vcpus / default_threads_per_core,
+        default_threads_per_core,
+        memory_mib,
+        bare_metal: name.bare_metal(),
+        burstable: name.burstable(),
+        current_generation: name.current_generation(),
+        nitro: name.nitro(),
+        architecture,
+        instance_storage,
+        hibernation_supported: hibernation_supported(
+            &name,
+            memory_mib,
+            instance_storage.is_some(),
+        ),
+        maximum_network_interfaces,
+        ipv4_addresses_per_interface,
+    })
+}
+
+/// The architectures the instance type's AMIs may be built for: its own, plus `i386`
+/// for the four previous generation sizes that run 32-bit AMIs.
+fn supported_architectures(instance_type: &str, architecture: &str) -> Vec<String> {
+    let mut architectures = Vec::new();
+    if I386_INSTANCE_TYPES.contains(&instance_type) {
+        architectures.push("i386".to_string());
+    }
+    architectures.push(architecture.to_string());
+    architectures
+}
+
+/// The manufacturer of the processor: AWS designs Graviton, Apple the silicon in every
+/// Mac but the Intel `mac1`, and the `a` capability letter means AMD — the rest are
+/// Intel.
+fn processor_manufacturer(name: &InstanceTypeName<'_>, architecture: &str) -> &'static str {
+    match architecture {
+        "arm64" => "AWS",
+        "arm64_mac" => "Apple",
+        "x86_64_mac" => "Intel",
+        _ if name.has_attribute('a') => "AMD",
+        _ => "Intel",
+    }
+}
+
+/// The additional processor features: "if the request returns `amd-sev-snp`, AMD
+/// SEV-SNP is supported" (`ProcessorInfo$SupportedFeatures`), which the AMD families
+/// offer from [`FIRST_SEV_SNP_GENERATION`] on.
+fn processor_features(name: &InstanceTypeName<'_>) -> Vec<String> {
+    let sev_snp = name.has_attribute('a')
+        && name
+            .generation
+            .is_some_and(|generation| generation >= FIRST_SEV_SNP_GENERATION);
+    if sev_snp {
+        vec!["amd-sev-snp".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// The usage classes the instance type is offered in: "whether the instance type is
+/// offered for spot, On-Demand, or Capacity Blocks"
+/// (`InstanceTypeInfo$SupportedUsageClasses`).
+///
+/// An EC2 Mac runs only on a Dedicated Host, which is never a Spot allocation, so
+/// On-Demand is the only class it is offered in; Capacity Blocks reserve the
+/// accelerated P and Trn families.
+fn supported_usage_classes(name: &InstanceTypeName<'_>) -> Vec<String> {
+    if name.root == MAC_INSTANCE_FAMILY_PREFIX {
+        return vec!["on-demand".to_string()];
+    }
+    let mut classes = vec!["on-demand".to_string(), "spot".to_string()];
+    if matches!(name.root, "p" | "trn") {
+        classes.push("capacity-block".to_string());
+    }
+    classes
+}
+
+/// The root device types the instance type supports: every type boots from EBS, and the
+/// previous generation families that came with instance store volumes can also boot
+/// from one.
+fn supported_root_device_types(name: &InstanceTypeName<'_>) -> Vec<String> {
+    let mut types = vec!["ebs".to_string()];
+    if PARAVIRTUAL_ONLY_FAMILIES.contains(&name.family)
+        || PARAVIRTUAL_AND_HVM_FAMILIES.contains(&name.family)
+    {
+        types.push("instance-store".to_string());
+    }
+    types
+}
+
+/// The virtualization types the instance type supports: HVM everywhere, paravirtual on
+/// the previous generation families that predate it — four of which run paravirtual
+/// AMIs only.
+fn supported_virtualization_types(name: &InstanceTypeName<'_>) -> Vec<String> {
+    if PARAVIRTUAL_ONLY_FAMILIES.contains(&name.family) {
+        return vec!["paravirtual".to_string()];
+    }
+    let mut types = vec!["hvm".to_string()];
+    if PARAVIRTUAL_AND_HVM_FAMILIES.contains(&name.family) {
+        types.push("paravirtual".to_string());
+    }
+    types
+}
+
+/// Whether the instance type is EBS-optimized: `default` where EBS optimization is
+/// always on (every Nitro type, and the fourth generation families that shipped it
+/// enabled), `supported` where it is an option of the launch, and `unsupported` on the
+/// pre-Nitro burstable and oldest families, which have no EBS-optimized mode at all.
+fn ebs_optimized_support(name: &InstanceTypeName<'_>) -> &'static str {
+    if name.nitro() {
+        return "default";
+    }
+    if name.burstable() {
+        return "unsupported";
+    }
+    match name.generation {
+        None => "default",
+        Some(generation) if generation >= 4 => "default",
+        Some(generation) if generation >= FIRST_EBS_ENCRYPTION_GENERATION => "supported",
+        Some(_) => "unsupported",
+    }
+}
+
+/// Whether Elastic Network Adapter is supported: `required` on the Nitro types, which
+/// have no other network device, `supported` on the current generation types that
+/// offered it beside their original one, and `unsupported` on the previous generation
+/// families that predate it.
+fn ena_support(name: &InstanceTypeName<'_>) -> &'static str {
+    if name.nitro() {
+        return "required";
+    }
+    if name.current_generation() {
+        return "supported";
+    }
+    "unsupported"
+}
+
+/// The placement group strategies the instance type supports.
+///
+/// "Cluster placement groups ... supported instance types: current generation instance
+/// types" (EC2 User Guide, "Placement groups"), which the burstable families are not
+/// among; partition and spread groups take any instance type. An EC2 Mac runs only on a
+/// Dedicated Host, which cannot be in a placement group, so it supports none.
+fn placement_group_strategies(name: &InstanceTypeName<'_>) -> Vec<String> {
+    if name.root == MAC_INSTANCE_FAMILY_PREFIX {
+        return Vec::new();
+    }
+    let mut strategies = Vec::new();
+    if name.current_generation() && !name.burstable() {
+        strategies.push("cluster".to_string());
+    }
+    strategies.push("partition".to_string());
+    strategies.push("spread".to_string());
+    strategies
+}
+
+/// The boot modes the instance type supports: "Graviton instance types support UEFI
+/// only", the Intel and AMD Nitro types support both, and the pre-Nitro types only the
+/// legacy BIOS (EC2 User Guide, "Boot modes").
+fn supported_boot_modes(architecture: &str, nitro: bool) -> Vec<String> {
+    if architecture.starts_with("arm64") {
+        return vec!["uefi".to_string()];
+    }
+    if nitro {
+        return vec!["legacy-bios".to_string(), "uefi".to_string()];
+    }
+    vec!["legacy-bios".to_string()]
+}
+
+/// Everything `DescribeInstanceTypes` reports about `instance_type`, or `None` when it
+/// is not one of the offered types ([`offered_instance_types`]).
+///
+/// An instance type is a FACT of the catalog, not a resource a caller creates: no EC2
+/// operation adds a type or changes one, so this is derived from the type's name and the
+/// published per-family ratios rather than stored, exactly the way
+/// [`instance_type_offerings`] derives which location offers which type. Two calls
+/// therefore report one instance type identically.
+///
+/// The members this leaves absent are the per-type figures AWS publishes as HARDWARE
+/// data that neither the model nor the name yields — the processor's clock speed, the
+/// EBS-optimized bandwidth/throughput/IOPS table, the Gigabit network performance
+/// string, the network CARD count (AWS names the multi-card types individually, and the
+/// naming conventions say nothing about them), and the GPU, FPGA, inference, media and
+/// Neuron device inventories. An absent member is reported absent rather than invented,
+/// and a filter naming one therefore selects nothing.
+pub fn instance_type_info(instance_type: &str) -> Option<InstanceTypeInfo> {
+    let name = InstanceTypeName::parse(instance_type)?;
+    let record = instance_type_record(instance_type)?;
+    let sixteenths = instance_size_sixteenths_of(&name);
+    let nitro = record.nitro;
+
+    // Amazon EBS encryption, and IPv6, reach every current generation instance type and
+    // the previous generation ones from the generation that introduced them on; the
+    // oldest families predate both.
+    let modern = record.current_generation
+        || name
+            .generation
+            .is_some_and(|generation| generation >= FIRST_EBS_ENCRYPTION_GENERATION);
+    let ipv6_supported = modern;
+    let efa_interfaces = efa_interfaces(&name, sixteenths);
+    let (tcp_established, udp, udp_stream) = CONNECTION_TRACKING_TIMEOUTS;
+
+    Some(InstanceTypeInfo {
+        instance_type: Some(record.instance_type.clone()),
+        current_generation: Some(record.current_generation),
+        free_tier_eligible: Some(FREE_TIER_INSTANCE_TYPES.contains(&instance_type)),
+        supported_usage_classes: Some(supported_usage_classes(&name)),
+        supported_root_device_types: Some(supported_root_device_types(&name)),
+        supported_virtualization_types: Some(supported_virtualization_types(&name)),
+        bare_metal: Some(record.bare_metal),
+        // A bare metal instance runs the caller's own software on the host with no
+        // hypervisor under it, so it reports none at all.
+        hypervisor: (!record.bare_metal)
+            .then(|| if nitro { "nitro" } else { "xen" }.to_string()),
+        processor_info: Some(ProcessorInfo {
+            supported_architectures: Some(supported_architectures(
+                instance_type,
+                &record.architecture,
+            )),
+            sustained_clock_speed_in_ghz: None,
+            supported_features: Some(processor_features(&name)),
+            manufacturer: Some(processor_manufacturer(&name, &record.architecture).to_string()),
+        }),
+        v_cpu_info: Some(VCpuInfo {
+            default_v_cpus: Some(record.default_vcpus),
+            default_cores: Some(record.default_cores),
+            default_threads_per_core: Some(record.default_threads_per_core),
+            valid_cores: Some(record.valid_cores()),
+            valid_threads_per_core: Some(record.valid_threads_per_core()),
+        }),
+        memory_info: Some(MemoryInfo {
+            size_in_mi_b: Some(record.memory_mib),
+        }),
+        instance_storage_supported: Some(record.instance_storage.is_some()),
+        instance_storage_info: record
+            .instance_storage
+            .as_ref()
+            .map(InstanceStorageFacts::to_instance_storage_info),
+        ebs_info: Some(EbsInfo {
+            ebs_optimized_support: Some(ebs_optimized_support(&name).to_string()),
+            encryption_support: Some(
+                if modern { "supported" } else { "unsupported" }.to_string(),
+            ),
+            ebs_optimized_info: None,
+            nvme_support: Some(if nitro { "required" } else { "unsupported" }.to_string()),
+            maximum_ebs_attachments: Some(if nitro {
+                NITRO_ATTACHMENT_LIMIT
+            } else {
+                XEN_EBS_VOLUME_LIMIT
+            }),
+            // A Nitro instance's attachments are shared between its EBS volumes, its
+            // network interfaces and its instance store devices; a Xen instance's EBS
+            // volumes have a limit of their own.
+            attachment_limit_type: Some(if nitro { "shared" } else { "dedicated" }.to_string()),
+            maximum_ebs_cards: None,
+            ebs_cards: None,
+        }),
+        network_info: Some(NetworkInfo {
+            network_performance: None,
+            maximum_network_interfaces: Some(record.maximum_network_interfaces),
+            // How many network CARDS a type carries is per-type hardware data the name
+            // does not yield: AWS publishes a multi-card count only for a named set of
+            // accelerated and high-bandwidth types (and that set grows with each family),
+            // while the naming conventions say nothing about it. Claiming one card for
+            // every type would therefore answer a filter on
+            // `network-info.maximum-network-cards` confidently wrongly for exactly those
+            // types, so the count — and with it the index of the default card and the card
+            // inventory — is reported ABSENT, the way every other figure this module
+            // cannot derive is.
+            maximum_network_cards: None,
+            default_network_card_index: None,
+            network_cards: None,
+            ipv4_addresses_per_interface: Some(record.ipv4_addresses_per_interface),
+            ipv6_addresses_per_interface: ipv6_supported
+                .then_some(record.ipv4_addresses_per_interface),
+            ipv6_supported: Some(ipv6_supported),
+            ena_support: Some(ena_support(&name).to_string()),
+            efa_supported: Some(efa_interfaces > 0),
+            efa_info: (efa_interfaces > 0).then_some(EfaInfo {
+                maximum_efa_interfaces: Some(efa_interfaces),
+            }),
+            encryption_in_transit_supported: None,
+            ena_srd_supported: None,
+            bandwidth_weightings: None,
+            flexible_ena_queues_support: None,
+            connection_tracking_configuration: nitro.then_some(
+                DefaultConnectionTrackingConfiguration {
+                    default_tcp_established_timeout: Some(tcp_established),
+                    default_udp_timeout: Some(udp),
+                    default_udp_stream_timeout: Some(udp_stream),
+                },
+            ),
+            secondary_network_supported: None,
+            maximum_secondary_network_interfaces: None,
+            ipv4_addresses_per_secondary_interface: None,
+        }),
+        gpu_info: None,
+        fpga_info: None,
+        placement_group_info: Some(PlacementGroupInfo {
+            supported_strategies: Some(placement_group_strategies(&name)),
+        }),
+        inference_accelerator_info: None,
+        hibernation_supported: Some(record.hibernation_supported),
+        burstable_performance_supported: Some(record.burstable),
+        // "Dedicated Hosts are supported for ... current generation instance types",
+        // and an EC2 Mac runs on nothing else; the burstable families are not offered
+        // on a host.
+        dedicated_hosts_supported: Some(record.current_generation && !record.burstable),
+        // "Simplified automatic recovery" covers neither a bare metal instance nor one
+        // with an instance store, whose local data a recovery cannot carry over.
+        auto_recovery_supported: Some(
+            !record.bare_metal && record.instance_storage.is_none(),
+        ),
+        supported_boot_modes: Some(supported_boot_modes(&record.architecture, nitro)),
+        nitro_enclaves_support: Some(
+            if nitro
+                && !record.bare_metal
+                && !record.burstable
+                && record.default_vcpus >= MIN_ENCLAVE_VCPUS
+            {
+                "supported"
+            } else {
+                "unsupported"
+            }
+            .to_string(),
+        ),
+        nitro_tpm_support: Some(if nitro { "supported" } else { "unsupported" }.to_string()),
+        nitro_tpm_info: nitro.then(|| NitroTpmInfo {
+            supported_versions: Some(vec![NITRO_TPM_VERSION.to_string()]),
+        }),
+        media_accelerator_info: None,
+        neuron_info: None,
+        phc_support: None,
+        reboot_migration_support: None,
+        // Every type of the catalog is offered in every Region this emulator serves,
+        // which is what [`instance_type_offerings`] reports too.
+        supported_in_region: Some(true),
+    })
+}
+
+// =============================================================================
 // Regions
 // =============================================================================
 
@@ -4116,11 +5266,14 @@ pub const UNDIVERSIFIED_PLACEMENT_SCORE: i32 = 3;
 /// demand, down to [`MIN_PLACEMENT_SCORE`], and a request naming one or two instance types
 /// is never scored above [`UNDIVERSIFIED_PLACEMENT_SCORE`].
 ///
-/// The unit the capacity is counted in does not enter the score: this emulator holds no
-/// vCPU-or-memory-per-instance-type data to convert `vcpu` or `memory-mib` into instances
-/// with (the modelled `InstanceType` enum is a list of names — see
-/// [`offered_instance_types`]), so the capacity is scored in whatever unit the request
-/// states it in rather than through a conversion invented here.
+/// The unit the capacity is counted in does not enter the score, which is a DELIBERATE
+/// declining of the conversion rather than a missing catalog: [`instance_type_info`] now
+/// derives each type's vCPUs and memory, so `vcpu` or `memory-mib` demand could be divided
+/// by a per-type figure — but WHICH type a location would have placed is exactly what AWS
+/// decides and this emulator does not, and a request may name none at all
+/// (`GetSpotPlacementScoresRequest$InstanceTypes` is optional) or a whole set of types with
+/// different figures. Dividing by one chosen member of that set would invent a placement
+/// decision, so the capacity is scored in whatever unit the request states it in.
 pub fn placement_score(capacity: u64, instance_type_count: usize) -> i32 {
     // `ilog10` of a `u64` is at most 19, so this conversion cannot actually saturate; the
     // fallback is there so the arithmetic below needs no unchecked cast.
@@ -4271,6 +5424,12 @@ enum FilterToken {
 ///
 /// Compiling is separate from matching so a describe that compares one filter value
 /// against a whole candidate set parses the value once instead of once per candidate.
+///
+/// A value longer than [`MAX_FILTER_PATTERN_TOKENS`] is not compiled into a pattern at
+/// all: it is recorded as oversize and matches NOTHING, so neither the compiled vector
+/// nor the scan over it can be grown by a request beyond that bound. A filter value no
+/// candidate of this service can be that long cannot select anything anyway, and
+/// matching nothing can never widen a result.
 #[derive(Clone, Debug)]
 pub struct FilterPattern {
     tokens: Vec<FilterToken>,
@@ -12474,9 +13633,11 @@ impl ComAmazonawsEc2Amazonec2State {
     /// [`STORED_RECORD_OVERHEAD_BYTES`] every stored record costs, so no path can store a
     /// record uncharged and a tag-free attachment is not free against the byte budget.
     ///
-    /// `None` means the store is at [`MAX_STORED_RECORDS_PER_STORE`] and NOTHING was
-    /// stored; a writer that sees it refuses the request with EC2's own quota code rather
-    /// than reporting an attachment it does not hold.
+    /// `None` means the store is at its ceiling and NOTHING was stored; a writer that sees
+    /// it refuses the request with EC2's own quota code rather than reporting an attachment
+    /// it does not hold. The ceiling is enforced HERE as well as by
+    /// [`Self::has_transit_gateway_attachment_capacity`], so a handler that forgets the
+    /// gate cannot grow the store without bound either.
     pub fn insert_transit_gateway_attachment(
         &mut self,
         mut view: TransitGatewayAttachmentView,
@@ -12498,8 +13659,8 @@ impl ComAmazonawsEc2Amazonec2State {
     }
 
     /// Store a transit gateway multicast domain and answer the
-    /// `TransitGatewayMulticastDomainId` it was given — or `None` when the store is at
-    /// [`MAX_STORED_RECORDS_PER_STORE`] and nothing was stored.
+    /// `TransitGatewayMulticastDomainId` it was given — or `None` when the store is at its
+    /// ceiling and nothing was stored.
     pub fn insert_transit_gateway_multicast_domain(
         &mut self,
         mut record: TransitGatewayMulticastDomainRecord,
@@ -12530,7 +13691,7 @@ impl ComAmazonawsEc2Amazonec2State {
 
     /// Store a transit gateway route table announcement and answer the
     /// `TransitGatewayRouteTableAnnouncementId` it was given — or `None` when the store is
-    /// at [`MAX_STORED_RECORDS_PER_STORE`] and nothing was stored.
+    /// at its ceiling and nothing was stored.
     pub fn insert_transit_gateway_route_table_announcement(
         &mut self,
         mut view: TransitGatewayRouteTableAnnouncement,
@@ -12541,7 +13702,8 @@ impl ComAmazonawsEc2Amazonec2State {
         let announcement_id = self.next_id(TRANSIT_GATEWAY_ROUTE_TABLE_ANNOUNCEMENT_ID_PREFIX);
         view.transit_gateway_route_table_announcement_id = Some(announcement_id.clone());
         self.add_stored_bytes(
-            STORED_RECORD_OVERHEAD_BYTES + tag_list_bytes(view.tags.as_deref().unwrap_or_default()),
+            STORED_RECORD_OVERHEAD_BYTES
+                + tag_list_bytes(view.tags.as_deref().unwrap_or_default()),
         );
         self.transit_gateway_route_table_announcements.insert(
             announcement_id.clone(),
@@ -12554,8 +13716,8 @@ impl ComAmazonawsEc2Amazonec2State {
     }
 
     /// Store one of the account's own VPC endpoint service configurations and answer the
-    /// `ServiceId` it was given — or `None` when the store is at
-    /// [`MAX_STORED_RECORDS_PER_STORE`] and nothing was stored.
+    /// `ServiceId` it was given — or `None` when the store is at its ceiling and nothing
+    /// was stored.
     pub fn insert_vpc_endpoint_service(
         &mut self,
         mut view: ServiceConfiguration,
@@ -12566,14 +13728,15 @@ impl ComAmazonawsEc2Amazonec2State {
         let service_id = self.next_id(VPC_ENDPOINT_SERVICE_ID_PREFIX);
         view.service_id = Some(service_id.clone());
         self.add_stored_bytes(
-            STORED_RECORD_OVERHEAD_BYTES + tag_list_bytes(view.tags.as_deref().unwrap_or_default()),
+            STORED_RECORD_OVERHEAD_BYTES
+                + tag_list_bytes(view.tags.as_deref().unwrap_or_default()),
         );
         self.vpc_endpoint_services.insert(service_id.clone(), view);
         Some(service_id)
     }
 
     /// Store a VPC endpoint and answer the `VpcEndpointId` it was given — or `None` when
-    /// the store is at [`MAX_STORED_RECORDS_PER_STORE`] and nothing was stored.
+    /// the store is at its ceiling and nothing was stored.
     pub fn insert_vpc_endpoint(&mut self, mut view: VpcEndpoint) -> Option<String> {
         if !self.has_vpc_endpoint_capacity() {
             return None;
@@ -12581,14 +13744,15 @@ impl ComAmazonawsEc2Amazonec2State {
         let endpoint_id = self.next_id(VPC_ENDPOINT_ID_PREFIX);
         view.vpc_endpoint_id = Some(endpoint_id.clone());
         self.add_stored_bytes(
-            STORED_RECORD_OVERHEAD_BYTES + tag_list_bytes(view.tags.as_deref().unwrap_or_default()),
+            STORED_RECORD_OVERHEAD_BYTES
+                + tag_list_bytes(view.tags.as_deref().unwrap_or_default()),
         );
         self.vpc_endpoints.insert(endpoint_id.clone(), view);
         Some(endpoint_id)
     }
 
     /// Store an IPAM pool and answer the `IpamPoolId` it was given — or `None` when the
-    /// store is at [`MAX_STORED_RECORDS_PER_STORE`] and nothing was stored.
+    /// store is at its ceiling and nothing was stored.
     pub fn insert_ipam_pool(&mut self, mut view: IpamPool) -> Option<String> {
         if !self.has_ipam_pool_capacity() {
             return None;
@@ -13266,6 +14430,312 @@ impl ComAmazonawsEc2Amazonec2State {
         self.snapshot_block_public_access = state;
         self.snapshot_block_public_access
     }
+}
+
+// ---------------------------------------------------------------------------
+// Route server ENDPOINTS and their BGP peers
+// ---------------------------------------------------------------------------
+//
+// The route servers these hang off are the "Route servers" section above
+// ([`RouteServerRecord`]); an endpoint and a peer are stored as the modelled shapes
+// themselves, with the one non-terminal state each has moved by the clock sweep.
+
+/// A route server endpoint still coming up: `RouteServerEndpointState`'s `pending`.
+pub const ROUTE_SERVER_ENDPOINT_STATE_PENDING: &str = "pending";
+
+/// A route server endpoint that is usable: `RouteServerEndpointState`'s `available`.
+pub const ROUTE_SERVER_ENDPOINT_STATE_AVAILABLE: &str = "available";
+
+/// A route server peer still coming up: `RouteServerPeerState`'s `pending`.
+pub const ROUTE_SERVER_PEER_STATE_PENDING: &str = "pending";
+
+/// A route server peer whose session is configured: `RouteServerPeerState`'s `available`.
+pub const ROUTE_SERVER_PEER_STATE_AVAILABLE: &str = "available";
+
+/// The liveness detection protocol a peer gets when the request names none: "Defaults to
+/// `bgp-keepalive`" (`RouteServerBgpOptionsRequest$PeerLivenessDetection`).
+pub const PEER_LIVENESS_BGP_KEEPALIVE: &str = "bgp-keepalive";
+
+/// The other member of `RouteServerPeerLivenessMode`: "`bfd`: An additional Bidirectional
+/// Forwarding Detection (BFD) protocol" (same member).
+pub const PEER_LIVENESS_BFD: &str = "bfd";
+
+/// A BGP or BFD session that is not established: the `down` member of
+/// `RouteServerBgpState` and of `RouteServerBfdState`.
+///
+/// This is the only status either session can have in this emulator: a session comes up
+/// only when a real BGP speaker on the peer address answers, and nothing here speaks BGP,
+/// so reporting `up` would be reporting work nobody did.
+pub const ROUTE_SERVER_SESSION_DOWN: &str = "down";
+
+/// The `ResourceType` a `CreateRouteServerEndpoint` tag specification may name.
+pub const RESOURCE_TYPE_ROUTE_SERVER_ENDPOINT: &str = "route-server-endpoint";
+
+/// The `ResourceType` a `CreateRouteServerPeer` tag specification may name.
+pub const RESOURCE_TYPE_ROUTE_SERVER_PEER: &str = "route-server-peer";
+
+/// The largest number of route server endpoints this in-memory store holds, and the same
+/// ceiling for their peers.
+///
+/// A capacity bound in the same style as [`MAX_TRANSIT_GATEWAYS`] and
+/// [`MAX_STORED_ROUTE_SERVERS`], not an AWS quota: each record lives in this process's
+/// memory, so the number a caller can create has to be finite. It is well above the
+/// published per-Region route server quota, so a test that creates more than a real
+/// account's default quota is not refused for a reason this emulator cannot have.
+pub const MAX_ROUTE_SERVER_RECORDS: usize = 1_000;
+
+/// EC2's error code for a request naming a route server endpoint id this account holds no
+/// endpoint for — the code the service answers `CreateRouteServerPeer` with when its
+/// `RouteServerEndpointId` resolves to nothing.
+pub const INVALID_ROUTE_SERVER_ENDPOINT_ID_NOT_FOUND: &str =
+    "InvalidRouteServerEndpointId.NotFound";
+
+/// EC2's error code for a request naming a route server peer id this account holds no peer
+/// for.
+pub const INVALID_ROUTE_SERVER_PEER_ID_NOT_FOUND: &str = "InvalidRouteServerPeerId.NotFound";
+
+/// Everything [`ComAmazonawsEc2Amazonec2State::insert_route_server_endpoint`] needs that it
+/// does not derive itself.
+#[derive(Debug, Clone)]
+pub struct RouteServerEndpointSpec {
+    /// "The ID of the route server for which to create an endpoint"
+    /// (`CreateRouteServerEndpointRequest$RouteServerId`), already resolved against the
+    /// store.
+    pub route_server_id: String,
+    /// "The ID of the subnet to place the route server endpoint into" (same request).
+    pub subnet_id: String,
+    /// The VPC of that subnet, read off the stored subnet rather than taken from the
+    /// request: "The ID of the VPC containing the endpoint"
+    /// (`RouteServerEndpoint$VpcId`).
+    pub vpc_id: Option<String>,
+    /// The address of the endpoint's elastic network interface, taken from the subnet's
+    /// own CIDR block by [`ComAmazonawsEc2Amazonec2State::mint_route_server_eni_address`].
+    pub eni_address: Option<String>,
+    /// The tags of a `route-server-endpoint` tag specification.
+    pub tags: Vec<Tag>,
+}
+
+/// Everything [`ComAmazonawsEc2Amazonec2State::insert_route_server_peer`] needs that it
+/// does not derive itself. Every fact about the ENDPOINT the peer belongs to is read off
+/// the stored endpoint by the insert, so a peer can never name a different route server,
+/// VPC or subnet than its endpoint does.
+#[derive(Debug, Clone)]
+pub struct RouteServerPeerSpec {
+    /// "The IPv4 address of the peer device" (`CreateRouteServerPeerRequest$PeerAddress`).
+    pub peer_address: String,
+    /// "The Border Gateway Protocol (BGP) Autonomous System Number (ASN) for the
+    /// appliance" (`RouteServerBgpOptionsRequest$PeerAsn`).
+    pub peer_asn: i64,
+    /// The resolved liveness detection protocol. A `&'static str` so only a member of the
+    /// modelled `RouteServerPeerLivenessMode` catalog can be stored.
+    pub peer_liveness_detection: &'static str,
+    /// The tags of a `route-server-peer` tag specification.
+    pub tags: Vec<Tag>,
+}
+
+/// The caller-chosen bytes one stored route server endpoint holds: its tags. The ids, the
+/// ENI address and the state are this module's own.
+pub fn route_server_endpoint_payload_bytes(endpoint: &RouteServerEndpoint) -> usize {
+    tag_list_bytes(endpoint.tags.as_deref().unwrap_or_default())
+}
+
+/// The caller-chosen bytes one stored route server peer holds: its tags and the peer
+/// address the request named.
+pub fn route_server_peer_payload_bytes(peer: &RouteServerPeer) -> usize {
+    tag_list_bytes(peer.tags.as_deref().unwrap_or_default())
+        .saturating_add(peer.peer_address.as_deref().map_or(0, str::len))
+}
+
+/// The liveness detection protocol a peer the request asked for `requested` with gets.
+///
+/// "Defaults to `bgp-keepalive`" (`RouteServerBgpOptionsRequest$PeerLivenessDetection`),
+/// and a word no member of `RouteServerPeerLivenessMode` has is refused rather than stored.
+pub fn route_server_peer_liveness<E>(
+    requested: Option<&str>,
+) -> Result<&'static str, Scaffolded<E>> {
+    match requested {
+        None | Some(PEER_LIVENESS_BGP_KEEPALIVE) => Ok(PEER_LIVENESS_BGP_KEEPALIVE),
+        Some(PEER_LIVENESS_BFD) => Ok(PEER_LIVENESS_BFD),
+        Some(value) => Err(invalid_parameter_value(format!(
+            "Value ({value}) for parameter bgpOptions.peerLivenessDetection is invalid. \
+             Valid values are {PEER_LIVENESS_BFD} and {PEER_LIVENESS_BGP_KEEPALIVE}."
+        ))),
+    }
+}
+
+/// The ASN `asn` if the published range admits it, or the refusal EC2 answers for one it
+/// does not.
+///
+/// "Valid values are from 1 to 4294967295" is published identically for the Amazon side of
+/// the session ([`AMAZON_SIDE_ASN_RANGE`], `CreateRouteServerRequest$AmazonSideAsn`) and for
+/// the appliance's side (`RouteServerBgpOptionsRequest$PeerAsn`), so the peer's side is held
+/// to that same one pair of published bounds and `member` only names which one the message
+/// is about.
+pub fn require_route_server_asn<E>(asn: i64, member: &str) -> Result<i64, Scaffolded<E>> {
+    let (min, max) = AMAZON_SIDE_ASN_RANGE;
+    if (min..=max).contains(&asn) {
+        return Ok(asn);
+    }
+    Err(invalid_parameter_value(format!(
+        "Value ({asn}) for parameter {member} is invalid. Valid values are from {min} to {max}."
+    )))
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another route server endpoint fits inside the store's ceiling
+    /// ([`MAX_ROUTE_SERVER_RECORDS`]).
+    ///
+    /// The same contract as [`Self::has_transit_gateway_capacity`]: a create asks first and
+    /// refuses with [`route_server_limit_exceeded`] when it answers `false`. The endpoint
+    /// and the peer store are asked about separately, so a full store of one kind cannot
+    /// refuse a create of another.
+    pub fn has_route_server_endpoint_capacity(&self) -> bool {
+        self.route_server_endpoints.len() < MAX_ROUTE_SERVER_RECORDS
+    }
+
+    /// Whether another route server peer fits inside that same ceiling.
+    pub fn has_route_server_peer_capacity(&self) -> bool {
+        self.route_server_peers.len() < MAX_ROUTE_SERVER_RECORDS
+    }
+
+    /// Insert a route server endpoint in `pending` and answer the
+    /// `RouteServerEndpointId` it was given.
+    ///
+    /// The endpoint's elastic network interface is the service's, not the caller's, so its
+    /// id is minted here beside the endpoint's own.
+    pub fn insert_route_server_endpoint(&mut self, spec: RouteServerEndpointSpec) -> String {
+        let route_server_endpoint_id = self.next_id("rse");
+        let eni_id = self.next_id("eni");
+        let endpoint = RouteServerEndpoint {
+            route_server_id: Some(spec.route_server_id),
+            route_server_endpoint_id: Some(route_server_endpoint_id.clone()),
+            vpc_id: spec.vpc_id,
+            subnet_id: Some(spec.subnet_id),
+            eni_id: Some(eni_id),
+            eni_address: spec.eni_address,
+            state: Some(ROUTE_SERVER_ENDPOINT_STATE_PENDING.to_string()),
+            // "The reason for any failure in endpoint creation or operation"
+            // (`RouteServerEndpoint$FailureReason`): this endpoint is coming up, so there
+            // is no failure to report.
+            failure_reason: None,
+            tags: Some(spec.tags),
+        };
+        self.add_stored_bytes(route_server_endpoint_payload_bytes(&endpoint));
+        self.route_server_endpoints
+            .insert(route_server_endpoint_id.clone(), endpoint);
+        self.route_server_endpoint_available_at.insert(
+            route_server_endpoint_id.clone(),
+            Instant::now() + TRANSITION_DELAY,
+        );
+        route_server_endpoint_id
+    }
+
+    /// Insert a route server peer of the endpoint `route_server_endpoint_id` in `pending`
+    /// and answer the `RouteServerPeerId` it was given, or `None` when no endpoint of that
+    /// id is stored.
+    ///
+    /// The peer's route server, VPC, subnet and endpoint network interface are read off the
+    /// STORED endpoint, so they cannot disagree with it whatever the request said.
+    pub fn insert_route_server_peer(
+        &mut self,
+        route_server_endpoint_id: &str,
+        spec: RouteServerPeerSpec,
+    ) -> Option<String> {
+        let endpoint = self
+            .route_server_endpoints
+            .get(route_server_endpoint_id)?
+            .clone();
+        let route_server_peer_id = self.next_id("rsp");
+        let peer = RouteServerPeer {
+            route_server_peer_id: Some(route_server_peer_id.clone()),
+            route_server_endpoint_id: endpoint.route_server_endpoint_id.clone(),
+            route_server_id: endpoint.route_server_id.clone(),
+            vpc_id: endpoint.vpc_id.clone(),
+            subnet_id: endpoint.subnet_id.clone(),
+            state: Some(ROUTE_SERVER_PEER_STATE_PENDING.to_string()),
+            // Nothing has failed: "The reason for any failure in peer creation or
+            // operation" (`RouteServerPeer$FailureReason`).
+            failure_reason: None,
+            endpoint_eni_id: endpoint.eni_id.clone(),
+            endpoint_eni_address: endpoint.eni_address.clone(),
+            peer_address: Some(spec.peer_address),
+            bgp_options: Some(RouteServerBgpOptions {
+                peer_asn: Some(spec.peer_asn),
+                peer_liveness_detection: Some(spec.peer_liveness_detection.to_string()),
+            }),
+            // The session with the appliance is not established — nothing in this emulator
+            // speaks BGP to the peer address — so it is reported as
+            // [`ROUTE_SERVER_SESSION_DOWN`] rather than as a session nobody opened.
+            bgp_status: Some(RouteServerBgpStatus {
+                status: Some(ROUTE_SERVER_SESSION_DOWN.to_string()),
+            }),
+            // BFD is a session only a peer that asked for that liveness mode has, so a
+            // `bgp-keepalive` peer carries no BFD status at all.
+            bfd_status: (spec.peer_liveness_detection == PEER_LIVENESS_BFD).then(|| {
+                RouteServerBfdStatus {
+                    status: Some(ROUTE_SERVER_SESSION_DOWN.to_string()),
+                }
+            }),
+            tags: Some(spec.tags),
+        };
+        self.add_stored_bytes(route_server_peer_payload_bytes(&peer));
+        self.route_server_peers
+            .insert(route_server_peer_id.clone(), peer);
+        self.route_server_peer_available_at.insert(
+            route_server_peer_id.clone(),
+            Instant::now() + TRANSITION_DELAY,
+        );
+        Some(route_server_peer_id)
+    }
+
+    /// The address the next route server endpoint in the subnet `cidr_block` gets for its
+    /// elastic network interface, or `None` when the block holds no free address.
+    ///
+    /// The lowest assignable address of the block that nothing in the account already holds
+    /// — not another route server endpoint, and not an instance's primary private address
+    /// ([`Self::private_ip_in_use`], the one record of the addresses this emulator has
+    /// handed out), so one subnet cannot give the same address to two interfaces. AWS
+    /// "reserves the first four IPv4 addresses and the last IPv4 address in each subnet
+    /// CIDR block" (the [`SUBNET_RESERVED_ADDRESSES`] this crate already counts against a
+    /// subnet's available addresses), and the address is the service's choice, never the
+    /// caller's.
+    pub fn mint_route_server_eni_address(&self, cidr_block: &str) -> Option<String> {
+        let (first, last) = ipv4_cidr_bounds(cidr_block)?;
+        let held: BTreeSet<&str> = self
+            .route_server_endpoints
+            .values()
+            .filter_map(|endpoint| endpoint.eni_address.as_deref())
+            .collect();
+        // The first four addresses of the block and its last are reserved, so the
+        // assignable window starts four above the base and stops one below the broadcast
+        // address.
+        let lowest = first.checked_add(SUBNET_RESERVED_ADDRESSES - 1)?;
+        (lowest..last)
+            .map(|address| ::std::net::Ipv4Addr::from(address).to_string())
+            .find(|candidate| {
+                !held.contains(candidate.as_str()) && !self.private_ip_in_use(candidate)
+            })
+    }
+}
+
+/// Refuse a request that named a route server endpoint id no endpoint of the account has:
+/// HTTP 400 `InvalidRouteServerEndpointId.NotFound`.
+pub fn invalid_route_server_endpoint_id_not_found<E>(endpoint_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_ROUTE_SERVER_ENDPOINT_ID_NOT_FOUND,
+        400,
+        format!("The route server endpoint ID '{endpoint_id}' does not exist"),
+    )
+}
+
+/// Refuse a request that named a route server peer id no peer of the account has: HTTP 400
+/// `InvalidRouteServerPeerId.NotFound`.
+pub fn invalid_route_server_peer_id_not_found<E>(peer_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_ROUTE_SERVER_PEER_ID_NOT_FOUND,
+        400,
+        format!("The route server peer ID '{peer_id}' does not exist"),
+    )
 }
 
 // ---------------------------------------------------------------------------

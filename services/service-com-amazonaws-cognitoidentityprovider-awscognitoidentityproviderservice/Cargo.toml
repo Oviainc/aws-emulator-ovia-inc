@@ -21,12 +21,23 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Key generation and ES256 (ECDSA on NIST P-256 with SHA-256, RFC 7518 §3.4)
+# signing of the user-pool tokens, plus the public curve point the pool's JWKS
+# publishes. ES256 rather than the RS256 AWS uses because the only maintained
+# pure-Rust RSA implementation carries two unfixable timing advisories
+# (RUSTSEC-2023-0071, GHSA-4grx-2x9w-596c) this repository's dependency audit
+# blocks; what a verifier checks is unchanged (see `src/state.rs`).
+p256 = "0.13"
+# SHA-256 for the RFC 7638 JWK thumbprint used as the key's `kid`.
+sha2 = { workspace = true }
+# The CSPRNG the key is drawn from (rand 0.8 is the rand_core 0.6 generation
+# `p256` 0.13 takes).
+rand = "0.8"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
 hex = { workspace = true }
 
 [lints]

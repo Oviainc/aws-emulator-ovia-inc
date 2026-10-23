@@ -266,9 +266,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .repository_mut(&input.repository_name)
             .map_err(fault_error)?;
         // The policy replaces whatever the repository carried: one repository holds one
-        // policy, and it is stored exactly as the caller wrote it so a later read
-        // reports the same document.
-        repo.policy_text = Some(input.policy_text);
+        // policy, and it is stored in the canonical IAM-policy rendering ECR echoes an
+        // attached policy in — the caller's own tokens, in the caller's own order,
+        // re-indented and nothing more — so the read and the delete report the same
+        // document this call answers with.
+        repo.policy_text = Some(crate::state::canonical_policy_document(&input.policy_text));
 
         Ok(SetRepositoryPolicyOutput {
             registry_id: Some(repo.registry_id.clone()),

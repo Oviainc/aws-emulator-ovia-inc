@@ -213,7 +213,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // Reconfiguring takes the graph through UPDATING; the clock owes the move back
         // to AVAILABLE a fixed span later.
-        graph.begin_transition(crate::state::GraphStatus::Updating, now);
+        graph.begin_transition(
+            crate::state::GraphStatus::Updating,
+            crate::state::GraphStatus::Available,
+            now,
+        );
 
         Ok(Self::Output::from(&*graph))
     }

@@ -73,7 +73,7 @@ pub(crate) async fn call(
 }
 
 /// Call one operation with the credential scope naming `scope_region`.
-async fn call_signed_for(
+pub(crate) async fn call_signed_for(
     router: &MultiServiceRouter,
     scope_region: &str,
     operation: &str,

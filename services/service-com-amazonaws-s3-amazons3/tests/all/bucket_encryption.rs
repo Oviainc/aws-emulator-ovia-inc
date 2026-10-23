@@ -55,17 +55,21 @@ const ENCRYPTION_TYPE_VALUES: [&str; 2] = ["NONE", "SSE-C"];
 ///
 /// The same type on both sides, so a round-trip assertion compares the rule that was sent
 /// with the rule that was reported rather than with a hand-spelled expectation.
+///
+/// `pub(crate)`, with the three helpers below it: the default-encryption suite
+/// ([`super::object_default_encryption`]) configures the buckets whose default an object
+/// inherits through these rather than spelling the payload a second time.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct Rule {
-    sse_algorithm: Option<String>,
-    kms_master_key_id: Option<String>,
-    bucket_key_enabled: Option<bool>,
-    blocked_encryption_types: Option<Vec<String>>,
+pub(crate) struct Rule {
+    pub(crate) sse_algorithm: Option<String>,
+    pub(crate) kms_master_key_id: Option<String>,
+    pub(crate) bucket_key_enabled: Option<bool>,
+    pub(crate) blocked_encryption_types: Option<Vec<String>>,
 }
 
 impl Rule {
     /// A rule whose `ApplyServerSideEncryptionByDefault` names `algorithm`.
-    fn by_default(algorithm: &str) -> Self {
+    pub(crate) fn by_default(algorithm: &str) -> Self {
         Self {
             sse_algorithm: Some(algorithm.to_string()),
             ..Self::default()
@@ -74,24 +78,24 @@ impl Rule {
 
     /// A rule that names only `BucketKeyEnabled` — every member of
     /// `ServerSideEncryptionRule` is optional on its own.
-    fn bucket_key_only(enabled: bool) -> Self {
+    pub(crate) fn bucket_key_only(enabled: bool) -> Self {
         Self {
             bucket_key_enabled: Some(enabled),
             ..Self::default()
         }
     }
 
-    fn with_key(mut self, key: &str) -> Self {
+    pub(crate) fn with_key(mut self, key: &str) -> Self {
         self.kms_master_key_id = Some(key.to_string());
         self
     }
 
-    fn with_bucket_key(mut self, enabled: bool) -> Self {
+    pub(crate) fn with_bucket_key(mut self, enabled: bool) -> Self {
         self.bucket_key_enabled = Some(enabled);
         self
     }
 
-    fn blocking(mut self, types: &[&str]) -> Self {
+    pub(crate) fn blocking(mut self, types: &[&str]) -> Self {
         self.blocked_encryption_types =
             Some(types.iter().map(|kind| kind.to_string()).collect());
         self
@@ -132,7 +136,11 @@ fn configuration_payload(rules: &[Rule]) -> String {
 }
 
 /// `PUT /<bucket>?encryption` — `PutBucketEncryption`.
-async fn put_encryption(router: &MultiServiceRouter, bucket: &str, rules: &[Rule]) -> Answer {
+pub(crate) async fn put_encryption(
+    router: &MultiServiceRouter,
+    bucket: &str,
+    rules: &[Rule],
+) -> Answer {
     put_encryption_payload(router, bucket, &configuration_payload(rules), &[]).await
 }
 
@@ -155,7 +163,7 @@ async fn put_encryption_payload(
 }
 
 /// `GET /<bucket>?encryption` — `GetBucketEncryption`.
-async fn get_encryption(router: &MultiServiceRouter, bucket: &str) -> Answer {
+pub(crate) async fn get_encryption(router: &MultiServiceRouter, bucket: &str) -> Answer {
     send(router, "GET", &format!("/{bucket}?encryption"), &[], "").await
 }
 
@@ -163,7 +171,7 @@ async fn get_encryption(router: &MultiServiceRouter, bucket: &str) -> Answer {
 ///
 /// Parsed with `quick-xml` (already a dependency of this workspace), the way the ownership
 /// controls suite beside this one reads a container, rather than by slicing the body.
-fn reported_rules(answer: &Answer) -> Vec<Rule> {
+pub(crate) fn reported_rules(answer: &Answer) -> Vec<Rule> {
     let body = String::from_utf8_lossy(&answer.body).into_owned();
     let mut reader = Reader::from_str(&body);
 

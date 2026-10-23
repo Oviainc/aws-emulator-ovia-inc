@@ -153,10 +153,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(DeleteConnectionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Resource not found. Verify the connection resource ARN and try again: {}",
-                        input.connection_arn
-                    )),
+                    // The same fixed sentence every connection-addressed refusal of this
+                    // service carries (`state::CONNECTION_NOT_FOUND_MESSAGE`): a second
+                    // delete, and a delete of an ARN that was never minted, are worded
+                    // identically and neither echoes the ARN back.
+                    message: Some(crate::state::CONNECTION_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());

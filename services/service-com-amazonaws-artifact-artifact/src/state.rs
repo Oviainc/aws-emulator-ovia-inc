@@ -661,7 +661,8 @@ pub struct InquiryFeedback {
     /// "An optional comment for the feedback." `@sensitive` in the model, so it is never
     /// written to a log or an error message.
     pub comment: Option<String>,
-    /// "The response revision ID", as the request named it.
+    /// "The response revision ID", as the request named it, and half of the
+    /// [`FeedbackTarget`] this record is keyed by.
     ///
     /// Part of the record's [`FeedbackTarget`]: the revision is what feedback is submitted
     /// once per, so two submissions naming different revisions of one query are two
@@ -1790,7 +1791,9 @@ pub const FEEDBACK_ALREADY_SUBMITTED_MESSAGE: &str =
 ///
 /// The same judgement [`inquiry_token_mismatch`] states for a create, for the same reason:
 /// an `@idempotencyToken` identifies ONE call, so honouring it on a different request would
-/// either hide the second submission or silently replace the first.
+/// either hide the second submission or silently replace the first. It is decided AFTER
+/// [`feedback_already_submitted`], because the state of the targeted response version is
+/// what AWS keys the refusal on; the token only tells a retry from a new submission.
 pub fn feedback_token_mismatch(inquiry_id: &str) -> ConflictException {
     ConflictException {
         message: "the clientToken was already used to submit different feedback on a \

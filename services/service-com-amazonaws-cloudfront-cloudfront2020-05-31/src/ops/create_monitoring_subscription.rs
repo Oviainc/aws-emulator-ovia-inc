@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMonitoringSubscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMonitoringSubscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMonitoringSubscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Associates the submitted monitoring subscription with the distribution the route
+//! names, so a later `GetMonitoringSubscription` answers from that record. A monitoring
+//! subscription is a SUB-RESOURCE of the distribution
+//! (`/distributions/{DistributionId}/monitoring-subscription`), not a member of its
+//! configuration: storing one leaves the distribution's configuration, version token and
+//! propagation status untouched. A distribution the store does not hold is
+//! `NoSuchDistribution`, and a distribution that already carries a subscription is
+//! `MonitoringSubscriptionAlreadyExists` — the subscription it already carries is left
+//! exactly as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +152,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMonitoringSubscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMonitoringSubscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMonitoringSubscription"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // "The ID of the distribution that you are enabling metrics for": metrics are
+        // enabled ON a distribution, so an id this store holds no distribution for names
+        // nothing to enable them on.
+        let Some(distribution) = store.distributions.get_mut(&input.distribution_id) else {
+            return Err(CreateMonitoringSubscriptionErrorModeled::NoSuchDistribution(
+                crate::state::no_such_distribution(),
+            )
+            .into());
+        };
+
+        // A distribution carries at most ONE monitoring subscription, so a create against
+        // one that already has it is refused and the subscription already stored stays
+        // exactly as it is.
+        if distribution.monitoring_subscription.is_some() {
+            return Err(
+                CreateMonitoringSubscriptionErrorModeled::MonitoringSubscriptionAlreadyExists(
+                    crate::state::monitoring_subscription_already_exists(),
+                )
+                .into(),
+            );
+        }
+
+        // Stored whole: a later read of this subscription answers from the record this
+        // call leaves behind, down to the members the request left out. Nothing else on
+        // the distribution moves — a monitoring subscription is not part of the
+        // configuration, so neither its version token nor its propagation status changes.
+        distribution.monitoring_subscription = Some(input.monitoring_subscription);
+
+        Ok(CreateMonitoringSubscriptionOutput {
+            // Read back out of the record just written, never from the request.
+            monitoring_subscription: distribution.monitoring_subscription.clone(),
+        })
     }
 }

@@ -827,6 +827,157 @@ pub fn protocol_has_delivery_policy(protocol: &str) -> bool {
     DELIVERY_POLICY_PROTOCOLS.contains(&protocol)
 }
 
+// =============================================================================
+// What a subscription attribute may be SET to
+// =============================================================================
+
+/// The subscription attribute a dead-letter queue is named under: "RedrivePolicy –
+/// When specified, sends undeliverable messages to the specified Amazon SQS
+/// dead-letter queue" (`SetSubscriptionAttributesInput$AttributeName` doc).
+pub const REDRIVE_POLICY_ATTRIBUTE: &str = "RedrivePolicy";
+
+/// The subscription attribute a message replay is asked for under
+/// (`SubscribeInput$Attributes` doc).
+pub const REPLAY_POLICY_ATTRIBUTE: &str = "ReplayPolicy";
+
+/// The subscription attribute the role a Firehose delivery is written under lives
+/// under: "SubscriptionRoleArn – The ARN of the IAM role that has … Permission to write
+/// to the Firehose delivery stream" (`SetSubscriptionAttributesInput$AttributeName`
+/// doc).
+pub const SUBSCRIPTION_ROLE_ARN_ATTRIBUTE: &str = "SubscriptionRoleArn";
+
+/// The member of a redrive policy that names the dead-letter queue.
+pub const DEAD_LETTER_TARGET_ARN: &str = "deadLetterTargetArn";
+
+/// What `RawMessageDelivery` is when raw delivery is asked for — the counterpart of
+/// [`RAW_MESSAGE_DELIVERY_DISABLED`], and the only other value the flag takes.
+pub const RAW_MESSAGE_DELIVERY_ENABLED: &str = "true";
+
+/// The filtering scopes SNS defines: "FilterPolicyScope – This attribute lets you
+/// choose the filtering scope by using one of the following string value types:
+/// MessageAttributes (default) … MessageBody"
+/// (`SetSubscriptionAttributesInput$AttributeName` doc).
+pub const FILTER_POLICY_SCOPES: &[&str] = &[DEFAULT_FILTER_POLICY_SCOPE, "MessageBody"];
+
+/// The protocols raw message delivery may be ENABLED for: "RawMessageDelivery – When
+/// set to true, enables raw message delivery to Amazon SQS or HTTP/S endpoints"
+/// (`SetSubscriptionAttributesInput$AttributeName` doc). A subscription over any other
+/// protocol always carries SNS's JSON envelope, so there is no raw delivery to switch
+/// on for it.
+pub const RAW_MESSAGE_DELIVERY_PROTOCOLS: &[&str] = &["sqs", "http", "https"];
+
+/// The protocols a `SubscriptionRoleArn` applies to: "The following attribute applies
+/// only to Amazon Data Firehose delivery stream subscriptions: SubscriptionRoleArn"
+/// (`SetSubscriptionAttributesInput$AttributeName` doc).
+pub const SUBSCRIPTION_ROLE_ARN_PROTOCOLS: &[&str] = &["firehose"];
+
+/// The members of `value` when it is a JSON OBJECT, else `None` — the form every policy
+/// document a subscription attribute carries has.
+fn json_object(value: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+    match serde_json::from_str::<serde_json::Value>(value) {
+        Ok(serde_json::Value::Object(members)) => Some(members),
+        _ => None,
+    }
+}
+
+/// Why `value` is not one the subscription attribute `name` accepts, or `None` when it
+/// is — including every `name` SNS documents no constraint on the value of.
+///
+/// The reason names the attribute and the constraint its value failed, built from the
+/// request, the way every other refusal of this service states one; it never echoes a
+/// policy document back.
+///
+/// This is ARGUMENT validation — it judges the value alone — so it runs before any
+/// record is looked up, and it is SHARED by every operation that writes a subscription
+/// attribute: a value `Subscribe` accepts cannot be one `SetSubscriptionAttributes`
+/// refuses.
+pub fn subscription_attribute_value_reason(name: &str, value: &str) -> Option<String> {
+    match name {
+        // A flag, carried as a word because SNS carries every attribute value as a
+        // string (see [`attribute_flag`]).
+        RAW_MESSAGE_DELIVERY_ATTRIBUTE => (value != RAW_MESSAGE_DELIVERY_ENABLED
+            && value != RAW_MESSAGE_DELIVERY_DISABLED)
+            .then(|| {
+                format!(
+                    "{name} - the value must be {RAW_MESSAGE_DELIVERY_ENABLED} or \
+                     {RAW_MESSAGE_DELIVERY_DISABLED}"
+                )
+            }),
+        FILTER_POLICY_SCOPE_ATTRIBUTE => (!FILTER_POLICY_SCOPES.contains(&value))
+            .then(|| format!("{name} - the value must be one of {FILTER_POLICY_SCOPES:?}")),
+        // "The simple JSON object that lets your subscriber receive only a subset of
+        // messages" (`SetSubscriptionAttributesInput$AttributeName` doc): the policy is
+        // matched property by property, so it has to be an object to match anything.
+        FILTER_POLICY_ATTRIBUTE => json_object(value).is_none().then(|| {
+            format!(
+                "{name} - the value must be a filter policy document: a JSON object of \
+                 the message properties to match"
+            )
+        }),
+        // The SAME parse the effective policy is computed with, so a document the read
+        // path could not honour is never stored.
+        DELIVERY_POLICY_ATTRIBUTE => {
+            delivery_policy_refusal(value).map(|reason| format!("{name} - {reason}"))
+        }
+        REDRIVE_POLICY_ATTRIBUTE => match json_object(value) {
+            None => Some(format!(
+                "{name} - the value must be a redrive policy document: a JSON object \
+                 naming the dead-letter queue in {DEAD_LETTER_TARGET_ARN}"
+            )),
+            // "sends undeliverable messages to the specified Amazon SQS dead-letter
+            // queue" — a redrive policy that names no SQS queue redrives nowhere.
+            Some(members) => members
+                .get(DEAD_LETTER_TARGET_ARN)
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|arn| arn_resource(arn, "sqs").is_none())
+                .then(|| {
+                    format!(
+                        "{name} - {DEAD_LETTER_TARGET_ARN} must name an Amazon SQS queue"
+                    )
+                }),
+        },
+        REPLAY_POLICY_ATTRIBUTE => json_object(value).is_none().then(|| {
+            format!("{name} - the value must be a replay policy document: a JSON object")
+        }),
+        // "The ARN of the IAM role that has …" — only the ARN's shape is judged here;
+        // whether that role exists is not this service's record to check.
+        SUBSCRIPTION_ROLE_ARN_ATTRIBUTE => {
+            arn_shape_reason(value).map(|reason| format!("{name} - {reason}"))
+        }
+        _ => None,
+    }
+}
+
+/// Why the subscription attribute `name` cannot be set to `value` on a subscription
+/// that delivers over `protocol`, or `None` when it can.
+///
+/// SNS documents some subscription attributes for the delivery protocols they have a
+/// meaning for alone, and refuses one set on a subscription of any other protocol:
+/// storing it would leave the subscription reporting a setting nothing it does is
+/// governed by. Shared by every operation that writes a subscription attribute, so the
+/// scope does not depend on which call wrote it.
+pub fn subscription_attribute_protocol_reason(
+    name: &str,
+    value: &str,
+    protocol: &str,
+) -> Option<String> {
+    let (scoped, feature): (&[&str], &str) = match name {
+        // Raw delivery is a property of the envelope SNS puts a notification in, so
+        // only switching it ON is scoped: every protocol carries the JSON envelope by
+        // default, which is what the flag's other value asks for.
+        RAW_MESSAGE_DELIVERY_ATTRIBUTE if value == RAW_MESSAGE_DELIVERY_ENABLED => {
+            (RAW_MESSAGE_DELIVERY_PROTOCOLS, "raw message delivery")
+        }
+        DELIVERY_POLICY_ATTRIBUTE => (DELIVERY_POLICY_PROTOCOLS, "a delivery policy"),
+        SUBSCRIPTION_ROLE_ARN_ATTRIBUTE => {
+            (SUBSCRIPTION_ROLE_ARN_PROTOCOLS, "a subscription role")
+        }
+        _ => return None,
+    };
+    (!scoped.contains(&protocol))
+        .then(|| format!("Delivery protocol [{protocol}] does not support {feature}"))
+}
+
 /// The effective delivery policy of one SUBSCRIPTION: the system defaults, the
 /// `DeliveryPolicy` of the topic laid over them, and then the subscription's own
 /// `DeliveryPolicy` — "the effective delivery policy that takes into account the topic

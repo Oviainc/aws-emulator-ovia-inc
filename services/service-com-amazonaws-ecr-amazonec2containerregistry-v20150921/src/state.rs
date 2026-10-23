@@ -1058,7 +1058,9 @@ pub struct Repo {
     pub image_scanning_config: ImageScanningConfiguration,
     pub encryption_config: EncryptionConfiguration,
     pub tags: Vec<Tag>,
-    /// The repository policy, as the last `SetRepositoryPolicy` stored it: `None`
+    /// The repository policy, as the last `SetRepositoryPolicy` stored it — the
+    /// submitted document in the canonical IAM-policy rendering ECR reports a policy in
+    /// (see [`canonical_policy_document`]). `None`
     /// until a policy is set and again once `DeleteRepositoryPolicy` removes it, which
     /// is what `GetRepositoryPolicy` reports `RepositoryPolicyNotFoundException` for.
     /// It lives on the repository record, so deleting the repository drops its policy
@@ -1506,11 +1508,13 @@ pub struct ComAmazonawsEcrAmazonec2containerregistryV20150921State {
     /// "a registry cannot replicate to itself" refusal is evaluated per call, against
     /// the Region that call was made against.
     pub replication_rules: Vec<ReplicationRule>,
-    /// The registry permissions policy, as `PutRegistryPolicy` stored it: the document
-    /// text exactly as it arrived, so a read returns it byte for byte. `None` is "this
-    /// registry has no associated registry policy", which the registry-policy read and
-    /// delete answer with `RegistryPolicyNotFoundException`. One registry is served
-    /// here, so there is at most one such policy.
+    /// The registry permissions policy, as `PutRegistryPolicy` stored it: the submitted
+    /// document in the canonical IAM-policy rendering ECR reports a policy in (see
+    /// [`canonical_policy_document`]), so the read and the delete report the same
+    /// document the put answered with. `None` is "this registry has no associated
+    /// registry policy", which the registry-policy read and delete answer with
+    /// `RegistryPolicyNotFoundException`. One registry is served here, so there is at
+    /// most one such policy.
     pub registry_policy: Option<String>,
     /// The registry's signing configuration, which `PutSigningConfiguration` creates or
     /// replaces and `GetSigningConfiguration` reports. There is at most one per registry
@@ -1951,6 +1955,250 @@ pub fn validate_resource_policy(
         check_statement(entry)?;
     }
     Ok(())
+}
+
+/// The indentation one nesting level of an IAM policy document is written with: see
+/// [`canonical_policy_document`].
+const POLICY_INDENT: usize = 2;
+
+/// What separates a policy document's key from its value: a colon with a space on BOTH
+/// sides (`"Version" : "2012-10-17"`). See [`canonical_policy_document`].
+const POLICY_KEY_SEPARATOR: &str = " : ";
+
+/// An attached IAM policy document as ECR REPORTS one: the canonical IAM-policy
+/// rendering, which is the pretty-printed layout every policy ECR echoes back comes in,
+/// whatever layout the caller submitted.
+///
+/// The layout, as the recorded responses of the registry- and repository-policy
+/// operations show it:
+///
+/// * each member of a JSON object on its own line, indented [`POLICY_INDENT`] spaces per
+///   enclosing OBJECT (an enclosing array adds no indentation), with the closing brace on
+///   its own line at the enclosing level;
+/// * [`POLICY_KEY_SEPARATOR`] between a key and its value;
+/// * arrays laid out inline — `[ ` before the first element, `, ` between elements and
+///   ` ]` after the last — so a statement list reads `"Statement" : [ {` … `} ]`;
+/// * an empty object and an empty array written `{ }` and `[ ]`;
+/// * a VALUE LIST holding exactly one value written as that value alone, without the
+///   brackets: the IAM policy language documents `Action`, `NotAction`, `Resource`,
+///   `NotResource`, the per-type lists of `Principal`/`NotPrincipal` and a condition
+///   key's values as "a string or an array of strings", and a one-value list of those is
+///   reported in its string form. A list of STATEMENTS is not a value list, so a
+///   `Statement` carrying one statement keeps its brackets — which is the difference a
+///   one-element array of strings makes against one of objects.
+///
+/// Only the whitespace BETWEEN tokens, and the brackets of a one-value list, are this
+/// function's: every token is copied out of the submitted text byte for byte, so nothing
+/// else about the document's content changes. That is what keeps the caller's document
+/// the caller's — member order survives, a number keeps the digits it was written with,
+/// and every string literal keeps the escapes it was written with (`\u00e9` is not
+/// decoded, and a literal non-ASCII character is not escaped). The rendering is therefore
+/// a fixed point: re-rendering a rendered document returns it unchanged, so a client that
+/// puts back what it read sees no drift.
+///
+/// `text` that is not well-formed JSON is returned as it came: this is a rendering, not a
+/// validation, and the policy grammar ([`validate_resource_policy`]) is what refuses an
+/// unusable document — and what bounds the nesting this walk recurses over, since
+/// `serde_json` refuses a document nested past its own recursion limit.
+pub fn canonical_policy_document(text: &str) -> String {
+    let mut renderer = PolicyRenderer {
+        source: text,
+        at: 0,
+        rendered: String::with_capacity(text.len() + text.len() / 2),
+    };
+    if renderer.render() {
+        renderer.rendered
+    } else {
+        text.to_string()
+    }
+}
+
+/// The re-indenter behind [`canonical_policy_document`]: walks the submitted document a
+/// token at a time, copying every token verbatim into `rendered` and writing the
+/// canonical whitespace between them.
+struct PolicyRenderer<'a> {
+    /// The document being rendered.
+    source: &'a str,
+    /// How far into `source` the walk has read. Only ever advanced over ASCII bytes or
+    /// over a whole token, so it is always a character boundary.
+    at: usize,
+    /// What has been rendered so far.
+    rendered: String,
+}
+
+impl PolicyRenderer<'_> {
+    /// Render the whole document, reporting whether it was one JSON value and nothing
+    /// else. `false` leaves `rendered` half-written, which [`canonical_policy_document`]
+    /// discards.
+    fn render(&mut self) -> bool {
+        if self.value(0).is_none() {
+            return false;
+        }
+        self.skip_space();
+        self.at == self.source.len()
+    }
+
+    /// The next byte of `source`, or `None` at its end.
+    fn peek(&self) -> Option<u8> {
+        self.source.as_bytes().get(self.at).copied()
+    }
+
+    /// Step over the whitespace between two tokens: insignificant, and the whitespace
+    /// this renderer replaces.
+    fn skip_space(&mut self) {
+        while self.peek().is_some_and(|byte| byte.is_ascii_whitespace()) {
+            self.at += 1;
+        }
+    }
+
+    /// Step over `expected`, or report that the document does not carry it here.
+    fn expect(&mut self, expected: u8) -> Option<()> {
+        if self.peek()? != expected {
+            return None;
+        }
+        self.at += 1;
+        Some(())
+    }
+
+    /// Write a line break and the indentation `depth` enclosing objects are written with.
+    fn newline(&mut self, depth: usize) {
+        self.rendered.push('\n');
+        for _ in 0..depth * POLICY_INDENT {
+            self.rendered.push(' ');
+        }
+    }
+
+    /// Render one JSON value, whose own members sit `depth` objects deep.
+    fn value(&mut self, depth: usize) -> Option<()> {
+        self.skip_space();
+        match self.peek()? {
+            // An object's members are one level deeper than the object itself.
+            b'{' => self.object(depth + 1),
+            // An array is inline, so it adds no level of its own.
+            b'[' => self.array(depth),
+            b'"' => self.string(),
+            _ => self.scalar(),
+        }
+    }
+
+    /// Render a JSON object whose members are written at `depth`.
+    fn object(&mut self, depth: usize) -> Option<()> {
+        self.expect(b'{')?;
+        self.rendered.push('{');
+        self.skip_space();
+        if self.peek()? == b'}' {
+            self.at += 1;
+            self.rendered.push_str(" }");
+            return Some(());
+        }
+        loop {
+            self.skip_space();
+            self.newline(depth);
+            self.string()?;
+            self.skip_space();
+            self.expect(b':')?;
+            self.rendered.push_str(POLICY_KEY_SEPARATOR);
+            self.value(depth)?;
+            self.skip_space();
+            match self.peek()? {
+                b',' => {
+                    self.at += 1;
+                    self.rendered.push(',');
+                }
+                b'}' => {
+                    self.at += 1;
+                    self.newline(depth - 1);
+                    self.rendered.push('}');
+                    return Some(());
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// Render a JSON array inline, its elements' own members staying at `depth` — or, when
+    /// it is a value list holding exactly one value, as that value alone (see
+    /// [`canonical_policy_document`]).
+    fn array(&mut self, depth: usize) -> Option<()> {
+        self.expect(b'[')?;
+        self.skip_space();
+        if self.peek()? == b']' {
+            self.at += 1;
+            self.rendered.push_str("[ ]");
+            return Some(());
+        }
+        // Where this array's rendering begins: its brackets are written only once it is
+        // known not to be a one-value list, which is rendered without them.
+        let opens_at = self.rendered.len();
+        let holds_values = self.peek()? == b'"';
+        self.value(depth)?;
+        self.skip_space();
+        if holds_values && self.peek()? == b']' {
+            self.at += 1;
+            return Some(());
+        }
+        self.rendered.insert_str(opens_at, "[ ");
+        loop {
+            match self.peek()? {
+                b',' => {
+                    self.at += 1;
+                    self.rendered.push_str(", ");
+                }
+                b']' => {
+                    self.at += 1;
+                    self.rendered.push_str(" ]");
+                    return Some(());
+                }
+                _ => return None,
+            }
+            self.value(depth)?;
+            self.skip_space();
+        }
+    }
+
+    /// Copy a string literal — a key's or a value's — out verbatim, escapes and all. A
+    /// UTF-8 continuation byte is never one of the ASCII bytes scanned for, so reading
+    /// the literal byte by byte cannot split a character.
+    fn string(&mut self) -> Option<()> {
+        let source = self.source;
+        if self.peek()? != b'"' {
+            return None;
+        }
+        let start = self.at;
+        self.at += 1;
+        let mut escaped = false;
+        loop {
+            let byte = self.peek()?;
+            self.at += 1;
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                break;
+            }
+        }
+        self.rendered.push_str(&source[start..self.at]);
+        Some(())
+    }
+
+    /// Copy a number, `true`, `false` or `null` out verbatim: a token that runs up to the
+    /// next structural character.
+    fn scalar(&mut self) -> Option<()> {
+        let source = self.source;
+        let start = self.at;
+        while self
+            .peek()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'+' | b'.'))
+        {
+            self.at += 1;
+        }
+        if self.at == start {
+            return None;
+        }
+        self.rendered.push_str(&source[start..self.at]);
+        Some(())
+    }
 }
 
 /// Whether a policy element names at least one value: a non-empty string, a non-empty

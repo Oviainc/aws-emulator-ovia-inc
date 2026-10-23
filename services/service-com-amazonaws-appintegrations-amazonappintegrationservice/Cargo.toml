@@ -23,12 +23,26 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Opaque list-pagination cursors: the exclusive start key, hex-encoded.
 hex = { workspace = true }
+# The one rule for a REST front door's body rejection (`BadRequestException`), shared
+# with every other service that has one.
+service-common = { path = "../common" }
+# The KMS client `CreateDataIntegration` resolves its required `KmsKey` through, over the
+# in-process callback into this same emulator (no network client feature is enabled: the
+# transport is the emulator's own).
+aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# The `Id` of a DataIntegration is a v4 UUID (model: `CreateDataIntegrationResponse.Id`
+# -> `UUID`, pattern ^[a-f0-9]{8}-[a-f0-9]{4}-...$), minted with the maintained crate
+# rather than hand-formatted from a random number.
+uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# The DataIntegration suite mounts the KMS service beside AppIntegrations on one engine,
+# because `CreateDataIntegration` resolves its required `KmsKey` by calling it.
+service-com-amazonaws-kms-trentservice = { workspace = true }
 
 [lints]
 workspace = true

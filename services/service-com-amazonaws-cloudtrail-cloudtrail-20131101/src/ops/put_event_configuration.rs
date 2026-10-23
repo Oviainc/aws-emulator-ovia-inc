@@ -321,7 +321,7 @@ fn configure_event_data_store(
             )
         })?;
     let addressed_arn = parsed.arn(region);
-    let Some(record) = store.addressed_event_data_store_mut(&parsed, region) else {
+    let Some(record) = store.addressed_event_data_store_mut(&parsed, region, now) else {
         return Err(crate::scaffolded::Scaffolded::modeled_with_status(
             PutEventConfigurationErrorModeled::EventDataStoreNotFoundException(
                 EventDataStoreNotFoundException {

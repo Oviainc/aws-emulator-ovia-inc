@@ -374,21 +374,7 @@ const PUBLIC_ACCESS_FINDING: &str = "Public access granted in the following stat
 /// The reason reports the statement's own position and `Sid`, so a caller can map it back
 /// onto the document it submitted.
 fn public_access_reason(statement: &policy::Statement) -> Option<ReasonSummary> {
-    // A `Deny` statement grants nothing, so it can never be why a policy is public.
-    if statement.effect != policy::Effect::Allow {
-        return None;
-    }
-    let principals = statement.principals.as_ref()?;
-    // `NotPrincipal` with `Allow` admits every principal the element does not list, and a
-    // `"*"` element (or one listing it) admits every caller, anonymous ones included;
-    // a statement naming only known principals grants nothing to the public, whatever its
-    // conditions say.
-    if !principals.negated && !principals.any {
-        return None;
-    }
-    // The `Condition` block is a conjunction, so ONE clause that binds the caller is
-    // enough to keep the wildcard principal from reaching the public.
-    if statement.conditions.iter().any(clause_scopes_access) {
+    if !grants_public_access(statement) {
         return None;
     }
     Some(ReasonSummary {
@@ -399,6 +385,32 @@ fn public_access_reason(statement: &policy::Statement) -> Option<ReasonSummary> 
         statement_index: Some(statement.index),
         statement_id: statement.sid.clone(),
     })
+}
+
+/// Whether one parsed statement can grant PUBLIC access — access to a caller this
+/// account never names.
+///
+/// The crate's ONE public-access rule: this check's verdict and the `isPublic` member of
+/// an access-preview finding are the same judgement about the same parsed statement, so
+/// both read it here rather than each applying its own version of it.
+pub(crate) fn grants_public_access(statement: &policy::Statement) -> bool {
+    // A `Deny` statement grants nothing, so it can never be why a policy is public.
+    if statement.effect != policy::Effect::Allow {
+        return false;
+    }
+    let Some(principals) = statement.principals.as_ref() else {
+        return false;
+    };
+    // `NotPrincipal` with `Allow` admits every principal the element does not list, and a
+    // `"*"` element (or one listing it) admits every caller, anonymous ones included;
+    // a statement naming only known principals grants nothing to the public, whatever its
+    // conditions say.
+    if !principals.negated && !principals.any {
+        return false;
+    }
+    // The `Condition` block is a conjunction, so ONE clause that binds the caller is
+    // enough to keep the wildcard principal from reaching the public.
+    !statement.conditions.iter().any(clause_scopes_access)
 }
 
 /// Whether one condition clause binds the request to something the account names.

@@ -1,15 +1,39 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetParametersByPath
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetParametersByPath`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Retrieve the parameters stored under a level of a parameter hierarchy — the
+//! hierarchy read of Parameter Store. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetParametersByPath::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The answer is computed from the parameters `PutParameter` persisted (see
+//! [`crate::state`]): this Region's parameters whose name carries the requested `Path`
+//! as a whole prefix of its levels, in ascending name order — the level immediately
+//! below the path by default, every level under it when `Recursive` is set. Each one is
+//! reported at its newest version, or at the version a `Label` filter names. Nothing
+//! here mutates the store — a read must not change what a later caller sees.
+//!
+//! ## Filters
+//!
+//! `ParameterFilters` accepts the three keys this operation publishes — `Type`, `KeyId`
+//! and `Label` ([`crate::state::PARAMETERS_BY_PATH_FILTER_KEYS`]) — and refuses every
+//! other key the modelled pattern allows with `InvalidFilterKey`, which is what the
+//! model's `Key` doc excludes here. An option outside `Equals` / `BeginsWith` (and
+//! `Equals` alone for `Label`) is `InvalidFilterOption`, and a filter carrying no value,
+//! or a `Type` equality no `ParameterType` can satisfy, is `InvalidFilterValue`.
+//!
+//! ## `WithDecryption` and `SecureString`
+//!
+//! As for `GetParameter`: this emulator holds no key material and encrypts nothing, so a
+//! `SecureString`'s value is reported exactly as `PutParameter` persisted it and
+//! `WithDecryption` selects nothing. `InvalidKeyId` is therefore never the answer to a
+//! read — no key is resolved, so none is found invalid.
+//!
+//! ## Paging
+//!
+//! The token this operation hands out is the `Name` of the parameter the next page
+//! starts at, so a resume is a position in the store's own total order rather than an
+//! offset into a list that may have changed between two pages. A token that is not
+//! shaped like a parameter name was not issued here: that is the modelled
+//! `InvalidNextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +202,189 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetParametersByPath` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetParametersByPathErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetParametersByPath"))
+        use crate::state::{
+            canonical_name, is_parameters_by_path_filter_key, is_under_path, name_rejection,
+            parameter_path, parameters_by_path_filter_options, parameters_by_path_page_size,
+            request_region, FILTER_KEY_TYPE, FILTER_OPTION_EQUALS, INVALID_NEXT_TOKEN,
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetParametersByPathErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some(
+                        "this service is mounted on an engine that holds no state".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // The path is a parameter-name prefix, so it carries the name rules: trimmed,
+        // no spaces between characters, and a leading forward slash.
+        let path =
+            parameter_path(&input.path).map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        let filters = input.parameter_filters.as_deref().unwrap_or_default();
+        for filter in filters {
+            if !is_parameters_by_path_filter_key(&filter.key) {
+                // The shape declares no members, so the refusal carries no message.
+                return Err(
+                    GetParametersByPathErrorModeled::InvalidFilterKey(InvalidFilterKey {}).into(),
+                );
+            }
+            // "Valid options include Equals and BeginsWith" — and a filter naming none
+            // compares whole values.
+            let option = filter.option.as_deref().unwrap_or(FILTER_OPTION_EQUALS);
+            let allowed = parameters_by_path_filter_options(&filter.key);
+            if !allowed.contains(&option) {
+                return Err(GetParametersByPathErrorModeled::InvalidFilterOption(
+                    InvalidFilterOption {
+                        message: Some(format!(
+                            "Option '{option}' at filter key '{}' isn't valid: valid options are {}",
+                            filter.key,
+                            allowed.join(" and ")
+                        )),
+                    },
+                )
+                .into());
+            }
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.is_empty() {
+                return Err(invalid_filter_value(format!(
+                    "Filter key '{}' carries no value to search for",
+                    filter.key
+                )));
+            }
+            // A parameter's type is one of the modelled `ParameterType` values, so an
+            // equality filter on a value outside that enum asks for a type no parameter
+            // can have. A `BeginsWith` value is a prefix of a type, not a type, so it is
+            // not checked against the enum.
+            if filter.key == FILTER_KEY_TYPE && option == FILTER_OPTION_EQUALS {
+                if let Some(unknown) = values
+                    .iter()
+                    .find(|value| !PARAMETER_TYPE_VALUES.contains(&value.as_str()))
+                {
+                    return Err(invalid_filter_value(format!(
+                        "Value '{unknown}' at filter key '{}' isn't a parameter type: valid \
+                         values are {}",
+                        filter.key,
+                        PARAMETER_TYPE_VALUES.join(", ")
+                    )));
+                }
+            }
+        }
+
+        let page_size = parameters_by_path_page_size(input.max_results)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // The token is the name of the parameter the next page starts at, so a token
+        // that is not a parameter name at all was not issued here.
+        let resume_from = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) if name_rejection(token).is_none() => Some(canonical_name(token)),
+            Some(_) => {
+                return Err(GetParametersByPathErrorModeled::InvalidNextToken(
+                    InvalidNextToken {
+                        message: Some(INVALID_NEXT_TOKEN.to_string()),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // Parameter Store is regional: a parameter is reached through the endpoint it
+        // was created against, which is the Region this request was signed for. The
+        // store yields that Region's parameters in ascending canonical-name order, which
+        // is what makes the resume cursor total.
+        let recursive = input.recursive.unwrap_or(false);
+        let region = request_region(ctx.parts());
+        let store = state.lock();
+        let mut parameters = Vec::new();
+        let mut next_token = None;
+        for (name, record) in store.parameters_of_region(&region) {
+            if resume_from.is_some_and(|from| name < from) {
+                continue;
+            }
+            if !is_under_path(name, path, recursive) {
+                continue;
+            }
+            let Some(version) = select_version(record, filters) else {
+                continue;
+            };
+            if !filters.iter().all(|filter| version_matches(version, filter)) {
+                continue;
+            }
+            if parameters.len() == page_size {
+                // The page is full and a parameter is still waiting: hand the caller the
+                // name it resumes at, so the next request continues where this stopped.
+                next_token = Some(record.name.clone());
+                break;
+            }
+            // The request named no `name:selector`, so the reported parameter carries
+            // none: a selector is "either the version number or the label used to
+            // retrieve the parameter value" (`Parameter$Selector`).
+            parameters.push(version.to_parameter(record, None));
+        }
+
+        Ok(GetParametersByPathOutput {
+            parameters: Some(parameters),
+            next_token,
+        })
     }
+}
+
+/// The version of `record` a hierarchy read reports, or `None` when the read's filters
+/// name a label no version of this parameter carries.
+///
+/// A label points at ONE version of a parameter ("A label can be assigned to only one
+/// version of a parameter at a time", `LabelParameterVersion`), so a read filtered on a
+/// label reports the labelled version rather than the newest. With no label filter the
+/// newest version is what the read reports, as a read with no selector does.
+fn select_version<'a>(
+    record: &'a crate::state::ParameterRecord,
+    filters: &[ParameterStringFilter],
+) -> Option<&'a crate::state::ParameterVersionRecord> {
+    let labels: Vec<&str> = filters
+        .iter()
+        .filter(|filter| filter.key == crate::state::FILTER_KEY_LABEL)
+        .flat_map(|filter| filter.values.as_deref().unwrap_or_default())
+        .map(String::as_str)
+        .collect();
+    if labels.is_empty() {
+        return record.latest();
+    }
+    record
+        .versions
+        .iter()
+        .rev()
+        .find(|version| labels.iter().any(|label| version.labels.contains(*label)))
+}
+
+/// Whether `version` carries a value one filter asks for. A key that names no attribute
+/// of a parameter version matches nothing — such a key is already refused above, so that
+/// arm is a backstop.
+fn version_matches(
+    version: &crate::state::ParameterVersionRecord,
+    filter: &ParameterStringFilter,
+) -> bool {
+    let Some(held) = version.filter_values(&filter.key) else {
+        return false;
+    };
+    crate::state::string_filter_matches(
+        &held,
+        filter
+            .option
+            .as_deref()
+            .unwrap_or(crate::state::FILTER_OPTION_EQUALS),
+        filter.values.as_deref().unwrap_or_default(),
+    )
+}
+
+/// The modelled refusal for a filter value this operation cannot search on: "The filter
+/// value isn't valid. Verify the value and try again".
+fn invalid_filter_value(message: String) -> GetParametersByPathError {
+    GetParametersByPathErrorModeled::InvalidFilterValue(InvalidFilterValue {
+        message: Some(message),
+    })
+    .into()
 }

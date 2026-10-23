@@ -27,6 +27,8 @@ mod delete_method_response;
 mod documentation_parts;
 #[path = "all/documentation_versions.rs"]
 mod documentation_versions;
+#[path = "all/domain_name_collection.rs"]
+mod domain_name_collection;
 #[path = "all/epoch_second_timestamps.rs"]
 mod epoch_second_timestamps;
 #[path = "all/execute_api_data_plane.rs"]
@@ -63,6 +65,8 @@ mod rest_api_lifecycle;
 mod sdk_types;
 #[path = "all/service_claim.rs"]
 mod service_claim;
+#[path = "all/stage_collection.rs"]
+mod stage_collection;
 #[path = "all/stage_lifecycle.rs"]
 mod stage_lifecycle;
 #[path = "all/state_roundtrip.rs"]

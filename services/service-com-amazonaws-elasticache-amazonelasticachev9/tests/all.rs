@@ -98,6 +98,10 @@ mod serverless_cache_delete;
 #[path = "all/cache_cluster_gates_and_messages.rs"]
 mod cache_cluster_gates_and_messages;
 
+// Appended for the same reason: the `TestFailover` suite.
+#[path = "all/test_failover.rs"]
+mod test_failover;
+
 // Appended for the same reason: the RBAC access-string, `DeleteUser` and error-envelope
 // suite.
 #[path = "all/rbac_user_access_string_and_deletion.rs"]
@@ -106,3 +110,7 @@ mod rbac_user_access_string_and_deletion;
 // Appended for the same reason: the `CacheNodeType` catalogue-validation suite.
 #[path = "all/cache_node_type_validation.rs"]
 mod cache_node_type_validation;
+
+// Appended for the same reason: the `DeleteSnapshot` suite.
+#[path = "all/snapshot_delete.rs"]
+mod snapshot_delete;

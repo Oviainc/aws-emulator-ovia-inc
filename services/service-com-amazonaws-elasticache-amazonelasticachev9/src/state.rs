@@ -22,8 +22,13 @@
 //! owed `AVAILABLE`.
 //!
 //! A snapshot is a copy of a cluster as of the time it was taken:
-//! `CreateSnapshot` mints one from a stored cluster and `DescribeSnapshots`
-//! reports it, so [`SnapshotRecord`] below is the one copy both read.
+//! `CreateSnapshot` mints one from a stored cluster, `CopySnapshot` mints a
+//! second from a stored snapshot, `DescribeSnapshots` reports it and
+//! `DeleteSnapshot` takes it away, so [`SnapshotRecord`] below is the one copy
+//! all of them read. A deleted snapshot does not vanish at the call: it answers
+//! `deleting` and the clock owes its removal
+//! ([`SnapshotRecord::pending_removal`]), the same way a created one is owed
+//! `available`.
 //!
 //! Beside the resources sits the event log: every change this service makes to
 //! one of them records an [`EventRecord`], and `DescribeEvents` reports that log
@@ -319,11 +324,14 @@ pub fn maintenance_window_refusal(value: &str) -> Option<String> {
 /// reads it — nothing sleeps.
 pub const CLUSTER_TRANSITION: Duration = Duration::from_millis(500);
 
-/// How long a snapshot stays `creating` before the clock owes it `available`.
+/// How long a snapshot stays in the status the call that started the work
+/// returned — `creating` after a create or a copy before the clock owes it
+/// `available`, and `deleting` after a delete before the clock owes its removal.
 ///
 /// The same reasoning as [`CLUSTER_TRANSITION`]: ElastiCache takes minutes, the
 /// emulator chooses a span, and it is deliberately NOT zero so a caller acting
-/// straight after `CreateSnapshot` still observes the transient status.
+/// straight after `CreateSnapshot` or `DeleteSnapshot` still observes the
+/// transient status.
 pub const SNAPSHOT_TRANSITION: Duration = Duration::from_millis(500);
 
 /// How many clusters, and how many subnet groups, the store holds before a
@@ -2057,6 +2065,19 @@ pub fn cache_cluster_not_found_message(cache_cluster_id: &str) -> String {
     format!("CacheCluster not found: {cache_cluster_id}")
 }
 
+/// How ElastiCache words a snapshot this account does not hold: the name the
+/// request asked for, which is all the service knows about a snapshot that does
+/// not exist.
+///
+/// One helper, so every operation that acts on a NAMED snapshot
+/// (`DeleteSnapshot`, `CopySnapshot`, and the tag operations when they land)
+/// words its `SnapshotNotFoundFault` the one way the service does. The name is
+/// reported as the caller sent it rather than lowercased, because the message is
+/// built from the request.
+pub fn snapshot_not_found_message(snapshot_name: &str) -> String {
+    format!("Snapshot with name {snapshot_name} not found")
+}
+
 /// The ARN of a cache cluster: `arn:aws:elasticache:<region>:<account>:cluster:<id>`.
 pub fn cluster_arn(region: &str, cache_cluster_id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("cluster:{cache_cluster_id}"))
@@ -3633,6 +3654,17 @@ pub const MAX_NODE_GROUPS: i32 = 90;
 /// `NodeGroupConfiguration$Slots`: "Keyspaces range from 0 to 16,383."
 pub const KEYSPACE_SLOTS: i32 = 16_384;
 
+/// How many shards an account may test automatic failover on in one rolling
+/// window, as `TestFailover` documents it: "A customer can use this operation to
+/// test automatic failover on up to 15 shards (called node groups in the
+/// ElastiCache API and Amazon CLI) in any rolling 24-hour period." Past it the
+/// call is refused with the modelled `APICallRateForCustomerExceededFault`.
+pub const MAX_TEST_FAILOVERS_PER_WINDOW: usize = 15;
+
+/// The window [`MAX_TEST_FAILOVERS_PER_WINDOW`] is counted over, from the same
+/// sentence: "any rolling 24-hour period".
+pub const TEST_FAILOVER_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// `AuthToken`'s documented length bounds: "Must be at least 16 characters and
 /// no more than 128 characters in length."
 pub const AUTH_TOKEN_MIN_LEN: usize = 16;
@@ -3868,10 +3900,43 @@ pub struct NodeGroupRecord {
     /// enabled group, where the keyspace is partitioned across shards.
     pub slots: Option<String>,
     /// This shard's members, the primary first.
+    ///
+    /// The ORDER is this emulator's own: `NodeGroupMembers` carries no modelled
+    /// ordering, so a client must read a member's role from `CurrentRole`
+    /// rather than from its position. Holding the primary first is what lets
+    /// [`ComAmazonawsElasticacheAmazonelasticachev9State::set_shard_replica_count`]
+    /// drop the newest replicas from the end while keeping the primary, and
+    /// [`NodeGroupRecord::fail_over`] maintains it.
     pub members: Vec<NodeGroupMemberRecord>,
 }
 
 impl NodeGroupRecord {
+    /// Fail this shard over: the first replica takes the primary role and the
+    /// primary it had becomes a replica, which is what an automatic failover
+    /// does to a shard. Hands back `(demoted cluster, promoted cluster)`, or
+    /// `None` when the shard has no primary or no replica to promote.
+    ///
+    /// The promoted member is moved to the front, because this record holds its
+    /// members "the primary first" and [`ReplicationGroupRecord`]'s replica
+    /// scaling relies on that order.
+    pub fn fail_over(&mut self) -> Option<(String, String)> {
+        let primary = self
+            .members
+            .iter()
+            .position(|member| member.current_role == ROLE_PRIMARY)?;
+        let replica = self
+            .members
+            .iter()
+            .position(|member| member.current_role != ROLE_PRIMARY)?;
+        self.members[primary].current_role = ROLE_REPLICA.to_string();
+        self.members[replica].current_role = ROLE_PRIMARY.to_string();
+        let demoted = self.members[primary].cache_cluster_id.clone();
+        let promoted = self.members[replica].cache_cluster_id.clone();
+        let promoted_member = self.members.remove(replica);
+        self.members.insert(0, promoted_member);
+        Some((demoted, promoted))
+    }
+
     /// This shard as the modelled `NodeGroup`.
     ///
     /// `PrimaryEndpoint` / `ReaderEndpoint` are the cluster mode DISABLED
@@ -4982,6 +5047,11 @@ pub struct SnapshotRecord {
     pub status: String,
     /// The status change the clock owes this snapshot, if any.
     pub pending_status: Option<PendingTransition>,
+    /// When the clock owes this snapshot's REMOVAL, set by `DeleteSnapshot`:
+    /// "ElastiCache immediately begins deleting the snapshot", so the record
+    /// answers [`STATUS_DELETING`] from that call and is dropped once the span
+    /// has passed. `None` on a snapshot nobody has deleted.
+    pub pending_removal: Option<SystemTime>,
     /// [`SNAPSHOT_SOURCE_MANUAL`] or [`SNAPSHOT_SOURCE_AUTOMATED`].
     pub source: String,
     /// When the snapshot was taken. `Snapshot` has no member for it — each
@@ -5047,6 +5117,7 @@ impl SnapshotRecord {
                 due: new.now + SNAPSHOT_TRANSITION,
                 status: STATUS_AVAILABLE.to_string(),
             }),
+            pending_removal: None,
             source: new.source,
             created_at: new.now,
             cache_node_type: cluster.cache_node_type.clone(),
@@ -5092,6 +5163,9 @@ impl SnapshotRecord {
                 due: new.now + SNAPSHOT_TRANSITION,
                 status: STATUS_AVAILABLE.to_string(),
             }),
+            // The copy is its own resource: whatever the source's deletion
+            // owes, nothing is owed on the record stored under the new name.
+            pending_removal: None,
             source: SNAPSHOT_SOURCE_MANUAL.to_string(),
             // "The ID of the KMS key used to encrypt the target snapshot": the
             // copy keeps the source's key when the request names none.
@@ -5119,6 +5193,22 @@ impl SnapshotRecord {
         self.status = pending.status.clone();
         self.pending_status = None;
         Some(settled)
+    }
+
+    /// Put this snapshot into [`STATUS_DELETING`] and let the clock owe its
+    /// removal [`SNAPSHOT_TRANSITION`] later.
+    ///
+    /// `DeleteSnapshot` documents exactly this: "When you receive a successful
+    /// response from this operation, ElastiCache immediately begins deleting the
+    /// snapshot; you cannot cancel or revert this operation" — so the record is
+    /// still there, reporting `deleting`, and the removal is what the clock
+    /// materialises ([`ComAmazonawsElasticacheAmazonelasticachev9State::purge_deleted_snapshots`]).
+    /// Any status change that was still pending is dropped: a snapshot that is
+    /// going away is not owed `available` any more.
+    pub fn begin_deletion(&mut self, now: SystemTime) {
+        self.status = STATUS_DELETING.to_string();
+        self.pending_status = None;
+        self.pending_removal = Some(now + SNAPSHOT_TRANSITION);
     }
 
     /// This record as the modelled `Snapshot`.
@@ -6769,6 +6859,14 @@ pub struct ComAmazonawsElasticacheAmazonelasticachev9State {
     /// was given. A `BTreeMap` is what gives `DescribeReservedCacheNodes` the
     /// stable total order its `Marker` indexes into.
     pub reserved_cache_nodes: BTreeMap<String, ReservedCacheNodeRecord>,
+    /// When each shard this account has tested automatic failover on was tested.
+    ///
+    /// Not a resource but a RATE: `TestFailover` is bounded at
+    /// [`MAX_TEST_FAILOVERS_PER_WINDOW`] shards per [`TEST_FAILOVER_WINDOW`], so
+    /// the instants of the accepted calls are what that bound is counted over,
+    /// and the ones that have left the window are dropped (see
+    /// [`Self::test_failovers_in_window`]).
+    pub test_failovers: Vec<SystemTime>,
 }
 
 impl Default for ComAmazonawsElasticacheAmazonelasticachev9State {
@@ -6809,6 +6907,7 @@ impl Default for ComAmazonawsElasticacheAmazonelasticachev9State {
             reserved_cache_nodes_offerings: offering_catalog(),
             engine_default_parameters: published_engine_default_parameters(),
             reserved_cache_nodes: BTreeMap::new(),
+            test_failovers: Vec::new(),
         }
     }
 }
@@ -7142,9 +7241,27 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
         name: &str,
         now: SystemTime,
     ) -> Option<&mut SnapshotRecord> {
+        // A snapshot whose removal the clock has already carried through is
+        // gone, so it resolves to nothing rather than to a record reporting
+        // `deleting` for ever.
+        self.purge_deleted_snapshots(now);
         let snapshot = self.snapshots.get_mut(name)?;
         snapshot.settle(now);
         Some(snapshot)
+    }
+
+    /// Drop every snapshot whose removal the clock already owes — the snapshots
+    /// a `DeleteSnapshot` put into [`STATUS_DELETING`] at least
+    /// [`SNAPSHOT_TRANSITION`] ago.
+    ///
+    /// Owed by the clock alone (due at this instant whether or not anybody
+    /// called), so a reporting operation materialises it too, the same way it
+    /// materialises a status change — see
+    /// [`Self::purge_deleted_serverless_caches`], the same rule for the other
+    /// resource a delete only begins.
+    pub fn purge_deleted_snapshots(&mut self, now: SystemTime) {
+        self.snapshots
+            .retain(|_, snapshot| snapshot.pending_removal.is_none_or(|due| now < due));
     }
 
     /// Materialise every status change the clock owes, for a caller that is
@@ -7155,6 +7272,7 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
         // A deletion the clock has carried through removes the record before
         // anything is reported from it.
         self.purge_deleted_serverless_caches(now);
+        self.purge_deleted_snapshots(now);
         let mut settled: Vec<(String, SettledTransition)> = Vec::new();
         for cluster in self.cache_clusters.values_mut() {
             if let Some(transition) = cluster.settle(now) {
@@ -7410,6 +7528,14 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
                 drop_clusters.push(member.cache_cluster_id.clone());
             }
         }
+        // How many members the shard ends up with, HELD TO THE PUBLISHED BOUND
+        // before anything is allocated: `ReplicasPerNodeGroup` /
+        // `NewReplicaCount` is documented "Valid values are 0 to 5"
+        // ([`MAX_REPLICAS_PER_NODE_GROUP`]), so a request's count is clamped to
+        // that range here as well as refused by the handlers that call this —
+        // no request can drive the minting loop below past the bound, whatever
+        // a caller forgets to check.
+        let replicas = replicas.clamp(0, MAX_REPLICAS_PER_NODE_GROUP);
         let target = usize::try_from(replicas.saturating_add(1)).unwrap_or(1);
         while keep.len() > target {
             if let Some(member) = keep.pop() {
@@ -7943,6 +8069,26 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
         };
         self.replication_groups
             .insert(new.replication_group_id.clone(), record);
+    }
+
+    /// How many shards this account has tested automatic failover on inside the
+    /// rolling [`TEST_FAILOVER_WINDOW`] that ends at `now` — the count
+    /// [`MAX_TEST_FAILOVERS_PER_WINDOW`] bounds.
+    ///
+    /// Counting drops the calls that have left the window, which is a write the
+    /// CLOCK owes: a call leaves a rolling window at a fixed instant whether or
+    /// not anybody calls again.
+    pub fn test_failovers_in_window(&mut self, now: SystemTime) -> usize {
+        if let Some(cutoff) = now.checked_sub(TEST_FAILOVER_WINDOW) {
+            self.test_failovers.retain(|at| *at >= cutoff);
+        }
+        self.test_failovers.len()
+    }
+
+    /// Record that automatic failover was tested on one shard at `at`; see
+    /// [`Self::test_failovers_in_window`].
+    pub fn record_test_failover(&mut self, at: SystemTime) {
+        self.test_failovers.push(at);
     }
 
     /// The stored replication group `id` names, as the modelled shape — built

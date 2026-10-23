@@ -25,6 +25,8 @@ mod global_secondary_indexes;
 mod index_capacity_and_item_collections;
 #[path = "all/item_write_expressions.rs"]
 mod item_write_expressions;
+#[path = "all/item_write_vocabularies.rs"]
+mod item_write_vocabularies;
 #[path = "all/key_schema_element_refusals.rs"]
 mod key_schema_element_refusals;
 #[path = "all/number_canonicalization.rs"]

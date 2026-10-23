@@ -10,6 +10,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use ::p256::ecdsa::signature::Signer;
+use ::p256::ecdsa::SigningKey;
+use ::sha2::Digest;
+
 use crate::ops::types::{
     AccountRecoverySettingType, AcrLevelConfigType, AdminCreateUserConfigType,
     AnalyticsConfigurationType, AttributeType, AuthenticationResultType, DeviceConfigurationType,
@@ -204,8 +208,11 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
     /// Every claim comes from stored state: the `sub` and `username` from the
     /// stored user, its `cognito:groups` from the groups the stored user belongs
     /// to, `client_id` from the stored app client, the issuer from the stored
-    /// pool, and each lifetime from the app client's validity settings.
-    /// `None` only when the pool, the client or the user is gone.
+    /// pool, and each lifetime from the app client's validity settings. Each of
+    /// the three is signed with the POOL's key pair, so a verifier can check it
+    /// against the key set that pool publishes. `None` when the pool, the client
+    /// or the user is gone, or when the signature could not be computed — never
+    /// a token nothing signed.
     ///
     /// Tokens the clock has already expired are swept first, and the oldest are
     /// evicted if the store is still at [`MAX_ISSUED_TOKENS`], so repeated
@@ -242,6 +249,10 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
     /// The one token-minting path behind [`issue_tokens`] and [`refresh_tokens`]:
     /// `with_refresh_token` decides whether a refresh token is minted beside the access
     /// and id tokens, so the two entry points cannot disagree about a claim.
+    ///
+    /// Every token it mints is signed with the POOL's key pair and names that key by
+    /// `kid`, so a verifier can check it against the key set the pool publishes; a token
+    /// whose signature could not be computed is not issued at all ([`signed_jws`]).
     fn mint_tokens(
         &mut self,
         user_pool_id: &str,
@@ -256,6 +267,7 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
             stored_username,
             email,
             groups,
+            signing_key,
             access_ttl,
             id_ttl,
             refresh_ttl,
@@ -269,6 +281,7 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
                 stored_username: user.username.clone(),
                 email: user.attributes.get("email").cloned(),
                 groups: pool.user_group_names(user),
+                signing_key: pool.signing_key.clone(),
                 access_ttl: client.access_token_ttl(),
                 id_ttl: client.id_token_ttl(),
                 refresh_ttl: client.refresh_token_ttl(),
@@ -327,11 +340,11 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
             }
         }
 
-        let access_token = unsecured_jws(&access_claims);
-        let id_token = unsecured_jws(&id_claims);
+        let access_token = signed_jws(&access_claims, &signing_key)?;
+        let id_token = signed_jws(&id_claims, &signing_key)?;
         // A refresh sign-in reuses the token the caller presented, so no refresh claims
         // are built on that path at all.
-        let refresh_token = with_refresh_token.then(|| {
+        let refresh_token = if with_refresh_token {
             let refresh_claims = serde_json::json!({
                 "sub": sub,
                 "iss": issuer,
@@ -343,8 +356,10 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
                 "jti": new_uuid(),
                 "origin_jti": origin_jti,
             });
-            unsecured_jws(&refresh_claims)
-        });
+            Some(signed_jws(&refresh_claims, &signing_key)?)
+        } else {
+            None
+        };
 
         let minted = 2 + usize::from(with_refresh_token);
         self.issued_tokens
@@ -447,6 +462,11 @@ pub struct UserPool {
     /// stable. `GroupNameType` carries no case-insensitivity trait, so a name is
     /// matched exactly as it was created.
     pub groups: BTreeMap<String, Group>,
+    /// The key pair this pool's tokens are signed with and whose public half
+    /// its key set publishes, minted with the pool and kept for its lifetime,
+    /// so every token the pool ever issued stays verifiable against the key set
+    /// it publishes now.
+    pub signing_key: PoolSigningKey,
 }
 
 impl UserPool {
@@ -456,6 +476,29 @@ impl UserPool {
             "https://{SIGNING_NAME}.{}.amazonaws.com/{}",
             self.region, self.id
         )
+    }
+
+    /// Where this pool publishes the key set its tokens are verified against:
+    /// `<issuer>/.well-known/jwks.json`, the location the token's `iss` claim
+    /// leads a verifier to (Amazon Cognito Developer Guide, "Verifying a JSON
+    /// web token").
+    pub fn jwks_uri(&self) -> String {
+        format!("{}/.well-known/jwks.json", self.issuer())
+    }
+
+    /// This pool's token-signing key pair, minted when the pool was created.
+    pub fn signing_key(&self) -> &PoolSigningKey {
+        &self.signing_key
+    }
+
+    /// This pool's JSON Web Key Set (RFC 7517 §5): the public half of every key
+    /// its tokens are signed with, each entry found by the `kid` the token
+    /// header carries. This is the document a verifier reads from
+    /// [`UserPool::jwks_uri`], and it holds only PUBLIC key parameters.
+    ///
+    /// A pure read: it renders the stored key and changes nothing.
+    pub fn jwks(&self) -> serde_json::Value {
+        serde_json::json!({ "keys": [self.signing_key.to_jwk()] })
     }
 
     /// This pool with a freshly minted id, and the ARN that id implies. Used
@@ -1239,6 +1282,10 @@ pub fn new_user_pool(name: String, region: &str, now: SystemTime) -> UserPool {
         clients: HashMap::new(),
         users: HashMap::new(),
         groups: BTreeMap::new(),
+        // A pool's token-signing key exists from the moment the pool does, as
+        // on AWS, so its key set is publishable before anything signs in. One
+        // scalar multiplication, so creating a pool waits on nothing.
+        signing_key: PoolSigningKey::generate(),
     }
 }
 
@@ -1323,27 +1370,172 @@ struct TokenInputs {
     email: Option<String>,
     /// The names of the pool's groups the stored user belongs to, in stored order.
     groups: Vec<String>,
+    /// The pool's own token-signing key pair: every token of this sign-in is
+    /// signed with it and names it by `kid`.
+    signing_key: PoolSigningKey,
     access_ttl: Duration,
     id_ttl: Duration,
     refresh_ttl: Duration,
 }
 
-/// `claims` as an UNSECURED JWS in compact serialization (RFC 7515 §6, "Using
-/// the Algorithm none"): `base64url(header) '.' base64url(claims) '.'`, with an
-/// empty signature segment.
+// ---------------------------------------------------------------------------
+// Token signing
+//
+// Amazon Cognito signs every token a user pool issues against a key pair
+// belonging to THAT pool, and publishes the verifying half as a JSON Web Key
+// Set: a verifier must "decode the token ... and verify the signature" against
+// the key the token's `kid` names in the pool's `jwks.json` (Amazon Cognito
+// Developer Guide, "Verifying a JSON web token"). Every consumer of such a
+// token — Verified Permissions, an API Gateway JWT authorizer, any JOSE
+// library — reads `alg` and `kid` from the header, finds the matching JWK and
+// checks the signature over `base64url(header) '.' base64url(claims)`, so a
+// token whose third segment is EMPTY is unusable: it is not even a
+// syntactically valid signed JWT.
+//
+// AWS signs with RS256. This emulator signs with ES256 (ECDSA on NIST P-256
+// with SHA-256, RFC 7518 §3.4) because the only maintained pure-Rust RSA
+// implementation carries two unfixable timing advisories (RUSTSEC-2023-0071 /
+// CVE-2023-49092 and GHSA-4grx-2x9w-596c, both "no fixed version") that this
+// repository's dependency audit blocks, and every other RSA option needs a C
+// toolchain this image does not build. Nothing a verifier does changes: the
+// algorithm is named in the token header AND in the published JWK, which is
+// where a JOSE library reads it from, so the token verifies by the same
+// `kid`-lookup-then-check-signature path. Both algorithms are JOSE registered
+// (RFC 7518 §3.1), and the signature segment is a non-empty base64url run
+// either way.
+// ---------------------------------------------------------------------------
+
+/// The `alg` of every token this service signs, and of the JWK it publishes for
+/// the key that signed it: ECDSA using P-256 and SHA-256 (RFC 7518 §3.1/§3.4).
+const TOKEN_SIGNING_ALGORITHM: &str = "ES256";
+
+/// The `crv` of the curve [`TOKEN_SIGNING_ALGORITHM`] is defined over, as the
+/// published JWK names it (RFC 7518 §6.2.1.1).
+const TOKEN_SIGNING_CURVE: &str = "P-256";
+
+/// One user pool's token-signing key pair: the private key the pool's tokens
+/// are signed with, named by the `kid` its published JWK carries.
 ///
-/// Amazon Cognito signs its tokens with RS256 against the key pair published at
-/// a pool's JWKS endpoint. This emulator holds no such key pair, and no
-/// operation here verifies a token, so it issues the form RFC 7515 defines for
-/// a JWS that carries no signature rather than filling the third segment with
-/// bytes that would only look like one. The token is still this emulator's own:
-/// its claims come from stored state, each carries a unique `jti`, and every
-/// token issued is recorded in `issued_tokens`.
-fn unsecured_jws(claims: &serde_json::Value) -> String {
-    let header = serde_json::json!({ "alg": "none", "typ": "JWT" });
-    let encoded_header = base64_url(header.to_string().as_bytes());
-    let encoded_claims = base64_url(claims.to_string().as_bytes());
-    format!("{encoded_header}.{encoded_claims}.")
+/// The key belongs to the pool, so a token one pool issued carries one pool's
+/// `kid` and verifies against only that pool's JWKS.
+#[derive(Clone)]
+pub struct PoolSigningKey {
+    /// The `kid` the token header carries and the published JWK is found by:
+    /// this key's RFC 7638 JWK thumbprint, so it is derived from the key itself
+    /// rather than minted beside it.
+    kid: String,
+    private: SigningKey,
+}
+
+/// Renders the key's PUBLIC identity only. Private key material is never
+/// logged, traced or put in a response, so it is not in this rendering either.
+impl ::std::fmt::Debug for PoolSigningKey {
+    fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        formatter
+            .debug_struct("PoolSigningKey")
+            .field("kid", &self.kid)
+            .field("alg", &TOKEN_SIGNING_ALGORITHM)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PoolSigningKey {
+    /// A freshly generated key pair, drawn from the operating system's CSPRNG
+    /// (`rand`'s thread-local generator, seeded from the OS).
+    ///
+    /// One scalar multiplication, so this is microseconds of work: a pool mints
+    /// its key when the pool is created and no request path ever generates one.
+    #[must_use]
+    pub fn generate() -> Self {
+        let private = SigningKey::random(&mut ::rand::thread_rng());
+        let kid = jwk_thumbprint(&public_coordinates(&private));
+        Self { kid, private }
+    }
+
+    /// The `kid` naming this key in the pool's JWKS.
+    #[must_use]
+    pub fn kid(&self) -> &str {
+        &self.kid
+    }
+
+    /// This key's PUBLIC half as a JWK (RFC 7517), the entry a verifier finds
+    /// by `kid` in the pool's key set: `kty`/`crv` and the `x`/`y` curve
+    /// coordinates RFC 7518 §6.2.1 defines, with the `use` and `alg` the
+    /// signature is checked under. No private parameter (`d`) is in it.
+    #[must_use]
+    pub fn to_jwk(&self) -> serde_json::Value {
+        let (x, y) = public_coordinates(&self.private);
+        serde_json::json!({
+            "alg": TOKEN_SIGNING_ALGORITHM,
+            "crv": TOKEN_SIGNING_CURVE,
+            "kid": self.kid,
+            "kty": "EC",
+            "use": "sig",
+            "x": base64_url(&x),
+            "y": base64_url(&y),
+        })
+    }
+
+    /// The ES256 signature over `signing_input` — the 64-byte `R || S` form RFC
+    /// 7518 §3.4 puts in the third segment — or `None` when signing failed, in
+    /// which case the caller issues no token rather than one carrying bytes
+    /// that are not a signature.
+    #[must_use]
+    pub fn sign(&self, signing_input: &[u8]) -> Option<Vec<u8>> {
+        let signature: ::p256::ecdsa::Signature = self.private.try_sign(signing_input).ok()?;
+        Some(signature.to_bytes().to_vec())
+    }
+}
+
+/// `key`'s public curve point as the two fixed-width coordinates a JWK
+/// publishes: the uncompressed SEC1 encoding's `x` and `y`, 32 bytes each
+/// (RFC 7518 §6.2.1.2 — "the octet string representation MUST utilize all
+/// octets", i.e. no leading zero is dropped).
+fn public_coordinates(key: &SigningKey) -> (Vec<u8>, Vec<u8>) {
+    let point = key.verifying_key().to_encoded_point(false);
+    let x = point.x().map(|x| x.to_vec()).unwrap_or_default();
+    let y = point.y().map(|y| y.to_vec()).unwrap_or_default();
+    (x, y)
+}
+
+/// The RFC 7638 JWK thumbprint of the public key whose coordinates are
+/// `(x, y)`: the base64url SHA-256 of the key's canonical JWK — its required
+/// members (`crv`, `kty`, `x`, `y` for an EC key) in lexicographic order, with
+/// no whitespace. Two pools' keys therefore never share a `kid`, and a key's
+/// `kid` is the same every time it is published.
+fn jwk_thumbprint((x, y): &(Vec<u8>, Vec<u8>)) -> String {
+    let canonical = serde_json::json!({
+        "crv": TOKEN_SIGNING_CURVE,
+        "kty": "EC",
+        "x": base64_url(x),
+        "y": base64_url(y),
+    })
+    .to_string();
+    base64_url(&::sha2::Sha256::digest(canonical.as_bytes()))
+}
+
+/// `claims` as a JWS in compact serialization (RFC 7515 §3.1) signed with
+/// `key`: `base64url(header) '.' base64url(claims) '.' base64url(signature)`,
+/// where the header names the algorithm and the key (`kid`) a verifier checks
+/// the signature with.
+///
+/// `None` when the signature could not be computed, so a token is either
+/// signed or not issued.
+fn signed_jws(claims: &serde_json::Value, key: &PoolSigningKey) -> Option<String> {
+    let header = serde_json::json!({
+        "alg": TOKEN_SIGNING_ALGORITHM,
+        "kid": key.kid(),
+        "typ": "JWT",
+    });
+    // RFC 7515 §5.1: the signature is computed over the ENCODED header and
+    // payload, joined by '.', so those exact bytes are what the token carries.
+    let signing_input = format!(
+        "{}.{}",
+        base64_url(header.to_string().as_bytes()),
+        base64_url(claims.to_string().as_bytes())
+    );
+    let signature = key.sign(signing_input.as_bytes())?;
+    Some(format!("{signing_input}.{}", base64_url(&signature)))
 }
 
 /// `bytes` in base64url without padding, as a JWS segment is encoded

@@ -1229,6 +1229,50 @@ impl FlowOperationFilter {
     }
 }
 
+/// Why a change to a firewall's subnet associations was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubnetAssociationBreach {
+    /// The firewall is protected against changes to its subnet associations.
+    Protected,
+    /// The request named no subnet at all, so it asks for no association.
+    NoSubnets,
+    /// One subnet was named twice in the same request, which cannot mean two
+    /// endpoints: a subnet is associated at most once.
+    RepeatedSubnet(String),
+    /// The change would need more Availability Zones than one firewall spans.
+    ZoneCapacity,
+}
+
+/// What a change to a protected firewall's subnet associations is refused with.
+///
+/// The rule is documented on `Firewall$SubnetChangeProtection`: "A setting
+/// indicating whether the firewall is protected against changes to the subnet
+/// associations. Use this setting to protect against accidentally modifying the
+/// subnet associations for a firewall that is in use", so while the flag is set
+/// the change is not a valid operation on this firewall
+/// (`InvalidOperationException`, client, HTTP 400). The model does not fix the
+/// text, and the refusal is a property of the setting rather than of the
+/// request, so the message is one constant carrying nothing from the request —
+/// the shape every resource-agnostic refusal this service answers takes (see
+/// [`RESOURCE_NOT_FOUND_MESSAGE`]).
+pub const SUBNET_CHANGE_PROTECTED_MESSAGE: &str =
+    "Unable to change the subnet associations because the firewall is protected against subnet \
+     changes";
+
+/// What a subnet-association change naming no subnet is refused with: the
+/// request asks for no association at all, which no mapping can satisfy.
+pub const NO_SUBNETS_MESSAGE: &str = "Specify at least one subnet.";
+
+/// What a subnet-association change past [`MAX_AVAILABILITY_ZONES`] is refused
+/// with: `AssociateSubnets` is documented "You can specify one subnet for each
+/// of the Availability Zones that the VPC spans", and
+/// [`availability_zone_of`] names that many zones.
+pub fn too_many_zones_message() -> String {
+    format!(
+        "A firewall can use at most {MAX_AVAILABILITY_ZONES} subnets, one per Availability Zone."
+    )
+}
+
 /// A firewall, as persisted. Every member `Firewall` / `FirewallStatus` reports
 /// is read back from here.
 #[derive(Debug, Clone)]
@@ -1267,9 +1311,12 @@ pub struct FirewallRecord {
     pub sync_states: HashMap<String, SyncStateRecord>,
     /// The optimistic-locking token; re-minted on every mutation.
     pub update_token: String,
-    /// When `CreateFirewall` stored this record, and so the instant the clock
-    /// measures this firewall's provisioning from (see [`FirewallRecord::ready_at`]).
-    pub created_at: SystemTime,
+    /// When this firewall's endpoints last STARTED provisioning, and so the
+    /// instant the clock measures that provisioning from (see
+    /// [`FirewallRecord::ready_at`]): the `CreateFirewall` that stored the
+    /// record, or a later call that attached a new firewall endpoint (see
+    /// [`FirewallRecord::associate_subnets`]).
+    pub provisioning_since: SystemTime,
     /// Every flow operation started on this firewall and not yet dropped with
     /// it, keyed by `FlowOperationId`. A flow operation acts on one firewall's
     /// flow table and is identified by `FirewallArn` + `FlowOperationId`, so it
@@ -1280,9 +1327,10 @@ pub struct FirewallRecord {
 
 impl FirewallRecord {
     /// When the clock owes this firewall its `PROVISIONING` -> `READY` move:
-    /// [`FIREWALL_PROVISIONING_SPAN`] after the create that started it.
+    /// [`FIREWALL_PROVISIONING_SPAN`] after the call that started its endpoints
+    /// provisioning.
     pub fn ready_at(&self) -> SystemTime {
-        self.created_at + FIREWALL_PROVISIONING_SPAN
+        self.provisioning_since + FIREWALL_PROVISIONING_SPAN
     }
 
     /// Apply the status move the clock already made due, and say whether
@@ -1300,6 +1348,96 @@ impl FirewallRecord {
             sync_state.attachment_status = ATTACHMENT_READY.to_string();
         }
         true
+    }
+
+    /// Associate `requested` with this firewall, and answer the subnets that
+    /// gained a firewall endpoint here.
+    ///
+    /// `AssociateSubnets` is documented "Associates the specified subnets in the
+    /// Amazon VPC to the firewall. You can specify one subnet for each of the
+    /// Availability Zones that the VPC spans. This request creates an Network
+    /// Firewall firewall endpoint in each of the subnets", so a firewall's
+    /// mappings are a SET of subnets with one endpoint per Availability Zone: a
+    /// subnet the firewall already carries is already associated and gains no
+    /// second endpoint, while every newly named subnet takes a free zone
+    /// ([`availability_zone_of`]) and an endpoint that starts out
+    /// [`ATTACHMENT_CREATING`] — which is what puts the firewall back in
+    /// [`FIREWALL_PROVISIONING`] until the clock owes it `READY` again at
+    /// [`FirewallRecord::ready_at`].
+    ///
+    /// Nothing is written on a refusal: every check runs before the first
+    /// mutation.
+    pub fn associate_subnets(
+        &mut self,
+        region: &str,
+        requested: &[SubnetMapping],
+        now: SystemTime,
+    ) -> Result<Vec<String>, SubnetAssociationBreach> {
+        if requested.is_empty() {
+            return Err(SubnetAssociationBreach::NoSubnets);
+        }
+        if self.subnet_change_protection {
+            return Err(SubnetAssociationBreach::Protected);
+        }
+        let mut named = HashSet::new();
+        for mapping in requested {
+            if !named.insert(mapping.subnet_id.as_str()) {
+                return Err(SubnetAssociationBreach::RepeatedSubnet(
+                    mapping.subnet_id.clone(),
+                ));
+            }
+        }
+
+        // A subnet this firewall already carries is already associated, so it is
+        // not attached a second time and keeps the `IPAddressType` it was
+        // associated with (`SubnetMapping$IPAddressType`: "You can't change the
+        // IP address type after you create the subnet").
+        let added: Vec<SubnetMapping> = {
+            let associated: HashSet<&str> = self
+                .subnet_mappings
+                .iter()
+                .map(|mapping| mapping.subnet_id.as_str())
+                .collect();
+            requested
+                .iter()
+                .filter(|mapping| !associated.contains(mapping.subnet_id.as_str()))
+                .cloned()
+                .collect()
+        };
+        if self.subnet_mappings.len() + added.len() > MAX_AVAILABILITY_ZONES {
+            return Err(SubnetAssociationBreach::ZoneCapacity);
+        }
+        // One endpoint per Availability Zone, so each added subnet takes a zone
+        // no endpoint of this firewall occupies yet.
+        let zones: Vec<String> = (0..MAX_AVAILABILITY_ZONES)
+            .map(|index| availability_zone_of(region, index))
+            .filter(|zone| !self.sync_states.contains_key(zone))
+            .take(added.len())
+            .collect();
+        if zones.len() < added.len() {
+            return Err(SubnetAssociationBreach::ZoneCapacity);
+        }
+
+        let attached: Vec<String> = added
+            .iter()
+            .map(|mapping| mapping.subnet_id.clone())
+            .collect();
+        for (mapping, zone) in added.into_iter().zip(zones) {
+            self.sync_states.insert(
+                zone,
+                SyncStateRecord {
+                    subnet_id: mapping.subnet_id.clone(),
+                    endpoint_id: new_endpoint_id(),
+                    attachment_status: ATTACHMENT_CREATING.to_string(),
+                },
+            );
+            self.subnet_mappings.push(mapping);
+        }
+        if !attached.is_empty() {
+            self.status = FIREWALL_PROVISIONING.to_string();
+            self.provisioning_since = now;
+        }
+        Ok(attached)
     }
 
     /// The `Firewall` shape for this record.

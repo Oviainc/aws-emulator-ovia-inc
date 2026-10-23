@@ -80,6 +80,8 @@ mod import_image_tasks;
 mod instance_lifecycle;
 #[path = "all/instance_type_offerings.rs"]
 mod instance_type_offerings;
+#[path = "all/instance_types.rs"]
+mod instance_types;
 #[path = "all/ipam_routing_policy_registrations.rs"]
 mod ipam_routing_policy_registrations;
 #[path = "all/launch_templates.rs"]
@@ -102,6 +104,8 @@ mod principal_id_format;
 mod regions;
 #[path = "all/resource_specific_error_codes.rs"]
 mod resource_specific_error_codes;
+#[path = "all/route_server_peers.rs"]
+mod route_server_peers;
 #[path = "all/route_servers.rs"]
 mod route_servers;
 #[path = "all/secondary_networks.rs"]

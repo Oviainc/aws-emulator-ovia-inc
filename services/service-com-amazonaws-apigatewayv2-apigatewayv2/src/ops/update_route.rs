@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRoute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRoute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRoute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -200,18 +191,194 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRoute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRouteErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRoute"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRoute"));
+        };
+        let mut store = state.lock();
+
+        let Some(api) = store.apis.get_mut(&input.api_id) else {
+            return Err(UpdateRouteErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!(
+                    "Invalid API identifier specified {}:{}",
+                    ::engine::emulator_account_id(),
+                    input.api_id
+                )),
+                resource_type: ::std::option::Option::None,
+            })
+            .into());
+        };
+        // Each of these members is documented "Supported only for WebSocket APIs" on
+        // `UpdateRoute` too, so a patch cannot put one on a route of an api of another
+        // protocol — the same gate `CreateRoute` applies, on the same members, over the
+        // members THIS request configures. Checked before anything is written, so a
+        // refused patch leaves the route exactly as it was. A map the request sent
+        // empty, and an `ApiKeyRequired` it sent `false`, configure nothing: `false` is
+        // the value a route carries either way (`Route$ApiKeyRequired`).
+        let restricted = [
+            crate::state::ProtocolRestrictedMember::websocket_only(
+                "ApiKeyRequired",
+                input.api_key_required == Some(true),
+            ),
+            crate::state::ProtocolRestrictedMember::websocket_only(
+                "ModelSelectionExpression",
+                input.model_selection_expression.is_some(),
+            ),
+            crate::state::ProtocolRestrictedMember::websocket_only(
+                "RequestModels",
+                input
+                    .request_models
+                    .as_ref()
+                    .is_some_and(|models| !models.is_empty()),
+            ),
+            crate::state::ProtocolRestrictedMember::websocket_only(
+                "RequestParameters",
+                input
+                    .request_parameters
+                    .as_ref()
+                    .is_some_and(|parameters| !parameters.is_empty()),
+            ),
+            crate::state::ProtocolRestrictedMember::websocket_only(
+                "RouteResponseSelectionExpression",
+                input.route_response_selection_expression.is_some(),
+            ),
+        ];
+        if let Err(message) =
+            crate::state::validate_protocol_restricted_members(&api.protocol_type, &restricted)
+        {
+            return Err(bad_request(&message));
+        }
+
+        let Some(existing) = api.routes.get(&input.route_id) else {
+            return Err(UpdateRouteErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!(
+                    "Invalid Route identifier specified {}:{}",
+                    ::engine::emulator_account_id(),
+                    input.route_id
+                )),
+                resource_type: ::std::option::Option::None,
+            })
+            .into());
+        };
+
+        // The update is a PATCH (`PATCH /v2/apis/{ApiId}/routes/{RouteId}`): a member
+        // the request carries replaces the stored one, and a member it omits leaves the
+        // stored value exactly as it was. A map or list member is a VALUE like any
+        // other, so one the request carries replaces the stored map wholesale; removing
+        // a single request parameter without resending the rest is what
+        // `DeleteRouteRequestParameter` is for. Nothing here is defaulted: a default
+        // belongs to the create, and applying one again would silently undo a value a
+        // later caller can still see through `GetRoute`.
+        let mut updated = existing.clone();
+        if let Some(route_key) = input.route_key {
+            // "If you created an API using quick create, the $default route is managed
+            // by API Gateway. You can't modify the $default route key"
+            // (`Route$ApiGatewayManaged`), so a managed route keeps the key the service
+            // gave it. Re-sending the key it already carries changes nothing and is
+            // accepted.
+            if updated.api_gateway_managed && route_key != updated.route_key {
+                return Err(bad_request(&format!(
+                    "The RouteKey of a route managed by API Gateway cannot be changed; \
+                     this route's RouteKey is {}",
+                    updated.route_key
+                )));
+            }
+            updated.route_key = route_key;
+        }
+        if let Some(target) = input.target {
+            updated.target = Some(target);
+        }
+        if let Some(authorization_type) = input.authorization_type {
+            updated.authorization_type = authorization_type;
+        }
+        if let Some(authorizer_id) = input.authorizer_id {
+            updated.authorizer_id = Some(authorizer_id);
+        }
+        if let Some(api_key_required) = input.api_key_required {
+            updated.api_key_required = api_key_required;
+        }
+        if let Some(operation_name) = input.operation_name {
+            updated.operation_name = Some(operation_name);
+        }
+        if let Some(authorization_scopes) = input.authorization_scopes {
+            updated.authorization_scopes = authorization_scopes;
+        }
+        if let Some(expression) = input.model_selection_expression {
+            updated.model_selection_expression = Some(expression);
+        }
+        if let Some(expression) = input.route_response_selection_expression {
+            updated.route_response_selection_expression = Some(expression);
+        }
+        if let Some(request_models) = input.request_models {
+            updated.request_models = request_models.into_iter().collect();
+        }
+        if let Some(request_parameters) = input.request_parameters {
+            updated.request_parameters = request_parameters.into_iter().collect();
+        }
+
+        // A route key identifies the route within its api, so an update cannot move a
+        // route onto a key another route of the same api already holds. The route being
+        // updated is excluded, so re-sending its own key is not a conflict with itself.
+        if api
+            .routes
+            .iter()
+            .any(|(route_id, route)| route_id != &input.route_id && route.route_key == updated.route_key)
+        {
+            return Err(UpdateRouteErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Route with key {} already exists for this API.",
+                    updated.route_key
+                )),
+            })
+            .into());
+        }
+
+        // The MERGED record is what has to hold together: a route that already names an
+        // authorizer may switch to an authorizer-backed type without resending the id,
+        // and one that names none cannot.
+        if let Err(message) = crate::state::validate_route_authorization(
+            &updated.authorization_type,
+            updated.authorizer_id.as_deref(),
+        ) {
+            return Err(bad_request(&message));
+        }
+
+        // Read the response back out of the STORE, so what the caller gets is what a
+        // later GetRoute will report. The route exists (checked above), so this replaces
+        // its record rather than minting a second one, and its `RouteId`, its route
+        // responses and their id seed are carried over untouched by the clone.
+        api.routes.insert(input.route_id.clone(), updated);
+        let stored = api
+            .routes
+            .get(&input.route_id)
+            .map(crate::state::Route::to_wire)
+            .expect("the route just written is in the store");
+        Ok(UpdateRouteOutput {
+            api_gateway_managed: stored.api_gateway_managed,
+            api_key_required: stored.api_key_required,
+            authorization_scopes: stored.authorization_scopes,
+            authorization_type: stored.authorization_type,
+            authorizer_id: stored.authorizer_id,
+            model_selection_expression: stored.model_selection_expression,
+            operation_name: stored.operation_name,
+            request_models: stored.request_models,
+            request_parameters: stored.request_parameters,
+            route_id: stored.route_id,
+            route_key: Some(stored.route_key),
+            route_response_selection_expression: stored.route_response_selection_expression,
+            target: stored.target,
+        })
     }
+}
+
+/// This operation's refusal of a request it models no more specific error for: the
+/// modelled `BadRequestException` ("The request is not valid, for example, the input is
+/// incomplete or incorrect"), whose message names the member and the constraint. Takes
+/// the same `&str` the sibling helper in `create_route` does.
+fn bad_request(message: &str) -> UpdateRouteError {
+    UpdateRouteErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

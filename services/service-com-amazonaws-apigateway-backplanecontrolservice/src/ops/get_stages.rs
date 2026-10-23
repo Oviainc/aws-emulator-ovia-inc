@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetStages
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetStages`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetStages::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: answers the stored `Stage`s of `restApiId`, narrowed to the ones that
+//! serve `deploymentId` when the request carries that filter.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +144,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetStages` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetStagesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetStages"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let store = state.lock();
+        // The API owns the collection, so an unresolvable `restApiId` is a missing
+        // resource — the same refusal every operation that resolves an API id gives.
+        let api = store.rest_apis.get(&input.rest_api_id).ok_or_else(|| {
+            GetStagesErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
+            })
+        })?;
+        let items = api
+            .stages
+            .values()
+            // `deploymentId` NARROWS the collection ("The stages' deployment
+            // identifiers"): it selects the stages that serve that deployment, and a
+            // filter no stage matches leaves an empty collection rather than a refusal —
+            // the same rule the other filtered listings of this service apply.
+            .filter(|stage| {
+                input
+                    .deployment_id
+                    .as_deref()
+                    .is_none_or(|deployment_id| stage.deployment_id == deployment_id)
+            })
+            // One rendering of the `Stage` shape for the whole crate, so a listed stage
+            // and a `GetStage` of the same record cannot differ member for member.
+            .map(super::create_stage::stage_body)
+            .collect();
+        // Reported even when empty: the API has the collection, and an absent `item`
+        // would say something different from "no stage matches". The order is the stored
+        // map's, keyed by stage name — one stage name names one stage of an API, so that
+        // order is total and stable across reads.
+        Ok(GetStagesOutput { item: Some(items) })
     }
 }
+

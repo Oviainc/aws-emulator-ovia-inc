@@ -6,11 +6,16 @@
 //!
 //! The rule under test: a repository holds at most one policy document, which is
 //! whatever the last `SetRepositoryPolicy` stored on that repository, which the read
-//! reports unchanged and the delete reports and removes; a repository with no policy is
+//! reports and the delete reports and removes; a repository with no policy is
 //! reported with `RepositoryPolicyNotFoundException`, one that does not exist with
 //! `RepositoryNotFoundException`, and a `policyText` that is not a resource-based IAM
 //! policy document — or one that would deny every principal the right to set another
 //! policy, absent `force` — with `InvalidParameterException`.
+//!
+//! The document the three operations report is the submitted one in the canonical
+//! IAM-policy rendering, so what is compared here is the policy's CONTENT
+//! ([`crate::policy_document_canonical_form::document_content`]); the rendering itself is
+//! pinned byte for byte in `policy_document_canonical_form.rs`.
 //!
 //! The policy grammar is the crate's shared `state::validate_resource_policy`, the one
 //! `PutRegistryPolicy` uses, so the rows below mirror `registry_policy.rs`'s — minus the
@@ -19,6 +24,7 @@
 
 use serde_json::{json, Value};
 
+use crate::policy_document_canonical_form::document_content;
 use crate::wire::{call, emulator, ok, refused, REGISTRY_ID};
 
 /// A syntactically valid registry id (`RegistryId` is `^[0-9]{12}$`) that is NOT this
@@ -59,7 +65,7 @@ fn name_request(name: &str) -> Value {
 }
 
 /// Assert the three identity members of a policy response: the registry, the repository
-/// and the policy document, which must be the stored text verbatim.
+/// and the policy document, whose content must be the stored policy's.
 fn assert_policy_response(case: &str, operation: &str, body: &Value, name: &str, policy: &str) {
     assert_eq!(
         body["registryId"].as_str(),
@@ -73,18 +79,20 @@ fn assert_policy_response(case: &str, operation: &str, body: &Value, name: &str,
         "case {case:?}: {operation} must report the repository it acted on, got {:?}",
         body["repositoryName"]
     );
+    let reported = body["policyText"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: {operation} must report a policyText"));
     assert_eq!(
-        body["policyText"].as_str(),
-        Some(policy),
-        "case {case:?}: {operation} must report the stored policy document, got {:?}",
-        body["policyText"]
+        document_content(reported),
+        document_content(policy),
+        "case {case:?}: {operation} must report the stored policy document, got {reported:?}"
     );
 }
 
 /// The forms a repository policy document can take, as a table: the rule generalises
 /// over the document's shape (one statement or many, object or list), its `Version`
 /// (either published value, or none), its principal and action forms, its whitespace and
-/// its length — and the stored text is the caller's own bytes in every row.
+/// its length — and the stored policy is the caller's own content in every row.
 fn policy_forms() -> Vec<(&'static str, String)> {
     vec![
         (
@@ -268,7 +276,7 @@ fn not_policy_documents() -> Vec<(&'static str, &'static str)> {
 }
 
 #[tokio::test]
-async fn a_policy_set_on_a_repository_is_read_back_verbatim() {
+async fn a_policy_set_on_a_repository_is_read_back_with_its_content_intact() {
     let router = emulator();
     // A second repository, never given a policy, shows the policy is held per
     // repository rather than per registry.
@@ -287,12 +295,17 @@ async fn a_policy_set_on_a_repository_is_read_back_verbatim() {
         .await;
         assert_policy_response(case, "SetRepositoryPolicy", &set, &name, &policy);
 
-        // Two reads: the document comes back unchanged, and reading it does not consume
+        // Two reads: the document comes back the same, and reading it does not consume
         // it — the second read sees exactly what the first did.
         for read in 1..=2 {
             let case = format!("{case} (read {read})");
             let got = ok(&router, &case, "GetRepositoryPolicy", &name_request(&name)).await;
             assert_policy_response(&case, "GetRepositoryPolicy", &got, &name, &policy);
+            assert_eq!(
+                got["policyText"], set["policyText"],
+                "case {case:?}: the read reports the text the set did, got {:?}",
+                got["policyText"]
+            );
         }
 
         // And the neighbouring repository still carries nothing.

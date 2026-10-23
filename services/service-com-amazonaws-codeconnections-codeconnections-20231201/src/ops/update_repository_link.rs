@@ -178,10 +178,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(UpdateRepositoryLinkErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Repository not found for accountId: {} and UUID: {}",
-                        ::engine::emulator_account_id(),
-                        input.repository_link_id
+                    // The same template `GetRepositoryLink` answers
+                    // (`state::repository_link_not_found_message`), tail included: one
+                    // id resolving to nothing is worded one way whichever operation
+                    // resolved it.
+                    message: Some(crate::state::repository_link_not_found_message(
+                        &input.repository_link_id,
                     )),
                 },
             )

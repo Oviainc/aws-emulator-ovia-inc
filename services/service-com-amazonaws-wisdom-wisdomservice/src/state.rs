@@ -12,7 +12,8 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    AssistantData, AssistantSummary, ServerSideEncryptionConfiguration, SessionData,
+    AssistantAssociationData, AssistantAssociationOutputData, AssistantData, AssistantSummary,
+    KnowledgeBaseAssociationData, ServerSideEncryptionConfiguration, SessionData,
 };
 
 /// The ARN namespace Wisdom resources carry (`awsService.arnNamespace` in the
@@ -53,6 +54,22 @@ pub const MAX_SESSIONS_PER_ASSISTANT: usize = 100;
 /// assistants x sessions-per-assistant PRODUCT is finite and not just each
 /// factor. Refused the same way as [`MAX_SESSIONS_PER_ASSISTANT`].
 pub const MAX_STORED_SESSIONS: usize = 10_000;
+
+/// The most assistant associations one assistant holds.
+///
+/// The same guard as [`MAX_SESSIONS_PER_ASSISTANT`], one level down from the
+/// assistant: an association is reclaimed by `DeleteAssistantAssociation` or by
+/// the delete of its assistant, so without a ceiling one assistant could be
+/// associated without limit. `CreateAssistantAssociation` declares a quota error
+/// for exactly this, so a create past it is refused with the modelled
+/// `ServiceQuotaExceededException` (402). It is a resource guard this emulator
+/// owns, NOT an AWS-published quota.
+pub const MAX_ASSOCIATIONS_PER_ASSISTANT: usize = 100;
+
+/// The only `AssociationType` this model declares
+/// (`smithy_query(query="shape",shape="AssociationType")`), and so the only type
+/// an association this service holds carries.
+pub const ASSOCIATION_TYPE_KNOWLEDGE_BASE: &str = "KNOWLEDGE_BASE";
 
 /// The most `clientToken` replay entries the store remembers, oldest evicted
 /// first.
@@ -107,6 +124,99 @@ pub struct Session {
     /// When this session was created. `SessionData` models no timestamp member,
     /// so nothing renders it; see [`Assistant::created_at`].
     pub created_at: SystemTime,
+}
+
+/// A knowledge base this account holds, as this crate persists it.
+///
+/// Only the two members an assistant association needs are kept — the id a
+/// request names the knowledge base by, and the ARN a record that references it
+/// reports — because this crate's `CreateKnowledgeBase` is still a scaffold stub
+/// (its own issue): nothing else of a knowledge base is reported by any
+/// implemented operation of this model yet. `CreateKnowledgeBase` EXTENDS this
+/// record and this map when it lands, rather than adding a second knowledge-base
+/// store beside them, so the two cannot disagree about one knowledge base.
+///
+/// The endpoint's real `wisdom` traffic is served by the Amazon Q in Connect
+/// crate (`src/service.rs`'s `OWN_REGISTRATION_KEY` explains why), whose own
+/// `CreateKnowledgeBase` fills the registry the same association create there
+/// resolves against.
+#[derive(Debug, Clone)]
+pub struct KnowledgeBase {
+    pub knowledge_base_id: String,
+    pub knowledge_base_arn: String,
+}
+
+/// A persisted association between an assistant and a knowledge base.
+///
+/// An association is reachable only through its assistant — every modelled route
+/// is `/assistants/{assistantId}/associations/…` — so [`Self::assistant_id`] is
+/// what makes a lookup under another assistant miss.
+#[derive(Debug, Clone)]
+pub struct AssistantAssociation {
+    pub assistant_association_id: String,
+    pub assistant_association_arn: String,
+    pub assistant_id: String,
+    pub assistant_arn: String,
+    /// `AssociationType` on the wire; this model declares the single value
+    /// [`ASSOCIATION_TYPE_KNOWLEDGE_BASE`].
+    pub association_type: String,
+    /// The knowledge base this association was made against, kept by id together
+    /// with the ARN it carried then, so a read reports the knowledge base the
+    /// association was made against even once that knowledge base is gone.
+    pub knowledge_base_id: String,
+    pub knowledge_base_arn: String,
+    pub tags: BTreeMap<String, String>,
+    /// The fingerprint of the create that minted this record — see
+    /// [`association_fingerprint`]. What a replayed `clientToken` is compared
+    /// against, so a token reused with different parameters is told it conflicts
+    /// instead of being handed a resource it did not ask for.
+    pub fingerprint: String,
+    /// When this association was created. `AssistantAssociationData` models no
+    /// timestamp member, so nothing renders it; see [`Assistant::created_at`].
+    pub created_at: SystemTime,
+}
+
+impl AssistantAssociation {
+    /// This association as the `AssistantAssociationData` shape
+    /// `CreateAssistantAssociation` and `GetAssistantAssociation` return.
+    pub fn to_data(&self) -> AssistantAssociationData {
+        AssistantAssociationData {
+            assistant_association_id: self.assistant_association_id.clone(),
+            assistant_association_arn: self.assistant_association_arn.clone(),
+            assistant_id: self.assistant_id.clone(),
+            assistant_arn: self.assistant_arn.clone(),
+            association_type: self.association_type.clone(),
+            association_data: AssistantAssociationOutputData::knowledgeBaseAssociation(
+                KnowledgeBaseAssociationData {
+                    knowledge_base_id: Some(self.knowledge_base_id.clone()),
+                    knowledge_base_arn: Some(self.knowledge_base_arn.clone()),
+                },
+            ),
+            tags: wire_tags(&self.tags),
+        }
+    }
+}
+
+/// The fingerprint of a `CreateAssistantAssociation` request: what its
+/// `clientToken` identifies.
+///
+/// An idempotency token identifies ONE request, so a replay carrying the
+/// identical request is a retry and answers with the resource the first call
+/// created, while the same token carrying a DIFFERENT request is an idempotency
+/// conflict and is refused. The fingerprint therefore covers every member the
+/// created record is made of — the association type, the associated knowledge
+/// base and the tags — and nothing else; the tag pairs are sorted, so the same
+/// request written in another order is one request.
+pub fn association_fingerprint(
+    association_type: &str,
+    knowledge_base_id: &str,
+    tags: &BTreeMap<String, String>,
+) -> String {
+    let pairs: Vec<String> = tags.iter().map(|(key, tag)| format!("{key}={tag}")).collect();
+    format!(
+        "{association_type}\u{1f}{knowledge_base_id}\u{1f}{}",
+        pairs.join("\u{1e}")
+    )
 }
 
 /// The `tags` member of a resource this service reports: ALWAYS present, and an
@@ -246,6 +356,17 @@ pub struct ComAmazonawsWisdomWisdomserviceState {
     pub assistant_arn_index: HashMap<String, String>,
     /// `sessionArn` -> (`assistantId`, `sessionId`), the same for session labels.
     pub session_arn_index: HashMap<String, (String, String)>,
+    /// Every assistant association, keyed by its `assistantAssociationId`. Each
+    /// record names the assistant it belongs to, so a lookup is always scoped to
+    /// the parent the route named.
+    pub assistant_associations: HashMap<String, AssistantAssociation>,
+    /// `assistantAssociationArn` -> (`assistantId`, `assistantAssociationId`), so
+    /// an ARN-form label resolves to the same record an id-form label does.
+    pub assistant_association_arn_index: HashMap<String, (String, String)>,
+    /// Every knowledge base this account holds, keyed by its `knowledgeBaseId` —
+    /// what a `CreateAssistantAssociation` resolves its `knowledgeBaseId` against.
+    /// See [`KnowledgeBase`] for why only two members are kept and who fills this.
+    pub knowledge_bases: HashMap<String, KnowledgeBase>,
     /// How many sessions `assistants` holds in total, for the store-wide
     /// session ceiling ([`MAX_STORED_SESSIONS`]).
     pub stored_sessions: usize,
@@ -344,21 +465,35 @@ impl ComAmazonawsWisdomWisdomserviceState {
         SessionInsert::Stored
     }
 
-    /// Drop an assistant, its sessions and every index entry that named them —
-    /// including the `clientToken` entries that created them, so a create/delete
-    /// cycle reclaims everything it allocated instead of retaining a row per
-    /// token for the life of the process.
+    /// Drop an assistant, its sessions, its associations and every index entry
+    /// that named them — including the `clientToken` entries that created them,
+    /// so a create/delete cycle reclaims everything it allocated instead of
+    /// retaining a row per token for the life of the process.
     pub fn remove_assistant(&mut self, assistant_id: &str) -> Option<Assistant> {
         let assistant = self.assistants.remove(assistant_id)?;
         self.assistant_order
             .retain(|entry| entry.assistant_id != assistant_id);
         self.assistant_name_index.remove(&assistant.name);
         self.assistant_arn_index.remove(&assistant.assistant_arn);
-        let mut removed: std::collections::HashSet<&str> =
-            std::collections::HashSet::from([assistant_id]);
+        let mut removed: std::collections::HashSet<String> =
+            std::collections::HashSet::from([assistant_id.to_string()]);
         for session in assistant.sessions.values() {
             self.session_arn_index.remove(&session.session_arn);
-            removed.insert(session.session_id.as_str());
+            removed.insert(session.session_id.clone());
+        }
+        // An association exists only inside its assistant, so it goes with it.
+        let associations: Vec<String> = self
+            .assistant_associations
+            .values()
+            .filter(|association| association.assistant_id == assistant_id)
+            .map(|association| association.assistant_association_id.clone())
+            .collect();
+        for id in associations {
+            if let Some(association) = self.assistant_associations.remove(&id) {
+                self.assistant_association_arn_index
+                    .remove(&association.assistant_association_arn);
+            }
+            removed.insert(id);
         }
         self.stored_sessions = self.stored_sessions.saturating_sub(assistant.sessions.len());
         self.idempotency
@@ -367,6 +502,107 @@ impl ComAmazonawsWisdomWisdomserviceState {
         self.idempotency_order
             .retain(|key| self.idempotency.contains_key(key));
         Some(assistant)
+    }
+
+    /// The knowledge base a `knowledgeBaseId` names, or `None` when this account
+    /// holds none under it. The modelled member is a bare `Uuid` (no ARN form),
+    /// so an id is the only label a request can name a knowledge base by.
+    pub fn knowledge_base(&self, knowledge_base_id: &str) -> Option<&KnowledgeBase> {
+        self.knowledge_bases.get(knowledge_base_id)
+    }
+
+    /// Persist a knowledge base and make it referenceable by an association.
+    pub fn insert_knowledge_base(&mut self, knowledge_base: KnowledgeBase) {
+        self.knowledge_bases
+            .insert(knowledge_base.knowledge_base_id.clone(), knowledge_base);
+    }
+
+    /// The association a (assistant label, association label) pair names, in
+    /// either label form. An association whose owner is a different assistant
+    /// does not resolve, the way a session of another assistant does not.
+    pub fn assistant_association(
+        &self,
+        assistant_label: &str,
+        association_label: &str,
+    ) -> Option<&AssistantAssociation> {
+        let assistant_id = self.resolve_assistant_id(assistant_label)?;
+        let association_id = if association_label.starts_with("arn:") {
+            let (owner, association_id) = self
+                .assistant_association_arn_index
+                .get(association_label)?;
+            if *owner != assistant_id {
+                return None;
+            }
+            association_id.clone()
+        } else {
+            association_label.to_string()
+        };
+        self.assistant_associations
+            .get(&association_id)
+            .filter(|association| association.assistant_id == assistant_id)
+    }
+
+    /// Every association of one (resolved) assistant, in
+    /// `assistantAssociationId` order, so what a read reports does not depend on
+    /// map iteration order.
+    pub fn assistant_associations_of(&self, assistant_id: &str) -> Vec<&AssistantAssociation> {
+        let mut associations: Vec<&AssistantAssociation> = self
+            .assistant_associations
+            .values()
+            .filter(|association| association.assistant_id == assistant_id)
+            .collect();
+        associations.sort_by(|left, right| {
+            left.assistant_association_id
+                .cmp(&right.assistant_association_id)
+        });
+        associations
+    }
+
+    /// Persist a new association under its (already resolved) parent assistant
+    /// and index it by ARN. `false` — nothing stored — when that assistant
+    /// already holds [`MAX_ASSOCIATIONS_PER_ASSISTANT`], so the bound holds
+    /// however the caller reaches this.
+    pub fn insert_assistant_association(&mut self, association: AssistantAssociation) -> bool {
+        if self
+            .assistant_associations_of(&association.assistant_id)
+            .len()
+            >= MAX_ASSOCIATIONS_PER_ASSISTANT
+        {
+            return false;
+        }
+        self.assistant_association_arn_index.insert(
+            association.assistant_association_arn.clone(),
+            (
+                association.assistant_id.clone(),
+                association.assistant_association_id.clone(),
+            ),
+        );
+        self.assistant_associations.insert(
+            association.assistant_association_id.clone(),
+            association,
+        );
+        true
+    }
+
+    /// Drop one association and every index entry that named it — including the
+    /// `clientToken` entry that created it, so a replay of that token does not
+    /// resurrect a resource a delete removed.
+    pub fn remove_assistant_association(
+        &mut self,
+        assistant_label: &str,
+        association_label: &str,
+    ) -> Option<AssistantAssociation> {
+        let id = self
+            .assistant_association(assistant_label, association_label)?
+            .assistant_association_id
+            .clone();
+        let association = self.assistant_associations.remove(&id)?;
+        self.assistant_association_arn_index
+            .remove(&association.assistant_association_arn);
+        self.idempotency.retain(|_, resource_id| *resource_id != id);
+        self.idempotency_order
+            .retain(|key| self.idempotency.contains_key(key));
+        Some(association)
     }
 
     /// The listing a page starts at: the creation-ordered assistants at or
@@ -482,6 +718,34 @@ pub fn session_arn(region: &str, assistant_id: &str, session_id: &str) -> String
         ARN_NAMESPACE,
         region,
         &format!("session/{assistant_id}/{session_id}"),
+    )
+}
+
+/// The ARN of a knowledge base:
+/// `arn:aws:wisdom:<region>:<account>:knowledge-base/<knowledgeBaseId>`.
+pub fn knowledge_base_arn(region: &str, knowledge_base_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("knowledge-base/{knowledge_base_id}"),
+    )
+}
+
+/// The ARN of an assistant association:
+/// `arn:aws:wisdom:<region>:<account>:association/<assistantId>/<assistantAssociationId>`.
+///
+/// The association's own id is the LAST segment and the owning assistant's the
+/// middle one, the same two-segment form [`session_arn`] uses and the only one
+/// the model's `Arn` pattern accepts for a nested resource.
+pub fn assistant_association_arn(
+    region: &str,
+    assistant_id: &str,
+    assistant_association_id: &str,
+) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("association/{assistant_id}/{assistant_association_id}"),
     )
 }
 

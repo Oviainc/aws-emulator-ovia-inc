@@ -2,7 +2,8 @@
 
 //! @op GetRegistryPolicy
 //! Reports the permissions policy of this emulator's registry: the document
-//! `PutRegistryPolicy` stored, returned byte for byte beside the registry id it is held
+//! `PutRegistryPolicy` stored — in the canonical IAM-policy rendering it stored it in —
+//! returned beside the registry id it is held
 //! under. This operation only REPORTS — it never changes the store — and a registry
 //! that carries no policy is refused with `RegistryPolicyNotFoundException`.
 //!

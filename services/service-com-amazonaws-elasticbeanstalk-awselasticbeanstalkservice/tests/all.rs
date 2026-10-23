@@ -57,6 +57,8 @@ mod solution_stacks;
 mod source_bundle_download;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/storage_location.rs"]
+mod storage_location;
 #[path = "all/swap_environment_cnames.rs"]
 mod swap_environment_cnames;
 #[path = "all/tag_batch_conflicts.rs"]

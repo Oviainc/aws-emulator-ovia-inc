@@ -1,21 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The form of the tokens this service issues: the base64url of their segments
-//! and the unsecured-JWS compact serialization they are serialized as.
+//! The tokens this service issues, as a verifier sees them: three NON-EMPTY
+//! base64url segments whose third one is an ES256 signature that checks out
+//! against the PUBLIC key the issuing pool's key set publishes, and whose
+//! claims come from stored state.
 //!
-//! The encoding is pinned by PUBLISHED vectors rather than by this emulator's
-//! own output: RFC 4648 §10's base64 test strings, plus inputs whose standard
-//! encoding carries both characters RFC 7515 §2 substitutes. A second suite
-//! signs in over the wire and reads the issued tokens back: three segments with
-//! an EMPTY third one and an `alg` of `none`, exactly what RFC 7515 §6 defines
-//! for a JWS that carries no signature — this emulator holds no JWKS key pair
-//! and verifies no token, so it says so in the header instead of filling the
-//! segment with bytes that would only look like a signature. Their claims come
-//! from stored state, and each token resolves back to the stored user.
+//! The encoding of a segment is pinned by PUBLISHED vectors rather than by this
+//! emulator's own output: RFC 4648 §10's base64 test strings, plus inputs whose
+//! standard encoding carries both characters RFC 7515 §2 substitutes.
+//!
+//! The signature suite signs in over the wire and then verifies each issued
+//! token the way any consumer does (Verified Permissions, an API Gateway JWT
+//! authorizer, a JOSE library): read `alg` and `kid` from the header, find that
+//! key in the pool's JWKS, and check the signature over
+//! `base64url(header) '.' base64url(claims)` with the algorithm the key set
+//! advertises (ES256 — ECDSA on P-256 with SHA-256, RFC 7518 §3.4). Nothing
+//! here touches a private key — the verification path uses only the `x`/`y`
+//! curve coordinates the key set publishes — so a token that passes is one a
+//! third party could have verified. The rows span the three tokens of a
+//! sign-in, users with and without groups and an email, two pools, a table of
+//! tamperings each of which must FAIL to verify, and the key set as served over
+//! the wire at the pool's `/.well-known/jwks.json`.
 
 use std::sync::Arc;
 
 use bytes::Bytes;
+use p256::ecdsa::signature::Verifier;
+use p256::ecdsa::{Signature, VerifyingKey};
+use p256::{EncodedPoint, FieldBytes};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -30,6 +42,14 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 
 /// A password satisfying a default pool's password policy.
 const GOOD_PASSWORD: &str = "Passw0rd!2024";
+
+/// The members of `AuthenticationResult` that carry a token, with the
+/// `token_use` claim each one's token states.
+const TOKEN_MEMBERS: [(&str, &str); 3] = [
+    ("AccessToken", "access"),
+    ("IdToken", "id"),
+    ("RefreshToken", "refresh"),
+];
 
 /// One emulator with just this service mounted, beside the engine its state
 /// lives in.
@@ -70,16 +90,22 @@ async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value
     payload
 }
 
-/// A base64url segment's bytes, decoded with the codec the wire serializer uses
-/// (`aws_smithy_types::base64`): the two alphabet substitutions and the padding
-/// RFC 7515 §2 strips are restored first.
-fn decode_base64url(segment: &str) -> Vec<u8> {
+/// A base64url segment's bytes, or `None` when the segment is not base64url at
+/// all: decoded with the codec the wire serializer uses
+/// (`aws_smithy_types::base64`), with the two alphabet substitutions and the
+/// padding RFC 7515 §2 strips restored first.
+fn try_decode_base64url(segment: &str) -> Option<Vec<u8>> {
     let mut standard = segment.replace('-', "+").replace('_', "/");
     while !standard.len().is_multiple_of(4) {
         standard.push('=');
     }
-    aws_smithy_types::base64::decode(&standard)
-        .unwrap_or_else(|error| panic!("{segment:?} must be base64url ({error})"))
+    aws_smithy_types::base64::decode(&standard).ok()
+}
+
+/// [`try_decode_base64url`] for a segment this emulator itself produced, which
+/// must therefore decode.
+fn decode_base64url(segment: &str) -> Vec<u8> {
+    try_decode_base64url(segment).unwrap_or_else(|| panic!("{segment:?} must be base64url"))
 }
 
 /// A JWS segment is base64url without padding (RFC 7515 §2): the standard
@@ -119,22 +145,132 @@ async fn a_jws_segment_is_base64url_without_padding() {
     }
 }
 
-/// Every token a sign-in returns is an unsecured JWS whose claims come from
-/// stored state, and every one of them resolves back to the stored user.
-#[tokio::test]
-async fn an_issued_token_is_an_unsecured_jws_over_stored_claims() {
-    let (router, engine) = router_and_engine();
-    let pool = ok(&router, "CreateUserPool", &json!({ "PoolName": "token-pool" })).await;
+/// Why a token failed to verify against a key set, for an assertion message.
+#[derive(Debug, PartialEq, Eq)]
+enum Rejected {
+    /// Not three non-empty segments, or a segment that is not base64url JSON.
+    Malformed(String),
+    /// The header names no algorithm or key this key set can check it under.
+    UnusableHeader(String),
+    /// No key in the set carries the `kid` the header names.
+    UnknownKey(String),
+    /// The signature does not check out against the named key.
+    BadSignature,
+}
+
+/// Verify `token` exactly as a third-party consumer does, using ONLY the public
+/// parameters in `jwks`, and return its claims.
+///
+/// The steps are the ones RFC 7515 §5.2 and RFC 7518 §3.4 define: split the
+/// compact serialization, read `alg`/`kid` from the header, find that key in
+/// the set, rebuild the public key from its `crv`/`x`/`y` (RFC 7518 §6.2.1),
+/// and check ECDSA-P-256-SHA-256 over the two encoded segments.
+fn verify_against_jwks(token: &str, jwks: &Value) -> Result<Value, Rejected> {
+    let segments: Vec<&str> = token.split('.').collect();
+    if segments.len() != 3 || segments.iter().any(|segment| segment.is_empty()) {
+        return Err(Rejected::Malformed(format!(
+            "expected three non-empty segments, got {token:?}"
+        )));
+    }
+    let header_bytes = try_decode_base64url(segments[0])
+        .ok_or_else(|| Rejected::Malformed("the header is not base64url".to_string()))?;
+    let header: Value = serde_json::from_slice(&header_bytes)
+        .map_err(|error| Rejected::Malformed(format!("the header is not JSON: {error}")))?;
+    if header["alg"] != "ES256" {
+        return Err(Rejected::UnusableHeader(format!(
+            "unsupported alg in {header}"
+        )));
+    }
+    let Some(kid) = header["kid"].as_str() else {
+        return Err(Rejected::UnusableHeader(format!("no kid in {header}")));
+    };
+    let key = jwks["keys"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a key set has a keys list, got {jwks}"))
+        .iter()
+        .find(|jwk| jwk["kid"] == kid)
+        .ok_or_else(|| Rejected::UnknownKey(kid.to_string()))?;
+    assert_eq!(key["kty"], "EC", "the published JWK must be EC, got {key}");
+    assert_eq!(key["crv"], "P-256", "the published JWK must be on P-256");
+    assert_eq!(key["alg"], "ES256", "the published JWK must be ES256");
+    assert_eq!(key["use"], "sig", "the published JWK must be for signing");
+    // RFC 7518 §6.2.1.2: each coordinate is the full-width octet string of the
+    // field element, so both are exactly 32 bytes on P-256.
+    let coordinate = |member: &str| {
+        let bytes = decode_base64url(
+            key[member]
+                .as_str()
+                .unwrap_or_else(|| panic!("the JWK carries {member}, got {key}")),
+        );
+        assert_eq!(
+            bytes.len(),
+            32,
+            "the JWK's {member} must be a 32-byte P-256 coordinate, got {} bytes",
+            bytes.len()
+        );
+        FieldBytes::clone_from_slice(&bytes)
+    };
+    let point = EncodedPoint::from_affine_coordinates(&coordinate("x"), &coordinate("y"), false);
+    let public = VerifyingKey::from_encoded_point(&point)
+        .expect("the JWK's coordinates are a point on P-256");
+    // A signature segment that is not base64url, or not the 64-byte R||S form
+    // RFC 7518 §3.4 defines, is no signature of this key: the token is refused
+    // the same way one carrying wrong bytes is.
+    let signature_bytes = try_decode_base64url(segments[2]).ok_or(Rejected::BadSignature)?;
+    let signature =
+        Signature::from_slice(signature_bytes.as_slice()).map_err(|_| Rejected::BadSignature)?;
+    let signing_input = format!("{}.{}", segments[0], segments[1]);
+    public
+        .verify(signing_input.as_bytes(), &signature)
+        .map_err(|_| Rejected::BadSignature)?;
+    let claim_bytes = try_decode_base64url(segments[1])
+        .ok_or_else(|| Rejected::Malformed("the claims are not base64url".to_string()))?;
+    serde_json::from_slice(&claim_bytes)
+        .map_err(|error| Rejected::Malformed(format!("the claims are not JSON: {error}")))
+}
+
+/// One row of the sign-in table: a pool to build and the user to sign in.
+struct SignInCase {
+    case: &'static str,
+    pool_name: &'static str,
+    username: &'static str,
+    /// The groups the user is added to, which land in the `cognito:groups`
+    /// claim the signature must bind.
+    groups: &'static [&'static str],
+    /// The `email` attribute the user is created with, when the row has one.
+    email: Option<&'static str>,
+}
+
+/// What a signed-in row left behind: the pool it belongs to and its tokens.
+struct SignedIn {
+    case: &'static str,
+    user_pool_id: String,
+    client_id: String,
+    sub: String,
+    issuer: String,
+    /// The groups the signed-in user belongs to, in the order they were added.
+    groups: &'static [&'static str],
+    result: Value,
+}
+
+/// Build `case`'s pool, app client, groups and user, then sign the user in.
+async fn sign_in(router: &MultiServiceRouter, case: &SignInCase) -> SignedIn {
+    let pool = ok(
+        router,
+        "CreateUserPool",
+        &json!({ "PoolName": case.pool_name }),
+    )
+    .await;
     let user_pool_id = pool["UserPool"]["Id"]
         .as_str()
         .expect("a minted pool id")
         .to_string();
     let client = ok(
-        &router,
+        router,
         "CreateUserPoolClient",
         &json!({
             "UserPoolId": user_pool_id,
-            "ClientName": "token-client",
+            "ClientName": format!("{}-client", case.pool_name),
             "ExplicitAuthFlows": ["ALLOW_ADMIN_USER_PASSWORD_AUTH"],
         }),
     )
@@ -143,10 +279,18 @@ async fn an_issued_token_is_an_unsecured_jws_over_stored_claims() {
         .as_str()
         .expect("a minted client id")
         .to_string();
+    let attributes: Vec<Value> = case
+        .email
+        .map(|email| vec![json!({ "Name": "email", "Value": email })])
+        .unwrap_or_default();
     let created = ok(
-        &router,
+        router,
         "AdminCreateUser",
-        &json!({ "UserPoolId": user_pool_id, "Username": "alice" }),
+        &json!({
+            "UserPoolId": user_pool_id,
+            "Username": case.username,
+            "UserAttributes": attributes,
+        }),
     )
     .await;
     let sub = created["User"]["Attributes"]
@@ -158,104 +302,571 @@ async fn an_issued_token_is_an_unsecured_jws_over_stored_claims() {
         .expect("a generated sub")
         .to_string();
     ok(
-        &router,
+        router,
         "AdminSetUserPassword",
         &json!({
             "UserPoolId": user_pool_id,
-            "Username": "alice",
+            "Username": case.username,
             "Password": GOOD_PASSWORD,
             "Permanent": true,
         }),
     )
     .await;
+    for group in case.groups {
+        ok(
+            router,
+            "CreateGroup",
+            &json!({ "UserPoolId": user_pool_id, "GroupName": group }),
+        )
+        .await;
+        ok(
+            router,
+            "AdminAddUserToGroup",
+            &json!({
+                "UserPoolId": user_pool_id,
+                "Username": case.username,
+                "GroupName": group,
+            }),
+        )
+        .await;
+    }
     let result = ok(
-        &router,
+        router,
         "AdminInitiateAuth",
         &json!({
             "UserPoolId": user_pool_id,
             "ClientId": client_id,
             "AuthFlow": "ADMIN_USER_PASSWORD_AUTH",
-            "AuthParameters": { "USERNAME": "alice", "PASSWORD": GOOD_PASSWORD },
+            "AuthParameters": { "USERNAME": case.username, "PASSWORD": GOOD_PASSWORD },
         }),
     )
     .await;
+    SignedIn {
+        case: case.case,
+        issuer: format!("https://cognito-idp.us-east-1.amazonaws.com/{user_pool_id}"),
+        user_pool_id,
+        client_id,
+        sub,
+        groups: case.groups,
+        result: result["AuthenticationResult"].clone(),
+    }
+}
 
-    // Each row: the member of AuthenticationResult and the `token_use` claim
-    // the stored token carries.
+/// The key set the stored pool publishes, read from this service's state the
+/// way the endpoint that serves it does.
+fn pool_jwks(engine: &engine::InMemoryEngine, user_pool_id: &str) -> Value {
+    let service_state = state::service_state(engine).expect("this service's state");
+    let guard = service_state.lock();
+    guard
+        .pool(user_pool_id)
+        .unwrap_or_else(|| panic!("the stored pool {user_pool_id}"))
+        .jwks()
+}
+
+/// Every token a sign-in returns is a signed JWS whose signature
+/// verifies against the issuing pool's published key set, over claims that come
+/// from stored state — and a token one pool issued verifies against no other
+/// pool's key set.
+#[tokio::test]
+async fn an_issued_token_is_signed_and_verifies_against_its_pools_key_set() {
+    // The rows differ along what the signing rule generalises over: whether the
+    // user is in no group, one group or several (so the `cognito:groups` claim
+    // is absent, scalar-sized or longer), and whether it carries an extra
+    // `email` claim — the payload the signature is computed over differs in
+    // every row, and each pool signs with its OWN key.
     let cases = [
-        ("AccessToken", "access"),
-        ("IdToken", "id"),
-        ("RefreshToken", "refresh"),
+        SignInCase {
+            case: "a user in no group and with no email",
+            pool_name: "plain-pool",
+            username: "alice",
+            groups: &[],
+            email: None,
+        },
+        SignInCase {
+            case: "a user in two groups with an email",
+            pool_name: "group-pool",
+            username: "bob",
+            groups: &["admins", "auditors"],
+            email: Some("bob@example.test"),
+        },
     ];
-    let mut jtis: Vec<String> = Vec::new();
-    for (member, token_use) in cases {
-        let token = result["AuthenticationResult"][member]
-            .as_str()
-            .unwrap_or_else(|| panic!("case {member:?}: the sign-in must return it, got {result}"));
-        let segments: Vec<&str> = token.split('.').collect();
+
+    let (router, engine) = router_and_engine();
+    let mut signed_in: Vec<SignedIn> = Vec::new();
+    for case in &cases {
+        signed_in.push(sign_in(&router, case).await);
+    }
+
+    for row in &signed_in {
+        let case = row.case;
+        let jwks = pool_jwks(&engine, &row.user_pool_id);
+        let keys = jwks["keys"].as_array().expect("a keys list");
         assert_eq!(
-            segments.len(),
-            3,
-            "case {member:?}: a JWS compact serialization has three segments, got {token}"
+            keys.len(),
+            1,
+            "case {case:?}: the pool publishes the key it signs with, got {jwks}"
         );
-        // RFC 7515 §6: an unsecured JWS has an EMPTY signature segment, and its
-        // header says `alg: none` rather than naming an algorithm nothing ran.
         assert!(
-            segments[2].is_empty(),
-            "case {member:?}: an unsecured JWS carries no signature, got {:?}",
-            segments[2]
+            keys[0]["x"].as_str().is_some_and(|x| x.len() == 43)
+                && keys[0]["y"].as_str().is_some_and(|y| y.len() == 43),
+            "case {case:?}: a P-256 JWK publishes both 32-byte coordinates \
+             (43 base64url characters each), got {}",
+            keys[0]
         );
-        let header: Value = serde_json::from_slice(&decode_base64url(segments[0]))
-            .unwrap_or_else(|error| panic!("case {member:?}: the header must be JSON ({error})"));
-        assert_eq!(
-            header["alg"], "none",
-            "case {member:?}: expected alg none, got {header}"
-        );
-        assert_eq!(
-            header["typ"], "JWT",
-            "case {member:?}: expected typ JWT, got {header}"
+        assert!(
+            keys[0].get("d").is_none(),
+            "case {case:?}: a published JWK carries no private parameter, got {}",
+            keys[0]
         );
 
-        let claims: Value = serde_json::from_slice(&decode_base64url(segments[1]))
-            .unwrap_or_else(|error| panic!("case {member:?}: the claims must be JSON ({error})"));
-        assert_eq!(
-            claims["sub"], sub,
-            "case {member:?}: the sub claim must be the stored user's, got {claims}"
-        );
-        assert_eq!(
-            claims["token_use"], token_use,
-            "case {member:?}: expected token_use {token_use}, got {claims}"
-        );
-        let issued_at = claims["iat"].as_i64().unwrap_or_default();
-        let expires_at = claims["exp"].as_i64().unwrap_or_default();
-        assert!(
-            expires_at > issued_at,
-            "case {member:?}: a token must expire after it was issued, got {claims}"
-        );
-        let jti = claims["jti"]
-            .as_str()
-            .unwrap_or_else(|| panic!("case {member:?}: a token must carry a jti, got {claims}"))
-            .to_string();
-        assert!(
-            !jtis.contains(&jti),
-            "case {member:?}: every token gets its own jti, {jti} repeated"
-        );
-        jtis.push(jti);
+        let mut signatures: Vec<String> = Vec::new();
+        let mut jtis: Vec<String> = Vec::new();
+        for (member, token_use) in TOKEN_MEMBERS {
+            let token = row.result[member].as_str().unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: the sign-in must return {member}, got {}",
+                    row.result
+                )
+            });
+            let segments: Vec<&str> = token.split('.').collect();
+            assert_eq!(
+                segments.len(),
+                3,
+                "case {case:?} / {member}: a JWS compact serialization has three segments, \
+                 got {token}"
+            );
+            assert!(
+                !segments[2].is_empty(),
+                "case {case:?} / {member}: a signed JWS has a non-empty signature segment, \
+                 got {token}"
+            );
+            // The whole token must satisfy what a consumer's model constrains
+            // an identity token to: three non-empty base64url runs (the
+            // `Token` shape of Verified Permissions' `IsAuthorizedWithToken`
+            // is `^[A-Za-z0-9-_=]+.[A-Za-z0-9-_=]+.[A-Za-z0-9-_=]+$`).
+            assert!(
+                segments.iter().all(|segment| !segment.is_empty()
+                    && segment
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '=')),
+                "case {case:?} / {member}: every segment must be non-empty base64url, got {token}"
+            );
+            signatures.push(segments[2].to_string());
 
-        // The emulator records what it issued, so a later operation can resolve
-        // the token back to the stored user.
+            let header: Value = serde_json::from_slice(&decode_base64url(segments[0]))
+                .unwrap_or_else(|error| {
+                    panic!("case {case:?} / {member}: the header must be JSON ({error})")
+                });
+            assert_eq!(
+                header["alg"], "ES256",
+                "case {case:?} / {member}: expected alg ES256, got {header}"
+            );
+            assert_eq!(
+                header["typ"], "JWT",
+                "case {case:?} / {member}: expected typ JWT, got {header}"
+            );
+            assert_eq!(
+                header["kid"], keys[0]["kid"],
+                "case {case:?} / {member}: the header must name the published key, got {header}"
+            );
+
+            let claims = verify_against_jwks(token, &jwks).unwrap_or_else(|rejected| {
+                panic!(
+                    "case {case:?} / {member}: the signature must verify against the pool's \
+                     key set, got {rejected:?}"
+                )
+            });
+            assert_eq!(
+                claims["sub"], row.sub,
+                "case {case:?} / {member}: the sub claim must be the stored user's, got {claims}"
+            );
+            assert_eq!(
+                claims["iss"], row.issuer,
+                "case {case:?} / {member}: the iss claim must be the pool's issuer, got {claims}"
+            );
+            assert_eq!(
+                claims["token_use"], token_use,
+                "case {case:?} / {member}: expected token_use {token_use}, got {claims}"
+            );
+            // Each token of a sign-in is its own token, so each carries its
+            // own `jti`, and the signature covers that claim too.
+            let jti = claims["jti"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!("case {case:?} / {member}: a token must carry a jti, got {claims}")
+                })
+                .to_string();
+            assert!(
+                !jtis.contains(&jti),
+                "case {case:?} / {member}: every token gets its own jti, {jti} repeated"
+            );
+            jtis.push(jti);
+            // `AdminAddUserToGroup`: a user in a group "populates a
+            // `cognito:groups` claim to their access and identity tokens", so
+            // the claim the signature covers is the stored membership on those
+            // two, and absent on the refresh token and for a user in no group.
+            let expected_groups =
+                (member != "RefreshToken" && !row.groups.is_empty()).then(|| json!(row.groups));
+            match expected_groups {
+                Some(expected) => assert_eq!(
+                    claims["cognito:groups"], expected,
+                    "case {case:?} / {member}: the signed claims must carry the stored \
+                     membership {expected}, got {claims}"
+                ),
+                None => assert!(
+                    claims["cognito:groups"].is_null(),
+                    "case {case:?} / {member}: expected no cognito:groups claim, got {claims}"
+                ),
+            }
+        }
+        assert!(
+            signatures[0] != signatures[1] && signatures[1] != signatures[2],
+            "case {case:?}: each token is signed over its own claims, so no two of a \
+             sign-in's signatures are equal, got {signatures:?}"
+        );
+    }
+
+    // Each pool signs with its own key, so neither pool's key set verifies the
+    // other's token and neither publishes the other's `kid`.
+    for signer in &signed_in {
+        for verifier in &signed_in {
+            if signer.user_pool_id == verifier.user_pool_id {
+                continue;
+            }
+            let token = signer.result["IdToken"].as_str().expect("an id token");
+            let jwks = pool_jwks(&engine, &verifier.user_pool_id);
+            let outcome = verify_against_jwks(token, &jwks);
+            assert!(
+                matches!(
+                    outcome,
+                    Err(Rejected::UnknownKey(_)) | Err(Rejected::BadSignature)
+                ),
+                "case {:?}: a token from another pool must not verify against {:?}'s key set, \
+                 got {outcome:?}",
+                signer.case,
+                verifier.case
+            );
+        }
+    }
+
+    // The id token's audience is the app client it was issued for, and the
+    // signature covers that too.
+    let first = &signed_in[0];
+    let claims = verify_against_jwks(
+        first.result["IdToken"].as_str().expect("an id token"),
+        &pool_jwks(&engine, &first.user_pool_id),
+    )
+    .expect("the id token verifies");
+    assert_eq!(
+        claims["aud"], first.client_id,
+        "the id token's aud must be the app client it was issued for, got {claims}"
+    );
+}
+
+/// The signature BINDS the claims: every tampering of a signed token fails to
+/// verify against the pool's key set, so a rewritten claim cannot be passed off
+/// as this pool's.
+#[tokio::test]
+async fn a_tampered_token_does_not_verify() {
+    let (router, engine) = router_and_engine();
+    let row = sign_in(
+        &router,
+        &SignInCase {
+            case: "a group member whose claims are then rewritten",
+            pool_name: "tamper-pool",
+            username: "carol",
+            groups: &["readers"],
+            email: None,
+        },
+    )
+    .await;
+    let jwks = pool_jwks(&engine, &row.user_pool_id);
+    let token = row.result["IdToken"]
+        .as_str()
+        .expect("an id token")
+        .to_string();
+    let segments: Vec<String> = token.split('.').map(str::to_string).collect();
+    let claims: Value =
+        serde_json::from_slice(&decode_base64url(&segments[1])).expect("the claims are JSON");
+
+    /// `value` as a JWS segment, the encoding `state::base64_url` performs.
+    fn segment(value: &Value) -> String {
+        state::base64_url(value.to_string().as_bytes())
+    }
+
+    let mut forged_claims = claims.clone();
+    forged_claims["cognito:groups"] = json!(["admins"]);
+    let mut other_subject = claims.clone();
+    other_subject["sub"] = json!("00000000-0000-4000-8000-000000000000");
+    let flipped = {
+        let mut signature = segments[2].clone();
+        let last = signature.pop().expect("a non-empty signature");
+        signature.push(if last == 'A' { 'B' } else { 'A' });
+        signature
+    };
+
+    // Each row: a token built from the genuine one, and what the verifier must
+    // answer for it. The rows differ along WHICH part was rewritten — the
+    // claims, the header, the signature — and in which direction.
+    let cases: Vec<(&str, String, Rejected)> = vec![
+        (
+            "a forged cognito:groups claim with the original signature",
+            format!("{}.{}.{}", segments[0], segment(&forged_claims), segments[2]),
+            Rejected::BadSignature,
+        ),
+        (
+            "another subject with the original signature",
+            format!("{}.{}.{}", segments[0], segment(&other_subject), segments[2]),
+            Rejected::BadSignature,
+        ),
+        (
+            "the last character of the signature flipped",
+            format!("{}.{}.{}", segments[0], segments[1], flipped),
+            Rejected::BadSignature,
+        ),
+        (
+            "the signature truncated by one character",
+            format!(
+                "{}.{}.{}",
+                segments[0],
+                segments[1],
+                &segments[2][..segments[2].len() - 1]
+            ),
+            Rejected::BadSignature,
+        ),
+        (
+            "the signature dropped, as an unsecured JWS",
+            format!("{}.{}.", segments[0], segments[1]),
+            Rejected::Malformed(String::new()),
+        ),
+        (
+            "the header downgraded to alg none",
+            format!(
+                "{}.{}.{}",
+                segment(&json!({ "alg": "none", "typ": "JWT" })),
+                segments[1],
+                segments[2]
+            ),
+            Rejected::UnusableHeader(String::new()),
+        ),
+        (
+            "the header naming a key the pool does not publish",
+            format!(
+                "{}.{}.{}",
+                segment(&json!({ "alg": "ES256", "kid": "not-this-pools-key", "typ": "JWT" })),
+                segments[1],
+                segments[2]
+            ),
+            Rejected::UnknownKey(String::new()),
+        ),
+    ];
+
+    for (case, tampered, expected) in cases {
+        let outcome = verify_against_jwks(&tampered, &jwks);
+        let rejected = match outcome {
+            Ok(claims) => panic!("case {case:?}: must not verify, got the claims {claims}"),
+            Err(rejected) => rejected,
+        };
+        assert_eq!(
+            ::std::mem::discriminant(&rejected),
+            ::std::mem::discriminant(&expected),
+            "case {case:?}: expected {expected:?}, got {rejected:?}"
+        );
+    }
+
+    // The genuine token still verifies, so the rows above failed on their
+    // tampering and not on the fixture.
+    assert!(
+        verify_against_jwks(&token, &jwks).is_ok(),
+        "the untampered token must still verify against the pool's key set"
+    );
+}
+
+/// A pool's key set is the same on every read, and the tokens it issued keep
+/// verifying against it: the key belongs to the pool, not to the call.
+#[tokio::test]
+async fn a_pools_key_set_is_stable_across_reads_and_sign_ins() {
+    let (router, engine) = router_and_engine();
+
+    // A pool has a key from the moment it is created, before anyone signs in,
+    // and reading its key set does not mint one: two reads of a brand-new pool
+    // answer the same document.
+    let fresh = ok(
+        &router,
+        "CreateUserPool",
+        &json!({ "PoolName": "never-signed-in-pool" }),
+    )
+    .await;
+    let fresh_id = fresh["UserPool"]["Id"]
+        .as_str()
+        .expect("a minted pool id")
+        .to_string();
+    let fresh_keys = pool_jwks(&engine, &fresh_id);
+    assert_eq!(
+        fresh_keys,
+        pool_jwks(&engine, &fresh_id),
+        "a pool that has issued no token still publishes one stable key set, got {fresh_keys}"
+    );
+    assert!(
+        fresh_keys["keys"][0]["kid"].as_str().is_some_and(|kid| !kid.is_empty()),
+        "a created pool's key set names its key, got {fresh_keys}"
+    );
+
+    let row = sign_in(
+        &router,
+        &SignInCase {
+            case: "two sign-ins of one user",
+            pool_name: "stable-pool",
+            username: "dave",
+            groups: &[],
+            email: None,
+        },
+    )
+    .await;
+    let first = pool_jwks(&engine, &row.user_pool_id);
+    let second = pool_jwks(&engine, &row.user_pool_id);
+    assert_eq!(
+        first, second,
+        "a pool's key set must not change between reads, got {first} then {second}"
+    );
+    assert_ne!(
+        first["keys"][0]["kid"], fresh_keys["keys"][0]["kid"],
+        "each pool gets its own key, so two pools never publish one kid"
+    );
+
+    let again = ok(
+        &router,
+        "AdminInitiateAuth",
+        &json!({
+            "UserPoolId": row.user_pool_id,
+            "ClientId": row.client_id,
+            "AuthFlow": "ADMIN_USER_PASSWORD_AUTH",
+            "AuthParameters": { "USERNAME": "dave", "PASSWORD": GOOD_PASSWORD },
+        }),
+    )
+    .await;
+    for (member, _) in TOKEN_MEMBERS {
+        let sign_ins = [
+            ("the first sign-in", &row.result),
+            ("a later sign-in", &again["AuthenticationResult"]),
+        ];
+        for (case, result) in sign_ins {
+            let token = result[member].as_str().unwrap_or_else(|| {
+                panic!("case {case:?} / {member}: the sign-in must return it, got {result}")
+            });
+            assert!(
+                verify_against_jwks(token, &first).is_ok(),
+                "case {case:?} / {member}: every token of a pool verifies against that pool's \
+                 one key set"
+            );
+        }
+    }
+}
+
+/// A pool publishes its key set where a token's `iss` claim leads: an ANONYMOUS
+/// GET of `/<UserPoolId>/.well-known/jwks.json` answers the document, and every
+/// token the pool issued verifies against the document as SERVED.
+#[tokio::test]
+async fn a_pool_serves_its_key_set_at_its_well_known_path() {
+    let (router, engine) = router_and_engine();
+    let row = sign_in(
+        &router,
+        &SignInCase {
+            case: "a pool whose key set is fetched over the wire",
+            pool_name: "jwks-pool",
+            username: "erin",
+            groups: &["readers"],
+            email: None,
+        },
+    )
+    .await;
+
+    // The location is the one the token's issuer leads a verifier to.
+    let jwks_uri = {
         let service_state = state::service_state(&*engine).expect("this service's state");
         let guard = service_state.lock();
-        let record = guard
-            .token(token)
-            .unwrap_or_else(|| panic!("case {member:?}: the token must be recorded, got None"));
+        guard
+            .pool(&row.user_pool_id)
+            .expect("the stored pool")
+            .jwks_uri()
+    };
+    assert_eq!(
+        jwks_uri,
+        format!("{}/.well-known/jwks.json", row.issuer),
+        "a pool publishes its key set under its own issuer"
+    );
+    let path = jwks_uri
+        .strip_prefix("https://cognito-idp.us-east-1.amazonaws.com")
+        .expect("the issuer is this endpoint");
+
+    // Each row: a path on this endpoint, and whether it serves a key set. The
+    // request carries NO credential — a key set is public — so it also pins
+    // that the document is served before anything authenticates.
+    let rows: Vec<(&str, String, bool)> = vec![
+        ("the pool's own key set", path.to_string(), true),
+        (
+            "a key set of a pool that does not exist",
+            "/us-east-1_nosuchpool/.well-known/jwks.json".to_string(),
+            false,
+        ),
+        (
+            "another well-known document of this pool",
+            format!("/{}/.well-known/openid-configuration", row.user_pool_id),
+            false,
+        ),
+    ];
+
+    for (case, requested, serves) in rows {
+        let request = http::Request::builder()
+            .method("GET")
+            .uri(&requested)
+            .header("host", "cognito-idp.us-east-1.amazonaws.com")
+            .body(Bytes::new())
+            .expect("the request is well formed");
+        let response = router.dispatch(request).await;
+        let status = response.status().as_u16();
+        if !serves {
+            assert_ne!(
+                status, 200,
+                "case {case:?}: {requested} must not serve a key set, got 200 with {:?}",
+                String::from_utf8_lossy(response.body())
+            );
+            continue;
+        }
         assert_eq!(
-            record.username, "alice",
-            "case {member:?}: the record must name the stored user, got {record:?}"
+            status,
+            200,
+            "case {case:?}: {requested} must serve the key set, got {status} with {:?}",
+            String::from_utf8_lossy(response.body())
         );
         assert_eq!(
-            record.client_id, client_id,
-            "case {member:?}: the record must name the app client it was issued for"
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json"),
+            "case {case:?}: a key set is served as JSON, got {:?}",
+            response.headers()
         );
+        let served: Value = serde_json::from_slice(response.body()).unwrap_or_else(|error| {
+            panic!(
+                "case {case:?}: the key set must be JSON ({error}): {:?}",
+                String::from_utf8_lossy(response.body())
+            )
+        });
+        assert_eq!(
+            served,
+            pool_jwks(&engine, &row.user_pool_id),
+            "case {case:?}: the served document must be the pool's stored key set"
+        );
+        for (member, _) in TOKEN_MEMBERS {
+            let token = row.result[member]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case:?}: the sign-in must return {member}"));
+            assert!(
+                verify_against_jwks(token, &served).is_ok(),
+                "case {case:?} / {member}: the token must verify against the key set as SERVED"
+            );
+        }
     }
 }

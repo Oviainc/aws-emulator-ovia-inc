@@ -34,10 +34,24 @@
 //! log group: a definition is identified only by its own `queryDefinitionId`, and the log
 //! groups it names are a value it carries, not its owner.
 //!
+//! A log group's syslog configurations live on the group as well
+//! ([`LogGroupRecord::syslog_configurations`]), because `PutSyslogConfiguration` "creates
+//! or updates a syslog configuration for a log group" and the only other thing that names
+//! one is the VPC endpoint it ingests through — so the group keys them by that endpoint and
+//! deleting the group takes them with it.
+//!
 //! The account's deliveries — each "a connection between a logical delivery source and a
 //! logical delivery destination", which `CreateDelivery` creates and `DescribeDeliveries`
 //! reports — live in [`ComAmazonawsCloudwatchlogsLogs20140328State::deliveries`], each one
 //! a [`DeliveryRecord`].
+//!
+//! The account's log anomaly detectors — "one anomaly detector in the account", which
+//! `CreateLogAnomalyDetector` creates and `GetLogAnomalyDetector` reports — live in
+//! [`ComAmazonawsCloudwatchlogsLogs20140328State::anomaly_detectors`], each one an
+//! [`AnomalyDetectorRecord`] carrying the instant the clock owes it its next status. A
+//! detector is an account-level resource rather than a log group's: it watches log groups
+//! named by their ARNs and outlives none of them, so it lives beside the groups and not on
+//! [`LogGroupRecord`].
 
 use std::collections::BTreeMap;
 
@@ -373,6 +387,14 @@ pub const MAX_STREAM_EVENTS: usize = 20_000;
 /// The byte half of the per-stream storage ceiling. See [`MAX_STREAM_EVENTS`].
 pub const MAX_STREAM_BYTES: i64 = 8 * 1024 * 1024;
 
+/// THE EMULATOR'S OWN CEILING on the syslog configurations one log group holds, not an AWS
+/// quota: CloudWatch Logs documents no limit on them, but a `vpcEndpointId` is caller-chosen
+/// (`^vpce-[0-9a-f]{1,64}$` admits astronomically many) and every configuration a put
+/// creates stays resident in this store, so a group refuses to take on more than this many
+/// rather than growing without bound on request. A put naming an endpoint the group already
+/// holds is an UPDATE of that configuration, so it does not count against this.
+pub const MAX_SYSLOG_CONFIGURATIONS_PER_GROUP: usize = 100;
+
 /// An import task that is still running, from the model's `ImportStatus` enum
 /// (`IN_PROGRESS` | `CANCELLED` | `COMPLETED` | `FAILED`). This is the only
 /// non-terminal one: an import AWS accepts starts here and leaves it on its own.
@@ -398,6 +420,51 @@ pub const IMPORT_STATUS_FAILED: &str = "FAILED";
 /// cancels the task straight after creating it still observes `IN_PROGRESS`, and the
 /// state rules that go with it.
 pub const IMPORT_COMPLETION_DELAY_MS: i64 = 500;
+
+/// The status a log anomaly detector is created in, from the model's
+/// `AnomalyDetectorStatus` enum: it has to initialize before it can train on a log group's
+/// events, so a create hands back a detector that is not analyzing anything yet.
+pub const ANOMALY_DETECTOR_STATUS_INITIALIZING: &str = "INITIALIZING";
+
+/// The status a log anomaly detector reaches once it is initialized and is learning the
+/// log group's patterns: `CreateLogAnomalyDetector` documents that the detector "uses the
+/// evaluationFrequency to compare current log events and patterns with trained baselines",
+/// so training precedes analysis.
+pub const ANOMALY_DETECTOR_STATUS_TRAINING: &str = "TRAINING";
+
+/// The status a trained log anomaly detector settles in: it is scanning log events for
+/// anomalies. Nothing but an `UpdateLogAnomalyDetector` (which can pause it) or a delete
+/// moves a detector out of this status, so the clock owes it nothing further.
+pub const ANOMALY_DETECTOR_STATUS_ANALYZING: &str = "ANALYZING";
+
+/// How long after it is created a log anomaly detector takes to leave
+/// [`ANOMALY_DETECTOR_STATUS_INITIALIZING`] for [`ANOMALY_DETECTOR_STATUS_TRAINING`].
+///
+/// AWS documents no duration for this — the detector trains "using machine learning
+/// algorithms" over however long its log group needs — so this span is THE EMULATOR'S OWN
+/// CHOICE. It is deliberately not zero: a caller that reads the detector straight after
+/// creating it still observes the status the create handed back.
+pub const ANOMALY_DETECTOR_TRAINING_DELAY_MS: i64 = 500;
+
+/// How long after it starts training a log anomaly detector takes to reach
+/// [`ANOMALY_DETECTOR_STATUS_ANALYZING`]. The emulator's own choice, for the same reason as
+/// [`ANOMALY_DETECTOR_TRAINING_DELAY_MS`].
+pub const ANOMALY_DETECTOR_ANALYSIS_DELAY_MS: i64 = 500;
+
+/// How many log groups one log anomaly detector watches, from
+/// `CreateLogAnomalyDetector$logGroupArnList`: "An array containing the ARN of the log
+/// group that this anomaly detector will watch. You can specify only one log group ARN."
+pub const ANOMALY_DETECTOR_LOG_GROUPS: usize = 1;
+
+/// THE EMULATOR'S OWN CEILING on the log anomaly detectors one account holds, not a quota
+/// cited from AWS: every accepted create mints a fresh ARN and keeps the detector's
+/// configuration in memory for as long as the process runs, and nothing expires one, so
+/// `CreateLogAnomalyDetector` refuses to create more than this many with the
+/// `LimitExceededException` it models ("You have reached the maximum number of resources
+/// that can be created") rather than growing without bound on request. It is set far above
+/// the number of detectors a caller legitimately creates, so only a caller hammering the
+/// create reaches it.
+pub const MAX_ANOMALY_DETECTORS: usize = 1_000;
 
 /// THE EMULATOR'S OWN CEILING on the saved query definitions one account holds, not a
 /// quota cited from AWS: each definition keeps its query string (modelled `@length` up to
@@ -466,6 +533,15 @@ pub struct ComAmazonawsCloudwatchlogsLogs20140328State {
     /// its destination are both named by their own resources, so it lives here and not on
     /// [`LogGroupRecord`].
     pub deliveries: BTreeMap<String, DeliveryRecord>,
+    /// Every log anomaly detector of this account — the resource `CreateLogAnomalyDetector`
+    /// creates and `GetLogAnomalyDetector` reports — keyed by `anomalyDetectorArn`, the one
+    /// member every other anomaly-detector operation identifies one by. A `BTreeMap` so
+    /// `ListLogAnomalyDetectors` enumerates in detector-ARN order without re-sorting, which
+    /// is also what makes its pagination cursor stable.
+    pub anomaly_detectors: BTreeMap<String, AnomalyDetectorRecord>,
+    /// Monotonic counter behind the anomaly-detector identifiers, so every create mints an
+    /// ARN no earlier create used — including after the detector holding it was deleted.
+    pub next_anomaly_detector_seq: u64,
 }
 
 impl ComAmazonawsCloudwatchlogsLogs20140328State {
@@ -480,6 +556,13 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
     pub fn take_policy_revision(&mut self) -> u64 {
         let seq = self.next_policy_revision;
         self.next_policy_revision = self.next_policy_revision.saturating_add(1);
+        seq
+    }
+
+    /// Take the next anomaly-detector sequence number, advancing the counter.
+    pub fn take_anomaly_detector_seq(&mut self) -> u64 {
+        let seq = self.next_anomaly_detector_seq;
+        self.next_anomaly_detector_seq = self.next_anomaly_detector_seq.saturating_add(1);
         seq
     }
 
@@ -536,6 +619,19 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
     pub fn materialize_due_import_transitions(&mut self, now_ms: i64) {
         for task in self.import_tasks.values_mut() {
             task.materialize_due_transitions(now_ms);
+        }
+    }
+
+    /// Materialise every anomaly-detector status change the clock has ALREADY made due, as
+    /// of `now_ms`.
+    ///
+    /// A detector initializes and trains on its own, so the status it is in is owed by the
+    /// clock rather than by a call ([`AnomalyDetectorRecord::status_due_ms`]). A reporting
+    /// operation calls this before it reads, so what it reports is what the clock already
+    /// decided — never a status moved on because something was polled.
+    pub fn materialize_due_anomaly_detector_transitions(&mut self, now_ms: i64) {
+        for detector in self.anomaly_detectors.values_mut() {
+            detector.materialize_due_transitions(now_ms);
         }
     }
 }
@@ -857,6 +953,142 @@ pub fn delivery_destination_type_for_arn(arn: &str) -> Option<&'static str> {
         .iter()
         .find(|(namespace, _)| vendor == *namespace)
         .map(|(_, destination_type)| *destination_type)
+}
+
+/// One log anomaly detector — "one anomaly detector in the account" — as it is stored.
+/// Every member of the model's `AnomalyDetector` shape is reported from this record, so
+/// `GetLogAnomalyDetector` and `ListLogAnomalyDetectors` answer from state alone.
+#[derive(Debug, Clone)]
+pub struct AnomalyDetectorRecord {
+    /// `AnomalyDetector$anomalyDetectorArn` — "The ARN of the anomaly detector", as
+    /// [`anomaly_detector_arn`] builds it. Also the key the store is keyed by.
+    pub arn: String,
+    /// `AnomalyDetector$detectorName` — "The name of the anomaly detector". Optional on the
+    /// create, so a detector created without one reports no name.
+    pub detector_name: Option<String>,
+    /// `AnomalyDetector$logGroupArnList` — "A list of the ARNs of the log groups that this
+    /// anomaly detector watches", exactly as the create named them.
+    pub log_group_arn_list: Vec<String>,
+    /// `AnomalyDetector$evaluationFrequency` — "Specifies how often the anomaly detector
+    /// runs and look for anomalies", one value of the model's `EvaluationFrequency` enum.
+    /// `None` when neither the create nor an update named one: AWS documents no default for
+    /// the member, so none is invented here.
+    pub evaluation_frequency: Option<String>,
+    /// `AnomalyDetector$filterPattern` — the pattern that limits "the anomaly detection
+    /// model to examine only log events that match", when one was named.
+    pub filter_pattern: Option<String>,
+    /// `AnomalyDetector$anomalyDetectorStatus`, one of the
+    /// [`ANOMALY_DETECTOR_STATUS_INITIALIZING`] family.
+    pub status: String,
+    /// `AnomalyDetector$kmsKeyId` — "The ARN of the KMS key assigned to this anomaly
+    /// detector, if any."
+    pub kms_key_id: Option<String>,
+    /// `AnomalyDetector$creationTimeStamp` — "when this anomaly detector was created", in
+    /// epoch milliseconds.
+    pub creation_time_ms: i64,
+    /// `AnomalyDetector$lastModifiedTimeStamp` — "when this anomaly detector was most
+    /// recently modified", in epoch milliseconds. A status the clock owes is not a
+    /// modification of the detector's configuration, so only a call that changes that
+    /// configuration moves this on.
+    pub last_modified_time_ms: i64,
+    /// `AnomalyDetector$anomalyVisibilityTime` — "The number of days used as the life cycle
+    /// of anomalies". `None` when no call named one; AWS documents no default.
+    pub anomaly_visibility_time: Option<i64>,
+    /// The tags `CreateLogAnomalyDetector$tags` assigned to this detector. A `BTreeMap` so
+    /// the stored order is stable; no `AnomalyDetector` member reports them, so they are
+    /// read back through the tagging operations once those reach this resource.
+    pub tags: BTreeMap<String, String>,
+    /// The instant this detector is due to reach its next status, stored rather than waited
+    /// for: a reporting operation materialises the transition once the clock is past it
+    /// ([`AnomalyDetectorRecord::materialize_due_transitions`]). `None` once the detector is
+    /// in a status the clock owes nothing after.
+    pub status_due_ms: Option<i64>,
+}
+
+impl AnomalyDetectorRecord {
+    /// A brand-new anomaly detector over the log groups it was asked to watch: still
+    /// initializing, and due to start training [`ANOMALY_DETECTOR_TRAINING_DELAY_MS`] after
+    /// it was created. This is what `CreateLogAnomalyDetector` stores.
+    ///
+    /// The optional members a create may name — `detectorName`, `evaluationFrequency`,
+    /// `filterPattern`, `kmsKeyId`, `anomalyVisibilityTime`, `tags` — are left at their "the
+    /// request named none" value and set on the returned record by the caller that has them.
+    pub fn new(arn: &str, log_group_arn_list: Vec<String>, creation_time_ms: i64) -> Self {
+        Self {
+            arn: arn.to_string(),
+            detector_name: None,
+            log_group_arn_list,
+            evaluation_frequency: None,
+            filter_pattern: None,
+            status: ANOMALY_DETECTOR_STATUS_INITIALIZING.to_string(),
+            kms_key_id: None,
+            creation_time_ms,
+            last_modified_time_ms: creation_time_ms,
+            anomaly_visibility_time: None,
+            tags: BTreeMap::new(),
+            status_due_ms: Some(creation_time_ms.saturating_add(ANOMALY_DETECTOR_TRAINING_DELAY_MS)),
+        }
+    }
+
+    /// This detector as the model's `AnomalyDetector` structure, which is what
+    /// `ListLogAnomalyDetectors` reports, so one record renders the same way through any
+    /// reader of it.
+    pub fn reported(&self) -> crate::ops::types::AnomalyDetector {
+        crate::ops::types::AnomalyDetector {
+            anomaly_detector_arn: Some(self.arn.clone()),
+            detector_name: self.detector_name.clone(),
+            log_group_arn_list: Some(self.log_group_arn_list.clone()),
+            evaluation_frequency: self.evaluation_frequency.clone(),
+            filter_pattern: self.filter_pattern.clone(),
+            anomaly_detector_status: Some(self.status.clone()),
+            kms_key_id: self.kms_key_id.clone(),
+            creation_time_stamp: self.creation_time_ms,
+            last_modified_time_stamp: self.last_modified_time_ms,
+            anomaly_visibility_time: self.anomaly_visibility_time,
+        }
+    }
+
+    /// Materialise the status changes the clock owes this detector: a detector whose next
+    /// status was due before `now_ms` is already in it, and a detector that then became due
+    /// for the one after is in that one too — each change taken AT the instant it was due,
+    /// not at the time something happened to look.
+    pub fn materialize_due_transitions(&mut self, now_ms: i64) {
+        while let Some(due) = self.status_due_ms {
+            if due > now_ms {
+                return;
+            }
+            match self.status.as_str() {
+                ANOMALY_DETECTOR_STATUS_INITIALIZING => {
+                    self.status = ANOMALY_DETECTOR_STATUS_TRAINING.to_string();
+                    self.status_due_ms =
+                        Some(due.saturating_add(ANOMALY_DETECTOR_ANALYSIS_DELAY_MS));
+                }
+                ANOMALY_DETECTOR_STATUS_TRAINING => {
+                    self.status = ANOMALY_DETECTOR_STATUS_ANALYZING.to_string();
+                    self.status_due_ms = None;
+                }
+                // Every other status is one the clock owes nothing after: it was reached
+                // because a call put the detector there.
+                _ => self.status_due_ms = None,
+            }
+        }
+    }
+}
+
+/// An anomaly detector's ARN, the form `AnomalyDetector$anomalyDetectorArn` carries: an
+/// `anomaly-detector` resource of this service, identified by the detector's own id
+/// ([`mint_anomaly_detector_id`]).
+pub fn anomaly_detector_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn("logs", region, &format!("anomaly-detector:{id}"))
+}
+
+/// The identifier an anomaly detector's ARN carries, minted from the monotonic
+/// anomaly-detector counter so it is unique and derived from stored state. AWS gives the
+/// resource a UUID-shaped identifier, and the modelled `AnomalyDetectorArn` pattern
+/// (`^[\w#+=/:,.@-]*$`) admits exactly that, so it is minted through the shared
+/// [`mint_uuid_from_seq`] every UUID-shaped id of this service comes from.
+pub fn mint_anomaly_detector_id(seq: u64) -> String {
+    mint_uuid_from_seq(seq)
 }
 
 /// How many account-level policies of `policy_type` the account may hold IN TOTAL once a
@@ -1736,6 +1968,14 @@ pub struct LogGroupRecord {
     /// counts log groups by. See [`DataSourceRecord`] for why a group created through
     /// this emulator's API carries none.
     pub data_sources: Vec<DataSourceRecord>,
+    /// The syslog configurations put on this group, keyed by the `vpcEndpointId` the
+    /// configuration ingests through — `PutSyslogConfiguration` "enables ingestion of
+    /// syslog data through the specified VPC endpoint into the log group", so one group
+    /// holds at most one configuration per endpoint and a put under an endpoint already
+    /// stored updates that configuration in place. A `BTreeMap` so
+    /// `ListSyslogConfigurations` enumerates them ASCII-sorted by endpoint id without
+    /// re-sorting. Every configuration names an endpoint ([`VPC_ENDPOINT_ID_REQUIRED`]).
+    pub syslog_configurations: BTreeMap<String, SyslogConfigurationRecord>,
 }
 
 impl LogGroupRecord {
@@ -1761,6 +2001,7 @@ impl LogGroupRecord {
             data_protection_policy: None,
             had_data_protection_policy: false,
             data_sources: Vec::new(),
+            syslog_configurations: BTreeMap::new(),
         }
     }
 
@@ -1781,6 +2022,42 @@ impl LogGroupRecord {
             None
         }
     }
+}
+
+/// The one value the model's `SyslogSourceType` enum admits
+/// ([`crate::ops::types::SYSLOG_SOURCE_TYPE_VALUES`]), and the source a syslog
+/// configuration ingests through: the VPC endpoint `PutSyslogConfiguration` names. Kept as
+/// a named constant so the stamped `SyslogConfiguration$sourceType` is the model's value
+/// rather than a literal typed into a handler; `tests/all/syslog_configurations.rs` pins
+/// what a listed configuration reports to that catalogue.
+pub const SYSLOG_SOURCE_TYPE: &str = "VPCE";
+
+/// The key a syslog configuration is stored under: its `vpcEndpointId`. The member is
+/// OPTIONAL in the model on both `PutSyslogConfiguration` and
+/// `DeleteSyslogConfiguration`, but a syslog configuration IS the ingestion a log group
+/// accepts through one VPC endpoint — the only `SyslogSourceType` the model admits is
+/// `VPCE`, and the endpoint is the only thing that distinguishes one configuration on a log
+/// group from another — so the service refuses a request that names none. This is that
+/// refusal's sentence: the service's own fixed wording for the constraint, naming the member
+/// and what it requires.
+pub const VPC_ENDPOINT_ID_REQUIRED: &str = "vpcEndpointId is required";
+
+/// One syslog configuration stored on a log group: the model's `SyslogConfiguration`
+/// minus the `logGroupArn` the owning group already carries.
+#[derive(Debug, Clone)]
+pub struct SyslogConfigurationRecord {
+    /// `SyslogConfiguration$vpcEndpointId` — "The ID of the VPC endpoint used for syslog
+    /// ingestion", which is also the key the owning group stores this configuration under
+    /// (see [`VPC_ENDPOINT_ID_REQUIRED`]).
+    pub vpc_endpoint_id: String,
+    /// `SyslogConfiguration$sourceType` — "The source type for the syslog
+    /// configuration": [`SYSLOG_SOURCE_TYPE`].
+    pub source_type: String,
+    /// `SyslogConfiguration$createdAt` — "The time when the syslog configuration was
+    /// created, expressed as the number of milliseconds after Jan 1, 1970 00:00:00 UTC".
+    /// A put over a configuration already stored UPDATES it, so this keeps the instant the
+    /// first put created it.
+    pub created_at_ms: i64,
 }
 
 /// One data source that ingests into a log group: the model's `DataSource` — "a data
@@ -2654,19 +2931,25 @@ pub fn mint_sequence_token(seq: u64) -> String {
     format!("{seq:056}")
 }
 
+/// A canonical hyphenated UUID minted from one of the store's monotonic counters, which
+/// is how every resource of this service whose id AWS renders as a UUID gets one: unique
+/// and DERIVED FROM STORED STATE rather than from a random source this crate would need a
+/// new dependency for — the way [`mint_revision_id`] and [`mint_sequence_token`] mint from
+/// stored counters. The version (`4`) and variant (`8`) nibbles sit where a UUID carries
+/// them, and the counter fills the node field, offset by one so the first id minted is not
+/// the nil UUID.
+pub fn mint_uuid_from_seq(seq: u64) -> String {
+    format!("00000000-0000-4000-8000-{:012x}", seq.saturating_add(1))
+}
+
 /// The id `PutQueryDefinition` hands back for a definition it creates: "CloudWatch
 /// generates a unique ID for the new query definition and include it in the response to
 /// this operation."
 ///
-/// CloudWatch Logs renders one as a canonical hyphenated UUID, so this mints one in that
-/// shape from the store's monotonic query-definition counter — the way
-/// [`mint_revision_id`] and [`mint_sequence_token`] mint from stored counters — which
-/// makes every id unique and DERIVED FROM STORED STATE rather than from a random source
-/// this crate would need a new dependency for. The version (`4`) and variant (`8`) nibbles
-/// sit where a UUID carries them, and the counter fills the node field, offset by one so
-/// the first id minted is not the nil UUID.
+/// CloudWatch Logs renders one as a canonical hyphenated UUID, so it is minted through the
+/// shared [`mint_uuid_from_seq`] from the store's monotonic query-definition counter.
 pub fn mint_query_definition_id(seq: u64) -> String {
-    format!("00000000-0000-4000-8000-{:012x}", seq.saturating_add(1))
+    mint_uuid_from_seq(seq)
 }
 
 /// The refusal CloudWatch Logs answers when the resource an operation names is not
@@ -2684,6 +2967,15 @@ pub fn resource_not_found_message(resource_kind: &str) -> String {
 /// instead of guessing which of its requests failed.
 pub fn policy_not_found_message(policy_name: &str) -> String {
     format!("Policy with name [{policy_name}] does not exist.")
+}
+
+/// The refusal CloudWatch Logs builds from the request when the log group names no syslog
+/// configuration for the endpoint a `DeleteSyslogConfiguration` names. The message
+/// interpolates the requested `vpcEndpointId`, so a caller deleting configurations in a
+/// loop can attribute the refusal to one endpoint instead of guessing which of its
+/// requests failed.
+pub fn syslog_configuration_not_found_message(vpc_endpoint_id: &str) -> String {
+    format!("No syslog configuration for vpcEndpointId [{vpc_endpoint_id}] exists on this log group.")
 }
 
 /// The refusal for a value outside the set a member's own documentation enumerates: the

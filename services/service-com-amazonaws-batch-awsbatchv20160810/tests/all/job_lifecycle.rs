@@ -166,15 +166,31 @@ impl Batch {
 
     /// POST `uri` with `body` as JSON; answer the status and the decoded body.
     pub(crate) async fn call(&self, uri: &str, body: Value) -> (u16, Value) {
+        self.send("POST", uri, Some(body)).await
+    }
+
+    /// `method` `uri` with `payload` as the JSON body (nothing at all when it is
+    /// `None`); answer the status and the decoded body.
+    ///
+    /// The ONE place a request is built, so the `GET` and `DELETE` routes this service
+    /// models (`/v1/tags/{resourceArn}`) go through the same router, host header and
+    /// credential scope as every `POST`.
+    pub(crate) async fn send(
+        &self,
+        method: &str,
+        uri: &str,
+        payload: Option<Value>,
+    ) -> (u16, Value) {
+        let body = payload.map_or_else(Bytes::new, |value| {
+            Bytes::from(serde_json::to_vec(&value).expect("the request body serializes"))
+        });
         let request = http::Request::builder()
-            .method("POST")
+            .method(method)
             .uri(format!("https://batch.{REGION}.amazonaws.com{uri}"))
             .header("host", format!("batch.{REGION}.amazonaws.com"))
             .header("content-type", "application/json")
             .header("authorization", AUTHORIZATION)
-            .body(Bytes::from(
-                serde_json::to_vec(&body).expect("the request body serializes"),
-            ))
+            .body(body)
             .expect("a well-formed request");
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();

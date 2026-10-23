@@ -11,10 +11,11 @@
 //! delete answers from the one record rather than from the request that is being served.
 //!
 //! The same holds for every other resource kind this store carries — a key value store, a
-//! response headers policy, an origin request policy, a cache policy: each record is put
-//! there by the call that creates it and is what every later read of that resource answers
-//! from. None of a response headers policy, an origin request policy or a cache policy has
-//! a status member or a propagation deadline, so nothing about one is owed by the clock.
+//! response headers policy, an origin request policy, a cache policy, an origin access
+//! control: each record is put there by the call that creates it and is what every later
+//! read of that resource answers from. None of a response headers policy, an origin
+//! request policy, a cache policy or an origin access control has a status member or a
+//! propagation deadline, so nothing about one is owed by the clock.
 //!
 //! Two things in here are owed by the CLOCK rather than by a call:
 //!
@@ -51,10 +52,12 @@ use crate::ops::types::{
     DistributionTenant, DomainResult, EntityAlreadyExists, EntityNotFound, ForwardedValues,
     FunctionAssociations, GeoRestriction, Invalidation, InvalidationBatch, InvalidationSummary,
     InvalidTagging, KGKeyPairIds, KeyPairIds, KeyValueStore, LambdaFunctionAssociations,
-    LoggingConfig, ManagedCertificateRequest, NoSuchCloudFrontOriginAccessIdentity,
-    NoSuchCachePolicy, NoSuchDistribution, NoSuchInvalidation, NoSuchOriginRequestPolicy,
+    LoggingConfig, ManagedCertificateRequest, MonitoringSubscription, NoSuchCachePolicy,
+    NoSuchCloudFrontOriginAccessIdentity, NoSuchDistribution, NoSuchInvalidation,
+    NoSuchMonitoringSubscription, NoSuchOriginAccessControl, NoSuchOriginRequestPolicy,
     NoSuchResource,
-    NoSuchResponseHeadersPolicy, Origin, OriginRequestPolicy, OriginRequestPolicyAlreadyExists,
+    NoSuchResponseHeadersPolicy, Origin, OriginAccessControl, OriginAccessControlConfig,
+    OriginAccessControlSummary, OriginRequestPolicy, OriginRequestPolicyAlreadyExists,
     OriginRequestPolicyConfig, OriginSslProtocols, Parameter, ParameterDefinition, Paths,
     ResponseHeadersPolicy,
     ResponseHeadersPolicyAlreadyExists, ResponseHeadersPolicyConfig, Restrictions,
@@ -354,6 +357,22 @@ pub const MAX_ORIGIN_ACCESS_IDENTITIES: usize = 100;
 /// lowercase hex characters — the form a bucket ACL grantee takes, which is what makes
 /// the shape part of the contract rather than cosmetic.
 pub const S3_CANONICAL_USER_ID_LEN: usize = 64;
+
+/// The most origin access controls this emulator holds.
+///
+/// CloudFront's published quota is 100 origin access controls per account, and
+/// `CreateOriginAccessControl` models `TooManyOriginAccessControls` — "The number of
+/// origin access controls in your Amazon Web Services account exceeds the maximum
+/// allowed" — for a create that would exceed it. A control record is what a later read
+/// answers from, so it cannot be evicted: the create path is refused at this entry count
+/// rather than growing further.
+pub const MAX_ORIGIN_ACCESS_CONTROLS: usize = 100;
+
+/// The longest `OriginAccessControlConfig$Name` this service accepts.
+///
+/// The member carries no `@length` in the model, but its documentation states the bound:
+/// "A name to identify the origin access control. You can specify up to 64 characters."
+pub const MAX_ORIGIN_ACCESS_CONTROL_NAME: usize = 64;
 
 /// The most response headers policies this emulator holds.
 ///
@@ -749,6 +768,17 @@ pub struct StoredDistribution {
     pub tags: TagSet,
     /// Every invalidation created under this distribution, keyed by invalidation id.
     pub invalidations: BTreeMap<String, StoredInvalidation>,
+    /// The additional-CloudWatch-metrics subscription associated with this distribution,
+    /// or `None` while it has none.
+    ///
+    /// A sub-resource of the distribution rather than a member of its configuration —
+    /// `CreateMonitoringSubscription`, `GetMonitoringSubscription` and
+    /// `DeleteMonitoringSubscription` address it under
+    /// `/distributions/{Id}/monitoring-subscription` — so it is carried on this record
+    /// and released with it, and changing it leaves the configuration, the version token
+    /// and the propagation status of the distribution exactly as they were. A
+    /// distribution is created without one: nothing but a create puts one here.
+    pub monitoring_subscription: Option<MonitoringSubscription>,
 }
 
 impl StoredDistribution {
@@ -1323,6 +1353,60 @@ impl StoredResponseHeadersPolicy {
     }
 }
 
+/// One CloudFront origin access control, as this emulator persists it.
+///
+/// The record is the single source of truth for the control's id, the configuration it
+/// was created with and its version token, so the create, a later
+/// `GetOriginAccessControl` and every `ListOriginAccessControls` page answer from it
+/// rather than from the request being served.
+///
+/// Nothing in here is owed by the CLOCK: the model's `OriginAccessControl` is `Id` and
+/// `OriginAccessControlConfig` only — a control carries no status and no propagation
+/// deadline, so a control this service accepts is immediately complete.
+#[derive(Debug, Clone)]
+pub struct StoredOriginAccessControl {
+    /// `OriginAccessControl$Id` — "The unique identifier of the origin access control":
+    /// the token minted at creation, which is also the key this record is held under and
+    /// the path segment its `Location` names.
+    pub id: String,
+    /// The configuration as submitted — stored whole, so a read reports what was stored
+    /// rather than re-deriving anything from a request.
+    pub config: OriginAccessControlConfig,
+    /// The version token the last mutation handed back, and the single source of truth
+    /// for every `If-Match` check against this control.
+    pub etag: String,
+}
+
+impl StoredOriginAccessControl {
+    /// The `OriginAccessControl` projection every origin access control operation
+    /// returns, read from the one stored record.
+    pub fn to_origin_access_control(&self) -> OriginAccessControl {
+        OriginAccessControl {
+            id: self.id.clone(),
+            origin_access_control_config: Some(self.config.clone()),
+        }
+    }
+
+    /// The `OriginAccessControlSummary` a listing reports for this control.
+    ///
+    /// `OriginAccessControlSummary$Description` is REQUIRED while
+    /// `OriginAccessControlConfig$Description` is optional, so a control created without
+    /// a description is summarised with an empty one rather than with no element.
+    pub fn to_summary(&self) -> OriginAccessControlSummary {
+        OriginAccessControlSummary {
+            id: self.id.clone(),
+            description: self.config.description.clone().unwrap_or_default(),
+            name: self.config.name.clone(),
+            signing_protocol: self.config.signing_protocol.clone(),
+            signing_behavior: self.config.signing_behavior.clone(),
+            origin_access_control_origin_type: self
+                .config
+                .origin_access_control_origin_type
+                .clone(),
+        }
+    }
+}
+
 /// One CloudFront origin request policy, as this emulator persists it.
 ///
 /// The record is the single source of truth for the policy's id, the configuration it was
@@ -1441,6 +1525,11 @@ pub struct ComAmazonawsCloudfrontCloudfront20200531State {
     /// for the same reason as `distributions`: one stable total order for a listing to
     /// page through.
     pub response_headers_policies: BTreeMap<String, StoredResponseHeadersPolicy>,
+    /// Every origin access control this emulator holds, keyed by its minted id — the
+    /// identifier every origin access control operation addresses one by. A `BTreeMap`
+    /// for the same reason as `distributions`: one stable total order for a listing to
+    /// page through.
+    pub origin_access_controls: BTreeMap<String, StoredOriginAccessControl>,
     /// Every origin request policy this emulator holds, keyed by its minted id — the
     /// identifier every origin request policy operation addresses one by. A `BTreeMap`
     /// for the same reason as `distributions`: one stable total order for a listing to
@@ -1615,6 +1704,32 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         self.response_headers_policies
             .values()
             .find(|policy| policy.config.name == name)
+    }
+
+    /// The origin access control `id` names, or `None` when the store holds none.
+    pub fn origin_access_control(&self, id: &str) -> Option<&StoredOriginAccessControl> {
+        self.origin_access_controls.get(id)
+    }
+
+    /// The origin access control whose STORED configuration asks for exactly what
+    /// `config` asks for, or `None` when no control does.
+    ///
+    /// `CreateOriginAccessControl` models `OriginAccessControlAlreadyExists` as "An origin
+    /// access control with the specified parameters already exists", so what makes a
+    /// create a conflict is the whole set of parameters rather than any single member: a
+    /// request that changes any of them describes a DIFFERENT control and creates one.
+    ///
+    /// A scan over the controls rather than a second index beside them: the stored
+    /// records are the single source of truth for which configurations exist, so a scan
+    /// cannot drift out of step with them, and the collection is bounded by
+    /// [`MAX_ORIGIN_ACCESS_CONTROLS`].
+    pub fn origin_access_control_with_config(
+        &self,
+        config: &OriginAccessControlConfig,
+    ) -> Option<&StoredOriginAccessControl> {
+        self.origin_access_controls
+            .values()
+            .find(|control| same_origin_access_control_config(&control.config, config))
     }
 
     /// The origin request policy `id` names, or `None` when the store holds none.
@@ -1804,6 +1919,10 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             config,
             tags,
             invalidations: BTreeMap::new(),
+            // Additional CloudWatch metrics are enabled by a call of their own, so a
+            // distribution this create minted carries no monitoring subscription until
+            // `CreateMonitoringSubscription` puts one on it.
+            monitoring_subscription: None,
         };
         let created = CreatedDistribution {
             id: id.clone(),
@@ -1916,6 +2035,22 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         loop {
             let candidate = self.mint_uuid();
             if !self.response_headers_policies.contains_key(&candidate) {
+                break candidate;
+            }
+        }
+    }
+
+    /// Allocate an origin access control id no stored control holds.
+    ///
+    /// `OriginAccessControl$Id` is "The unique identifier of the origin access control",
+    /// and CloudFront mints one in the shape every CloudFront entity id takes (`E` +
+    /// [`ID_BODY_LEN`] uppercase alphanumerics, as `--origin-access-control-id
+    /// E127EXAMPLE51Z` shows), drawn from the same mint as every other id here so no two
+    /// controls are minted the same id.
+    pub fn allocate_origin_access_control_id(&mut self) -> String {
+        loop {
+            let candidate = format!("E{}", self.mint(ID_BODY_LEN));
+            if !self.origin_access_controls.contains_key(&candidate) {
                 break candidate;
             }
         }
@@ -2423,6 +2558,13 @@ pub fn response_headers_policy_path(id: &str) -> String {
     format!("/2020-05-31/response-headers-policy/{id}")
 }
 
+/// The path of an origin access control resource under this service's API version — the
+/// route `GetOriginAccessControl` serves (`/origin-access-control/{Id}`), which is
+/// therefore the resource the create's `Location` names.
+pub fn origin_access_control_path(id: &str) -> String {
+    format!("/2020-05-31/origin-access-control/{id}")
+}
+
 /// The path of an origin request policy resource under this service's API version. The
 /// resource is addressed by ID, as `GetOriginRequestPolicy`'s `{Id}` label is.
 pub fn origin_request_policy_path(id: &str) -> String {
@@ -2468,6 +2610,17 @@ pub fn is_distribution_id(value: &str) -> bool {
 /// only if it equals the one stored.
 pub fn is_version_token(value: &str) -> bool {
     is_distribution_id(value)
+}
+
+/// Whether `value` has the shape of an origin access control id this service mints.
+///
+/// `ListOriginAccessControls`'s `Marker` is an origin access control id — "set this
+/// field's value to the value of `NextMarker` from the current page's response" — and the
+/// model constrains it no further than `string`, so this is what tells a resume point the
+/// service issued from a value a client made up. The same shape
+/// [`is_distribution_id`] describes, because CloudFront draws every entity id from it.
+pub fn is_origin_access_control_id(value: &str) -> bool {
+    is_prefixed_token(value, 'E')
 }
 
 /// Whether `value` has the shape every id this service MINTS AS A UUID takes
@@ -2674,6 +2827,20 @@ fn same_single_header_config(
 pub fn same_origin_access_identity_config(
     left: &CloudFrontOriginAccessIdentityConfig,
     right: &CloudFrontOriginAccessIdentityConfig,
+) -> bool {
+    format!("{left:?}") == format!("{right:?}")
+}
+
+/// Whether two origin access control configurations ask for the same thing, which is what
+/// decides whether a create describes a control the account already holds or a new one.
+///
+/// The same comparison [`same_config`] makes, for the same reasons: every member a caller
+/// can submit takes part — down to the members a request left out — and comparing the
+/// DESERIALIZED configurations is what makes it insensitive to the request document's
+/// whitespace and member order.
+pub fn same_origin_access_control_config(
+    left: &OriginAccessControlConfig,
+    right: &OriginAccessControlConfig,
 ) -> bool {
     format!("{left:?}") == format!("{right:?}")
 }
@@ -3925,9 +4092,92 @@ pub fn no_such_response_headers_policy() -> NoSuchResponseHeadersPolicy {
     }
 }
 
+/// The modelled `MonitoringSubscriptionAlreadyExists` (HTTP 409) for a distribution that
+/// already carries a monitoring subscription.
+///
+/// A property of the distribution's state rather than of the request, so nothing from the
+/// request belongs in the text, exactly as in [`no_such_distribution`]: one CONSTANT per
+/// error code.
+pub fn monitoring_subscription_already_exists()
+-> crate::ops::types::MonitoringSubscriptionAlreadyExists {
+    crate::ops::types::MonitoringSubscriptionAlreadyExists {
+        message: Some(MONITORING_SUBSCRIPTION_ALREADY_EXISTS_MESSAGE.to_string()),
+    }
+}
+
+/// The message `MonitoringSubscriptionAlreadyExists` carries, on the wire.
+///
+/// The value below is the WIRE text — what the recorded service answers this code with,
+/// and what this emulator therefore serves. Like
+/// [`DISTRIBUTION_NOT_DISABLED_MESSAGE`], it deliberately differs from the sentence the
+/// MODEL's documentation of the error shape uses for the same rule ("A monitoring
+/// subscription already exists for the specified distribution."): that one documents the
+/// condition, this one is served. Do not "correct" this constant to the documentation
+/// sentence.
+pub const MONITORING_SUBSCRIPTION_ALREADY_EXISTS_MESSAGE: &str =
+    "A monitoring subscription already exists for this distribution";
+
+/// The modelled `NoSuchMonitoringSubscription` (HTTP 404) for a distribution that carries
+/// no monitoring subscription. Fixed service text, for the same reason
+/// [`monitoring_subscription_already_exists`]'s is.
+pub fn no_such_monitoring_subscription() -> NoSuchMonitoringSubscription {
+    NoSuchMonitoringSubscription {
+        message: Some(NO_SUCH_MONITORING_SUBSCRIPTION_MESSAGE.to_string()),
+    }
+}
+
+/// The message `NoSuchMonitoringSubscription` carries, on the wire.
+///
+/// The WIRE text — what the recorded service answers this code with, and what this
+/// emulator therefore serves. Like [`MONITORING_SUBSCRIPTION_ALREADY_EXISTS_MESSAGE`] and
+/// [`DISTRIBUTION_NOT_DISABLED_MESSAGE`], it differs from the sentence the MODEL's
+/// documentation of the error shape uses for the same rule ("A monitoring subscription does
+/// not exist for the specified distribution."): that one documents the condition, this one
+/// is served. Do not "correct" this constant to the documentation sentence.
+pub const NO_SUCH_MONITORING_SUBSCRIPTION_MESSAGE: &str =
+    "The monitoring subscription does not exist.";
+
 /// `NoSuchResponseHeadersPolicy`'s message, as the model documents the shape.
 pub const NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE: &str =
     "The response headers policy does not exist.";
+
+/// The modelled `NoSuchOriginAccessControl` (HTTP 404) for an origin access control id
+/// the store does not hold.
+///
+/// The sentence is the one the model states on the shape itself — "The origin access
+/// control does not exist." — a property of the store rather than of the request, so
+/// nothing from the request belongs in the text.
+pub fn no_such_origin_access_control() -> NoSuchOriginAccessControl {
+    NoSuchOriginAccessControl {
+        message: Some(NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE.to_string()),
+    }
+}
+
+/// `NoSuchOriginAccessControl`'s message, as the model documents the shape.
+pub const NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE: &str = "The origin access control does not exist.";
+
+/// The sentence `OriginAccessControlAlreadyExists` carries, up to the control that
+/// already holds the submitted parameters, which it names at the end — the one piece of
+/// store-derived detail in it, and the one a caller cannot work out for itself.
+pub fn origin_access_control_already_exists_message(existing_id: &str) -> String {
+    format!(
+        "An origin access control with the specified parameters already exists: {existing_id}"
+    )
+}
+
+/// The modelled `InvalidArgument` for an `OriginAccessControlConfig$Name` longer than the
+/// documented bound.
+///
+/// The message states the CONSTRAINT the request broke and the length it submitted, which
+/// is the rule the refusal is built from rather than text echoed out of the request.
+pub fn origin_access_control_name_too_long(length: usize) -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(format!(
+            "An argument is invalid: the origin access control name cannot be longer than \
+             {MAX_ORIGIN_ACCESS_CONTROL_NAME} characters but the request submits {length}"
+        )),
+    }
+}
 
 /// The modelled `ResponseHeadersPolicyAlreadyExists` (HTTP 409) for a policy name that is
 /// already taken — "A response headers policy with this name already exists. You must

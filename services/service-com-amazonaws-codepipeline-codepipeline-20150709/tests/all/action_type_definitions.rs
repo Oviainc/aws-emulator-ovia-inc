@@ -58,7 +58,10 @@ const MIN_JOB_TIMEOUT: i64 = 60;
 const LAMBDA_ARN: &str = "arn:aws:lambda:us-east-1:123456789012:function:cp-action";
 
 /// An `ActionTypeIdentifier` as a request carries it.
-fn identifier(category: &str, owner: &str, provider: &str, version: &str) -> Value {
+///
+/// `pub(crate)` so the other suites of this target drive these two operations through
+/// the same helpers; see `tests/all/delete_custom_action_type.rs`.
+pub(crate) fn identifier(category: &str, owner: &str, provider: &str, version: &str) -> Value {
     json!({
         "category": category,
         "owner": owner,

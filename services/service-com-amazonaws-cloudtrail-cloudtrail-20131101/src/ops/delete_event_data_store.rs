@@ -218,7 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the status it was created for.
         store.settle_event_data_stores(now);
 
-        let found = store.addressed_event_data_store_mut(&identifier, &region);
+        let found = store.addressed_event_data_store_mut(&identifier, &region, now);
         let Some(record) = found else {
             return Err(crate::scaffolded::Scaffolded::modeled_with_status(
                 DeleteEventDataStoreErrorModeled::EventDataStoreNotFoundException(

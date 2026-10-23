@@ -158,9 +158,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(tags) = store.tags_for_resource(&input.resource_arn) else {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Resource not found. Verify the resource ARN and try again: {}",
-                        input.resource_arn
+                    // This operation is addressed by RESOURCE ARN and resolves a
+                    // connection, a host or a repository link, so an ARN that resolves to
+                    // nothing is refused in the wording of the KIND the ARN names — the
+                    // connection readers' fixed sentence for a connection ARN, the host
+                    // readers' for a host ARN. See
+                    // `state::tagging_resource_not_found_message`.
+                    message: Some(crate::state::tagging_resource_not_found_message(
+                        &input.resource_arn,
                     )),
                 },
             )

@@ -3,12 +3,13 @@
 //! @op DeleteToken
 //!
 //! Reclaims the challenge token `(AppId, SessionId)` addresses and answers
-//! `IsSuccess: true`. A session id this service holds no LIVE token for — never minted,
-//! already deleted, or past its `Ttl` — is the modelled `NotFoundException` (404):
-//! there is nothing to delete, which is a different answer from "deleted". An `AppId`
-//! that identifies no registered Amplify app is refused with HTTP 400
-//! `ValidationException` before the token is looked up at all
-//! ([`crate::state::require_registered_app`]).
+//! `IsSuccess: true`. IDEMPOTENT over session ids: a session id this service holds no
+//! LIVE token for — never minted, already deleted, or past its `Ttl` — is NOT an error,
+//! it is the same `IsSuccess: true` (HTTP 200), because the call's postcondition ("this
+//! app holds no token for that session") already holds. An `AppId` that identifies no
+//! registered Amplify app is refused with HTTP 400 `ValidationException` before the
+//! token is looked up at all ([`crate::state::require_registered_app`]), which is the
+//! ONLY identity this path validates.
 //!
 //! ## Shape of an operation
 //!
@@ -162,16 +163,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already run out is reported as absent rather than as deleted by this call.
         store.expire_challenge_tokens(now);
 
-        if !store.remove_challenge_token(&input.app_id, &input.session_id) {
-            return Err(DeleteTokenErrorModeled::NotFoundException(crate::state::not_found(
-                crate::state::RESOURCE_TYPE_CHALLENGE_TOKEN,
-                format!(
-                    "no challenge token with session id {} exists for app {}",
-                    input.session_id, input.app_id
-                ),
-            ))
-            .into());
-        }
+        // Idempotent: whether a token was held or not, the call leaves the app holding
+        // none for this session and answers `IsSuccess: true`. Session EXISTENCE is not
+        // validated on this path — only app identity, gated above — so a retried delete,
+        // or a cleanup that deletes a session it never confirmed exists, succeeds.
+        let _reclaimed = store.remove_challenge_token(&input.app_id, &input.session_id);
         Ok(DeleteTokenOutput {
             is_success: Some(true),
         })

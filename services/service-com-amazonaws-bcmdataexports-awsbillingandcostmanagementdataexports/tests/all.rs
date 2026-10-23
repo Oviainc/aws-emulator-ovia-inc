@@ -17,6 +17,8 @@ mod catalog_dictionary;
 mod catalog_published_text;
 #[path = "all/catalog_schema.rs"]
 mod catalog_schema;
+#[path = "all/catalog_schema_versions.rs"]
+mod catalog_schema_versions;
 #[path = "all/data_query.rs"]
 mod data_query;
 #[path = "all/execution_listing.rs"]

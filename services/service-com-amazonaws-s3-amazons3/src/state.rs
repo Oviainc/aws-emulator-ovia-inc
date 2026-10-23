@@ -12,6 +12,12 @@
 //! noncurrent ones a later write or a delete displaced, each addressable by the version id
 //! the store minted for it ([`mint_version_id`]). Every stored version counts against the
 //! same ceilings a current object does.
+//!
+//! A bucket also holds the multipart uploads it has IN PROGRESS ([`MultipartUpload`]),
+//! each addressable by the upload id the store minted for it ([`mint_upload_id`]) until a
+//! completion or an abort takes it away. An in-progress upload is not an object: it is
+//! where everything the initiating `CreateMultipartUpload` settled about the object it
+//! will become is kept in the meantime.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
@@ -185,6 +191,44 @@ pub enum ObjectTagWrite {
     /// Keeping the tag set would take the whole store past [`MAX_OBJECT_BYTES_TOTAL`]
     /// retained bytes; nothing was written.
     TotalByteBudgetReached { would_hold: usize },
+}
+
+/// How many in-progress multipart uploads one bucket in this emulator keeps.
+///
+/// NOT a fidelity claim: S3 publishes no limit on concurrent multipart uploads of a
+/// bucket, and the model bounds nothing either (`MultipartUploadId` is a plain string,
+/// `smithy_query(query="shape",shape="MultipartUploadId")`). It is the emulator's own
+/// ceiling, for the same reason as [`MAX_OBJECTS_PER_BUCKET`]: every upload this store
+/// records lives in this process's memory, so a caller looping on
+/// `CreateMultipartUpload` must not grow it without bound. An initiation past it is
+/// refused rather than recorded.
+pub const MAX_MULTIPART_UPLOADS_PER_BUCKET: usize = 1_000;
+
+/// How many in-progress multipart uploads this emulator keeps ACROSS every bucket.
+///
+/// Same reason as [`MAX_OBJECTS_TOTAL`]: the per-bucket ceiling alone would leave the
+/// total bounded only by its product with [`MAX_BUCKETS_PER_ACCOUNT`], so this is what
+/// bounds the uploads this process holds whatever a caller does.
+pub const MAX_MULTIPART_UPLOADS_TOTAL: usize = 10_000;
+
+/// What [`ComAmazonawsS3Amazons3State::create_multipart_upload`] did, so the caller
+/// answers each outcome without re-deriving it — and cannot record an upload without
+/// having gone through the key, metadata and count checks, per bucket AND service-wide.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultipartUploadCreation {
+    /// The upload was recorded, and is addressed by this id from now on.
+    Initiated { upload_id: String },
+    /// The key is longer than [`MAX_OBJECT_KEY_BYTES`]; nothing was written.
+    KeyTooLong { bytes: usize },
+    /// The request's user-defined metadata is larger than
+    /// [`MAX_OBJECT_METADATA_BYTES`]; nothing was written.
+    MetadataTooLarge { bytes: usize },
+    /// The bucket already holds [`MAX_MULTIPART_UPLOADS_PER_BUCKET`] in-progress
+    /// uploads; nothing was written.
+    UploadCountReached,
+    /// This emulator already holds [`MAX_MULTIPART_UPLOADS_TOTAL`] in-progress uploads
+    /// across every bucket; nothing was written.
+    TotalUploadCountReached,
 }
 
 /// How many tags one bucket's tag set may carry.
@@ -1817,6 +1861,20 @@ pub struct Bucket {
     /// so a version cannot be recorded without passing the ceilings every stored version
     /// counts against.
     noncurrent_versions: BTreeMap<String, Vec<Object>>,
+    /// The multipart uploads the bucket has in progress, by upload id.
+    ///
+    /// An upload lands here when `CreateMultipartUpload` initiates it and leaves only
+    /// when it is completed or aborted: "After you initiate a multipart upload and upload
+    /// one or more parts … you must either complete or abort the multipart upload"
+    /// (`CreateMultipartUpload`'s own documentation). Keyed by the id the store minted
+    /// ([`mint_upload_id`]), because that is what every later request names the upload by;
+    /// sorted, because `ListMultipartUploads` reports uploads in key order and an id is
+    /// what distinguishes two uploads of one key.
+    ///
+    /// Private, like `objects`, and written only through
+    /// [`ComAmazonawsS3Amazons3State::create_multipart_upload`], which is the only place
+    /// that sees the ceilings an in-progress upload counts against.
+    multipart_uploads: BTreeMap<String, MultipartUpload>,
 }
 
 impl Bucket {
@@ -1988,6 +2046,63 @@ impl Bucket {
         self.encryption = Some(rules);
     }
 
+    /// The default encryption rules IN FORCE on the bucket: the ones a
+    /// `PutBucketEncryption` associated with it, or the single SSE-S3 rule every bucket
+    /// carries until one does ([`default_encryption_rule`]).
+    ///
+    /// COMPUTED, never stored: a bucket that was never configured keeps [`Self::encryption`]
+    /// at `None`, so reading this changes nothing a later caller sees. This is what
+    /// `GetBucketEncryption` reports and what [`Self::default_object_encryption`] resolves a
+    /// write's inherited encryption from, so the two can never disagree.
+    pub fn effective_encryption_rules(&self) -> Vec<BucketEncryptionRule> {
+        match self.encryption() {
+            Some(configured) => configured.to_vec(),
+            None => vec![default_encryption_rule()],
+        }
+    }
+
+    /// The encryption an object written to this bucket WITHOUT naming any encryption of its
+    /// own is stored under: the bucket's default encryption configuration.
+    ///
+    /// "Amazon S3 encrypts data with server-side encryption by using Amazon S3 managed keys
+    /// (SSE-S3) by default. You can optionally tell Amazon S3 to encrypt data at rest by
+    /// using server-side encryption with other key options"
+    /// (`PutObjectRequest$ServerSideEncryption`) — the other key options being the ones
+    /// `PutBucketEncryption` configures, which is why the rule applied here is the bucket's
+    /// effective one rather than SSE-S3 always.
+    ///
+    /// The rule that decides it is the first of [`Self::effective_encryption_rules`] that
+    /// names an `ApplyServerSideEncryptionByDefault` algorithm; a configuration whose rules
+    /// name none (`ServerSideEncryptionRule` makes that container optional) leaves the
+    /// bucket on the SSE-S3 base default. The Bucket Key setting travels with the algorithm
+    /// only when that algorithm is SSE-KMS, because an S3 Bucket Key is "for object
+    /// encryption with server-side encryption using Key Management Service (KMS) keys
+    /// (SSE-KMS)" (`PutObjectRequest$BucketKeyEnabled`) and nothing else; an encryption
+    /// CONTEXT is never inherited, because it is a per-request value no bucket
+    /// configuration carries.
+    pub fn default_object_encryption(&self) -> ObjectEncryption {
+        let rules = self.effective_encryption_rules();
+        let rule = rules
+            .iter()
+            .find(|rule| rule.sse_algorithm.is_some())
+            .cloned()
+            .unwrap_or_else(default_encryption_rule);
+        let inherited = ObjectEncryption {
+            sse_algorithm: rule.sse_algorithm,
+            kms_key_id: rule.kms_master_key_id,
+            kms_encryption_context: None,
+            bucket_key_enabled: rule.bucket_key_enabled,
+        };
+        if inherited.uses_kms() {
+            inherited
+        } else {
+            ObjectEncryption {
+                sse_algorithm: inherited.sse_algorithm,
+                ..ObjectEncryption::default()
+            }
+        }
+    }
+
     /// The bucket's website configuration, or `None` when no website configuration is
     /// associated with the bucket.
     pub fn website(&self) -> Option<&BucketWebsite> {
@@ -2056,6 +2171,24 @@ impl Bucket {
     /// every ceiling.
     pub fn objects(&self) -> &BTreeMap<String, Object> {
         &self.objects
+    }
+
+    /// The in-progress multipart upload `upload_id` names, or `None` when the bucket has
+    /// no such upload in progress — which is what makes a read or a part upload naming an
+    /// id this store never minted (or one a completion or an abort has since taken away)
+    /// answer `NoSuchUpload`.
+    pub fn multipart_upload(&self, upload_id: &str) -> Option<&MultipartUpload> {
+        self.multipart_uploads.get(upload_id)
+    }
+
+    /// Every multipart upload the bucket has in progress, keyed by upload id.
+    ///
+    /// The read seam for anything that reports the bucket's uploads rather than one of
+    /// them, so no caller reaches into the map. Read-only: an upload is recorded only
+    /// through [`ComAmazonawsS3Amazons3State::create_multipart_upload`], the only place
+    /// that sees every ceiling.
+    pub fn multipart_uploads(&self) -> &BTreeMap<String, MultipartUpload> {
+        &self.multipart_uploads
     }
 
     /// Remove the object at `key`, reporting whether the bucket held one.
@@ -2349,6 +2482,11 @@ pub struct Object {
 /// `BucketKeyEnabled` — the four `PutObject`, `GetObject` and `HeadObject` all report
 /// back as bound response headers.
 ///
+/// A write that names one or more of them is stored under what it named; one that names
+/// none inherits the bucket's default encryption configuration
+/// ([`Bucket::default_object_encryption`]), which is what makes every object in a bucket
+/// encrypted even when no client ever asked.
+///
 /// What this records is an object's encryption CONFIGURATION, not a key and not a
 /// ciphertext: this emulator holds an object's bytes in this process's memory and
 /// performs no cryptography, so the only thing it can answer faithfully is which
@@ -2361,10 +2499,10 @@ pub struct ObjectEncryption {
     /// stored before any encryption state was recorded for it.
     pub sse_algorithm: Option<String>,
     /// `SSEKMSKeyId`, verbatim as the request carried it — "You can specify the key ID,
-    /// key alias, or the Amazon Resource Name (ARN) of the KMS key" — and `None` for a
-    /// write that named none. Only the request's own value: a bucket's DEFAULT encryption
-    /// configuration is not consulted here, which is why a write that names no encryption
-    /// member reports none.
+    /// key alias, or the Amazon Resource Name (ARN) of the KMS key" — or, for a write that
+    /// named no encryption member at all, the `KMSMasterKeyID` of the bucket's default
+    /// encryption configuration ([`Bucket::default_object_encryption`]), and `None` when
+    /// neither names one.
     pub kms_key_id: Option<String>,
     /// `SSEKMSEncryptionContext`: "a Base64-encoded string holding a UTF-8 encoded JSON
     /// of additional encryption context key-value pairs", verbatim.
@@ -2374,6 +2512,14 @@ pub struct ObjectEncryption {
 }
 
 impl ObjectEncryption {
+    /// Whether this record names NO encryption member at all — what a write that leaves
+    /// every one of `PutObject`'s encryption headers off parses to, and exactly the case
+    /// where the bucket's own default encryption configuration is what the object is
+    /// stored under ([`Bucket::default_object_encryption`]).
+    pub fn names_no_member(&self) -> bool {
+        self == &Self::default()
+    }
+
     /// Whether this object's encryption is SSE-KMS — the only kind a KMS key id, an
     /// encryption context or an S3 Bucket Key belongs to
     /// (`ApplyServerSideEncryptionByDefault$KMSMasterKeyID`: "This parameter is allowed if
@@ -2471,6 +2617,104 @@ impl Object {
             .map(|(key, value)| key.len() + value.len())
             .sum()
     }
+}
+
+/// One in-progress multipart upload this emulator holds, as the
+/// `CreateMultipartUpload` that initiated it recorded it.
+///
+/// A multipart upload is a RESOURCE of its own, distinct from the object it will become:
+/// "This action initiates a multipart upload and returns an upload ID … You also include
+/// this upload ID in the final request to either complete or abort the multipart upload
+/// request" (`CreateMultipartUpload`'s own documentation). So everything the initiating
+/// request settles about the FINISHED object is kept here until a later
+/// `CompleteMultipartUpload` applies it — the same members [`Object`] keeps, because that
+/// is what the completed object is made of — and the upload is addressed by its id in the
+/// meantime.
+///
+/// The parts themselves are NOT here: `UploadPart` is still a scaffold stub, so this
+/// store records no part, and `ListParts` reports the empty part list that is the truth
+/// about an upload nothing has uploaded a part to.
+#[derive(Debug, Clone)]
+pub struct MultipartUpload {
+    /// The object key the upload was initiated for — "Object key for which the multipart
+    /// upload is to be initiated" (`CreateMultipartUploadRequest$Key`). An upload is
+    /// addressed by its id AND its key, so a request naming the id under another key
+    /// names no upload.
+    pub key: String,
+    /// When the upload was initiated: the instant
+    /// [`ComAmazonawsS3Amazons3State::create_multipart_upload`] recorded it, which is what
+    /// `MultipartUpload$Initiated` reports. Never reassigned, so the value a reader sees
+    /// does not move while the upload is in progress.
+    pub initiated_at: SystemTime,
+    /// A `StorageClass` value; [`DEFAULT_STORAGE_CLASS`] when the request named none —
+    /// what `ListParts` reports as the "class of storage used to store the uploaded
+    /// object" (`ListPartsOutput$StorageClass`).
+    pub storage_class: String,
+    pub content_type: Option<String>,
+    pub cache_control: Option<String>,
+    pub content_disposition: Option<String>,
+    pub content_encoding: Option<String>,
+    pub content_language: Option<String>,
+    pub expires: Option<String>,
+    pub website_redirect_location: Option<String>,
+    /// The user-defined metadata the initiating request carried in its `x-amz-meta-`
+    /// headers: "A map of metadata to store with the object in S3"
+    /// (`CreateMultipartUploadRequest$Metadata`) — the object the upload completes into,
+    /// so it is held with the upload until then.
+    pub metadata: BTreeMap<String, String>,
+    /// The tag set the initiating request's `x-amz-tagging` header named, judged against
+    /// an OBJECT's published tag-set limits ([`OBJECT_TAG_SET_LIMITS`]) exactly as
+    /// `PutObject`'s own header is. Empty when the request carried none.
+    pub tags: Vec<ResourceTag>,
+    /// The server-side encryption configuration the upload was initiated under, which
+    /// every reader of the upload reports back — see [`ObjectEncryption`].
+    pub encryption: ObjectEncryption,
+    /// The `ChecksumAlgorithm` the initiating request asked S3 to create the object's
+    /// checksum with, or `None` when it named none. The CONFIGURATION, not a checksum:
+    /// nothing here computes one, so no checksum VALUE is recorded or reported.
+    pub checksum_algorithm: Option<String>,
+    /// The `ChecksumType` the initiating request asked for, kept for the same reason as
+    /// [`Self::checksum_algorithm`].
+    pub checksum_type: Option<String>,
+}
+
+impl MultipartUpload {
+    /// How large this upload's user-defined metadata is, in UTF-8 bytes summed over every
+    /// key and value — what [`MAX_OBJECT_METADATA_BYTES`] bounds, measured the way
+    /// [`Object::metadata_bytes`] measures a stored object's.
+    pub fn metadata_bytes(&self) -> usize {
+        self.metadata
+            .iter()
+            .map(|(key, value)| key.len() + value.len())
+            .sum()
+    }
+}
+
+/// The id an initiated multipart upload is addressed by.
+///
+/// S3's upload ids are OPAQUE: `MultipartUploadId` is a plain string in the model
+/// (`smithy_query(query="shape",shape="MultipartUploadId")` reports no pattern and no
+/// length), and the only thing documented about one is that it identifies the upload every
+/// later part, completion and abort request names ("This upload ID is used to associate
+/// all of the parts in the specific multipart upload"). So this is DERIVED rather than
+/// drawn from a generator, exactly as [`mint_version_id`] is: the SHA-256 of the bucket,
+/// the key and the store's monotonic mint sequence, URL-safe Base64 encoded so the id
+/// survives the round trip through the `uploadId` query parameter a client sends it back
+/// in. Two uploads — of one key or anywhere in the store — therefore never collide, and
+/// the id stays what it was once recorded, because nothing re-derives it.
+pub fn mint_upload_id(bucket: &str, key: &str, sequence: u64) -> String {
+    use ::sha2::Digest;
+    let mut digest = ::sha2::Sha256::new();
+    digest.update(bucket.as_bytes());
+    // A separator, so ("a", "bc") and ("ab", "c") cannot hash the same bytes.
+    digest.update([0u8]);
+    digest.update(key.as_bytes());
+    digest.update([0u8]);
+    digest.update(sequence.to_be_bytes());
+    ::aws_smithy_types::base64::encode(digest.finalize().as_slice())
+        .replace('+', "-")
+        .replace('/', "_")
+        .replace('=', "")
 }
 
 /// The entity tag S3 reports for an object written by a single `PutObject`.
@@ -2599,6 +2843,12 @@ pub struct ComAmazonawsS3Amazons3State {
     /// Only ever increases, so [`Self::mint_notification_configuration_id`] cannot hand
     /// out the same id twice however many configurations are put.
     minted_notification_configuration_ids: u64,
+    /// How many multipart upload ids this store has minted, ever.
+    ///
+    /// The sequence [`mint_upload_id`] derives each id from, so two uploads of one key —
+    /// and two uploads anywhere in the store — can never carry the same id, whatever the
+    /// clock does. Only [`Self::create_multipart_upload`] advances it.
+    minted_upload_ids: u64,
 }
 
 impl ComAmazonawsS3Amazons3State {
@@ -2709,6 +2959,65 @@ impl ComAmazonawsS3Amazons3State {
         self.buckets
             .get_mut(bucket)
             .map(|held| held.put_object(key, object, minted))
+    }
+
+    /// Record `upload` as a new multipart upload in progress in the bucket named
+    /// `bucket`, reporting what that did and the id the upload is addressed by — or
+    /// `None` when this emulator holds no such bucket (so an initiation refuses a name
+    /// that is not a bucket instead of creating one).
+    ///
+    /// This is also where the UPLOAD ID is minted, because this is the only place that
+    /// sees the store's mint sequence: "This action initiates a multipart upload and
+    /// returns an upload ID" (`CreateMultipartUpload`'s own documentation), and the id is
+    /// recorded with the upload, so every later reader reports the id the upload really
+    /// is addressed by rather than one re-derived from the request. Two initiations of one
+    /// key are two uploads, each with its own id — "You specify this upload ID in each of
+    /// your subsequent upload part requests" — so nothing here replaces an upload the
+    /// bucket already has in progress.
+    ///
+    /// This is the ONLY way an upload is recorded, because it is the only place that can
+    /// see BOTH the per-bucket ceiling ([`MAX_MULTIPART_UPLOADS_PER_BUCKET`]) and the
+    /// service-wide one ([`MAX_MULTIPART_UPLOADS_TOTAL`]), which together bound the
+    /// uploads this process holds whatever a caller does. Nothing is written unless the
+    /// answer is [`MultipartUploadCreation::Initiated`]: an over-long key, metadata past
+    /// [`MAX_OBJECT_METADATA_BYTES`] and either ceiling are each refused here, leaving
+    /// every recorded upload exactly as it was.
+    pub fn create_multipart_upload(
+        &mut self,
+        bucket: &str,
+        upload: MultipartUpload,
+    ) -> Option<MultipartUploadCreation> {
+        let held_bucket = self.buckets.get(bucket)?;
+        if upload.key.len() > MAX_OBJECT_KEY_BYTES {
+            return Some(MultipartUploadCreation::KeyTooLong {
+                bytes: upload.key.len(),
+            });
+        }
+        let metadata_bytes = upload.metadata_bytes();
+        if metadata_bytes > MAX_OBJECT_METADATA_BYTES {
+            return Some(MultipartUploadCreation::MetadataTooLarge {
+                bytes: metadata_bytes,
+            });
+        }
+        if held_bucket.multipart_uploads.len() >= MAX_MULTIPART_UPLOADS_PER_BUCKET {
+            return Some(MultipartUploadCreation::UploadCountReached);
+        }
+        let held_total: usize = self
+            .buckets
+            .values()
+            .map(|held| held.multipart_uploads.len())
+            .sum();
+        if held_total >= MAX_MULTIPART_UPLOADS_TOTAL {
+            return Some(MultipartUploadCreation::TotalUploadCountReached);
+        }
+
+        self.minted_upload_ids = self.minted_upload_ids.saturating_add(1);
+        let upload_id = mint_upload_id(bucket, &upload.key, self.minted_upload_ids);
+        self.buckets
+            .get_mut(bucket)?
+            .multipart_uploads
+            .insert(upload_id.clone(), upload);
+        Some(MultipartUploadCreation::Initiated { upload_id })
     }
 
     /// Record `configuration` as the whole notification configuration of the bucket named

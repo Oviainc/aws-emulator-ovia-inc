@@ -35,6 +35,10 @@ mod invalidation_list;
 mod key_value_store_lifecycle;
 #[path = "all/key_value_store_update.rs"]
 mod key_value_store_update;
+#[path = "all/monitoring_subscription.rs"]
+mod monitoring_subscription;
+#[path = "all/origin_access_control_lifecycle.rs"]
+mod origin_access_control_lifecycle;
 #[path = "all/origin_access_identity_lifecycle.rs"]
 mod origin_access_identity_lifecycle;
 #[path = "all/origin_request_policy_lifecycle.rs"]

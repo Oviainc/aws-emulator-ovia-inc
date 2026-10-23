@@ -80,6 +80,15 @@ pub const CANCELLATION_CODE_NONE: &str = "None";
 /// The `CancellationReason$Code` an action whose condition was not met carries.
 pub const CANCELLATION_CODE_CONDITION_FAILED: &str = "ConditionalCheckFailed";
 
+/// The `CancellationReason$Code` an action the transaction refused on its own merits
+/// carries: "ValidationError - Code: ValidationError, Message: One or more parameter
+/// values were invalid" ("Cancellation reason codes and possible error messages", the
+/// `TransactWriteItems` doc). A failure the transaction decides PER ACTION is reported
+/// this way rather than as a bare `ValidationException`, which is how a malformed
+/// REQUEST — one addressing an item twice, or an entry naming no operation — is
+/// refused.
+pub const CANCELLATION_CODE_VALIDATION_ERROR: &str = "ValidationError";
+
 /// What a transactional read or write costs relative to the same single-item one:
 /// "Transactional write requests require two write capacity units" and "Transactional
 /// read requests require two read capacity units to perform one read per second for

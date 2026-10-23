@@ -47,10 +47,14 @@ mod head_object_read_back;
 mod list_buckets;
 #[path = "all/listing_encoding_type.rs"]
 mod listing_encoding_type;
+#[path = "all/multipart_upload_initiation.rs"]
+mod multipart_upload_initiation;
 #[path = "all/object_and_policy.rs"]
 mod object_and_policy;
 #[path = "all/object_and_tagging_roundtrip.rs"]
 mod object_and_tagging_roundtrip;
+#[path = "all/object_default_encryption.rs"]
+mod object_default_encryption;
 #[path = "all/object_encryption.rs"]
 mod object_encryption;
 #[path = "all/object_listing_and_deletion.rs"]

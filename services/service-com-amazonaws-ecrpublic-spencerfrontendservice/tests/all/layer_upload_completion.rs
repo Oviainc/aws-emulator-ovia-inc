@@ -45,20 +45,24 @@ const UNKNOWN_UPLOAD_ID: &str = "0123abcd-4567-89ef-0123-456789abcdef";
 
 /// The `sha256:<hex>` digest of `bytes`, computed in the test: the derivation
 /// `CompleteLayerUpload$layerDigest` ("the sha256 digest of the image layer") states.
-fn digest_of(bytes: &[u8]) -> String {
+pub(crate) fn digest_of(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
 /// `len` deterministic bytes that depend on `seed`, so two layers of one case differ and a
 /// commit that dropped or reordered bytes cannot digest to the expected value.
-fn layer_bytes(len: usize, seed: usize) -> Vec<u8> {
+pub(crate) fn layer_bytes(len: usize, seed: usize) -> Vec<u8> {
     (0..len)
         .map(|index| u8::try_from((index * 37 + seed * 11) % 256).unwrap_or_default())
         .collect()
 }
 
 /// A repository of this registry plus one upload opened against it.
-async fn given_upload(router: &MultiServiceRouter, case: &str, repository: &str) -> String {
+pub(crate) async fn given_upload(
+    router: &MultiServiceRouter,
+    case: &str,
+    repository: &str,
+) -> String {
     given_repository(router, case, repository).await;
     let answer = ok(
         router,
@@ -75,7 +79,7 @@ async fn given_upload(router: &MultiServiceRouter, case: &str, repository: &str)
 
 /// Send `layer` to `upload_id` as `part_count` consecutive parts, each of which must be
 /// accepted: the precondition a completion is measured against.
-async fn given_parts(
+pub(crate) async fn given_parts(
     router: &MultiServiceRouter,
     repository: &str,
     upload_id: &str,
@@ -107,7 +111,7 @@ async fn given_parts(
 }
 
 /// One `BatchCheckLayerAvailability` answer for `digests` against `repository`.
-async fn availability(
+pub(crate) async fn availability(
     router: &MultiServiceRouter,
     repository: &str,
     digests: &[String],
@@ -124,7 +128,7 @@ async fn availability(
 
 /// The `(layerDigest, layerAvailability, layerSize)` triples a report lists under
 /// `layers`, in the order it listed them.
-fn reported_layers(report: &Value, case: &str) -> Vec<(String, String, Option<i64>)> {
+pub(crate) fn reported_layers(report: &Value, case: &str) -> Vec<(String, String, Option<i64>)> {
     report["layers"]
         .as_array()
         .unwrap_or_else(|| panic!("case {case:?}: expected a layers array, got {report}"))

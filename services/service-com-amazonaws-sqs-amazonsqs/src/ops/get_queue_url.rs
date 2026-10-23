@@ -8,6 +8,11 @@
 //!
 //! A pure read: it resolves the stored [`crate::state::Queue`] and writes nothing.
 //!
+//! A name this account has no queue for — and a request naming any other owner — is
+//! refused as `QueueDoesNotExist` carrying Amazon SQS's own fixed message
+//! ([`crate::state::QUEUE_DOES_NOT_EXIST_MESSAGE`]), which names no queue: the probed
+//! name is never reported back to the caller.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -166,28 +171,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "To access a queue owned by another Amazon Web Services account, use the
         // QueueOwnerAWSAccountId parameter to specify the account ID of the queue's
         // owner." This emulator presents exactly one account, so a request naming any
-        // other owner resolves to no queue at all.
-        if let Some(owner) = input
+        // other owner resolves to no queue at all — the same refusal, with the same fixed
+        // message, as a name this account never created: nothing of the request is
+        // reported back.
+        if input
             .queue_owner_aws_account_id
             .as_deref()
-            .filter(|owner| *owner != ::engine::emulator_account_id())
+            .is_some_and(|owner| owner != ::engine::emulator_account_id())
         {
-            return Err(GetQueueUrlErrorModeled::QueueDoesNotExist(QueueDoesNotExist {
-                message: Some(format!(
-                    "The queue {} is not owned by account {owner}.",
-                    input.queue_name,
-                )),
-            })
+            return Err(GetQueueUrlErrorModeled::QueueDoesNotExist(
+                state::queue_does_not_exist(),
+            )
             .into());
         }
 
         let queue = store.queues.get(&input.queue_name).ok_or_else(|| {
-            GetQueueUrlErrorModeled::QueueDoesNotExist(QueueDoesNotExist {
-                message: Some(format!(
-                    "The queue named {} does not exist in this account and Region.",
-                    input.queue_name,
-                )),
-            })
+            GetQueueUrlErrorModeled::QueueDoesNotExist(state::queue_does_not_exist())
         })?;
 
         Ok(GetQueueUrlOutput {

@@ -22,7 +22,7 @@ use crate::ops::types::{
     MatchmakingConfiguration, MatchmakingRuleSet, MatchmakingTicket, PlacedPlayerSession, Player,
     PlayerGatewayConfiguration, PlayerLatency, PlayerLatencyPolicy, PlayerSession,
     PriorityConfiguration, PriorityConfigurationOverride, ResourceCreationLimitPolicy,
-    RoutingStrategy, RuntimeConfiguration, Tag,
+    RoutingStrategy, RuntimeConfiguration, S3Location, Script, Tag,
 };
 
 /// `ComputeType` values the model declares (`smithy_query shape=ComputeType`).
@@ -240,6 +240,19 @@ pub const DEFAULT_QUEUE_TIMEOUT_SECONDS: i32 = QUEUE_TIMEOUT_RANGE_SECONDS.1;
 /// realistic script, and the bound that keeps the location store from growing without
 /// limit.
 pub const MAX_CUSTOM_LOCATIONS_PER_ACCOUNT: usize = 100;
+
+/// How many Realtime scripts this emulator holds before `CreateScript` refuses the next
+/// create.
+///
+/// CHOSEN for the same reason as [`MAX_CUSTOM_LOCATIONS_PER_ACCOUNT`]: the model carries
+/// no quota, a stored script record lives until `DeleteScript` removes it, and this is the
+/// bound that keeps the script store from growing without limit. `CreateScript` models no
+/// `LimitExceededException`, so the create past the bound answers the modelled
+/// `ConflictException` — "the requested operation would cause a conflict with the current
+/// state of a service resource associated with the request" — the one modelled client
+/// error that is about the state of the account's resources rather than about a parameter
+/// value.
+pub const MAX_SCRIPTS_PER_ACCOUNT: usize = 100;
 
 /// How many matchmaking rule sets this emulator holds before `CreateMatchmakingRuleSet`
 /// answers the modelled `LimitExceededException`. CHOSEN for the same reason as
@@ -1076,6 +1089,81 @@ pub fn aws_location_model(location: &str) -> LocationModel {
     }
 }
 
+/// A Realtime script, as `CreateScript` persisted it — the one projection every read of
+/// the script is served from.
+#[derive(Debug, Clone)]
+pub struct ScriptRecord {
+    pub script_id: String,
+    pub script_arn: String,
+    /// "A descriptive label that is associated with a script. Script names do not need to
+    /// be unique", and the member is optional, so a script may carry no name at all.
+    pub name: Option<String>,
+    pub version: Option<String>,
+    /// `Script$SizeOnDisk`: "The file size of the uploaded Realtime script, expressed in
+    /// bytes. When files are uploaded from an S3 location, this value remains at `0`."
+    pub size_on_disk: i64,
+    pub creation_time: SystemTime,
+    /// Where the script's zip file is stored: the location the request named for an S3
+    /// upload, or the service-owned one ([`service_owned_script_location`]) for a local
+    /// zip file.
+    pub storage_location: S3Location,
+    pub node_js_version: String,
+    /// The labels assigned to the script resource, read back through
+    /// `ListTagsForResource`.
+    pub tags: Vec<Tag>,
+    /// The Region of the request that created the script, which its ARN names.
+    pub region: String,
+}
+
+impl ScriptRecord {
+    /// This script as the modelled `Script`.
+    pub fn to_modelled(&self) -> Script {
+        Script {
+            script_id: Some(self.script_id.clone()),
+            script_arn: Some(self.script_arn.clone()),
+            name: self.name.clone(),
+            version: self.version.clone(),
+            size_on_disk: Some(self.size_on_disk),
+            creation_time: Some(to_date_time(self.creation_time)),
+            storage_location: Some(self.storage_location.clone()),
+            node_js_version: Some(self.node_js_version.clone()),
+        }
+    }
+}
+
+/// The `NodeJsVersion` values a Realtime script may declare: that member's own doc — "The
+/// valid values are `10.x | 24.x`". The modelled pattern (`^[0-9]+\.(?:x|[0-9]+)$`)
+/// accepts any version string at all, so the documented catalog is enforced where the
+/// request is served.
+pub const NODE_JS_VERSIONS: [&str; 2] = ["10.x", "24.x"];
+
+/// The `NodeJsVersion` a script created without one carries: same doc — "By default,
+/// `NodeJsVersion` is `10.x`."
+pub const DEFAULT_NODE_JS_VERSION: &str = NODE_JS_VERSIONS[0];
+
+/// The Amazon GameLift Servers-owned S3 location a script uploaded as a local zip file is
+/// held at.
+///
+/// CreateScript's doc: "If the script file is provided as a local file, the file is
+/// uploaded to an Amazon GameLift Servers-owned S3 bucket and the script record's storage
+/// location reflects this location." The bucket belongs to the service rather than to the
+/// caller, so the location carries no `RoleArn` — that member "allows Amazon GameLift
+/// Servers to access the S3 bucket" of ANOTHER account, and none is involved here — and no
+/// `ObjectVersion`, which is the caller's own bucket versioning. The bucket and key
+/// formats are CHOSEN (the service documents neither): they name the Region the upload was
+/// served in and the script that holds it, so two scripts never share a location.
+pub fn service_owned_script_location(region: &str, script_id: &str) -> S3Location {
+    S3Location {
+        bucket: Some(format!(
+            "gamelift-script-uploads-{region}-{}",
+            ::engine::emulator_account_id()
+        )),
+        key: Some(format!("{script_id}/script.zip")),
+        role_arn: None,
+        object_version: None,
+    }
+}
+
 /// A FlexMatch rule set, as `CreateMatchmakingRuleSet` persisted it.
 #[derive(Debug, Clone)]
 pub struct MatchmakingRuleSetRecord {
@@ -1408,6 +1496,9 @@ pub struct ComAmazonawsGameliftGameliftState {
     /// Custom locations by `LocationName`, which `CreateLocation` keeps unique: a second
     /// create under a name a location already holds answers `ConflictException`.
     pub custom_locations: HashMap<String, CustomLocationRecord>,
+    /// Realtime scripts by `ScriptId`, "a unique identifier for the Realtime script",
+    /// while script names "do not need to be unique" — so the id is the script's key.
+    pub scripts: HashMap<String, ScriptRecord>,
     /// Matchmaking rule sets by `RuleSetName`, which "a unique identifier for the
     /// matchmaking rule set" makes the record's key.
     pub matchmaking_rule_sets: HashMap<String, MatchmakingRuleSetRecord>,
@@ -1858,6 +1949,21 @@ impl ComAmazonawsGameliftGameliftState {
                 .find(|alias| alias.alias_arn == id_or_arn)
         } else {
             self.aliases.get(id_or_arn)
+        }
+    }
+
+    /// The script a `ScriptIdOrArn` names, or `None` when no stored script matches it.
+    ///
+    /// `Script$ScriptArn`'s doc: "In a GameLift script ARN, the resource ID matches the
+    /// `ScriptId` value", so either form selects the same script — which is why the
+    /// member's pattern accepts both.
+    pub fn resolve_script(&self, id_or_arn: &str) -> Option<&ScriptRecord> {
+        if id_or_arn.starts_with("arn:") {
+            self.scripts
+                .values()
+                .find(|script| script.script_arn == id_or_arn)
+        } else {
+            self.scripts.get(id_or_arn)
         }
     }
 

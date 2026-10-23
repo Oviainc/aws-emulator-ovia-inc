@@ -31,9 +31,8 @@ pub const PROVISIONING_SPAN: Duration = Duration::from_millis(500);
 ///
 /// Every variant's wire form is one of the modelled `GraphStatus` values
 /// (`crate::ops::types::GRAPH_STATUS_VALUES`). The statuses this slice never
-/// produces (`FAILED`, `IMPORTING`, `RESETTING`, `STARTING`, `STOPPED`,
-/// `STOPPING`) belong to operations that are still scaffolded, and are added with
-/// them.
+/// produces (`FAILED`, `IMPORTING`, `RESETTING`) belong to operations that are
+/// still scaffolded, and are added with them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GraphStatus {
     /// `CreateGraph` has accepted the graph; it is not usable yet.
@@ -45,6 +44,13 @@ pub enum GraphStatus {
     /// `CreateGraphSnapshot` has accepted a snapshot of the graph; the graph is
     /// being snapshotted and is not reconfigurable until that finishes.
     Snapshotting,
+    /// `StopGraph` has accepted the stop; the graph is winding down.
+    Stopping,
+    /// The graph is stopped: it exists and keeps its configuration and data, but it
+    /// is not serving, so nothing reaches its endpoint until `StartGraph`.
+    Stopped,
+    /// `StartGraph` has accepted the start; the graph is coming back up.
+    Starting,
     /// `DeleteGraph` has accepted the deletion.
     Deleting,
 }
@@ -57,13 +63,50 @@ impl GraphStatus {
             Self::Available => "AVAILABLE",
             Self::Updating => "UPDATING",
             Self::Snapshotting => "SNAPSHOTTING",
+            Self::Stopping => "STOPPING",
+            Self::Stopped => "STOPPED",
+            Self::Starting => "STARTING",
             Self::Deleting => "DELETING",
+        }
+    }
+
+    /// Whether this is a RESTING status: one the clock owes nothing out of.
+    ///
+    /// A graph rests either serving (`AVAILABLE`) or stopped (`STOPPED`); every other
+    /// status this slice produces is a transition already in flight, during which a
+    /// request that would start another transition is a conflict.
+    pub const fn is_at_rest(self) -> bool {
+        matches!(self, Self::Available | Self::Stopped)
+    }
+}
+
+/// A status change the clock owes a graph: the status it lands in, and the instant
+/// from which it is due.
+///
+/// The target is carried beside the instant because a graph does not always settle
+/// into the same status: provisioning, reconfiguring and starting settle to
+/// `AVAILABLE`, while stopping settles to `STOPPED`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingTransition {
+    /// The status the graph takes once this transition falls due.
+    pub settled_status: GraphStatus,
+    /// The instant from which the transition is due.
+    pub due: Instant,
+}
+
+impl PendingTransition {
+    /// The transition a call starting at `now` owes: `settled_status`, due
+    /// [`PROVISIONING_SPAN`] later.
+    pub fn owed(settled_status: GraphStatus, now: Instant) -> Self {
+        Self {
+            settled_status,
+            due: now + PROVISIONING_SPAN,
         }
     }
 }
 
 /// One stored Neptune Analytics graph: every member `GetGraph` reports, plus the
-/// instant at which a pending provisioning transition becomes due.
+/// status change the clock still owes it, if any.
 #[derive(Debug, Clone)]
 pub struct Graph {
     pub id: String,
@@ -82,30 +125,33 @@ pub struct Graph {
     pub source_snapshot_id: Option<String>,
     pub build_number: Option<String>,
     pub tags: BTreeMap<String, String>,
-    /// When the pending `CREATING`/`UPDATING` -> `AVAILABLE` transition falls due.
-    /// `None` once there is nothing outstanding.
-    pub settles_at: Option<Instant>,
+    /// The status change the clock owes this graph, and when it falls due. `None`
+    /// once there is nothing outstanding.
+    pub pending: Option<PendingTransition>,
 }
 
 impl Graph {
     /// Materialise the transition the clock has already made due.
     ///
     /// This is the one write a reporting operation (`GetGraph`, `ListGraphs`) is
-    /// allowed to make: the graph would have become `AVAILABLE` at `settles_at`
-    /// whether or not anybody called, so applying it on read is bookkeeping, not a
-    /// state change caused by the read.
+    /// allowed to make: the graph would have reached the pending transition's
+    /// `settled_status` at its `due` instant whether or not anybody called, so
+    /// applying it on read is bookkeeping, not a state change caused by the read.
     pub fn settle(&mut self, now: Instant) {
-        if self.settles_at.is_some_and(|due| now >= due) {
-            self.status = GraphStatus::Available;
-            self.settles_at = None;
+        let Some(pending) = self.pending else {
+            return;
+        };
+        if now >= pending.due {
+            self.status = pending.settled_status;
+            self.pending = None;
         }
     }
 
-    /// Start a provisioning transition to `AVAILABLE`, due [`PROVISIONING_SPAN`]
-    /// from `now`, and report `status` until then.
-    pub fn begin_transition(&mut self, status: GraphStatus, now: Instant) {
-        self.status = status;
-        self.settles_at = Some(now + PROVISIONING_SPAN);
+    /// Report `transient` now and settle into `settled` [`PROVISIONING_SPAN`] after
+    /// `now`: the shape of every graph transition an operation accepts.
+    pub fn begin_transition(&mut self, transient: GraphStatus, settled: GraphStatus, now: Instant) {
+        self.status = transient;
+        self.pending = Some(PendingTransition::owed(settled, now));
     }
 }
 
@@ -630,9 +676,9 @@ fn encode_resource_id(prefix: &str, mut value: u64) -> String {
     id
 }
 
-/// The five `*Output` shapes that carry a whole graph record are structurally
-/// identical, so one macro renders the stored graph into each rather than five
-/// hand-copied field lists that could drift apart.
+/// The `*Output` shapes that carry a whole graph record are structurally
+/// identical, so one macro renders the stored graph into each rather than one
+/// hand-copied field list per operation, which could drift apart.
 macro_rules! graph_record_output {
     ($($ty:ident),+ $(,)?) => {$(
         impl From<&Graph> for crate::ops::types::$ty {
@@ -664,6 +710,8 @@ graph_record_output!(
     GetGraphOutput,
     UpdateGraphOutput,
     DeleteGraphOutput,
+    StopGraphOutput,
+    StartGraphOutput,
 );
 
 /// `GraphSummary` is the listing projection of the same record: it carries no
@@ -997,55 +1045,51 @@ mod tests {
             source_snapshot_id: None,
             build_number: None,
             tags: BTreeMap::new(),
-            settles_at: None,
+            pending: None,
         }
     }
 
     /// The transition is owed at a future instant, so a read taken immediately
-    /// still sees the transient status.
+    /// still sees the transient status — and it settles into the status the pending
+    /// transition names, which is not always `AVAILABLE`.
     #[test]
     fn a_pending_transition_settles_only_once_it_is_due() {
         let now = Instant::now();
-        let mut graph = Graph {
-            id: "g-0123456789".to_string(),
-            name: "example".to_string(),
-            arn: "arn".to_string(),
-            status: GraphStatus::Creating,
-            status_reason: None,
-            create_time: SystemTime::UNIX_EPOCH,
-            provisioned_memory: 16,
-            endpoint: "endpoint".to_string(),
-            public_connectivity: false,
-            replica_count: 1,
-            kms_key_identifier: None,
-            vector_search_configuration: None,
-            deletion_protection: false,
-            source_snapshot_id: None,
-            build_number: None,
-            tags: BTreeMap::new(),
-            settles_at: Some(now + PROVISIONING_SPAN),
-        };
+        // (case, the transient status reported until the transition falls due, the
+        // status it settles into) — one row per transition this service accepts.
+        for (case, transient, settled) in [
+            ("provisioning", GraphStatus::Creating, GraphStatus::Available),
+            ("reconfiguring", GraphStatus::Updating, GraphStatus::Available),
+            (
+                "snapshotting",
+                GraphStatus::Snapshotting,
+                GraphStatus::Available,
+            ),
+            ("stopping", GraphStatus::Stopping, GraphStatus::Stopped),
+            ("starting", GraphStatus::Starting, GraphStatus::Available),
+        ] {
+            let mut graph = sample_graph("g-0123456789", "arn");
+            graph.begin_transition(transient, settled, now);
 
-        graph.settle(now);
-        assert_eq!(
-            graph.status,
-            GraphStatus::Creating,
-            "case not-yet-due: expected CREATING, got {:?}",
-            graph.status
-        );
+            graph.settle(now);
+            assert_eq!(
+                graph.status, transient,
+                "case {case:?} not-yet-due: expected {transient:?}, got {:?}",
+                graph.status
+            );
 
-        graph.settle(now + PROVISIONING_SPAN);
-        assert_eq!(
-            graph.status,
-            GraphStatus::Available,
-            "case due: expected AVAILABLE, got {:?}",
-            graph.status
-        );
-        assert!(
-            graph.settles_at.is_none(),
-            "case due: the settled transition must be cleared, got {:?}",
-            graph.settles_at
-        );
+            graph.settle(now + PROVISIONING_SPAN);
+            assert_eq!(
+                graph.status, settled,
+                "case {case:?} due: expected {settled:?}, got {:?}",
+                graph.status
+            );
+            assert!(
+                graph.pending.is_none(),
+                "case {case:?} due: the settled transition must be cleared, got {:?}",
+                graph.pending
+            );
+        }
     }
 
     /// Every minted snapshot id matches the modelled `SnapshotId` pattern, no id
@@ -1241,6 +1285,9 @@ mod tests {
             GraphStatus::Available,
             GraphStatus::Updating,
             GraphStatus::Snapshotting,
+            GraphStatus::Stopping,
+            GraphStatus::Stopped,
+            GraphStatus::Starting,
             GraphStatus::Deleting,
         ] {
             let wire = status.as_wire();

@@ -192,29 +192,31 @@ pub(crate) fn assert_created_now(case: &str, body: &Value) {
         .duration_since(UNIX_EPOCH)
         .map(|since| since.as_secs_f64())
         .unwrap_or_default();
-    match body.get("createdDate") {
-        Some(Value::Number(number)) => {
-            let seconds = number.as_f64().unwrap_or_default();
-            assert!(
-                (now - seconds).abs() <= CREATED_DATE_SLACK_SECONDS,
-                "case {case:?}: CreatedDate must be the creation instant; got {seconds} against a clock reading {now}"
-            );
-        }
-        Some(Value::String(rendered)) => {
-            let parsed = ::aws_smithy_types::DateTime::from_str(
-                rendered,
-                ::aws_smithy_types::date_time::Format::DateTime,
-            )
-            .unwrap_or_else(|error| {
-                panic!("case {case:?}: CreatedDate {rendered:?} is not ISO-8601: {error}")
-            });
-            let seconds = parsed.as_secs_f64();
-            assert!(
-                (now - seconds).abs() <= CREATED_DATE_SLACK_SECONDS,
-                "case {case:?}: CreatedDate must be the creation instant; got {rendered:?} against a clock reading {now}"
-            );
-        }
-        other => panic!("case {case:?}: the response must report a CreatedDate, got {other:?}"),
+    let seconds = instant(case, body, "createdDate");
+    assert!(
+        (now - seconds).abs() <= CREATED_DATE_SLACK_SECONDS,
+        "case {case:?}: CreatedDate must be the creation instant; got {seconds} against a clock reading {now}"
+    );
+}
+
+/// The instant a timestamp member reports, in epoch seconds — the one decoder every
+/// suite reads a timestamp through, so two of them cannot drift.
+///
+/// Accepts both forms for the reason given on [`assert_created_now`], and panics when
+/// the member is absent or is neither: a response that must carry an instant and does
+/// not is a failure, not a zero.
+pub(crate) fn instant(case: &str, body: &Value, member: &str) -> f64 {
+    match body.get(member) {
+        Some(Value::Number(number)) => number.as_f64().unwrap_or_default(),
+        Some(Value::String(rendered)) => ::aws_smithy_types::DateTime::from_str(
+            rendered,
+            ::aws_smithy_types::date_time::Format::DateTime,
+        )
+        .unwrap_or_else(|error| {
+            panic!("case {case:?}: {member} {rendered:?} is not ISO-8601: {error}")
+        })
+        .as_secs_f64(),
+        other => panic!("case {case:?}: the response must report a {member}, got {other:?}"),
     }
 }
 

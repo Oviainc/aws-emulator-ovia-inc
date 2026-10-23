@@ -136,6 +136,11 @@ pub fn form_type_reference_name(identifier: &str) -> &str {
 pub const GLOSSARY_STATUS_ENABLED: &str = "ENABLED";
 pub const GLOSSARY_STATUS_DISABLED: &str = "DISABLED";
 
+/// The `GlossaryTermStatus` members (model enum
+/// `com.amazonaws.datazone#GlossaryTermStatus`: ENABLED | DISABLED).
+pub const GLOSSARY_TERM_STATUS_ENABLED: &str = "ENABLED";
+pub const GLOSSARY_TERM_STATUS_DISABLED: &str = "DISABLED";
+
 /// The `Revision` (`com.amazonaws.datazone#Revision`, len 1..64) a freshly created
 /// revisioned resource carries: DataZone numbers revisions from 1, as a decimal string.
 pub const FIRST_REVISION: &str = "1";
@@ -240,6 +245,13 @@ pub struct Domain {
     /// The business glossaries stored in this domain, keyed by glossary id, so they go
     /// with the domain when it is deleted. Bounded by [`MAX_GLOSSARIES_PER_DOMAIN`].
     pub glossaries: BTreeMap<String, Glossary>,
+    /// The business glossary TERMS stored in this domain, keyed by term id — the
+    /// `GlossaryTermId` `GetGlossaryTerm`/`DeleteGlossaryTerm` address a term by, which
+    /// names no glossary, so the terms of every glossary in the domain share one
+    /// namespace and each term records the glossary it belongs to
+    /// ([`GlossaryTerm::glossary_id`]). Nested under the domain so they go with it when
+    /// it is deleted. Bounded by [`MAX_GLOSSARY_TERMS_PER_DOMAIN`].
+    pub glossary_terms: BTreeMap<String, GlossaryTerm>,
     /// The custom asset types stored in this domain, keyed by the type's NAME — the
     /// `AssetTypeIdentifier` `GetAssetType`/`DeleteAssetType` address a type by — so a
     /// name is unique within the domain and the types go with it when it is deleted.
@@ -523,10 +535,12 @@ pub fn listing_forms(forms: &[StoredForm]) -> Option<String> {
 /// `dataProductId`/`dataProductRevision`).
 ///
 /// `glossaryTerms` is a `DetailedGlossaryTerms` — each term's NAME and short
-/// description, not its id (smithy_query shape="DetailedGlossaryTerm") — and a term's
-/// record is a resource this emulator does not store yet (`CreateGlossaryTerm` is a
-/// scaffold), so no stored term can resolve the ids an entity carries and the member is
-/// left absent rather than filled with an id dressed up as a name.
+/// description, not its id (smithy_query shape="DetailedGlossaryTerm") — and a
+/// [`ListingRevision`] records no glossary term ids at all: a listing is the published
+/// entity AS IT WAS, so the terms would have to be snapshotted by the change set that
+/// published it, which records none. There is therefore nothing for this rendering to
+/// resolve against the domain's stored terms, and the member is left absent rather than
+/// filled with a term the listing never recorded.
 pub fn listing_item(
     listing: &Listing,
     revision: &ListingRevision,
@@ -728,6 +742,90 @@ pub struct Glossary {
     /// `GetGlossary` reports `updatedAt`/`updatedBy` as optional members.
     pub updated_by: Option<String>,
     pub updated_at_ms: Option<i64>,
+}
+
+/// One stored DataZone business glossary term: an entry of one glossary of one domain.
+///
+/// A term belongs to the glossary `glossary_id` names, and its name is unique within
+/// THAT glossary (smithy_query doc operation="CreateGlossaryTerm"), so two glossaries of
+/// one domain may each carry a term of the same name.
+#[derive(Debug, Clone)]
+pub struct GlossaryTerm {
+    pub id: String,
+    pub domain_id: String,
+    /// The glossary this term is an entry of, within the same domain.
+    pub glossary_id: String,
+    pub name: String,
+    pub short_description: Option<String>,
+    pub long_description: Option<String>,
+    /// One of [`GLOSSARY_TERM_STATUS_ENABLED`] / [`GLOSSARY_TERM_STATUS_DISABLED`].
+    pub status: String,
+    /// The term's relations to other terms of the same domain.
+    pub term_relations: StoredTermRelations,
+    pub created_by: String,
+    pub created_at_ms: i64,
+    /// Who last updated the term and when — `None` until something does, because
+    /// `GetGlossaryTerm` reports `updatedAt`/`updatedBy` as optional members.
+    pub updated_by: Option<String>,
+    pub updated_at_ms: Option<i64>,
+}
+
+/// The stored form of the modelled `TermRelations` structure (smithy_query
+/// shape="TermRelations": `isA` and `classifies`, each a `GlossaryTerms` list of 1..10
+/// term ids). Each list is empty exactly when the request named none, so the absent and
+/// the empty case cannot drift apart in the store.
+#[derive(Debug, Clone, Default)]
+pub struct StoredTermRelations {
+    pub is_a: Vec<String>,
+    pub classifies: Vec<String>,
+}
+
+impl StoredTermRelations {
+    /// Every term id this relation names, `isA` first then `classifies`: what a create
+    /// has to resolve against the store before it keeps the relation.
+    pub fn related_term_ids(&self) -> impl Iterator<Item = &str> {
+        self.is_a
+            .iter()
+            .chain(self.classifies.iter())
+            .map(String::as_str)
+    }
+}
+
+/// A request's `termRelations` in stored form. Shared by every handler that takes one,
+/// so none of them reads the same request differently.
+pub fn stored_term_relations(
+    relations: Option<crate::ops::types::TermRelations>,
+) -> StoredTermRelations {
+    let relations = relations.unwrap_or_default();
+    StoredTermRelations {
+        is_a: relations.is_a.unwrap_or_default(),
+        classifies: relations.classifies.unwrap_or_default(),
+    }
+}
+
+/// A stored term's relations as the modelled `TermRelations` structure.
+///
+/// Both lists are modelled 1..10, so an EMPTY one is not a legal value on the wire: a
+/// relation the term does not have is reported absent, and a term with no relation at
+/// all reports no `termRelations` at all. Shared by every handler that reports a term so
+/// the forms cannot drift.
+pub fn term_relations_output(
+    relations: &StoredTermRelations,
+) -> Option<crate::ops::types::TermRelations> {
+    let is_a = (!relations.is_a.is_empty()).then(|| relations.is_a.clone());
+    let classifies = (!relations.classifies.is_empty()).then(|| relations.classifies.clone());
+    (is_a.is_some() || classifies.is_some())
+        .then_some(crate::ops::types::TermRelations { is_a, classifies })
+}
+
+/// The `usageRestrictions` a glossary term reports: "The usage restriction of the
+/// restricted glossary" (smithy_query doc shape="CreateGlossaryTermOutput"
+/// member="usageRestrictions"), so it is the OWNING GLOSSARY's restriction rather than
+/// anything a term carries of its own. `None` when that glossary has none; the list is
+/// modelled 1..1, so an empty one is never reported.
+pub fn term_usage_restrictions(domain: &Domain, glossary_id: &str) -> Option<Vec<String>> {
+    let glossary = domain.glossaries.get(glossary_id)?;
+    (!glossary.usage_restrictions.is_empty()).then(|| glossary.usage_restrictions.clone())
 }
 
 /// The stored form of the modelled `SingleSignOn` structure.
@@ -1736,6 +1834,11 @@ pub const MAX_MEMBERSHIPS_PER_PROJECT: usize = 200;
 /// and with the same refusal (`CreateGlossary` models `ServiceQuotaExceededException`).
 pub const MAX_GLOSSARIES_PER_DOMAIN: usize = 500;
 
+/// The most business glossary terms this emulator stores in one domain, for the same
+/// reason and with the same refusal (`CreateGlossaryTerm` models
+/// `ServiceQuotaExceededException` too).
+pub const MAX_GLOSSARY_TERMS_PER_DOMAIN: usize = 500;
+
 /// The most asset types this emulator stores in one domain, for the same reason and
 /// with the same refusal (`CreateAssetType` models `ServiceQuotaExceededException` too).
 pub const MAX_ASSET_TYPES_PER_DOMAIN: usize = 500;
@@ -1803,6 +1906,7 @@ pub enum IdempotentResource {
     Domain,
     DomainUnit,
     Glossary,
+    GlossaryTerm,
     Asset,
 }
 
@@ -1845,6 +1949,16 @@ impl IdempotencyKey {
     pub fn glossary(domain_id: &str, token: &str) -> Self {
         Self {
             kind: IdempotentResource::Glossary,
+            domain_id: domain_id.to_string(),
+            token: token.to_string(),
+        }
+    }
+
+    /// The key a `CreateGlossaryTerm` token is filed under, scoped the same way: a term
+    /// is created IN a domain, so the same token in another domain is a different key.
+    pub fn glossary_term(domain_id: &str, token: &str) -> Self {
+        Self {
+            kind: IdempotentResource::GlossaryTerm,
             domain_id: domain_id.to_string(),
             token: token.to_string(),
         }
@@ -1924,6 +2038,18 @@ impl ComAmazonawsDatazoneDatazoneState {
             .get(&record.resource_id)
     }
 
+    /// The glossary term a `clientToken` already created in `domain_id`, if it is still
+    /// stored. Scoped to the domain the same way a glossary token is.
+    pub fn idempotent_glossary_term(&self, domain_id: &str, token: &str) -> Option<&GlossaryTerm> {
+        let record = self
+            .idempotency
+            .get(&IdempotencyKey::glossary_term(domain_id, token))?;
+        self.domains
+            .get(domain_id)?
+            .glossary_terms
+            .get(&record.resource_id)
+    }
+
     /// The asset a `clientToken` already created in `domain_id`, if it is still stored.
     /// Scoped to the domain the same way a glossary token is.
     pub fn idempotent_asset(&self, domain_id: &str, token: &str) -> Option<&Asset> {
@@ -1946,6 +2072,10 @@ impl ComAmazonawsDatazoneDatazoneState {
                 .domains
                 .get(&key.domain_id)
                 .is_some_and(|domain| domain.glossaries.contains_key(&record.resource_id)),
+            IdempotentResource::GlossaryTerm => self
+                .domains
+                .get(&key.domain_id)
+                .is_some_and(|domain| domain.glossary_terms.contains_key(&record.resource_id)),
             IdempotentResource::Asset => self
                 .domains
                 .get(&key.domain_id)
@@ -2322,6 +2452,7 @@ pub enum ResourceKind {
     AssetType,
     FormType,
     Glossary,
+    GlossaryTerm,
     Asset,
     AssetFilter,
     DataProduct,
@@ -2338,6 +2469,7 @@ impl ResourceKind {
             Self::AssetType => "Asset type",
             Self::FormType => "Form type",
             Self::Glossary => "Glossary",
+            Self::GlossaryTerm => "Glossary term",
             Self::Asset => "Asset",
             Self::AssetFilter => "Asset filter",
             Self::DataProduct => "Data product",

@@ -223,9 +223,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
-        // Read before the inquiry is borrowed for the write; WHICH refusal the caller sees
-        // is decided below, in the order the service decides it: the target first, then the
-        // token.
+        // Read before the inquiry is borrowed for the write. WHICH answer the caller sees
+        // is decided below in the order the service decides it: a retry of this very
+        // request replays its first answer, then the TARGET's state decides the conflict,
+        // and only then does a token recorded for a different request.
         let remembered = input
             .client_token
             .as_deref()

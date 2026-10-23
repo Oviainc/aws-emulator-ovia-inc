@@ -847,6 +847,117 @@ pub async fn archive_download_refusal(
     Some(unable_to_download_message(bucket, key, reason))
 }
 
+/// The HTTP status Amazon S3 answers a `CreateBucket` whose name the one bucket
+/// namespace already holds with: `BucketAlreadyOwnedByYou` and `BucketAlreadyExists`
+/// — the two errors `CreateBucket` models — are both 409.
+const BUCKET_EXISTS_STATUS: u16 = 409;
+
+/// The Region an Amazon S3 `CreateBucket` that carries NO location constraint places
+/// its bucket in, from `CreateBucketConfiguration$LocationConstraint`'s own
+/// documentation: "If you don't specify a Region, the bucket is created in the US East
+/// (N. Virginia) Region (us-east-1) by default." It is also why
+/// `BucketLocationConstraint` enumerates every other Region code but not this one, so
+/// a bucket in this Region is created with no configuration at all.
+const UNCONSTRAINED_BUCKET_REGION: &str = "us-east-1";
+
+/// Amazon S3's published REST error code for an account that has reached its bucket
+/// limit — the refusal `CreateStorageLocation`'s modelled `TooManyBucketsException`
+/// ("The specified account has reached its limit of Amazon S3 buckets") is about.
+const TOO_MANY_BUCKETS_CODE: &str = "TooManyBuckets";
+
+/// Why object storage would not stand the account's Elastic Beanstalk storage bucket
+/// up, when its answer said something about the bucket at all. Each variant is the
+/// modelled `CreateStorageLocation` error the caller is owed for it; see
+/// [`create_storage_bucket`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageBucketRefusal {
+    /// The create was not PERMITTED (HTTP 403 carrying one of
+    /// [`DENIED_ARCHIVE_CODES`]) — `InsufficientPrivilegesException`.
+    NotPermitted,
+    /// The account is at its Amazon S3 bucket limit — `TooManyBucketsException`.
+    TooManyBuckets,
+}
+
+/// Create the account's Elastic Beanstalk storage bucket named `bucket` in `region`
+/// in object storage, unless it is already there.
+///
+/// `CreateStorageLocation` "creates a bucket in Amazon S3 to store application
+/// versions, logs, and other files used by Elastic Beanstalk environments", and the
+/// bucket it reports is the one a client then uploads its source bundle into — so the
+/// bucket has to EXIST in the emulator's object storage, which is Amazon S3's own
+/// service, not merely be named in this service's store. The create goes over the
+/// in-process callback (see [`s3_client`]), so the bucket a client addresses is the
+/// bucket object storage really holds.
+///
+/// IDEMPOTENT, which is the operation's own contract ("if the storage location already
+/// exists, `CreateStorageLocation` still returns the bucket name but does not create a
+/// new bucket"): a name the one bucket namespace already holds answers 409, and this
+/// emulator serves one account, so that bucket is the account's own storage location
+/// and the call reports it.
+///
+/// A refusal is only ever grounded in an answer about the BUCKET: a 403 carrying one of
+/// [`DENIED_ARCHIVE_CODES`] (the permission-refusal codes Amazon S3 answers any request
+/// with, read off the same published list the archive read uses) and the bucket-limit
+/// code. Anything else says nothing about whether object storage holds the bucket — an
+/// emulator assembled without object storage answers the router's own `UnknownService`,
+/// an authentication refusal is about the signer, a transport failure answers nothing at
+/// all — so it is logged and the storage location is still reported, the way
+/// [`archive_download_refusal`] treats the same class of answers.
+pub async fn create_storage_bucket(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    bucket: &str,
+) -> Result<(), StorageBucketRefusal> {
+    use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
+
+    // One storage location per account per REGION, so the bucket is placed in the
+    // request's own region — which on `CreateBucket` is said with the location
+    // constraint, not with the signing region. See [`UNCONSTRAINED_BUCKET_REGION`] for
+    // the one region that is said by saying nothing.
+    let mut create = s3_client(ctx, region).create_bucket().bucket(bucket);
+    if region != UNCONSTRAINED_BUCKET_REGION {
+        create = create.create_bucket_configuration(
+            ::aws_sdk_s3::types::CreateBucketConfiguration::builder()
+                .location_constraint(::aws_sdk_s3::types::BucketLocationConstraint::from(region))
+                .build(),
+        );
+    }
+    let failure = match create.send().await {
+        // The bucket is there now.
+        Ok(_) => return Ok(()),
+        Err(failure) => failure,
+    };
+    let status = failure
+        .raw_response()
+        .map(|response| response.status().as_u16());
+    let code = failure.code().unwrap_or_default().to_string();
+    match (status, code.as_str()) {
+        // The bucket was already there, so there was nothing to create and the
+        // storage location is reported as it stands.
+        (Some(BUCKET_EXISTS_STATUS), _) => Ok(()),
+        (Some(ARCHIVE_DENIED_STATUS), code) if DENIED_ARCHIVE_CODES.contains(&code) => {
+            Err(StorageBucketRefusal::NotPermitted)
+        }
+        // Amazon S3's bucket quota is far above this service's own
+        // [`MAX_STORAGE_LOCATIONS`], so this is the account having spent its buckets
+        // elsewhere rather than on storage locations.
+        (_, TOO_MANY_BUCKETS_CODE) => Err(StorageBucketRefusal::TooManyBuckets),
+        _ => {
+            ::tracing::warn!(
+                bucket,
+                region,
+                code = %code,
+                status = ?status,
+                detail = %::aws_smithy_types::error::display::DisplayErrorContext(&failure),
+                "the Amazon S3 create of the account's Elastic Beanstalk storage bucket \
+                 answered nothing about the bucket, so the storage location was reported \
+                 as it stands",
+            );
+            Ok(())
+        }
+    }
+}
+
 /// `arn:aws:elasticbeanstalk:<region>:<account>:application/<name>`.
 pub fn application_arn(region: &str, application_name: &str) -> String {
     ::engine::emulator_arn(

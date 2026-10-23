@@ -167,8 +167,23 @@ impl Emulator {
     /// object's own bytes, so this is a raw request rather than an `Action=` form.
     /// The credential scope names `s3`, which is what the router claims on.
     pub(crate) async fn s3(&self, method: &str, path: &str, body: &[u8]) -> u16 {
+        self.s3_in_region(TEST_REGION, method, path, body)
+            .await
+            .status
+    }
+
+    /// As [`Emulator::s3`], signed for `region` and answering the whole response, for
+    /// a suite that reads what object storage handed back (an object's bytes, the
+    /// account's buckets) rather than only whether the request succeeded.
+    pub(crate) async fn s3_in_region(
+        &self,
+        region: &str,
+        method: &str,
+        path: &str,
+        body: &[u8],
+    ) -> Answer {
         let authorization = format!(
-            "AWS4-HMAC-SHA256 Credential=AKIDTESTEXAMPLE/20261021/{TEST_REGION}/s3/aws4_request, \
+            "AWS4-HMAC-SHA256 Credential=AKIDTESTEXAMPLE/20261021/{region}/s3/aws4_request, \
              SignedHeaders=host, Signature=0123456789abcdef"
         );
         let request = http::Request::builder()
@@ -177,7 +192,7 @@ impl Emulator {
             .header("authorization", authorization)
             .body(bytes::Bytes::copy_from_slice(body))
             .expect("a well-formed request");
-        self.router.dispatch(request).await.status().as_u16()
+        Answer::of(self.router.dispatch(request).await)
     }
 
     /// Store `body` at `key` in `bucket` in the emulator's object storage, creating

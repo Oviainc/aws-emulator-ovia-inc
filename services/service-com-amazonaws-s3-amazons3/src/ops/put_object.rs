@@ -5,8 +5,10 @@
 //! or, on a bucket whose versioning status is `Enabled`, storing it as a new version with
 //! a minted version id that this operation reports. A write that names a server-side
 //! encryption configuration (`x-amz-server-side-encryption` and the members that qualify
-//! it) is recorded under it and reports it back, as does every later read of the object;
-//! SSE-C is refused, because S3 keeps no customer-provided key for a later read to use.
+//! it) is recorded under it, and a write that names none is recorded under the bucket's
+//! DEFAULT encryption configuration; either way this operation reports it back, as does
+//! every later read of the object. SSE-C is refused, because S3 keeps no
+//! customer-provided key for a later read to use.
 //! Implemented here — this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -492,13 +494,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The encryption configuration this write stores the object under, taken from the
-        // modelled members the request carried: `ServerSideEncryption` and the three that
-        // qualify it. What is recorded is the CONFIGURATION, not a key and not a
-        // ciphertext — this emulator holds the bytes in this process's memory and performs
-        // no cryptography — and it is exactly what `PutObject`, `GetObject` and
-        // `HeadObject` report back as `x-amz-server-side-encryption` and its companions.
-        let encryption = crate::state::ObjectEncryption {
+        // The encryption configuration this write ASKED for, taken from the modelled
+        // members the request carried: `ServerSideEncryption` and the three that qualify
+        // it. What is recorded is the CONFIGURATION, not a key and not a ciphertext — this
+        // emulator holds the bytes in this process's memory and performs no cryptography —
+        // and it is exactly what `PutObject`, `GetObject` and `HeadObject` report back as
+        // `x-amz-server-side-encryption` and its companions. A request that names none of
+        // the four inherits the bucket's default configuration instead, resolved below once
+        // the store is reachable.
+        let requested = crate::state::ObjectEncryption {
             sse_algorithm: input.server_side_encryption.clone(),
             kms_key_id: input.ssekms_key_id.clone(),
             kms_encryption_context: input.ssekms_encryption_context.clone(),
@@ -512,8 +516,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // algorithm, or beside none at all, is a parameter that is not valid for this
         // request, which S3 answers with `InvalidArgument` (400); the alternative would be
         // storing a key id the object's encryption does not use.
-        if !encryption.uses_kms() {
-            if let Some(member) = encryption.kms_only_member() {
+        if !requested.uses_kms() {
+            if let Some(member) = requested.kms_only_member() {
                 return Err(crate::scaffolded::Scaffolded::unmodeled(
                     crate::state::INVALID_ARGUMENT_CODE,
                     crate::state::INVALID_ARGUMENT_STATUS,
@@ -525,6 +529,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
             }
         }
+
+        let mut store = state.lock();
+        // The bucket decides the encryption of a write that named none of it: "Amazon S3
+        // encrypts data with server-side encryption by using Amazon S3 managed keys
+        // (SSE-S3) by default. You can optionally tell Amazon S3 to encrypt data at rest by
+        // using server-side encryption with other key options"
+        // (`PutObjectRequest$ServerSideEncryption`) — the other key options being the ones
+        // `PutBucketEncryption` configures for the bucket. So a request that carries one of
+        // the four encryption members is stored under what IT named, and one that carries
+        // none is stored under the bucket's default encryption configuration, the very
+        // configuration `GetBucketEncryption` reports (`default_object_encryption` resolves
+        // both from the one accessor, so the two can never disagree). Reading it writes
+        // nothing: a never-configured bucket's default is computed, not materialised.
+        let Some(bucket_record) = store.bucket(&input.bucket) else {
+            return Err(PutObjectErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        let encryption = if requested.names_no_member() {
+            bucket_record.default_object_encryption()
+        } else {
+            requested
+        };
 
         let etag = crate::state::object_etag(&input.body);
         let object = crate::state::Object {
@@ -560,7 +585,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             body: input.body,
         };
 
-        let mut store = state.lock();
         // "Amazon S3 is a distributed system. If it receives multiple write requests for
         // the same object simultaneously, it overwrites all but the last object written"
         // — so a key that is already there is REPLACED, wholesale: "You cannot use
@@ -641,8 +665,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the caller is told the id the object is addressable by and nothing else.
             version_id: version_id_of(&store, &input.bucket, &input.key),
             // The encryption the object was stored under, reported back the way every
-            // reader of that object reports it. These are the stored values, so a write
-            // that named no encryption reports none rather than a default nothing applied.
+            // reader of that object reports it. These are the STORED values, so a write
+            // that named an encryption reports that one and a write that named none reports
+            // the bucket default it inherited — never a configuration nothing applied.
             server_side_encryption: encryption.sse_algorithm.clone(),
             ssekms_key_id: encryption.kms_key_id.clone(),
             ssekms_encryption_context: encryption.kms_encryption_context.clone(),

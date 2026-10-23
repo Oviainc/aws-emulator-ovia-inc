@@ -30,12 +30,13 @@
 //!   input carries a tag list, so a tag outside its modelled length is refused in
 //!   this service's own error shape rather than in the framework's envelope.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. THIS service rewords three classes: a tag key or value outside its
-//!   modelled length, which CloudTrail answers as `InvalidTagParameterException`; a
-//!   value inside an event selector outside its modelled constraint, which the model
-//!   declares `InvalidEventSelectorsException` for; and a violated `@pattern`, whose
-//!   recorded clause carries no value. See the inline notes on that method.
+//!   before any handler ran. EDITED HERE: a tag key or value outside its modelled
+//!   length is `InvalidTagParameterException`; a value inside an event selector outside
+//!   its modelled constraint is `InvalidEventSelectorsException`, the error the model
+//!   declares for that case; and every other input-constraint refusal is the
+//!   `ValidationException` envelope with the violated bound stated WITHOUT echoing the
+//!   offending value, which the framework's own clause renderer cannot do. See the
+//!   inline notes on that method.
 //!   That seam carries only a code and a message, not a SHAPE, so a refusal leaving
 //!   through it still carries its prose in the framework's pre-dispatch envelope, whose
 //!   key is a lowercase `message`; CloudTrail's error shapes carry `Message`. Every
@@ -114,7 +115,7 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 /// * `service_common::validation_message::aws_validation_refusal` is the shared
 ///   `override_refusal` body, but it states a pattern requirement UNANCHORED
 ///   (`service_common::validation::unanchored`) and KEEPS the rejected value — the two
-///   things CloudTrail's recorded answer does not do, and the exact `$.message`
+///   things CloudTrail's recorded answers do not do, and the exact `$.message`
 ///   divergence this fix removed. A service whose recorded answer differs on both
 ///   counts cannot call it.
 /// * `aws_smithy_schema_server::constraints::envelope` IS public, so the envelope could
@@ -163,7 +164,7 @@ fn is_value_free(violation: &Violation) -> bool {
 }
 
 /// The `ValidationException` message for a refused request: the AWS validation envelope
-/// (`N validation error(s) detected: `) over one clause per violation.
+/// (`N validation error(s) detected: `) over one [`clause`] per violation.
 ///
 /// `None` declines the refusal, leaving the framework's wording, for a request that
 /// broke no class this service rewords ([`is_value_free`]) — there is nothing to reword

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRouteServerEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRouteServerEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: creates an endpoint of a stored route server in a stored subnet, stores it
+//! as the modelled [`RouteServerEndpoint`] shape with the elastic network interface a
+//! create gives it, and answers it in `pending` with the instant the clock owes it
+//! `available` recorded beside it (see
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::route_server_endpoint_available_at`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRouteServerEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +143,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRouteServerEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRouteServerEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRouteServerEndpoint"))
+        use crate::state;
+
+        // `ctx` carries request metadata only; every fact this endpoint reports comes from
+        // the request or from the store the engine on `self` holds.
+        let _ = ctx;
+
+        // "The tags to apply to the route server endpoint during creation"
+        // (`TagSpecifications`), refusing a specification that names any resource type but
+        // the one this action creates.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_ROUTE_SERVER_ENDPOINT,
+            Self::NAME,
+        )?;
+
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "clientToken accepts at most {} characters",
+                state::MAX_CLIENT_TOKEN_CHARS
+            )));
+        }
+
+        let payload_bytes = state::tag_list_bytes(&tags)
+            .saturating_add(input.client_token.as_deref().map_or(0, str::len));
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+
+        // "The ID of the route server for which to create an endpoint" (`RouteServerId`)
+        // and "The ID of the subnet to place the route server endpoint into" (`SubnetId`):
+        // an id that names no resource of the account is an error, not a resource created
+        // out of thin air. The route server is resolved through the crate's one helper for
+        // that lookup, so a malformed id and an unknown one are told apart here exactly as
+        // `DescribeRouteServers` tells them apart.
+        state::require_known_route_server(&store, &input.route_server_id)?;
+        let Some(subnet) = store.subnets.get(&input.subnet_id) else {
+            return Err(state::invalid_subnet_id_not_found(&input.subnet_id));
+        };
+        // "The ID of the VPC containing the endpoint" (`RouteServerEndpoint$VpcId`) is the
+        // VPC of that subnet, read off the stored subnet rather than asked of the caller.
+        let vpc_id = subnet.vpc_id.clone();
+        let subnet_cidr_block = subnet.cidr_block.clone().unwrap_or_default();
+
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.route_server_endpoint_client_tokens.get(token).cloned());
+
+        if replayed.is_none() && !store.has_route_server_endpoint_capacity() {
+            return Err(state::route_server_limit_exceeded(format!(
+                "This emulator holds {max} route server endpoints, which is as many as it \
+                 stores",
+                max = state::MAX_ROUTE_SERVER_RECORDS,
+            )));
+        }
+        if replayed.is_none() && store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(state::route_server_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                 data, so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The endpoint is "an Amazon Web Services-managed component inside a subnet"
+        // (`RouteServerEndpoint`), reached over an elastic network interface of that
+        // subnet, so its address comes out of the subnet's own CIDR block. Only a create
+        // that will WRITE an endpoint needs one, so a replay is answerable even out of a
+        // subnet with no address left — and a fresh create that could not be given one is
+        // refused HERE, before the dry run, so a dry run reports the refusal a real create
+        // would have hit. Reading a free address does not take it: the write below is what
+        // does.
+        let eni_address = match replayed {
+            Some(_) => None,
+            None => match store.mint_route_server_eni_address(&subnet_cidr_block) {
+                Some(eni_address) => Some(eni_address),
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::insufficient_free_addresses());
+                }
+            },
+        };
+
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let route_server_endpoint_id = match replayed {
+            Some(endpoint_id) => endpoint_id,
+            None => {
+                let endpoint_id =
+                    store.insert_route_server_endpoint(state::RouteServerEndpointSpec {
+                        route_server_id: input.route_server_id.clone(),
+                        subnet_id: input.subnet_id.clone(),
+                        vpc_id,
+                        eni_address,
+                        tags,
+                    });
+                if let Some(token) = input.client_token.clone() {
+                    store
+                        .route_server_endpoint_client_tokens
+                        .insert(token, endpoint_id.clone());
+                }
+                // The insert charged the record's own caller-chosen bytes; the token the
+                // map now keeps is charged here, so no path stores them uncharged.
+                store.add_stored_bytes(input.client_token.as_deref().map_or(0, str::len));
+                endpoint_id
+            }
+        };
+
+        // The answer is the record as it was stored, so this create and
+        // `DescribeRouteServerEndpoints` cannot drift apart.
+        let Some(endpoint) = store
+            .route_server_endpoints
+            .get(&route_server_endpoint_id)
+            .cloned()
+        else {
+            return Err(state::internal_error(format!(
+                "the route server endpoint '{route_server_endpoint_id}' could not be read back"
+            )));
+        };
+        Ok(CreateRouteServerEndpointOutput {
+            route_server_endpoint: Some(endpoint),
+        })
     }
 }

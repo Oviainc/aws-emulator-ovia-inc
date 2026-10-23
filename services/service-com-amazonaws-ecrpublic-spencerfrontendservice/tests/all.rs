@@ -27,6 +27,8 @@ mod json_document_members;
 mod layer_part_uploads;
 #[path = "all/layer_upload_completion.rs"]
 mod layer_upload_completion;
+#[path = "all/layer_upload_convergence.rs"]
+mod layer_upload_convergence;
 #[path = "all/layer_upload_sessions.rs"]
 mod layer_upload_sessions;
 #[path = "all/region_gate.rs"]

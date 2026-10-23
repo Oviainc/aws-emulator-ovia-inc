@@ -9,6 +9,10 @@
 //! handler's internals. The clock-driven half — the move from the `Pending` state the
 //! model documents on `CreateFunction` to `Active` — is exercised by moving the stored
 //! due instant into the past, so nothing here sleeps.
+//!
+//! The harness below (the router, the `Answer` wrapper and the request helpers) is
+//! `pub(crate)` so the other suites of this test target drive the same wire, rather than
+//! each rebuilding one that could disagree with it.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -30,17 +34,17 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      SignedHeaders=host, Signature=not-verified";
 
 /// The region the `AUTHORIZATION` scope above names, which every minted ARN carries.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The account id every emulator ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// A well-formed execution role ARN, satisfying the model's `RoleArn` pattern.
-const ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambda-exec";
+pub(crate) const ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambda-exec";
 
 /// One service mounted on its own engine, reached exactly the way the production
 /// router reaches it.
-fn router_on(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
+pub(crate) fn router_on(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     // Pinned off so the suite does not depend on how the emulator process was started;
     // these tests assert Lambda's behaviour, not the emulator's SigV4 check.
@@ -50,16 +54,16 @@ fn router_on(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
 }
 
 /// What a dispatched request answered.
-struct Answer {
-    status: u16,
-    headers: http::HeaderMap,
-    body: bytes::Bytes,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) headers: http::HeaderMap,
+    pub(crate) body: bytes::Bytes,
 }
 
 impl Answer {
     /// The response body as JSON. Panics with the body text when it is not JSON, which
     /// is the failure a caller needs to see.
-    fn json(&self) -> serde_json::Value {
+    pub(crate) fn json(&self) -> serde_json::Value {
         serde_json::from_slice(&self.body).unwrap_or_else(|error| {
             panic!(
                 "expected a JSON body, got {error}: {}",
@@ -69,7 +73,7 @@ impl Answer {
     }
 
     /// A `String` member of the JSON body, or `None` when absent or not a string.
-    fn string(&self, member: &str) -> Option<String> {
+    pub(crate) fn string(&self, member: &str) -> Option<String> {
         self.json()
             .get(member)
             .and_then(serde_json::Value::as_str)
@@ -77,7 +81,7 @@ impl Answer {
     }
 
     /// A bound response header's value.
-    fn header(&self, name: &str) -> Option<String> {
+    pub(crate) fn header(&self, name: &str) -> Option<String> {
         self.headers
             .get(name)
             .and_then(|value| value.to_str().ok())
@@ -85,7 +89,7 @@ impl Answer {
     }
 
     /// The wire error code (`__type`) of an error response.
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         self.string("__type")
             .or_else(|| self.header("x-amzn-errortype"))
             .unwrap_or_else(|| String::from_utf8_lossy(&self.body).to_string())
@@ -93,7 +97,7 @@ impl Answer {
 }
 
 /// Dispatch one request with the given body and content type.
-async fn send(
+pub(crate) async fn send(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -123,7 +127,7 @@ async fn send(
 }
 
 /// A JSON request, the shape every control-plane operation here uses.
-async fn json_call(
+pub(crate) async fn json_call(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -138,7 +142,10 @@ async fn json_call(
 }
 
 /// `CreateFunction` with the given request body.
-async fn create_function(router: &MultiServiceRouter, body: &serde_json::Value) -> Answer {
+pub(crate) async fn create_function(
+    router: &MultiServiceRouter,
+    body: &serde_json::Value,
+) -> Answer {
     json_call(router, "POST", "/2015-03-31/functions", body).await
 }
 
@@ -157,36 +164,39 @@ fn expected_code_sha256(bytes: &[u8]) -> String {
 /// Deployment package bytes of a given length. The content is irrelevant to the API —
 /// only its length and its digest are reported — but it differs per length so two
 /// packages never share a digest.
-fn package_bytes(length: usize) -> Vec<u8> {
+pub(crate) fn package_bytes(length: usize) -> Vec<u8> {
     (0..length)
         .map(|index| u8::try_from(index % 251).unwrap_or(0))
         .collect()
 }
 
 /// A `Code.ZipFile` member: restJson1 carries a blob base64-encoded in a JSON body.
-fn zip_file(bytes: &[u8]) -> serde_json::Value {
+pub(crate) fn zip_file(bytes: &[u8]) -> serde_json::Value {
     serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(bytes))
 }
 
 /// The unqualified ARN a function of `name` must carry.
-fn function_arn(name: &str) -> String {
+pub(crate) fn function_arn(name: &str) -> String {
     format!("arn:aws:lambda:{REGION}:{ACCOUNT}:function:{name}")
 }
 
 /// Move every stored function's activation instant into the past, so the next read
 /// materialises the `Pending` -> `Active` transition the clock owes. This is what
 /// waiting would do, without waiting.
-fn make_activation_due(engine: &Arc<engine::InMemoryEngine>) {
+pub(crate) fn make_activation_due(engine: &Arc<engine::InMemoryEngine>) {
     let state = engine.state::<ComAmazonawsLambdaAwsgirapiserviceState>();
     let mut store = state.lock();
     let past = SystemTime::now() - Duration::from_secs(1);
     for function in store.functions.values_mut() {
         function.active_due = past;
     }
+    for provider in store.capacity_providers.values_mut() {
+        provider.active_due = past;
+    }
 }
 
 /// Create a function and bring it to `Active`, the state every invocation test needs.
-async fn create_active_function(
+pub(crate) async fn create_active_function(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
     name: &str,

@@ -194,8 +194,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
-        // A graph still provisioning or reconfiguring cannot be deleted yet.
-        if graph.status != crate::state::GraphStatus::Available {
+        // A graph whose status change is still in flight cannot be deleted yet. One at
+        // REST can, whether it rests serving (`AVAILABLE`) or stopped (`STOPPED`): a
+        // stopped graph is a graph that still exists, and deletion is how it goes away.
+        if !graph.status.is_at_rest() {
             return Err(DeleteGraphErrorModeled::ConflictException(ConflictException {
                 message: format!(
                     "graph {} is in status {} and cannot be deleted",
@@ -229,7 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // way out; it is already gone from the store, so GetGraph and ListGraphs no
         // longer show it.
         deleted.status = crate::state::GraphStatus::Deleting;
-        deleted.settles_at = None;
+        deleted.pending = None;
         Ok(Self::Output::from(&deleted))
     }
 }

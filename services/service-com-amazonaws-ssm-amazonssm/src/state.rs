@@ -3,8 +3,10 @@
 //! Engine state for the com-amazonaws-ssm-amazonssm service.
 //!
 //! Two slices are modelled here. The first is **Parameter Store**: `PutParameter`
-//! creates or updates a parameter and `GetParameter` reads one back. Both reach the one
-//! store below, so whatever a put persisted is what a later get reports.
+//! creates or updates a parameter, `GetParameter` reads one back and
+//! `GetParametersByPath` reads the parameters stored under one level of a hierarchy
+//! ([`parameter_path`], [`is_under_path`]). All of them reach the one store below, so
+//! whatever a put persisted is what a later read reports.
 //!
 //! The second slice is the **managed-node inventory** the node describes report: one
 //! record per node that registered with this Region's Systems Manager endpoint
@@ -348,6 +350,24 @@ impl ParameterVersionRecord {
     }
 }
 
+impl ParameterVersionRecord {
+    /// The values of `key` this version holds, for a `ParameterStringFilter` to compare
+    /// against, or `None` when the key names no attribute of a parameter version.
+    ///
+    /// A version has exactly one type, at most one key id (only a `SecureString` names
+    /// one) and any number of labels, so a key that names an attribute this version
+    /// does not carry yields an EMPTY list — which matches no filter value, rather than
+    /// refusing the filter.
+    pub fn filter_values(&self, key: &str) -> Option<Vec<&str>> {
+        match key {
+            FILTER_KEY_TYPE => Some(vec![self.type_.as_str()]),
+            FILTER_KEY_KEY_ID => Some(self.key_id.as_deref().into_iter().collect()),
+            FILTER_KEY_LABEL => Some(self.labels.iter().map(String::as_str).collect()),
+            _ => None,
+        }
+    }
+}
+
 /// One stored parameter: its name, where it lives, its tags, and every version of it
 /// the store still retains.
 #[derive(Debug, Clone)]
@@ -475,6 +495,138 @@ pub fn parse_parameter_query(name: &str) -> Option<ParameterQuery<'_>> {
         region,
         account,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Reading a hierarchy of parameters
+// ---------------------------------------------------------------------------
+
+/// A `ParameterStringFilter` key that filters on a parameter's `ParameterType`.
+pub const FILTER_KEY_TYPE: &str = "Type";
+
+/// A `ParameterStringFilter` key that filters on the KMS key a `SecureString` names.
+pub const FILTER_KEY_KEY_ID: &str = "KeyId";
+
+/// A `ParameterStringFilter` key that filters on a version's labels.
+pub const FILTER_KEY_LABEL: &str = "Label";
+
+/// The `Key` values a `ParameterStringFilter` may carry on a hierarchy read.
+///
+/// The modelled key pattern is `^(tag:.+|Name|Type|KeyId|Path|Label|Tier|DataType)$`,
+/// and "For `GetParametersByPath`, the following patterns listed for `Key` aren't valid:
+/// `tag`, `DataType`, `Name`, `Path`, and `Tier`" (the `ParameterStringFilter$Key`
+/// doc) — which leaves these three.
+pub const PARAMETERS_BY_PATH_FILTER_KEYS: &[&str] =
+    &[FILTER_KEY_TYPE, FILTER_KEY_KEY_ID, FILTER_KEY_LABEL];
+
+/// Compare a filter's value against the whole held value.
+pub const FILTER_OPTION_EQUALS: &str = "Equals";
+
+/// Compare a filter's value against the start of the held value.
+pub const FILTER_OPTION_BEGINS_WITH: &str = "BeginsWith";
+
+/// The comparison options a hierarchy read's filters accept: "For filters used with
+/// `GetParametersByPath`, valid options include `Equals` and `BeginsWith`" (the
+/// `ParameterStringFilter$Option` doc).
+pub const PARAMETERS_BY_PATH_FILTER_OPTIONS: &[&str] =
+    &[FILTER_OPTION_EQUALS, FILTER_OPTION_BEGINS_WITH];
+
+/// The options a `Label` filter accepts: "(Exception: For filters using `Label` as the
+/// Key name, the only valid option is `Equals`.)" (the same doc).
+pub const LABEL_FILTER_OPTIONS: &[&str] = &[FILTER_OPTION_EQUALS];
+
+/// Whether `key` is a filter key a hierarchy read accepts (see
+/// [`PARAMETERS_BY_PATH_FILTER_KEYS`]).
+pub fn is_parameters_by_path_filter_key(key: &str) -> bool {
+    PARAMETERS_BY_PATH_FILTER_KEYS.contains(&key)
+}
+
+/// The comparison options a hierarchy read accepts for `key`.
+pub fn parameters_by_path_filter_options(key: &str) -> &'static [&'static str] {
+    if key == FILTER_KEY_LABEL {
+        LABEL_FILTER_OPTIONS
+    } else {
+        PARAMETERS_BY_PATH_FILTER_OPTIONS
+    }
+}
+
+/// Whether `held` carries a value matching one of `wanted` under `option`.
+///
+/// `held` is every value the stored record carries for the filter's key (a parameter
+/// has one type, at most one key id, and any number of labels), and a filter matches
+/// when any held value matches any wanted one.
+pub fn string_filter_matches(held: &[&str], option: &str, wanted: &[String]) -> bool {
+    held.iter().any(|value| {
+        wanted.iter().any(|want| {
+            if option == FILTER_OPTION_BEGINS_WITH {
+                value.starts_with(want.as_str())
+            } else {
+                *value == want.as_str()
+            }
+        })
+    })
+}
+
+/// The bounds the modelled `GetParametersByPathMaxResults` carries (range 1..10).
+pub const MIN_PARAMETERS_BY_PATH_PAGE_SIZE: i32 = 1;
+
+/// See [`MIN_PARAMETERS_BY_PATH_PAGE_SIZE`]. It is also the page size a request that
+/// names no `MaxResults` gets: "If you specify `MaxResults` in the request, the response
+/// includes information up to the limit specified" (`GetParametersByPath`'s doc), so a
+/// request naming none is served up to the modelled maximum.
+pub const MAX_PARAMETERS_BY_PATH_PAGE_SIZE: i32 = 10;
+
+/// The page size a hierarchy read serves, or the refusal message for a `MaxResults`
+/// outside the modelled range — which the protocol's boundary validator already
+/// refuses, so this is a backstop rather than the first line of defence.
+pub fn parameters_by_path_page_size(max_results: Option<i32>) -> Result<usize, String> {
+    let requested = max_results.unwrap_or(MAX_PARAMETERS_BY_PATH_PAGE_SIZE);
+    if !(MIN_PARAMETERS_BY_PATH_PAGE_SIZE..=MAX_PARAMETERS_BY_PATH_PAGE_SIZE).contains(&requested) {
+        return Err(format!(
+            "Value '{requested}' at 'maxResults' failed to satisfy constraint: Member must be \
+             between {MIN_PARAMETERS_BY_PATH_PAGE_SIZE} and {MAX_PARAMETERS_BY_PATH_PAGE_SIZE}"
+        ));
+    }
+    Ok(requested as usize)
+}
+
+/// The hierarchy a read's `Path` names, canonical (no leading and no trailing `/`), or
+/// the reason the request is refused.
+///
+/// "The hierarchy for the parameter. Hierarchies start with a forward slash (/)"
+/// (`GetParametersByPath`'s `Path` doc), so a path that carries no leading separator
+/// names no hierarchy and is refused. The spaces rule is the name rule
+/// ([`trimmed_name`]): the path is a parameter-name prefix.
+pub fn parameter_path(path: &str) -> Result<&str, String> {
+    let trimmed = trimmed_name(path)?;
+    if !trimmed.starts_with('/') {
+        return Err(format!(
+            "Path '{path}' doesn't start with a forward slash (/): a parameter hierarchy starts \
+             with a forward slash (/)"
+        ));
+    }
+    Ok(canonical_name(trimmed).trim_end_matches('/'))
+}
+
+/// Whether the parameter stored under canonical `name` lies in the hierarchy under
+/// canonical `path` (both as [`canonical_name`] and [`parameter_path`] render them).
+///
+/// A parameter is under a path when the path is a whole prefix of its name's levels —
+/// "the hierarchy is the parameter name except the last part of the parameter" — so the
+/// parameter AT the path is not under it and a path is never half a level (`/Dev` does
+/// not hold `/DevOps/x`). A non-recursive read reports only the level immediately below
+/// the path; a recursive one reports every level under it ("Retrieve all parameters
+/// within a hierarchy", the `Recursive` doc).
+pub fn is_under_path(name: &str, path: &str, recursive: bool) -> bool {
+    let rest = if path.is_empty() {
+        name
+    } else {
+        match name.strip_prefix(path).and_then(|rest| rest.strip_prefix('/')) {
+            Some(rest) => rest,
+            None => return false,
+        }
+    };
+    !rest.is_empty() && (recursive || !rest.contains('/'))
 }
 
 // ---------------------------------------------------------------------------
@@ -677,6 +829,20 @@ impl ComAmazonawsSsmAmazonssmState {
             .keys()
             .filter(|(held, _)| held == region)
             .count()
+    }
+
+    /// Every parameter `region` holds, in ascending canonical-name order, as
+    /// `(canonical name, record)`. The order is what makes a hierarchy read's resume
+    /// cursor total: it is a parameter name, not an offset into a list that may have
+    /// changed between two pages.
+    pub fn parameters_of_region<'a>(
+        &'a self,
+        region: &'a str,
+    ) -> impl Iterator<Item = (&'a str, &'a ParameterRecord)> + 'a {
+        self.parameters
+            .iter()
+            .filter(move |((held, _), _)| held == region)
+            .map(|((_, name), record)| (name.as_str(), record))
     }
 
     /// Every managed node `region` holds, in ascending node-id order, as

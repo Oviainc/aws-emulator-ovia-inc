@@ -419,7 +419,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A store name is unique per Region, so a name already taken IN THIS REGION
         // is a conflict, never an overwrite.
-        if store.event_data_store_named(&input.name, &region) {
+        if store.event_data_store_name_taken(&input.name, &region, None) {
             return Err(
                 CreateEventDataStoreErrorModeled::EventDataStoreAlreadyExistsException(
                     EventDataStoreAlreadyExistsException {

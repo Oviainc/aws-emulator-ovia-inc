@@ -24,19 +24,22 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// One seeded association: where the pod runs and which role it may assume.
 #[derive(Debug, Clone, Copy)]
-struct Seed {
-    cluster: &'static str,
-    namespace: &'static str,
-    service_account: &'static str,
-    pod: &'static str,
-    role_arn: &'static str,
+pub(crate) struct Seed {
+    pub(crate) cluster: &'static str,
+    pub(crate) namespace: &'static str,
+    pub(crate) service_account: &'static str,
+    pub(crate) pod: &'static str,
+    pub(crate) role_arn: &'static str,
 }
 
 /// The seeded world every test in this file starts from: two clusters, four
 /// associations, differing in namespace, service account, pod name and role — including
 /// one role associated in BOTH clusters, and two namespaces carrying the same service
 /// account name.
-const SEEDS: &[Seed] = &[
+///
+/// `pub(crate)` because it is the seeded world of the sibling suites too: every module of
+/// `tests/all.rs` is one test binary, so this harness is shared rather than copied.
+pub(crate) const SEEDS: &[Seed] = &[
     Seed {
         cluster: "demo-cluster",
         namespace: "default",
@@ -69,15 +72,15 @@ const SEEDS: &[Seed] = &[
 
 /// The emulator under test: one engine, one service, one router — the same dispatch path
 /// the production router uses.
-struct Harness {
-    engine: Arc<engine::InMemoryEngine>,
-    router: MultiServiceRouter,
+pub(crate) struct Harness {
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
+    pub(crate) router: MultiServiceRouter,
 }
 
 impl Harness {
     /// A harness with [`SEEDS`] registered through the state seam, exactly as the EKS
     /// control plane would create the cluster and its pod identity associations.
-    fn seeded() -> Self {
+    pub(crate) fn seeded() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Signature verification is the emulator's own concern and is off here: these
@@ -105,7 +108,7 @@ impl Harness {
 
     /// A projected service account token for `seed`, minted by the cluster that seed
     /// belongs to — the token the EKS Pod Identity Agent would present.
-    fn token(&self, seed: &Seed) -> String {
+    pub(crate) fn token(&self, seed: &Seed) -> String {
         self.token_request(
             seed.cluster,
             ServiceAccountTokenRequest::for_pod(seed.namespace, seed.service_account, seed.pod),
@@ -113,7 +116,11 @@ impl Harness {
     }
 
     /// A token minted by `cluster` for an arbitrary request.
-    fn token_request(&self, cluster: &str, request: ServiceAccountTokenRequest) -> String {
+    pub(crate) fn token_request(
+        &self,
+        cluster: &str,
+        request: ServiceAccountTokenRequest,
+    ) -> String {
         self.issue(cluster, request)
             .unwrap_or_else(|| panic!("cluster {cluster} issues the token it was asked for"))
     }
@@ -131,22 +138,66 @@ impl Harness {
 
     /// `POST /clusters/{cluster}/assume-role-for-pod-identity` with `token`, returning
     /// the HTTP status and the parsed JSON body.
-    async fn assume(&self, cluster: &str, token: &str) -> (u16, serde_json::Value) {
+    pub(crate) async fn assume(&self, cluster: &str, token: &str) -> (u16, serde_json::Value) {
         self.assume_with(cluster, serde_json::json!({ "token": token }))
             .await
     }
 
-    /// A token in the modelled three-segment shape that no cluster ever issued — what a
-    /// caller presenting a token from somewhere else looks like.
-    fn unissued_token() -> String {
-        "0123456789abcdef0123456789abcdef\
-         .fedcba9876543210fedcba9876543210\
-         .00112233445566778899aabbccddeeff"
-            .to_string()
+    /// A token in the FORM a cluster issues — three base64url segments whose header names
+    /// `cluster`'s own signing key — that `cluster` never issued, so only its record of
+    /// what it issued can refuse it.
+    fn unissued_token(&self, cluster: &str) -> String {
+        crate::rejection_errors::token_for_key(&self.signing_key_id(cluster))
+    }
+
+    /// The id of the key `cluster`'s Kubernetes API server signs its tokens with — the
+    /// `kid` header of every token it issues.
+    pub(crate) fn signing_key_id(&self, cluster: &str) -> String {
+        let state = service_state(&*self.engine).expect("state");
+        let guard = state.lock();
+        guard
+            .cluster(cluster)
+            .unwrap_or_else(|| panic!("cluster {cluster} is seeded"))
+            .signing_key_id
+            .clone()
+    }
+
+    /// The issuer URL `cluster`'s OIDC provider publishes, which its tokens name in their
+    /// `iss` claim.
+    pub(crate) fn oidc_issuer(&self, cluster: &str) -> String {
+        let state = service_state(&*self.engine).expect("state");
+        let guard = state.lock();
+        guard
+            .cluster(cluster)
+            .unwrap_or_else(|| panic!("cluster {cluster} is seeded"))
+            .oidc_issuer
+            .clone()
     }
 
     /// The same call with a caller-built body, for the optional members.
-    async fn assume_with(&self, cluster: &str, body: serde_json::Value) -> (u16, serde_json::Value) {
+    pub(crate) async fn assume_with(
+        &self,
+        cluster: &str,
+        body: serde_json::Value,
+    ) -> (u16, serde_json::Value) {
+        let (status, _, raw) = self.send(cluster, body).await;
+        let parsed = if raw.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null)
+        };
+        (status, parsed)
+    }
+
+    /// The same call, answered as the status, the `x-amzn-errortype` header and the RAW
+    /// body — what a suite asserting the error envelope reads, where [`Self::assume_with`]
+    /// answers the parsed body a success-path suite reads. The one place a request is
+    /// built, so both read the same wire path.
+    pub(crate) async fn send(
+        &self,
+        cluster: &str,
+        body: serde_json::Value,
+    ) -> (u16, Option<String>, String) {
         let request = http::Request::builder()
             .method("POST")
             .uri(format!("/clusters/{cluster}/assume-role-for-pod-identity"))
@@ -159,13 +210,13 @@ impl Harness {
             .expect("a well-formed request");
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
-        let body = response.body();
-        let parsed = if body.is_empty() {
-            serde_json::Value::Null
-        } else {
-            serde_json::from_slice(body).unwrap_or(serde_json::Value::Null)
-        };
-        (status, parsed)
+        let errortype = response
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let raw = String::from_utf8_lossy(response.body()).to_string();
+        (status, errortype, raw)
     }
 }
 
@@ -558,8 +609,8 @@ async fn a_token_the_cluster_did_not_issue_for_pod_identity_is_invalid() {
         ServiceAccountTokenRequest::for_pod(seed.namespace, seed.service_account, seed.pod)
             .for_audience(&[]),
     );
-    // A token in the modelled shape that no cluster issued.
-    let unissued = Harness::unissued_token();
+    // A token in the form this cluster issues that it never issued.
+    let unissued = harness.unissued_token(seed.cluster);
     // A token this cluster issued for a window that has not opened yet.
     let not_yet_valid = harness.token_request(
         seed.cluster,

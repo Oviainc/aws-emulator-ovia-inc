@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteSyslogConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteSyslogConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: removes the syslog configuration the request names — the one stored on
+//! the log group its `logGroupIdentifier` resolves to for the VPC endpoint it names.
+//! This is the ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`DeleteSyslogConfiguration::handle`] with real behaviour and
@@ -168,18 +168,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteSyslogConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteSyslogConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteSyslogConfiguration"))
+        // `ctx` carries only request metadata; this operation reads nothing from it.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteSyslogConfigurationError::from(
+                DeleteSyslogConfigurationErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        // `logGroupIdentifier` is "the name or ARN of the log group", so an ARN resolves
+        // to the name the store is keyed by.
+        let log_group_name =
+            crate::state::log_group_name_from_identifier(&input.log_group_identifier).to_string();
+
+        let Some(group) = store.log_groups.get_mut(&log_group_name) else {
+            return Err(
+                DeleteSyslogConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::resource_not_found_message("log group")),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "After deletion, syslog data is no longer ingested through the specified VPC
+        // endpoint": the endpoint is what identifies the configuration within the group, so
+        // a request that names none names no configuration and is refused for that member
+        // (`crate::state::VPC_ENDPOINT_ID_REQUIRED`) even though the model leaves it
+        // optional.
+        let Some(vpc_endpoint_id) = input.vpc_endpoint_id else {
+            return Err(
+                DeleteSyslogConfigurationErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(crate::state::VPC_ENDPOINT_ID_REQUIRED.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The delete takes away exactly the configuration stored for that endpoint and
+        // leaves the group's other endpoints ingesting. A delete naming an endpoint the
+        // group has no configuration for is refused as the parameter it was named by
+        // rather than as a missing log group: the group is there, and it is the
+        // `vpcEndpointId` that selects nothing.
+        if group
+            .syslog_configurations
+            .remove(&vpc_endpoint_id)
+            .is_none()
+        {
+            return Err(
+                DeleteSyslogConfigurationErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(crate::state::syslog_configuration_not_found_message(
+                            &vpc_endpoint_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        Ok(DeleteSyslogConfigurationOutput)
     }
 }

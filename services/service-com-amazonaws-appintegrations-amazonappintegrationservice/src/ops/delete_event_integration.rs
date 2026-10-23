@@ -148,7 +148,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let removed = state.event_integrations.remove(&input.name).ok_or_else(|| {
             DeleteEventIntegrationErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("No event integration named {} exists.", input.name)),
+                    message: Some(crate::state::event_integration_not_found(&input.name)),
                 },
             )
         })?;

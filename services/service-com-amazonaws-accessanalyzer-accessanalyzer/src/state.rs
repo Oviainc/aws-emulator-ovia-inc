@@ -15,7 +15,11 @@
 //! Access previews are nested the same way: `CreateAccessPreview` stores an
 //! [`AccessPreviewRecord`] on the analyzer the request names, `GetAccessPreview`
 //! projects it back with [`AccessPreviewRecord::preview_at`], and deleting the analyzer
-//! takes its previews with it.
+//! takes its previews with it. The preview's FINDINGS are not stored at all:
+//! `ListAccessPreviewFindings` derives them from the stored proposed configuration (the
+//! policies [`proposed_policies`] enumerates, the resource type
+//! [`configuration_resource_type`] names) on every read, so there is no second copy of
+//! the analysis to keep in step with the configuration it came from.
 //!
 //! So are resource scans: `StartResourceScan` records a [`ResourceScan`] on the analyzer
 //! it names, and the analyzer's `lastResourceAnalyzed` / `lastResourceAnalyzedAt` are
@@ -264,6 +268,24 @@ pub const ACCESS_PREVIEW_QUOTA_EXCEEDED_MESSAGE: &str =
 pub fn access_preview_not_found(access_preview_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: ACCESS_PREVIEW_NOT_FOUND_MESSAGE.to_string(),
+        resource_id: access_preview_id.to_string(),
+        resource_type: ACCESS_PREVIEW_RESOURCE_TYPE.to_string(),
+    }
+}
+
+/// The fixed `message` of the `ConflictException` (HTTP 409) that answers a call asking
+/// for the RESULT of an access preview whose analysis has not completed — one still
+/// `CREATING`, and one that resolved to `FAILED`, which produced no findings at all.
+/// Same provenance as [`ACCESS_PREVIEW_NOT_FOUND_MESSAGE`]: one constant text per
+/// refusal kind, with the identifier in the modelled `resourceId`.
+pub const ACCESS_PREVIEW_NOT_COMPLETED_MESSAGE: &str =
+    "Access preview findings are available once the access preview is completed";
+
+/// The 409 for an access preview whose analysis has not completed: fixed text, the
+/// `accessPreviewId` in the modelled `resourceId`/`resourceType` members.
+pub fn access_preview_not_completed(access_preview_id: &str) -> ConflictException {
+    ConflictException {
+        message: ACCESS_PREVIEW_NOT_COMPLETED_MESSAGE.to_string(),
         resource_id: access_preview_id.to_string(),
         resource_type: ACCESS_PREVIEW_RESOURCE_TYPE.to_string(),
     }
@@ -740,8 +762,8 @@ pub fn configuration_defect(resource: &str, configuration: &Configuration) -> Op
             "{resource} is not the ARN of a resource to preview access for"
         ));
     }
-    for document in policy_documents(configuration) {
-        if !serde_json::from_str::<serde_json::Value>(document)
+    for policy in proposed_policies(configuration) {
+        if !serde_json::from_str::<serde_json::Value>(policy.document)
             .is_ok_and(|parsed| parsed.is_object())
         {
             return Some(format!(
@@ -761,62 +783,157 @@ pub fn is_resource_arn(candidate: &str) -> bool {
     segments.len() == 6 && segments[0] == "arn" && !segments[5].is_empty()
 }
 
-/// Every policy document a proposed configuration carries, in no particular order.
+/// One policy document a proposed access-preview configuration carries, with where in
+/// the configuration it was proposed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposedPolicy<'a> {
+    /// The member path the document was proposed at, spelled the way the wire spells the
+    /// members (`s3Bucket.bucketPolicy`, `kmsKey.keyPolicies.default`,
+    /// `s3Bucket.accessPoints.<access point ARN>.accessPointPolicy`). It identifies the
+    /// document within the configuration, so two documents of one configuration are
+    /// never confused for each other.
+    pub member: String,
+    /// The document itself, exactly as the create carried it.
+    pub document: &'a str,
+    /// The ARN of the Amazon S3 access point that proposed the document, when an access
+    /// point did; `None` for a policy the resource itself carries.
+    pub access_point_arn: Option<&'a str>,
+}
+
+/// Every policy document a proposed configuration carries, ordered by [`ProposedPolicy::member`]
+/// so a reader of one stored configuration always walks them in the same order.
 ///
 /// One arm per `Configuration` union member (from
 /// `smithy_query(query="shape", shape="Configuration")`), so a member that proposes no
 /// policy — an EBS snapshot's share list, an RDS snapshot's attributes, a KMS grant —
 /// contributes nothing and a member that proposes several contributes all of them.
-pub fn policy_documents(configuration: &Configuration) -> Vec<&str> {
-    let mut documents: Vec<&str> = Vec::new();
+pub fn proposed_policies(configuration: &Configuration) -> Vec<ProposedPolicy<'_>> {
+    /// The document one named member carries, when it carries one.
+    fn at<'a>(member: &str, document: Option<&'a String>) -> Option<ProposedPolicy<'a>> {
+        document.map(|document| ProposedPolicy {
+            member: member.to_string(),
+            document: document.as_str(),
+            access_point_arn: None,
+        })
+    }
+    let mut policies: Vec<ProposedPolicy<'_>> = Vec::new();
     match configuration {
         // Shared through account ids and groups, not through a policy document.
         Configuration::ebsSnapshot(_) => {}
-        Configuration::ecrRepository(config) => {
-            documents.extend(config.repository_policy.as_deref())
+        Configuration::ecrRepository(config) => policies.extend(at(
+            "ecrRepository.repositoryPolicy",
+            config.repository_policy.as_ref(),
+        )),
+        Configuration::iamRole(config) => {
+            policies.extend(at("iamRole.trustPolicy", config.trust_policy.as_ref()))
         }
-        Configuration::iamRole(config) => documents.extend(config.trust_policy.as_deref()),
-        Configuration::efsFileSystem(config) => {
-            documents.extend(config.file_system_policy.as_deref())
-        }
-        Configuration::kmsKey(config) => documents.extend(
+        Configuration::efsFileSystem(config) => policies.extend(at(
+            "efsFileSystem.fileSystemPolicy",
+            config.file_system_policy.as_ref(),
+        )),
+        Configuration::kmsKey(config) => policies.extend(
             config
                 .key_policies
                 .iter()
                 .flatten()
-                .map(|(_, policy)| policy.as_str()),
+                .map(|(name, policy)| ProposedPolicy {
+                    member: format!("kmsKey.keyPolicies.{name}"),
+                    document: policy.as_str(),
+                    access_point_arn: None,
+                }),
         ),
         // Shared through snapshot attributes, not through a policy document.
         Configuration::rdsDbClusterSnapshot(_) | Configuration::rdsDbSnapshot(_) => {}
-        Configuration::secretsManagerSecret(config) => {
-            documents.extend(config.secret_policy.as_deref())
-        }
+        Configuration::secretsManagerSecret(config) => policies.extend(at(
+            "secretsManagerSecret.secretPolicy",
+            config.secret_policy.as_ref(),
+        )),
         Configuration::s3Bucket(config) => {
-            documents.extend(config.bucket_policy.as_deref());
-            documents.extend(
-                config
-                    .access_points
-                    .iter()
-                    .flatten()
-                    .filter_map(|(_, point)| point.access_point_policy.as_deref()),
-            );
+            policies.extend(at("s3Bucket.bucketPolicy", config.bucket_policy.as_ref()));
+            policies.extend(access_point_policies(
+                "s3Bucket",
+                config.access_points.iter().flatten().map(|(arn, point)| {
+                    (arn.as_str(), point.access_point_policy.as_deref())
+                }),
+            ));
         }
-        Configuration::snsTopic(config) => documents.extend(config.topic_policy.as_deref()),
-        Configuration::sqsQueue(config) => documents.extend(config.queue_policy.as_deref()),
+        Configuration::snsTopic(config) => {
+            policies.extend(at("snsTopic.topicPolicy", config.topic_policy.as_ref()))
+        }
+        Configuration::sqsQueue(config) => {
+            policies.extend(at("sqsQueue.queuePolicy", config.queue_policy.as_ref()))
+        }
         Configuration::s3ExpressDirectoryBucket(config) => {
-            documents.extend(config.bucket_policy.as_deref());
-            documents.extend(
-                config
-                    .access_points
-                    .iter()
-                    .flatten()
-                    .filter_map(|(_, point)| point.access_point_policy.as_deref()),
-            );
+            policies.extend(at(
+                "s3ExpressDirectoryBucket.bucketPolicy",
+                config.bucket_policy.as_ref(),
+            ));
+            policies.extend(access_point_policies(
+                "s3ExpressDirectoryBucket",
+                config.access_points.iter().flatten().map(|(arn, point)| {
+                    (arn.as_str(), point.access_point_policy.as_deref())
+                }),
+            ));
         }
-        Configuration::dynamodbStream(config) => documents.extend(config.stream_policy.as_deref()),
-        Configuration::dynamodbTable(config) => documents.extend(config.table_policy.as_deref()),
+        Configuration::dynamodbStream(config) => policies.extend(at(
+            "dynamodbStream.streamPolicy",
+            config.stream_policy.as_ref(),
+        )),
+        Configuration::dynamodbTable(config) => {
+            policies.extend(at("dynamodbTable.tablePolicy", config.table_policy.as_ref()))
+        }
     }
-    documents
+    policies.sort_by(|left, right| left.member.cmp(&right.member));
+    policies
+}
+
+/// The access-point policies of a bucket configuration, keyed by the access point that
+/// proposed each one — the one form of proposed policy that is not the resource's own.
+///
+/// Takes the ARN-and-policy pairs rather than the map itself, because a general-purpose
+/// bucket and a directory bucket key their access points by two different (structurally
+/// identical) configuration shapes.
+fn access_point_policies<'a>(
+    member: &str,
+    access_points: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+) -> Vec<ProposedPolicy<'a>> {
+    access_points
+        .into_iter()
+        .filter_map(|(arn, document)| {
+            document.map(|document| ProposedPolicy {
+                member: format!("{member}.accessPoints.{arn}.accessPointPolicy"),
+                document,
+                access_point_arn: Some(arn),
+            })
+        })
+        .collect()
+}
+
+/// The `ResourceType` a proposed configuration is for.
+///
+/// One arm per `Configuration` union member, each paired with the entry of the model's
+/// `ResourceType` enum ([`crate::ops::types::RESOURCE_TYPE_VALUES`]) that the member's
+/// own documentation names: `s3Bucket` is "for an Amazon S3 bucket", so the finding it
+/// contributes reports `AWS::S3::Bucket`. The two enum entries no `Configuration` member
+/// can propose (`AWS::Lambda::Function`, `AWS::Lambda::LayerVersion`, `AWS::IAM::User`)
+/// are therefore unreachable from an access preview.
+pub fn configuration_resource_type(configuration: &Configuration) -> &'static str {
+    match configuration {
+        Configuration::ebsSnapshot(_) => "AWS::EC2::Snapshot",
+        Configuration::ecrRepository(_) => "AWS::ECR::Repository",
+        Configuration::iamRole(_) => "AWS::IAM::Role",
+        Configuration::efsFileSystem(_) => "AWS::EFS::FileSystem",
+        Configuration::kmsKey(_) => "AWS::KMS::Key",
+        Configuration::rdsDbClusterSnapshot(_) => "AWS::RDS::DBClusterSnapshot",
+        Configuration::rdsDbSnapshot(_) => "AWS::RDS::DBSnapshot",
+        Configuration::secretsManagerSecret(_) => "AWS::SecretsManager::Secret",
+        Configuration::s3Bucket(_) => "AWS::S3::Bucket",
+        Configuration::snsTopic(_) => "AWS::SNS::Topic",
+        Configuration::sqsQueue(_) => "AWS::SQS::Queue",
+        Configuration::s3ExpressDirectoryBucket(_) => "AWS::S3Express::DirectoryBucket",
+        Configuration::dynamodbStream(_) => "AWS::DynamoDB::Stream",
+        Configuration::dynamodbTable(_) => "AWS::DynamoDB::Table",
+    }
 }
 
 /// A fresh `accessPreviewId`: a version-4 UUID in the lowercase hyphenated form the
@@ -855,6 +972,47 @@ pub fn new_access_preview_id() -> String {
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&hashed[..16]);
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+    let mut rendered = String::with_capacity(36);
+    for (index, byte) in bytes.iter().enumerate() {
+        if matches!(index, 4 | 6 | 8 | 10) {
+            rendered.push('-');
+        }
+        // Infallible: writing to a String never fails.
+        let _ = write!(rendered, "{byte:02x}");
+    }
+    rendered
+}
+
+/// A UUID DERIVED from what it identifies, rather than minted: the same `parts` always
+/// render the same id, and two different part lists practically never collide (the id is
+/// the first 128 bits of the SHA-256 of the parts, length-prefixed so no two different
+/// lists hash the same bytes).
+///
+/// Used for an identifier the service reports for something it does NOT store a record
+/// of — an access preview finding, which is recomputed from the stored proposed
+/// configuration on every read. Deriving it is what makes the id STABLE across reads
+/// without a stored table of ids, which a minted id could not be.
+///
+/// Rendered as a version-8 UUID (RFC 9562 §5.8: the version for an id whose bits come
+/// from an application-chosen source, which is exactly this), in the same lowercase
+/// hyphenated 8-4-4-4-12 form as [`new_access_preview_id`].
+pub fn derived_uuid(parts: &[&str]) -> String {
+    use std::fmt::Write as _;
+
+    let mut digest = <::sha2::Sha256 as ::sha2::Digest>::new();
+    for part in parts {
+        // The length prefix is what keeps `["ab", "c"]` and `["a", "bc"]` apart.
+        ::sha2::Digest::update(&mut digest, (part.len() as u64).to_le_bytes());
+        ::sha2::Digest::update(&mut digest, part.as_bytes());
+    }
+    let hashed = ::sha2::Digest::finalize(digest);
+
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&hashed[..16]);
+    // Version 8 in the high nibble of octet 6, variant `0b10` in the top bits of octet 8.
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
 
     let mut rendered = String::with_capacity(36);

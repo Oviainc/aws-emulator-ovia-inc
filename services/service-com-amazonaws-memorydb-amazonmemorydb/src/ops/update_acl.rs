@@ -290,15 +290,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is not resolved here, exactly as `CreateACL` does not resolve its
         // `UserNames`: the two write paths of one membership must agree about what a
         // member is.
+        // A name added that the ACL ALREADY lists is a delta that cannot hold against
+        // the membership it is applied to — the modelled COMBINATION fault, which is
+        // what AWS answers for it. `DuplicateUserNameFault` ("A user with the specified
+        // name already exists") stays what `member_set` above uses for a name the
+        // REQUEST itself repeats, so the two refusals report different mistakes.
         if let Some(name) = to_add.iter().find(|name| current.contains(name.as_str())) {
-            return Err(UpdateACLErrorModeled::DuplicateUserNameFault(
-                DuplicateUserNameFault {
-                    message: Some(format!(
-                        "User {name} is already a member of ACL {acl_name}."
-                    )),
-                },
-            )
-            .into());
+            return Err(
+                UpdateACLErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(format!(
+                            "User {name} is already a member of ACL {acl_name}."
+                        )),
+                    },
+                )
+                .into(),
+            );
         }
         // The new membership, in the order the ACL already held its members plus the
         // added ones. Bounded by `MAX_USERS_PER_ACL` like the lists that built it, so a

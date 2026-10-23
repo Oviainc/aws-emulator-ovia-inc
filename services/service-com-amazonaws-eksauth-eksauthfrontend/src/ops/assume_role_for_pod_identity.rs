@@ -9,17 +9,26 @@
 //!
 //! Every output member is computed from state (see [`crate::state`]):
 //!
-//! 1. the cluster named by the `clusterName` label must be registered — otherwise
+//! 1. the `token` must be a JSON Web Token — three base64url segments, a JOSE header
+//!    that is a JSON object carrying the headers JWS requires, and a claim set —
+//!    otherwise `InvalidTokenException` (400). This is a question about the VALUE, so it
+//!    is answered BEFORE any state is read: a token that is not a JWT is refused as such
+//!    whether or not the cluster the URI names exists;
+//! 2. the cluster named by the `clusterName` label must be registered — otherwise
 //!    `ResourceNotFoundException` (404);
-//! 2. the token must be one that cluster issued for the pod identity audience and still
+//! 3. the token must be one that cluster issued for the pod identity audience and still
 //!    within its lifetime — otherwise `ExpiredTokenException` or `InvalidTokenException`
 //!    (400), decided by the cluster's own record of what it issued, never by inspecting
 //!    the request;
-//! 3. the cluster must hold a pod identity association for the (namespace, service
+//! 4. the cluster must hold a pod identity association for the (namespace, service
 //!    account) pair the token names — otherwise `AccessDeniedException` (400);
-//! 4. the credentials are minted through the emulator's credential store, so the
+//! 5. the credentials are minted through the emulator's credential store, so the
 //!    session they identify is one the emulator will accept, and the session record is
 //!    stored under its access key id with the instant it expires.
+//!
+//! A value that fails a constraint the MODEL declares never reaches this handler at all:
+//! the framework refuses it first, and `crate::service` words that refusal as this
+//! service's own `InvalidParameterException`.
 //!
 //! ## Reaching this service's state
 //!
@@ -109,7 +118,8 @@
 use super::types::*;
 
 use crate::state::{
-    PodIdentitySession, ServiceAccountIdentity, TokenRejection, PODS_AUDIENCE, SESSION_DURATION,
+    parse_service_account_token, PodIdentitySession, ServiceAccountIdentity, TokenMalformation,
+    TokenRejection, PODS_AUDIENCE, SESSION_DURATION,
 };
 use emulator_server::aws_credentials::{AWS_SESSION, SECRET_ACCESS_KEY, SESSION_TOKEN};
 use std::time::SystemTime;
@@ -194,6 +204,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             internal_server_error("the EKS Auth state store is unavailable on this engine")
         })?;
 
+        // Who presented this request, for the access record below. It comes from a
+        // request header, so it is recorded with `?` (Debug): the value is quoted and
+        // its control characters escaped, and cannot forge a line in the record.
+        let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
+
+        // WHETHER THE PRESENTED VALUE IS A TOKEN AT ALL comes first, before anything is
+        // read from state. It is a question about the value, so the answer cannot depend
+        // on which cluster the request names: a value that is not a JWT is the modeled
+        // invalid-token failure even when the cluster in the URI is not registered.
+        let token_headers =
+            parse_service_account_token(&input.token).map_err(|malformation| {
+                refused(&caller_akid, &input.cluster_name, "InvalidTokenException");
+                malformed_token(malformation)
+            })?;
+
         // A session whose expiration has passed is over whether or not anybody called,
         // and a token record far enough past its token's expiry is owed to nobody, so
         // materialise both here and forget the credentials with them. The state guard is
@@ -218,11 +243,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // Who presented this request, for the access record below. It comes from a
-        // request header, so it is recorded with `?` (Debug): the value is quoted and
-        // its control characters escaped, and cannot forge a line in the record.
-        let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
-
         // The whole authorization decision reads state: the cluster, its token signing
         // key, and its associations.
         let (association, identity) = {
@@ -243,7 +263,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
             let identity = cluster
-                .verify_service_account_token(&input.token, now)
+                .verify_service_account_token(&input.token, &token_headers, now)
                 .map_err(|rejection| {
                     refused(
                         &caller_akid,
@@ -373,6 +393,46 @@ fn refused(caller_akid: &str, cluster_name: &str, error_code: &str) {
         error_code = %error_code,
         "refused an EKS Pod Identity credential exchange"
     );
+}
+
+/// How a value that is not a JSON Web Token is reported: the modeled invalid-token
+/// failure.
+///
+/// The caller is told WHICH JOSE header it left out, and which one it filled in with
+/// something that is not a value for that header, because those name the one thing it
+/// has to change; every other way a value can fail to be a token is one answer, "it
+/// could not be parsed", since the caller's fix is the same and the segment that failed
+/// is a detail of the parse. Which part it was goes to the log instead.
+///
+/// NO PART OF THE TOKEN IS INTERPOLATED. `token` is `@sensitive` and carries a
+/// credential, and an error body is logged by the clients that read it, so the message
+/// states the rule the value broke and never the value.
+fn malformed_token(malformation: TokenMalformation) -> AssumeRoleForPodIdentityError {
+    // The malformation is derived from the token's FORM, not from its characters, so it
+    // carries no part of the value.
+    ::tracing::info!(
+        operation = "AssumeRoleForPodIdentity",
+        malformation = ?malformation,
+        "refused a service account token that is not a JSON Web Token"
+    );
+    let message = match malformation {
+        TokenMalformation::MissingHeader(name) => {
+            format!("The token included in the request has missing header - {name}.")
+        }
+        TokenMalformation::InvalidHeader(name) => {
+            format!("The token included in the request has invalid header - {name}.")
+        }
+        TokenMalformation::Length
+        | TokenMalformation::Segments
+        | TokenMalformation::Encoding(_)
+        | TokenMalformation::NotJson(_) => {
+            "Failed to parse the token included in the request.".to_string()
+        }
+    };
+    AssumeRoleForPodIdentityErrorModeled::InvalidTokenException(InvalidTokenException {
+        message: Some(message),
+    })
+    .into()
 }
 
 /// How the cluster's verdict on a token is reported to the caller: a token whose

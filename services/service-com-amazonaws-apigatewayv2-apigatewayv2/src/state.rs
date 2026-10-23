@@ -133,6 +133,17 @@ pub const AUTHORIZER_TYPE_REQUEST: &str = "REQUEST";
 /// 2.0").
 pub const AUTHORIZER_PAYLOAD_FORMAT_VERSIONS: &[&str] = &["1.0", "2.0"];
 
+/// The `AuthorizationType` values that hand a route's authorization decision to an
+/// `Authorizer` resource, out of the generated `AUTHORIZATION_TYPE_VALUES` catalog
+/// (`AWS_IAM | CUSTOM | JWT | NONE`).
+///
+/// From `Route$AuthorizationType`: "JWT for using JSON Web Tokens" and "CUSTOM for
+/// using a Lambda authorizer" — both name a resource, and `Route$AuthorizerId` is "the
+/// identifier of the Authorizer resource to be associated with this route". The other
+/// two decide without one: `NONE` is "open access" and `AWS_IAM` uses "AWS IAM
+/// permissions".
+pub const AUTHORIZER_BACKED_AUTHORIZATION_TYPES: &[&str] = &["CUSTOM", "JWT"];
+
 /// The most deployments one api may hold, after which CreateDeployment is refused.
 ///
 /// API Gateway publishes a quota of 500 deployments per API, so this is the faithful
@@ -658,6 +669,31 @@ pub fn validate_authorizer_config(
                 AUTHORIZER_PAYLOAD_FORMAT_VERSIONS.join(", ")
             ));
         }
+    }
+    Ok(())
+}
+
+/// `Ok(())`, or why this route's authorization configuration cannot hold together —
+/// the message for the operation's `BadRequestException`.
+///
+/// One rule: a route whose `AuthorizationType` hands the decision to an `Authorizer`
+/// resource ([`AUTHORIZER_BACKED_AUTHORIZATION_TYPES`]) must be associated with one,
+/// because `Route$AuthorizerId` is what names it and nothing else on the route does.
+///
+/// Shared by every writer of a route, so the requirement cannot differ between the
+/// create and a later update; an update validates the MERGED record, so a route that
+/// already names an authorizer may switch type without resending the id.
+pub fn validate_route_authorization(
+    authorization_type: &str,
+    authorizer_id: Option<&str>,
+) -> Result<(), String> {
+    if AUTHORIZER_BACKED_AUTHORIZATION_TYPES.contains(&authorization_type)
+        && authorizer_id.is_none_or(str::is_empty)
+    {
+        return Err(format!(
+            "AuthorizerId is required for a route whose AuthorizationType is \
+             {authorization_type}"
+        ));
     }
     Ok(())
 }

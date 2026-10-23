@@ -93,23 +93,39 @@ use base64::Engine as _;
 use sha2::Digest as _;
 
 use crate::ops::types::{
-    AccountLimit, AccountUsage, AliasRoutingConfiguration, AmazonManagedKafkaEventSourceConfig,
-    CapacityProvider, CapacityProviderConfig, CapacityProviderPermissionsConfig,
-    CapacityProviderScalingConfig, CapacityProviderTelemetryConfig, CapacityProviderVpcConfig,
-    Cors, CreateAliasOutput, CreateEventSourceMappingOutput, CreateFunctionOutput,
-    DeadLetterConfig, DestinationConfig, DocumentDBEventSourceConfig, DurableConfig, Environment,
-    EnvironmentResponse, EphemeralStorage, EventSourceMappingLoggingConfig,
-    EventSourceMappingMetricsConfig, FileSystemConfig, FilterCriteria, FunctionCodeLocation,
-    GetLayerVersionOutput, ImageConfig, ImageConfigResponse, InstanceRequirements, Layer,
-    LayerVersionContentOutput, LoggingConfig, PropagateTags, ProvisionedPollerConfig,
-    PutFunctionConcurrencyOutput, ResolvedS3Object, ScalingConfig, SelfManagedEventSource,
-    SelfManagedKafkaEventSourceConfig, SnapStartResponse, SourceAccessConfiguration,
+    AccountLimit, AccountUsage, AliasRoutingConfiguration, AllowedPublishers,
+    AmazonManagedKafkaEventSourceConfig, CapacityProvider, CapacityProviderConfig,
+    CapacityProviderPermissionsConfig, CapacityProviderScalingConfig,
+    CapacityProviderTelemetryConfig, CapacityProviderVpcConfig, CodeSigningConfig,
+    CodeSigningPolicies, Cors, CreateAliasOutput, CreateEventSourceMappingOutput,
+    CreateFunctionOutput, DeadLetterConfig, DestinationConfig, DocumentDBEventSourceConfig,
+    DurableConfig, Environment, EnvironmentResponse, EphemeralStorage,
+    EventSourceMappingLoggingConfig, EventSourceMappingMetricsConfig, FileSystemConfig,
+    FilterCriteria, FunctionCodeLocation, GetLayerVersionOutput, ImageConfig, ImageConfigResponse,
+    InstanceRequirements, Layer, LayerVersionContentOutput, LoggingConfig, PropagateTags,
+    ProvisionedPollerConfig, PutFunctionConcurrencyOutput, ResolvedS3Object, RuntimeVersionConfig,
+    ScalingConfig, SelfManagedEventSource, SelfManagedKafkaEventSourceConfig, SnapStartResponse,
+    SourceAccessConfiguration,
     TenancyConfig, TracingConfigResponse, VpcConfig, VpcConfigResponse,
 };
 
 /// The ARN namespace this service stamps into every ARN it mints
-/// (`OPERATIONS.md`: "ARN namespace: `lambda`").
-const ARN_NAMESPACE: &str = "lambda";
+/// (`OPERATIONS.md`: "ARN namespace: `lambda`"). It is also the vendor field a client-sent
+/// ARN must carry to name one of this service's resources, which is what the handlers
+/// that accept a name-or-ARN member check it against.
+pub const ARN_NAMESPACE: &str = "lambda";
+
+/// How a capacity provider is addressed — the ARN this service mints for one, the ARN
+/// resource type it carries, the reading of a client-sent `CapacityProviderName` and the
+/// refusal a value naming no provider gets — lives in [`capacity_provider`] and is
+/// re-exported here, so a handler still names those as `crate::state::…`. The record, its
+/// clock-owed transition and the store that holds it stay in this module, beside the
+/// function slice the tagging surface reaches them through.
+pub mod capacity_provider;
+pub use capacity_provider::{
+    capacity_provider_arn, capacity_provider_name_message, parse_capacity_provider_name,
+    CAPACITY_PROVIDER_RESOURCE_TYPE,
+};
 
 /// The region an ARN carries when the request is unsigned and therefore names no
 /// SigV4 credential scope to read a region from.
@@ -194,6 +210,23 @@ pub const DEFAULT_MEMORY_SIZE_MB: i32 = 128;
 /// the member (the model carries only its 1..5400 range).
 pub const DEFAULT_TIMEOUT_SECONDS: i32 = 3;
 
+/// The longest `Timeout` a function may carry, in seconds: AWS's published Lambda quota
+/// "Function timeout: 900 seconds (15 minutes)".
+///
+/// The model's `Timeout` range is wider (1..5400), so this is the narrower of the two and
+/// the one a request is refused against — the same way the recorded service refuses a
+/// larger value, naming the member and the bound it failed.
+pub const MAX_TIMEOUT_SECONDS: i32 = 900;
+
+/// The `LogFormat` a function gets when the caller names none: "The default log format is
+/// plain text", as AWS documents for the member (the model carries only its `JSON | Text`
+/// enum).
+pub const DEFAULT_LOG_FORMAT: &str = "Text";
+
+/// The `SnapStart` `ApplyOn` a function gets when the caller names none, from the model's
+/// `SnapStartApplyOn` enum (`PublishedVersions | None`): no snapshot is taken.
+pub const SNAP_START_APPLY_ON_NONE: &str = "None";
+
 /// The default `EphemeralStorage` size, in MB, which the model's own member
 /// documentation states: "The default value is 512, but can be any whole number
 /// between 512 and 10,240 MB."
@@ -255,6 +288,15 @@ pub const MAX_PAGE_SIZE: usize = 50;
 /// `CodeStorageExceededException` rather than growing without bound. AWS caps the
 /// total code storage of an account and answers the same modelled error there.
 pub const MAX_FUNCTIONS: usize = 1_000;
+
+/// The `UntrustedArtifactOnDeployment` a code-signing configuration gets when the caller
+/// names no policy, which the model's own member documentation states: "Default value:
+/// `Warn`".
+pub const DEFAULT_CODE_SIGNING_POLICY: &str = "Warn";
+
+/// The most code-signing configurations this emulator keeps, from AWS's published Lambda
+/// quota "Code signing configurations: 20 per account".
+pub const MAX_CODE_SIGNING_CONFIGS: usize = 20;
 
 /// The most published versions this emulator keeps for one function.
 ///
@@ -1118,6 +1160,10 @@ impl FunctionRecord {
     /// being applied becomes `Successful`. Both would have been owed at the same instant
     /// even if nobody had called, so applying them on a read reports the truth rather
     /// than inventing a change.
+    ///
+    /// The instants are COMPARED, never arithmetic: each due instant was computed once,
+    /// at the call that started the transition, so nothing here can overflow a
+    /// `SystemTime` however long a stored record has been around.
     pub fn materialize(&mut self, now: SystemTime) {
         if self.state == STATE_PENDING && now >= self.active_due {
             self.state = STATE_ACTIVE.to_string();
@@ -1383,10 +1429,17 @@ impl FunctionRecord {
                     error: None,
                 }
             }),
-            snap_start: config
-                .snap_start_apply_on
-                .clone()
-                .map(|apply_on| SnapStartResponse {
+            // "When you provide a qualified Amazon Resource Name (ARN), this response
+            // element indicates whether SnapStart is activated for the specified function
+            // version" — so every read reports `SnapStart`, and a function the caller set
+            // no `ApplyOn` for carries the documented default (`None`: nothing is
+            // snapshotted), exactly as AWS reports it.
+            snap_start: {
+                let apply_on = config
+                    .snap_start_apply_on
+                    .clone()
+                    .unwrap_or_else(|| SNAP_START_APPLY_ON_NONE.to_string());
+                Some(SnapStartResponse {
                     optimization_status: Some(
                         if version != VERSION_LATEST
                             && apply_on == SNAP_START_APPLY_ON_PUBLISHED_VERSIONS
@@ -1398,8 +1451,41 @@ impl FunctionRecord {
                         .to_string(),
                     ),
                     apply_on: Some(apply_on),
-                }),
-            logging_config: config.logging_config.clone(),
+                })
+            },
+            // AWS reports a function's CloudWatch Logs configuration on every read, so a
+            // function the caller gave none for reports the documented defaults rather
+            // than no member: "The default log format is plain text", and "By default,
+            // Lambda functions send logs to a default log group named
+            // /aws/lambda/<function name>".
+            logging_config: Some(LoggingConfig {
+                log_format: config
+                    .logging_config
+                    .as_ref()
+                    .and_then(|logging| logging.log_format.clone())
+                    .or_else(|| Some(DEFAULT_LOG_FORMAT.to_string())),
+                application_log_level: config
+                    .logging_config
+                    .as_ref()
+                    .and_then(|logging| logging.application_log_level.clone()),
+                system_log_level: config
+                    .logging_config
+                    .as_ref()
+                    .and_then(|logging| logging.system_log_level.clone()),
+                log_group: config
+                    .logging_config
+                    .as_ref()
+                    .and_then(|logging| logging.log_group.clone())
+                    .or_else(|| Some(default_log_group(&config.name))),
+            }),
+            // The runtime version the function is pinned to. A container image carries no
+            // managed runtime, so there is no runtime version to report for one.
+            runtime_version_config: config.runtime.as_deref().map(|runtime| {
+                RuntimeVersionConfig {
+                    runtime_version_arn: Some(runtime_version_arn(&self.region, runtime)),
+                    error: None,
+                }
+            }),
             capacity_provider_config: config.capacity_provider_config.clone(),
             durable_config: config.durable_config.clone(),
             tenancy_config: config.tenancy_config.clone(),
@@ -2159,15 +2245,59 @@ pub struct ComAmazonawsLambdaAwsgirapiserviceState {
     /// Every function this emulator holds, keyed by function name so `ListFunctions`
     /// pages through them in a stable order.
     pub functions: BTreeMap<String, FunctionRecord>,
+    /// Every code-signing configuration, keyed by its ARN — the identifier every
+    /// operation on one takes (`GetCodeSigningConfig`, `DeleteCodeSigningConfig`,
+    /// `PutFunctionCodeSigningConfig` all bind `CodeSigningConfigArn`).
+    pub code_signing_configs: BTreeMap<String, CodeSigningConfigRecord>,
+    /// Every capacity provider, keyed by its name — the `{CapacityProviderName}` path
+    /// label the capacity-provider operations bind.
+    pub capacity_providers: BTreeMap<String, CapacityProviderRecord>,
     /// Every layer this emulator holds, keyed by layer name so `ListLayers` pages
     /// through them in a stable order.
     pub layers: BTreeMap<String, LayerRecord>,
-    /// Every capacity provider this emulator holds, keyed by provider name so
-    /// `ListCapacityProviders` pages through them in a stable order.
-    pub capacity_providers: BTreeMap<String, CapacityProviderRecord>,
     /// Every event source mapping this emulator holds, keyed by its UUID so
     /// `ListEventSourceMappings` pages through them in a stable order.
     pub event_source_mappings: BTreeMap<String, EventSourceMappingRecord>,
+}
+
+/// One code-signing configuration.
+#[derive(Debug, Clone)]
+pub struct CodeSigningConfigRecord {
+    /// The `csc-`-prefixed id minted at creation.
+    pub id: String,
+    /// The configuration's ARN.
+    pub arn: String,
+    /// The description, when the caller gave one.
+    pub description: Option<String>,
+    /// The signing profile version ARNs allowed to sign a package.
+    pub signing_profile_version_arns: Vec<String>,
+    /// `Warn` or `Enforce`, from the model's `CodeSigningPolicy` enum.
+    pub untrusted_artifact_on_deployment: String,
+    /// ISO-8601 instant of the last change.
+    pub last_modified: String,
+    /// The tags supplied at creation.
+    pub tags: BTreeMap<String, String>,
+}
+
+impl CodeSigningConfigRecord {
+    /// The `CodeSigningConfig` the wire reports, built entirely out of what is stored.
+    #[must_use]
+    pub fn to_wire(&self) -> CodeSigningConfig {
+        CodeSigningConfig {
+            code_signing_config_id: self.id.clone(),
+            code_signing_config_arn: self.arn.clone(),
+            description: self.description.clone(),
+            allowed_publishers: AllowedPublishers {
+                signing_profile_version_arns: self.signing_profile_version_arns.clone(),
+            },
+            code_signing_policies: CodeSigningPolicies {
+                untrusted_artifact_on_deployment: Some(
+                    self.untrusted_artifact_on_deployment.clone(),
+                ),
+            },
+            last_modified: self.last_modified.clone(),
+        }
+    }
 }
 
 /// One entry of a `ListFunctions` page: the key it is addressed by in the flattened
@@ -2344,54 +2474,55 @@ pub fn function_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("function:{name}"))
 }
 
+/// The ARN of a code-signing configuration:
+/// `arn:aws:lambda:<region>:<account>:code-signing-config:<id>`, as the model's
+/// `CodeSigningConfigArn` pattern requires.
+#[must_use]
+pub fn code_signing_config_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("code-signing-config:{id}"))
+}
+
+/// A fresh code-signing configuration id.
+///
+/// The model's `CodeSigningConfigId` pattern is `^csc-[a-zA-Z0-9-_\.]{17}$` and its
+/// `CodeSigningConfigArn` pattern narrows the same id to `csc-[a-z0-9]{17}`, so the 17
+/// characters are taken from the lower-case hexadecimal of a fresh UUID: unique per
+/// configuration and inside both patterns.
+#[must_use]
+pub fn mint_code_signing_config_id() -> String {
+    let hex = ::uuid::Uuid::new_v4().simple().to_string();
+    format!("csc-{}", &hex[..17])
+}
+
+/// The default CloudWatch log group of a function: "By default, Lambda functions send
+/// logs to a default log group named `/aws/lambda/<function name>`" (the model's own
+/// `LoggingConfig$LogGroup` documentation).
+#[must_use]
+pub fn default_log_group(name: &str) -> String {
+    format!("/aws/lambda/{name}")
+}
+
+/// The ARN of the managed runtime version a function is pinned to:
+/// `arn:aws:lambda:<region>::runtime:<id>`, the first form the model's
+/// `RuntimeVersionArn` pattern admits.
+///
+/// The id identifies the runtime BUILD, so it is DERIVED from the runtime identifier
+/// through `service_common::stable_hex_id`: two reads of a function on one runtime report
+/// the same runtime version, two runtimes report different ones, and nothing is taken
+/// from the clock or from the request.
+#[must_use]
+pub fn runtime_version_arn(region: &str, runtime: &str) -> String {
+    format!(
+        "arn:aws:lambda:{region}::runtime:{}",
+        ::service_common::stable_hex_id(&[runtime])
+    )
+}
+
 /// The unqualified ARN of a layer: `arn:aws:lambda:<region>:<account>:layer:<name>`,
 /// as the model's `LayerArn` pattern requires.
 #[must_use]
 pub fn layer_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("layer:{name}"))
-}
-
-/// The ARN of a capacity provider:
-/// `arn:aws:lambda:<region>:<account>:capacity-provider:<name>`, as the model's
-/// `CapacityProviderArn` pattern requires.
-#[must_use]
-pub fn capacity_provider_arn(region: &str, name: &str) -> String {
-    ::engine::emulator_arn(
-        ARN_NAMESPACE,
-        region,
-        &format!("capacity-provider:{name}"),
-    )
-}
-
-/// The bare provider name a `CapacityProviderName` names.
-///
-/// The model's `CapacityProviderName` pattern admits two forms — a capacity-provider ARN
-/// and a bare name — and both name the same record, so an ARN resolves here to the name
-/// it carries. `None` when the value is an `arn:`-prefixed string that is not a
-/// capacity-provider ARN of this service, which names no provider at all.
-#[must_use]
-pub fn parse_capacity_provider_name(value: &str) -> Option<String> {
-    if !value.starts_with("arn:") {
-        return (!value.is_empty()).then(|| value.to_string());
-    }
-    // arn:<partition>:lambda:<region>:<account>:capacity-provider:<name>. The resource
-    // type is required, so an ARN of another Lambda resource is not read as a provider
-    // named after its resource type.
-    let parts: Vec<&str> = value.split(':').collect();
-    if parts.len() != 7 || parts[2] != ARN_NAMESPACE || parts[5] != "capacity-provider" {
-        return None;
-    }
-    (!parts[6].is_empty()).then(|| parts[6].to_string())
-}
-
-/// The message a `CapacityProviderName` that names no provider is refused with.
-#[must_use]
-pub fn capacity_provider_name_message(value: &str) -> String {
-    format!(
-        "1 validation error detected: Value '{value}' at 'capacityProviderName' failed to \
-         satisfy constraint: Member must satisfy one of the documented name formats (name \
-         or capacity provider ARN)"
-    )
 }
 
 /// Resolve a `CapacityProviderName` (in either of its documented forms) to one stored
@@ -2659,53 +2790,60 @@ pub struct FunctionReference {
 /// all resolve here to the same [`FunctionReference`].
 ///
 /// `None` when the value is not any of those forms.
+///
+/// The value is UNTRUSTED input, so it is read without indexing: the full-ARN form goes
+/// through the one shared parser (`service_common::arn`, which walks the six fields with
+/// an iterator), and every other form is peeled with `strip_prefix` / `split_once`. No
+/// length check can therefore go stale into an out-of-bounds index, and no input can make
+/// this function panic.
 #[must_use]
 pub fn parse_function_reference(value: &str) -> Option<FunctionReference> {
-    let mut parts: Vec<&str> = value.split(':').collect();
-    let mut was_arn = false;
-
     // Full ARN: arn:<partition>:lambda:<region>:<account>:function:<name>[:<qualifier>].
     // The resource type is required, so an ARN of another Lambda resource (a layer, a
     // code-signing config) is not read as a function named after its resource type.
-    if parts.first() == Some(&"arn") {
-        if parts.len() < 7 || parts[2] != ARN_NAMESPACE || parts[5] != "function" {
-            return None;
-        }
-        parts.drain(..5);
-        was_arn = true;
+    if value.starts_with("arn:") {
+        let arn = service_common::arn::parse_of(value, ARN_NAMESPACE)?;
+        let after_type = arn.resource.strip_prefix(FUNCTION_RESOURCE_TYPE_PREFIX)?;
+        return name_and_qualifier(after_type, true);
     }
 
     // Partial ARN: <account>:function:<name>[:<qualifier>]. The `function` literal is
     // required for the leading 12-digit segment to be read as an account id, because a
     // function name may itself be twelve digits: `123456789012:2` names version 2 of
     // the function `123456789012`, not the function `2`.
-    if parts.len() > 2
-        && parts[1] == "function"
-        && parts[0].len() == 12
-        && parts[0].bytes().all(|byte| byte.is_ascii_digit())
-    {
-        parts.remove(0);
-        was_arn = true;
+    if let Some((account, after_account)) = value.split_once(':') {
+        if account.len() == 12 && account.bytes().all(|byte| byte.is_ascii_digit()) {
+            if let Some(after_type) = after_account.strip_prefix(FUNCTION_RESOURCE_TYPE_PREFIX) {
+                return name_and_qualifier(after_type, true);
+            }
+        }
     }
 
-    // Both ARN forms, and the pattern's bare `function:` prefix, carry the resource
-    // type before the name. The bare prefix is not an ARN, so it does not lift the
-    // documented 64-character limit on a name given without one.
-    if parts.len() > 1 && parts[0] == "function" {
-        parts.remove(0);
+    // The pattern's bare `function:` prefix carries the resource type before the name.
+    // It is not an ARN, so it does not lift the documented 64-character limit on a name
+    // given without one.
+    match value.strip_prefix(FUNCTION_RESOURCE_TYPE_PREFIX) {
+        Some(after_type) => name_and_qualifier(after_type, false),
+        None => name_and_qualifier(value, false),
     }
+}
 
-    let name = parts.first().copied().filter(|name| !name.is_empty())?;
-    let qualifier = match parts.len() {
-        1 => None,
-        2 => Some(parts[1]).filter(|qualifier| !qualifier.is_empty()),
-        _ => return None,
+/// The resource-type prefix every form that carries one writes before the name.
+const FUNCTION_RESOURCE_TYPE_PREFIX: &str = "function:";
+
+/// `<name>[:<qualifier>]`, once whatever preceded the name has been peeled off.
+///
+/// `None` for a value that names no function: an empty name, an empty qualifier, or a
+/// third `:`-separated field, none of which any documented form writes.
+fn name_and_qualifier(value: &str, was_arn: bool) -> Option<FunctionReference> {
+    let (name, qualifier) = match value.split_once(':') {
+        None => (value, None),
+        Some((name, qualifier)) if !qualifier.is_empty() && !qualifier.contains(':') => {
+            (name, Some(qualifier))
+        }
+        Some(_) => return None,
     };
-    if parts.len() == 2 && qualifier.is_none() {
-        return None;
-    }
-
-    Some(FunctionReference {
+    (!name.is_empty()).then(|| FunctionReference {
         name: name.to_string(),
         qualifier: qualifier.map(str::to_string),
         was_arn,

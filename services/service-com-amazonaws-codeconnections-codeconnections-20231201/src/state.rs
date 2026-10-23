@@ -714,6 +714,255 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// How this service WORDS a refusal.
+//
+// CodeConnections does not author a sentence per call site: each refusal carries the
+// FIXED template of the case it refuses, interpolated only from the request and from
+// the resource the service already holds. Every template this service emits is stated
+// once here, so two handlers refusing the same case can never word it differently and
+// no handler echoes a value AWS leaves out (a resource ARN appended to a constant, say).
+//
+// The refusals raised by the Git-sync component behind the repository-link and
+// sync-configuration surface carry one extra thing: the service framework appends its
+// own tail to the message ([`with_framework_tail`]). The connection surface's refusals
+// do not — what AWS is recorded to answer there is the bare sentence.
+// ---------------------------------------------------------------------------
+
+/// The service name the framework tail states, which is this service's `sdkId`
+/// (`smithy_query(query="service_info")`: `awsService.sdkId` = `CodeConnections`) and
+/// not its signing name (`codeconnections`) or its shape id.
+const FRAMEWORK_TAIL_SERVICE: &str = "CodeConnections";
+
+/// The HTTP status a refusal is answered with and the exception the framework names for
+/// it in the tail — one pair per refusal family, so the status the tail states can never
+/// drift from the status the response carries.
+///
+/// Each status is the `httpError` the model declares for the error the refusal is
+/// answered with (`smithy_query(query="shape", shape="ResourceNotFoundException")` 404,
+/// `ResourceAlreadyExistsException` 409, `SyncConfigurationStillExistsException` 409).
+type FrameworkTailFacts = (u16, &'static str);
+
+/// A resource the request named that this account holds none of: 404, as the model's
+/// `ResourceNotFoundException` declares.
+const TAIL_RESOURCE_NOT_FOUND: FrameworkTailFacts = (404, "ResourceNotFoundException");
+
+/// A resource the request would create that is already there: 409, as the model's
+/// `ResourceAlreadyExistsException` declares.
+const TAIL_RESOURCE_ALREADY_EXISTS: FrameworkTailFacts = (409, "ResourceAlreadyExistsException");
+
+/// A resource the request would remove that something still references: 409, as the
+/// model's `SyncConfigurationStillExistsException` declares. The EXCEPTION NAME is the
+/// framework's own (`ResourceStillExistsException`) rather than that wire code — see
+/// [`sync_configurations_still_exist_message`].
+const TAIL_RESOURCE_STILL_EXISTS: FrameworkTailFacts = (409, "ResourceStillExistsException");
+
+/// The id of the request a refusal is answering, as the framework tail names it.
+///
+/// A request id is minted by the SERVICE, per call — nothing in the request carries one
+/// — so this is a PER-RUN value, never derived from the request or from a recording. It
+/// is the emulator's ONE request-id mint,
+/// [`service_common::query_error_envelope::new_request_id`] (a fresh v4 UUID), so the id
+/// this tail names is indistinguishable from the one the framework's own renderers report.
+fn new_request_id() -> String {
+    ::service_common::query_error_envelope::new_request_id()
+}
+
+/// `body` followed by the tail the CodeConnections service framework appends to the
+/// refusals its Git-sync component raises:
+/// ` (Service: CodeConnections; Status Code: <status>; Error Code: <code>; Request ID: <id>; Proxy: null)`.
+///
+/// `facts` is the status-and-exception pair of the refusal family (one of
+/// [`TAIL_RESOURCE_NOT_FOUND`], [`TAIL_RESOURCE_ALREADY_EXISTS`],
+/// [`TAIL_RESOURCE_STILL_EXISTS`]) — the two values a client parses back out of the
+/// message text, kept PAIRED so neither can be stated without the other. The request id
+/// is the only per-run field ([`new_request_id`]).
+///
+/// One function, so every message of that family carries the same tail in the same
+/// shape; a refusal AWS is recorded to answer WITHOUT a tail (every connection-scoped
+/// one, and the `InvalidInputException`s of the sync-configuration surface) does not
+/// call it.
+fn with_framework_tail(body: &str, facts: FrameworkTailFacts) -> String {
+    let (status_code, error_code) = facts;
+    format!(
+        "{body} (Service: {FRAMEWORK_TAIL_SERVICE}; Status Code: {status_code}; \
+         Error Code: {error_code}; Request ID: {}; Proxy: null)",
+        new_request_id()
+    )
+}
+
+/// What this service answers when the ARN a request names resolves to no connection it
+/// holds — whether the ARN was never minted, names another account, region or partition,
+/// or named a connection that has since been deleted.
+///
+/// A CONSTANT: the sentence states that no connection matches the ARN the caller already
+/// has, and the ARN itself is not echoed back into it. Used by every operation that
+/// addresses a CONNECTION by ARN, so "never created" and "deleted" are indistinguishable
+/// — which is what keeps a deleted connection from being probed through its refusal.
+pub const CONNECTION_NOT_FOUND_MESSAGE: &str = "No connection exists with the ARN";
+
+/// What this service answers for an ARN that resolves to no HOST it holds: the sentence
+/// the host readers answer, naming the ARN that resolved to nothing.
+///
+/// Stated here so `GetHost`, the host-ARN references (`CreateConnection$HostArn`,
+/// `ListConnections$HostArnFilter`) and the ARN-addressed tagging surface word one
+/// absence one way. Unlike the connection sentence it DOES name the ARN, which is what
+/// this service is recorded to answer for a host.
+pub fn host_not_found_message(host_arn: &str) -> String {
+    format!("No host exists with the ARN: {host_arn}")
+}
+
+/// What the ARN-addressed tagging surface answers for an ARN of neither a connection nor
+/// a host — a repository-link ARN this account holds no link for, say.
+///
+/// The shape's own documented sentence plus the ARN that resolved to nothing: no recorded
+/// per-kind template is known for this case, so the refusal states the rule it broke and
+/// the value it was given rather than borrowing another resource kind's wording.
+pub fn resource_not_found_message(resource_arn: &str) -> String {
+    format!("Resource not found. Verify the resource ARN and try again: {resource_arn}")
+}
+
+/// The kind of resource an ARN of this service names — the kinds whose absences this
+/// service words differently.
+///
+/// An ENUM rather than a string, so the kind-keyed wording below is exhaustive and a
+/// misspelling cannot fall through to the generic sentence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArnResourceKind {
+    /// `connection/<id>` — the `ConnectionArn` form.
+    Connection,
+    /// `host/<id>` — the `HostArn` form.
+    Host,
+    /// `repository-link/<id>` — the `RepositoryLinkArn` form.
+    RepositoryLink,
+}
+
+/// The resource kind the ARN `resource_arn` names, read through the emulator's ONE ARN
+/// parse (`service_common::arn`, whose `resource_type` is the `connection` of
+/// `connection/<id>`), so this service does not split an ARN of its own.
+///
+/// The three types are the ones the modeled `ConnectionArn`, `HostArn` and
+/// `RepositoryLinkArn` patterns carry. `None` for an ARN naming no kind this service
+/// mints, which is what the generic sentence is for.
+pub fn arn_resource_kind(resource_arn: &str) -> Option<ArnResourceKind> {
+    match ::service_common::arn::resource_type(resource_arn)? {
+        "connection" => Some(ArnResourceKind::Connection),
+        "host" => Some(ArnResourceKind::Host),
+        "repository-link" => Some(ArnResourceKind::RepositoryLink),
+        _ => None,
+    }
+}
+
+/// How the ARN-addressed tagging surface words an ARN that resolves to no resource: the
+/// sentence of the KIND the ARN names ([`arn_resource_kind`]), so a connection ARN is
+/// refused the way `GetConnection` refuses one and a host ARN the way `GetHost` does.
+pub fn tagging_resource_not_found_message(resource_arn: &str) -> String {
+    match arn_resource_kind(resource_arn) {
+        Some(ArnResourceKind::Connection) => CONNECTION_NOT_FOUND_MESSAGE.to_string(),
+        Some(ArnResourceKind::Host) => host_not_found_message(resource_arn),
+        Some(ArnResourceKind::RepositoryLink) | None => resource_not_found_message(resource_arn),
+    }
+}
+
+/// What the repository-link surface answers for a `RepositoryLinkId` that resolves to no
+/// link: the account the lookup was made in and the id that resolved to nothing, plus the
+/// framework tail for a 404 `ResourceNotFoundException`.
+pub fn repository_link_not_found_message(repository_link_id: &str) -> String {
+    with_framework_tail(
+        &format!(
+            "Repository not found for accountId: {} and UUID: {repository_link_id}",
+            ::engine::emulator_account_id()
+        ),
+        TAIL_RESOURCE_NOT_FOUND,
+    )
+}
+
+/// What `CreateRepositoryLink` answers when the (connection, owner, repository) triple it
+/// was given is already linked: the ARN of the link that already holds the triple — so a
+/// caller can adopt it — plus the framework tail for a 409
+/// `ResourceAlreadyExistsException`. The ARN is the STORED one, read off the existing
+/// record rather than rebuilt from the request.
+pub fn repository_link_already_exists_message(existing_repository_link_arn: &str) -> String {
+    with_framework_tail(
+        &format!("RepoConfiguration already exists. Arn: {existing_repository_link_arn}"),
+        TAIL_RESOURCE_ALREADY_EXISTS,
+    )
+}
+
+/// What `DeleteRepositoryLink` answers for a link a sync configuration still references:
+/// the repository the blocked link names, as `<OwnerId>/<RepositoryName>`, and what the
+/// caller has to do first, plus the framework tail for a 409.
+///
+/// The tail's `Error Code` is the exception the framework names, which for this refusal is
+/// `ResourceStillExistsException` — not the wire code the model declares for it
+/// (`SyncConfigurationStillExistsException`, the `__type` of the response). That is what
+/// AWS is recorded to answer, and the two fields are read by different consumers: the wire
+/// code by the SDK, the tail by whoever parses the message text.
+pub fn sync_configurations_still_exist_message(owner_id: &str, repository_name: &str) -> String {
+    with_framework_tail(
+        &format!(
+            "Cfn stack sync configurations still exist for repository \
+             {owner_id}/{repository_name}. Please delete them before retrying."
+        ),
+        TAIL_RESOURCE_STILL_EXISTS,
+    )
+}
+
+/// The only value the modeled `SyncConfigurationType` enum declares
+/// (`smithy_query(query="shape", shape="SyncConfigurationType")`, also carried by the
+/// generated `ops::types::SYNC_CONFIGURATION_TYPE_VALUES`).
+pub const SYNC_TYPE_CFN_STACK_SYNC: &str = "CFN_STACK_SYNC";
+
+/// How this service names a sync type in prose: `CFN_STACK_SYNC` is the CloudFormation
+/// stack sync, and a refusal spells it out rather than quoting the wire token.
+///
+/// A token the enum does not declare never reaches a handler — the request walk refuses a
+/// value outside an enum before it — so one is reported by the token itself rather than
+/// renamed on a guess.
+pub fn sync_type_prose(sync_type: &str) -> &str {
+    match sync_type {
+        SYNC_TYPE_CFN_STACK_SYNC => "CloudFormation Stack Sync",
+        other => other,
+    }
+}
+
+/// The `configTarget` a sync configuration of `sync_type` for `resource_name` addresses:
+/// the sync type's own locator prefix, then the ARN of the resource being synced.
+///
+/// A `CFN_STACK_SYNC` configuration syncs a CloudFormation STACK, so the target is
+/// `cfn-stack-sync/` followed by that stack's ARN in the region the caller addressed —
+/// derived from the request, never stored. An undeclared sync type (unreachable while the
+/// enum declares one value) locates the resource by name under its own token.
+pub fn sync_configuration_target(sync_type: &str, resource_name: &str, region: &str) -> String {
+    match sync_type {
+        SYNC_TYPE_CFN_STACK_SYNC => format!(
+            "cfn-stack-sync/{}",
+            ::engine::emulator_arn("cloudformation", region, &format!("stack/{resource_name}"))
+        ),
+        other => format!("{other}/{resource_name}"),
+    }
+}
+
+/// What `GetSyncConfiguration` answers for a `(SyncType, ResourceName)` pair this account
+/// holds no configuration for: the sync type in prose, the account the lookup was made in
+/// and the [`sync_configuration_target`] locator of the resource, plus the framework tail
+/// for a 404 `ResourceNotFoundException`.
+pub fn sync_configuration_not_found_message(
+    sync_type: &str,
+    resource_name: &str,
+    region: &str,
+) -> String {
+    with_framework_tail(
+        &format!(
+            "{} configuration not found for accountId: {} and configTarget: {}",
+            sync_type_prose(sync_type),
+            ::engine::emulator_account_id(),
+            sync_configuration_target(sync_type, resource_name, region)
+        ),
+        TAIL_RESOURCE_NOT_FOUND,
+    )
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.

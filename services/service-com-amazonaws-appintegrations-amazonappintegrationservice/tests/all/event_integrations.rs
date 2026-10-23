@@ -14,97 +14,22 @@
 //! the bootstrap issue is only one row.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
-use bytes::Bytes;
 use serde_json::{json, Value};
-use service_com_amazonaws_appintegrations_amazonappintegrationservice::EmulatedService;
-use smithy_server_runtime::MultiServiceRouter;
 
-/// The region every test signs with unless it is exercising the region rule itself.
-const REGION: &str = "us-east-1";
+// The wire plumbing — router, request building, the reduced `Reply` — is the crate's
+// one harness, so this suite and the data-integration ones cannot drift apart in how
+// they talk to the service.
+use super::harness::{Emulator, Reply, REGION};
 
 /// `MaxResults` is `range 1..50` on `ListEventIntegrations` (model:
 /// `smithy_query(query="operation", operation="ListEventIntegrations")`).
 const MAX_RESULTS_MIN: i64 = 1;
 const MAX_RESULTS_MAX: i64 = 50;
 
-/// One wire answer, reduced to what a client branches on.
-#[derive(Debug)]
-struct Reply {
-    status: u16,
-    error_type: String,
-    body: Value,
-}
-
-impl Reply {
-    fn field(&self, name: &str) -> Option<&Value> {
-        self.body.get(name).filter(|v| !v.is_null())
-    }
-
-    fn string(&self, name: &str) -> Option<String> {
-        self.field(name)
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    }
-}
-
-/// An emulator with just this service mounted on a fresh engine, driven in-process
-/// through the production router.
-struct Emulator {
-    router: MultiServiceRouter,
-}
-
+/// The event-integration operations, as methods on the shared harness: an inherent
+/// impl, so every call site below still reads as a call on the service under test.
 impl Emulator {
-    fn new() -> Self {
-        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-        let mut router = MultiServiceRouter::new();
-        // Signatures are not what these tests are about; the router still routes by the
-        // SigV4 credential scope below, which is also where the ARN's region comes from.
-        router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
-    }
-
-    async fn send(&self, method: &str, uri: &str, region: &str, body: Option<Value>) -> Reply {
-        let authorization = format!(
-            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/app-integrations/aws4_request, \
-             SignedHeaders=host, Signature=deadbeef"
-        );
-        let builder = http::Request::builder()
-            .method(method)
-            .uri(uri)
-            .header("host", format!("app-integrations.{region}.amazonaws.com"))
-            .header("authorization", authorization);
-        let request = match &body {
-            Some(value) => builder
-                .header("content-type", "application/json")
-                .body(Bytes::from(serde_json::to_vec(value).expect("serialize body")))
-                .expect("build request"),
-            None => builder.body(Bytes::new()).expect("build request"),
-        };
-
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let error_type = response
-            .headers()
-            .get("x-amzn-errortype")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
-        let bytes = response.into_body();
-        let body = if bytes.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-        };
-        Reply {
-            status,
-            error_type,
-            body,
-        }
-    }
-
     async fn create(&self, region: &str, body: Value) -> Reply {
         self.send("POST", "/eventIntegrations", region, Some(body))
             .await
@@ -433,6 +358,65 @@ async fn a_second_create_of_a_live_name_is_refused_as_a_duplicate() {
         let fetched = emulator.get(REGION, &expected.name).await;
         assert_reported_case(label, &fetched, &expected, REGION);
     }
+}
+
+#[tokio::test]
+async fn a_store_at_its_ceiling_refuses_another_create_until_one_is_deleted() {
+    let emulator = Emulator::new();
+
+    // The emulator's own ceiling on this in-memory store, read from the crate rather
+    // than restated, so the test follows the constant the handler checks.
+    let ceiling = service_com_amazonaws_appintegrations_amazonappintegrationservice::state::MAX_STORED_EVENT_INTEGRATIONS;
+
+    let body_for = |name: String| {
+        json!({
+            "Name": name,
+            "EventBridgeBus": "default",
+            "EventFilter": { "Source": "aws.partner/demo" },
+        })
+    };
+
+    for index in 0..ceiling {
+        let reply = emulator
+            .create(REGION, body_for(format!("ceiling-{index:05}")))
+            .await;
+        assert_eq!(
+            reply.status, 200,
+            "case {index}: a create below the ceiling must succeed, got {} / {}",
+            reply.status, reply.body
+        );
+    }
+
+    let refused = emulator
+        .create(REGION, body_for("one-too-many".to_string()))
+        .await;
+    assert_eq!(
+        refused.status, 429,
+        "case one past the ceiling: expected HTTP 429, got {} / {}",
+        refused.status, refused.body
+    );
+    assert_eq!(
+        refused.error_type, "ResourceQuotaExceededException",
+        "case one past the ceiling: expected ResourceQuotaExceededException, got {:?}",
+        refused.error_type
+    );
+
+    // A delete frees a slot, so the ceiling bounds the store rather than ending its
+    // usefulness.
+    let removed = emulator.delete(REGION, "ceiling-00000").await;
+    assert_eq!(
+        removed.status, 200,
+        "case freeing a slot: expected HTTP 200, got {} / {}",
+        removed.status, removed.body
+    );
+    let accepted = emulator
+        .create(REGION, body_for("one-too-many".to_string()))
+        .await;
+    assert_eq!(
+        accepted.status, 200,
+        "case after a delete: expected HTTP 200, got {} / {}",
+        accepted.status, accepted.body
+    );
 }
 
 #[tokio::test]

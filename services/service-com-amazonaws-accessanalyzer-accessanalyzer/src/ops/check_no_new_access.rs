@@ -478,8 +478,60 @@ pub mod policy {
 
     /// The principal types a `Principal` map may key.
     ///
-    /// From the IAM JSON policy grammar's `Principal` element.
-    const PRINCIPAL_KINDS: &[&str] = &["aws", "service", "federated", "canonicaluser"];
+    /// From the IAM JSON policy grammar's `Principal` element, which keys the element by
+    /// `AWS`, `Service`, `Federated` or `CanonicalUser`. The type is kept beside each
+    /// named principal (rather than folded away) because it is part of WHICH principal
+    /// was named: `{"Federated": "x"}` and `{"AWS": "x"}` are different grants, and a
+    /// caller that reports a principal back reports the pair.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    pub enum PrincipalKind {
+        /// `AWS`: an account, its root user, an IAM user or role, or an assumed-role
+        /// session. Also what a bare-string `Principal` names.
+        Aws,
+        /// `Service`: an Amazon Web Services service principal.
+        Service,
+        /// `Federated`: a web-identity or SAML federated principal.
+        Federated,
+        /// `CanonicalUser`: an account's Amazon S3 canonical user id.
+        CanonicalUser,
+    }
+
+    impl PrincipalKind {
+        /// The type's name as the IAM grammar spells it, which is also how a response
+        /// reporting the principal keys it.
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::Aws => "AWS",
+                Self::Service => "Service",
+                Self::Federated => "Federated",
+                Self::CanonicalUser => "CanonicalUser",
+            }
+        }
+
+        /// The type a `Principal` map keyed by `name` names, compared the way IAM
+        /// compares element names (case-insensitively); `None` for a key that is not a
+        /// principal type at all.
+        fn parse(name: &str) -> Option<Self> {
+            match name.to_ascii_lowercase().as_str() {
+                "aws" => Some(Self::Aws),
+                "service" => Some(Self::Service),
+                "federated" => Some(Self::Federated),
+                "canonicaluser" => Some(Self::CanonicalUser),
+                _ => None,
+            }
+        }
+    }
+
+    /// One principal a `Principal`/`NotPrincipal` element names: its type and its value.
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    pub struct NamedPrincipal {
+        /// The principal type the element keyed it by; [`PrincipalKind::Aws`] for the
+        /// bare-string form, which IAM reads as an `AWS` principal.
+        pub kind: PrincipalKind,
+        /// The principal as written, normalised so the two spellings of an account root
+        /// (the bare account id and its `:root` ARN) compare equal.
+        pub value: String,
+    }
 
     /// Which policy grammar the two documents follow, from the request's `policyType`.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -628,9 +680,8 @@ pub mod policy {
         pub negated: bool,
         /// True when the element is `"*"` (or lists `"*"`), which matches any principal.
         pub any: bool,
-        /// The principals named, normalised so the two spellings of an account root
-        /// (the bare account id and its `:root` ARN) compare equal.
-        pub values: Vec<String>,
+        /// The principals named, each with the type it was keyed by.
+        pub values: Vec<NamedPrincipal>,
     }
 
     impl Principals {
@@ -639,8 +690,14 @@ pub mod policy {
         /// Principal values are matched literally: the IAM grammar gives `Principal` no
         /// partial wildcards, only the whole-element `"*"`.
         fn matches(&self, principal: &str) -> bool {
-            let hit = self.any || self.values.iter().any(|known| known == principal);
+            let hit = self.any || self.values.iter().any(|known| known.value == principal);
             hit != self.negated
+        }
+
+        /// The principal values this element names, without their types: what a
+        /// comparison matches a request's principal against.
+        fn named_values(&self) -> impl Iterator<Item = &String> {
+            self.values.iter().map(|named| &named.value)
         }
     }
 
@@ -734,6 +791,9 @@ pub mod policy {
     pub struct ConditionClause {
         /// The condition key, lowercased: IAM condition key names are case-insensitive.
         pub key: String,
+        /// The condition key as the document spells it, which is how a caller that
+        /// reports the clause back reports its key.
+        pub spelling: String,
         /// The comparison the operator performs.
         pub operator: Operator,
         /// Set for the reversed (`Not…`) spellings, which a missing key satisfies.
@@ -1157,6 +1217,7 @@ pub mod policy {
                     }
                     conditions.push(ConditionClause {
                         key: key.to_ascii_lowercase(),
+                        spelling: key.clone(),
                         operator,
                         negated,
                         if_exists,
@@ -1240,25 +1301,33 @@ pub mod policy {
         };
         let mut any = false;
         let mut values = Vec::new();
-        /// Record one principal: `"*"` widens the element to every principal, anything
-        /// else is a principal named literally.
-        fn note(principal: &str, values: &mut Vec<String>, any: &mut bool) {
+        /// Record one principal of `kind`: `"*"` widens the element to every principal,
+        /// anything else is a principal named literally.
+        fn note(
+            kind: PrincipalKind,
+            principal: &str,
+            values: &mut Vec<NamedPrincipal>,
+            any: &mut bool,
+        ) {
             if principal == "*" {
                 *any = true;
             } else {
-                values.push(normalize_principal(principal));
+                values.push(NamedPrincipal {
+                    kind,
+                    value: normalize_principal(principal),
+                });
             }
         }
         match value {
-            Value::String(text) => note(text, &mut values, &mut any),
+            // The bare-string form names an `AWS` principal (or `"*"`), which is how IAM
+            // reads `"Principal": "arn:aws:iam::…"`.
+            Value::String(text) => note(PrincipalKind::Aws, text, &mut values, &mut any),
             Value::Object(map) => {
                 for (kind, listed) in map {
-                    if !PRINCIPAL_KINDS.contains(&kind.to_ascii_lowercase().as_str()) {
-                        return Err(
-                            "a Principal map keys only the AWS, Service, Federated and CanonicalUser principal types"
-                                .to_string(),
-                        );
-                    }
+                    let kind = PrincipalKind::parse(kind).ok_or_else(|| {
+                        "a Principal map keys only the AWS, Service, Federated and CanonicalUser principal types"
+                            .to_string()
+                    })?;
                     let listed = string_list(listed).ok_or_else(|| {
                         "a Principal entry is a string or an array of strings".to_string()
                     })?;
@@ -1268,7 +1337,7 @@ pub mod policy {
                                 "the Principal element this emulator compares lists at most {MAX_ELEMENT_VALUES} principals"
                             ));
                         }
-                        note(&principal, &mut values, &mut any);
+                        note(kind, &principal, &mut values, &mut any);
                     }
                 }
             }
@@ -1475,7 +1544,7 @@ pub mod policy {
                         }
                     }
                     if let Some(element) = &statement.principals {
-                        principals.extend(element.values.iter().cloned());
+                        principals.extend(element.named_values().cloned());
                     }
                     for clause in &statement.conditions {
                         keys.entry(clause.key.clone())
@@ -1593,7 +1662,7 @@ pub mod policy {
                     element.values.iter().for_each(&mut note);
                 }
                 if let Some(element) = &statement.principals {
-                    element.values.iter().for_each(&mut note);
+                    element.named_values().for_each(&mut note);
                 }
                 for clause in &statement.conditions {
                     clause.values.iter().for_each(&mut note);

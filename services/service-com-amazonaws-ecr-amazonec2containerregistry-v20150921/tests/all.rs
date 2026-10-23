@@ -33,6 +33,8 @@ mod layer_upload_sessions;
 mod lifecycle_policy;
 #[path = "all/lifecycle_policy_preview.rs"]
 mod lifecycle_policy_preview;
+#[path = "all/policy_document_canonical_form.rs"]
+mod policy_document_canonical_form;
 #[path = "all/pull_through_cache_rule_deletion.rs"]
 mod pull_through_cache_rule_deletion;
 #[path = "all/pull_through_cache_rules.rs"]

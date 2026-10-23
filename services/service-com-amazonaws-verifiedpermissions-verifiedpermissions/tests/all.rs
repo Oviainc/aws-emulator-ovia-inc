@@ -17,6 +17,8 @@ mod batch_get_policy;
 mod batch_is_authorized;
 #[path = "all/date_time_wire_format.rs"]
 mod date_time_wire_format;
+#[path = "all/delete_policy_template.rs"]
+mod delete_policy_template;
 #[path = "all/error_messages.rs"]
 mod error_messages;
 #[path = "all/evaluation_errors.rs"]

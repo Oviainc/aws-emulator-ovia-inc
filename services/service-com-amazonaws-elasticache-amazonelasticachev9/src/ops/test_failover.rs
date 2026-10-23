@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TestFailover
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TestFailover`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TestFailover::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: tests automatic failover on one node group (shard) of a stored
+//! replication group — the shard's first replica takes the primary role, the primary it
+//! had becomes a replica, and the group answers `modifying` until the clock settles the
+//! node replacement. The scaffold's census marker is gone because this operation is no
+//! longer a stub; see [`TestFailover::handle`] for the refusals the model declares.
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +180,191 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TestFailover` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TestFailoverErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TestFailover"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // The FORM of the identifier before it is resolved, as every lookup in
+        // this service does it: a value no replication group could ever carry is
+        // a bad parameter value rather than a group that does not exist. See
+        // `crate::state::identifier_refusal`.
+        if let Some(message) = crate::state::identifier_refusal(
+            "Replication Group ID",
+            "ReplicationGroupIdentifier",
+            &input.replication_group_id,
+            crate::state::LOOKUP_IDENTIFIER_MAX_LEN,
+        ) {
+            return Err(TestFailoverErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // `ReplicationGroupId` "is stored as a lowercase string", so the lookup
+        // lowercases too.
+        let key = input.replication_group_id.to_ascii_lowercase();
+        let node_group_id = input.node_group_id.clone();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let Some(group) = store.settled_replication_group_mut(&key, now) else {
+            return Err(TestFailoverErrorModeled::ReplicationGroupNotFoundFault(
+                ReplicationGroupNotFoundFault {
+                    message: Some(format!(
+                        "Replication group {} not found.",
+                        input.replication_group_id
+                    )),
+                },
+            )
+            .into());
+        };
+        let status = group.status.clone();
+        let automatic_failover = group.automatic_failover.clone();
+        let shard_exists = group
+            .node_groups
+            .iter()
+            .any(|shard| shard.node_group_id == node_group_id);
+        let shard_replicas = group.shard_replica_count(&node_group_id).unwrap_or_default();
+
+        // Which SHARD the request names is part of the request, resolved before
+        // the group's own state is consulted: a `NodeGroupId` the group does not
+        // have is answered the same whatever the group happens to be doing, so a
+        // caller is never told the group is busy about a shard that does not
+        // exist. `NodeGroupNotFoundFault` is exactly "the node group specified
+        // by the NodeGroupId parameter could not be found".
+        if !shard_exists {
+            return Err(TestFailoverErrorModeled::NodeGroupNotFoundFault(
+                NodeGroupNotFoundFault {
+                    message: Some(format!(
+                        "Node group {node_group_id} not found in replication group {}.",
+                        input.replication_group_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `InvalidReplicationGroupStateFault` is "the requested replication
+        // group is not in the available state": a group still `creating`, or
+        // `modifying` from an earlier change — including the node replacement an
+        // earlier `TestFailover` started, which "must complete before a
+        // subsequent call can be made" — is refused rather than failed over
+        // twice.
+        if status != crate::state::STATUS_AVAILABLE {
+            return Err(TestFailoverErrorModeled::InvalidReplicationGroupStateFault(
+                InvalidReplicationGroupStateFault {
+                    message: Some(format!(
+                        "Replication group {key} is in {status} state, not {}.",
+                        crate::state::STATUS_AVAILABLE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // This operation "tests automatic failover on a specified node group",
+        // so there has to be an automatic failover to test: the group's
+        // `AutomaticFailover` has to be enabled, and the shard has to hold a
+        // replica for the primary role to move to. Neither is a bad parameter
+        // value — the request names a shard this group really has — which is
+        // what `TestFailoverNotAvailableFault` ("the TestFailover action is not
+        // available") says.
+        if automatic_failover != crate::state::FAILOVER_ENABLED {
+            return Err(TestFailoverErrorModeled::TestFailoverNotAvailableFault(
+                TestFailoverNotAvailableFault {
+                    message: Some(format!(
+                        "Replication group {key} has automatic failover {automatic_failover}, so \
+                         there is no automatic failover to test."
+                    )),
+                },
+            )
+            .into());
+        }
+        if shard_replicas < 1 {
+            return Err(TestFailoverErrorModeled::TestFailoverNotAvailableFault(
+                TestFailoverNotAvailableFault {
+                    message: Some(format!(
+                        "Node group {node_group_id} of replication group {key} has no replica to \
+                         fail over to."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "A customer can use this operation to test automatic failover on up to
+        // 15 shards … in any rolling 24-hour period": past that the call is
+        // refused rather than performed. Counted over the ACCEPTED calls, so a
+        // refused one does not spend the allowance.
+        if store.test_failovers_in_window(now) >= crate::state::MAX_TEST_FAILOVERS_PER_WINDOW {
+            return Err(
+                TestFailoverErrorModeled::APICallRateForCustomerExceededFault(
+                    APICallRateForCustomerExceededFault {
+                        message: Some(format!(
+                            "Automatic failover has already been tested on {} node groups in the \
+                             last 24 hours.",
+                            crate::state::MAX_TEST_FAILOVERS_PER_WINDOW
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The failover itself: the shard's first replica takes the primary role
+        // and the primary it had becomes a replica, and the group answers
+        // `modifying` until the clock settles the node replacement — so a caller
+        // that polls straight after this call sees the work in progress, and a
+        // second call on the group is refused until it completes.
+        let Some(group) = store.replication_groups.get_mut(&key) else {
+            // Unreachable: resolved under this same lock above.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+        let failed_over = group
+            .node_groups
+            .iter_mut()
+            .find(|shard| shard.node_group_id == node_group_id)
+            .and_then(crate::state::NodeGroupRecord::fail_over);
+        let Some((demoted, promoted)) = failed_over else {
+            // Unreachable: the shard was resolved above and holds a replica.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+        group.begin_transition(crate::state::STATUS_MODIFYING, now);
+        store.record_test_failover(now);
+
+        // The first of the events this operation documents, "listed here in
+        // order of occurrance: Replication group message: Test Failover API
+        // called for node group <id>". The ones that follow report the node
+        // replacement COMPLETING, which the clock owes rather than this call:
+        // the transition recorded when the group settles back to `available` is
+        // that event (see `ComAmazonawsElasticacheAmazonelasticachev9State::settle_all`).
+        store.record_event(
+            crate::state::SOURCE_TYPE_REPLICATION_GROUP,
+            &key,
+            format!(
+                "Test Failover API called for node group {node_group_id}: failing over from \
+                 primary node {demoted} to replica node {promoted}"
+            ),
+            now,
+        );
+
+        let Some(answer) = store.modeled_replication_group(&key) else {
+            // Unreachable, for the same reason.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+        Ok(TestFailoverOutput {
+            replication_group: Some(answer),
+        })
     }
 }

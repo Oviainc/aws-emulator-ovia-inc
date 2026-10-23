@@ -2,10 +2,12 @@
 
 //! @op PutRegistryPolicy
 //! Creates or replaces the permissions policy of this emulator's registry: the document
-//! is validated as a resource-based IAM policy and then persisted in [`crate::state`]
-//! exactly as it arrived, so `GetRegistryPolicy` reads it back byte for byte and a later
-//! put replaces it. A document that is not a usable registry policy is refused with
-//! `InvalidParameterException` and nothing is stored.
+//! is validated as a resource-based IAM policy and then persisted in [`crate::state`] in
+//! the canonical IAM-policy rendering ECR reports a policy in
+//! ([`crate::state::canonical_policy_document`]), so `GetRegistryPolicy` reads back the
+//! same document this call answered with and a later put replaces it. A document that is
+//! not a usable registry policy is refused with `InvalidParameterException` and nothing
+//! is stored.
 //!
 //! ## Shape of an operation
 //!
@@ -168,9 +170,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::validate_registry_policy("policyText", &input.policy_text)
             .map_err(invalid_parameter)?;
 
-        // Stored verbatim — not reserialised — so every later read returns the caller's
-        // own bytes, and a second put replaces the first (last writer wins).
-        let policy_text = input.policy_text;
+        // Stored — and answered with — in the canonical IAM-policy rendering ECR echoes
+        // an attached policy in: the caller's own tokens, in the caller's own order,
+        // re-indented and nothing more. A second put replaces the first (last writer
+        // wins).
+        let policy_text = crate::state::canonical_policy_document(&input.policy_text);
         state.lock().registry_policy = Some(policy_text.clone());
 
         Ok(PutRegistryPolicyOutput {

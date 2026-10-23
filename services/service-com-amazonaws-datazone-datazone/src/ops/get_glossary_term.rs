@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetGlossaryTerm
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetGlossaryTerm`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetGlossaryTerm::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one stored business glossary term of a domain, read from the record
+//! `CreateGlossaryTerm` persisted — a term of another domain, or one nothing created, is
+//! answered with the modelled 404.
+//!
+//! A pure READ: it writes nothing beyond the clock-owed domain transitions every
+//! handler materialises first (`crate::state::settle_clock`).
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +169,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetGlossaryTerm` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetGlossaryTermErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetGlossaryTerm"))
+        let _ = ctx;
+        use crate::state::{
+            date_time, now_ms, term_relations_output, term_usage_restrictions, ResourceKind,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetGlossaryTermErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        store.settle_clock(now_ms());
+
+        // A term is addressed by its domain and its own id, so a term of ANOTHER domain
+        // is as absent here as one that was never created.
+        let domain = store.live_domain(&input.domain_identifier).ok_or_else(|| {
+            GetGlossaryTermErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: ResourceKind::Domain.not_found_message(),
+            })
+        })?;
+        let term = domain.glossary_terms.get(&input.identifier).ok_or_else(|| {
+            GetGlossaryTermErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: ResourceKind::GlossaryTerm.not_found_message(),
+            })
+        })?;
+
+        Ok(GetGlossaryTermOutput {
+            domain_id: term.domain_id.clone(),
+            glossary_id: term.glossary_id.clone(),
+            id: term.id.clone(),
+            name: term.name.clone(),
+            short_description: term.short_description.clone(),
+            long_description: term.long_description.clone(),
+            term_relations: term_relations_output(&term.term_relations),
+            status: term.status.clone(),
+            created_at: Some(date_time(term.created_at_ms)),
+            created_by: Some(term.created_by.clone()),
+            updated_at: term.updated_at_ms.map(date_time),
+            updated_by: term.updated_by.clone(),
+            // The restriction is the owning GLOSSARY's, by the rule
+            // `crate::state::term_usage_restrictions` states.
+            usage_restrictions: term_usage_restrictions(domain, &term.glossary_id),
+        })
     }
 }

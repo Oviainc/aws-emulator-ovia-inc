@@ -35,6 +35,8 @@ mod form_type_deletion;
 mod form_type_revisions;
 #[path = "all/glossary_lifecycle.rs"]
 mod glossary_lifecycle;
+#[path = "all/glossary_terms.rs"]
+mod glossary_terms;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/listing_change_set.rs"]

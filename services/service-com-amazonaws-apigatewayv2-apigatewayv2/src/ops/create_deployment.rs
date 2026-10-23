@@ -231,6 +231,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let deployment_id = api.mint_deployment_id();
+        // ONE clock reading for this call: the deployment's creation instant is also the
+        // instant a stage released to it was last changed, so the two cannot disagree.
+        let now = ::std::time::SystemTime::now();
 
         let record = crate::state::Deployment {
             deployment_id: deployment_id.clone(),
@@ -245,17 +248,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The caller asked for this deployment, so the service did not release it
             // by itself for an auto-deploying stage.
             auto_deployed: false,
-            created_date: ::std::time::SystemTime::now(),
+            created_date: now,
         };
 
         // A stage serves ONE deployment, so deploying to it moves the stage onto this
-        // one; a later GetStage reports the move.
+        // one; a later GetStage reports the move. Moving it REWRITES the stage record,
+        // so the stage was "last updated" at this instant (`Stage$LastUpdatedDate`: "The
+        // timestamp when the stage was last updated") — its `CreatedDate` does not move.
         if let Some(stage) = input
             .stage_name
             .as_ref()
             .and_then(|stage_name| api.stages.get_mut(stage_name))
         {
             stage.deployment_id = Some(deployment_id.clone());
+            stage.last_updated_date = now;
         }
 
         // Read the response back out of the STORE, so what the caller gets is what a
