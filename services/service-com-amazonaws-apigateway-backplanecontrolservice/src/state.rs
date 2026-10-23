@@ -190,6 +190,11 @@ pub struct StageEntry {
     /// stage has no cache cluster, which is reported `NOT_AVAILABLE`. See
     /// [`CACHE_CLUSTER_CREATE_SPAN`].
     pub cache_cluster_ready_at: Option<::std::time::Instant>,
+    /// When the LAST cache flush `FlushStageCache` started on this stage finishes. A
+    /// cluster is reported `FLUSH_IN_PROGRESS` until this instant and `AVAILABLE` from
+    /// it on, so an instant already in the past means no flush is outstanding; absent
+    /// until the stage is flushed at all. See [`CACHE_CLUSTER_FLUSH_SPAN`].
+    pub cache_flush_done_at: Option<::std::time::Instant>,
     pub variables: BTreeMap<String, String>,
     pub documentation_version: Option<String>,
     pub canary_settings: Option<CanarySettings>,
@@ -209,14 +214,21 @@ impl StageEntry {
     /// cluster the caller asked for is created over [`CACHE_CLUSTER_CREATE_SPAN`], so a
     /// caller reading straight after the call still sees `CREATE_IN_PROGRESS`; the
     /// transition is one the CLOCK owes, materialised from the stored due instant rather
-    /// than by sleeping or by being read.
+    /// than by sleeping or by being read. A cluster a `FlushStageCache` call emptied
+    /// reports `FLUSH_IN_PROGRESS` over [`CACHE_CLUSTER_FLUSH_SPAN`] the same way, and is
+    /// `AVAILABLE` again once that instant has passed.
     pub fn cache_cluster_status(&self) -> &'static str {
+        let now = ::std::time::Instant::now();
         match self.cache_cluster_ready_at {
             None => CACHE_CLUSTER_NOT_AVAILABLE,
-            Some(ready_at) if ::std::time::Instant::now() < ready_at => {
-                CACHE_CLUSTER_CREATE_IN_PROGRESS
+            Some(ready_at) if now < ready_at => CACHE_CLUSTER_CREATE_IN_PROGRESS,
+            Some(_) => {
+                if self.cache_flush_done_at.is_some_and(|done_at| now < done_at) {
+                    CACHE_CLUSTER_FLUSH_IN_PROGRESS
+                } else {
+                    CACHE_CLUSTER_AVAILABLE
+                }
             }
-            Some(_) => CACHE_CLUSTER_AVAILABLE,
         }
     }
 }
@@ -780,6 +792,16 @@ pub const CACHE_CLUSTER_CREATE_IN_PROGRESS: &str = "CREATE_IN_PROGRESS";
 
 /// The `cacheClusterStatus` of a cache cluster that is up.
 pub const CACHE_CLUSTER_AVAILABLE: &str = "AVAILABLE";
+
+/// The `cacheClusterStatus` of a cache cluster whose entries are being flushed.
+pub const CACHE_CLUSTER_FLUSH_IN_PROGRESS: &str = "FLUSH_IN_PROGRESS";
+
+/// How long a stage's cache cluster stays `FLUSH_IN_PROGRESS` after
+/// `FlushStageCache` empties it, after which it reports `AVAILABLE` again. API Gateway
+/// documents no duration for a flush, so this span is the emulator's own, chosen so a
+/// caller reading straight after `FlushStageCache` still observes `FLUSH_IN_PROGRESS`.
+pub const CACHE_CLUSTER_FLUSH_SPAN: ::std::time::Duration =
+    ::std::time::Duration::from_millis(500);
 
 /// From `Authorizer$authorizerResultTtlInSeconds`'s own documentation: "If this field
 /// is not set, the default value is 300."

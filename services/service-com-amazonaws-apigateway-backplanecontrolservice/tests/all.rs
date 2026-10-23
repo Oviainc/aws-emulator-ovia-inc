@@ -27,6 +27,8 @@ mod documentation_parts;
 mod documentation_versions;
 #[path = "all/epoch_second_timestamps.rs"]
 mod epoch_second_timestamps;
+#[path = "all/flush_stage_cache.rs"]
+mod flush_stage_cache;
 #[path = "all/gateway_response.rs"]
 mod gateway_response;
 #[path = "all/integration_response.rs"]

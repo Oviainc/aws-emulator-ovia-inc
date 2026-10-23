@@ -399,6 +399,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             cache_cluster_ready_at: input.cache_cluster_enabled.then(|| {
                 ::std::time::Instant::now() + crate::state::CACHE_CLUSTER_CREATE_SPAN
             }),
+            // No flush has run on a stage this call creates.
+            cache_flush_done_at: None,
             variables: input
                 .variables
                 .unwrap_or_default()
