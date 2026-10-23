@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeInferenceComponent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeInferenceComponent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeInferenceComponent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: replays what `CreateInferenceComponent` stored, settling the
+//! `Creating` -> `InService` transition the clock already owed the component and
+//! deriving its runtime-config summary from that status. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -144,6 +139,45 @@ impl<Eng> DescribeInferenceComponent<Eng> {
     }
 }
 
+/// The summary form of one stored specification.
+///
+/// Every member is replayed as stored; the two that differ in the summary shape are
+/// `Container` (an `InferenceComponentContainerSpecificationSummary`, whose image is
+/// reported as a `DeployedImage`) and `DataCacheConfig`.
+fn specification_summary(
+    specification: &InferenceComponentSpecification,
+) -> InferenceComponentSpecificationSummary {
+    InferenceComponentSpecificationSummary {
+        instance_type: specification.instance_type.clone(),
+        model_name: specification.model_name.clone(),
+        container: specification.container.as_ref().map(|container| {
+            InferenceComponentContainerSpecificationSummary {
+                // `SpecifiedImage` is the image the specification named. This emulator
+                // pulls nothing from a registry, so there is no digest it could report
+                // as `ResolvedImage` and no instant it resolved one at: both members are
+                // optional and stay absent rather than carrying a made-up digest.
+                deployed_image: container.image.as_ref().map(|image| DeployedImage {
+                    specified_image: Some(image.clone()),
+                    resolved_image: None,
+                    resolution_time: None,
+                }),
+                artifact_url: container.artifact_url.clone(),
+                environment: container.environment.clone(),
+                container_metrics_config: container.container_metrics_config.clone(),
+            }
+        }),
+        startup_parameters: specification.startup_parameters.clone(),
+        compute_resource_requirements: specification.compute_resource_requirements.clone(),
+        base_inference_component_name: specification.base_inference_component_name.clone(),
+        data_cache_config: specification.data_cache_config.as_ref().map(|cache| {
+            InferenceComponentDataCacheConfigSummary {
+                enable_caching: cache.enable_caching,
+            }
+        }),
+        scheduling_config: specification.scheduling_config.clone(),
+    }
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for DescribeInferenceComponent<Eng>
 {
@@ -161,18 +195,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeInferenceComponent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeInferenceComponentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let mut store = state.lock();
+        let Some(component) = store
+            .inference_components
+            .get_mut(&input.inference_component_name)
+        else {
+            let arn = crate::state::resource_arn(
+                &crate::state::request_region(ctx),
+                "inference-component",
+                &input.inference_component_name,
+            );
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Could not find inference component \"{arn}\"."
+            )));
+        };
+
+        // The only write this reporting call makes: the deployment the clock already
+        // owed. It was due at the stored instant whether or not anybody described the
+        // component, so a waiter terminates and no caller's read changes the outcome.
+        let settled = component.settle_status(::std::time::SystemTime::now());
+        let in_service = component.status == crate::state::STATUS_IN_SERVICE;
+
+        // `DesiredCopyCount` is the count the caller asked for; `CurrentCopyCount` is
+        // how many are running, which is none while the component is still `Creating`
+        // and all of them once the placement the clock owed has happened.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeInferenceComponent"))
+        // `PlacementStatus` is per INSTANCE TYPE, so it is reported only where this
+        // emulator can state it without inventing a distribution: when the
+        // specifications name exactly one distinct instance type, every current copy
+        // sits on it. Several distinct types means the copies are split across them in a
+        // way nothing here places, and none at all leaves nothing to key the entry on
+        // (the list is `len 1..`), so the member is omitted in both cases.
+        let runtime_config = component.runtime_config.as_ref().map(|runtime| {
+            let current = if in_service { runtime.copy_count } else { 0 };
+            let instance_types: ::std::collections::BTreeSet<&str> = component
+                .specifications()
+                .iter()
+                .filter_map(|specification| specification.instance_type.as_deref())
+                .collect();
+            let placement = match instance_types.iter().copied().next() {
+                Some(instance_type) if instance_types.len() == 1 => {
+                    Some(vec![InferenceComponentPlacementStatus {
+                        instance_type: instance_type.to_string(),
+                        current_copy_count: current,
+                    }])
+                }
+                _ => None,
+            };
+            InferenceComponentRuntimeConfigSummary {
+                desired_copy_count: Some(runtime.copy_count),
+                current_copy_count: Some(current),
+                placement_status: placement,
+            }
+        });
+
+        let output = DescribeInferenceComponentOutput {
+            inference_component_name: component.name.clone(),
+            inference_component_arn: component.arn.clone(),
+            endpoint_name: component.endpoint_name.clone(),
+            endpoint_arn: component.endpoint_arn.clone(),
+            variant_name: component.variant_name.clone(),
+            failure_reason: component.failure_reason.clone(),
+            specification: component.specification.as_ref().map(specification_summary),
+            // Set only when the component was created with the plural member, so the
+            // singular `Specification` is never reported beside it. The summary list is
+            // `len 1..`, so an empty one is omitted rather than serialised.
+            specifications: component
+                .specifications
+                .as_ref()
+                .filter(|list| !list.is_empty())
+                .map(|list| list.iter().map(specification_summary).collect()),
+            runtime_config,
+            creation_time: crate::state::timestamp(component.creation_time),
+            last_modified_time: crate::state::timestamp(component.last_modified_time),
+            inference_component_status: Some(component.status.clone()),
+            // Nothing has updated this component: `UpdateInferenceComponent` is still
+            // scaffolded, so there is no deployment configuration to report.
+            last_deployment_config: None,
+        };
+        let arn = component.arn.clone();
+        drop(store);
+
+        if settled {
+            // The transition is a state change, so it leaves the same record a create
+            // does rather than happening unobservably on a read path.
+            crate::state::record_state_change(Self::NAME, &arn, ctx);
+        }
+        Ok(output)
     }
 }

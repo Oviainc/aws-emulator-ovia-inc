@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/access_policy.rs"]
 mod access_policy;
+#[path = "all/account_settings.rs"]
+mod account_settings;
 #[path = "all/collection_group_lifecycle.rs"]
 mod collection_group_lifecycle;
 #[path = "all/collection_lifecycle.rs"]

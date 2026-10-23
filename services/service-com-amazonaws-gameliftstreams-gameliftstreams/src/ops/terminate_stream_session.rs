@@ -174,7 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        let region = crate::state::region_of(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(TerminateStreamSessionErrorModeled::InternalServerException(
                 InternalServerException {
@@ -188,37 +188,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.materialize(now);
 
-        let Some(session_id) = crate::state::identifier_id(
+        // Session-scoped: the resource this call addresses is the stream session the
+        // two path labels name, so an unresolvable session identifier, an absent
+        // group and an absent session are the SAME miss, reported against the
+        // composite stream session ARN.
+        let session = crate::state::identifier_id(
             &input.stream_session_identifier,
             crate::state::STREAM_SESSION_RESOURCE,
-        ) else {
+        )
+        .and_then(|session_id| {
+            state
+                .stream_group_mut(&input.identifier)
+                .and_then(move |group| group.sessions.get_mut(&session_id))
+        });
+        let Some(session) = session else {
             return Err(TerminateStreamSessionErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!(
-                        "no stream session matches identifier {}",
-                        input.stream_session_identifier
+                crate::state::stream_session_not_found(
+                    &crate::state::resolved_stream_session_arn(
+                        &region,
+                        &input.identifier,
+                        &input.stream_session_identifier,
                     ),
-                },
-            )
-            .into());
-        };
-        let Some(group) = state.stream_group_mut(&input.identifier) else {
-            return Err(TerminateStreamSessionErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("no stream group matches identifier {}", input.identifier),
-                },
-            )
-            .into());
-        };
-        let group_id = group.id.clone();
-        let Some(session) = group.sessions.get_mut(&session_id) else {
-            return Err(TerminateStreamSessionErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!(
-                        "no stream session matches identifier {} in stream group {}",
-                        input.stream_session_identifier, group_id
-                    ),
-                },
+                ),
             )
             .into());
         };

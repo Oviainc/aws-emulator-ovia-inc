@@ -191,6 +191,82 @@ impl NotificationHubRecord {
     }
 }
 
+/// `DISABLED`, the `AccessStatus` of Service Trust Enablement between User
+/// Notifications and Amazon Web Services Organizations in an account where
+/// nobody has enabled it.
+///
+/// One of `AccessStatus`'s four modelled values
+/// (`crate::ops::types::ACCESS_STATUS_VALUES`). It is the status a store that
+/// has never seen an `EnableNotificationsAccessForOrganization` reports, and the
+/// status a `DisableNotificationsAccessForOrganization` returns the account to.
+pub const ORGANIZATION_ACCESS_DISABLED: &str = "DISABLED";
+
+/// `PENDING`, the transitional `AccessStatus` an account carries between the
+/// `EnableNotificationsAccessForOrganization` that asked for service trust and
+/// the instant that trust is in force.
+///
+/// Enabling trust is an organization-wide step, and `PENDING` is the modelled
+/// value that names it in flight — the only operations that touch this status
+/// are the enable and the disable, so this is where it arises. The clock, not a
+/// read, moves it to [`ORGANIZATION_ACCESS_ENABLED`]
+/// [`ORGANIZATION_ACCESS_TRANSITION_SPAN`] later.
+pub const ORGANIZATION_ACCESS_PENDING: &str = "PENDING";
+
+/// `ENABLED`, the `AccessStatus` of an account whose service trust is in force.
+/// Terminal: nothing moves out of it but a
+/// `DisableNotificationsAccessForOrganization`.
+pub const ORGANIZATION_ACCESS_ENABLED: &str = "ENABLED";
+
+/// How long service trust stays [`ORGANIZATION_ACCESS_PENDING`] before the clock
+/// makes [`ORGANIZATION_ACCESS_ENABLED`] due.
+///
+/// AWS publishes no duration for the step, so this span is the EMULATOR's own
+/// choice; what matters is that it is never zero — a caller reading straight
+/// after the enable still observes the `PENDING` the model declares — and that
+/// it is short enough to wait on. Nothing sleeps for it: the due instant is
+/// stored and
+/// [`ComAmazonawsNotificationsNotificationsState::settle_due_organization_access`]
+/// materialises it once it has fallen due.
+pub const ORGANIZATION_ACCESS_TRANSITION_SPAN: Duration = Duration::from_millis(500);
+
+/// The persisted state of Service Trust Enablement between User Notifications
+/// and Amazon Web Services Organizations for this account.
+///
+/// `EnableNotificationsAccessForOrganization` moves it to `PENDING`,
+/// `DisableNotificationsAccessForOrganization` returns it to `DISABLED`, and
+/// `GetNotificationsAccessForOrganization` reports it. There is exactly one such
+/// record per account, so it is a single field on the store rather than a map.
+#[derive(Debug, Clone)]
+pub struct OrganizationAccessRecord {
+    /// `notificationsAccessForOrganization.accessStatus`, one of
+    /// `AccessStatus`'s modelled values.
+    pub access_status: String,
+    /// When the clock owes this record its next step, or `None` when it is
+    /// settled. See [`ORGANIZATION_ACCESS_TRANSITION_SPAN`].
+    pub due_at: Option<SystemTime>,
+}
+
+impl Default for OrganizationAccessRecord {
+    /// Service trust is off until an account enables it, so a store that has
+    /// never seen an enable reports `DISABLED` and owes the clock nothing.
+    fn default() -> Self {
+        Self {
+            access_status: ORGANIZATION_ACCESS_DISABLED.to_string(),
+            due_at: None,
+        }
+    }
+}
+
+impl OrganizationAccessRecord {
+    /// This record as the wire shape `GetNotificationsAccessForOrganization`
+    /// reports.
+    pub fn overview(&self) -> crate::ops::types::NotificationsAccessForOrganization {
+        crate::ops::types::NotificationsAccessForOrganization {
+            access_status: self.access_status.clone(),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-notifications-notifications. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsNotificationsNotificationsState {
@@ -207,6 +283,10 @@ pub struct ComAmazonawsNotificationsNotificationsState {
     /// record's [`NotificationHubRecord::sequence`], so a listing's order and its
     /// page tokens survive a deregister and a re-register of the same region.
     pub hubs_registered: u64,
+    /// Service Trust Enablement between User Notifications and Amazon Web
+    /// Services Organizations for this account. One record per account, holding
+    /// `DISABLED` until an enable asks for trust.
+    pub organization_access: OrganizationAccessRecord,
 }
 
 impl ComAmazonawsNotificationsNotificationsState {
@@ -323,6 +403,56 @@ impl ComAmazonawsNotificationsNotificationsState {
         let mut records: Vec<&NotificationHubRecord> = self.hubs.values().collect();
         records.sort_by_key(|record| record.sequence);
         records
+    }
+
+    /// Materialise the organization-access transition the clock has already made
+    /// due as of `now`: trust that was asked for becomes `ENABLED` once its
+    /// [`ORGANIZATION_ACCESS_TRANSITION_SPAN`] has elapsed.
+    ///
+    /// Every organization-access operation calls this first, including the
+    /// reporting one: the step was owed at that instant whether or not anybody
+    /// called, so applying it is not a mutation this request chose. Nothing here
+    /// sleeps or depends on a request's shape.
+    pub fn settle_due_organization_access(&mut self, now: SystemTime) {
+        let Some(due_at) = self.organization_access.due_at else {
+            return;
+        };
+        if due_at > now {
+            return;
+        }
+        self.organization_access.due_at = None;
+        if self.organization_access.access_status == ORGANIZATION_ACCESS_PENDING {
+            self.organization_access.access_status = ORGANIZATION_ACCESS_ENABLED.to_string();
+        }
+    }
+
+    /// Ask for service trust between User Notifications and Organizations, and
+    /// return the stored record.
+    ///
+    /// The enable is `@idempotent`: an account whose trust is already in force,
+    /// or already on its way there, keeps the record it has — so repeating the
+    /// call neither restarts the transition nor moves a settled account back to
+    /// `PENDING`. Call [`Self::settle_due_organization_access`] first, or an
+    /// enablement the clock has already completed still looks pending.
+    pub fn enable_organization_access(&mut self, now: SystemTime) -> &OrganizationAccessRecord {
+        if self.organization_access.access_status == ORGANIZATION_ACCESS_DISABLED {
+            self.organization_access = OrganizationAccessRecord {
+                access_status: ORGANIZATION_ACCESS_PENDING.to_string(),
+                due_at: Some(now + ORGANIZATION_ACCESS_TRANSITION_SPAN),
+            };
+        }
+        &self.organization_access
+    }
+
+    /// Withdraw service trust, and return the stored record.
+    ///
+    /// `DISABLED` is immediate and terminal — `AccessStatus` models no
+    /// transitional value on the way out — and it also cancels an enablement
+    /// the clock has not yet made due, so a disable can never be overtaken by
+    /// the enable it followed.
+    pub fn disable_organization_access(&mut self) -> &OrganizationAccessRecord {
+        self.organization_access = OrganizationAccessRecord::default();
+        &self.organization_access
     }
 }
 

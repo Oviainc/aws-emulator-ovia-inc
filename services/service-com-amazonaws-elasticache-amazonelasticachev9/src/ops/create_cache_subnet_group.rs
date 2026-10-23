@@ -252,6 +252,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
         if store.cache_subnet_groups.contains_key(&name) {
@@ -297,6 +298,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags,
         };
         store.cache_subnet_groups.insert(name.clone(), record);
+        // Creating a cache subnet group is one of the events this service
+        // records; see `crate::state::EventRecord`.
+        store.record_event(
+            crate::state::SOURCE_TYPE_CACHE_SUBNET_GROUP,
+            &name,
+            "Cache subnet group created",
+            now,
+        );
 
         // Read back out of the store, so the response is the persisted group
         // rather than the request echoed.

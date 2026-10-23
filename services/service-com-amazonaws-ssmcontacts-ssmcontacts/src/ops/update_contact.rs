@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateContact
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateContact`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateContact::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the contact or escalation plan `ContactId` names, IN PLACE, in
+//! [`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::contacts`], so the next
+//! `GetContact`/`ListContacts` reports what this call wrote.
+//!
+//! Two things happen before the write, in this order:
+//!
+//! 1. The ACCOUNT-level Incident Manager precondition
+//!    ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`]):
+//!    SSM Contacts is fronted by a per-account replication set, and until the account has
+//!    an active one the data-plane call is refused with the modelled `ValidationException`
+//!    (HTTP 400) WITHOUT resolving `ContactId` — so a non-onboarded account is told its
+//!    account is not onboarded, never that its contact is missing.
+//! 2. The resource lookup: an onboarded account naming a `ContactId` the store does not
+//!    hold gets the modelled `ResourceNotFoundException` (HTTP 404).
+//!
+//! The update itself is a PATCH, not a replace: `DisplayName` and `Plan` are both optional,
+//! so each one the request names overwrites the stored value and each one it omits is left
+//! exactly as it was. `Alias` and `Type` are not in the input at all, so no update can
+//! change a contact's identity or kind.
+//!
+//! Like `CreateContact`, the `Plan` is persisted as given: the model constrains the stage
+//! durations and the target ARNs (already enforced at the boundary) but documents no rule
+//! tying a plan's shape to the contact's `Type`, so inventing one here would refuse
+//! requests AWS admits.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +172,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateContact` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateContactErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateContact"))
+        // This operation addresses its contact by ARN and reads nothing off the request
+        // envelope, so no request metadata is consulted.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateContactErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "this service is mounted on an engine that holds no state"
+                        .to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+
+        let mut state = state.lock();
+
+        // The account gate comes FIRST: it is evaluated before `ContactId` is resolved, so
+        // a non-onboarded account is refused identically whether or not its contact exists.
+        state
+            .require_active_replication_set()
+            .map_err(account_precondition_failed)?;
+
+        let Some(contact) = state.contacts.get_mut(&input.contact_id) else {
+            return Err(UpdateContactErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Contact {} not found", input.contact_id),
+                    resource_id: input.contact_id.clone(),
+                    resource_type: CONTACT_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // Named members replace, omitted members are left alone — including a `DisplayName`
+        // the request sets to the empty string, which `ContactName`'s modelled length
+        // (0..255) admits and which is a value, not an omission.
+        if let Some(display_name) = &input.display_name {
+            contact.display_name = Some(display_name.clone());
+        }
+        if let Some(plan) = &input.plan {
+            contact.plan = plan.clone();
+        }
+
+        Ok(UpdateContactOutput {})
     }
+}
+
+/// The `resourceType` this operation's not-found error names, spelled as `CreateContact`'s
+/// conflict and quota errors spell it.
+const CONTACT_RESOURCE_TYPE: &str = "contact";
+
+/// The account precondition's refusal: this operation's modelled `ValidationException`,
+/// which the model classifies `client` with `httpError` 400.
+///
+/// `reason` carries `OTHER` because the failure is not a member-level one, and `OTHER` is
+/// the modelled `ValidationExceptionReason` value for that (the whole value set is rendered
+/// as [`VALIDATION_EXCEPTION_REASON_VALUES`]); `fields` is present but EMPTY for the same
+/// reason — no field of the request is at fault.
+fn account_precondition_failed(message: String) -> UpdateContactError {
+    UpdateContactErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some("OTHER".to_string()),
+        fields: Some(Vec::new()),
+    })
+    .into()
 }

@@ -4,6 +4,11 @@
 //! Creates or replaces a metric alarm in this service's store. Implemented here — this
 //! is the ONLY file to touch for this operation.
 //!
+//! An EC2 instance action (`arn:aws:automate:region:ec2:stop|terminate|reboot|recover`, or
+//! its Simple Workflow equivalent) is accepted only on an alarm whose metric is dimensioned
+//! by `InstanceId`; any other request carrying one is refused with HTTP 400
+//! `ValidationError` and stores nothing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -247,6 +252,118 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The dimension that makes a metric a per-instance EC2 metric: an EC2 instance action can
+/// only ever execute against the instance the alarm's metric names, and `InstanceId` is the
+/// dimension that names it.
+const INSTANCE_ID_DIMENSION: &str = "InstanceId";
+
+/// The EC2 instance actions an alarm action list may carry, as this operation's own
+/// `AlarmActions` / `OKActions` / `InsufficientDataActions` documentation lists them:
+/// `arn:aws:automate:region:ec2:stop|terminate|reboot|recover` and the equivalent Simple
+/// Workflow forms `arn:aws:swf:region:account-id:action/actions/AWS_EC2.InstanceId.<Action>/1.0`.
+const EC2_INSTANCE_ACTIONS: [&str; 4] = ["stop", "terminate", "reboot", "recover"];
+
+/// The Simple Workflow EC2-instance-action resource prefix, from the same documentation.
+const SWF_EC2_ACTION_PREFIX: &str = "action/actions/AWS_EC2.InstanceId.";
+
+/// Whether `arn` names one of the EC2 instance actions in [`EC2_INSTANCE_ACTIONS`].
+///
+/// The partition and region segments are not matched: an EC2 instance action is one
+/// whatever partition or region it names, and an action in another region is still an EC2
+/// instance action (CloudWatch refuses it for the same reason). Any other ARN — an SNS
+/// topic, an Auto Scaling policy, an SSM OpsItem — carries no instance precondition.
+fn is_ec2_instance_action(arn: &str) -> bool {
+    // `arn:<partition>:<service>:<region>:<account>:<resource>`, resource last so a
+    // resource containing `:` stays whole.
+    let mut segments = arn.splitn(6, ':');
+    if segments.next() != Some("arn") {
+        return false;
+    }
+    let _partition = segments.next();
+    let service = segments.next().unwrap_or_default();
+    let _region = segments.next();
+    let account = segments.next().unwrap_or_default();
+    let resource = segments.next().unwrap_or_default();
+    match service {
+        "automate" => {
+            account == "ec2"
+                && EC2_INSTANCE_ACTIONS
+                    .iter()
+                    .any(|action| resource.eq_ignore_ascii_case(action))
+        }
+        "swf" => resource
+            .strip_prefix(SWF_EC2_ACTION_PREFIX)
+            .and_then(|rest| rest.strip_suffix("/1.0"))
+            .is_some_and(|action| {
+                EC2_INSTANCE_ACTIONS
+                    .iter()
+                    .any(|known| action.eq_ignore_ascii_case(known))
+            }),
+        _ => false,
+    }
+}
+
+/// Whether a dimension list identifies one EC2 instance: it carries an `InstanceId`
+/// dimension with a value. A dimension is `Name`/`Value`, both required, so an empty value
+/// names no instance.
+fn dimensioned_by_instance_id(dimensions: Option<&Vec<Dimension>>) -> bool {
+    dimensions.is_some_and(|dimensions| {
+        dimensions
+            .iter()
+            .any(|dimension| dimension.name == INSTANCE_ID_DIMENSION && !dimension.value.is_empty())
+    })
+}
+
+/// Whether EVERY metric this alarm watches is dimensioned by `InstanceId`.
+///
+/// * With `MetricName` the alarm watches exactly one metric, the one the request's own
+///   `Dimensions` identify ("The dimensions for the metric specified in MetricName").
+/// * With `Metrics` the alarm watches the result of a query array, so every metric the
+///   array RETRIEVES has to be a per-instance metric; a query that is only an `Expression`
+///   retrieves none, and an array that retrieves nothing identifies no instance.
+/// * With `EvaluationCriteria` (a PromQL query) the alarm identifies no dimensioned metric
+///   at all.
+fn watches_instance_metric_only(input: &PutMetricAlarmInput) -> bool {
+    if let Some(queries) = input.metrics.as_deref() {
+        let retrieved: Vec<&MetricStat> = queries
+            .iter()
+            .filter_map(|query| query.metric_stat.as_ref())
+            .collect();
+        return !retrieved.is_empty()
+            && retrieved
+                .iter()
+                .all(|stat| dimensioned_by_instance_id(stat.metric.dimensions.as_ref()));
+    }
+    input.metric_name.is_some() && dimensioned_by_instance_id(input.dimensions.as_ref())
+}
+
+/// CloudWatch's refusal text for this precondition.
+///
+/// A fixed sentence, not built from the request: the service answers the same one for every
+/// EC2 instance action asked for on an alarm that does not monitor an EC2 instance, in any
+/// of the three action lists, so the message carries no member name or ARN.
+const EC2_ACTION_REFUSAL: &str = "Invalid use of EC2 action. An EC2 action can only be used \
+                                  if the alarm is monitoring an EC2 instance.";
+
+/// Whether this request asks for an EC2 instance action its metric cannot carry out.
+///
+/// All three action lists count: each one's documentation lists the same EC2 action values,
+/// so an EC2 action anywhere among them needs the same per-instance metric.
+fn carries_unsatisfiable_ec2_action(input: &PutMetricAlarmInput) -> bool {
+    if watches_instance_metric_only(input) {
+        return false;
+    }
+    [
+        input.alarm_actions.as_deref(),
+        input.ok_actions.as_deref(),
+        input.insufficient_data_actions.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .flatten()
+    .any(|arn| is_ec2_instance_action(arn))
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -342,6 +459,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // An EC2 instance action executes against the instance the alarm's metric names, so
+        // an alarm whose metric is not dimensioned by `InstanceId` could never carry one
+        // out. CloudWatch refuses such a request outright rather than storing an alarm with
+        // an action that can never run — checked before anything is written, so a refused
+        // request leaves the store exactly as it was.
+        if carries_unsatisfiable_ec2_action(&input) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                EC2_ACTION_REFUSAL,
+            ));
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             PutMetricAlarmErrorModeled::InternalServiceFault(InternalServiceFault {
                 message: Some("the CloudWatch alarm store is unavailable".into()),

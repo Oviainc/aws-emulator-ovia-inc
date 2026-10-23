@@ -8,13 +8,15 @@
 //! project's [`crate::ops::types::Webhook`], `StartBuild` writes a
 //! [`StoredBuild`], `StartBuildBatch` writes a [`StoredBuildBatch`],
 //! `StartSandbox` writes a [`StoredSandbox`] and `StopSandbox` ends one,
+//! `StartCommandExecution` writes a [`StoredCommandExecution`],
 //! `CreateReportGroup` writes a [`StoredReportGroup`],
 //! `ImportSourceCredentials` writes a [`StoredSourceCredentials`],
 //! `BatchDeleteBuilds` removes a build, and the reporting operations
 //! (`BatchGetProjects`, `BatchGetBuilds`, `BatchGetBuildBatches`,
-//! `BatchGetFleets`, `BatchGetSandboxes`, `BatchGetReportGroups`,
-//! `ListProjects`, `ListBuildsForProject`, `ListSandboxes`,
-//! `ListSandboxesForProject`, `ListSourceCredentials`) only read them.
+//! `BatchGetFleets`, `BatchGetSandboxes`, `BatchGetCommandExecutions`,
+//! `BatchGetReportGroups`, `ListProjects`, `ListBuildsForProject`,
+//! `ListSandboxes`, `ListSandboxesForProject`, `ListSourceCredentials`) only
+//! read them.
 //!
 //! The model shapes themselves are what is stored, so a read hands back exactly
 //! the structure the write persisted rather than a second, drifting copy of the
@@ -23,9 +25,9 @@
 use std::collections::BTreeMap;
 
 use crate::ops::types::{
-    Build, BuildArtifacts, BuildBatch, BuildBatchPhase, BuildPhase, EnvironmentVariable, Fleet,
-    FleetStatus, PhaseContext, Project, ProjectArtifacts, ReportGroup, Sandbox, SandboxSession,
-    SandboxSessionPhase, SourceCredentialsInfo,
+    Build, BuildArtifacts, BuildBatch, BuildBatchPhase, BuildPhase, CommandExecution,
+    EnvironmentVariable, Fleet, FleetStatus, PhaseContext, Project, ProjectArtifacts, ReportGroup,
+    Sandbox, SandboxSession, SandboxSessionPhase, SourceCredentialsInfo,
 };
 
 /// The ARN service segment for this service, as `emulator_arn`'s first argument
@@ -287,6 +289,17 @@ pub const MAX_SANDBOXES: usize = 1_000;
 /// [`MAX_IDEMPOTENCY_TOKENS`] is for `StartBuild`'s, for the same reason.
 pub const MAX_SANDBOX_IDEMPOTENCY_TOKENS: usize = MAX_IDEMPOTENCY_TOKENS;
 
+/// Command-execution records this emulator retains, across every sandbox.
+///
+/// A command execution is minted by each `StartCommandExecution` rather than being a
+/// resource the caller deletes, so the store needs a ceiling at that growth site:
+/// past this,
+/// [`ComAmazonawsCodebuildCodebuild20161006State::insert_command_execution`] evicts
+/// the oldest execution (preferring one that has already reached a terminal status),
+/// which also prunes `command_executions_by_sandbox`. THIS NUMBER IS THE EMULATOR'S,
+/// NOT AWS'S — it is the one [`MAX_SANDBOXES`] puts on the resource these belong to.
+pub const MAX_COMMAND_EXECUTIONS: usize = MAX_SANDBOXES;
+
 /// Why an emulated build never reaches `SUCCEEDED`.
 ///
 /// Nothing in this emulator executes a CodeBuild build container, so a build
@@ -356,6 +369,47 @@ const PHASE_COMPLETED: &str = "COMPLETED";
 
 /// Milliseconds in one minute — what a documented `timeoutInMinutes` is converted by.
 const MILLIS_PER_MINUTE: i64 = 60_000;
+
+/// How long after `StartCommandExecution` the clock owes a command execution its move
+/// out of [`COMMAND_EXECUTION_STATUS_IN_PROGRESS`].
+///
+/// AWS documents no duration for a command execution — it is however long the command
+/// itself takes — so this span is CHOSEN, inside the 250-750 ms band this project
+/// fixes for an emulated transition. It is deliberately not zero: a caller that reads
+/// an execution straight after starting it still observes it in flight. The due
+/// instant is stored, never slept on.
+pub const COMMAND_EXECUTION_SETTLE_MILLIS: i64 = 500;
+
+/// Why an emulated command execution never reports a result.
+///
+/// A command execution runs a shell command inside the sandbox's environment; nothing
+/// in this emulator executes one — there is no shell, container or process here to
+/// hand the command to — so the execution cannot report an exit code or any output. It
+/// ends instead in CodeBuild's own build-system failure status,
+/// [`COMMAND_EXECUTION_STATUS_FAULT`], carrying this explanation — the emulator's own,
+/// never output attributed to the command — as the execution's error text.
+pub const COMMAND_NOT_EXECUTED_MESSAGE: &str = "this emulator does not execute sandbox \
+    commands, so nothing ran this command: it produced no output and no exit code";
+
+/// The status a command execution reports between `StartCommandExecution` and the
+/// transition the clock owes it.
+///
+/// The model types `CommandExecution$status` as a free-form `NonEmptyString`, so the
+/// values reported for it here are the service's own `StatusType` enum values — the
+/// same pair a build's `buildStatus` moves through in this emulator.
+pub const COMMAND_EXECUTION_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// The terminal status an emulated command execution reaches, for the reason
+/// [`COMMAND_NOT_EXECUTED_MESSAGE`] gives. `FAULT` is the `StatusType` value CodeBuild
+/// reports when the build system itself could not run the work.
+pub const COMMAND_EXECUTION_STATUS_FAULT: &str = "FAULT";
+
+/// The `CommandType` a `StartCommandExecution` that names none can only mean.
+///
+/// The model declares exactly one value for `CommandType` — `SHELL`, the single entry
+/// of [`crate::ops::types::COMMAND_TYPE_VALUES`] — so an omitted `type` is a request
+/// for that one.
+pub const DEFAULT_COMMAND_TYPE: &str = "SHELL";
 
 /// Per-service state for com-amazonaws-codebuild-codebuild-20161006. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
@@ -432,6 +486,21 @@ pub struct ComAmazonawsCodebuildCodebuild20161006State {
     pub next_sandbox_numbers: BTreeMap<String, i64>,
     /// `StartSandbox` idempotency tokens, keyed by (project name, token).
     pub start_sandbox_tokens: BTreeMap<(String, String), StartSandboxToken>,
+    /// Command executions, keyed by command execution id.
+    ///
+    /// Keyed globally rather than per sandbox because that is how
+    /// `BatchGetCommandExecutions` addresses one (an id, with the sandbox as the scope
+    /// it must belong to), and the id is derived under the sandbox it was started in,
+    /// so two sandboxes cannot mint the same one.
+    pub command_executions: BTreeMap<String, StoredCommandExecution>,
+    /// Command execution ids per sandbox id, in submit order — which is the order
+    /// `ListCommandExecutionsForSandbox` pages over, so a list operation reads this
+    /// without re-reading every execution.
+    pub command_executions_by_sandbox: BTreeMap<String, Vec<String>>,
+    /// The next per-sandbox command execution sequence number to hand out. It is not a
+    /// modelled member: it is what makes an execution's derived id unique when two
+    /// commands of one sandbox are submitted in the same millisecond.
+    pub next_command_execution_numbers: BTreeMap<String, i64>,
     /// `RetryBuild` idempotency tokens, keyed by (project name, token).
     ///
     /// Kept apart from `start_build_tokens` for the reason
@@ -555,6 +624,20 @@ pub struct StoredSandbox {
     /// `sandbox.requestTime` reports, kept as the integer the phase arithmetic uses.
     pub request_millis: i64,
     /// Epoch millis at which this sandbox's transition out of `QUEUED` became due.
+    pub settle_due_millis: i64,
+}
+
+/// A persisted command execution: the modelled [`CommandExecution`] plus the instant
+/// its `submitTime` reports and the instant at which the clock owes its move out of
+/// [`COMMAND_EXECUTION_STATUS_IN_PROGRESS`].
+#[derive(Debug, Clone)]
+pub struct StoredCommandExecution {
+    /// The record every reader hands back.
+    pub command_execution: CommandExecution,
+    /// Epoch millis the command was submitted at — the same instant
+    /// `commandExecution.submitTime` reports, kept as the integer the arithmetic uses.
+    pub submit_millis: i64,
+    /// Epoch millis at which this execution's terminal transition became due.
     pub settle_due_millis: i64,
 }
 
@@ -1057,6 +1140,98 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
         stored.settle(now_millis);
         Some(stored)
     }
+
+    /// Hand out `sandbox_id`'s next command execution sequence number and advance the
+    /// counter. Like a `buildNumber`, a number is never reused for a sandbox.
+    pub fn allocate_command_execution_number(&mut self, sandbox_id: &str) -> i64 {
+        allocate_number(&mut self.next_command_execution_numbers, sandbox_id)
+    }
+
+    /// Persist `stored` under `id` and record it as the newest command execution of its
+    /// sandbox, then bring the store back inside [`MAX_COMMAND_EXECUTIONS`]. The
+    /// sibling of [`Self::insert_sandbox`], and the id is a parameter for the same
+    /// reason: no caller can lose a record to an absent id.
+    pub fn insert_command_execution(&mut self, id: String, stored: StoredCommandExecution) {
+        if let Some(sandbox_id) = stored.command_execution.sandbox_id.clone() {
+            self.command_executions_by_sandbox
+                .entry(sandbox_id)
+                .or_default()
+                .push(id.clone());
+        }
+        self.command_executions.insert(id, stored);
+        self.enforce_command_execution_ceiling();
+    }
+
+    /// Evict command executions until at most [`MAX_COMMAND_EXECUTIONS`] are retained,
+    /// oldest terminal one first — the same rule [`Self::enforce_sandbox_ceiling`]
+    /// applies to sandboxes, so an execution a caller may still be polling survives an
+    /// eviction round. Evicting one also drops its id from
+    /// `command_executions_by_sandbox` and retires the per-sandbox sequence counter
+    /// once no execution of that sandbox is left.
+    fn enforce_command_execution_ceiling(&mut self) {
+        let mut evicted_any = false;
+        while self.command_executions.len() > MAX_COMMAND_EXECUTIONS {
+            let oldest_terminal = self
+                .command_executions
+                .iter()
+                .filter(|(_, stored)| stored.is_terminal())
+                .min_by_key(|(_, stored)| stored.submit_millis)
+                .map(|(id, _)| id.clone());
+            let evicted = oldest_terminal.or_else(|| {
+                self.command_executions
+                    .iter()
+                    .min_by_key(|(_, stored)| stored.submit_millis)
+                    .map(|(id, _)| id.clone())
+            });
+            let Some(id) = evicted else { break };
+            evicted_any = true;
+            let sandbox_id = self
+                .command_executions
+                .remove(&id)
+                .and_then(|stored| stored.command_execution.sandbox_id);
+            if let Some(sandbox_id) = sandbox_id {
+                if let Some(ids) = self.command_executions_by_sandbox.get_mut(&sandbox_id) {
+                    ids.retain(|held| held != &id);
+                    if ids.is_empty() {
+                        self.command_executions_by_sandbox.remove(&sandbox_id);
+                    }
+                }
+            }
+        }
+        if !evicted_any {
+            return;
+        }
+        let mut counters = ::std::mem::take(&mut self.next_command_execution_numbers);
+        counters.retain(|sandbox_id, _| {
+            self.sandboxes.contains_key(sandbox_id)
+                || self.command_executions_by_sandbox.contains_key(sandbox_id)
+        });
+        self.next_command_execution_numbers = counters;
+    }
+
+    /// Read a command execution of `sandbox_id`, first materialising the transition the
+    /// clock already owes it — the command-execution counterpart of
+    /// [`Self::settled_build`], and the only write a reporting operation makes: the
+    /// move out of [`COMMAND_EXECUTION_STATUS_IN_PROGRESS`] was due at
+    /// `settle_due_millis` whether or not anybody called, and it is computed from the
+    /// stored instants, so repeating it changes nothing.
+    ///
+    /// `None` for an id this sandbox did not start, even when another sandbox did: a
+    /// command execution is addressed within the sandbox it belongs to, so one
+    /// sandbox's id never resolves against another's executions.
+    pub fn settled_command_execution(
+        &mut self,
+        sandbox_id: &str,
+        id: &str,
+        now_millis: i64,
+    ) -> Option<&StoredCommandExecution> {
+        let stored = self.command_executions.get_mut(id)?;
+        if stored.command_execution.sandbox_id.as_deref() != Some(sandbox_id) {
+            return None;
+        }
+        stored.settle(now_millis);
+        Some(stored)
+    }
 }
 
 /// Hand out `name`'s next number from `counters` and advance it. Shared by the
@@ -1184,6 +1359,18 @@ impl StoredSandbox {
         self.sandbox.end_time.is_some()
     }
 
+    /// Whether this sandbox's session is LIVE — provisioned, not ended — which is what
+    /// a command execution or a connection needs to act on.
+    ///
+    /// Read off the record's own status, so it is true exactly for the sandbox
+    /// [`Self::settle`] has moved to [`SANDBOX_STATUS_RUNNING`]: one still in the queue
+    /// has no session yet, and one that stopped or timed out no longer has one. Call it
+    /// through [`ComAmazonawsCodebuildCodebuild20161006State::settled_sandbox`], so the
+    /// transitions the clock owes the sandbox are materialised before it is judged.
+    pub fn is_running(&self) -> bool {
+        !self.is_terminal() && self.sandbox.status.as_deref() == Some(SANDBOX_STATUS_RUNNING)
+    }
+
     /// The minutes this sandbox waits before timing out, from the modelled member it
     /// carries: `Sandbox$timeoutInMinutes` is "How long, in minutes, from 5 to 2160 (36
     /// hours), for CodeBuild to wait before timing out this sandbox if it does not get
@@ -1271,6 +1458,43 @@ impl StoredSandbox {
     }
 }
 
+impl StoredCommandExecution {
+    /// Whether this command execution has reached a status it can never leave.
+    ///
+    /// Read from the instant the record carries rather than from the status string,
+    /// the way [`StoredSandbox::is_terminal`] is: `endTime` is set exactly when the
+    /// execution stopped, so nothing has to keep a list of terminal status names in
+    /// step with it.
+    pub fn is_terminal(&self) -> bool {
+        self.command_execution.end_time.is_some()
+    }
+
+    /// Materialise this command execution's terminal state once its due instant has
+    /// passed.
+    ///
+    /// Idempotent and purely a function of the stored instants: an execution that has
+    /// already ended, or whose span has not elapsed, is left alone. It ends in
+    /// [`COMMAND_EXECUTION_STATUS_FAULT`] because nothing here ran the command — see
+    /// [`COMMAND_NOT_EXECUTED_MESSAGE`] — and therefore reports neither an
+    /// `exitCode` nor any `standardOutputContent`: no process exited and no command
+    /// wrote anything.
+    ///
+    /// `startTime` and `endTime` are both the due instant: the attempt was made and
+    /// given up there, so the record carries no run duration for work nothing
+    /// performed.
+    pub fn settle(&mut self, now_millis: i64) {
+        if self.is_terminal() || now_millis < self.settle_due_millis {
+            return;
+        }
+        let due = self.settle_due_millis;
+        self.command_execution.status = Some(COMMAND_EXECUTION_STATUS_FAULT.to_string());
+        self.command_execution.start_time = Some(datetime(due));
+        self.command_execution.end_time = Some(datetime(due));
+        self.command_execution.standard_err_content =
+            Some(COMMAND_NOT_EXECUTED_MESSAGE.to_string());
+    }
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.
@@ -1329,6 +1553,33 @@ pub fn sandbox_uuid(project_name: &str, sandbox_number: i64, request_millis: i64
 /// the session's sequence number within that sandbox and the instant it started.
 pub fn sandbox_session_uuid(sandbox_id: &str, session_number: i64, start_millis: i64) -> String {
     derived_uuid("sandbox-session", sandbox_id, session_number, start_millis)
+}
+
+/// A command execution's unique identifier, derived from the sandbox it was submitted
+/// to, the per-sandbox sequence number allocated for it under the state lock, and the
+/// instant it was submitted — exactly as [`sandbox_uuid`] is derived for a sandbox.
+pub fn command_execution_uuid(sandbox_id: &str, command_number: i64, submit_millis: i64) -> String {
+    derived_uuid(
+        "command-execution",
+        sandbox_id,
+        command_number,
+        submit_millis,
+    )
+}
+
+/// The store key for one sandbox a request names.
+///
+/// Every operation that takes a sandbox takes "a sandboxId or sandboxArn"
+/// (`StartCommandExecution$sandboxId`, `BatchGetSandboxes$ids`), so an ARN names the
+/// same sandbox its id does: everything up to and including the `sandbox/` resource
+/// segment is dropped. Only a value in ARN form is rewritten, so a project literally
+/// named `sandbox` (whose sandbox ids read `sandbox:<uuid>`) is still looked up as it
+/// stands.
+pub fn sandbox_store_id(entry: &str) -> &str {
+    if !entry.starts_with("arn:") {
+        return entry;
+    }
+    entry.rsplit_once(":sandbox/").map_or(entry, |(_, id)| id)
 }
 
 /// A compute fleet's unique identifier — the UUID AWS puts after `<fleetName>:`.

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RebootCacheCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RebootCacheCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RebootCacheCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +142,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RebootCacheCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RebootCacheClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RebootCacheCluster"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // Same identity rule as `CreateCacheCluster`: `CacheClusterId` "is
+        // stored as a lowercase string".
+        let cache_cluster_id = input.cache_cluster_id.to_ascii_lowercase();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let Some(cluster) = store.settled_cluster_mut(&cache_cluster_id, now) else {
+            return Err(RebootCacheClusterErrorModeled::CacheClusterNotFoundFault(
+                CacheClusterNotFoundFault {
+                    message: Some(format!(
+                        "Cache cluster {} not found.",
+                        input.cache_cluster_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // `InvalidCacheClusterStateFault` is "the requested cluster is not in
+        // the available state": a cluster still `creating`, `modifying` from an
+        // immediate change, or already rebooting from an earlier call is refused
+        // rather than rebooted twice.
+        if cluster.status != crate::state::STATUS_AVAILABLE {
+            return Err(RebootCacheClusterErrorModeled::InvalidCacheClusterStateFault(
+                InvalidCacheClusterStateFault {
+                    message: Some(format!(
+                        "Cache cluster {cache_cluster_id} is in {} state, not available.",
+                        cluster.status
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `CacheNodeIdsToReboot` is "a list of cache node IDs to reboot. A node
+        // ID is a numeric identifier (0001, 0002, etc.). To reboot an entire
+        // cluster, specify all of the cache node IDs." The member is `@required`
+        // but carries no modelled `@length`, so an EMPTY list reaches this
+        // handler; it names no node to reboot, and this operation models no
+        // parameter error, so both it and an id the cluster does not hold are
+        // refused through the synthetic `ValidationException` rather than
+        // answered 200 with the member ignored.
+        let ids_to_reboot = input.cache_node_ids_to_reboot;
+        if ids_to_reboot.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "CacheNodeIdsToReboot must name at least one cache node of the cluster to \
+                 reboot.",
+            ));
+        }
+        for id in &ids_to_reboot {
+            if !cluster.nodes.iter().any(|node| &node.cache_node_id == id) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Invalid value {id} for CacheNodeIdsToReboot: cache cluster \
+                     {cache_cluster_id} has no such cache node."
+                )));
+            }
+        }
+
+        // "The reboot operation takes place as soon as possible, and results in
+        // a momentary outage to the cluster. During the reboot, the cluster
+        // status is set to REBOOTING" — and only the nodes the request named are
+        // rebooting; the rest keep running. The clock owes the cluster
+        // `available` again after the transition span, which is what moves every
+        // node back to `available` too (see `CacheClusterRecord::settle`).
+        for node in &mut cluster.nodes {
+            if ids_to_reboot.contains(&node.cache_node_id) {
+                node.status = crate::state::NODE_STATUS_REBOOTING.to_string();
+            }
+        }
+        cluster.begin_transition(crate::state::STATUS_REBOOTING_NODES, now);
+
+        // "This operation applies any modified cache parameter groups to the
+        // cluster": every parameter-group operation is a scaffolded 501, so no
+        // parameter value can ever be pending here and the association is
+        // already reported `in-sync` (`crate::state::PARAMETER_APPLY_STATUS`).
+        // The cluster event the reboot's completion creates belongs to
+        // `DescribeEvents`, which is still a scaffolded 501 and owns that gap:
+        // this slice holds no event log to append to.
+        Ok(RebootCacheClusterOutput {
+            cache_cluster: Some(cluster.to_modeled(true)),
+        })
     }
 }

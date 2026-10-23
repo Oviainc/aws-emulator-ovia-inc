@@ -223,6 +223,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
 
+        // The entry is keyed by the resource's OWN `<resourceType>/<name>` identity,
+        // never by the request-scoped ARN, exactly as `PutPolicy` keys it (see
+        // `crate::state::policies`).
+        let policy_key = crate::state::policy_key(&input.arn, &region)
+            .ok_or_else(|| {
+                AddPolicyStatementErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::messages::policy_resource_not_found(
+                            &input.arn,
+                        )),
+                    },
+                )
+            })?
+            .to_string();
+
         let condition = condition.map_err(|reason| {
             AddPolicyStatementErrorModeled::ValidationException(ValidationException {
                 message: Some(crate::state::messages::invalid_statement_condition(reason)),
@@ -294,6 +309,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // whose resource is gone, exactly as `PutPolicy` does.
         store.prune_orphaned_policies();
 
+        // The explicit bound on the collection, as `PutPolicy` enforces it.
+        if !store.has_room_for_policy(&policy_key) {
+            return Err(AddPolicyStatementErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::messages::resource_policies_at_capacity(
+                        crate::state::MAX_RESOURCE_POLICIES,
+                    )),
+                },
+            )
+            .into());
+        }
+
         // Adding a statement produces a NEW revision, so it mints a new token: the one
         // every later read serves until the next change.
         let record = crate::state::ResourcePolicy {
@@ -304,7 +331,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Answered from the STORED record, read back through the slot it was written
         // into, so this response and a later `GetPolicy` cannot disagree about the
         // policy this add produced.
-        let stored = match store.policies.entry(input.arn.clone()) {
+        let stored = match store.policies.entry(policy_key) {
             ::std::collections::btree_map::Entry::Occupied(slot) => {
                 let slot = slot.into_mut();
                 *slot = record;

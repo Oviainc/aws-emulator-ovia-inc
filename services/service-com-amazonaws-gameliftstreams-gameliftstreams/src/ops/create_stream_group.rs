@@ -275,6 +275,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        let region = crate::state::region_of(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateStreamGroupErrorModeled::InternalServerException(
                 InternalServerException {
@@ -322,14 +323,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             arn: Some(application.arn.clone()),
                         }),
                         None => {
+                            // Same rule as every other not-found path: the message
+                            // names the ARN `DefaultApplicationIdentifier` resolves
+                            // to.
                             return Err(
                                 CreateStreamGroupErrorModeled::ResourceNotFoundException(
-                                    ResourceNotFoundException {
-                                        message: format!(
-                                            "no application matches \
-                                             DefaultApplicationIdentifier {identifier}"
+                                    crate::state::resource_not_found(
+                                        &crate::state::resolved_arn(
+                                            &region,
+                                            identifier,
+                                            crate::state::APPLICATION_RESOURCE,
                                         ),
-                                    },
+                                    ),
                                 )
                                 .into(),
                             );
@@ -358,7 +363,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     })
                     .collect();
 
-                let region = crate::state::region_of(ctx.parts());
                 let id = state.mint_id("sg-");
                 let arn = crate::state::stream_group_arn(&region, &id);
                 let associated_applications: Vec<String> = default_application

@@ -15,6 +15,8 @@
 mod cluster_lifecycle;
 #[path = "all/cluster_parameter_groups.rs"]
 mod cluster_parameter_groups;
+#[path = "all/cluster_parameters.rs"]
+mod cluster_parameters;
 #[path = "all/cluster_versions.rs"]
 mod cluster_versions;
 #[path = "all/orderable_cluster_options.rs"]

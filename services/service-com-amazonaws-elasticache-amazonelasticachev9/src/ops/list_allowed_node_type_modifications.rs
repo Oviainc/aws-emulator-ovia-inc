@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAllowedNodeTypeModifications
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAllowedNodeTypeModifications`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`ListAllowedNodeTypeModifications::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -125,6 +121,316 @@ impl From<ListAllowedNodeTypeModificationsErrorModeled> for ListAllowedNodeTypeM
     }
 }
 
+// ---------------------------------------------------------------------------
+// The node type catalogue this operation answers from
+//
+// A node type is not an account resource: it is an item of the catalogue the
+// service publishes, which every account sees the same and which no operation
+// creates or changes. It therefore lives here, beside the one operation that
+// reads it, rather than in `crate::state`, which holds what requests persist.
+// ---------------------------------------------------------------------------
+
+/// The sizes `CacheNodeType`'s catalogue names for the M7g, M6g, R7g and R6g
+/// families: "cache.m7g.large, cache.m7g.xlarge, cache.m7g.2xlarge,
+/// cache.m7g.4xlarge, cache.m7g.8xlarge, cache.m7g.12xlarge,
+/// cache.m7g.16xlarge".
+const SIZES_LARGE_THROUGH_16XLARGE: &[&str] = &[
+    "large", "xlarge", "2xlarge", "4xlarge", "8xlarge", "12xlarge", "16xlarge",
+];
+/// The sizes the catalogue names for the M5 and R5 families: "cache.m5.large,
+/// cache.m5.xlarge, cache.m5.2xlarge, cache.m5.4xlarge, cache.m5.12xlarge,
+/// cache.m5.24xlarge".
+const SIZES_M5: &[&str] = &["large", "xlarge", "2xlarge", "4xlarge", "12xlarge", "24xlarge"];
+/// The sizes the catalogue names for the M4 family: "cache.m4.large,
+/// cache.m4.xlarge, cache.m4.2xlarge, cache.m4.4xlarge, cache.m4.10xlarge".
+const SIZES_M4: &[&str] = &["large", "xlarge", "2xlarge", "4xlarge", "10xlarge"];
+/// The sizes the catalogue names for the R4 family: "cache.r4.large,
+/// cache.r4.xlarge, cache.r4.2xlarge, cache.r4.4xlarge, cache.r4.8xlarge,
+/// cache.r4.16xlarge".
+const SIZES_R4: &[&str] = &["large", "xlarge", "2xlarge", "4xlarge", "8xlarge", "16xlarge"];
+/// The sizes the catalogue names for the R3 family: "cache.r3.large,
+/// cache.r3.xlarge, cache.r3.2xlarge, cache.r3.4xlarge, cache.r3.8xlarge".
+const SIZES_R3: &[&str] = &["large", "xlarge", "2xlarge", "4xlarge", "8xlarge"];
+/// The sizes the catalogue names for the T4g, T3 and T2 families:
+/// "cache.t3.micro, cache.t3.small, cache.t3.medium".
+const SIZES_BURSTABLE: &[&str] = &["micro", "small", "medium"];
+
+/// One family of cache node types, as the catalogue `CacheNodeType` publishes
+/// holds it (`smithy_query(query="doc", shape="CreateCacheClusterMessage",
+/// member="CacheNodeType")` — the one source of every name and flag below).
+#[derive(Debug, Clone, Copy)]
+pub struct NodeTypeFamily {
+    /// The part of a node type's name before its size, e.g. `cache.m7g`.
+    pub prefix: &'static str,
+    /// The sizes the catalogue names for this family.
+    pub sizes: &'static [&'static str],
+    /// False for the families the catalogue lists under "Previous generation:
+    /// (not recommended. Existing clusters are still supported but creation of
+    /// new clusters is not supported for these types.)" — an existing cluster
+    /// may still RUN one, but no cluster can be moved onto nodes of a type new
+    /// nodes cannot be created on.
+    pub current_generation: bool,
+    /// True for the families the catalogue gates on an engine version — M6g and
+    /// R6g are "available only for Redis OSS engine version 5.0.6 onward and
+    /// for Memcached engine version 1.5.16 onward", and T4g carries the same
+    /// note.
+    pub version_gated: bool,
+}
+
+/// The Redis OSS version the catalogue's gated families need: "available only
+/// for Redis OSS engine version 5.0.6 onward".
+pub const VERSION_GATED_MIN_REDIS: &str = "5.0.6";
+/// The Memcached version the same note names: "and for Memcached engine version
+/// 1.5.16 onward".
+pub const VERSION_GATED_MIN_MEMCACHED: &str = "1.5.16";
+
+/// Every cache node type this service knows, by family, from `CacheNodeType`'s
+/// catalogue: general purpose (M7g, M6g, M5, M4, T4g, T3, T2, and the previous
+/// generation T1, M1, M3), compute optimized (the previous generation C1) and
+/// memory optimized (R7g, R6g, R5, R4, and the previous generation M2, R3).
+///
+/// Region availability is NOT modelled — the catalogue defers it to "Supported
+/// Node Types", a per-region table this emulator does not hold — so a family is
+/// offered in every region.
+///
+/// `crate::state::OFFERING_NODE_TYPES` is the subset of these names the
+/// reserved-cache-node offering catalog prices; the test suite asserts every one
+/// of those names is a name this catalogue carries, so the two published lists
+/// cannot drift apart.
+pub const NODE_TYPE_FAMILIES: &[NodeTypeFamily] = &[
+    NodeTypeFamily {
+        prefix: "cache.m7g",
+        sizes: SIZES_LARGE_THROUGH_16XLARGE,
+        current_generation: true,
+        version_gated: false,
+    },
+    NodeTypeFamily {
+        prefix: "cache.m6g",
+        sizes: SIZES_LARGE_THROUGH_16XLARGE,
+        current_generation: true,
+        version_gated: true,
+    },
+    NodeTypeFamily {
+        prefix: "cache.m5",
+        sizes: SIZES_M5,
+        current_generation: true,
+        version_gated: false,
+    },
+    NodeTypeFamily {
+        prefix: "cache.m4",
+        sizes: SIZES_M4,
+        current_generation: true,
+        version_gated: false,
+    },
+    NodeTypeFamily {
+        prefix: "cache.t4g",
+        sizes: SIZES_BURSTABLE,
+        current_generation: true,
+        version_gated: true,
+    },
+    NodeTypeFamily {
+        prefix: "cache.t3",
+        sizes: SIZES_BURSTABLE,
+        current_generation: true,
+        version_gated: false,
+    },
+    NodeTypeFamily {
+        prefix: "cache.t2",
+        sizes: SIZES_BURSTABLE,
+        current_generation: true,
+        version_gated: false,
+    },
+    NodeTypeFamily {
+        prefix: "cache.t1",
+        sizes: &["micro"],
+        current_generation: false,
+        version_gated: false,
+    },
+    NodeTypeFamily {
+        prefix: "cache.m1",
+        sizes: &["small", "medium", "large", "xlarge"],
+        current_generation: false,
+        version_gated: false,
+    },
+    NodeTypeFamily {
+        prefix: "cache.m3",
+        sizes: &["medium", "large", "xlarge", "2xlarge"],
+        current_generation: false,
+        version_gated: false,
+    },
+    NodeTypeFamily {
+        prefix: "cache.c1",
+        sizes: &["xlarge"],
+        current_generation: false,
+        version_gated: false,
+    },
+    NodeTypeFamily {
+        prefix: "cache.r7g",
+        sizes: SIZES_LARGE_THROUGH_16XLARGE,
+        current_generation: true,
+        version_gated: false,
+    },
+    NodeTypeFamily {
+        prefix: "cache.r6g",
+        sizes: SIZES_LARGE_THROUGH_16XLARGE,
+        current_generation: true,
+        version_gated: true,
+    },
+    NodeTypeFamily {
+        prefix: "cache.r5",
+        sizes: SIZES_M5,
+        current_generation: true,
+        version_gated: false,
+    },
+    NodeTypeFamily {
+        prefix: "cache.r4",
+        sizes: SIZES_R4,
+        current_generation: true,
+        version_gated: false,
+    },
+    NodeTypeFamily {
+        prefix: "cache.m2",
+        sizes: &["xlarge", "2xlarge", "4xlarge"],
+        current_generation: false,
+        version_gated: false,
+    },
+    NodeTypeFamily {
+        prefix: "cache.r3",
+        sizes: SIZES_R3,
+        current_generation: false,
+        version_gated: false,
+    },
+];
+
+/// Where `node_type`'s size sits on the ladder the node type names themselves
+/// encode.
+///
+/// `CacheNodeType`'s catalogue names each family's sizes in ascending order —
+/// `micro`, `small`, `medium`, `large`, then the `xlarge` multiples — so a node
+/// type's size is read off its own name. Only the ORDER of the ranks is
+/// meaningful; nothing reads their absolute value, and they are not a claim
+/// about a node type's memory.
+///
+/// `None` when the name's SIZE segment is not one of the sizes the catalogue
+/// names — the `cache.<family>.<size>` form is what carries a size at all, and a
+/// multiplier so large that the rank cannot hold it is no size the catalogue
+/// names either. The FAMILY segment is only required to be present: a family
+/// this catalogue does not list still has the size its name states, which is
+/// all the ladder reads.
+///
+/// The name is read case-insensitively: the catalogue names every node type in
+/// lowercase, and a stored node type is whatever the create supplied.
+pub fn node_type_size_rank(node_type: &str) -> Option<u32> {
+    let lowered = node_type.to_ascii_lowercase();
+    let mut parts = lowered.split('.');
+    if parts.next()? != "cache" {
+        return None;
+    }
+    if parts.next()?.is_empty() {
+        return None;
+    }
+    let size = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    match size {
+        "micro" => Some(1),
+        "small" => Some(2),
+        "medium" => Some(3),
+        "large" => Some(4),
+        multiple => {
+            let factor = multiple.strip_suffix("xlarge")?;
+            let factor = if factor.is_empty() {
+                1
+            } else {
+                factor.parse::<u32>().ok()?
+            };
+            // `large` is 4, so every `xlarge` multiple sits above it and the
+            // multiples keep the order of their own multiplier. A stored node
+            // type is caller-supplied, so a multiplier that would carry the
+            // rank past the end of the range leaves the name unplaceable
+            // rather than overflowing it.
+            4u32.checked_add(factor)
+        }
+    }
+}
+
+/// True when a cluster running `engine` at `engine_version` can run the node
+/// types of `family`.
+///
+/// Versions are ordered through [`crate::state::version_sort_key`], the one
+/// version ordering this crate has, so the gate and the published engine-version
+/// catalogue cannot come to disagree about which version is newer. The engine is
+/// matched case-insensitively: ElastiCache stores the name lowercased, and a
+/// stored engine is whatever the create supplied.
+pub fn family_runs_engine(family: &NodeTypeFamily, engine: &str, engine_version: &str) -> bool {
+    if !family.version_gated {
+        return true;
+    }
+    let floor = match engine.to_ascii_lowercase().as_str() {
+        "memcached" => VERSION_GATED_MIN_MEMCACHED,
+        // The catalogue's note names a Redis OSS floor; Valkey forked from a
+        // later Redis OSS line, so every Valkey version is past it.
+        "valkey" => return true,
+        _ => VERSION_GATED_MIN_REDIS,
+    };
+    crate::state::version_sort_key(engine_version) >= crate::state::version_sort_key(floor)
+}
+
+/// The node types a cluster can be scaled onto, split by direction — what this
+/// operation reports.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AllowedNodeTypeModifications {
+    /// The node types whose size sits above the cluster's own.
+    pub scale_up: Vec<String>,
+    /// The node types whose size sits below the cluster's own.
+    pub scale_down: Vec<String>,
+}
+
+/// What a cluster running `engine` at `engine_version` on `cache_node_type` may
+/// be scaled onto: every node type in [`NODE_TYPE_FAMILIES`] that a new cluster
+/// can be created on and that this engine version can run, split by whether its
+/// size sits above or below the cluster's own on the ladder
+/// [`node_type_size_rank`] reads off the names.
+///
+/// A node type of the SAME size in another family is neither: that is a move
+/// sideways rather than a scale. A cluster whose node type this service cannot
+/// place on the ladder — none stored, or a name outside the catalogue's form —
+/// has no position to scale from, so nothing is reported for it rather than a
+/// guess.
+///
+/// Each list is ordered by name, so two reads of a cluster nothing changed in
+/// between answer with the same lists.
+pub fn allowed_node_type_modifications(
+    engine: &str,
+    engine_version: &str,
+    cache_node_type: Option<&str>,
+) -> AllowedNodeTypeModifications {
+    let mut allowed = AllowedNodeTypeModifications::default();
+    let Some(current) = cache_node_type.and_then(node_type_size_rank) else {
+        return allowed;
+    };
+    for family in NODE_TYPE_FAMILIES {
+        if !family.current_generation || !family_runs_engine(family, engine, engine_version) {
+            continue;
+        }
+        for size in family.sizes {
+            let name = format!("{}.{size}", family.prefix);
+            let Some(rank) = node_type_size_rank(&name) else {
+                continue;
+            };
+            match rank.cmp(&current) {
+                ::std::cmp::Ordering::Greater => allowed.scale_up.push(name),
+                ::std::cmp::Ordering::Less => allowed.scale_down.push(name),
+                ::std::cmp::Ordering::Equal => {}
+            }
+        }
+    }
+    allowed.scale_up.sort();
+    allowed.scale_down.sort();
+    allowed
+}
+
 /// The `ListAllowedNodeTypeModifications` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -161,18 +467,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAllowedNodeTypeModifications` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAllowedNodeTypeModificationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAllowedNodeTypeModifications"))
+        // A reporting operation: it reads the engine, engine version and node
+        // type of the resource the request names and splits this service's
+        // node-type catalogue around them. It writes nothing — not even the
+        // status change the clock may owe that resource, because what this
+        // operation reports does not depend on its status.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        let store = state.lock();
+        // Both inputs document "You must provide a value for either the
+        // CacheClusterId or the ReplicationGroupId", so naming neither — and
+        // naming both, which would name two different current node types — is
+        // the incompatible combination this operation models. Whichever is
+        // named, the three values the lists are built from are read off the
+        // STORED resource: "ElastiCache uses the cluster id to identify the
+        // current node type of this cluster and from that to create a list of
+        // node types you can scale up to", and the same for a replication
+        // group. A node type a modify only left pending is therefore not yet
+        // what this operation scales from.
+        let current = match (
+            input.cache_cluster_id.as_deref(),
+            input.replication_group_id.as_deref(),
+        ) {
+            (Some(_), Some(_)) => {
+                return Err(
+                    ListAllowedNodeTypeModificationsErrorModeled::InvalidParameterCombinationException(
+                        InvalidParameterCombinationException {
+                            message: Some(
+                                "CacheClusterId and ReplicationGroupId cannot be specified \
+                                 together."
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                )
+            }
+            (None, None) => {
+                return Err(
+                    ListAllowedNodeTypeModificationsErrorModeled::InvalidParameterCombinationException(
+                        InvalidParameterCombinationException {
+                            message: Some(
+                                "Either CacheClusterId or ReplicationGroupId must be specified."
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                )
+            }
+            // A replication group is stored under its lowercased id, like a
+            // cluster, and is reported on the same way: the modelled not-found
+            // is for an id the store does not hold, not for every id.
+            (None, Some(replication_group_id)) => {
+                let Some(group) = store
+                    .replication_groups
+                    .get(&replication_group_id.to_ascii_lowercase())
+                else {
+                    return Err(
+                        ListAllowedNodeTypeModificationsErrorModeled::ReplicationGroupNotFoundFault(
+                            ReplicationGroupNotFoundFault {
+                                message: Some(format!(
+                                    "Replication group {replication_group_id} not found."
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                };
+                allowed_node_type_modifications(
+                    &group.engine,
+                    &group.engine_version,
+                    group.cache_node_type.as_deref(),
+                )
+            }
+            // A cluster is stored under its lowercased id, and the id "isn't
+            // case sensitive".
+            (Some(cache_cluster_id), None) => {
+                let Some(cluster) = store
+                    .cache_clusters
+                    .get(&cache_cluster_id.to_ascii_lowercase())
+                else {
+                    return Err(
+                        ListAllowedNodeTypeModificationsErrorModeled::CacheClusterNotFoundFault(
+                            CacheClusterNotFoundFault {
+                                message: Some(format!(
+                                    "Cache cluster {cache_cluster_id} not found."
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                };
+                allowed_node_type_modifications(
+                    &cluster.engine,
+                    &cluster.engine_version,
+                    cluster.cache_node_type.as_deref(),
+                )
+            }
+        };
+
+        Ok(ListAllowedNodeTypeModificationsOutput {
+            scale_up_modifications: Some(current.scale_up),
+            scale_down_modifications: Some(current.scale_down),
+        })
     }
 }

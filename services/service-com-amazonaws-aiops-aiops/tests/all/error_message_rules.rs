@@ -20,7 +20,7 @@
 //!    four operations that can be refused this way.
 //! 2. A `ResourceNotFoundException` message names the modelled RESOURCE TYPE that is
 //!    absent — `<Resource> does not exist.` — and carries nothing of the identifier
-//!    that named it. The rows span the five operations that read or write a group by
+//!    that named it. The rows span the six operations that read or write a group by
 //!    `{identifier}`, the three identifier forms each accepts, and both resources the
 //!    policy operations reference (an absent GROUP is reported as the group; a group
 //!    that exists with no policy as the policy).
@@ -214,7 +214,7 @@ fn unknown_identifiers() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// The five operations that resolve a group through `{identifier}`, as
+/// The six operations that resolve a group through `{identifier}`, as
 /// `(name, method, path suffix, body)`.
 fn group_readers() -> Vec<(&'static str, &'static str, &'static str, Option<Value>)> {
     vec![
@@ -233,6 +233,7 @@ fn group_readers() -> Vec<(&'static str, &'static str, &'static str, Option<Valu
             "/policy",
             Some(json!({ "policy": POLICY })),
         ),
+        ("DeleteInvestigationGroupPolicy", "DELETE", "/policy", None),
     ]
 }
 

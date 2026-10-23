@@ -164,7 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The only write a read makes: a sandbox whose transition out of `QUEUED`
             // fell due before now is materialised here, because it was owed at that
             // instant whether or not anybody called.
-            match guard.settled_sandbox(stored_id(entry), now) {
+            match guard.settled_sandbox(crate::state::sandbox_store_id(entry), now) {
                 Some(stored) => sandboxes.push(stored.sandbox.clone()),
                 // Echoed as the caller wrote it, ARN and all, so a client can match
                 // the entry it sent against this list.
@@ -183,18 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The store key for one requested entry.
-///
-/// The model documents `ids` as "A comma separated list of sandboxIds or
-/// sandboxArns", so an ARN names the same sandbox its id does: everything up to and
-/// including the `sandbox/` resource segment is dropped. Only a value in ARN form is
-/// rewritten, so a project literally named `sandbox` (whose sandbox ids read
-/// `sandbox:<uuid>`) is still looked up as it stands.
-fn stored_id(entry: &str) -> &str {
-    if !entry.starts_with("arn:") {
-        return entry;
-    }
-    entry
-        .rsplit_once(":sandbox/")
-        .map_or(entry, |(_, id)| id)
-}
+// The model documents `ids` as "A comma separated list of sandboxIds or sandboxArns",
+// so an ARN names the same sandbox its id does. That rewrite is
+// `crate::state::sandbox_store_id`, shared with every other operation that takes a
+// sandbox by either form.

@@ -31,6 +31,8 @@ mod container_image_registry;
 mod container_service_lifecycle;
 #[path = "all/container_service_public_endpoint.rs"]
 mod container_service_public_endpoint;
+#[path = "all/disk_attachment.rs"]
+mod disk_attachment;
 #[path = "all/disk_block_storage.rs"]
 mod disk_block_storage;
 #[path = "all/disk_restore_from_snapshot.rs"]

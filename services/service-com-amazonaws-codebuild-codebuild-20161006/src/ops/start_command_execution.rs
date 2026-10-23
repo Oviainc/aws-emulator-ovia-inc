@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartCommandExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartCommandExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Submits a command to a stored sandbox and persists the execution: this is the ONLY
+//! file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartCommandExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The record is the command the caller asked for, in flight, with its terminal
+//! transition owed by the clock and materialised on the next read
+//! ([`crate::state::StoredCommandExecution::settle`]). A command execution needs a
+//! LIVE sandbox session to act on, so a sandbox that is still queued, or that has
+//! stopped or timed out, is refused. Nothing in this emulator executes a sandbox
+//! command, so the transition ends the execution in `FAULT` with the reason as its
+//! error text, and with no exit code and no output — see
+//! `crate::state::COMMAND_NOT_EXECUTED_MESSAGE`.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +143,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartCommandExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartCommandExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartCommandExecution"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "StartCommandExecution (this engine carries no CodeBuild state)",
+            ));
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_millis();
+
+        // `sandboxId` is documented as "A sandboxId or sandboxArn", so either form
+        // names the same record — the rewrite every sandbox-addressing operation
+        // shares.
+        let store_id = crate::state::sandbox_store_id(&input.sandbox_id);
+
+        // One critical section: resolving the sandbox, allocating the sequence number
+        // and persisting the execution happen together, so a sandbox that stops while
+        // this request is resolving cannot end up with a command submitted after it.
+        let mut guard = state.lock();
+
+        // The sandbox is read through `settled_sandbox`, so the transition the clock
+        // has owed it since `StartSandbox` is materialised before this request judges
+        // its state — the same record a reporting call would see.
+        let Some(stored) = guard.settled_sandbox(store_id, now) else {
+            return Err(sandbox_not_found(&region, store_id));
+        };
+        // A command execution runs inside the sandbox's live session, so a sandbox
+        // that is still queued has no session to run it in yet and one that has ended
+        // (stopped by the caller, or timed out) no longer has one. Refused with the
+        // modelled client error naming the status, never by persisting an execution no
+        // session could ever pick up.
+        if !stored.is_running() {
+            let status = stored.sandbox.status.clone().unwrap_or_default();
+            return Err(sandbox_not_running(store_id, &status));
+        }
+        // Addressed by its own id from here on, so an ARN in the request is stored and
+        // reported as the id it names.
+        let sandbox_id = stored
+            .sandbox
+            .id
+            .clone()
+            .unwrap_or_else(|| store_id.to_string());
+        let sandbox_arn = stored
+            .sandbox
+            .arn
+            .clone()
+            .unwrap_or_else(|| crate::state::sandbox_arn(&region, &sandbox_id));
+
+        let command_number = guard.allocate_command_execution_number(&sandbox_id);
+        let id = crate::state::command_execution_uuid(&sandbox_id, command_number, now);
+        let command_execution = CommandExecution {
+            id: Some(id.clone()),
+            sandbox_id: Some(sandbox_id),
+            sandbox_arn: Some(sandbox_arn),
+            submit_time: Some(crate::state::datetime(now)),
+            // The command has been submitted and nothing has executed it yet, so it
+            // has neither started nor ended; both instants are set by the transition
+            // the clock owes it.
+            start_time: None,
+            end_time: None,
+            status: Some(crate::state::COMMAND_EXECUTION_STATUS_IN_PROGRESS.to_string()),
+            command: Some(input.command.clone()),
+            // `CommandType` declares exactly one value, so a request that names no
+            // type is asking for that one.
+            r#type: Some(
+                input
+                    .r#type
+                    .clone()
+                    .unwrap_or_else(|| crate::state::DEFAULT_COMMAND_TYPE.to_string()),
+            ),
+            // Nothing has run, so there is no result to report: no exit code, no
+            // stdout, no stderr. The terminal transition fills in the error text that
+            // says why. `logs` stays absent for the same reason the sandbox session's
+            // does — a log stream is created with the container.
+            exit_code: None,
+            standard_output_content: None,
+            standard_err_content: None,
+            logs: None,
+        };
+
+        guard.insert_command_execution(
+            id,
+            crate::state::StoredCommandExecution {
+                command_execution: command_execution.clone(),
+                submit_millis: now,
+                settle_due_millis: now + crate::state::COMMAND_EXECUTION_SETTLE_MILLIS,
+            },
+        );
+
+        Ok(StartCommandExecutionOutput {
+            command_execution: Some(command_execution),
+        })
     }
+}
+
+/// The modelled refusal for a `sandboxId` no sandbox of this account answers to.
+fn sandbox_not_found(region: &str, sandbox_id: &str) -> StartCommandExecutionError {
+    StartCommandExecutionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!(
+            "Sandbox cannot be found: {}",
+            crate::state::sandbox_arn(region, sandbox_id)
+        )),
+    })
+    .into()
+}
+
+/// The modelled refusal for a sandbox whose session is not live: there is no session
+/// for a command to run in.
+fn sandbox_not_running(sandbox_id: &str, status: &str) -> StartCommandExecutionError {
+    StartCommandExecutionErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(format!(
+            "Invalid input: sandbox {sandbox_id} is not running (status {status}) and \
+             cannot run a command execution"
+        )),
+    })
+    .into()
 }

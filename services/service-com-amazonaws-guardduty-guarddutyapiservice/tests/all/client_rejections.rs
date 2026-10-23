@@ -36,9 +36,9 @@ const CLASS: &str = "InvalidInputException";
 /// class; an SDK needs the first to unmarshal and a client the second to switch on.
 const ENVELOPE: &str = "BadRequestException";
 
-/// The six operations that take a `DetectorId` in the URI and are implemented in
+/// The eight operations that take a `DetectorId` in the URI and are implemented in
 /// this slice: (operation, method, path suffix after the id, request body).
-const DETECTOR_ID_OPERATIONS: [(&str, &str, &str, Option<&str>); 6] = [
+const DETECTOR_ID_OPERATIONS: [(&str, &str, &str, Option<&str>); 8] = [
     ("GetDetector", "GET", "", None),
     ("UpdateDetector", "POST", "", Some(r#"{"enable":true}"#)),
     ("DeleteDetector", "DELETE", "", None),
@@ -54,6 +54,13 @@ const DETECTOR_ID_OPERATIONS: [(&str, &str, &str, Option<&str>); 6] = [
         "POST",
         "/findings/create",
         Some(r#"{"findingTypes":["Recon:EC2/PortProbeUnprotectedPort"]}"#),
+    ),
+    ("GetMalwareScanSettings", "GET", "/malware-scan-settings", None),
+    (
+        "UpdateMalwareScanSettings",
+        "POST",
+        "/malware-scan-settings",
+        Some(r#"{"ebsSnapshotPreservation":"NO_RETENTION"}"#),
     ),
 ];
 

@@ -471,7 +471,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "The default value is true."
             recursive_logging: input.recursive_logging.unwrap_or(true),
             home_region: region,
-            has_custom_event_selectors: false,
+            // A trail is created without event selectors of its own; until
+            // `PutEventSelectors` configures some it logs by the documented default
+            // (all read and write management events, no data events).
+            event_selectors: None,
             has_insight_selectors: false,
             tags,
             status: crate::state::TrailStatus::default(),

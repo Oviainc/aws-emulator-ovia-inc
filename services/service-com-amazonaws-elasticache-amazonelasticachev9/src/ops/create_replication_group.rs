@@ -1170,6 +1170,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::STORE_UNAVAILABLE,
             ));
         };
+        // Creating a replication group is one of the events this service
+        // records; see `crate::state::EventRecord`. The member clusters it
+        // mints are created as part of the group, so the group is the one
+        // source the creation is reported under.
+        store.record_event(
+            crate::state::SOURCE_TYPE_REPLICATION_GROUP,
+            &replication_group_id,
+            "Replication group created",
+            now,
+        );
         Ok(CreateReplicationGroupOutput {
             replication_group: Some(replication_group),
         })

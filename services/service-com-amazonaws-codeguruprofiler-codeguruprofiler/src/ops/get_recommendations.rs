@@ -273,7 +273,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             profile_end_time,
             // No anti-pattern matcher and no anomaly detector run over the stored agent
             // profiles (see this module's header), so the analysis reports no findings
-            // rather than invented ones.
+            // rather than invented ones. An analysis with nothing to report OMITS the two
+            // lists from the body rather than sending them empty — that is what the
+            // `GetRecommendationsResponse` serializer does with an empty one (see
+            // `ops/types/date_time_wire.rs`), so a client can tell "no analysis to report"
+            // from "analysis ran and found nothing" by the key's presence.
             recommendations: Vec::new(),
             anomalies: Vec::new(),
         })

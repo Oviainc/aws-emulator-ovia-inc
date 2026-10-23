@@ -17,6 +17,8 @@ mod access_point_listing;
 mod file_system_lifecycle;
 #[path = "all/file_system_policy.rs"]
 mod file_system_policy;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/synchronization_configuration.rs"]

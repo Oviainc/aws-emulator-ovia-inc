@@ -344,6 +344,8 @@ pub const OPERATION_TYPE_DELETE_BUCKET: &str = "DeleteBucket";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_DISK: &str = "CreateDisk";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_ATTACH_DISK: &str = "AttachDisk";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_RELATIONAL_DATABASE: &str = "CreateRelationalDatabase";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_LOAD_BALANCER: &str = "CreateLoadBalancer";
@@ -2911,9 +2913,23 @@ pub struct StoredInstance {
     pub due: Option<DueTransition>,
 }
 
+/// The device path an instance's system disk is exposed at.
+///
+/// A Lightsail instance is an EC2 instance whose root volume is the first device
+/// of the machine, which is `/dev/xvda` on the Xen-style device naming an EC2
+/// Linux instance uses. It is reported as the system disk's `path`, and it is
+/// therefore a path no block storage disk can be attached at.
+pub const SYSTEM_DISK_PATH: &str = "/dev/xvda";
+
 impl StoredInstance {
     /// This record as the modelled `Instance`.
-    pub fn view(&self) -> Instance {
+    ///
+    /// `attached_disks` are the block storage disks the store has attached to
+    /// this instance, which `hardware.disks` reports after the system disk. They
+    /// are passed in because an attachment lives on the DISK record (the disk
+    /// names the instance it is attached to), so only the store can resolve
+    /// them — see [`ComAmazonawsLightsailLightsail20161128State::instance_view`].
+    pub fn view(&self, attached_disks: Vec<crate::ops::types::Disk>) -> Instance {
         Instance {
             name: Some(self.name.clone()),
             arn: Some(self.arn.clone()),
@@ -2934,11 +2950,15 @@ impl StoredInstance {
             hardware: Some(InstanceHardware {
                 cpu_count: Some(self.bundle.cpu_count),
                 ram_size_in_gb: Some(self.bundle.ram_size_in_gb),
-                // The bundle's system disk is reported through
-                // `GetInstance`'s own `hardware.disks`; attaching a block
-                // storage disk is `AttachDisk`, which is not in this slice,
-                // so the only disk an instance has is the system one.
-                disks: Some(vec![self.system_disk()]),
+                // The bundle's system disk first, then every block storage disk
+                // `AttachDisk` has attached to this instance: an instance's
+                // hardware is the volumes it actually has, so a disk attached to
+                // it is reported here for as long as the attachment stands.
+                disks: Some(
+                    std::iter::once(self.system_disk())
+                        .chain(attached_disks)
+                        .collect(),
+                ),
             }),
             networking: Some(InstanceNetworking {
                 monthly_transfer: Some(MonthlyTransfer {
@@ -2970,7 +2990,7 @@ impl StoredInstance {
             location: Some(self.location.view()),
             size_in_gb: Some(self.bundle.disk_size_in_gb),
             is_system_disk: Some(true),
-            path: Some("/dev/xvda".to_string()),
+            path: Some(SYSTEM_DISK_PATH.to_string()),
             // `DiskState` enum: a disk an instance is using is `in-use`.
             state: Some("in-use".to_string()),
             attached_to: Some(self.name.clone()),
@@ -5365,6 +5385,43 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// Store a newly created block storage disk.
     pub fn insert_disk(&mut self, disk: StoredDisk) {
         self.disks.insert(disk.name.clone(), disk);
+    }
+
+    /// The block storage disk `name` names, for an operation the spec says
+    /// mutates it — attaching it to an instance, say.
+    ///
+    /// `name` is this record's store key, so it must not be reassigned through
+    /// this handle; no operation in this slice renames a disk.
+    pub fn disk_mut(&mut self, name: &str) -> Option<&mut StoredDisk> {
+        self.disks.get_mut(name)
+    }
+
+    /// The instance `name` names as the modelled `Instance`, with every block
+    /// storage disk attached to it reported in its hardware.
+    ///
+    /// The one way a reporting operation renders an instance: an attachment
+    /// lives on the DISK record, so assembling the view needs the whole store,
+    /// not just the instance.
+    pub fn instance_view(&self, name: &str) -> Option<Instance> {
+        let instance = self.instances.get(name)?;
+        Some(instance.view(self.attached_disk_views(name)))
+    }
+
+    /// Every block storage disk attached to the instance `instance_name` names,
+    /// in the store's own stable order (by disk name).
+    pub fn disks_attached_to(&self, instance_name: &str) -> Vec<&StoredDisk> {
+        self.disks
+            .values()
+            .filter(|disk| disk.attached_to.as_deref() == Some(instance_name))
+            .collect()
+    }
+
+    /// The same disks as [`Self::disks_attached_to`], as the modelled `Disk`.
+    pub fn attached_disk_views(&self, instance_name: &str) -> Vec<crate::ops::types::Disk> {
+        self.disks_attached_to(instance_name)
+            .into_iter()
+            .map(StoredDisk::view)
+            .collect()
     }
 
     /// The disk snapshot `name` names, for a reporting operation.

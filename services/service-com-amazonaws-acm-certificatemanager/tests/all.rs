@@ -39,6 +39,8 @@ mod certificate_tag_removal;
 mod certificate_validation_state_machine;
 #[path = "all/resend_validation_email.rs"]
 mod resend_validation_email;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/validation_domain_superdomain.rs"]

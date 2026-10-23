@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteInvestigationGroupPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteInvestigationGroupPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteInvestigationGroupPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the IAM resource policy stored on the investigation group `{identifier}`
+//! names and answers an empty 200. `ResourceNotFoundException` when no group matches
+//! (the GROUP is what is reported absent) and when the group carries no policy (the
+//! POLICY is), exactly as `GetInvestigationGroupPolicy` tells the two conditions apart.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +141,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteInvestigationGroupPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteInvestigationGroupPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteInvestigationGroupPolicy"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteInvestigationGroupPolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the investigation group store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        let principal = crate::state::caller_principal(ctx.parts());
+        let modified_at = crate::state::now_epoch_seconds();
+
+        let mut store = state.lock();
+        // Which resource is missing decides which 404 this answers, the same way
+        // `GetInvestigationGroupPolicy` reports it: an absent GROUP is reported as the
+        // absent group, and a group that exists while carrying no policy is reported
+        // as the absent policy, so a client can tell the two conditions apart.
+        let group = store.group_mut(&input.identifier).ok_or_else(|| {
+            DeleteInvestigationGroupPolicyErrorModeled::ResourceNotFoundException(
+                crate::state::investigation_group_not_found(),
+            )
+        })?;
+        // Taking the document is the whole delete: the group itself survives, and a
+        // later read of this policy must report it absent. A group that never had a
+        // policy stored has nothing to remove, which is the policy's own 404 rather
+        // than a success that removed nothing.
+        if group.policy.take().is_none() {
+            return Err(
+                DeleteInvestigationGroupPolicyErrorModeled::ResourceNotFoundException(
+                    crate::state::investigation_group_policy_not_found(),
+                )
+                .into(),
+            );
+        }
+        group.touch(&principal, modified_at);
+
+        Ok(DeleteInvestigationGroupPolicyOutput {})
     }
 }

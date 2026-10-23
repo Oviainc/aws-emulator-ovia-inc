@@ -201,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        let region = crate::state::region_of(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetApplicationErrorModeled::InternalServerException(
                 InternalServerException {
@@ -218,10 +218,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.materialize(now);
 
         let Some(application) = state.application(&input.identifier) else {
+            // The message names the ARN the request's `Identifier` resolves to.
             return Err(GetApplicationErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("no application matches identifier {}", input.identifier),
-                },
+                crate::state::resource_not_found(&crate::state::resolved_arn(
+                    &region,
+                    &input.identifier,
+                    crate::state::APPLICATION_RESOURCE,
+                )),
             )
             .into());
         };

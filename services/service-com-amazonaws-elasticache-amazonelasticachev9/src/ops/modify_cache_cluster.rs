@@ -642,8 +642,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             cluster.begin_transition(crate::state::STATUS_MODIFYING, now);
         }
 
+        let cache_cluster = cluster.to_modeled(true);
+        // Modifying a cluster is one of the events this service records; see
+        // `crate::state::EventRecord`.
+        store.record_event(
+            crate::state::SOURCE_TYPE_CACHE_CLUSTER,
+            &cache_cluster_id,
+            "Cache cluster modified",
+            now,
+        );
         Ok(ModifyCacheClusterOutput {
-            cache_cluster: Some(cluster.to_modeled(true)),
+            cache_cluster: Some(cache_cluster),
         })
     }
 }

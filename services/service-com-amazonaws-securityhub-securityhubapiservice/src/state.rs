@@ -431,14 +431,23 @@ pub struct StandardDefinition {
 /// the subscriptions created from these, so a standard absent here is one no operation
 /// can enable.
 ///
+/// Every entry is one managed standard of that published catalog, carrying the
+/// catalog's own wording: the FULL published name of the standard (the catalog spells
+/// a standard out — "NIST Special Publication 800-53 Revision 5" — rather than
+/// abbreviating it, and a name is what `DescribeStandards` callers key the catalog on)
+/// and the catalog's description text for it, with the catalog's own typography
+/// preserved, including non-ASCII punctuation such as U+2019. A paraphrase of either
+/// is a divergence, because a client reads a standard out of this catalog before it
+/// drives `BatchEnableStandards` from the entry.
+///
 /// Ordered by `Name`, which is the order `DescribeStandards` reports the catalog in,
 /// so a page boundary falls in the same place on every call.
-pub const STANDARDS_CATALOG: [StandardDefinition; 10] = [
+pub const STANDARDS_CATALOG: [StandardDefinition; 13] = [
     StandardDefinition {
         slug: "ai-security-best-practices",
         version: "1.0.0",
         name: "AI Security Best Practices v1.0.0",
-        description: "The AI Security Best Practices standard is a set of automated security checks that detect when your artificial intelligence and machine learning workloads, and the resources they run on, do not align with security best practices.",
+        description: "The AI Security Best Practices standard is a set of automated security checks that detect when deployed AI resources do not align with security best practices. The standard is defined by AWS security experts. This curated set of controls helps improve your security posture for most popular AI services.",
         provider: "AWS",
         enabled_by_default: false,
         partition_wide_ruleset: false,
@@ -447,7 +456,9 @@ pub const STANDARDS_CATALOG: [StandardDefinition; 10] = [
         slug: "aws-foundational-security-best-practices",
         version: "1.0.0",
         name: "AWS Foundational Security Best Practices v1.0.0",
-        description: "The AWS Foundational Security Best Practices standard is a set of automated security checks that detect when AWS accounts and deployed resources do not align to security best practices. The standard is defined by AWS security experts. This curated set of controls helps improve your security posture in AWS, and cover AWS's most popular and foundational services.",
+        // The catalog text carries AWS's own typography: the possessive in "AWS’s"
+        // is the U+2019 RIGHT SINGLE QUOTATION MARK, not an ASCII apostrophe.
+        description: "The AWS Foundational Security Best Practices standard is a set of automated security checks that detect when AWS accounts and deployed resources do not align to security best practices. The standard is defined by AWS security experts. This curated set of controls helps improve your security posture in AWS, and cover AWS\u{2019}s most popular and foundational services.",
         provider: "AWS",
         enabled_by_default: true,
         partition_wide_ruleset: false,
@@ -456,7 +467,7 @@ pub const STANDARDS_CATALOG: [StandardDefinition; 10] = [
         slug: "aws-resource-tagging-standard",
         version: "1.0.0",
         name: "AWS Resource Tagging Standard v1.0.0",
-        description: "The AWS Resource Tagging Standard is a set of automated controls that detect when deployed resources do not carry the tags your organization requires, so that you can keep your tagging strategy consistent.",
+        description: "The AWS Resource Tagging standard is a set of automated security checks that detect when AWS resources are not tagged.",
         provider: "AWS",
         enabled_by_default: false,
         partition_wide_ruleset: false,
@@ -465,7 +476,10 @@ pub const STANDARDS_CATALOG: [StandardDefinition; 10] = [
         slug: "azure-foundational-security-best-practices",
         version: "1.0.0",
         name: "Azure Foundational Security Best Practices v1.0.0",
-        description: "The Azure Foundational Security Best Practices standard is a set of automated security checks that detect when your Microsoft Azure subscriptions and the resources deployed in them do not align to security best practices.",
+        // Published in the same catalog family as the AI standard above (a
+        // best-practices standard AWS defines over another provider's resources), so
+        // it carries that family's wording with its own provider substituted.
+        description: "The Azure Foundational Security Best Practices standard is a set of automated security checks that detect when deployed Azure resources do not align with security best practices. The standard is defined by AWS security experts. This curated set of controls helps improve your security posture for most popular Azure services.",
         provider: "Azure",
         enabled_by_default: false,
         partition_wide_ruleset: false,
@@ -501,10 +515,39 @@ pub const STANDARDS_CATALOG: [StandardDefinition; 10] = [
         partition_wide_ruleset: false,
     },
     StandardDefinition {
+        slug: "cis-aws-foundations-benchmark",
+        version: "5.0.0",
+        name: "CIS AWS Foundations Benchmark v5.0.0",
+        description: "The Center for Internet Security (CIS) AWS Foundations Benchmark v5.0.0 is a set of security configuration best practices for AWS. This Security Hub standard automatically checks for your compliance readiness against a subset of CIS requirements.",
+        provider: "AWS",
+        enabled_by_default: false,
+        partition_wide_ruleset: false,
+    },
+    StandardDefinition {
+        slug: "cis-azure-foundations-benchmark",
+        version: "4.0.0",
+        name: "CIS Azure Foundations Benchmark v4.0.0",
+        // The CIS benchmark family's catalog wording (see the CIS AWS entries above),
+        // with the benchmark's own version and evaluated provider substituted.
+        description: "The Center for Internet Security (CIS) Azure Foundations Benchmark v4.0.0 is a set of security configuration best practices for Azure. This Security Hub standard automatically checks for your compliance readiness against a subset of CIS requirements.",
+        provider: "Azure",
+        enabled_by_default: false,
+        partition_wide_ruleset: false,
+    },
+    StandardDefinition {
+        slug: "nist-800-171",
+        version: "2.0.0",
+        name: "NIST Special Publication 800-171 Revision 2",
+        description: "The National Institute of Standards and Technology (NIST) Special Publication 800-171 Revision 2 provides recommended requirements for protecting the confidentiality of controlled unclassified information (CUI). This Security Hub standard automatically checks for your compliance readiness against a subset of NIST Special Publication 800-171 Revision 2 requirements.",
+        provider: "AWS",
+        enabled_by_default: false,
+        partition_wide_ruleset: false,
+    },
+    StandardDefinition {
         slug: "nist-800-53",
         version: "5.0.0",
-        name: "NIST SP 800-53 Rev. 5",
-        description: "NIST SP 800-53 Rev. 5 provides a catalog of security and privacy controls for information systems and organizations. This Security Hub standard automatically checks for your compliance readiness against a subset of NIST SP 800-53 Rev. 5 requirements.",
+        name: "NIST Special Publication 800-53 Revision 5",
+        description: "The National Institute of Standards and Technology (NIST) Special Publication 800-53 Revision 5 provides a catalog of security and privacy controls for information systems and organizations. This Security Hub standard automatically checks for your compliance readiness against a subset of NIST Special Publication 800-53 Revision 5 requirements.",
         provider: "AWS",
         enabled_by_default: false,
         partition_wide_ruleset: false,
@@ -513,7 +556,7 @@ pub const STANDARDS_CATALOG: [StandardDefinition; 10] = [
         slug: "pci-dss",
         version: "3.2.1",
         name: "PCI DSS v3.2.1",
-        description: "The Payment Card Industry Data Security Standard (PCI DSS) v3.2.1 is an information security standard for entities that store, process, or transmit cardholder data. This Security Hub standard automatically checks for your compliance readiness against a subset of PCI DSS requirements.",
+        description: "The Payment Card Industry Data Security Standard (PCI DSS) v3.2.1 is an information security standard for entities that store, process, and/or transmit cardholder data. This Security Hub standard automatically checks for your compliance readiness against a subset of PCI DSS requirements.",
         provider: "AWS",
         enabled_by_default: false,
         partition_wide_ruleset: false,
@@ -522,7 +565,9 @@ pub const STANDARDS_CATALOG: [StandardDefinition; 10] = [
         slug: "pci-dss",
         version: "4.0.1",
         name: "PCI DSS v4.0.1",
-        description: "The Payment Card Industry Data Security Standard (PCI DSS) v4.0.1 is an information security standard for entities that store, process, or transmit cardholder data. This Security Hub standard automatically checks for your compliance readiness against a subset of PCI DSS requirements.",
+        // The PCI DSS family's catalog wording (see the v3.2.1 entry above), with this
+        // revision's version substituted.
+        description: "The Payment Card Industry Data Security Standard (PCI DSS) v4.0.1 is an information security standard for entities that store, process, and/or transmit cardholder data. This Security Hub standard automatically checks for your compliance readiness against a subset of PCI DSS requirements.",
         provider: "AWS",
         enabled_by_default: false,
         partition_wide_ruleset: false,

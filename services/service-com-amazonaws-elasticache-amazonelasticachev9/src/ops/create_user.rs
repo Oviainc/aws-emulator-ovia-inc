@@ -273,6 +273,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx.parts());
+        // One instant for the whole request, so the user's event is dated at the
+        // moment the user was created.
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // The built-in `default` user the account already had is in the store
         // from the moment it is built, so a create naming it collides with it
@@ -342,6 +345,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::STORE_UNAVAILABLE,
             ));
         };
-        Ok(stored.to_modeled())
+        let user = stored.to_modeled();
+        // Creating a user is one of the events this service records; see
+        // `crate::state::EventRecord`.
+        store.record_event(
+            crate::state::SOURCE_TYPE_USER,
+            &user_id,
+            "User created",
+            now,
+        );
+        Ok(user)
     }
 }

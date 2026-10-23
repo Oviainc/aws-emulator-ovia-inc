@@ -14,7 +14,11 @@
 //!
 //! Besides the state itself this module holds the helpers more than one operation needs —
 //! ARN minting, the page/token codec, the shared enum check and the output-shape
-//! rebuilders — so the handlers of the contact/channel lifecycle cannot drift apart.
+//! rebuilders — so the handlers of the contact/channel lifecycle cannot drift apart. The
+//! account-level Incident Manager precondition lives here too
+//! ([`ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`]): it is the
+//! same gate for every data-plane operation, so it is written once and consulted from each
+//! handler.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::SystemTime;
@@ -65,9 +69,35 @@ pub struct ContactChannelRecord {
     pub created_at: SystemTime,
 }
 
+/// The account's Incident Manager replication set, as the contact data plane sees it.
+///
+/// Amazon SSM Contacts is fronted by a per-account Incident Manager replication set: until
+/// the account has an ACTIVE one, contact resources have no home region and the contact
+/// data plane refuses the call — with the modelled `ValidationException`, BEFORE the named
+/// resource is resolved — rather than reporting the resource missing. The replication set
+/// is minted by Incident Manager's own `CreateReplicationSet`
+/// (`services/service-com-amazonaws-ssmincidents-ssmincidents/src/ops/create_replication_set.rs`),
+/// which AWS deprecated on 2025-11-07 and that handler refuses unconditionally, so in this
+/// emulator no call onboards an account and
+/// [`ComAmazonawsSsmcontactsSsmcontactsState::replication_set`] stays `None` — exactly what
+/// an account that was never onboarded sees from AWS today. The record is still read rather
+/// than assumed, so the serviced path is reachable whenever the store does hold one.
+#[derive(Debug, Clone)]
+pub struct AccountReplicationSet {
+    /// The replication-set ARN Incident Manager minted for this account.
+    pub arn: String,
+    /// Whether the set has finished replicating. Only an ACTIVE set opens the contact data
+    /// plane; a set still being created or deleted does not.
+    pub active: bool,
+}
+
 /// Per-service state for com-amazonaws-ssmcontacts-ssmcontacts. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSsmcontactsSsmcontactsState {
+    /// The account's Incident Manager replication set, when it has one — the
+    /// account-level precondition every contact data-plane call is gated on. See
+    /// [`AccountReplicationSet`] for why the shipped value is `None`.
+    pub replication_set: Option<AccountReplicationSet>,
     /// Contacts and escalation plans, keyed by `ContactArn`.
     pub contacts: BTreeMap<String, ContactRecord>,
     /// `Alias` -> `ContactArn`. Enforces the alias uniqueness constraint and serves
@@ -106,6 +136,28 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 }
 
 impl ComAmazonawsSsmcontactsSsmcontactsState {
+    /// The account's ACTIVE replication set, when it has one.
+    ///
+    /// A stored set that is not active does not open the data plane, so this is the only
+    /// reader a precondition check needs.
+    pub fn active_replication_set(&self) -> Option<&AccountReplicationSet> {
+        self.replication_set.as_ref().filter(|set| set.active)
+    }
+
+    /// `Ok(())` when this account may reach the contact data plane at all, else the message
+    /// the refusal carries.
+    ///
+    /// The precondition is ACCOUNT level, so a handler evaluates it BEFORE looking the
+    /// named resource up: an account with no active replication set is refused whether or
+    /// not the resource it named exists. The caller renders the `Err` as the modelled
+    /// `ValidationException` (HTTP 400) its own operation declares.
+    pub fn require_active_replication_set(&self) -> Result<(), String> {
+        if self.active_replication_set().is_some() {
+            return Ok(());
+        }
+        Err(ACCOUNT_NOT_FOUND_MESSAGE.to_string())
+    }
+
     /// The ARNs of the channels that belong to `contact_arn`, in creation order.
     pub fn channel_arns_of(&self, contact_arn: &str) -> Vec<String> {
         let mut channels: Vec<&ContactChannelRecord> = self
@@ -381,6 +433,16 @@ pub fn invalid_next_token_message(token: &str) -> String {
 // ---------------------------------------------------------------------------
 // Shared validation
 // ---------------------------------------------------------------------------
+
+/// The message the contact data plane refuses a request from an account with no active
+/// Incident Manager replication set with.
+///
+/// The refusal's REQUIREMENT is its class — HTTP 400 with the error code
+/// `ValidationException`, not a 404 — so the text here is the example AWS was recorded
+/// answering with for exactly this precondition; it names the account rather than any
+/// member of the request, because no member is at fault.
+pub const ACCOUNT_NOT_FOUND_MESSAGE: &str =
+    "Invalid value provided - Account not found for the request";
 
 /// `Ok` when `value` is one of `allowed`, else the `ValidationException` message naming the
 /// member, the offending value and the permitted set.

@@ -69,6 +69,20 @@ impl Emulator {
         Self::in_region("us-east-1")
     }
 
+    /// Another emulator over the SAME engine, serving requests signed for `region`:
+    /// one account's store reached from two Regions, which is how a suite checks that
+    /// a regional resource is served only to the Region it belongs to.
+    pub(crate) fn in_other_region(&self, region: &str) -> Self {
+        let mut router = MultiServiceRouter::new();
+        router.set_request_authentication(false);
+        router.register_service(EmulatedService::new(Arc::clone(&self.engine)));
+        Self {
+            router,
+            region: region.to_string(),
+            engine: Arc::clone(&self.engine),
+        }
+    }
+
     /// The SigV4 credential scope that routes the request to this service and names
     /// the Region its ARNs are minted in.
     fn authorization(&self) -> String {

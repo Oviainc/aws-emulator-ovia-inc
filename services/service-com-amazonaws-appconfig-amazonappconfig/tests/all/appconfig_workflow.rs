@@ -31,7 +31,7 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 
 /// One service mounted on its own engine, reached exactly the way the production
 /// router reaches it.
-fn router_on(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
+pub(crate) fn router_on(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     // Pinned off so the suite does not depend on how the emulator process was started;
     // `emulator_server::authentication_enabled()` is off unless the launcher turns it
@@ -42,21 +42,21 @@ fn router_on(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
 }
 
 /// A router over a fresh engine, for a suite that needs no direct state access.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     router_on(&Arc::new(engine::InMemoryEngine::new()))
 }
 
 /// What a dispatched request answered.
-struct Answer {
-    status: u16,
-    headers: http::HeaderMap,
-    body: bytes::Bytes,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) headers: http::HeaderMap,
+    pub(crate) body: bytes::Bytes,
 }
 
 impl Answer {
     /// The response body as JSON. Panics with the body text when it is not JSON, which
     /// is the failure a caller needs to see.
-    fn json(&self) -> serde_json::Value {
+    pub(crate) fn json(&self) -> serde_json::Value {
         serde_json::from_slice(&self.body).unwrap_or_else(|error| {
             panic!(
                 "expected a JSON body, got {error}: {}",
@@ -66,7 +66,7 @@ impl Answer {
     }
 
     /// A `String` member of the JSON body, or `None` when absent or not a string.
-    fn string(&self, member: &str) -> Option<String> {
+    pub(crate) fn string(&self, member: &str) -> Option<String> {
         self.json()
             .get(member)
             .and_then(serde_json::Value::as_str)
@@ -74,7 +74,7 @@ impl Answer {
     }
 
     /// A bound response header's value.
-    fn header(&self, name: &str) -> Option<String> {
+    pub(crate) fn header(&self, name: &str) -> Option<String> {
         self.headers
             .get(name)
             .and_then(|value| value.to_str().ok())
@@ -82,7 +82,7 @@ impl Answer {
     }
 
     /// The wire error code (`__type`) of an error response.
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         self.string("__type")
             .or_else(|| self.header("x-amzn-errortype"))
             .unwrap_or_else(|| String::from_utf8_lossy(&self.body).to_string())
@@ -90,7 +90,7 @@ impl Answer {
 }
 
 /// Dispatch one request with the given body and extra headers.
-async fn send(
+pub(crate) async fn send(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -121,7 +121,7 @@ async fn send(
 
 /// `POST`/`GET` a JSON request, the shape every operation here except the hosted
 /// configuration version uses.
-async fn json_call(
+pub(crate) async fn json_call(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -136,7 +136,7 @@ async fn json_call(
 }
 
 /// Create an application and return its minted id.
-async fn create_application(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn create_application(router: &MultiServiceRouter, name: &str) -> String {
     let answer = json_call(
         router,
         "POST",
@@ -157,7 +157,7 @@ async fn create_application(router: &MultiServiceRouter, name: &str) -> String {
 }
 
 /// Create an environment under `application_id` and return its minted id.
-async fn create_environment(
+pub(crate) async fn create_environment(
     router: &MultiServiceRouter,
     application_id: &str,
     name: &str,
@@ -182,7 +182,11 @@ async fn create_environment(
 }
 
 /// Create a hosted configuration profile under `application_id` and return its id.
-async fn create_profile(router: &MultiServiceRouter, application_id: &str, name: &str) -> String {
+pub(crate) async fn create_profile(
+    router: &MultiServiceRouter,
+    application_id: &str,
+    name: &str,
+) -> String {
     let answer = json_call(
         router,
         "POST",
@@ -203,7 +207,7 @@ async fn create_profile(router: &MultiServiceRouter, application_id: &str, name:
 }
 
 /// Whether `id` satisfies the model's `Id` shape, `^[a-z0-9]{4,7}$`.
-fn is_modelled_id(id: &str) -> bool {
+pub(crate) fn is_modelled_id(id: &str) -> bool {
     (4..=7).contains(&id.chars().count())
         && id
             .chars()

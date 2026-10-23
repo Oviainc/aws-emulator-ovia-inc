@@ -21,3 +21,5 @@ mod state_roundtrip;
 mod thing_group_hierarchy;
 #[path = "all/thing_registry_lifecycle.rs"]
 mod thing_registry_lifecycle;
+#[path = "all/topic_rule_registry.rs"]
+mod topic_rule_registry;

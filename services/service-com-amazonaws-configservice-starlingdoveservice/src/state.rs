@@ -19,8 +19,8 @@ use crate::ops::types::{
     ComplianceContributorCount, ComplianceSummary, ConfigExportDeliveryInfo, ConfigRule,
     ConfigRuleEvaluationStatus, ConfigSnapshotDeliveryProperties, ConfigStreamDeliveryInfo,
     ConfigurationAggregator, ConfigurationRecorder, ConfigurationRecorderStatus,
-    ConfigurationRecorderSummary, DeliveryChannel, DeliveryChannelStatus,
-    EvaluationModeConfiguration, ExclusionByResourceTypes,
+    ConfigurationRecorderSummary, Connector, ConnectorConfiguration, ConnectorSummary,
+    DeliveryChannel, DeliveryChannelStatus, EvaluationModeConfiguration, ExclusionByResourceTypes,
     ExecutionControls, OrganizationAggregationSource, PendingAggregationRequest, RecordingGroup,
     RecordingMode, RecordingStrategy, RemediationConfiguration, RemediationParameterValue,
     ResourceDetails, ResourceEvaluation, ResourceIdentifier, RetentionConfiguration, Scope, Source,
@@ -209,6 +209,37 @@ pub const RECORDER_STATUS_SETTLE_AFTER: Duration = Duration::from_millis(500);
 /// `PutConfigRule` refuses a new rule with `MaxNumberOfConfigRulesExceededException`.
 /// 150 is the Config rules service quota (managed plus custom rules per Region).
 pub const CONFIG_RULES_QUOTA: usize = 150;
+
+/// The third-party cloud service provider a connector connects to
+/// (`com.amazonaws.configservice#Provider`, whose only published value is `AZURE`;
+/// `ConnectorSummary$provider`: "Currently, AZURE is supported").
+pub const PROVIDER_AZURE: &str = "AZURE";
+
+/// The only filter `ListConnectors` publishes
+/// (`com.amazonaws.configservice#ConnectorFilterName`; `ConnectorFilter$filterName`:
+/// "Currently, only provider is supported").
+pub const CONNECTOR_FILTER_PROVIDER: &str = "provider";
+
+/// How many connectors one `ListConnectors` page carries when the request does not
+/// ask for a page size — `MaxResults` defaults to 0, which is "unspecified" rather
+/// than "no results". 100 is the `ConnectorSummaries` length maximum (0..100), and
+/// also `ListConnectorsMaxResults`'s own maximum, so it is the largest page the model
+/// lets one response carry.
+pub const LIST_CONNECTORS_PAGE_SIZE: usize = 100;
+
+/// The most connectors this store holds, after which `PutConnector` refuses a new one
+/// with `MaxNumberOfConnectorsExceededException`.
+///
+/// The model carries no number for this quota, so the limit is CHOSEN: it is the
+/// `ConnectorSummaries` length maximum (0..100), the most connectors the model can
+/// report in one page. Config documents the connector quota per account per Region
+/// and one engine's store stands for ONE account in ONE Region, so — like
+/// [`CONFIG_RULES_QUOTA`] and [`CONFIGURATION_AGGREGATORS_QUOTA`] — it is enforced
+/// over the WHOLE store: the Region a request is scoped to is the caller's own, so
+/// counting per Region would let a caller keep one bucket of connectors per Region
+/// string it invents. This is also what bounds the work `ListConnectors` does to
+/// filter one Region's connectors out of the store.
+pub const CONNECTORS_QUOTA: usize = 100;
 
 /// The most customer managed configuration recorders this account and Region can
 /// hold. Config allows exactly ONE ("One customer managed configuration recorder per
@@ -939,6 +970,64 @@ impl ConfigRuleEntry {
     }
 }
 
+/// One persisted connector to a third-party cloud service provider.
+#[derive(Debug, Clone)]
+pub struct ConnectorEntry {
+    /// The connector's name. `PutConnector` takes no name, so Config derives it from
+    /// the configuration the connector was created with ([`connector_name`]).
+    pub name: String,
+    pub arn: String,
+    /// The Region this connector belongs to — the Region of the request that created
+    /// it, and the Region segment of [`Self::arn`]. A connector is a REGIONAL
+    /// resource, so every operation serves only the connectors of the Region its
+    /// request is scoped to.
+    pub region: String,
+    /// The `Provider` this connector's configuration names.
+    pub provider: String,
+    /// The provider-specific configuration the connector was created with. Connectors
+    /// cannot be updated (`PutConnector`: "To update the connector configuration, you
+    /// must delete all associated configuration recorders, delete the connector, and
+    /// recreate it"), so this never changes once stored.
+    pub connector_configuration: ConnectorConfiguration,
+    pub created_at: SystemTime,
+    /// Tags are taken at creation (`PutConnector`: "Tags are added at creation and
+    /// cannot be updated with this operation").
+    pub tags: Vec<Tag>,
+}
+
+impl ConnectorEntry {
+    /// The identifier of the tenant this connector's configuration names, which is
+    /// the identifier of the provider configuration it carries.
+    pub fn tenant_identifier(&self) -> &str {
+        self.connector_configuration
+            .azure
+            .as_ref()
+            .map(|azure| azure.tenant_identifier.as_str())
+            .unwrap_or_default()
+    }
+
+    /// The modelled `Connector`, read back out of state.
+    pub fn to_shape(&self) -> Connector {
+        Connector {
+            name: self.name.clone(),
+            arn: self.arn.clone(),
+            connector_configuration: self.connector_configuration.clone(),
+            created_time: timestamp(self.created_at),
+        }
+    }
+
+    /// The modelled `ConnectorSummary` a listing reports for this connector.
+    pub fn to_summary(&self) -> ConnectorSummary {
+        ConnectorSummary {
+            arn: self.arn.clone(),
+            name: self.name.clone(),
+            provider: self.provider.clone(),
+            tenant_identifier: self.tenant_identifier().to_string(),
+            created_time: timestamp(self.created_at),
+        }
+    }
+}
+
 /// One persisted remediation configuration: the remediation action Config runs for
 /// one Config rule.
 ///
@@ -1340,6 +1429,13 @@ pub struct ComAmazonawsConfigserviceStarlingdoveserviceState {
     /// Source of the next configuration recorder id, so every recorder Config
     /// creates here gets a distinct one.
     pub next_recorder_seq: u64,
+    /// Connectors to third-party cloud service providers, keyed by connector ARN. The
+    /// ARN carries both the Region the connector belongs to and its name, so the key
+    /// is what identifies one connector of one account in one Region. A `BTreeMap` so
+    /// `ListConnectors` pages over a stable ordering — which, within one Region, is
+    /// the connectors' name ordering — and a page token survives connectors created
+    /// and deleted between pages.
+    pub connectors: BTreeMap<String, ConnectorEntry>,
     /// Resource evaluations started by `StartResourceEvaluation`, keyed by
     /// `ResourceEvaluationId`. A `BTreeMap` so the store's iteration order is stable;
     /// `ListResourceEvaluations` reports them in [`ResourceEvaluationPageKey`] order.
@@ -1586,6 +1682,80 @@ fn splitmix64(seq: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     z ^ (z >> 31)
+}
+
+/// The ARN resource type of a connector, as Config spells it in the ARNs it mints.
+pub const CONNECTOR_ARN_RESOURCE_TYPE: &str = "connector";
+
+/// The `ConnectorName` length maximum (`com.amazonaws.configservice#ConnectorName`,
+/// length 1..256), which is also the length of the resource portion of a connector's
+/// ARN, because that portion is exactly the connector's name.
+pub const CONNECTOR_NAME_MAX_LEN: usize = 256;
+
+/// The ARN of a connector: `arn:aws:config:<region>:<account>:connector/<name>`.
+pub fn connector_arn(region: &str, name: &str) -> String {
+    ::emulator_server::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{CONNECTOR_ARN_RESOURCE_TYPE}/{name}"),
+    )
+}
+
+/// The name of the connector a configuration describes: the provider it connects to
+/// and the identifier of the tenant within that provider.
+///
+/// `PutConnector` carries no name, so the name is DERIVED from the configuration —
+/// which is also why one tenant can have only one connector: a second connector for
+/// the same provider configuration would need the same name.
+pub fn connector_name(provider: &str, tenant_identifier: &str) -> String {
+    format!("{}-{tenant_identifier}", provider.to_lowercase())
+}
+
+/// The Region and the connector name an `Arn` names, or `None` when the value is not
+/// a well-formed connector ARN of this service.
+///
+/// A well-formed ARN of another partition, Region or account parses here and simply
+/// names no connector this store holds — "not found" rather than "not valid".
+pub fn connector_arn_parts(arn: &str) -> Option<(&str, &str)> {
+    let mut segments = arn.splitn(6, ':');
+    if segments.next()? != "arn" {
+        return None;
+    }
+    let partition = segments.next()?;
+    let service = segments.next()?;
+    let region = segments.next()?;
+    let account = segments.next()?;
+    let resource = segments.next()?;
+    // A connector is a regional resource, so its ARN names a Region.
+    if partition.is_empty() || service != ARN_SERVICE || region.is_empty() || account.is_empty() {
+        return None;
+    }
+    let name = resource
+        .strip_prefix(CONNECTOR_ARN_RESOURCE_TYPE)?
+        .strip_prefix('/')?;
+    // `ConnectorName` is 1..256 characters, and the resource portion of a connector
+    // ARN is exactly that name.
+    if name.is_empty() || name.len() > CONNECTOR_NAME_MAX_LEN || name.contains('/') {
+        return None;
+    }
+    Some((region, name))
+}
+
+/// Why `arn` is not a well-formed connector ARN. BUILT FROM THE REQUEST: it quotes
+/// the value the caller sent and names the form the member takes, so every operation
+/// that takes a connector ARN refuses a malformed one the same way.
+pub fn invalid_connector_arn_message(arn: &str) -> String {
+    format!(
+        "The Arn '{arn}' provided in the request is not a valid connector ARN. Please \
+         provide an ARN of the form \
+         arn:aws:{ARN_SERVICE}:<region>:<account>:{CONNECTOR_ARN_RESOURCE_TYPE}/<name>."
+    )
+}
+
+/// How this service words a connector that no longer, or never did, exist. Built
+/// from the request for the same reason as [`invalid_connector_arn_message`].
+pub fn no_such_connector_message(arn: &str) -> String {
+    format!("The connector '{arn}' provided in the request does not exist.")
 }
 
 /// The ARN resource type of a configuration aggregator, as Config spells it in the

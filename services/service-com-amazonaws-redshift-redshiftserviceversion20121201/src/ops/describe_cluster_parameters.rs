@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeClusterParameters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeClusterParameters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeClusterParameters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the parameters one cluster parameter group carries: its family's
+//! engine defaults (`crate::state::ENGINE_DEFAULT_PARAMETERS`), each with the
+//! value the group holds for it and the `Source` that value came from, narrowed
+//! to the requested `Source` and cut into the requested page.
 //!
 //! ## Shape of an operation
 //!
@@ -107,12 +103,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `DescribeClusterParametersError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DescribeClusterParameters")]
+// `DependentServiceUnavailableFault` is widened in: the model does not list it for
+// this operation, but the service declares the shape, and it is the only modelled
+// way to say "the control-plane store could not be reached" (the same widening
+// `DescribeClusterParameterGroups` makes).
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DescribeClusterParameters",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DescribeClusterParametersErrorModeled {
     ClusterParameterGroupNotFoundFault(ClusterParameterGroupNotFoundFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
-
 /// This operation's error channel, as the generated `impl Operation` names it
 /// (`crate::ops::describe_cluster_parameters::DescribeClusterParametersError`). Wrapping the modeled enum is what
 /// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
@@ -162,20 +165,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeClusterParameters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeClusterParametersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeClusterParameters"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DescribeClusterParametersErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "Specify user to show parameters that are different form the default.
+        // Similarly, specify engine-default to show parameters that are the same
+        // as the default parameter group. Valid Values: user | engine-default" —
+        // a request naming anything else names no parameter type, so it is
+        // refused before the store is read at all.
+        if let Some(source) = input.source.as_deref() {
+            if !st::PARAMETER_SOURCES.contains(&source) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Invalid value for Source: '{source}'. Valid Values: {}",
+                    st::PARAMETER_SOURCES.join(" | ")
+                )));
+            }
+        }
+
+        // A pure report: nothing here changes what a later caller sees, and a
+        // parameter group has no status the clock owes a transition on.
+        let store = state.lock();
+
+        let Some(group) = store.parameter_group(&input.parameter_group_name) else {
+            return Err(
+                DescribeClusterParametersErrorModeled::ClusterParameterGroupNotFoundFault(
+                    ClusterParameterGroupNotFoundFault {
+                        message: Some(format!(
+                            "Cluster parameter group not found: {}",
+                            input.parameter_group_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The group's own view of its family's catalog: every parameter it
+        // publishes, carrying the value the group holds and the `Source` that
+        // value came from. The optional filter then keeps only the parameter
+        // types the request asked for — by default, all of them.
+        let matched: Vec<Parameter> = group
+            .parameters()
+            .into_iter()
+            .filter(|parameter| {
+                input
+                    .source
+                    .as_deref()
+                    .is_none_or(|wanted| parameter.source.as_deref() == Some(wanted))
+            })
+            .collect();
+
+        let (start, end, next_marker) =
+            match st::page_bounds(input.marker.as_deref(), input.max_records, matched.len()) {
+                Ok(page) => page,
+                Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+            };
+
+        Ok(DescribeClusterParametersOutput {
+            parameters: Some(matched[start..end].to_vec()),
+            marker: next_marker,
+        })
     }
 }

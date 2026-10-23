@@ -41,6 +41,8 @@ mod folder_listing;
 mod harness;
 #[path = "all/repository_description.rs"]
 mod repository_description;
+#[path = "all/repository_encryption_key.rs"]
+mod repository_encryption_key;
 #[path = "all/repository_lifecycle.rs"]
 mod repository_lifecycle;
 #[path = "all/repository_rename.rs"]

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListWorkspaceServiceAccounts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListWorkspaceServiceAccounts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListWorkspaceServiceAccounts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the service accounts the store holds for one workspace, a page at a time:
+//! the records `CreateWorkspaceServiceAccount` pushed onto that workspace, in the
+//! order it minted them, projected as `ServiceAccountSummary`. The operation is
+//! `@readonly`, so it writes nothing of its own — the only state it touches is the
+//! settle the clock already owed the workspace it reports on.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +157,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListWorkspaceServiceAccounts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListWorkspaceServiceAccountsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListWorkspaceServiceAccounts"))
+        // Every member this report reads is modelled, and the accounts are stored on
+        // the workspace the request names, so nothing here depends on request
+        // metadata.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListWorkspaceServiceAccountsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the grafana workspace store is unavailable".to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `maxResults` is modelled `@range(min: 1, max: 100)` and the boundary
+        // validator refused anything outside it before this handler ran, so the
+        // only case left is an absent value: serve the largest page the model
+        // allows. The `clamp` states that invariant rather than correcting a
+        // caller — a value reaching here outside the range is a validator bug,
+        // which the debug assertion surfaces instead of silently repairing.
+        let requested = input
+            .max_results
+            .unwrap_or(crate::state::SERVICE_ACCOUNT_PAGE_LIMIT);
+        debug_assert!(
+            (1..=crate::state::SERVICE_ACCOUNT_PAGE_LIMIT).contains(&requested),
+            "maxResults {requested} should have been refused at the boundary"
+        );
+        let page_size =
+            usize::try_from(requested.clamp(1, crate::state::SERVICE_ACCOUNT_PAGE_LIMIT))
+                .expect("a page size clamped into 1..=100 fits in usize");
+
+        // The token is the id of the account the next page starts at — "you receive
+        // this token from a previous ListWorkspaceServiceAccounts operation" — so the
+        // only tokens this operation accepts are ids of the form it issues. Anything
+        // else is a parameter value it cannot honour, which is what the modelled
+        // `ValidationException` reports.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                let Some(order) = crate::state::service_account_order(token) else {
+                    return Err(
+                        ListWorkspaceServiceAccountsErrorModeled::ValidationException(
+                            ValidationException {
+                                message: format!(
+                                    "nextToken {token:?} is not a token returned by \
+                                     ListWorkspaceServiceAccounts"
+                                ),
+                                reason: "FIELD_VALIDATION_FAILED".to_string(),
+                                field_list: Some(vec![ValidationExceptionField {
+                                    name: "nextToken".to_string(),
+                                    message: "must be a token returned by a previous \
+                                              ListWorkspaceServiceAccounts call"
+                                        .to_string(),
+                                }]),
+                            },
+                        )
+                        .into(),
+                    );
+                };
+                Some(order)
+            }
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The accounts hang off the workspace, so an id naming no workspace is a
+        // request against a resource that does not exist. `settled_mut` materialises
+        // only what the clock already owed that workspace by `now`; this report adds
+        // nothing of its own.
+        let Some(workspace) = store.settled_mut(&input.workspace_id, now) else {
+            return Err(
+                ListWorkspaceServiceAccountsErrorModeled::ResourceNotFoundException(
+                    crate::state::workspace_not_found(&input.workspace_id),
+                )
+                .into(),
+            );
+        };
+
+        // A workspace below the documented Grafana floor holds no service account at
+        // all (`CreateWorkspaceServiceAccount` refuses one), so its stored list is
+        // empty and this reports it empty rather than refusing a read of it.
+        let mut service_accounts =
+            Vec::with_capacity(page_size.min(workspace.service_accounts.len()));
+        let mut next_token = None;
+        for account in &workspace.service_accounts {
+            // Resume at the first account at or after the token, so a page is still
+            // served when the account the token named was deleted meanwhile.
+            let before_token = resume_at.is_some_and(|start| {
+                crate::state::service_account_order(&account.id)
+                    .is_some_and(|order| order < start)
+            });
+            if before_token {
+                continue;
+            }
+            if service_accounts.len() == page_size {
+                next_token = Some(account.id.clone());
+                break;
+            }
+            service_accounts.push(account.to_summary());
+        }
+
+        Ok(ListWorkspaceServiceAccountsOutput {
+            next_token,
+            service_accounts,
+            workspace_id: workspace.id.clone(),
+        })
     }
 }

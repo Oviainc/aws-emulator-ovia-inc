@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: drops the keys the request names from the tag map of the
+//! NON-certificate ACM resource the ARN names, so `ListTagsForResource` stops
+//! reporting them.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +154,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(validation_exception(
+                "the acm resource store is unavailable".to_string(),
+            ));
+        };
+
+        // "Use this action for all ACM resource types EXCEPT the certificate resource
+        // type. For certificate resources, use RemoveTagsFromCertificate instead" — so
+        // a certificate ARN is input this operation's own constraints do not admit.
+        if crate::state::certificate_id_from_arn(&input.resource_arn).is_some() {
+            return Err(validation_exception(
+                crate::state::certificate_resource_message(
+                    &input.resource_arn,
+                    "RemoveTagsFromCertificate",
+                ),
+            ));
+        }
+
+        // A reserved key is refused here exactly as the tagging path refuses it, so a
+        // request naming one never reaches the stored map. This operation models no
+        // `InvalidTagException`, so the refusal is the `ValidationException` it does
+        // model.
+        for key in &input.tag_keys {
+            crate::state::check_tag_key_not_reserved(key).map_err(validation_exception)?;
+        }
+
+        let mut store = state.lock();
+        // Every handler materialises what the clock already owes first, so untagging a
+        // resource cannot hold back a transition that was already due.
+        store.materialize_due(::std::time::SystemTime::now());
+        let Some(stored) = store.resource_tags_mut(&input.resource_arn) else {
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message(
+                        &input.resource_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // The removal rule itself lives in `state`, beside the tag map it edits: each
+        // named key is dropped whatever value it holds, and a key the resource does not
+        // carry leaves the map as it was.
+        crate::state::remove_tag_keys(stored, &input.tag_keys);
+
+        Ok(UntagResourceOutput)
     }
+}
+
+/// A refusal of the request as invalid, as this operation's own modelled
+/// `ValidationException` ("the supplied input failed to satisfy constraints").
+fn validation_exception(message: String) -> UntagResourceError {
+    UntagResourceErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
 }

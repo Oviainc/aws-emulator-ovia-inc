@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateInferenceComponent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateInferenceComponent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateInferenceComponent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: validates the request against the stored endpoint, its production
+//! variants and the stored models, then stores the component in `Creating` with the
+//! instant the clock owes it `InService` — which is never before the endpoint that
+//! hosts it is serving. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +158,154 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateInferenceComponent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateInferenceComponentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateInferenceComponent"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // Exactly one of the two specification members: the model doc for
+        // `Specifications` says "You can use either this parameter or the singular
+        // Specification parameter, but not both", and a component with neither names
+        // nothing to deploy. Neither rule is expressible in the model, so the boundary
+        // validator passed the request and this handler refuses it.
+        let specifications: &[InferenceComponentSpecification] =
+            match (input.specification.as_ref(), input.specifications.as_deref()) {
+                (Some(_), Some(_)) => {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "Specify either Specification or Specifications for the inference \
+                         component, but not both.",
+                    ));
+                }
+                (None, None) => {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "One of Specification or Specifications must be specified for the \
+                         inference component.",
+                    ));
+                }
+                (Some(single), None) => ::std::slice::from_ref(single),
+                // The modelled `len 1..5` already refuses this at the boundary; stated
+                // here too so the handler's own invariant does not rest on that.
+                (None, Some([])) => {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "Specifications must name at least one specification for the \
+                         inference component.",
+                    ));
+                }
+                (None, Some(list)) => list,
+            };
+
+        let region = crate::state::request_region(ctx);
+        let arn = crate::state::resource_arn(
+            &region,
+            "inference-component",
+            &input.inference_component_name,
+        );
+
+        let mut store = state.lock();
+        // The store is bounded, so a caller varying `InferenceComponentName` cannot grow
+        // it without end. `ResourceLimitExceeded` is the limit failure this operation
+        // models.
+        if !store.inference_components_below_quota() {
+            return Err(CreateInferenceComponentErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The account-level service limit for inference components is {}, with \
+                         current utilization of {} and a request delta of 1.",
+                        crate::state::INFERENCE_COMPONENT_QUOTA,
+                        store.inference_components.len()
+                    )),
+                },
+            )
+            .into());
+        }
+        if store
+            .inference_components
+            .contains_key(&input.inference_component_name)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Cannot create already existing inference component \"{arn}\"."
+            )));
+        }
+
+        // Every model a specification names must already exist, the way `CreateEndpoint`
+        // requires the endpoint configuration it is handed.
+        for specification in specifications {
+            if let Some(model_name) = specification.model_name.as_deref() {
+                if !store.models.contains_key(model_name) {
+                    let model_arn = crate::state::resource_arn(&region, "model", model_name);
+                    return Err(crate::scaffolded::Scaffolded::validation(format!(
+                        "Could not find model \"{model_arn}\"."
+                    )));
+                }
+            }
+        }
+
+        let Some(endpoint) = store.endpoints.get_mut(&input.endpoint_name) else {
+            let endpoint_arn = crate::state::resource_arn(&region, "endpoint", &input.endpoint_name);
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Could not find endpoint \"{endpoint_arn}\"."
+            )));
+        };
+
+        // `VariantName` names "an existing production variant where you host the
+        // inference component", so a name the endpoint does not carry is refused —
+        // BEFORE the clock-owed transition below, so a refused request leaves the stored
+        // endpoint exactly as it found it and nothing is recorded for a call that failed.
+        if let Some(variant_name) = input.variant_name.as_deref() {
+            if !endpoint
+                .production_variants
+                .iter()
+                .any(|variant| variant.variant_name == variant_name)
+            {
+                let endpoint_arn = endpoint.arn.clone();
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Could not find production variant \"{variant_name}\" on endpoint \
+                     \"{endpoint_arn}\"."
+                )));
+            }
+        }
+
+        // The deployment the clock already owed the ENDPOINT, materialised here: it was
+        // due at the stored instant whether or not anybody called, so this create is not
+        // what moved the endpoint on.
+        let now = ::std::time::SystemTime::now();
+        let endpoint_settled = endpoint.settle_status(now);
+        let endpoint_arn = endpoint.arn.clone();
+        // A component runs on the endpoint's own capacity, so its copies cannot be
+        // placed before that endpoint is serving: the instant the placement is owed is
+        // measured from whichever is later, this call or the endpoint going `InService`.
+        let placement_starts_at = now.max(endpoint.in_service_at);
+
+        store.inference_components.insert(
+            input.inference_component_name.clone(),
+            crate::state::InferenceComponent {
+                name: input.inference_component_name.clone(),
+                arn: arn.clone(),
+                endpoint_name: input.endpoint_name.clone(),
+                endpoint_arn: endpoint_arn.clone(),
+                variant_name: input.variant_name.clone(),
+                specification: input.specification.clone(),
+                specifications: input.specifications.clone(),
+                runtime_config: input.runtime_config.clone(),
+                // The copies still have to be placed, so the component reports
+                // `Creating` until the instant below, as the real service does.
+                status: crate::state::STATUS_CREATING.to_string(),
+                failure_reason: None,
+                tags: input.tags.clone().unwrap_or_default(),
+                creation_time: now,
+                last_modified_time: now,
+                in_service_at: placement_starts_at
+                    + crate::state::INFERENCE_COMPONENT_IN_SERVICE_AFTER,
+            },
+        );
+        drop(store);
+
+        if endpoint_settled {
+            // The endpoint's transition is a state change of its own, recorded against
+            // the call that materialised it — this one.
+            crate::state::record_state_change(Self::NAME, &endpoint_arn, ctx);
+        }
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateInferenceComponentOutput {
+            inference_component_arn: arn,
+        })
     }
 }

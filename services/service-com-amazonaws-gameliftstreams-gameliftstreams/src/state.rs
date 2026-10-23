@@ -16,13 +16,18 @@
 //!   a bare resource id or a full ARN for the same resource.
 //! * [`application_arn`] / [`stream_group_arn`] / [`stream_session_arn`] build ARNs
 //!   through `engine::emulator_arn`, so the account segment is the canonical one.
+//! * [`resolved_arn`] / [`resolved_stream_session_arn`] resolve the identifier a
+//!   request passed to the full ARN of the resource it names, and
+//!   [`resource_not_found`] / [`stream_session_not_found`] are the ONE place the
+//!   service's `ResourceNotFoundException` message is built from it.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     DefaultApplication, DisplayConfiguration, LocationConfiguration, LocationState,
-    PerformanceStatsConfiguration, ReplicationStatus, RuntimeEnvironment,
+    PerformanceStatsConfiguration, ReplicationStatus, ResourceNotFoundException,
+    RuntimeEnvironment,
 };
 
 /// This service's SigV4 signing name, and the `service` segment of its ARNs.
@@ -859,31 +864,145 @@ pub fn identifier_id(identifier: &str, resource_type: &str) -> Option<String> {
     path.split('/').next_back().map(str::to_string)
 }
 
+/// One resource's ARN: `arn:aws:gameliftstreams:<region>:<account>:<type>/<path>`.
+fn resource_arn(region: &str, resource_type: &str, path: &str) -> String {
+    ::engine::emulator_arn(SIGNING_NAME, region, &format!("{resource_type}/{path}"))
+}
+
 /// The ARN of an application: `arn:aws:gameliftstreams:<region>:<account>:application/<id>`.
 pub fn application_arn(region: &str, id: &str) -> String {
-    ::engine::emulator_arn(
-        SIGNING_NAME,
-        region,
-        &format!("{APPLICATION_RESOURCE}/{id}"),
-    )
+    resource_arn(region, APPLICATION_RESOURCE, id)
 }
 
 /// The ARN of a stream group: `arn:aws:gameliftstreams:<region>:<account>:streamgroup/<id>`.
 pub fn stream_group_arn(region: &str, id: &str) -> String {
-    ::engine::emulator_arn(
-        SIGNING_NAME,
-        region,
-        &format!("{STREAM_GROUP_RESOURCE}/{id}"),
-    )
+    resource_arn(region, STREAM_GROUP_RESOURCE, id)
 }
 
 /// The ARN of a stream session, which carries the hosting stream group:
 /// `arn:aws:gameliftstreams:<region>:<account>:streamsession/<group id>/<session id>`.
 pub fn stream_session_arn(region: &str, group_id: &str, session_id: &str) -> String {
-    ::engine::emulator_arn(
-        SIGNING_NAME,
+    resource_arn(
         region,
-        &format!("{STREAM_SESSION_RESOURCE}/{group_id}/{session_id}"),
+        STREAM_SESSION_RESOURCE,
+        &format!("{group_id}/{session_id}"),
+    )
+}
+
+/// The ARN the `Identifier` a request passed resolves to, for the resource type
+/// the operation addresses.
+///
+/// The model's `Identifier` shape accepts either form for the same resource, so an
+/// identifier already in ARN form IS the resolved ARN, and a bare id resolves
+/// against the region the request is answered in and this emulator's account. The
+/// identifier does NOT have to name a resource the store holds: resolution is a
+/// property of the request alone, which is what lets a not-found message name the
+/// ARN that is missing.
+///
+/// No kind check is performed, unlike [`identifier_id`]: an identifier already in
+/// ARN form is reported as the caller wrote it, even when its resource type is not
+/// the one the operation addresses, because that string IS the ARN the request
+/// named and the message reports what the request asked for.
+pub fn resolved_arn(region: &str, identifier: &str, resource_type: &str) -> String {
+    if identifier.starts_with("arn:") {
+        return identifier.to_string();
+    }
+    resource_arn(region, resource_type, identifier)
+}
+
+/// The composite stream session ARN the two path labels of a session-scoped
+/// operation resolve to: `…:streamsession/<stream group id>/<stream session id>`.
+///
+/// A `StreamSessionIdentifier` already in ARN form is its own resolved ARN;
+/// otherwise the enclosing stream group's id comes from the operation's
+/// `Identifier` label, whether that label is a bare id or a stream group ARN. An
+/// `Identifier` that is an ARN of some OTHER resource names no stream group this
+/// service can resolve, and the message still has to carry a well-formed ARN, so
+/// its last path segment stands in for the group id rather than being embedded
+/// whole.
+pub fn resolved_stream_session_arn(
+    region: &str,
+    group_identifier: &str,
+    session_identifier: &str,
+) -> String {
+    if session_identifier.starts_with("arn:") {
+        return session_identifier.to_string();
+    }
+    let group_id = identifier_id(group_identifier, STREAM_GROUP_RESOURCE).unwrap_or_else(|| {
+        group_identifier
+            .rsplit(['/', ':'])
+            .next()
+            .unwrap_or(group_identifier)
+            .to_string()
+    });
+    stream_session_arn(region, &group_id, session_identifier)
+}
+
+/// The service's `ResourceNotFoundException` for a resource-scoped operation: it
+/// names the ARN the request's identifier resolved to and carries a per-request
+/// correlation id.
+///
+/// The model types `ResourceNotFoundException` with a single required `Message` and
+/// `@httpError 404` and says nothing about the text, but the text the service emits
+/// is built from the REQUEST — the resolved ARN of the identifier the caller
+/// passed — so every not-found path in this crate goes through here (or through
+/// [`stream_session_not_found`]) rather than wording its own.
+pub fn resource_not_found(arn: &str) -> ResourceNotFoundException {
+    not_found("Resource", arn)
+}
+
+/// The service's `ResourceNotFoundException` for the session-scoped operations
+/// (`GetStreamSession`, `TerminateStreamSession`), which name the stream session —
+/// the resource the caller addressed — even when it is the enclosing stream group
+/// that is absent.
+pub fn stream_session_not_found(arn: &str) -> ResourceNotFoundException {
+    not_found("Stream session", arn)
+}
+
+/// `<subject> '<arn>' does not exist (Internal ID: <uuid>)`.
+///
+/// The correlation id is minted per call and is not stored: it identifies ONE
+/// request, so no two responses carry the same one and nothing reads it back.
+fn not_found(subject: &str, arn: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!(
+            "{subject} '{arn}' does not exist (Internal ID: {})",
+            internal_id()
+        ),
+    }
+}
+
+/// A fresh opaque correlation id, in the canonical 8-4-4-4-12 lowercase-hex form the
+/// service's internal ids take.
+///
+/// Minted per CALL from the wall clock and a process-local counter, mixed the way
+/// [`ComAmazonawsGameliftstreamsGameliftstreamsState::mint_id`] mixes a minted
+/// resource id — the counter is what makes two ids of the same nanosecond distinct by
+/// construction rather than by luck. It identifies one request, so it is never stored
+/// and never read back, and it is not part of this service's state: a refused call
+/// writes nothing.
+fn internal_id() -> String {
+    static NEXT: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
+    let counter = NEXT.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos() as u64);
+    let mut hash = nanos ^ counter.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut digits = String::with_capacity(32);
+    for _ in 0..2 {
+        hash = hash
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(0xBF58_476D_1CE4_E5B9);
+        let mixed = (hash >> 29) ^ hash;
+        digits.push_str(&format!("{mixed:016x}"));
+    }
+    format!(
+        "{}-{}-{}-{}-{}",
+        &digits[0..8],
+        &digits[8..12],
+        &digits[12..16],
+        &digits[16..20],
+        &digits[20..32]
     )
 }
 

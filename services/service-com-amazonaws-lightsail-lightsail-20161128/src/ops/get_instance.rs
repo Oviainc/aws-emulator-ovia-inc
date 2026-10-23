@@ -166,8 +166,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         crate::state::with_state(&*self.engine, |store| {
             store
-                .instance(&name)
-                .map(crate::state::StoredInstance::view)
+                .instance_view(&name)
                 .ok_or_else(|| not_found(&name))
         })
         .ok_or_else(unavailable)?

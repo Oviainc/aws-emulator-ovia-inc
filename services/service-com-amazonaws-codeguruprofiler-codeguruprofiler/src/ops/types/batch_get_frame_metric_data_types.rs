@@ -30,7 +30,9 @@ pub struct FrameMetric {
     pub thread_states: Vec<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.codeguruprofiler#BatchGetFrameMetricDataResponse")]
+/// `BatchGetFrameMetricDataResponse`. Hand-written because `startTime`/`endTime`, and
+/// every `TimestampStructure` it carries, are `@timestampFormat("date-time")` members —
+/// see `types/date_time_wire.rs`.
 #[derive(Debug, Clone)]
 pub struct BatchGetFrameMetricDataOutput {
     pub start_time: ::aws_smithy_types::DateTime,
@@ -41,11 +43,56 @@ pub struct BatchGetFrameMetricDataOutput {
     pub frame_metric_data: Vec<FrameMetricDatum>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.codeguruprofiler#TimestampStructure")]
+profiler_schema_and_codec!(
+    BatchGetFrameMetricDataOutput,
+    BATCH_GET_FRAME_METRIC_DATA_OUTPUT_SCHEMA,
+    "com.amazonaws.codeguruprofiler#BatchGetFrameMetricDataResponse",
+    "com.amazonaws.codeguruprofiler",
+    "BatchGetFrameMetricDataResponse",
+    (M_START_TIME, start_time, "startTime", 0, req, date_time),
+    (M_END_TIME, end_time, "endTime", 1, req, date_time),
+    (M_RESOLUTION, resolution, "resolution", 2, req, string),
+    (
+        M_END_TIMES,
+        end_times,
+        "endTimes",
+        3,
+        req,
+        list_of(TimestampStructure)
+    ),
+    (
+        M_UNPROCESSED_END_TIMES,
+        unprocessed_end_times,
+        "unprocessedEndTimes",
+        4,
+        req,
+        map_of_list_of(TimestampStructure)
+    ),
+    (
+        M_FRAME_METRIC_DATA,
+        frame_metric_data,
+        "frameMetricData",
+        5,
+        req,
+        list_of(FrameMetricDatum)
+    ),
+);
+
+/// `TimestampStructure`. Hand-written because its one member is a
+/// `@timestampFormat("date-time")` timestamp.
 #[derive(Debug, Clone)]
 pub struct TimestampStructure {
     pub value: ::aws_smithy_types::DateTime,
 }
+
+profiler_schema_and_codec!(
+    TimestampStructure,
+    TIMESTAMP_STRUCTURE_SCHEMA,
+    "com.amazonaws.codeguruprofiler#TimestampStructure",
+    "com.amazonaws.codeguruprofiler",
+    "TimestampStructure",
+    (M_VALUE, value, "value", 0, req, date_time),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.codeguruprofiler#FrameMetricDatum")]
 #[derive(Debug, Clone, Default)]

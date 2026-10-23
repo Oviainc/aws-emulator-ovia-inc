@@ -327,7 +327,9 @@ pub const AUTO_MODEL_REGISTRATION_DISABLED: &str = "AutoModelRegistrationDisable
 
 /// `EndpointStatus`'s and `ClusterStatus`'s members this emulator moves a resource
 /// through (both modelled enums also carry the update, rollback and delete states,
-/// which this slice does not reach). Named once here so no handler compares a bare
+/// which this slice does not reach). `InferenceComponentStatus` spells the same two
+/// members, so an inference component moves through these too. Named once here so no
+/// handler compares a bare
 /// string literal.
 pub const STATUS_CREATING: &str = "Creating";
 /// See [`STATUS_CREATING`].
@@ -576,22 +578,112 @@ pub struct Endpoint {
     pub in_service_at: SystemTime,
 }
 
+/// Materialise the `Creating` -> `InService` transition the clock already owes a
+/// resource that carries one.
+///
+/// This is the one write a reporting operation may make: the transition was due at
+/// `in_service_at` whether or not anybody called, so the observer makes no difference to
+/// the result. `last_modified_time` moves to the instant the transition was due, not to
+/// "now", so the value is stable across later reads.
+///
+/// Answers whether the transition happened on this call, so the caller can record it.
+fn settle_creating(
+    status: &mut String,
+    last_modified_time: &mut SystemTime,
+    in_service_at: SystemTime,
+    now: SystemTime,
+) -> bool {
+    if status == STATUS_CREATING && now >= in_service_at {
+        *status = STATUS_IN_SERVICE.to_string();
+        *last_modified_time = in_service_at;
+        return true;
+    }
+    false
+}
+
 impl Endpoint {
-    /// Materialise the `Creating` -> `InService` transition the clock already owes.
-    ///
-    /// This is the one write a reporting operation may make: the transition was due at
-    /// `in_service_at` whether or not anybody called, so the observer makes no
-    /// difference to the result. `LastModifiedTime` moves to the instant the
-    /// transition was due, not to "now", so the value is stable across later reads.
-    ///
-    /// Answers whether the transition happened on this call, so the caller can record it.
+    /// Materialise the `Creating` -> `InService` transition the clock already owes; see
+    /// [`settle_creating`].
     pub fn settle_status(&mut self, now: SystemTime) -> bool {
-        if self.status == STATUS_CREATING && now >= self.in_service_at {
-            self.status = STATUS_IN_SERVICE.to_string();
-            self.last_modified_time = self.in_service_at;
-            return true;
+        settle_creating(
+            &mut self.status,
+            &mut self.last_modified_time,
+            self.in_service_at,
+            now,
+        )
+    }
+}
+
+/// How long after `CreateInferenceComponent` the clock owes that component the
+/// `Creating` -> `InService` transition, on the same terms as
+/// [`ENDPOINT_IN_SERVICE_AFTER`]: a caller that describes the component straight after
+/// creating it still observes `Creating` with no copies running, and one that waits
+/// observes `InService` with the copies it asked for. Compressed, never zero.
+///
+/// The span is measured from the later of the create and the instant the hosting
+/// endpoint goes `InService`, because a component's copies run on that endpoint's
+/// capacity and cannot be placed before it is serving.
+pub const INFERENCE_COMPONENT_IN_SERVICE_AFTER: Duration = Duration::from_millis(300);
+
+/// See [`MODEL_QUOTA`]: the same bound on the inference-component store, which
+/// `CreateInferenceComponent` answers `ResourceLimitExceeded` past and
+/// `DeleteInferenceComponent` releases a slot of.
+pub const INFERENCE_COMPONENT_QUOTA: usize = 1_000;
+
+/// An inference component created by `CreateInferenceComponent`, as
+/// `DescribeInferenceComponent` replays it.
+///
+/// The endpoint it is hosted on is snapshotted by name AND by ARN, so the component
+/// keeps reporting the endpoint it was deployed to even after that endpoint is deleted.
+/// Exactly one of `specification` / `specifications` is ever set: the model doc for
+/// `Specifications` says a caller uses "either this parameter or the singular
+/// Specification parameter, but not both".
+///
+/// `in_service_at` is the instant the clock owes the `Creating` -> `InService`
+/// transition; it is stored, never slept on, and materialised by whichever reporting
+/// call first runs at or after it.
+#[derive(Debug, Clone)]
+pub struct InferenceComponent {
+    pub name: String,
+    pub arn: String,
+    pub endpoint_name: String,
+    pub endpoint_arn: String,
+    pub variant_name: Option<String>,
+    pub specification: Option<crate::ops::types::InferenceComponentSpecification>,
+    pub specifications: Option<Vec<crate::ops::types::InferenceComponentSpecification>>,
+    pub runtime_config: Option<crate::ops::types::InferenceComponentRuntimeConfig>,
+    pub status: String,
+    pub failure_reason: Option<String>,
+    pub tags: Vec<Tag>,
+    pub creation_time: SystemTime,
+    pub last_modified_time: SystemTime,
+    pub in_service_at: SystemTime,
+}
+
+impl InferenceComponent {
+    /// Materialise the `Creating` -> `InService` transition the clock already owes; see
+    /// [`settle_creating`].
+    pub fn settle_status(&mut self, now: SystemTime) -> bool {
+        settle_creating(
+            &mut self.status,
+            &mut self.last_modified_time,
+            self.in_service_at,
+            now,
+        )
+    }
+
+    /// The specifications this component deploys, whether the caller sent the singular
+    /// `Specification` or the `Specifications` list: one slice both readers walk.
+    ///
+    /// A stored record carries at most ONE of the two members —
+    /// `CreateInferenceComponent` refuses a request that sends both — so the
+    /// both-populated pair is not a case this has to choose between.
+    pub fn specifications(&self) -> &[crate::ops::types::InferenceComponentSpecification] {
+        match (&self.specification, &self.specifications) {
+            (Some(single), None) => ::std::slice::from_ref(single),
+            (None, Some(list)) => list.as_slice(),
+            _ => &[],
         }
-        false
     }
 }
 
@@ -1258,6 +1350,9 @@ pub fn model_package_lookup_key(identifier: &str) -> &str {
 /// Per-service state for com-amazonaws-sagemaker-sagemaker. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSagemakerSagemakerState {
+    /// Keyed by [`entity_key`] of `ExperimentName`. See [`Experiment`], with the rest
+    /// of the experiment-management slice.
+    pub experiments: BTreeMap<String, Experiment>,
     /// Whether this account's SageMaker Service Catalog portfolio is enabled, as
     /// `EnableSagemakerServicecatalogPortfolio` and
     /// `DisableSagemakerServicecatalogPortfolio` set it and
@@ -1270,6 +1365,8 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     pub servicecatalog_portfolio_enabled: bool,
     /// Keyed by `ModelName`.
     pub models: BTreeMap<String, Model>,
+    /// Keyed by `InferenceComponentName`.
+    pub inference_components: BTreeMap<String, InferenceComponent>,
     /// Keyed by `EndpointConfigName`.
     pub endpoint_configs: BTreeMap<String, EndpointConfig>,
     /// Keyed by `EndpointName`.
@@ -1369,6 +1466,12 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// Whether another model fits, i.e. the store is below [`MODEL_QUOTA`].
     pub fn models_below_quota(&self) -> bool {
         self.models.len() < MODEL_QUOTA
+    }
+
+    /// Whether another inference component fits, i.e. the store is below
+    /// [`INFERENCE_COMPONENT_QUOTA`].
+    pub fn inference_components_below_quota(&self) -> bool {
+        self.inference_components.len() < INFERENCE_COMPONENT_QUOTA
     }
 
     /// Whether another endpoint configuration fits, i.e. the store is below
@@ -3115,6 +3218,62 @@ pub fn entity_name_from_name_or_arn<'v>(
 }
 
 // ---------------------------------------------------------------------------
+// The experiment-management slice: `CreateExperiment` and `DescribeExperiment`. Kept
+// together as one span, the way the slices above are, so this one resource kind reads
+// as one block. The store key is [`entity_key`], shared with the experiment-tracking
+// slice: an `ExperimentEntityName` is unique per account and not case-sensitive.
+// ---------------------------------------------------------------------------
+
+/// The ARN resource kind an experiment carries, as the modelled `ExperimentArn` pattern
+/// spells it (`^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:experiment/`).
+///
+/// Named once, the way the lineage slices name theirs, so `CreateExperiment`'s ARN
+/// minting and the ARN PARSING that resolves an `experiment/...` ARN back to a stored
+/// record cannot drift apart.
+pub const EXPERIMENT_KIND: &str = "experiment";
+
+/// See [`MODEL_QUOTA`]. Bounds the experiment store the same way, and is what
+/// `CreateExperiment` answers `ResourceLimitExceeded` past.
+pub const EXPERIMENT_QUOTA: usize = 1_000;
+
+/// An experiment created by `CreateExperiment`, as `DescribeExperiment` replays it.
+///
+/// `name` keeps the spelling the creating request used; the store's key is
+/// [`entity_key`] of that name, so a later create or read that differs only in case
+/// resolves to this same record. `created_by` is stored at creation rather than rebuilt
+/// per read, so every later read reports the identity that actually created it.
+#[derive(Debug, Clone)]
+pub struct Experiment {
+    pub name: String,
+    pub arn: String,
+    /// What `DescribeExperiment` reports as `DisplayName`: the value the request
+    /// supplied, or `ExperimentName` when it supplied none — the model documents that
+    /// "if DisplayName isn't specified, ExperimentName is displayed".
+    pub display_name: String,
+    pub description: Option<String>,
+    pub created_by: UserContext,
+    /// The tags the create carried, which `AddTags`/`DeleteTags`/`ListTags` and `Search`
+    /// read once those operations are implemented (they are scaffolded stubs today).
+    pub tags: Vec<Tag>,
+    pub creation_time: SystemTime,
+    pub last_modified_time: SystemTime,
+}
+
+impl ComAmazonawsSagemakerSagemakerState {
+    /// Whether another experiment fits, i.e. the store is below [`EXPERIMENT_QUOTA`].
+    pub fn experiments_below_quota(&self) -> bool {
+        self.experiments.len() < EXPERIMENT_QUOTA
+    }
+
+    /// The experiment `name` identifies, whatever case it is written in — the name is
+    /// unique per account and not case-sensitive, so the lookup folds case the way
+    /// [`entity_key`] does.
+    pub fn experiment(&self, name: &str) -> Option<&Experiment> {
+        self.experiments.get(&entity_key(name))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The custom-image slice: `CreateImage` / `CreateImageVersion` and the two
 // `Describe*` readers. Kept together at the end of this module, the way the
 // lineage-action, model-card and notebook-instance slices are, so one slice's
@@ -3346,10 +3505,9 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// experiment-trial-component, artifact, action and context. Each is resolved against
     /// the store the matching create writes to, through
     /// [`entity_name_from_name_or_arn`], so an ARN naming another partition, service,
-    /// Region or account names no entity here. The experiment and context stores do not
-    /// exist yet — `CreateExperiment` and `CreateContext` are still scaffolds answering
-    /// 501, so nothing was ever created for an `experiment/...` or `context/...` ARN to
-    /// name and such an ARN names no entity.
+    /// Region or account names no entity here. The context store does not exist yet —
+    /// `CreateContext` is still a scaffold answering 501, so nothing was ever created for
+    /// a `context/...` ARN to name and such an ARN names no entity.
     pub fn lineage_entity_exists(&self, region: &str, arn: &str) -> bool {
         // Every `AssociationEntityArn` IS an ARN (its pattern starts `^arn:`), so the
         // bare-name branch of `entity_name_from_name_or_arn` is unreachable from an
@@ -3371,6 +3529,12 @@ impl ComAmazonawsSagemakerSagemakerState {
             // not case-sensitive" per its model doc), so the lookup goes through the same
             // key `CreateTrialComponent` stored the record under.
             return self.trial_components.contains_key(&entity_key(name));
+        }
+        if let Some(name) = entity_name_from_name_or_arn(arn, region, EXPERIMENT_KIND) {
+            // Same keying as the trial-component store, and for the same reason: an
+            // `ExperimentEntityName` is unique per account and not case-sensitive, so
+            // `CreateExperiment` filed the record under [`entity_key`] of the name.
+            return self.experiments.contains_key(&entity_key(name));
         }
         false
     }

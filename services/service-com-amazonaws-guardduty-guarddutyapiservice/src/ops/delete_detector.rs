@@ -163,9 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An idempotency token that pointed at the deleted detector must stop
         // resolving, or a replayed `CreateDetector` would answer with a detector id
         // that no longer exists.
-        state
-            .client_tokens
-            .retain(|_, detector_id| *detector_id != input.detector_id);
+        state.forget_client_tokens_for(&input.detector_id);
 
         Ok(DeleteDetectorOutput {})
     }

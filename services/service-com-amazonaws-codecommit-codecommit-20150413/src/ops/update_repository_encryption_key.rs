@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRepositoryEncryptionKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRepositoryEncryptionKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Rotates the KMS encryption key a repository already in the store is encrypted
+//! under: the STORED repository takes the requested key, so every later read of
+//! its metadata reports that key, and the call answers with the repository's id,
+//! the key now in effect and the key formerly in effect. Nothing else about the
+//! repository moves — its id, name, description, tags and whole history carry
+//! over — and a key selector that names no KMS key is refused, leaving the
+//! repository exactly as it was.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRepositoryEncryptionKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Of the modelled errors, this handler reports the two it can judge: a
+//! `repositoryName` the account does not hold (`RepositoryDoesNotExistException`)
+//! and a `kmsKeyId` that selects no key in any form KMS documents for `KeyId`
+//! (`EncryptionKeyInvalidIdException`). `EncryptionKeyRequiredException` is
+//! unreachable — the model makes `kmsKeyId` required under a pattern no blank
+//! value satisfies, so the boundary validator refuses it first. The rest
+//! (`EncryptionKeyDisabledException`, `…NotFoundException`,
+//! `…UnavailableException`, `…AccessDeniedException`, `…InvalidUsageException`,
+//! `EncryptionIntegrityChecksFailedException`) are the STATE of a KMS key, which
+//! CodeCommit resolves when it actually encrypts or decrypts the repository
+//! rather than when it is pointed at a key: a rotation onto a key that is
+//! disabled is accepted, and the disabled key surfaces on the repository's later
+//! data access. This emulator's CodeCommit does not resolve key state at all, so
+//! it reports none of them.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +188,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRepositoryEncryptionKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRepositoryEncryptionKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The repository is addressed by the name in the body, and the key it takes
+        // is the one the body names: neither is read off the request, so the
+        // request's region plays no part (the repository keeps the region its ARN
+        // and clone URLs were built for).
+        let _ = ctx;
+
+        // `kmsKeyId` is modelled required with the pattern `^[a-zA-Z0-9:/_-]+$`,
+        // which no empty or blank value satisfies, so the boundary validator
+        // refuses a missing, empty or whitespace-only key before this handler runs
+        // (the suite pins both refusals). That leaves the modelled
+        // `EncryptionKeyRequiredException` — "a KMS encryption key ID is required
+        // but was not specified" — nothing to report here.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRepositoryEncryptionKey"))
+        // Of the values the modelled pattern DOES admit, only the four forms KMS
+        // documents for `KeyId` select a key at all (see
+        // `crate::state::is_kms_key_selector`); anything else is an id KMS cannot
+        // read, and the repository keeps the key it has.
+        if !crate::state::is_kms_key_selector(&input.kms_key_id) {
+            return Err(
+                UpdateRepositoryEncryptionKeyErrorModeled::EncryptionKeyInvalidIdException(
+                    EncryptionKeyInvalidIdException {
+                        message: Some(format!(
+                            "the encryption key id {} is not valid: it names neither a key id, a key ARN, an alias nor an alias ARN",
+                            input.kms_key_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way,
+            // rather than claiming a KMS integrity check failed.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let mut store = state.lock();
+
+        let repository = store
+            .repositories
+            .get_mut(&input.repository_name)
+            .ok_or_else(|| {
+                UpdateRepositoryEncryptionKeyErrorModeled::RepositoryDoesNotExistException(
+                    RepositoryDoesNotExistException {
+                        message: Some(format!(
+                            "the repository {} does not exist",
+                            input.repository_name
+                        )),
+                    },
+                )
+            })?;
+
+        // The write: the stored repository now depends on the requested key, which
+        // is what every later read of its metadata reports. The key it leaves
+        // behind is the `originalKmsKeyId` this call answers with — absent for a
+        // repository that was holding no key of its own.
+        let original_kms_key_id =
+            repository.rotate_encryption_key(&input.kms_key_id, std::time::SystemTime::now());
+
+        Ok(UpdateRepositoryEncryptionKeyOutput {
+            repository_id: Some(repository.repository_id.clone()),
+            kms_key_id: repository.kms_key_id.clone(),
+            original_kms_key_id,
+        })
     }
 }

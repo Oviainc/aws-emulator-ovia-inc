@@ -233,6 +233,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .cache_clusters
             .remove(&cache_cluster_id)
             .map(|cluster| cluster.to_modeled(true));
+        // Deleting a cluster is one of the events this service records; see
+        // `crate::state::EventRecord`. The log outlives the record, so the
+        // events of a deleted cluster are still reported.
+        store.record_event(
+            crate::state::SOURCE_TYPE_CACHE_CLUSTER,
+            &cache_cluster_id,
+            "Cache cluster deleted",
+            now,
+        );
 
         Ok(DeleteCacheClusterOutput {
             cache_cluster: deleted,

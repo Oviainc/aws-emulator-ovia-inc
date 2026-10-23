@@ -187,6 +187,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+
+        // The entry is keyed by the resource's OWN `<resourceType>/<name>` identity,
+        // never by the request-scoped ARN, exactly as the writers key it (see
+        // `crate::state::policies`).
+        let policy_key = crate::state::policy_key(&input.arn, &region)
+            .ok_or_else(|| {
+                DeletePolicyStatementErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::messages::policy_resource_not_found(
+                            &input.arn,
+                        )),
+                    },
+                )
+            })?
+            .to_string();
         let standing = store
             .resource_policy(&input.arn, &region)
             // Cloned so the record can be written back below without holding a borrow
@@ -243,7 +258,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // itself rather than leaving a statement-less one behind: its readers
             // answer not-found again, exactly as they did before the first statement
             // was added.
-            store.policies.remove(&input.arn);
+            store.policies.remove(&policy_key);
             return Ok(DeletePolicyStatementOutput {
                 arn: input.arn,
                 token,
@@ -253,7 +268,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Answered from the STORED record, which the standing entry is updated in
         // place to become: the statements that remain, and the revision they are.
-        let stored = store.policies.get_mut(&input.arn).ok_or_else(|| {
+        let stored = store.policies.get_mut(&policy_key).ok_or_else(|| {
             DeletePolicyStatementErrorModeled::InternalServerException(InternalServerException {
                 message: Some(
                     "the Entity Resolution emulator lost the policy it just read".to_string(),

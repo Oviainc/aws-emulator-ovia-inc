@@ -360,7 +360,17 @@ pub(crate) fn group_cases() -> Vec<GroupCase> {
     ]
 }
 
-fn assert_description(case: &GroupCase, label: &str, description: &serde_json::Value) {
+/// Every member of a group's description, per the case that created it. `label` names the
+/// path the description came from, and `reports_profiling_status` says whether that path
+/// carries the `profilingStatus` container: a READ of a stored group does (empty while
+/// nothing has been reported about it), while the CREATE's own payload omits it, having
+/// nothing to report about a group that is only now coming into existence.
+fn assert_description(
+    case: &GroupCase,
+    label: &str,
+    reports_profiling_status: bool,
+    description: &serde_json::Value,
+) {
     assert_eq!(
         description.get("name").and_then(serde_json::Value::as_str),
         Some(case.name.as_str()),
@@ -409,10 +419,25 @@ fn assert_description(case: &GroupCase, label: &str, description: &serde_json::V
         description.get("updatedAt").is_some(),
         "case {case:?} ({label}): no updatedAt in {description:?}"
     );
-    assert!(
-        description.get("profilingStatus").is_some(),
-        "case {case:?} ({label}): no profilingStatus in {description:?}"
-    );
+    // No agent has pinged back and no profile has been posted for any group these cases
+    // build, so there is nothing to report in `profilingStatus`: a read carries the
+    // container with none of its three instants in it, and the create's payload leaves the
+    // member out altogether.
+    let status = description.get("profilingStatus");
+    if reports_profiling_status {
+        assert_eq!(
+            status.and_then(serde_json::Value::as_object).map(|o| o.len()),
+            Some(0),
+            "case {case:?} ({label}): a read must report an empty profilingStatus, got \
+             {description:?}"
+        );
+    } else {
+        assert_eq!(
+            status, None,
+            "case {case:?} ({label}): a create has no profiling activity to report, so \
+             profilingStatus must be absent, got {description:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -428,7 +453,7 @@ async fn a_created_group_is_described_from_what_was_stored() {
             String::from_utf8_lossy(&created.body)
         );
         let created_description = created.json();
-        assert_description(case, "create", &created_description);
+        assert_description(case, "create", false, &created_description);
 
         let described = harness.describe(&case.name).await;
         assert_eq!(
@@ -438,11 +463,22 @@ async fn a_created_group_is_described_from_what_was_stored() {
             String::from_utf8_lossy(&described.body)
         );
         let described_description = described.json();
-        assert_description(case, "describe", &described_description);
-        // The decisive assertion: describe answers with the record create stored,
-        // down to the create-time timestamps, not with a freshly built reply.
+        assert_description(case, "describe", true, &described_description);
+        // The decisive assertion: describe answers with the record create stored, down to
+        // the create-time timestamps, not with a freshly built reply. The two bodies differ
+        // in exactly one member — the `profilingStatus` container a read carries and a
+        // create omits — so the comparison is of everything else, member for member.
+        let mut described_without_status = described_description.clone();
+        assert!(
+            described_without_status
+                .as_object_mut()
+                .expect("a JSON object")
+                .remove("profilingStatus")
+                .is_some(),
+            "case {case:?}: a read must carry profilingStatus, got {described_description:?}"
+        );
         assert_eq!(
-            described_description, created_description,
+            described_without_status, created_description,
             "case {case:?}: describe must return the stored description verbatim"
         );
         assert_eq!(
@@ -866,7 +902,7 @@ async fn listing_pages_over_every_stored_group_once() {
             .iter()
             .find(|case| &case.name == name)
             .expect("a created case");
-        assert_description(case, "list", description);
+        assert_description(case, "list", true, description);
         assert_eq!(
             description,
             &harness.describe(name).await.json(),
