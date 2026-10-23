@@ -155,9 +155,20 @@ async fn sharing_with_the_sharers_own_principal_is_refused_and_records_nothing()
                             == Some("SharedWith"))),
                 "case {case:?}/attempt-{attempt}: the refusal must name SharedWith, got {refused:?}"
             );
+            // The refusal is about the RELATIONSHIP between the two principals of the
+            // request, so it states that relationship — and names no account id, not even
+            // the caller's own.
+            assert_eq!(
+                member(&refused, "Message"),
+                "[Validation] The shared with principal cannot be the same as the sharer's \
+                 principal.",
+                "case {case:?}/attempt-{attempt}: expected the self-share refusal sentence, \
+                 got {refused:?}"
+            );
             assert!(
-                !member(&refused, "Message").is_empty(),
-                "case {case:?}/attempt-{attempt}: ValidationException$Message is @required, got {refused:?}"
+                !refused.body.to_string().contains(own),
+                "case {case:?}/attempt-{attempt}: the refusal must disclose no account id, \
+                 got {refused:?}"
             );
 
             let listed = client.list_shares(&workload_id, "").await;

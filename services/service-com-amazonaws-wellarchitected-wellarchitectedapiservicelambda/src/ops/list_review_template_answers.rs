@@ -268,11 +268,12 @@ fn answer_summary(
         question_id: Some(question.question_id.to_string()),
         pillar_id: Some(question.pillar_id.to_string()),
         question_title: Some(question.title.to_string()),
-        // The per-question CHOICES a lens offers are lens content this emulator does
-        // not ship (see `crate::state::FRAMEWORK_LENS_QUESTIONS`), and the member is
-        // optional in the model, so no catalog of choices is reported. The choices an
-        // ANSWER speaks about are reported below, from the answer itself.
-        choices: None,
+        // The per-question CHOICE CATALOG the lens defines: the best practices the
+        // question asks about, each with the `ChoiceId` a client passes back in
+        // `UpdateReviewTemplateAnswer$SelectedChoices`. It describes the QUESTION, so it
+        // is reported whether or not the template has answered it; the choices the ANSWER
+        // speaks about are reported below, from the answer itself.
+        choices: Some(question.choices()),
         selected_choices: Some(
             answer
                 .map(|answer| answer.selected_choices.clone())

@@ -244,7 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let rename = match &input.workload_name {
             None => None,
             Some(new_name) => {
-                let normalized = crate::state::normalize_workload_name(new_name);
+                let normalized = crate::state::normalize_unique_name(new_name);
                 match store.workload_holding_name(new_name) {
                     Some((existing_name, owner)) if owner != input.workload_id => {
                         let collision = crate::state::workload_name_conflict(existing_name, owner);
@@ -261,7 +261,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let previous = store
                 .workloads
                 .get(&input.workload_id)
-                .map(|record| crate::state::normalize_workload_name(&record.workload_name));
+                .map(|record| crate::state::normalize_unique_name(&record.workload_name));
             if let Some(previous) = previous {
                 store.workload_name_index.remove(&previous);
             }

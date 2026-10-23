@@ -29,6 +29,12 @@ mod lookup_error_envelopes;
 #[path = "all/milestone_listing.rs"]
 mod milestone_listing;
 
+#[path = "all/milestone_name_uniqueness.rs"]
+mod milestone_name_uniqueness;
+
+#[path = "all/question_choice_catalog.rs"]
+mod question_choice_catalog;
+
 #[path = "all/review_template_answers.rs"]
 mod review_template_answers;
 

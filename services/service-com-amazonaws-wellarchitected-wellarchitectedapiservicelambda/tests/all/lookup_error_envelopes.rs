@@ -293,7 +293,10 @@ async fn a_name_collision_is_a_conflict_naming_the_workload_that_holds_the_name(
     }
 
     // A milestone name is unique within its workload, and the conflict is worded the
-    // same way — with the composite id of the milestone already holding the name.
+    // same way — with the composite id of the milestone already holding the name, the
+    // workload the uniqueness is scoped to, and the comparison rule. The comparison is
+    // the service's loose one, so every spelling that differs only in capitalization or
+    // whitespace is the same 409 naming the STORED name.
     let host = created_id(
         &client.create(minimal_create("milestone-conflict-host", "tok-mc")).await,
         "milestone-host",
@@ -309,30 +312,48 @@ async fn a_name_collision_is_a_conflict_naming_the_workload_that_holds_the_name(
             .get("MilestoneNumber")
             .and_then(Value::as_i64)
             .unwrap_or_default();
-        let again = create_milestone(&client, &host, name, &format!("tok-again-{case}")).await;
-        assert_eq!(
-            again.status, 409,
-            "case {case:?}: a repeated MilestoneName must be a 409, got {again:?}"
-        );
-        assert_eq!(
-            again.error_code, "ConflictException",
-            "case {case:?}: expected ConflictException, got {again:?}"
-        );
-        assert_eq!(
-            member(&again, "ResourceType"),
-            "MILESTONE",
-            "case {case:?}: expected ResourceType MILESTONE, got {again:?}"
-        );
-        assert_eq!(
-            member(&again, "ResourceId"),
-            format!("{host}.{number}"),
-            "case {case:?}: ResourceId must name the milestone holding the name, got {again:?}"
-        );
-        assert_eq!(
-            member(&again, "Message"),
-            format!("[Conflict] A milestone with name {name} already exists."),
-            "case {case:?}: the message must name the submitted name, got {again:?}"
-        );
+        for (spelling, submitted) in [
+            ("exact", name.to_string()),
+            ("upper", name.to_uppercase()),
+            ("padded", format!("  {name}  ")),
+            ("spaces-removed", name.replace(' ', "")),
+        ] {
+            let again = create_milestone(
+                &client,
+                &host,
+                &submitted,
+                &format!("tok-again-{case}-{spelling}"),
+            )
+            .await;
+            assert_eq!(
+                again.status, 409,
+                "case {case:?}/{spelling}: a repeated MilestoneName must be a 409, got {again:?}"
+            );
+            assert_eq!(
+                again.error_code, "ConflictException",
+                "case {case:?}/{spelling}: expected ConflictException, got {again:?}"
+            );
+            assert_eq!(
+                member(&again, "ResourceType"),
+                "MILESTONE",
+                "case {case:?}/{spelling}: expected ResourceType MILESTONE, got {again:?}"
+            );
+            assert_eq!(
+                member(&again, "ResourceId"),
+                format!("{host}.{number}"),
+                "case {case:?}/{spelling}: ResourceId must name the milestone holding the \
+                 name, got {again:?}"
+            );
+            assert_eq!(
+                member(&again, "Message"),
+                format!(
+                    "[Conflict] Milestone with name {name} already exists under workload \
+                     {host}. Capitalization and whitespace are ignored in milestone names."
+                ),
+                "case {case:?}/{spelling}: the message must name the stored name and the \
+                 workload it is unique within, got {again:?}"
+            );
+        }
     }
 }
 

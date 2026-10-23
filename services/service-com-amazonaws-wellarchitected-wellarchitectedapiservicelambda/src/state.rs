@@ -29,10 +29,10 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    ConflictException, Milestone, MilestoneSummary, ResourceNotFoundException, ReviewTemplate,
-    ShareInvitationSummary, Workload, WorkloadDiscoveryConfig, WorkloadJiraConfigurationInput,
-    WorkloadJiraConfigurationOutput, WorkloadShareSummary, WorkloadSummary, QUESTION_VALUES,
-    RISK_VALUES,
+    Choice, ConflictException, Milestone, MilestoneSummary, ResourceNotFoundException,
+    ReviewTemplate, ShareInvitationSummary, Workload, WorkloadDiscoveryConfig,
+    WorkloadJiraConfigurationInput, WorkloadJiraConfigurationOutput, WorkloadShareSummary,
+    WorkloadSummary, QUESTION_VALUES, RISK_VALUES,
 };
 
 /// `Workload$ImprovementStatus` before any lens review has been answered. The
@@ -123,12 +123,12 @@ pub const FRAMEWORK_LENS_VERSION: &str = "2023-10-03";
 pub const LENS_STATUS_CURRENT: &str = "CURRENT";
 
 /// One question of the AWS-official framework lens, as this emulator's lens content:
-/// the pillar it belongs to, the id it is named by on the wire and its title.
+/// the pillar it belongs to, the id it is named by on the wire, its title and the best
+/// practices it asks about.
 ///
 /// This is the STATIC catalog's entry, distinct from [`LensQuestion`] — the question of
 /// a custom lens DOCUMENT, which carries the choice and risk-rule content that document
-/// supplies. The framework lens ships no choice content here (see
-/// [`FRAMEWORK_LENS_QUESTIONS`]), so its question is the smaller record.
+/// supplies.
 #[derive(Debug, Clone, Copy)]
 pub struct FrameworkQuestion {
     /// `AnswerSummary$PillarId` — the pillar this question belongs to, one of
@@ -138,6 +138,55 @@ pub struct FrameworkQuestion {
     pub question_id: &'static str,
     /// `AnswerSummary$QuestionTitle` (`@length(1, 512)`).
     pub title: &'static str,
+    /// The best practices this question asks about, in the lens's own order: the
+    /// `Choice$Title` of each choice the question offers. Each is the Well-Architected
+    /// Framework's published best practice for this question, and its position in this
+    /// list is what [`FrameworkQuestion::choice_id`] names it by.
+    pub best_practices: &'static [&'static str],
+}
+
+impl FrameworkQuestion {
+    /// The `ChoiceId` of the best practice at `index` in [`Self::best_practices`]:
+    /// `<question id>-bp-<two-digit position>`.
+    ///
+    /// A lens's wire CHOICE ids are lens content, which neither the Smithy model nor the
+    /// service docs publish — the same reason the `question_id`s in
+    /// [`FRAMEWORK_LENS_QUESTIONS`] are this emulator's own — so they are derived from
+    /// the question that offers the choice and the choice's position in that question's
+    /// catalog. That makes them unique within the question, stable for the life of the
+    /// catalog (an answer stored under one keeps resolving), and inside the modelled
+    /// `ChoiceId` `@length(min: 1, max: 64)`.
+    pub fn choice_id(&self, index: usize) -> String {
+        format!("{}-bp-{:02}", self.question_id, index.saturating_add(1))
+    }
+
+    /// This question's CHOICE catalog — `AnswerSummary$Choices` /
+    /// `ReviewTemplateAnswerSummary$Choices` / `Answer$Choices`: one `Choice` per best
+    /// practice the question asks about, in the lens's order.
+    ///
+    /// It is the only place a client can discover the `ChoiceId`s that
+    /// `UpdateAnswer$SelectedChoices` and `ChoiceUpdates` name, so every projection of a
+    /// question reports it from here and they cannot disagree. `HelpfulResource`,
+    /// `ImprovementPlan` and `AdditionalResources` are left off: each "only applies to
+    /// custom lenses" / "does not apply to Amazon Web Services official lenses"
+    /// (`smithy_query(query="shape", shape="Choice")`), and this is an official lens.
+    pub fn choices(&self) -> Vec<Choice> {
+        self.best_practices
+            .iter()
+            .enumerate()
+            .map(|(index, best_practice)| Choice {
+                choice_id: Some(self.choice_id(index)),
+                title: Some((*best_practice).to_string()),
+                // `Choice$Description` is per-choice prose this emulator's lens content
+                // does not carry, and the member is optional, so it is omitted rather
+                // than filled with the title again.
+                description: None,
+                helpful_resource: None,
+                improvement_plan: None,
+                additional_resources: None,
+            })
+            .collect()
+    }
 }
 
 /// The AWS Well-Architected Framework lens's question set: the one lens definition this
@@ -152,74 +201,440 @@ pub struct FrameworkQuestion {
 /// what `QuestionId` means everywhere in this crate — `ListAnswers` reports them and an
 /// answer is stored under them.
 ///
-/// Per-question CHOICES (the best practices a question offers) are deliberately NOT
-/// here: they are lens content this emulator does not ship, and `AnswerSummary$Choices`
-/// is optional in the model, so a summary reports the choices an ANSWER recorded and no
-/// catalog of them.
+/// Each question's CHOICES are the best practices the Well-Architected Framework
+/// publishes for it, in the framework's order; the `ChoiceId` each is reported under is
+/// derived from the question and the choice's position
+/// ([`FrameworkQuestion::choice_id`]). They are what a client reads to discover the
+/// `ChoiceId`s `UpdateAnswer` requires, so the catalog is the one place they are defined.
 pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
     // Operational excellence — OPS 1-11.
-    q("operationalExcellence", "ops-01", "How do you determine what your priorities are?"),
-    q("operationalExcellence", "ops-02", "How do you structure your organization to support your business outcomes?"),
-    q("operationalExcellence", "ops-03", "How does your organizational culture support your business outcomes?"),
-    q("operationalExcellence", "ops-04", "How do you implement observability in your workload?"),
-    q("operationalExcellence", "ops-05", "How do you reduce defects, ease remediation, and improve flow into production?"),
-    q("operationalExcellence", "ops-06", "How do you mitigate deployment risks?"),
-    q("operationalExcellence", "ops-07", "How do you know that you are ready to support a workload?"),
-    q("operationalExcellence", "ops-08", "How do you utilize workload observability in your organization?"),
-    q("operationalExcellence", "ops-09", "How do you understand the health of your operations?"),
-    q("operationalExcellence", "ops-10", "How do you manage workload and operations events?"),
-    q("operationalExcellence", "ops-11", "How do you evolve operations?"),
+    q("operationalExcellence", "ops-01", "How do you determine what your priorities are?", &[
+        "Evaluate external customer needs",
+        "Evaluate internal customer needs",
+        "Evaluate governance requirements",
+        "Evaluate compliance requirements",
+        "Evaluate threat landscape",
+        "Evaluate tradeoffs while managing benefits and risks",
+    ]),
+    q("operationalExcellence", "ops-02", "How do you structure your organization to support your business outcomes?", &[
+        "Resources have identified owners",
+        "Processes and procedures have identified owners",
+        "Operations activities have identified owners responsible for their performance",
+        "Mechanisms exist to manage responsibilities and ownership",
+        "Mechanisms exist to request additions, changes, and exceptions",
+        "Responsibilities between teams are predefined or negotiated",
+    ]),
+    q("operationalExcellence", "ops-03", "How does your organizational culture support your business outcomes?", &[
+        "Provide executive sponsorship",
+        "Team members are empowered to take action when outcomes are at risk",
+        "Escalation is encouraged",
+        "Communications are timely, clear, and actionable",
+        "Experimentation is encouraged",
+        "Team members are encouraged to maintain and grow their skill sets",
+        "Resource teams appropriately",
+        "Diverse opinions are encouraged and sought within and across teams",
+    ]),
+    q("operationalExcellence", "ops-04", "How do you implement observability in your workload?", &[
+        "Implement application telemetry",
+        "Implement and configure workload telemetry",
+        "Implement user experience telemetry",
+        "Implement dependency telemetry",
+        "Implement distributed tracing",
+    ]),
+    q("operationalExcellence", "ops-05", "How do you reduce defects, ease remediation, and improve flow into production?", &[
+        "Use version control",
+        "Test and validate changes",
+        "Use configuration management systems",
+        "Use build and deployment management systems",
+        "Perform patch management",
+        "Implement practices to improve code quality",
+        "Share design standards",
+        "Use multiple environments",
+        "Make frequent, small, reversible changes",
+        "Fully automate integration and deployment",
+    ]),
+    q("operationalExcellence", "ops-06", "How do you mitigate deployment risks?", &[
+        "Plan for unsuccessful changes",
+        "Test deployments",
+        "Employ safe deployment strategies",
+        "Automate testing and rollback",
+    ]),
+    q("operationalExcellence", "ops-07", "How do you know that you are ready to support a workload?", &[
+        "Ensure personnel capability",
+        "Ensure a consistent review of operational readiness",
+        "Use runbooks to perform procedures",
+        "Use playbooks to investigate issues",
+        "Make informed decisions to deploy systems and changes",
+        "Create support plans for production workloads",
+    ]),
+    q("operationalExcellence", "ops-08", "How do you utilize workload observability in your organization?", &[
+        "Analyze workload metrics",
+        "Analyze workload logs",
+        "Analyze workload traces",
+        "Create actionable alerts",
+        "Create dashboards",
+    ]),
+    q("operationalExcellence", "ops-09", "How do you understand the health of your operations?", &[
+        "Measure operations goals and KPIs with metrics",
+        "Communicate status and trends to ensure visibility into operation",
+        "Review operations metrics and prioritize improvement",
+    ]),
+    q("operationalExcellence", "ops-10", "How do you manage workload and operations events?", &[
+        "Use a process for event, incident, and problem management",
+        "Have a process per alert",
+        "Prioritize operational events based on business impact",
+        "Define escalation paths",
+        "Define a customer communication plan for service-impacting events",
+        "Communicate status through dashboards",
+        "Automate responses to events",
+    ]),
+    q("operationalExcellence", "ops-11", "How do you evolve operations?", &[
+        "Have a process for continuous improvement",
+        "Perform post-incident analysis",
+        "Implement feedback loops",
+        "Perform knowledge management",
+        "Define drivers for improvement",
+        "Validate insights",
+        "Perform operations metrics reviews",
+        "Document and share lessons learned",
+        "Allocate time to make improvements",
+    ]),
     // Security — SEC 1-11.
-    q("security", "sec-01", "How do you securely operate your workload?"),
-    q("security", "sec-02", "How do you manage identities for people and machines?"),
-    q("security", "sec-03", "How do you manage permissions for people and machines?"),
-    q("security", "sec-04", "How do you detect and investigate security events?"),
-    q("security", "sec-05", "How do you protect your network resources?"),
-    q("security", "sec-06", "How do you protect your compute resources?"),
-    q("security", "sec-07", "How do you classify your data?"),
-    q("security", "sec-08", "How do you protect your data at rest?"),
-    q("security", "sec-09", "How do you protect your data in transit?"),
-    q("security", "sec-10", "How do you anticipate, respond to, and recover from incidents?"),
-    q("security", "sec-11", "How do you incorporate and validate the security properties of applications?"),
+    q("security", "sec-01", "How do you securely operate your workload?", &[
+        "Separate workloads using accounts",
+        "Secure account root user and properties",
+        "Identify and validate control objectives",
+        "Stay up to date with security threats and recommendations",
+        "Reduce security management scope",
+        "Automate testing and validation of security controls in pipelines",
+        "Identify threats and prioritize mitigations using a threat model",
+        "Evaluate and implement new security services and features regularly",
+    ]),
+    q("security", "sec-02", "How do you manage identities for people and machines?", &[
+        "Use strong sign-in mechanisms",
+        "Use temporary credentials",
+        "Store and use secrets securely",
+        "Rely on a centralized identity provider",
+        "Audit and rotate credentials periodically",
+        "Employ user groups and attributes",
+    ]),
+    q("security", "sec-03", "How do you manage permissions for people and machines?", &[
+        "Define access requirements",
+        "Grant least privilege access",
+        "Establish emergency access process",
+        "Reduce permissions continuously",
+        "Define permission guardrails for your organization",
+        "Manage access based on lifecycle",
+        "Analyze public and cross-account access",
+        "Share resources securely within your organization",
+        "Share resources securely with a third party",
+    ]),
+    q("security", "sec-04", "How do you detect and investigate security events?", &[
+        "Configure service and application logging",
+        "Capture logs, findings, and metrics in standardized locations",
+        "Correlate and enrich security alerts",
+        "Initiate remediation for non-compliant resources",
+    ]),
+    q("security", "sec-05", "How do you protect your network resources?", &[
+        "Create network layers",
+        "Control traffic flow within your network layers",
+        "Implement inspection-based protection",
+        "Automate network protection",
+    ]),
+    q("security", "sec-06", "How do you protect your compute resources?", &[
+        "Perform vulnerability management",
+        "Provision compute from hardened images",
+        "Reduce manual management and interactive access",
+        "Validate software integrity",
+        "Automate compute protection",
+    ]),
+    q("security", "sec-07", "How do you classify your data?", &[
+        "Understand your data classification scheme",
+        "Apply data protection controls based on data sensitivity",
+        "Automate identification and classification",
+        "Define scalable data lifecycle management",
+    ]),
+    q("security", "sec-08", "How do you protect your data at rest?", &[
+        "Implement secure key management",
+        "Enforce encryption at rest",
+        "Automate data at rest protection",
+        "Enforce access control",
+        "Use mechanisms to keep people away from data",
+    ]),
+    q("security", "sec-09", "How do you protect your data in transit?", &[
+        "Implement secure key and certificate management",
+        "Enforce encryption in transit",
+        "Authenticate network communications",
+    ]),
+    q("security", "sec-10", "How do you anticipate, respond to, and recover from incidents?", &[
+        "Identify key personnel and external resources",
+        "Develop incident management plans",
+        "Prepare forensic capabilities",
+        "Develop and test security incident response playbooks",
+        "Pre-provision access",
+        "Pre-deploy tools",
+        "Run simulations",
+        "Establish a framework for learning from incidents",
+    ]),
+    q("security", "sec-11", "How do you incorporate and validate the security properties of applications?", &[
+        "Train for application security",
+        "Automate testing throughout the development and release lifecycle",
+        "Perform regular penetration testing",
+        "Conduct code reviews",
+        "Centralize services for packages and dependencies",
+        "Deploy software programmatically",
+        "Regularly assess security properties of the pipelines",
+        "Build a program that embeds security ownership in workload teams",
+    ]),
     // Reliability — REL 1-13.
-    q("reliability", "rel-01", "How do you manage service quotas and constraints?"),
-    q("reliability", "rel-02", "How do you plan your network topology?"),
-    q("reliability", "rel-03", "How do you design your workload service architecture?"),
-    q("reliability", "rel-04", "How do you design interactions in a distributed system to prevent failures?"),
-    q("reliability", "rel-05", "How do you design interactions in a distributed system to mitigate or withstand failures?"),
-    q("reliability", "rel-06", "How do you monitor workload resources?"),
-    q("reliability", "rel-07", "How do you design your workload to adapt to changes in demand?"),
-    q("reliability", "rel-08", "How do you implement change?"),
-    q("reliability", "rel-09", "How do you back up data?"),
-    q("reliability", "rel-10", "How do you use fault isolation to protect your workload?"),
-    q("reliability", "rel-11", "How do you design your workload to withstand component failures?"),
-    q("reliability", "rel-12", "How do you test reliability?"),
-    q("reliability", "rel-13", "How do you plan for disaster recovery (DR)?"),
+    q("reliability", "rel-01", "How do you manage service quotas and constraints?", &[
+        "Aware of service quotas and constraints",
+        "Manage service quotas across accounts and Regions",
+        "Accommodate fixed service quotas and constraints through architecture",
+        "Monitor and manage quotas",
+        "Automate quota management",
+        "Ensure that a sufficient gap exists between the current quotas and the maximum usage to accommodate failover",
+    ]),
+    q("reliability", "rel-02", "How do you plan your network topology?", &[
+        "Use highly available network connectivity for your workload public endpoints",
+        "Provision redundant connectivity between private networks in the cloud and on-premises environments",
+        "Ensure IP subnet allocation accounts for expansion and availability",
+        "Prefer hub-and-spoke topologies over many-to-many mesh",
+        "Enforce non-overlapping private IP address ranges in all private address spaces where they are connected",
+    ]),
+    q("reliability", "rel-03", "How do you design your workload service architecture?", &[
+        "Choose how to segment your workload",
+        "Build services focused on specific business domains and functionality",
+        "Provide service contracts per API",
+    ]),
+    q("reliability", "rel-04", "How do you design interactions in a distributed system to prevent failures?", &[
+        "Identify the kind of distributed system you depend on",
+        "Implement loosely coupled dependencies",
+        "Do constant work",
+        "Make mutating operations idempotent",
+    ]),
+    q("reliability", "rel-05", "How do you design interactions in a distributed system to mitigate or withstand failures?", &[
+        "Implement graceful degradation to transform applicable hard dependencies into soft dependencies",
+        "Throttle requests",
+        "Control and limit retry calls",
+        "Fail fast and limit queues",
+        "Set client timeouts",
+        "Make services stateless where possible",
+        "Implement emergency levers",
+    ]),
+    q("reliability", "rel-06", "How do you monitor workload resources?", &[
+        "Monitor all components for the workload",
+        "Define and calculate metrics",
+        "Send notifications",
+        "Automate responses",
+        "Analytics",
+        "Conduct reviews regularly",
+        "Monitor end-to-end tracing of requests through your system",
+    ]),
+    q("reliability", "rel-07", "How do you design your workload to adapt to changes in demand?", &[
+        "Use automation when obtaining or scaling resources",
+        "Obtain resources upon detection of impairment to a workload",
+        "Obtain resources upon detection that more resources are needed for a workload",
+        "Load test your workload",
+    ]),
+    q("reliability", "rel-08", "How do you implement change?", &[
+        "Use runbooks for standard activities such as deployment",
+        "Integrate functional testing as part of your deployment",
+        "Integrate resiliency testing as part of your deployment",
+        "Deploy using immutable infrastructure",
+        "Deploy changes with automation",
+    ]),
+    q("reliability", "rel-09", "How do you back up data?", &[
+        "Identify and back up all data that needs to be backed up, or reproduce the data from sources",
+        "Secure and encrypt backups",
+        "Perform data backup automatically",
+        "Perform periodic recovery of the data to verify backup integrity and processes",
+    ]),
+    q("reliability", "rel-10", "How do you use fault isolation to protect your workload?", &[
+        "Deploy the workload to multiple locations",
+        "Select the appropriate locations for your multi-location deployment",
+        "Automate recovery for components constrained to a single location",
+        "Use bulkhead architectures to limit scope of impact",
+    ]),
+    q("reliability", "rel-11", "How do you design your workload to withstand component failures?", &[
+        "Monitor all components of the workload to detect failures",
+        "Fail over to healthy resources",
+        "Automate healing on all layers",
+        "Rely on the data plane and not the control plane during recovery",
+        "Use static stability to prevent bimodal behavior",
+        "Send notifications when events impact availability",
+        "Architect your product to meet availability targets and uptime service level agreements (SLAs)",
+    ]),
+    q("reliability", "rel-12", "How do you test reliability?", &[
+        "Use playbooks to investigate failures",
+        "Perform post-incident analysis",
+        "Test functional requirements",
+        "Test scaling and performance requirements",
+        "Test resiliency using chaos engineering",
+        "Conduct game days regularly",
+    ]),
+    q("reliability", "rel-13", "How do you plan for disaster recovery (DR)?", &[
+        "Define recovery objectives for downtime and data loss",
+        "Use defined recovery strategies to meet the recovery objectives",
+        "Test disaster recovery implementation to validate the implementation",
+        "Manage configuration drift at the DR site or Region",
+        "Automate recovery",
+    ]),
     // Performance efficiency — PERF 1-5.
-    q("performance", "perf-01", "How do you select appropriate cloud resources and architecture patterns for your workload?"),
-    q("performance", "perf-02", "How do you select and use compute resources in your workload?"),
-    q("performance", "perf-03", "How do you store, manage, and access data in your workload?"),
-    q("performance", "perf-04", "How do you select and configure networking resources in your workload?"),
-    q("performance", "perf-05", "What process do you use to support more performance efficiency for your workload?"),
+    q("performance", "perf-01", "How do you select appropriate cloud resources and architecture patterns for your workload?", &[
+        "Learn about and understand available cloud services and features",
+        "Use guidance from your cloud provider or an appropriate partner to learn about architecture patterns and best practices",
+        "Factor cost into architectural decisions",
+        "Use policies and reference architectures",
+        "Use benchmarking to drive architectural decisions",
+        "Use a data-driven approach for architectural choices",
+    ]),
+    q("performance", "perf-02", "How do you select and use compute resources in your workload?", &[
+        "Select the best compute options for your workload",
+        "Understand the available compute configuration and features",
+        "Collect compute-related metrics",
+        "Configure and right-size compute resources",
+        "Scale your compute resources dynamically",
+        "Use optimized hardware-based compute accelerators",
+    ]),
+    q("performance", "perf-03", "How do you store, manage, and access data in your workload?", &[
+        "Use a purpose-built data store that best supports your data access and storage requirements",
+        "Evaluate available configuration options for data store",
+        "Collect and record data store performance metrics",
+        "Implement strategies to improve query performance in data store",
+        "Implement data access patterns that utilize caching",
+    ]),
+    q("performance", "perf-04", "How do you select and configure networking resources in your workload?", &[
+        "Understand how networking impacts performance",
+        "Evaluate available networking features",
+        "Choose appropriate dedicated connectivity or VPN for your workload",
+        "Use load balancing to distribute traffic across multiple resources",
+        "Choose network protocols to improve performance",
+        "Choose your workload's location based on network requirements",
+        "Optimize network configuration based on metrics",
+    ]),
+    q("performance", "perf-05", "What process do you use to support more performance efficiency for your workload?", &[
+        "Establish key performance indicators (KPIs) to measure workload health and performance",
+        "Use monitoring solutions to understand the areas where performance is most critical",
+        "Define a process to improve workload performance",
+        "Load test your workload",
+        "Use automation to proactively remediate performance-related issues",
+        "Keep your workload and services up-to-date",
+        "Review metrics at regular intervals",
+    ]),
     // Cost optimization — COST 1-11.
-    q("costOptimization", "cost-01", "How do you implement cloud financial management?"),
-    q("costOptimization", "cost-02", "How do you govern usage?"),
-    q("costOptimization", "cost-03", "How do you monitor usage and cost?"),
-    q("costOptimization", "cost-04", "How do you decommission resources?"),
-    q("costOptimization", "cost-05", "How do you evaluate cost when you select services?"),
-    q("costOptimization", "cost-06", "How do you meet cost targets when you select resource type, size and number?"),
-    q("costOptimization", "cost-07", "How do you use pricing models to reduce cost?"),
-    q("costOptimization", "cost-08", "How do you plan for data transfer charges?"),
-    q("costOptimization", "cost-09", "How do you manage demand, and supply resources?"),
-    q("costOptimization", "cost-10", "How do you evaluate new services?"),
-    q("costOptimization", "cost-11", "How do you evaluate the cost of effort?"),
+    q("costOptimization", "cost-01", "How do you implement cloud financial management?", &[
+        "Establish ownership of cost optimization",
+        "Establish a partnership between finance and technology",
+        "Establish cloud budgets and forecasts",
+        "Implement cost awareness in your organizational processes",
+        "Report and notify on cost optimization",
+        "Monitor cost proactively",
+        "Keep up-to-date with new service releases",
+        "Create a cost-aware culture",
+        "Quantify business value from cost optimization",
+    ]),
+    q("costOptimization", "cost-02", "How do you govern usage?", &[
+        "Develop policies based on your organization requirements",
+        "Implement goals and targets",
+        "Implement an account structure",
+        "Implement groups and roles",
+        "Implement cost controls",
+        "Track project lifecycle",
+    ]),
+    q("costOptimization", "cost-03", "How do you monitor usage and cost?", &[
+        "Configure detailed information sources",
+        "Add organization information to cost and usage",
+        "Identify cost attribution categories",
+        "Establish organization metrics",
+        "Configure billing and cost management tools",
+        "Allocate costs based on workload metrics",
+    ]),
+    q("costOptimization", "cost-04", "How do you decommission resources?", &[
+        "Track resources over their lifetime",
+        "Implement a decommissioning process",
+        "Decommission resources",
+        "Decommission resources automatically",
+        "Enforce data retention policies",
+    ]),
+    q("costOptimization", "cost-05", "How do you evaluate cost when you select services?", &[
+        "Identify organization requirements for cost",
+        "Analyze all components of the workload",
+        "Perform a thorough analysis of each component",
+        "Select software with cost-effective licensing",
+        "Select components of this workload to optimize cost in line with organization priorities",
+        "Perform cost analysis for different usage over time",
+    ]),
+    q("costOptimization", "cost-06", "How do you meet cost targets when you select resource type, size and number?", &[
+        "Perform cost modeling",
+        "Select resource type, size, and number based on data",
+        "Select resource type, size, and number automatically based on metrics",
+    ]),
+    q("costOptimization", "cost-07", "How do you use pricing models to reduce cost?", &[
+        "Perform pricing model analysis",
+        "Choose Regions based on cost",
+        "Select third-party agreements with cost-efficient terms",
+        "Implement pricing models for all components of this workload",
+        "Perform pricing model analysis at the management account level",
+    ]),
+    q("costOptimization", "cost-08", "How do you plan for data transfer charges?", &[
+        "Perform data transfer modeling",
+        "Select components to optimize data transfer cost",
+        "Implement services to reduce data transfer costs",
+    ]),
+    q("costOptimization", "cost-09", "How do you manage demand, and supply resources?", &[
+        "Perform an analysis on the workload demand",
+        "Implement a buffer or throttle to manage demand",
+        "Supply resources dynamically",
+    ]),
+    q("costOptimization", "cost-10", "How do you evaluate new services?", &[
+        "Develop a workload review process",
+        "Review and analyze this workload regularly",
+    ]),
+    q("costOptimization", "cost-11", "How do you evaluate the cost of effort?", &[
+        "Perform automation for operations",
+    ]),
     // Sustainability — SUS 1-6.
-    q("sustainability", "sus-01", "How do you select Regions for your workload?"),
-    q("sustainability", "sus-02", "How do you align cloud resources to your demand?"),
-    q("sustainability", "sus-03", "How do you take advantage of software and architecture patterns to support your sustainability goals?"),
-    q("sustainability", "sus-04", "How do you take advantage of data access and usage patterns to support your sustainability goals?"),
-    q("sustainability", "sus-05", "How do your hardware management and usage practices support your sustainability goals?"),
-    q("sustainability", "sus-06", "How do your development and deployment processes support your sustainability goals?"),
+    q("sustainability", "sus-01", "How do you select Regions for your workload?", &[
+        "Choose Region based on both business requirements and sustainability goals",
+    ]),
+    q("sustainability", "sus-02", "How do you align cloud resources to your demand?", &[
+        "Scale workload infrastructure dynamically",
+        "Align SLAs with sustainability goals",
+        "Stop the creation and maintenance of unused assets",
+        "Optimize geographic placement of workloads based on their networking requirements",
+        "Optimize team member resources for activities performed",
+        "Implement buffering or throttling to flatten the demand curve",
+    ]),
+    q("sustainability", "sus-03", "How do you take advantage of software and architecture patterns to support your sustainability goals?", &[
+        "Optimize software and architecture for asynchronous and scheduled jobs",
+        "Remove or refactor workload components with low or no use",
+        "Optimize areas of code that consume the most time or resources",
+        "Optimize impact on devices and equipment",
+        "Use software patterns and architectures that best support data access and storage patterns",
+    ]),
+    q("sustainability", "sus-04", "How do you take advantage of data access and usage patterns to support your sustainability goals?", &[
+        "Implement a data classification policy",
+        "Use technologies that support data access and storage patterns",
+        "Use lifecycle policies to delete unnecessary data",
+        "Minimize over-provisioning in block storage",
+        "Remove unneeded or redundant data",
+        "Use shared file systems or storage to access common data",
+        "Minimize data movement across networks",
+        "Back up data only when difficult to recreate",
+    ]),
+    q("sustainability", "sus-05", "How do your hardware management and usage practices support your sustainability goals?", &[
+        "Use the minimum amount of hardware to meet your needs",
+        "Use instance types with the least impact",
+        "Use managed services",
+        "Optimize your use of hardware-based compute accelerators",
+    ]),
+    q("sustainability", "sus-06", "How do your development and deployment processes support your sustainability goals?", &[
+        "Adopt methods that can rapidly introduce sustainability improvements",
+        "Keep your workload up-to-date",
+        "Increase utilization of build environments",
+        "Use managed device farms for testing",
+    ]),
 ];
 
 /// One [`FrameworkQuestion`], so the catalog above reads as a table.
@@ -227,11 +642,13 @@ const fn q(
     pillar_id: &'static str,
     question_id: &'static str,
     title: &'static str,
+    best_practices: &'static [&'static str],
 ) -> FrameworkQuestion {
     FrameworkQuestion {
         pillar_id,
         question_id,
         title,
+        best_practices,
     }
 }
 
@@ -1838,7 +2255,7 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     pub fn remove_workload(&mut self, workload_id: &str) -> Option<WorkloadRecord> {
         let record = self.workloads.remove(workload_id)?;
         self.workload_name_index
-            .remove(&normalize_workload_name(&record.workload_name));
+            .remove(&normalize_unique_name(&record.workload_name));
         self.create_workload_tokens
             .retain(|_, token| token.workload_id != workload_id);
         // A milestone belongs to its workload, so the whole set goes with it — and with
@@ -1858,7 +2275,7 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// order [`workload_name_conflict`] takes them. The stored name is what a collision
     /// reports, rather than the caller's spelling of it.
     pub fn workload_holding_name(&self, name: &str) -> Option<(&str, &str)> {
-        let workload_id = self.workload_name_index.get(&normalize_workload_name(name))?;
+        let workload_id = self.workload_name_index.get(&normalize_unique_name(name))?;
         let record = self.workloads.get(workload_id)?;
         Some((
             record.workload_name.as_str(),
@@ -1869,6 +2286,25 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// The milestone `number` recorded for `workload_id`, if one is.
     pub fn milestone(&self, workload_id: &str, number: i32) -> Option<&MilestoneRecord> {
         self.milestones.get(workload_id)?.get(&number)
+    }
+
+    /// The milestone of `workload_id` already holding `name` under the service's own
+    /// loose comparison ([`normalize_unique_name`]), if one holds it: "Milestone names
+    /// must be unique within a workload" (`smithy_query(query="shape",
+    /// shape="MilestoneName")`), so the scope of the lookup is ONE workload and a
+    /// spelling differing only in capitalization or whitespace finds the same milestone.
+    ///
+    /// The record it answers with is the milestone AS STORED, which is what
+    /// [`milestone_name_conflict`] reports rather than the caller's spelling of the name.
+    pub fn milestone_holding_name(
+        &self,
+        workload_id: &str,
+        name: &str,
+    ) -> Option<&MilestoneRecord> {
+        let normalized = normalize_unique_name(name);
+        self.milestones.get(workload_id)?.values().find(|record| {
+            normalize_unique_name(&record.milestone_name) == normalized
+        })
     }
 
     /// The number the next milestone of `workload_id` takes: one past the highest ever
@@ -1952,9 +2388,20 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     }
 }
 
-/// The form a workload name is compared in: "Spaces and capitalization are ignored
-/// when checking for uniqueness" (`CreateWorkloadInput$WorkloadName` doc).
-pub fn normalize_workload_name(name: &str) -> String {
+/// The form a name whose uniqueness this service decides LOOSELY is compared in:
+/// capitalization and whitespace are dropped, so two spellings that differ only in
+/// either are the same name.
+///
+/// It is the comparison the service documents for a workload name — "The name must be
+/// unique within an account within an Amazon Web Services Region. Spaces and
+/// capitalization are ignored when checking for uniqueness"
+/// (`smithy_query(query="shape", shape="WorkloadName")`) — and it is how every name
+/// this service meters for uniqueness is compared, so the rule cannot differ between
+/// the resources that carry it: a workload name (through
+/// [`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::workload_name_index`])
+/// and a milestone name within its workload (through
+/// [`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::milestone_holding_name`]).
+pub fn normalize_unique_name(name: &str) -> String {
     name.chars()
         .filter(|c| !c.is_whitespace())
         .flat_map(char::to_lowercase)
@@ -2047,6 +2494,35 @@ pub const INVALID_NEXT_TOKEN_MESSAGE: &str = "The next token that was passed in 
 
 /// The member an undecodable-token finding names (`<Operation>Input$NextToken`).
 pub const NEXT_TOKEN_MEMBER: &str = "NextToken";
+
+/// The member a share refusal about the principal offered the share names
+/// (`Create<Resource>ShareInput$SharedWith`).
+pub const SHARED_WITH_MEMBER: &str = "SharedWith";
+
+/// The sentence a share offered to the principal that is already doing the sharing is
+/// refused with.
+///
+/// A share GRANTS a principal access it does not have — "The owner of a workload can
+/// share it with other Amazon Web Services accounts and users"
+/// (`smithy_query(query="operation", operation="CreateWorkloadShare")`) — so the refusal
+/// is about the RELATIONSHIP between the two principals of the request, not about the
+/// value of either one: it states that relationship and names no account id, so a
+/// refusal discloses no identity the caller did not send. Shared by every `Create*Share`
+/// operation, so none of them words it differently.
+pub const SELF_SHARE_MESSAGE: &str =
+    "The shared with principal cannot be the same as the sharer's principal.";
+
+/// The modelled `ValidationException` (HTTP 400) for a share offered to the principal
+/// doing the sharing: [`SELF_SHARE_MESSAGE`], reported as a finding on the member that
+/// named the principal. Unlike [`member_constraint_exception`] it is NOT worded as a
+/// per-field constraint — the rule is the relationship between two principals rather
+/// than a bound on one member's value — so the sentence stands on its own.
+pub fn self_share_exception() -> crate::ops::types::ValidationException {
+    field_validation_exception(&[(
+        SHARED_WITH_MEMBER.to_string(),
+        SELF_SHARE_MESSAGE.to_string(),
+    )])
+}
 
 /// Encode a cursor over a lens's questions: the `QuestionId` last served, in the same
 /// opaque scheme as [`encode_next_token`].
@@ -2371,8 +2847,9 @@ pub fn lens_version_conflict(alias: &str, version: &str) -> ConflictException {
 /// The message names the resource that is in the way AS STORED, and `resource_id`
 /// identifies it, so a caller can fetch it. It is deliberately the stored value rather
 /// than the spelling the request submitted: the two differ wherever the uniqueness rule
-/// compares loosely (workload names ignore spaces and capitalization), and what the
-/// caller needs named is the resource it collided with.
+/// compares loosely (a workload name and a milestone name both ignore spaces and
+/// capitalization — [`normalize_unique_name`]), and what the caller needs named is the
+/// resource it collided with.
 pub fn conflict(resource_type: &str, resource_id: String, sentence: &str) -> ConflictException {
     ConflictException {
         message: tagged_message("Conflict", sentence),
@@ -2397,8 +2874,14 @@ pub fn workload_name_conflict(existing_name: &str, existing_id: &str) -> Conflic
 
 /// [`conflict`] for a milestone name that is already taken within its workload:
 /// "Milestone names must be unique within a workload"
-/// (`CreateMilestoneInput$MilestoneName` doc). `existing_name` / `existing_number` are
-/// the stored name and number of the milestone already holding it.
+/// (`smithy_query(query="shape", shape="MilestoneName")`). `existing_name` /
+/// `existing_number` are the stored name and number of the milestone already holding it.
+///
+/// The sentence names the WORKLOAD the uniqueness is scoped to — a milestone name is
+/// unique within one workload, not across the account, so the refusal has to say which
+/// resource it collided inside — and states the comparison the service applies
+/// ([`normalize_unique_name`]), so a caller whose spelling differs only in
+/// capitalization or whitespace can tell why it was refused.
 pub fn milestone_name_conflict(
     existing_name: &str,
     workload_id: &str,
@@ -2407,7 +2890,10 @@ pub fn milestone_name_conflict(
     conflict(
         MILESTONE_RESOURCE_TYPE,
         milestone_resource_id(workload_id, existing_number),
-        &format!("A milestone with name {existing_name} already exists."),
+        &format!(
+            "Milestone with name {existing_name} already exists under workload \
+             {workload_id}. Capitalization and whitespace are ignored in milestone names."
+        ),
     )
 }
 
