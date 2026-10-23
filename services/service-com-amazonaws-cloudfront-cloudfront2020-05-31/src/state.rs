@@ -22,7 +22,9 @@
 //!   ([`PROPAGATION_DELAY`]);
 //! * an invalidation is `InProgress` until its batch finishes, and `Completed` after;
 //! * a key value store CloudFront has just created is `PROVISIONING` until it has been
-//!   provisioned, and `READY` after ([`KVS_PROVISIONING_DELAY`]).
+//!   provisioned, and `READY` after ([`KVS_PROVISIONING_DELAY`]);
+//! * a distribution tenant CloudFront has just created is `InProgress` until its
+//!   configuration has propagated, and `Deployed` after ([`PROPAGATION_DELAY`]).
 //!
 //! Both are materialised by [`ComAmazonawsCloudfrontCloudfront20200531State::settle`],
 //! which every handler calls before it reads: the transition was owed at the same
@@ -40,16 +42,16 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     ActiveTrustedKeyGroups, ActiveTrustedSigners, AllowedMethods, CacheBehavior, CacheBehaviors,
     CachedMethods, CloudFrontOriginAccessIdentity, CloudFrontOriginAccessIdentityConfig,
-    CustomErrorResponse, CustomErrorResponses, CustomOriginConfig,
-    DefaultCacheBehavior, Distribution, DistributionConfig, DistributionSummary,
-    EntityAlreadyExists, EntityNotFound, ForwardedValues, FunctionAssociations, GeoRestriction,
-    Invalidation, InvalidationBatch, InvalidationSummary, InvalidTagging, KGKeyPairIds, KeyPairIds,
-    KeyValueStore,
-    LambdaFunctionAssociations, LoggingConfig, NoSuchCloudFrontOriginAccessIdentity,
-    NoSuchDistribution, NoSuchInvalidation,
-    NoSuchResource, NoSuchResponseHeadersPolicy, Origin, OriginSslProtocols, Paths,
-    ResponseHeadersPolicy, ResponseHeadersPolicyAlreadyExists, ResponseHeadersPolicyConfig,
-    Restrictions, Signer, Tag, Tags, TrustedKeyGroups, TrustedSigners, ViewerCertificate,
+    CNAMEAlreadyExists, CustomErrorResponse, CustomErrorResponses, CustomOriginConfig,
+    Customizations, DefaultCacheBehavior, Distribution, DistributionConfig, DistributionSummary,
+    DistributionTenant, DomainResult, EntityAlreadyExists, EntityNotFound, ForwardedValues,
+    FunctionAssociations, GeoRestriction, Invalidation, InvalidationBatch, InvalidationSummary,
+    InvalidTagging, KGKeyPairIds, KeyPairIds, KeyValueStore, LambdaFunctionAssociations,
+    LoggingConfig, ManagedCertificateRequest, NoSuchCloudFrontOriginAccessIdentity,
+    NoSuchDistribution, NoSuchInvalidation, NoSuchResource, NoSuchResponseHeadersPolicy, Origin,
+    OriginSslProtocols, Parameter, ParameterDefinition, Paths, ResponseHeadersPolicy,
+    ResponseHeadersPolicyAlreadyExists, ResponseHeadersPolicyConfig, Restrictions, Signer,
+    StringSchemaConfig, Tag, Tags, TrustedKeyGroups, TrustedSigners, ViewerCertificate,
 };
 
 /// `Distribution$Status` while a configuration is still propagating to the edge
@@ -167,6 +169,85 @@ pub const MAX_INVALIDATION_PATHS: usize = 3_000;
 /// store as well. Over it, the refusal is the modelled `InvalidTagging`: "The tagging
 /// specified is not valid."
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The most domains ONE distribution tenant may hold.
+///
+/// The model states the quota on `UpdateDistributionTenantRequest$Domains`: "You must
+/// specify at least one domain. Each distribution tenant can have up to 5 domains"
+/// (`smithy_query(query="doc",shape="UpdateDistributionTenantRequest",member="Domains")`).
+/// `DomainList` carries no `@length`, so it is enforced here rather than by the modelled
+/// constraints — which also bounds what one record stores and what the conflict scan over
+/// the store walks. Over it, the refusal is the modelled `InvalidArgument`: "An argument
+/// is invalid."
+pub const MAX_DOMAINS_PER_TENANT: usize = 5;
+
+/// The most parameter VALUES one distribution tenant may carry.
+///
+/// Every value a tenant carries must name a parameter the multi-tenant distribution
+/// defines, and no name may repeat ([`parameter_refusal`]), so a longer list names
+/// definitions no distribution carries. CloudFront publishes no quota for it, so the
+/// number is the EMULATOR's bound — the same order as [`MAX_TAGS_PER_RESOURCE`], this
+/// service's other per-resource key-value list — on what one request may submit and one
+/// record may retain. Over it, the refusal is the modelled `InvalidArgument`.
+pub const MAX_PARAMETERS_PER_TENANT: usize = 50;
+
+/// The most locations one geographic restriction may name.
+///
+/// `GeoRestriction$Items`: "The `Location` element is a two-letter, uppercase country code
+/// for a country that you want to include in your `blacklist` or `whitelist`. Include one
+/// `Location` element for each country." There are 26 x 26 two-letter codes, so a list
+/// naming more than that names no set of countries at all. The model carries no
+/// `@length`, so the bound is enforced where a customization is accepted — which also
+/// caps what one tenant record retains.
+pub const MAX_GEO_RESTRICTION_LOCATIONS: usize = 26 * 26;
+
+/// The most distribution tenants this emulator holds.
+///
+/// A tenant record is held for the whole life of the emulator (a later read has to answer
+/// with what the create returned), so the store's growth is bounded here rather than left
+/// unbounded. CloudFront's own published quota for distribution tenants is per account and
+/// adjustable, so this is the EMULATOR's bound, not a claim about the service; over it the
+/// refusal is the modelled `EntityLimitExceeded`: "The entity limit has been exceeded."
+pub const MAX_DISTRIBUTION_TENANTS: usize = 10_000;
+
+/// `DomainResult$Status` — "Whether the domain is active or inactive" — for a domain a
+/// distribution tenant holds.
+///
+/// A domain becomes a tenant's by the call that associates it, which is state this
+/// emulator really holds; it performs no DNS resolution and issues no certificate, so
+/// there is no pending validation it could report and nothing in it moves a domain out of
+/// this value. `DomainStatus`'s other value (`inactive`) would claim a validation that
+/// nothing here runs.
+pub const DOMAIN_STATUS_ACTIVE: &str = "active";
+
+/// The prefix every distribution tenant id this service mints carries.
+///
+/// `GetDistributionTenant`'s `Identifier` is "the ARN, ID, or name of the distribution
+/// tenant", so the three namespaces have to be told apart by shape: `DistributionTenant`'s
+/// `Name` is `^[a-zA-Z0-9][a-zA-Z0-9-.]{1,126}[a-zA-Z0-9]$`, which admits no underscore,
+/// and an ARN starts with `arn:` — so an id carrying an underscore can never be read as
+/// either. The model states no id pattern, so the prefix is this emulator's choice.
+pub const DISTRIBUTION_TENANT_ID_PREFIX: &str = "dt_";
+
+/// The prefix every connection group id this service mints carries, told apart from a
+/// tenant id and from a distribution id for the same reason
+/// [`DISTRIBUTION_TENANT_ID_PREFIX`] is.
+pub const CONNECTION_GROUP_ID_PREFIX: &str = "cg_";
+
+/// `DistributionTenant$Enabled` for a create that named none.
+///
+/// "Indicates whether the distribution tenant should be enabled when created. If the
+/// distribution tenant is disabled, the distribution tenant won't serve traffic" — the
+/// member is optional, and a tenant is created to serve the domains the same call
+/// associates with it, so leaving it out asks for the serving tenant.
+pub const DEFAULT_TENANT_ENABLED: bool = true;
+
+/// The longest a domain name may be: RFC 1035's 255-octet wire limit less the length and
+/// root bytes, the bound every DNS name obeys.
+pub const MAX_DOMAIN_NAME_LEN: usize = 253;
+
+/// The longest one label of a domain name may be (RFC 1035).
+pub const MAX_DOMAIN_LABEL_LEN: usize = 63;
 
 /// `KeyValueStore$Status` while CloudFront is still provisioning a key value store.
 ///
@@ -920,6 +1001,121 @@ impl StoredKeyValueStore {
     }
 }
 
+/// One CloudFront distribution tenant, as this emulator persists it.
+///
+/// A tenant is "a distribution tenant" of ONE multi-tenant distribution: it holds the
+/// domains its viewers reach, the parameter values that fill in the distribution's
+/// `TenantConfig`, and the customizations that override the distribution's own settings.
+/// The record is the single source of truth for every one of them, so the create, a later
+/// read and a later mutation all answer from it rather than from the request being served.
+#[derive(Debug, Clone)]
+pub struct StoredDistributionTenant {
+    /// `DistributionTenant$Id`, allocated at creation and never reused.
+    pub id: String,
+    /// `DistributionTenant$Arn`. CloudFront is a global service, so the ARN carries no
+    /// region.
+    pub arn: String,
+    /// `DistributionTenant$Name` \u2014 "unique within your Amazon Web Services account. This
+    /// name can't be updated after you create the distribution tenant."
+    pub name: String,
+    /// `DistributionTenant$DistributionId` \u2014 the multi-tenant distribution this tenant
+    /// was created under.
+    pub distribution_id: String,
+    /// The domains associated with this tenant, in the order the create listed them. Each
+    /// is reported as a `DomainResult` in [`DOMAIN_STATUS_ACTIVE`].
+    pub domains: Vec<String>,
+    /// `DistributionTenant$ConnectionGroupId` \u2014 the connection group the tenant's viewers
+    /// are routed through: the one the create named, or the account's default one.
+    pub connection_group_id: String,
+    /// `DistributionTenant$Customizations`, exactly as submitted: these are "specific
+    /// values that you can override or disable from the multi-tenant distribution", so the
+    /// service supplies nothing of its own here.
+    pub customizations: Option<Customizations>,
+    /// `DistributionTenant$Parameters`, exactly as submitted \u2014 the values that fill in the
+    /// distribution's `TenantConfig$ParameterDefinitions`.
+    pub parameters: Vec<Parameter>,
+    /// The `ManagedCertificateRequest` the create carried, held so the certificate surface
+    /// (`GetManagedCertificateDetails`, still a scaffold) reads what was asked for. No
+    /// certificate is issued and no validation state is reported for it: this emulator
+    /// runs no ACM.
+    pub managed_certificate_request: Option<ManagedCertificateRequest>,
+    /// The tags submitted with the create, in the one representation every tagged
+    /// resource in this store uses.
+    pub tags: TagSet,
+    /// `DistributionTenant$Enabled` \u2014 whether the tenant serves traffic.
+    pub enabled: bool,
+    /// [`STATUS_IN_PROGRESS`] until [`StoredDistributionTenant::deployed_due`], then
+    /// [`STATUS_DEPLOYED`]: a tenant's configuration reaches the edge locations the same
+    /// way its distribution's does.
+    pub status: String,
+    /// The instant this tenant's current configuration is owed to be deployed. Stored
+    /// rather than slept for.
+    pub deployed_due: SystemTime,
+    /// `DistributionTenant$CreatedTime`.
+    pub created_time: SystemTime,
+    /// `DistributionTenant$LastModifiedTime`.
+    pub last_modified_time: SystemTime,
+    /// The version token the last mutation handed back, and the single source of truth for
+    /// every `If-Match` check against this tenant.
+    pub etag: String,
+}
+
+impl StoredDistributionTenant {
+    /// Apply the propagation transition the clock owes at `now`.
+    ///
+    /// Idempotent and monotonic, for the same reason
+    /// [`StoredDistribution::settle`] is: it only ever moves the non-terminal status to the
+    /// terminal one, and only once the deadline has passed, so a read that calls it cannot
+    /// change what a later caller sees.
+    pub fn settle(&mut self, now: SystemTime) {
+        if self.status == STATUS_IN_PROGRESS && now >= self.deployed_due {
+            self.status = STATUS_DEPLOYED.to_string();
+        }
+    }
+
+    /// Whether this tenant holds `domain`, compared as DNS names are.
+    pub fn holds_domain(&self, domain: &str) -> bool {
+        self.domains.iter().any(|held| same_domain(held, domain))
+    }
+
+    /// The `Tags` projection a tag read returns, built from the one stored tag set.
+    pub fn to_tags(&self) -> Tags {
+        tags_projection(&self.tags)
+    }
+
+    /// The `DistributionTenant` projection every distribution tenant operation returns,
+    /// read from the one stored record.
+    pub fn to_distribution_tenant(&self) -> DistributionTenant {
+        DistributionTenant {
+            id: Some(self.id.clone()),
+            distribution_id: Some(self.distribution_id.clone()),
+            name: Some(self.name.clone()),
+            arn: Some(self.arn.clone()),
+            domains: Some(
+                self.domains
+                    .iter()
+                    .map(|domain| DomainResult {
+                        domain: domain.clone(),
+                        status: Some(DOMAIN_STATUS_ACTIVE.to_string()),
+                    })
+                    .collect(),
+            ),
+            tags: Some(self.to_tags()),
+            customizations: self.customizations.clone(),
+            // A tenant that was created with no parameter values carries none, rather
+            // than an empty list the request never described.
+            parameters: (!self.parameters.is_empty()).then(|| self.parameters.clone()),
+            connection_group_id: Some(self.connection_group_id.clone()),
+            created_time: Some(::aws_smithy_types::DateTime::from(self.created_time)),
+            last_modified_time: Some(::aws_smithy_types::DateTime::from(
+                self.last_modified_time,
+            )),
+            enabled: Some(self.enabled),
+            status: Some(self.status.clone()),
+        }
+    }
+}
+
 /// One CloudFront origin access identity, as this emulator persists it.
 ///
 /// The record is the single source of truth for the identity's id, its S3 canonical user
@@ -1016,6 +1212,17 @@ pub struct ComAmazonawsCloudfrontCloudfront20200531State {
     /// and a repeated name an `EntityAlreadyExists`. A `BTreeMap` for the same reason as
     /// `distributions`: one stable total order for a listing to page through.
     pub key_value_stores: BTreeMap<String, StoredKeyValueStore>,
+    /// Every distribution tenant this emulator holds, keyed by tenant id. A `BTreeMap`
+    /// for the same reason as `distributions`: one stable total order a listing pages
+    /// through.
+    pub distribution_tenants: BTreeMap<String, StoredDistributionTenant>,
+    /// The id of the account's DEFAULT connection group, once something has needed one.
+    ///
+    /// "When you first create a distribution tenant and you don't specify a connection
+    /// group, CloudFront will automatically create a default connection group for you" —
+    /// so it is minted ONCE, by the first create that needs it, and every later tenant
+    /// that names no connection group is routed through that same one.
+    pub default_connection_group_id: Option<String>,
     /// Every origin access identity this emulator holds, keyed by its id. A `BTreeMap`
     /// for the same reason as `distributions`: one stable total order for a listing to
     /// page through.
@@ -1035,6 +1242,9 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         }
         for key_value_store in self.key_value_stores.values_mut() {
             key_value_store.settle(now);
+        }
+        for tenant in self.distribution_tenants.values_mut() {
+            tenant.settle(now);
         }
     }
 
@@ -1067,6 +1277,58 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     /// The distribution `id` names, or `None` when the store holds none.
     pub fn distribution(&self, id: &str) -> Option<&StoredDistribution> {
         self.distributions.get(id)
+    }
+
+    /// The distribution tenant `identifier` names, or `None` when the store holds none.
+    ///
+    /// A distribution tenant operation names its tenant by "the ARN, ID, or name of the
+    /// distribution tenant", so all three resolve to the one record: the id is the store's
+    /// key, and the ARN and the name are compared against the STORED values rather than
+    /// re-derived out of the request. The three namespaces cannot overlap — see
+    /// [`DISTRIBUTION_TENANT_ID_PREFIX`] — so at most one of them matches.
+    pub fn distribution_tenant(&self, identifier: &str) -> Option<&StoredDistributionTenant> {
+        if let Some(tenant) = self.distribution_tenants.get(identifier) {
+            return Some(tenant);
+        }
+        self.distribution_tenants
+            .values()
+            .find(|tenant| tenant.arn == identifier || tenant.name == identifier)
+    }
+
+    /// Whether `domain` is already associated with a CloudFront resource this store holds:
+    /// a domain of a distribution tenant other than `except_tenant_id`, or an alias of a
+    /// distribution.
+    ///
+    /// "The CNAME specified is already defined for CloudFront": one domain name routes to
+    /// at most one CloudFront resource, so the check spans every resource kind that can
+    /// claim one. `except_tenant_id` is the tenant a mutation is rewriting, whose own
+    /// domains are no conflict with itself.
+    pub fn domain_in_use(&self, domain: &str, except_tenant_id: Option<&str>) -> bool {
+        let held_by_tenant = self.distribution_tenants.values().any(|tenant| {
+            Some(tenant.id.as_str()) != except_tenant_id && tenant.holds_domain(domain)
+        });
+        held_by_tenant
+            || self.distributions.values().any(|distribution| {
+                distribution
+                    .config
+                    .aliases
+                    .as_ref()
+                    .and_then(|aliases| aliases.items.as_deref())
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|alias| same_domain(alias, domain))
+            })
+    }
+
+    /// Whether `id` names a connection group this store holds.
+    ///
+    /// The only connection group this emulator holds is the account's default one
+    /// ([`ComAmazonawsCloudfrontCloudfront20200531State::default_connection_group`]);
+    /// `CreateConnectionGroup` is still a scaffold, so no other one can have been created.
+    /// When it lands it extends this lookup with its own store rather than replacing the
+    /// rule: an id no connection group carries names no entity.
+    pub fn holds_connection_group(&self, id: &str) -> bool {
+        self.default_connection_group_id.as_deref() == Some(id)
     }
 
     /// The response headers policy `id` names, or `None` when the store holds none.
@@ -1105,10 +1367,13 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         {
             return Some(&distribution.tags);
         }
-        self.key_value_stores
+        if let Some(store) = self.key_value_stores.values().find(|store| store.arn == arn) {
+            return Some(&store.tags);
+        }
+        self.distribution_tenants
             .values()
-            .find(|store| store.arn == arn)
-            .map(|store| &store.tags)
+            .find(|tenant| tenant.arn == arn)
+            .map(|tenant| &tenant.tags)
     }
 
     /// The tag set of the resource `arn` names, MUTABLY, so a tagging call writes the
@@ -1291,6 +1556,17 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         }
     }
 
+    /// Allocate a distribution tenant id no stored tenant holds:
+    /// [`DISTRIBUTION_TENANT_ID_PREFIX`] followed by a minted token.
+    pub fn allocate_distribution_tenant_id(&mut self) -> String {
+        loop {
+            let candidate = format!("{DISTRIBUTION_TENANT_ID_PREFIX}{}", self.mint(ID_BODY_LEN));
+            if !self.distribution_tenants.contains_key(&candidate) {
+                break candidate;
+            }
+        }
+    }
+
     /// Allocate an origin access identity id no stored identity holds.
     ///
     /// `CloudFrontOriginAccessIdentity$Id` is "The ID for the origin access identity, for
@@ -1320,6 +1596,18 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
                 break candidate;
             }
         }
+    }
+
+    /// The id of the account's default connection group, minting it on the first call that
+    /// needs one — which is what "CloudFront will automatically create a default connection
+    /// group for you" means. Every later call reads that one id back.
+    pub fn default_connection_group(&mut self) -> String {
+        if let Some(id) = &self.default_connection_group_id {
+            return id.clone();
+        }
+        let id = format!("{CONNECTION_GROUP_ID_PREFIX}{}", self.mint(ID_BODY_LEN));
+        self.default_connection_group_id = Some(id.clone());
+        id
     }
 
     /// Allocate the Amazon S3 canonical user id of an origin access identity, in the
@@ -1564,6 +1852,169 @@ pub fn key_value_store_arn(id: &str) -> String {
 /// resource is addressed by NAME, as `DescribeKeyValueStore`'s `{Name}` label is.
 pub fn key_value_store_path(name: &str) -> String {
     format!("/2020-05-31/key-value-store/{name}")
+}
+
+/// The ARN of a distribution tenant. CloudFront is a GLOBAL service, so the ARN's region
+/// segment is empty: `arn:aws:cloudfront::<account>:distribution-tenant/<Id>`, the
+/// resource type this service's own `/distribution-tenant` routes name.
+pub fn distribution_tenant_arn(id: &str) -> String {
+    ::engine::emulator_arn("cloudfront", "", &format!("distribution-tenant/{id}"))
+}
+
+/// Whether two domain names are the same name. DNS names are case-insensitive, so the
+/// comparison is too — a domain claimed in one case is claimed in every case.
+pub fn same_domain(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
+/// Why `domain` is no domain name a CloudFront resource can be reached at, or `None` when
+/// it is one.
+///
+/// `DomainItem$Domain` is modelled as a plain `string`, so the shape of a DNS name is
+/// this check rather than a modelled constraint: a name is a dot-separated sequence of at
+/// least two non-empty labels, each at most [`MAX_DOMAIN_LABEL_LEN`] characters and
+/// carrying no whitespace, and the whole name is at most [`MAX_DOMAIN_NAME_LEN`]
+/// characters (RFC 1035). The character set of a label is deliberately NOT narrowed to
+/// ASCII: an internationalised domain name is a domain name.
+///
+/// ONE rule for every operation that associates a domain with a resource, so the create
+/// and a later association cannot drift apart. The reason carries no error wording of its
+/// own: the caller prefixes it with the wording of whichever refusal its own model
+/// declares.
+pub fn domain_name_refusal(domain: &str) -> Option<String> {
+    if domain.is_empty() {
+        return Some("a domain name cannot be empty".to_string());
+    }
+    if domain.chars().count() > MAX_DOMAIN_NAME_LEN {
+        return Some(format!(
+            "the domain {domain} is longer than the {MAX_DOMAIN_NAME_LEN} characters a domain \
+             name may carry"
+        ));
+    }
+    // The root label a fully qualified name ends in carries nothing, so a trailing dot is
+    // not a second, empty label.
+    let labels: Vec<&str> = domain.trim_end_matches('.').split('.').collect();
+    if labels.len() < 2 {
+        return Some(format!(
+            "the domain {domain} is a single label, not a domain name"
+        ));
+    }
+    for label in labels {
+        if label.is_empty() {
+            return Some(format!("the domain {domain} carries an empty label"));
+        }
+        if label.chars().count() > MAX_DOMAIN_LABEL_LEN {
+            return Some(format!(
+                "the domain {domain} carries a label longer than the {MAX_DOMAIN_LABEL_LEN} \
+                 characters a label may carry"
+            ));
+        }
+        if label.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Some(format!(
+                "the domain {domain} carries whitespace, which no domain name does"
+            ));
+        }
+    }
+    None
+}
+
+/// Why `customizations` is no set of customizations a distribution tenant can carry, or
+/// `None` when it is one.
+///
+/// A tenant's customizations are "specific values that you can override or disable from
+/// the multi-tenant distribution", and the only list among them is the geographic
+/// restriction's locations, bounded by [`MAX_GEO_RESTRICTION_LOCATIONS`] — so no caller
+/// chooses how much work one customization costs, nor how large the record that retains it
+/// is. Every other member is a single value the model already constrains.
+///
+/// ONE rule for every operation that accepts a tenant's customizations. The reason carries
+/// no error wording of its own, for the same reason [`domain_name_refusal`]'s does not.
+pub fn customizations_refusal(customizations: &Customizations) -> Option<String> {
+    let locations = customizations
+        .geo_restrictions
+        .as_ref()
+        .and_then(|geo| geo.locations.as_deref())
+        .unwrap_or_default();
+    if locations.len() > MAX_GEO_RESTRICTION_LOCATIONS {
+        return Some(format!(
+            "a geographic restriction names at most {MAX_GEO_RESTRICTION_LOCATIONS} locations \
+             but the request names {}",
+            locations.len()
+        ));
+    }
+    None
+}
+
+/// Why `parameters` does not satisfy the `TenantConfig$ParameterDefinitions` of the
+/// multi-tenant distribution a tenant is created or updated under, or `None` when it
+/// does.
+///
+/// "A parameter is specified as a key-value pair. A valid parameter value must exist for
+/// any parameter that is marked as required in the multi-tenant distribution" — so three
+/// things make a parameter list invalid: a value for a parameter the distribution defines
+/// nothing for, one parameter named twice (which describes no single value), and a
+/// definition marked `Required` for which neither the request nor the definition's own
+/// `DefaultValue` supplies a VALID value — a value being valid means a non-empty one, so
+/// an empty string satisfies a required parameter no more than an absent one does.
+///
+/// A definition carrying no `StringSchema` states no `Required` flag at all
+/// (`ParameterDefinitionSchema`'s only member is optional), so there is nothing to require
+/// of the request for it.
+///
+/// ONE rule for every operation that supplies a tenant's parameter values. The reason
+/// carries no error wording of its own, for the same reason [`domain_name_refusal`]'s
+/// does not.
+pub fn parameter_refusal(
+    definitions: &[ParameterDefinition],
+    parameters: &[Parameter],
+) -> Option<String> {
+    // The definitions are INDEXED once, so the check costs one logarithmic lookup per
+    // submitted value rather than a scan of the definitions per value: its cost is the
+    // SUM of the two lengths, never their product.
+    let defined: BTreeMap<&str, Option<&StringSchemaConfig>> = definitions
+        .iter()
+        .map(|definition| {
+            (
+                definition.name.as_str(),
+                definition.definition.string_schema.as_ref(),
+            )
+        })
+        .collect();
+    let mut submitted: BTreeMap<&str, &str> = BTreeMap::new();
+    for parameter in parameters {
+        if submitted
+            .insert(parameter.name.as_str(), parameter.value.as_str())
+            .is_some()
+        {
+            return Some(format!(
+                "the parameter {} is named more than once",
+                parameter.name
+            ));
+        }
+        if !defined.contains_key(parameter.name.as_str()) {
+            return Some(format!(
+                "the distribution defines no parameter named {}",
+                parameter.name
+            ));
+        }
+    }
+    for (name, schema) in &defined {
+        let Some(schema) = schema else {
+            continue;
+        };
+        let supplied = submitted.get(name).is_some_and(|value| !value.is_empty())
+            || schema
+                .default_value
+                .as_deref()
+                .is_some_and(|value| !value.is_empty());
+        if schema.required && !supplied {
+            return Some(format!(
+                "the parameter {name} is required by the distribution and the request supplies \
+                 no value for it"
+            ));
+        }
+    }
+    None
 }
 
 /// The path of one origin access identity under this service's API version — the route
@@ -2491,6 +2942,57 @@ pub fn key_value_store_already_exists(name: &str) -> EntityAlreadyExists {
     EntityAlreadyExists {
         message: Some(format!(
             "A key value store with the name {name} already exists in this account"
+        )),
+    }
+}
+
+/// The modelled `EntityNotFound` (HTTP 404) for a distribution id no stored distribution
+/// carries, for the operations whose model names `EntityNotFound` rather than
+/// `NoSuchDistribution` for that condition.
+pub fn distribution_not_found(id: &str) -> EntityNotFound {
+    EntityNotFound {
+        message: Some(format!("The specified distribution does not exist: {id}")),
+    }
+}
+
+/// The modelled `EntityNotFound` (HTTP 404) for an identifier — an ARN, an id or a name —
+/// no stored distribution tenant answers to.
+pub fn distribution_tenant_not_found(identifier: &str) -> EntityNotFound {
+    EntityNotFound {
+        message: Some(format!(
+            "The specified distribution tenant does not exist: {identifier}"
+        )),
+    }
+}
+
+/// The modelled `EntityNotFound` (HTTP 404) for a connection group id no connection group
+/// this store holds carries.
+pub fn connection_group_not_found(id: &str) -> EntityNotFound {
+    EntityNotFound {
+        message: Some(format!("The specified connection group does not exist: {id}")),
+    }
+}
+
+/// The modelled `EntityAlreadyExists` (HTTP 409) for a distribution tenant name that is
+/// already taken: the name is "unique within your Amazon Web Services account".
+pub fn distribution_tenant_already_exists(name: &str) -> EntityAlreadyExists {
+    EntityAlreadyExists {
+        message: Some(format!(
+            "A distribution tenant with the name {name} already exists in this account"
+        )),
+    }
+}
+
+/// The modelled `CNAMEAlreadyExists` (HTTP 409) for a domain another CloudFront resource
+/// already claims.
+///
+/// The sentence is CloudFront's own for this code, with the domain that conflicts named at
+/// the end of it so a caller that submitted several learns which one.
+pub fn cname_already_exists(domain: &str) -> CNAMEAlreadyExists {
+    CNAMEAlreadyExists {
+        message: Some(format!(
+            "One or more of the CNAMEs you provided are already associated with a different \
+             resource: {domain}"
         )),
     }
 }

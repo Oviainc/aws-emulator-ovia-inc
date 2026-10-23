@@ -156,10 +156,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `BuildBatches` admits an empty list (`@length(min: 0, max: 100)`), so a
             // caller that asked only for unknown ids reads `[]` here.
             build_batches: Some(build_batches),
-            // The ids this emulator holds no batch build for. Left absent rather than
-            // empty when every id resolved, the way `BatchGetBuilds` reports
-            // `buildsNotFound`.
-            build_batches_not_found: (!not_found.is_empty()).then_some(not_found),
+            // The ids this emulator holds no batch build for, serialized the same way
+            // as the found half: `[]` when every id resolved.
+            build_batches_not_found: Some(not_found),
         })
     }
 }

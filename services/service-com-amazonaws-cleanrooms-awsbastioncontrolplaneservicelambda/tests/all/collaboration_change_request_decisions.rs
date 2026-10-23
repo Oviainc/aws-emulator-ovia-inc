@@ -8,15 +8,22 @@
 //! denial, APPROVED once every party has approved, PENDING while a vote is outstanding),
 //! the collaboration owner's CANCEL settles it CANCELLED, and the owner's COMMIT is
 //! admitted only from APPROVED, which is the single action that applies the request's
-//! changes to the collaboration. A request in a terminal status (COMMITTED, DENIED,
-//! CANCELLED) admits no action, and every decision restamps `updateTime` and reads back
-//! unchanged through `GetCollaborationChangeRequest`.
+//! changes to the collaboration. A request that can no longer be modified (COMMITTED or
+//! CANCELLED) refuses every action with `ValidationException`; every decision that is
+//! admitted restamps `updateTime` and reads back unchanged through
+//! `GetCollaborationChangeRequest`.
 //!
 //! The tables vary what the rule generalises over: every value of the
-//! `ChangeRequestAction` catalog against every value of the `ChangeRequestStatus` catalog,
-//! the NUMBER of parties whose votes a request waits for, and which kind of
+//! `ChangeRequestAction` catalog against every `ChangeRequestStatus` a stored request can
+//! be reached in, the NUMBER of parties whose votes a request waits for, and which kind of
 //! `ChangeSpecification` a committed change applies. Requests go over the wire through the
 //! same `MultiServiceRouter` the production router uses.
+//!
+//! APPROVED is not among the statuses these tables start from: a request reaches APPROVED
+//! only once EVERY party has approved, and every emulated caller presents the one account
+//! id, so a request whose other parties have votes outstanding can never collect them —
+//! a request the caller is the only party to is settled at creation instead (see
+//! [`super::collaboration_change_request_auto_commit`]).
 
 use serde_json::{json, Value};
 
@@ -29,11 +36,12 @@ use super::collaboration_change_requests::{
 /// Every `ChangeRequestAction` the model declares (shape `ChangeRequestAction`).
 const ALL_ACTIONS: [&str; 4] = ["APPROVE", "DENY", "CANCEL", "COMMIT"];
 
-/// Every `ChangeRequestStatus` the model declares (shape `ChangeRequestStatus`) that a
-/// request can be sitting in when an action arrives.
-const TERMINAL_STATUSES: [&str; 3] = ["COMMITTED", "DENIED", "CANCELLED"];
+/// The `ChangeRequestStatus` values in which a stored request admits NO modification at
+/// all, as the service's own refusal states the rule ("Change requests in COMMITTED or
+/// CANCELLED status can't be modified").
+const UNMODIFIABLE_STATUSES: [&str; 2] = ["COMMITTED", "CANCELLED"];
 
-async fn update_change_request(
+pub(crate) async fn update_change_request(
     emulator: &Emulator,
     collaboration_id: &str,
     change_request_id: &str,
@@ -48,12 +56,18 @@ async fn update_change_request(
         .await
 }
 
-/// A collaboration whose only party is the caller, plus one PENDING change request
-/// against it (an `ADD_MEMBER` the collaboration does not auto-approve). Returns
-/// `(collaboration id, change request id)`.
+/// A collaboration with one party BESIDES the caller, plus one PENDING change request
+/// against it (an `ADD_MEMBER` the collaboration does not auto-approve, so the other
+/// party's approval is outstanding). Returns `(collaboration id, change request id)`.
 async fn pending_request(emulator: &Emulator, case: &str) -> (String, String) {
-    let collaboration_id =
-        seeded_collaboration(emulator, case, &["CAN_QUERY"], json!([]), None).await;
+    let collaboration_id = seeded_collaboration(
+        emulator,
+        case,
+        &["CAN_QUERY"],
+        json!([declared_member(PARTNER_ACCOUNT, &["CAN_QUERY"])]),
+        None,
+    )
+    .await;
     let (status, created) = create_change_request(
         emulator,
         &collaboration_id,
@@ -77,46 +91,78 @@ async fn pending_request(emulator: &Emulator, case: &str) -> (String, String) {
     (collaboration_id, id)
 }
 
-/// A change request sitting in `status`, in a collaboration whose only party is the
-/// caller. The caller is that collaboration's owner, so it can take every action.
-async fn request_in_status(
-    emulator: &Emulator,
-    case: &str,
-    status: &str,
-) -> (String, String, Value) {
+/// A collaboration whose only party is the caller, plus one change request against it.
+/// No approval of that request is outstanding, so the service settles it COMMITTED at
+/// creation. Returns `(collaboration id, change request id)`.
+async fn committed_request(emulator: &Emulator, case: &str) -> (String, String) {
+    let collaboration_id =
+        seeded_collaboration(emulator, case, &["CAN_QUERY"], json!([]), None).await;
+    let (status, created) = create_change_request(
+        emulator,
+        &collaboration_id,
+        json!([member_change(NEWCOMER_ACCOUNT, &["CAN_QUERY"])]),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected CreateCollaborationChangeRequest 200, got {status} with {created}"
+    );
+    let request = &created["collaborationChangeRequest"];
+    assert_eq!(
+        request["status"],
+        json!("COMMITTED"),
+        "case {case:?}: expected the sole party's own request to be settled at creation, got {created}"
+    );
+    let id = request["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: the created request carries an id: {created}"))
+        .to_string();
+    (collaboration_id, id)
+}
+
+/// A change request sitting in `status`. The caller is the collaboration's owner in every
+/// case, so it can take every action.
+async fn request_in_status(emulator: &Emulator, case: &str, status: &str) -> (String, String) {
+    if status == "COMMITTED" {
+        return committed_request(emulator, case).await;
+    }
     let (collaboration_id, id) = pending_request(emulator, case).await;
-    // The actions that walk a PENDING request to each status; "PENDING" needs none.
+    // The actions that walk a PENDING request to each remaining status; "PENDING" needs
+    // none.
     let walk: &[&str] = match status {
         "PENDING" => &[],
-        "APPROVED" => &["APPROVE"],
         "DENIED" => &["DENY"],
         "CANCELLED" => &["CANCEL"],
-        "COMMITTED" => &["APPROVE", "COMMIT"],
         other => panic!("case {case:?}: no walk to status {other:?}"),
     };
-    let mut body = Value::Null;
     for action in walk {
         let (code, updated) = update_change_request(emulator, &collaboration_id, &id, action).await;
         assert_eq!(
             code, 200,
             "case {case:?}: expected {action} 200 while reaching {status}, got {code} with {updated}"
         );
-        body = updated;
-    }
-    if !walk.is_empty() {
         assert_eq!(
-            body["collaborationChangeRequest"]["status"],
+            updated["collaborationChangeRequest"]["status"],
             json!(status),
-            "case {case:?}: expected the walk to leave the request {status}, got {body}"
+            "case {case:?}: expected the walk to leave the request {status}, got {updated}"
         );
     }
-    (collaboration_id, id, body)
+    (collaboration_id, id)
 }
 
 fn as_epoch(request: &Value, member: &str) -> f64 {
     request[member]
         .as_f64()
         .unwrap_or_else(|| panic!("{member} is an epoch-seconds timestamp: {request}"))
+}
+
+/// The calling account's own entry in a change request's `approvals` map.
+fn caller_approval(request: &Value, caller: &str) -> String {
+    approvals_of(request)
+        .into_iter()
+        .find(|(account, _)| account == caller)
+        .map(|(_, status)| status)
+        .unwrap_or_else(|| panic!("the request records the caller's approval: {request}"))
 }
 
 /// One row of the action/status table.
@@ -128,13 +174,13 @@ struct DecisionCase {
     expect_status: &'static str,
     /// The wire error code, for a row that is refused.
     expect_code: &'static str,
-    /// The caller's own approval afterwards, for a row that succeeds.
+    /// The CALLER's own approval afterwards, for a row that succeeds.
     expect_approval: &'static str,
 }
 
-/// Every `ChangeRequestAction` against every `ChangeRequestStatus`: the action is admitted
-/// only where the request's status admits it, and the status it leaves behind is the one
-/// the votes and the action prescribe.
+/// Every `ChangeRequestAction` against every `ChangeRequestStatus` a stored request can be
+/// reached in: the action is admitted only where the request's status admits it, and the
+/// status it leaves behind is the one the votes and the action prescribe.
 #[tokio::test]
 async fn each_action_is_admitted_only_from_the_status_that_allows_it() {
     let emulator = Emulator::new();
@@ -145,9 +191,9 @@ async fn each_action_is_admitted_only_from_the_status_that_allows_it() {
             from_status: "PENDING",
             action: "APPROVE",
             expect_http: 200,
-            // The caller is the collaboration's only party, so its approval is the last
-            // one outstanding.
-            expect_status: "APPROVED",
+            // The other party's vote is still outstanding, so the caller's approval does
+            // not settle the request.
+            expect_status: "PENDING",
             expect_code: "",
             expect_approval: "APPROVED",
         },
@@ -177,7 +223,7 @@ async fn each_action_is_admitted_only_from_the_status_that_allows_it() {
             expect_approval: "",
         },
         DecisionCase {
-            from_status: "APPROVED",
+            from_status: "DENIED",
             action: "APPROVE",
             expect_http: 409,
             expect_status: "",
@@ -185,7 +231,7 @@ async fn each_action_is_admitted_only_from_the_status_that_allows_it() {
             expect_approval: "",
         },
         DecisionCase {
-            from_status: "APPROVED",
+            from_status: "DENIED",
             action: "DENY",
             expect_http: 409,
             expect_status: "",
@@ -193,31 +239,34 @@ async fn each_action_is_admitted_only_from_the_status_that_allows_it() {
             expect_approval: "",
         },
         DecisionCase {
-            from_status: "APPROVED",
+            // A denied request is not one of the unmodifiable statuses, so the owner can
+            // still withdraw it.
+            from_status: "DENIED",
             action: "CANCEL",
             expect_http: 200,
             expect_status: "CANCELLED",
             expect_code: "",
-            expect_approval: "APPROVED",
+            expect_approval: "DENIED",
         },
         DecisionCase {
-            from_status: "APPROVED",
+            from_status: "DENIED",
             action: "COMMIT",
-            expect_http: 200,
-            expect_status: "COMMITTED",
-            expect_code: "",
-            expect_approval: "APPROVED",
+            expect_http: 409,
+            expect_status: "",
+            expect_code: "ConflictException",
+            expect_approval: "",
         },
     ];
-    // A terminal request admits nothing at all, whichever action arrives.
-    for from_status in TERMINAL_STATUSES {
+    // A request that can no longer be modified refuses every action with the same
+    // ValidationException.
+    for from_status in UNMODIFIABLE_STATUSES {
         for action in ALL_ACTIONS {
             cases.push(DecisionCase {
                 from_status,
                 action,
-                expect_http: 409,
+                expect_http: 400,
                 expect_status: "",
-                expect_code: "ConflictException",
+                expect_code: "ValidationException",
                 expect_approval: "",
             });
         }
@@ -225,7 +274,7 @@ async fn each_action_is_admitted_only_from_the_status_that_allows_it() {
 
     for case in cases {
         let label = format!("{} from {}", case.action, case.from_status);
-        let (collaboration_id, id, _) = request_in_status(&emulator, &label, case.from_status).await;
+        let (collaboration_id, id) = request_in_status(&emulator, &label, case.from_status).await;
         let (_, before) = get_change_request(&emulator, &collaboration_id, &id).await;
         let before = before["collaborationChangeRequest"].clone();
 
@@ -265,8 +314,8 @@ async fn each_action_is_admitted_only_from_the_status_that_allows_it() {
             case.expect_status
         );
         assert_eq!(
-            approvals_of(request),
-            vec![(creator.to_string(), case.expect_approval.to_string())],
+            caller_approval(request, creator),
+            case.expect_approval,
             "case {label:?}: expected the caller's approval to be {}, got {request}",
             case.expect_approval
         );
@@ -279,8 +328,8 @@ async fn each_action_is_admitted_only_from_the_status_that_allows_it() {
             "case {label:?}: an update must not move createTime, got {request}"
         );
         assert!(
-            as_epoch(request, "updateTime") > as_epoch(&before, "createTime"),
-            "case {label:?}: expected updateTime after createTime, got {request}"
+            as_epoch(request, "updateTime") >= as_epoch(&before, "createTime"),
+            "case {label:?}: expected updateTime at or after createTime, got {request}"
         );
         assert_eq!(
             request["changes"], before["changes"],
@@ -303,11 +352,11 @@ async fn each_action_is_admitted_only_from_the_status_that_allows_it() {
     }
 }
 
-/// A request waits for EVERY party's vote: the caller's approval settles it only when the
-/// caller is the only party, and a request still holding a PENDING vote cannot be
-/// committed. The row's variable is how many parties the collaboration has.
+/// A request waits for EVERY party's vote: the caller's approval settles nothing while
+/// another party has a vote outstanding, and such a request cannot be committed. The
+/// row's variable is how many parties BESIDES the caller the collaboration has.
 #[tokio::test]
-async fn a_request_is_approved_only_once_every_party_has_voted() {
+async fn a_request_waits_for_every_party_that_has_a_vote_outstanding() {
     let emulator = Emulator::new();
     let creator = account_id();
 
@@ -341,26 +390,52 @@ async fn a_request_is_approved_only_once_every_party_has_voted() {
             status, 200,
             "case {label:?}: expected 200, got {status} with {created}"
         );
-        let id = created["collaborationChangeRequest"]["id"]
+        let request = &created["collaborationChangeRequest"];
+        let id = request["id"]
             .as_str()
             .unwrap_or_else(|| panic!("case {label:?}: the request carries an id: {created}"))
             .to_string();
 
-        let (status, voted) = update_change_request(&emulator, &collaboration_id, &id, "APPROVE").await;
+        if others.is_empty() {
+            // Nothing is outstanding, so the request was settled at creation and admits
+            // no action afterwards.
+            assert_eq!(
+                request["status"],
+                json!("COMMITTED"),
+                "case {label:?}: expected the sole party's request to be settled, got {request}"
+            );
+            let (status, refused) =
+                update_change_request(&emulator, &collaboration_id, &id, "APPROVE").await;
+            assert_eq!(
+                status, 400,
+                "case {label:?}: a settled request admits no vote, got {status} with {refused}"
+            );
+            assert_eq!(
+                error_code(&refused),
+                "ValidationException",
+                "case {label:?}: expected ValidationException, got {refused}"
+            );
+            continue;
+        }
+
+        assert_eq!(
+            request["status"],
+            json!("PENDING"),
+            "case {label:?}: expected PENDING with {} vote(s) outstanding, got {request}",
+            others.len()
+        );
+
+        let (status, voted) =
+            update_change_request(&emulator, &collaboration_id, &id, "APPROVE").await;
         assert_eq!(
             status, 200,
             "case {label:?}: expected APPROVE 200, got {status} with {voted}"
         );
         let request = &voted["collaborationChangeRequest"];
-        let expected_status = if others.is_empty() {
-            "APPROVED"
-        } else {
-            "PENDING"
-        };
         assert_eq!(
             request["status"],
-            json!(expected_status),
-            "case {label:?}: expected {expected_status} with {} vote(s) outstanding, got {request}",
+            json!("PENDING"),
+            "case {label:?}: expected PENDING with {} vote(s) still outstanding, got {request}",
             others.len()
         );
 
@@ -376,53 +451,63 @@ async fn a_request_is_approved_only_once_every_party_has_voted() {
             "case {label:?}: expected only the caller's vote recorded, got {request}"
         );
 
-        // A request with an outstanding vote has nothing to commit yet; one every party
-        // approved does.
+        // A request with an outstanding vote has nothing to commit yet.
         let (status, committed) =
             update_change_request(&emulator, &collaboration_id, &id, "COMMIT").await;
-        if others.is_empty() {
-            assert_eq!(
-                status, 200,
-                "case {label:?}: an approved request is committable, got {status} with {committed}"
-            );
-            assert_eq!(
-                committed["collaborationChangeRequest"]["status"],
-                json!("COMMITTED"),
-                "case {label:?}: expected COMMITTED, got {committed}"
-            );
-        } else {
-            assert_eq!(
-                status, 409,
-                "case {label:?}: a request awaiting a vote is not committable, got {status} with {committed}"
-            );
-            assert_eq!(
-                error_code(&committed),
-                "ConflictException",
-                "case {label:?}: expected ConflictException, got {committed}"
-            );
-        }
+        assert_eq!(
+            status, 409,
+            "case {label:?}: a request awaiting a vote is not committable, got {status} with {committed}"
+        );
+        assert_eq!(
+            error_code(&committed),
+            "ConflictException",
+            "case {label:?}: expected ConflictException, got {committed}"
+        );
     }
 }
 
-/// COMMIT is the only decision that applies a change: APPROVE, DENY and CANCEL leave the
-/// collaboration exactly as it was.
+/// A change reaches the collaboration only through a COMMITTED request: APPROVE, DENY and
+/// CANCEL leave the collaboration exactly as it was, while a request settled at creation
+/// has already applied it.
 #[tokio::test]
-async fn only_a_commit_applies_the_change_to_the_collaboration() {
+async fn a_change_reaches_the_collaboration_only_once_the_request_is_committed() {
     let emulator = Emulator::new();
-
-    // Each row drives a pending edit of the collaboration's own auto-approval setting to
-    // one decision and then reads the collaboration back.
-    let rows: [(&str, &[&str], bool); 4] = [
-        ("APPROVE leaves it unapplied", &["APPROVE"], false),
-        ("DENY leaves it unapplied", &["DENY"], false),
-        ("CANCEL leaves it unapplied", &["CANCEL"], false),
-        ("COMMIT applies it", &["APPROVE", "COMMIT"], true),
-    ];
     let requested_setting = json!(["ADD_MEMBER", "GRANT_RECEIVE_RESULTS_ABILITY"]);
 
-    for (label, actions, expect_applied) in rows {
+    // Each row drives an edit of the collaboration's own auto-approval setting to one
+    // decision and then reads the collaboration back. The first three rows need the edit
+    // to stay un-committed, so their collaboration has a second party whose approval is
+    // outstanding; the last has only the caller, so the create settles it.
+    let rows: [(&str, Value, &[&str], bool); 4] = [
+        (
+            "APPROVE leaves it unapplied",
+            json!([declared_member(PARTNER_ACCOUNT, &["CAN_QUERY"])]),
+            &["APPROVE"],
+            false,
+        ),
+        (
+            "DENY leaves it unapplied",
+            json!([declared_member(PARTNER_ACCOUNT, &["CAN_QUERY"])]),
+            &["DENY"],
+            false,
+        ),
+        (
+            "CANCEL leaves it unapplied",
+            json!([declared_member(PARTNER_ACCOUNT, &["CAN_QUERY"])]),
+            &["CANCEL"],
+            false,
+        ),
+        (
+            "the sole party's own request applies it at creation",
+            json!([]),
+            &[],
+            true,
+        ),
+    ];
+
+    for (label, members, actions, expect_applied) in rows {
         let collaboration_id =
-            seeded_collaboration(&emulator, label, &["CAN_QUERY"], json!([]), None).await;
+            seeded_collaboration(&emulator, label, &["CAN_QUERY"], members, None).await;
         let (status, created) = create_change_request(
             &emulator,
             &collaboration_id,
@@ -477,48 +562,34 @@ async fn a_committed_member_change_is_applied_to_the_collaboration() {
     let emulator = Emulator::new();
     let creator = account_id();
 
-    // 1. An account that was not a party becomes one.
-    let collaboration_id = seeded_collaboration(
-        &emulator,
-        "a committed add makes the account a party",
-        &["CAN_QUERY"],
-        json!([]),
-        None,
-    )
-    .await;
+    // 1. An account that was not a party becomes one. The caller is the collaboration's
+    //    only party, so its own request is committed at creation.
+    let label = "a committed add makes the account a party";
+    let collaboration_id =
+        seeded_collaboration(&emulator, label, &["CAN_QUERY"], json!([]), None).await;
     let add = member_change(NEWCOMER_ACCOUNT, &["CAN_QUERY"]);
     let (status, created) =
         create_change_request(&emulator, &collaboration_id, json!([add.clone()])).await;
     assert_eq!(
         status, 200,
-        "case {:?}: expected 200, got {status} with {created}",
-        "a committed add makes the account a party"
+        "case {label:?}: expected 200, got {status} with {created}"
     );
-    let id = created["collaborationChangeRequest"]["id"]
-        .as_str()
-        .expect("the request carries an id")
-        .to_string();
-    for action in ["APPROVE", "COMMIT"] {
-        let (status, body) = update_change_request(&emulator, &collaboration_id, &id, action).await;
-        assert_eq!(
-            status, 200,
-            "case {:?}: expected {action} 200, got {status} with {body}",
-            "a committed add makes the account a party"
-        );
-    }
+    assert_eq!(
+        created["collaborationChangeRequest"]["status"],
+        json!("COMMITTED"),
+        "case {label:?}: expected the sole party's request to be committed, got {created}"
+    );
 
     // Asking for the same add again now asks for nothing (`ChangeTypeList` is len 1..).
     let (status, again) = create_change_request(&emulator, &collaboration_id, json!([add])).await;
     assert_eq!(
         status, 400,
-        "case {:?}: the applied add leaves nothing to ask for, got {status} with {again}",
-        "a committed add makes the account a party"
+        "case {label:?}: the applied add leaves nothing to ask for, got {status} with {again}"
     );
     assert_eq!(
         error_code(&again),
         "ValidationException",
-        "case {:?}: expected ValidationException, got {again}",
-        "a committed add makes the account a party"
+        "case {label:?}: expected ValidationException, got {again}"
     );
 
     // And the account is now a party: the next request derives a GRANT against its stored
@@ -534,15 +605,18 @@ async fn a_committed_member_change_is_applied_to_the_collaboration() {
     .await;
     assert_eq!(
         status, 200,
-        "case {:?}: expected 200, got {status} with {next}",
-        "a committed add makes the account a party"
+        "case {label:?}: expected 200, got {status} with {next}"
     );
     let next_request = &next["collaborationChangeRequest"];
     assert_eq!(
         types_of(&next_request["changes"][0]),
         sorted(&["GRANT_RECEIVE_RESULTS_ABILITY"]),
-        "case {:?}: expected a grant against the stored member, got {next_request}",
-        "a committed add makes the account a party"
+        "case {label:?}: expected a grant against the stored member, got {next_request}"
+    );
+    assert_eq!(
+        next_request["status"],
+        json!("PENDING"),
+        "case {label:?}: the added party's approval is outstanding, got {next_request}"
     );
     let mut expected_approvals = vec![
         (creator.to_string(), "PENDING".to_string()),
@@ -552,8 +626,7 @@ async fn a_committed_member_change_is_applied_to_the_collaboration() {
     assert_eq!(
         approvals_of(next_request),
         expected_approvals,
-        "case {:?}: expected the added account among the approvers, got {next_request}",
-        "a committed add makes the account a party"
+        "case {label:?}: expected the added account among the approvers, got {next_request}"
     );
 
     // 2. The caller's own committed grant is restated on the membership it holds.
@@ -585,17 +658,11 @@ async fn a_committed_member_change_is_applied_to_the_collaboration() {
         status, 200,
         "case {label:?}: expected 200, got {status} with {created}"
     );
-    let id = created["collaborationChangeRequest"]["id"]
-        .as_str()
-        .expect("the request carries an id")
-        .to_string();
-    for action in ["APPROVE", "COMMIT"] {
-        let (status, body) = update_change_request(&emulator, &collaboration_id, &id, action).await;
-        assert_eq!(
-            status, 200,
-            "case {label:?}: expected {action} 200, got {status} with {body}"
-        );
-    }
+    assert_eq!(
+        created["collaborationChangeRequest"]["status"],
+        json!("COMMITTED"),
+        "case {label:?}: expected the sole party's request to be committed, got {created}"
+    );
 
     let (status, read) = emulator.get_membership(&membership_id).await;
     assert_eq!(

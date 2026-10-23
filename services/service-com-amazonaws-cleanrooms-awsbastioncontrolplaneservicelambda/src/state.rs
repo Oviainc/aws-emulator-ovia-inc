@@ -42,7 +42,7 @@
 //! onto the collaboration by [`CleanRoomsState::apply_collaboration_change`]. The status
 //! a request's recorded votes put it in is derived the same way, by
 //! [`change_request_status_from_approvals`], and [`change_request_is_terminal`] says
-//! which statuses admit no further decision.
+//! which statuses admit no modification at all.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -333,6 +333,12 @@ pub const VALIDATION_REASON_FIELD_VALIDATION_FAILED: &str = "FIELD_VALIDATION_FA
 /// shape `ValidationExceptionReason`: FIELD_VALIDATION_FAILED | INVALID_CONFIGURATION |
 /// INVALID_QUERY | IAM_SYNCHRONIZATION_DELAY).
 pub const VALIDATION_REASON_INVALID_QUERY: &str = "INVALID_QUERY";
+
+/// `ValidationExceptionReason` for a request whose own members are well formed but ask
+/// for something the resource's configuration or state does not admit — an action on a
+/// change request that is already settled, say (model shape
+/// `ValidationExceptionReason`).
+pub const VALIDATION_REASON_INVALID_CONFIGURATION: &str = "INVALID_CONFIGURATION";
 
 /// The largest `members` list `CreateCollaboration` accepts.
 ///
@@ -1021,32 +1027,68 @@ fn same_change_type_set(left: &[String], right: &[String]) -> bool {
     left.len() == right.len() && left.iter().all(|value| right.contains(value))
 }
 
-/// Whether the collaboration's auto-approval settings cover every change type a request
-/// asks for — the `isAutoApproved` the created change request reports ("whether the
+/// Whether a change request needs NO decision from another party, so the service settles
+/// it at creation — the `isAutoApproved` the created change request reports ("whether the
 /// change request was automatically approved based on the collaboration's auto-approval
 /// settings").
 ///
-/// `AutoApprovedChangeType` is a 5-value subset of the 12-value `ChangeType` catalog, so
-/// a change type outside that subset can never be covered and such a request is never
-/// auto-approved.
-pub fn change_request_is_auto_approved(record: &CollaborationRecord, changes: &[Change]) -> bool {
+/// A request is automatically approved when no approval it needs is still outstanding,
+/// which happens two ways:
+///
+/// * the requesting account is the only party whose approval the request needs, so there
+///   is no other party left to decide — the request is its own approval; or
+/// * the collaboration's `autoApprovedChangeTypes` covers every change type the request
+///   asks for, so no party has to decide at all. `AutoApprovedChangeType` is a 5-value
+///   subset of the 12-value `ChangeType` catalog, so a change type outside that subset is
+///   never covered this way.
+///
+/// `approvers` are the parties whose approval the request needs (see
+/// [`CleanRoomsState::change_request_approvals`]) and `requester` is the account that
+/// created it.
+pub fn change_request_is_auto_approved(
+    record: &CollaborationRecord,
+    changes: &[Change],
+    approvers: &[String],
+    requester: &str,
+) -> bool {
+    if changes.is_empty() {
+        return false;
+    }
+    if approvers.iter().all(|account| account == requester) {
+        return true;
+    }
     let auto_approved = record.auto_approved_change_types.as_deref().unwrap_or(&[]);
-    !changes.is_empty()
-        && changes.iter().all(|change| {
-            change
-                .types
-                .iter()
-                .all(|change_type| auto_approved.contains(change_type))
-        })
+    changes.iter().all(|change| {
+        change
+            .types
+            .iter()
+            .all(|change_type| auto_approved.contains(change_type))
+    })
 }
 
-/// Whether a change request's status admits no further action: a COMMITTED, DENIED or
-/// CANCELLED request has reached the end of the `ChangeRequestStatus` lifecycle, so
-/// there is no decision left to take on it.
+/// Whether a change request's status admits no modification at all: a COMMITTED request
+/// has been applied to the collaboration and a CANCELLED one was withdrawn, so neither
+/// can be moved again.
+///
+/// A DENIED request is NOT terminal in this sense — the service's own refusal states the
+/// rule as "Change requests in COMMITTED or CANCELLED status can't be modified", so a
+/// denied request can still be cancelled.
 pub fn change_request_is_terminal(status: &str) -> bool {
-    status == CHANGE_REQUEST_STATUS_COMMITTED
-        || status == CHANGE_REQUEST_STATUS_DENIED
-        || status == CHANGE_REQUEST_STATUS_CANCELLED
+    status == CHANGE_REQUEST_STATUS_COMMITTED || status == CHANGE_REQUEST_STATUS_CANCELLED
+}
+
+/// The message `UpdateCollaborationChangeRequest` reports when the change request the
+/// request addresses can no longer be modified.
+///
+/// Composed from the request's `changeRequestIdentifier` and the status that request is
+/// stored in, plus the rule those two fail: the id says WHICH request was refused, and
+/// the status says why and which statuses the rule names.
+pub fn change_request_not_modifiable_message(change_request_id: &str, status: &str) -> String {
+    format!(
+        "You can't update change request {change_request_id} because it's in {status} status. \
+         Change requests in {} or {} status can't be modified.",
+        CHANGE_REQUEST_STATUS_COMMITTED, CHANGE_REQUEST_STATUS_CANCELLED
+    )
 }
 
 /// The `ChangeRequestStatus` a change request's recorded votes put it in.

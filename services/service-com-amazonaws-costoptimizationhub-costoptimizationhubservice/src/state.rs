@@ -13,10 +13,11 @@
 //! * `preferences` — one [`Preferences`] per account id, written by
 //!   `UpdatePreferences` and read by `GetPreferences` (and by the recommendation
 //!   readers, because `savingsEstimationMode` decides whether the figures they
-//!   report are before or after discounts). A member the account never set reads
-//!   back as the default the service applies for it, where it has one — the
-//!   member that governs the organization has none, and is reported only once
-//!   the management account has set it.
+//!   report are before or after discounts). Every member of the record is the
+//!   caller's to set, and a member the account never set reads back as the
+//!   default the service applies for it, where it has one —
+//!   `memberAccountDiscountVisibility` has none, so it is reported only once it
+//!   has been set.
 //! * `recommendations` + `recommendation_order` — the recommendation catalog
 //!   `ListRecommendations` pages over and `GetRecommendation` looks ids up in,
 //!   narrowed to what the calling account may read by
@@ -63,12 +64,6 @@ pub const ENROLLMENT_STATUS_WIRE_VALUES: &[&str] = &["Active", "Inactive", "Fail
 /// about but that has not opted in, which is what an account's enrollment reads
 /// as before it ever calls `UpdateEnrollmentStatus`.
 pub const STATUS_INACTIVE: &str = "Inactive";
-
-/// The `MemberAccountDiscountVisibility` value that ENABLES member-account
-/// discount visibility; the other value (`None`) leaves it disabled. Both come
-/// from the model's `MemberAccountDiscountVisibility` enum
-/// (`shared_types::MEMBER_ACCOUNT_DISCOUNT_VISIBILITY_VALUES`).
-pub const VISIBILITY_ALL: &str = "All";
 
 /// How long after an account enrolls its recommendations are due.
 ///
@@ -131,12 +126,12 @@ impl Enrollment {
 pub const DEFAULT_SAVINGS_ESTIMATION_MODE: &str = AFTER_DISCOUNTS;
 
 // `memberAccountDiscountVisibility` has NO default the service applies in an
-// account's place, so there is no constant for it: the preference belongs to the
-// organization's management account (see `ops::update_preferences`), so an
-// account that is not one never set it and the member is not reported for it —
-// which is what the recorded `GetPreferences` body shows (`preferredCommitment`
-// and `savingsEstimationMode` only). A management account that did set it reads
-// back the value it stored.
+// account's place, so there is no constant for it: the model documents a null
+// default for each `PreferredCommitment` member and none for this one, so an
+// account that never set it is reported WITHOUT the member — which is what the
+// recorded `GetPreferences` body shows (`preferredCommitment` and
+// `savingsEstimationMode` only). An account that did set it reads back the
+// value it stored, whichever of the enum's two values that is.
 
 /// The commitment term the service applies where the account states none. From
 /// the model's `PreferredCommitment$term` doc: "If the value is null, it will
@@ -196,7 +191,8 @@ impl Preferences {
     /// stated without a payment option still reports the default payment option.
     /// `memberAccountDiscountVisibility` is the exception: it has no default to
     /// apply (the note beside [`DEFAULT_COMMITMENT_TERM`] says why), so it is
-    /// reported only where the account set it.
+    /// reported only where the account set it — and then with the value that
+    /// was stored.
     ///
     /// This is what a read of an account's preferences reports: the preference
     /// the service acts on, never an empty record, because the service always

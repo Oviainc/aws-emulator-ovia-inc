@@ -171,9 +171,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         Ok(BatchDeleteBuildsOutput {
-            // `buildsDeleted` targets `BuildIds`, bounded at 1..100 entries, so an
-            // empty one is left absent rather than serialized as `[]`.
-            builds_deleted: (!deleted.is_empty()).then_some(deleted),
+            // The builds this call deleted, serialized the same way as the half below:
+            // `[]` when it deleted none. The `@length(min: 1)` on `BuildIds` bounds
+            // what a request may carry, not whether the answer states its result.
+            builds_deleted: Some(deleted),
             // `BuildsNotDeleted` carries no `@length`, so it is always reported —
             // `[]` when every named build was deleted. A client reads the member
             // unconditionally to find out what it has left to deal with.

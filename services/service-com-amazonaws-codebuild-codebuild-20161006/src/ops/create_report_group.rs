@@ -233,7 +233,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nothing has changed the record yet, so it was last modified when it was
             // created; `UpdateReportGroup` is what moves this on.
             last_modified: Some(created),
-            tags: input.tags,
+            // A resource's tag set is always reported, `[]` when it carries no tag:
+            // the answer states what the resource holds, and a caller reconciling
+            // desired tags against it must read a list rather than a missing member.
+            tags: Some(input.tags.unwrap_or_default()),
             // `status` is read-only and a created report group is usable at once, so
             // it is `ACTIVE` from this call: there is no non-terminal status here for
             // the clock to move it out of.

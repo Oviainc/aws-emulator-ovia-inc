@@ -347,7 +347,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             proxy_configuration: input.proxy_configuration,
             image_id: input.image_id,
             fleet_service_role: input.fleet_service_role,
-            tags: input.tags,
+            // A resource's tag set is always reported, `[]` when it carries no tag —
+            // the rule `crate::ops::create_report_group` states.
+            tags: Some(input.tags.unwrap_or_default()),
         };
 
         guard.fleets.insert(

@@ -19,6 +19,8 @@ mod distribution_delete_gate;
 mod distribution_lifecycle;
 #[path = "all/distribution_tags.rs"]
 mod distribution_tags;
+#[path = "all/distribution_tenant_lifecycle.rs"]
+mod distribution_tenant_lifecycle;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
 #[path = "all/invalidation_list.rs"]

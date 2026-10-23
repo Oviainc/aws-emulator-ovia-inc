@@ -187,9 +187,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(ListProjectsOutput {
-            // The model bounds `projects` at 1..100 entries, so an account with no
-            // projects answers with the member absent rather than an empty list.
-            projects: (!page.is_empty()).then_some(page),
+            // The registry this call reports is always serialized, `[]` when the
+            // account holds no project: the `@length(min: 1)` on `ProjectNames`
+            // bounds what a request may carry, not whether the answer states its
+            // result (see `crate::ops::list_builds`).
+            projects: Some(page),
             next_token,
         })
     }

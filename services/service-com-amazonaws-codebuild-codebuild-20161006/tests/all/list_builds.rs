@@ -132,17 +132,19 @@ async fn list_builds_reports_every_stored_build_in_the_requested_order() {
             ascending.len(),
             "case {case:?}: every listed id must resolve to a stored build, got {fetched}"
         );
-        assert!(
-            fetched["buildsNotFound"].is_null(),
+        assert_eq!(
+            fetched["buildsNotFound"],
+            json!([]),
             "case {case:?}: no listed id may be unknown to BatchGetBuilds, got {fetched}"
         );
     }
 }
 
-/// An account with no builds has no page of ids: the model bounds `BuildIds` at
-/// `@length(min: 1, max: 100)`, so the member is absent rather than an empty list.
+/// An account with no builds still states its (empty) registry: the listing a read
+/// computes is serialized whether or not it has entries, so `ids` is `[]` rather than
+/// absent.
 #[tokio::test]
-async fn list_builds_on_an_account_with_no_builds_omits_the_ids_member() {
+async fn list_builds_on_an_account_with_no_builds_reports_an_empty_ids_member() {
     let router = emulator();
 
     // (case, how the account was set up)
@@ -155,9 +157,10 @@ async fn list_builds_on_an_account_with_no_builds_omits_the_ids_member() {
             status, 200,
             "case {case:?}: expected 200, got {status} with {body}"
         );
-        assert!(
-            body["ids"].is_null(),
-            "case {case:?}: ids is bounded at 1..100, so it must be absent, got {body}"
+        assert_eq!(
+            body["ids"],
+            json!([]),
+            "case {case:?}: the registry is empty, so ids must be [], got {body}"
         );
         assert!(
             body["nextToken"].is_null(),

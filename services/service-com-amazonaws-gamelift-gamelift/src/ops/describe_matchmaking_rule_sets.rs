@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeMatchmakingRuleSets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeMatchmakingRuleSets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeMatchmakingRuleSets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the rule sets `CreateMatchmakingRuleSet` persisted — selected by name or ARN,
+//! and paged. A name no stored rule set carries is REFUSED rather than silently absent
+//! from the page, so "this rule set does not exist" never looks like "this page is
+//! empty".
 //!
 //! ## Shape of an operation
 //!
@@ -160,20 +156,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeMatchmakingRuleSets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeMatchmakingRuleSetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeMatchmakingRuleSets"))
+        let invalid = |message: String| -> Self::Error {
+            DescribeMatchmakingRuleSetsErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeMatchmakingRuleSetsErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some("the GameLift emulator state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+        state.tick(::std::time::SystemTime::now());
+
+        // "A list of one or more matchmaking rule set names to retrieve details for": a
+        // name is either the rule set's own name or its ARN, and a name that names NO
+        // stored rule set is refused — the recorded service answers
+        // `InvalidRequestException` for it rather than leaving it out of the page, so a
+        // caller can tell an absent rule set from an empty result page. The modelled
+        // `MatchmakingRuleSetNameList` length (1..10) is refused by the boundary walk
+        // before this handler runs.
+        let requested: Option<::std::collections::HashSet<String>> = match input.names.as_ref() {
+            Some(names) => {
+                let mut selected = ::std::collections::HashSet::new();
+                for name_or_arn in names {
+                    let Some(name) = state.resolve_rule_set_name(name_or_arn) else {
+                        return Err(invalid(format!("Failed to find rule set: {name_or_arn}")));
+                    };
+                    selected.insert(name);
+                }
+                Some(selected)
+            }
+            // "To request all existing rule sets, leave this parameter empty."
+            None => None,
+        };
+
+        let rule_sets: Vec<MatchmakingRuleSet> = state
+            .matchmaking_rule_sets_in_order()
+            .into_iter()
+            .filter(|rule_set| {
+                requested
+                    .as_ref()
+                    .is_none_or(|selected| selected.contains(&rule_set.rule_set_name))
+            })
+            .map(crate::state::MatchmakingRuleSetRecord::to_modelled)
+            .collect();
+
+        let Some((page, next_token)) = crate::state::paginate(
+            crate::state::PageKind::MatchmakingRuleSets,
+            &rule_sets,
+            input.limit,
+            input.next_token.as_deref(),
+        ) else {
+            return Err(invalid(
+                "NextToken is not a pagination token this service issued.".to_string(),
+            ));
+        };
+        Ok(DescribeMatchmakingRuleSetsOutput {
+            rule_sets: page,
+            next_token,
+        })
     }
 }

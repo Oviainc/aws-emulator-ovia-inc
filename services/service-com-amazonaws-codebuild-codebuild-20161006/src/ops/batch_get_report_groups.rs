@@ -151,12 +151,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // Both output lists target shapes bounded at 1..100 entries (`ReportGroups`
-        // and `ReportGroupArns`), so an empty one is left absent rather than
-        // serialized as `[]`.
+        // Both halves of the partition are always serialized, `[]` when a half is
+        // empty: the `@length(min: 1)` on `ReportGroups` / `ReportGroupArns` bounds
+        // what a request may carry, not whether the answer states its result, and a
+        // caller diffing the ARNs it asked for against `reportGroupsNotFound` must
+        // read a list either way.
         Ok(BatchGetReportGroupsOutput {
-            report_groups: (!report_groups.is_empty()).then_some(report_groups),
-            report_groups_not_found: (!not_found.is_empty()).then_some(not_found),
+            report_groups: Some(report_groups),
+            report_groups_not_found: Some(not_found),
         })
     }
 }
