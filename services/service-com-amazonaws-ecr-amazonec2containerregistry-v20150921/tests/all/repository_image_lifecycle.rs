@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 // The wire harness lives in `tests/all/wire.rs`, shared with every other suite.
-use crate::wire::{at, call, emulator, ok, REGION, REGISTRY_ID};
+use crate::wire::{at, call, emulator, given_layer, ok, REGION, REGISTRY_ID};
 
 /// The values `ImageTagMutability` accepts, from the model's enum. Spelled out here so a
 /// setting the implementation silently ignores is visible as an unexercised value.
@@ -442,9 +442,17 @@ async fn a_second_create_of_a_name_already_taken_is_refused() {
 /// manifest itself.
 #[tokio::test]
 async fn a_pushed_manifest_is_stored_and_reported_under_its_own_digest() {
-    let v2_manifest = "{\"schemaVersion\":2,\
+    let router = emulator();
+    given_repository(&router, "pushes", json!({})).await;
+    // The blob the docker v2 manifest below names as its config: in the repository
+    // first, because a manifest cannot be pushed before every blob it references is
+    // there (`PutImage`'s `LayersNotFoundException`).
+    let config_digest = given_layer(&router, "seed", "pushes", b"pushes config blob").await;
+    let v2_manifest = format!(
+        "{{\"schemaVersion\":2,\
          \"mediaType\":\"application/vnd.docker.distribution.manifest.v2+json\",\
-         \"config\":{\"size\":7023,\"digest\":\"sha256:b5b2\"}}";
+         \"config\":{{\"size\":7023,\"digest\":\"{config_digest}\"}}}}"
+    );
     let oci_manifest = "{\"schemaVersion\":2,\
          \"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\
          \"layers\":[]}";
@@ -454,7 +462,7 @@ async fn a_pushed_manifest_is_stored_and_reported_under_its_own_digest() {
         // case, manifest, tag, media type sent, media type expected back
         (
             "a docker v2 manifest, tagged, media type declared by the manifest",
-            v2_manifest,
+            v2_manifest.as_str(),
             Some("v1"),
             None,
             Some("application/vnd.docker.distribution.manifest.v2+json"),
@@ -467,6 +475,7 @@ async fn a_pushed_manifest_is_stored_and_reported_under_its_own_digest() {
             Some("application/vnd.oci.image.manifest.v1+json"),
         ),
         (
+            // A `config` descriptor naming no digest references no blob.
             "an untagged push",
             "{\"schemaVersion\":2,\"config\":{\"size\":1}}",
             None,
@@ -488,9 +497,6 @@ async fn a_pushed_manifest_is_stored_and_reported_under_its_own_digest() {
             Some("text/plain"),
         ),
     ];
-
-    let router = emulator();
-    given_repository(&router, "pushes", json!({})).await;
 
     for (case, manifest, tag, media_type_sent, media_type_expected) in cases {
         let digest = manifest_digest(manifest);

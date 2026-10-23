@@ -180,7 +180,10 @@ fn arn_resource(value: &str) -> Option<&str> {
 
 /// A `tags` map of `count` distinct entries, each key `key_len` and each value
 /// `value_len` characters long.
-fn tag_map(count: usize, key_len: usize, value_len: usize) -> Value {
+///
+/// `pub(crate)` so the sibling suites generate tag maps the same way rather than each
+/// growing its own copy.
+pub(crate) fn tag_map(count: usize, key_len: usize, value_len: usize) -> Value {
     let mut tags = serde_json::Map::new();
     for index in 0..count {
         let stem = format!("k{index}-");

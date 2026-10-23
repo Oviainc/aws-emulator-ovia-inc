@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CompleteLayerUpload
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CompleteLayerUpload`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CompleteLayerUpload::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Closes the layer upload `InitiateLayerUpload` opened and `UploadLayerPart` streamed
+//! into: the layer is the concatenation of the parts the upload accepted, the digest is
+//! the one computed over those bytes, and the blob joins the repository under it so a
+//! later `PutImage` can reference it and `BatchCheckLayerAvailability` reports it
+//! available.
 //!
 //! ## Shape of an operation
 //!
@@ -147,6 +143,44 @@ impl From<CompleteLayerUploadErrorModeled> for CompleteLayerUploadError {
     }
 }
 
+/// Map a shared-state failure onto this operation's own modelled errors.
+fn fault_error(fault: crate::state::Fault) -> CompleteLayerUploadErrorModeled {
+    let message = Some(fault.message().to_string());
+    match fault {
+        crate::state::Fault::RepositoryNotFound(_) => {
+            CompleteLayerUploadErrorModeled::RepositoryNotFoundException(
+                RepositoryNotFoundException { message },
+            )
+        }
+        // No other fault is reachable here: this handler resolves a repository and an
+        // upload, and names no image, tag or policy.
+        _ => CompleteLayerUploadErrorModeled::InvalidParameterException(
+            InvalidParameterException { message },
+        ),
+    }
+}
+
+/// Refuse the request: the audit record for a completion that registered no layer, and
+/// the modelled error it answers with. `reason` is this handler's own wording, never the
+/// request's values, so the record carries no caller-supplied text.
+fn refusal(
+    reason: &'static str,
+    caller_akid: &str,
+    error: CompleteLayerUploadErrorModeled,
+) -> CompleteLayerUploadErrorModeled {
+    ::tracing::info!(
+        target: "emulator::audit",
+        audit = true,
+        operation = "CompleteLayerUpload",
+        outcome = "refused",
+        reason,
+        caller_akid = %caller_akid,
+        registry_id = %crate::state::registry_id(),
+        "layer upload completion refused"
+    );
+    error
+}
+
 /// The `CompleteLayerUpload` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -183,18 +217,176 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CompleteLayerUpload` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CompleteLayerUploadErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CompleteLayerUpload"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CompleteLayerUploadErrorModeled::ServerException(
+                ServerException {
+                    message: Some("the ecr repository store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // Request metadata is used for the audit record only: the upload is held in
+        // this registry's state, not in the signing region.
+        let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
+
+        // "If you do not specify a registry, the default registry is assumed" — and the
+        // only registry served here is this emulator's own.
+        crate::state::check_registry(input.registry_id.as_ref())
+            .map_err(|fault| refusal("another registry", &caller_akid, fault_error(fault)))?;
+
+        let mut store = state.lock();
+
+        // The blob is registered on a repository, so there has to be one.
+        store
+            .repository(&input.repository_name)
+            .map_err(|fault| refusal("no such repository", &caller_akid, fault_error(fault)))?;
+
+        // An upload id is only valid for the repository it was issued for, so an id this
+        // registry never handed out, one opened against another repository, and one a
+        // previous completion already closed are the same refusal.
+        let Some(upload) = store.upload_mut(&input.repository_name, &input.upload_id) else {
+            return Err(refusal(
+                "no such upload",
+                &caller_akid,
+                CompleteLayerUploadErrorModeled::UploadNotFoundException(
+                    UploadNotFoundException {
+                        message: Some(crate::state::upload_not_found_message(
+                            &input.upload_id,
+                            &input.repository_name,
+                        )),
+                    },
+                ),
+            )
+            .into());
+        };
+
+        // The layer is the concatenation of the parts the upload accepted, so the digest
+        // is computed over those bytes — "the layer digest calculation performed by
+        // Amazon ECR upon receipt of the image layer" — and the byte count the registry
+        // records for the blob is its own count of them.
+        let assembled = ::std::mem::take(&mut upload.received_bytes);
+        let digest = crate::state::content_digest(&assembled);
+        let layer_size = i64::try_from(assembled.len()).unwrap_or(i64::MAX);
+        let repository_name = upload.repository_name.clone();
+        // An upload that accepted no part carries no layer to close: the parts, and
+        // therefore the upload, stay exactly as they were so a client can still send
+        // them.
+        if assembled.is_empty() {
+            return Err(refusal(
+                "upload carries no layer part",
+                &caller_akid,
+                CompleteLayerUploadErrorModeled::EmptyUploadException(EmptyUploadException {
+                    message: Some(format!(
+                        "The layer upload with ID '{}' for the repository with name '{}' in \
+                         the registry with id '{}' does not contain any layer parts",
+                        input.upload_id,
+                        repository_name,
+                        crate::state::registry_id()
+                    )),
+                }),
+            )
+            .into());
+        }
+        // The digest the client asserts for the layer must be the one the registry
+        // computed over the bytes it received. A mismatch leaves the upload's bytes in
+        // place, so the client can complete it again with the right digest.
+        if !input.layer_digests.contains(&digest) {
+            upload.received_bytes = assembled;
+            return Err(refusal(
+                "layer digest does not match the assembled layer",
+                &caller_akid,
+                CompleteLayerUploadErrorModeled::InvalidLayerException(InvalidLayerException {
+                    message: Some(format!(
+                        "The layer digests '{}' in the request do not match the digest \
+                         '{digest}' that Amazon ECR calculated for the {} bytes received by \
+                         upload '{}'",
+                        input.layer_digests.join(", "),
+                        layer_size,
+                        input.upload_id
+                    )),
+                }),
+            )
+            .into());
+        }
+
+        // Past the registry's own ceiling on how many blobs one repository holds a
+        // record of, the completion is refused rather than registering another.
+        // See [`crate::state::MAX_LAYERS_PER_REPOSITORY`].
+        let repo = store
+            .repository_mut(&input.repository_name)
+            .map_err(|fault| refusal("no such repository", &caller_akid, fault_error(fault)))?;
+        if !repo.layer_blobs.contains_key(&digest)
+            && repo.layer_blobs.len() >= crate::state::MAX_LAYERS_PER_REPOSITORY
+        {
+            return Err(refusal(
+                "repository layer ceiling reached",
+                &caller_akid,
+                CompleteLayerUploadErrorModeled::ServerException(ServerException {
+                    message: Some(format!(
+                        "the repository with name '{repository_name}' already holds the \
+                         maximum of {} layers",
+                        crate::state::MAX_LAYERS_PER_REPOSITORY
+                    )),
+                }),
+            )
+            .into());
+        }
+        // The repository already holds this blob, so there is nothing to register: the
+        // upload is closed either way, because its bytes have been accounted for.
+        if repo.layer_blobs.contains_key(&digest) {
+            store.uploads.remove(&input.upload_id);
+            return Err(refusal(
+                "layer already in the repository",
+                &caller_akid,
+                CompleteLayerUploadErrorModeled::LayerAlreadyExistsException(
+                    LayerAlreadyExistsException {
+                        message: Some(format!(
+                            "The layer with digest '{digest}' already exists in the \
+                             repository with name '{repository_name}' in the registry with \
+                             id '{}'",
+                            crate::state::registry_id()
+                        )),
+                    },
+                ),
+            )
+            .into());
+        }
+
+        // The blob joins the repository, addressed by the digest the registry computed,
+        // and the upload it came from is closed: its id resolves to nothing afterwards.
+        // The media type stays unset — a blob's media type is what a manifest
+        // referencing it declares, which this call carries nothing of.
+        repo.layer_blobs.insert(
+            digest.clone(),
+            crate::state::LayerBlob {
+                digest: digest.clone(),
+                size: Some(layer_size),
+                media_type: None,
+            },
+        );
+        store.uploads.remove(&input.upload_id);
+
+        // Audit record for a state-changing operation: who asked, what changed, how it
+        // ended. Only wire metadata, server-held counts and the upload's own id.
+        ::tracing::info!(
+            target: "emulator::audit",
+            audit = true,
+            operation = "CompleteLayerUpload",
+            outcome = "registered",
+            caller_akid = %caller_akid,
+            registry_id = %crate::state::registry_id(),
+            upload_id = %input.upload_id,
+            layer_size,
+            "layer registered"
+        );
+
+        // Everything reported comes from the stored upload and the registered blob, so
+        // the answer is what a later `BatchCheckLayerAvailability` reports.
+        Ok(CompleteLayerUploadOutput {
+            registry_id: Some(crate::state::registry_id().to_string()),
+            repository_name: Some(repository_name),
+            upload_id: Some(input.upload_id),
+            layer_digest: Some(digest),
+        })
     }
 }

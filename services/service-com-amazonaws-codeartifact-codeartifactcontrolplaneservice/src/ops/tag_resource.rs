@@ -172,9 +172,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(TagResourceErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: format!("Resource {} not found.", input.resource_arn),
-                        resource_id: Some(input.resource_arn.clone()),
                         // The ARN parsed but names no kind this store holds, so there is
-                        // no resolved kind to report.
+                        // no resolved resource to report an id or a kind for.
+                        resource_id: None,
                         resource_type: None,
                     },
                 )
@@ -186,12 +186,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // well-formed ARN of this namespace either names a record this store holds or
         // names no resource at all. An engine holding no state for this service holds
         // no domain either, so it is that same not-found — never a server fault, which
-        // this operation does not model. The kind IS resolved here, so the refusal
-        // reports it.
+        // this operation does not model. The resource IS resolved here, so the refusal
+        // reports its kind and its ID (its name, or a package group's pattern) rather than
+        // the ARN it was addressed by, and states it in the sentence that resource's own
+        // kind is refused with everywhere else in this service.
         let not_found = || {
             TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!("Resource {} not found.", input.resource_arn),
-                resource_id: Some(input.resource_arn.clone()),
+                message: crate::state::tagged_resource_not_found_message(&reference),
+                resource_id: Some(crate::state::reported_resource_id(&reference)),
                 resource_type: crate::state::reported_resource_type(&reference),
             })
         };
@@ -217,7 +219,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         merged.len(),
                         crate::state::MAX_TAGS_PER_RESOURCE
                     ),
-                    resource_id: Some(input.resource_arn.clone()),
+                    resource_id: Some(crate::state::reported_resource_id(&reference)),
                     resource_type: crate::state::reported_resource_type(&reference),
                 },
             )

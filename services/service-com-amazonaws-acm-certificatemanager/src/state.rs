@@ -22,6 +22,16 @@
 //! records through [`acme_account_summary`], and deleting an endpoint drops the
 //! accounts registered with it ([`ComAmazonawsAcmCertificatemanagerState::remove_acme_endpoint`]).
 //!
+//! Beside them, one [`AcmeDomainValidationRecord`] per domain validation an endpoint
+//! holds, keyed by its own ARN — which is a PATH under the endpoint's ARN
+//! ([`acme_domain_validation_arn`]), so one endpoint's validations are a contiguous
+//! range ([`ComAmazonawsAcmCertificatemanagerState::acme_domain_validations_of`]) and
+//! deleting the endpoint drops them with it. `DescribeAcmeDomainValidation` projects
+//! that record through [`acme_domain_validation_detail`], including the DNS record the
+//! service minted for it ([`acme_prevalidation_resource_record`]), and a freshly
+//! created validation is `VALIDATING` until the transition the clock owes it falls due,
+//! exactly as a freshly created endpoint is `CREATING`.
+//!
 //! Every URL those two records carry is minted here, on the Region's ACME enrollment
 //! host ([`ACME_ENROLLMENT_HOST_LABEL`]) with the endpoint's own id in the path
 //! ([`acme_endpoint_url`], [`acme_account_url`]) — and read back by
@@ -44,11 +54,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AcmCertificateMetadata, AcmeAccountSummary, AcmeEndpoint, AcmeEndpointSummary,
+    AcmCertificateMetadata, AcmeAccountSummary, AcmeDomainValidation, AcmeEndpoint,
+    AcmeEndpointSummary,
     CertificateAuthority,
     CertificateDetail, CertificateMetadata, CertificateOptions, CertificateSearchResult,
-    CertificateSummary, DistinguishedName, DomainValidation, ExpiryEventsConfiguration,
-    ExtendedKeyUsage, GeneralName, HttpRedirect, KeyUsage, ResourceRecord, Tag, X509Attributes,
+    CertificateSummary, DistinguishedName, DnsPrevalidationDetails, DomainScope, DomainValidation,
+    ExpiryEventsConfiguration,
+    ExtendedKeyUsage, FailureDetails, GeneralName, HttpRedirect, KeyUsage, PrevalidationDetails,
+    ResourceRecord, Tag, X509Attributes,
 };
 
 /// This service's SigV4 signing name, and the `acm` segment of every ARN it mints.
@@ -291,6 +304,63 @@ pub const ACME_ENDPOINT_STORE_LIMIT: usize = 1_000;
 /// by whichever call next touches the store (see
 /// [`ComAmazonawsAcmCertificatemanagerState::materialize_due`]).
 pub const ACME_ENDPOINT_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
+
+/// `AcmeDomainValidationStatus` of a domain validation whose prevalidation ACM is
+/// still working through: `AcmeDomainValidationStatus` models `VALIDATING` beside
+/// `VALID` precisely because ACM has not finished proving domain ownership the instant
+/// `CreateAcmeDomainValidation` returns
+/// (`smithy_query(query="shape", shape="com.amazonaws.acm#AcmeDomainValidationStatus")`
+/// declares `VALIDATING | VALID | INVALID | DELETING`).
+pub const ACME_DOMAIN_VALIDATION_STATUS_VALIDATING: &str = "VALIDATING";
+
+/// `AcmeDomainValidationStatus` of a domain validation that authorizes its endpoint to
+/// issue certificates for the domain: "domain validations authorize the endpoint to
+/// issue certificates for specified domain names" (`CreateAcmeDomainValidation` doc).
+pub const ACME_DOMAIN_VALIDATION_STATUS_VALID: &str = "VALID";
+
+/// `AcmeDomainValidationStatus` of a domain validation ACM could not complete; it is
+/// the status whose `FailureDetails` ("details about the failure, if the validation
+/// failed", `AcmeDomainValidation$FailureDetails` doc) is set. No path in this emulator
+/// reaches it yet: nothing here can fail a prevalidation, so a created validation
+/// settles to [`ACME_DOMAIN_VALIDATION_STATUS_VALID`], and the record's
+/// `failure_details` is what an operation that CAN fail one would write beside this
+/// status.
+pub const ACME_DOMAIN_VALIDATION_STATUS_INVALID: &str = "INVALID";
+
+/// `PrevalidationType` of a domain validation configured with
+/// `PrevalidationOptions$DnsPrevalidation`: the only member either union declares
+/// (`smithy_query(query="shape", shape="com.amazonaws.acm#PrevalidationType")` declares
+/// `DNS_PREVALIDATION` alone).
+pub const PREVALIDATION_TYPE_DNS: &str = "DNS_PREVALIDATION";
+
+/// How long after `CreateAcmeDomainValidation` the validation reaches
+/// [`ACME_DOMAIN_VALIDATION_STATUS_VALID`].
+///
+/// A CHOSEN span, not a documented one: neither the model nor ACM's documentation
+/// states how long prevalidating a domain takes. It is never zero, so a caller that
+/// describes the validation straight after creating it still observes `VALIDATING`, and
+/// it is never slept on: the due instant is stored on the record and materialised by
+/// whichever call next touches the store (see
+/// [`ComAmazonawsAcmCertificatemanagerState::materialize_due`]).
+pub const ACME_DOMAIN_VALIDATION_SETTLE_DELAY: Duration = Duration::from_millis(500);
+
+/// The number of domain validations one ACME endpoint may hold.
+///
+/// Neither the model nor ACM's documentation states this quota, so the NUMBER is
+/// chosen — generously, since a bound that is too low refuses a request ACM would
+/// accept. What it encodes is that an endpoint's domain validations are a bounded
+/// resource and that past the bound `CreateAcmeDomainValidation` answers the quota
+/// error it models.
+pub const ACME_DOMAIN_VALIDATION_LIMIT: usize = 500;
+
+/// The most ACME domain-validation records this emulator stores, across every endpoint.
+///
+/// The safety bound, for the same reason [`ACME_ENDPOINT_STORE_LIMIT`] is one: the
+/// per-endpoint quota above is keyed on a parent the caller can create more of, so it
+/// alone would not bound
+/// [`ComAmazonawsAcmCertificatemanagerState::acme_domain_validations`] (nor the
+/// per-request `materialize_due` pass over those records).
+pub const ACME_DOMAIN_VALIDATION_STORE_LIMIT: usize = 10_000;
 
 /// `AcmeAccountStatus` of a registered ACME account that may request and revoke
 /// certificates: the status an account carries until it is deactivated or revoked
@@ -744,6 +814,111 @@ impl AcmeEndpointRecord {
     }
 }
 
+/// The status transition the clock already owes an ACME domain validation.
+///
+/// Stored, never slept on, for the same reason [`PendingAcmeEndpointStatus`] is: the
+/// instant it falls due is fixed by the call that started the prevalidation, so the
+/// validation reaches that status at that instant whether or not anybody calls again.
+#[derive(Debug, Clone)]
+pub struct PendingAcmeDomainValidationStatus {
+    /// When the transition falls due.
+    pub due_at: SystemTime,
+    /// The `AcmeDomainValidationStatus` the validation carries from then on.
+    pub status: String,
+}
+
+impl PendingAcmeDomainValidationStatus {
+    /// The transition owed to a validation created at `created_at`: its prevalidation
+    /// completes [`ACME_DOMAIN_VALIDATION_SETTLE_DELAY`] later and it becomes
+    /// [`ACME_DOMAIN_VALIDATION_STATUS_VALID`].
+    pub fn validating_at(created_at: SystemTime) -> Self {
+        Self {
+            due_at: created_at + ACME_DOMAIN_VALIDATION_SETTLE_DELAY,
+            status: ACME_DOMAIN_VALIDATION_STATUS_VALID.to_string(),
+        }
+    }
+}
+
+/// One stored ACME domain validation: the authorization of one ACME endpoint to issue
+/// certificates for one domain name ("domain validations authorize the endpoint to
+/// issue certificates for specified domain names", `CreateAcmeDomainValidation` doc).
+///
+/// Every field `DescribeAcmeDomainValidation` reports is read from here, so no response
+/// echoes its own request — including the DNS record the caller must publish, which is
+/// server-managed ([`acme_prevalidation_resource_record`]).
+#[derive(Debug, Clone)]
+pub struct AcmeDomainValidationRecord {
+    /// `arn:aws:acm:<region>:<account>:acme-endpoint/<endpoint>/acme-domain-validation/<id>`
+    /// ([`acme_domain_validation_arn`]).
+    pub arn: String,
+    /// The ACME endpoint this validation authorizes — the ARN prefix of [`Self::arn`],
+    /// carried so the record reports it without re-parsing.
+    pub acme_endpoint_arn: String,
+    /// The domain name being validated, exactly as the create named it.
+    pub domain_name: String,
+    /// A `PrevalidationType` value: which `PrevalidationOptions` member the create
+    /// carried.
+    pub prevalidation_type: String,
+    /// "The scope of domains covered by this prevalidation"
+    /// (`DnsPrevalidationOptions$DomainScope` doc), as the create configured it.
+    pub domain_scope: Option<DomainScope>,
+    /// "The Route 53 hosted zone ID for DNS validation"
+    /// (`DnsPrevalidationOptions$HostedZoneId` doc), as the create named it.
+    pub hosted_zone_id: Option<String>,
+    /// "The DNS resource record to create for domain validation"
+    /// (`DnsPrevalidationDetails$ResourceRecord` doc) — minted by the service from this
+    /// validation's own identity, never from anything the caller sent.
+    pub resource_record: Option<ResourceRecord>,
+    /// An `AcmeDomainValidationStatus` value.
+    pub status: String,
+    /// "Details about the failure, if the validation failed"
+    /// (`AcmeDomainValidation$FailureDetails` doc), so it is set only beside an
+    /// [`ACME_DOMAIN_VALIDATION_STATUS_INVALID`] status.
+    pub failure_details: Option<FailureDetails>,
+    /// Tag key -> value on the validation resource itself, as `ListTagsForResource`
+    /// reports them.
+    pub tags: BTreeMap<String, String>,
+    /// The status transition the clock owes this validation. `None` once it has
+    /// reached a status the clock owes nothing beyond.
+    pub pending_status: Option<PendingAcmeDomainValidationStatus>,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+}
+
+impl AcmeDomainValidationRecord {
+    /// Apply the status transition the clock already owes this validation at `now`.
+    ///
+    /// A validation ACM reports as `VALIDATING` is waiting on prevalidation work ACM
+    /// does on its own; the instant that work completes was fixed when the validation
+    /// was created, so applying it here materialises a change the clock already made
+    /// rather than a side effect of whoever happened to call.
+    pub fn materialize_due(&mut self, now: SystemTime) {
+        let Some(pending) = self
+            .pending_status
+            .clone()
+            .filter(|pending| now >= pending.due_at)
+        else {
+            return;
+        };
+        self.pending_status = None;
+        self.status = pending.status;
+        // The validation changed at the instant the transition fell due, which is what
+        // `UpdatedAt` ("the time at which the domain validation was last updated")
+        // reports — not the instant somebody happened to read it.
+        self.updated_at = pending.due_at;
+    }
+}
+
+/// What one `CreateAcmeDomainValidation` idempotency token has already created.
+#[derive(Debug, Clone)]
+pub struct AcmeDomainValidationIdempotency {
+    /// A canonical rendering of every parameter the validation was created from, so a
+    /// re-sent token can be told apart from a changed request carrying the same token.
+    pub fingerprint: String,
+    /// The ARN the first call answered with.
+    pub acme_domain_validation_arn: String,
+}
+
 /// One ACME account registered with one of this account's ACME endpoints.
 ///
 /// "ACME accounts are created when clients use external account binding credentials
@@ -813,6 +988,17 @@ pub struct ComAmazonawsAcmCertificatemanagerState {
     /// which is the order `ListAcmeAccounts` pages through
     /// ([`Self::acme_accounts_of`]).
     pub acme_accounts: BTreeMap<(String, String), AcmeAccountRecord>,
+    /// ACME domain-validation ARN -> record. A `BTreeMap`, and every validation's ARN
+    /// begins with its endpoint's ARN ([`acme_domain_validation_arn`]), so one
+    /// endpoint's validations are a contiguous range walked in one deterministic order
+    /// ([`Self::acme_domain_validations_of`]).
+    pub acme_domain_validations: BTreeMap<String, AcmeDomainValidationRecord>,
+    /// (ACME endpoint ARN, `CreateAcmeDomainValidation` idempotency token) -> what that
+    /// token created. Keyed by the PAIR rather than a joined string, so no endpoint ARN
+    /// and token can run together into another pair's key, and separate from the other
+    /// token indexes because the three resolve to different resources.
+    pub acme_domain_validation_idempotency:
+        HashMap<(String, String), AcmeDomainValidationIdempotency>,
     /// The account's expiry-events configuration, as the last successful
     /// `PutAccountConfiguration` wrote it, and `None` until one has — when ACM is
     /// running the account on the documented default,
@@ -846,6 +1032,9 @@ impl ComAmazonawsAcmCertificatemanagerState {
         for endpoint in self.acme_endpoints.values_mut() {
             endpoint.materialize_due(now);
         }
+        for validation in self.acme_domain_validations.values_mut() {
+            validation.materialize_due(now);
+        }
     }
 
     /// The stored ACME endpoint the id `endpoint_id` names in `region`, or `None` when
@@ -873,14 +1062,24 @@ impl ComAmazonawsAcmCertificatemanagerState {
     /// later becomes taggable by being resolved here, not by another copy of the
     /// tagging rules.
     pub fn resource_tags(&self, arn: &str) -> Option<&BTreeMap<String, String>> {
-        self.acme_endpoints.get(arn).map(|endpoint| &endpoint.tags)
+        self.acme_endpoints
+            .get(arn)
+            .map(|endpoint| &endpoint.tags)
+            .or_else(|| {
+                self.acme_domain_validations
+                    .get(arn)
+                    .map(|validation| &validation.tags)
+            })
     }
 
     /// [`Self::resource_tags`] for a caller that writes the map.
     pub fn resource_tags_mut(&mut self, arn: &str) -> Option<&mut BTreeMap<String, String>> {
-        self.acme_endpoints
+        if let Some(endpoint) = self.acme_endpoints.get_mut(arn) {
+            return Some(&mut endpoint.tags);
+        }
+        self.acme_domain_validations
             .get_mut(arn)
-            .map(|endpoint| &mut endpoint.tags)
+            .map(|validation| &mut validation.tags)
     }
 
     /// Drop `arn`'s ACME endpoint record and every idempotency token that resolves to
@@ -896,6 +1095,61 @@ impl ComAmazonawsAcmCertificatemanagerState {
         // would be reachable through an ARN with no record behind it.
         self.acme_accounts
             .retain(|(endpoint_arn, _), _| endpoint_arn != arn);
+        // A domain validation authorizes ONE endpoint and its ARN is a path under that
+        // endpoint's, so it cannot outlive the endpoint either: the deletion cascades to
+        // the endpoint's validations and to the tokens that resolve to them.
+        let validations: Vec<String> = self
+            .acme_domain_validations_of(arn)
+            .map(|validation| validation.arn.clone())
+            .collect();
+        for validation_arn in validations {
+            self.remove_acme_domain_validation(&validation_arn);
+        }
+        Some(removed)
+    }
+
+    /// Every domain validation of `acme_endpoint_arn`, in the order
+    /// `ListAcmeDomainValidations` pages through them (by validation ARN).
+    ///
+    /// A range scan over the key prefix every one of that endpoint's validation ARNs
+    /// begins with, so the walk touches only that endpoint's validations however many
+    /// other endpoints the store holds.
+    pub fn acme_domain_validations_of<'a>(
+        &'a self,
+        acme_endpoint_arn: &'a str,
+    ) -> impl Iterator<Item = &'a AcmeDomainValidationRecord> + 'a {
+        let prefix = acme_domain_validation_arn_prefix(acme_endpoint_arn);
+        self.acme_domain_validations
+            .range(prefix.clone()..)
+            .take_while(move |(arn, _)| arn.starts_with(&prefix))
+            .map(|(_, validation)| validation)
+    }
+
+    /// The domain validation `acme_endpoint_arn` already holds for `domain_name`, if
+    /// any.
+    ///
+    /// One endpoint authorizes one domain through ONE validation, and DNS labels are
+    /// case-insensitive ([`same_domain`]), so the lookup is by domain rather than by the
+    /// exact text the create carried.
+    pub fn acme_domain_validation_for<'a>(
+        &'a self,
+        acme_endpoint_arn: &'a str,
+        domain_name: &'a str,
+    ) -> Option<&'a AcmeDomainValidationRecord> {
+        self.acme_domain_validations_of(acme_endpoint_arn)
+            .find(|validation| same_domain(&validation.domain_name, domain_name))
+    }
+
+    /// Drop `arn`'s domain-validation record and every idempotency token that resolves
+    /// to it, so a replayed `CreateAcmeDomainValidation` can never answer with an ARN
+    /// that has no record behind it.
+    pub fn remove_acme_domain_validation(
+        &mut self,
+        arn: &str,
+    ) -> Option<AcmeDomainValidationRecord> {
+        let removed = self.acme_domain_validations.remove(arn)?;
+        self.acme_domain_validation_idempotency
+            .retain(|_, seen| seen.acme_domain_validation_arn != arn);
         Some(removed)
     }
 
@@ -961,6 +1215,45 @@ pub fn acme_endpoint_arn(region: &str, endpoint_id: &str) -> String {
         region,
         &format!("acme-endpoint/{endpoint_id}"),
     )
+}
+
+/// The `acme-domain-validation` segment every ACME domain-validation ARN carries
+/// between its endpoint's ARN and its own id, as `AcmeDomainValidationArn`'s
+/// `@pattern` requires
+/// (`^arn:aws[a-z-]*:acm:[a-z0-9-]+:[0-9]{12}:acme-endpoint/[a-zA-Z0-9-]+/acme-domain-validation/[a-zA-Z0-9-]+$`).
+pub const ACME_DOMAIN_VALIDATION_SEGMENT: &str = "acme-domain-validation";
+
+/// `arn:aws:acm:<region>:<account>:acme-endpoint/<endpoint>/acme-domain-validation/<id>`.
+///
+/// Built by extending the ENDPOINT's own ARN, which is what the pattern above says the
+/// ARN of a domain validation is: a path under the endpoint it authorizes. So the two
+/// ARNs cannot disagree about the Region or the account, and the store keyed by this
+/// ARN groups one endpoint's validations into one contiguous range
+/// ([`acme_domain_validation_arn_prefix`]).
+pub fn acme_domain_validation_arn(acme_endpoint_arn: &str, validation_id: &str) -> String {
+    format!(
+        "{}{validation_id}",
+        acme_domain_validation_arn_prefix(acme_endpoint_arn)
+    )
+}
+
+/// The prefix every domain-validation ARN of `acme_endpoint_arn` begins with, and
+/// nothing else does: the endpoint's ARN plus the
+/// [`ACME_DOMAIN_VALIDATION_SEGMENT`] path. An endpoint id admits no `/`
+/// (`[a-zA-Z0-9-]+`), so one endpoint's prefix is never a prefix of another's.
+pub fn acme_domain_validation_arn_prefix(acme_endpoint_arn: &str) -> String {
+    format!("{acme_endpoint_arn}/{ACME_DOMAIN_VALIDATION_SEGMENT}/")
+}
+
+/// The `ResourceNotFoundException` message for an ACME domain-validation ARN that no
+/// stored record answers to, built from the ARN the request asked for.
+///
+/// `ResourceNotFoundException` carries one modelled member (`message: String`) and the
+/// model documents no text for it, so the sentence follows the template every other
+/// lookup in this service renders ([`certificate_not_found_message`]): one complete
+/// sentence naming the requested ARN and terminated by a period.
+pub fn acme_domain_validation_not_found_message(acme_domain_validation_arn: &str) -> String {
+    format!("Could not find ACME domain validation {acme_domain_validation_arn}.")
 }
 
 /// The leading label of the host ACM serves its managed ACME endpoints on.
@@ -1523,6 +1816,31 @@ pub fn domain_validation_record(
     record
 }
 
+/// The DNS record the caller publishes to prove ownership of `domain_name` for one
+/// ACME domain validation: "the DNS resource record to create for domain validation"
+/// (`DnsPrevalidationDetails$ResourceRecord` doc).
+///
+/// SERVER-MANAGED, like the CNAME a certificate's DNS validation publishes
+/// ([`domain_validation_record`]) and in the same form: a `_<label>` prefixed name
+/// under the domain being validated, pointing at a `_<label>` name in
+/// [`ACM_VALIDATIONS_ZONE`]. Both labels are derived from the validation's OWN id
+/// through [`validation_label`], so repeated reads of one validation report the same
+/// record, two validations of the same domain differ, and no part of the record comes
+/// from anything the caller sent.
+pub fn acme_prevalidation_resource_record(
+    validation_id: &str,
+    domain_name: &str,
+) -> ResourceRecord {
+    let target = validation_target(domain_name);
+    let name = validation_label(validation_id, domain_name, "dns-name");
+    let value = validation_label(validation_id, domain_name, "dns-value");
+    ResourceRecord {
+        name: format!("_{name}.{target}."),
+        r#type: RECORD_TYPE_CNAME.to_string(),
+        value: format!("_{value}.{ACM_VALIDATIONS_ZONE}."),
+    }
+}
+
 /// The tag-key prefix Amazon Web Services reserves for its own tags: neither half of
 /// a pair a caller names may begin with it (`InvalidTagException`: "you cannot specify
 /// a tag value that begins with aws:").
@@ -1906,6 +2224,37 @@ pub fn acme_endpoint_summary(endpoint: &AcmeEndpointRecord) -> AcmeEndpointSumma
         certificate_tags: detail.certificate_tags,
         created_at: detail.created_at,
         updated_at: detail.updated_at,
+    }
+}
+
+/// A stored ACME domain validation as `DescribeAcmeDomainValidation`'s
+/// `AcmeDomainValidation`.
+///
+/// Every member is read off the record: `PrevalidationDetails` reports the scope and
+/// hosted zone the create configured BESIDE the resource record the service minted
+/// ([`acme_prevalidation_resource_record`]), which is the one member of the three the
+/// caller cannot have sent. `FailureDetails` exists only for a validation that failed
+/// ("details about the failure, if the validation failed",
+/// `AcmeDomainValidation$FailureDetails` doc), which is what the record stores.
+pub fn acme_domain_validation_detail(
+    validation: &AcmeDomainValidationRecord,
+) -> AcmeDomainValidation {
+    AcmeDomainValidation {
+        acme_domain_validation_arn: Some(validation.arn.clone()),
+        acme_endpoint_arn: Some(validation.acme_endpoint_arn.clone()),
+        domain_name: Some(validation.domain_name.clone()),
+        prevalidation_type: Some(validation.prevalidation_type.clone()),
+        prevalidation_details: Some(PrevalidationDetails::DnsPrevalidation(
+            DnsPrevalidationDetails {
+                domain_scope: validation.domain_scope.clone(),
+                hosted_zone_id: validation.hosted_zone_id.clone(),
+                resource_record: validation.resource_record.clone(),
+            },
+        )),
+        status: Some(validation.status.clone()),
+        failure_details: validation.failure_details.clone(),
+        created_at: Some(to_date_time(validation.created_at)),
+        updated_at: Some(to_date_time(validation.updated_at)),
     }
 }
 
