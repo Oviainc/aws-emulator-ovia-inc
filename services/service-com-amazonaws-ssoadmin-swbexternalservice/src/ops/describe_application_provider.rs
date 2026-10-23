@@ -11,8 +11,13 @@
 //! creates or deletes one. The set of them is therefore the fixed catalogue
 //! [`crate::state::BUILT_IN_APPLICATION_PROVIDERS`], which this read answers from; an
 //! ARN outside it names nothing, which is the modelled `ResourceNotFoundException`
-//! (404). The lookup is by provider ID, so the same provider resolves in every
-//! partition the pattern admits, and the ARN reported back is the one asked for.
+//! (answered at the HTTP 400 this service answers a refused request with — see
+//! [`crate::scaffolded::modeled_error_status`]). The lookup is by provider ID — the whole
+//! id, so a `catalog/<Name>` application resolves as readily as a service slug — which is
+//! why the same provider resolves in every partition the pattern admits, and the ARN
+//! reported back is the one asked for. Every member of the record is reported: the
+//! complete `DisplayData` and, where the provider publishes access scopes, its
+//! `ResourceServerConfig`.
 //!
 //! ## Shape of an operation
 //!
@@ -189,10 +194,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             federation_protocol: Some(provider.federation_protocol.to_string()),
             display_data: Some(provider.display_data()),
             // `ResourceServerConfig` describes "the application provider's resource
-            // server" and its access scopes. The catalogue holds none, and inventing
-            // scope names would put values on the wire that no AWS rule produces, so
-            // the optional member is absent.
-            resource_server_config: None,
+            // server" and its access scopes: the catalogue record's own scopes, and
+            // ABSENT for a provider that publishes none (an empty `Scopes` map would
+            // claim a resource server that exposes nothing).
+            resource_server_config: provider.resource_server_config(),
         })
     }
 }
