@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
+use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 
@@ -86,6 +87,110 @@ pub struct NotificationConfigurationRecord {
     pub sequence: u64,
 }
 
+/// `REGISTERING`, the status a freshly registered `NotificationHub` carries.
+///
+/// One of `NotificationHubStatus`'s four modelled values
+/// (`crate::ops::types::NOTIFICATION_HUB_STATUS_VALUES`), documented in the model
+/// as "Notification Hub is initializing. Cannot deregister a Notification Hub in
+/// this status." — so it is transitional, and the clock owes it
+/// [`HUB_TRANSITION_SPAN`] later.
+pub const NOTIFICATION_HUB_STATUS_REGISTERING: &str = "REGISTERING";
+
+/// `ACTIVE`, the status a registered hub settles in: "Incoming Notification
+/// Events are being replicated to this Notification Hub. A Notification Hub with
+/// this status can be deregistered." It is terminal — nothing moves a hub out of
+/// it but a deregister.
+pub const NOTIFICATION_HUB_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// `DEREGISTERING`, the status a hub carries while it is being removed:
+/// "Notification Hub is being deleted. Cannot register a Notification Hub in the
+/// same region as one in this status." Transitional too: the record leaves the
+/// store [`HUB_TRANSITION_SPAN`] after the deregister call.
+pub const NOTIFICATION_HUB_STATUS_DEREGISTERING: &str = "DEREGISTERING";
+
+/// The `reason` reported beside a `REGISTERING` hub.
+///
+/// `NotificationHubStatusReason` is an unconstrained string for which the model
+/// declares no values, so each of these three sentences is this emulator's own
+/// rendering of the documentation the model carries for the matching
+/// `NotificationHubStatus` member: the status is the contract, this prose is not.
+pub const HUB_REASON_REGISTERING: &str = "The NotificationHub is initializing.";
+
+/// The `reason` reported beside an `ACTIVE` hub. See [`HUB_REASON_REGISTERING`].
+pub const HUB_REASON_ACTIVE: &str =
+    "Incoming Notification Events are being replicated to this NotificationHub.";
+
+/// The `reason` reported beside a `DEREGISTERING` hub. See
+/// [`HUB_REASON_REGISTERING`].
+pub const HUB_REASON_DEREGISTERING: &str = "The NotificationHub is being deleted.";
+
+/// How long a `NotificationHub` stays in a transitional status before the clock
+/// makes the next step due: `REGISTERING` -> `ACTIVE` after a register, and
+/// removal from the store after a deregister.
+///
+/// AWS publishes no duration for either step, so this span is the EMULATOR's own
+/// choice; what matters is that it is never zero, so a caller that reads straight
+/// after the call still observes the transitional status AWS reports, and that it
+/// is short enough for a caller to wait on. Nothing sleeps for it: the due instant
+/// is stored and [`ComAmazonawsNotificationsNotificationsState::settle_due_hubs`]
+/// materialises whatever it has already made due.
+pub const HUB_TRANSITION_SPAN: Duration = Duration::from_millis(500);
+
+/// The most `NotificationHub`s this account holds at once: "There is a maximum of
+/// one NotificationHub per Region. You can have a maximum of 3 NotificationHub
+/// resources at a time.", from `RegisterNotificationHub`'s own documentation in
+/// this service's model. A register past it is refused with the error the model
+/// declares for exactly that case, `ServiceQuotaExceededException` (HTTP 402).
+pub const MAX_NOTIFICATION_HUBS: usize = 3;
+
+/// One persisted `NotificationHub`.
+///
+/// `RegisterNotificationHub` inserts it, `ListNotificationHubs` reports it, and
+/// `DeregisterNotificationHub` moves it to `DEREGISTERING`; the clock removes it
+/// from there. A hub is keyed by its region — "a maximum of one NotificationHub
+/// per Region" — so there is no minted id.
+#[derive(Debug, Clone)]
+pub struct NotificationHubRecord {
+    /// `notificationHubRegion`, the hub's key.
+    pub region: String,
+    /// `statusSummary.status`, one of `NotificationHubStatus`'s values.
+    pub status: String,
+    /// `statusSummary.reason`, the prose that accompanies [`Self::status`].
+    pub reason: String,
+    /// `creationTime`, set once when the hub is registered and never rewritten.
+    pub creation_time: ::aws_smithy_types::DateTime,
+    /// `lastActivationTime`, absent until the hub first reaches `ACTIVE` and
+    /// stamped with the instant that activation fell due.
+    pub last_activation_time: Option<::aws_smithy_types::DateTime>,
+    /// When the clock owes this hub its next step, or `None` when the record is
+    /// settled. See [`HUB_TRANSITION_SPAN`].
+    pub due_at: Option<SystemTime>,
+    /// Registration order within this store — the order `ListNotificationHubs`
+    /// reports and pages through, so a listing is stable and a page token keeps
+    /// meaning across registers and deregisters.
+    pub sequence: u64,
+}
+
+impl NotificationHubRecord {
+    /// This hub's `statusSummary`, as the wire shape every hub operation returns.
+    pub fn status_summary(&self) -> crate::ops::types::NotificationHubStatusSummary {
+        crate::ops::types::NotificationHubStatusSummary {
+            status: self.status.clone(),
+            reason: self.reason.clone(),
+        }
+    }
+
+    /// This hub as the `NotificationHubOverview` a listing reports.
+    pub fn overview(&self) -> crate::ops::types::NotificationHubOverview {
+        crate::ops::types::NotificationHubOverview {
+            notification_hub_region: self.region.clone(),
+            status_summary: self.status_summary(),
+            creation_time: self.creation_time,
+            last_activation_time: self.last_activation_time,
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-notifications-notifications. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsNotificationsNotificationsState {
@@ -95,6 +200,13 @@ pub struct ComAmazonawsNotificationsNotificationsState {
     /// record's [`NotificationConfigurationRecord::sequence`] and as part of the
     /// uniqueness seed of a new arn, so an id is never reused after a delete.
     pub configurations_minted: u64,
+    /// notificationHubRegion -> hub. One entry per region, as AWS's "maximum of
+    /// one NotificationHub per Region" requires.
+    pub hubs: BTreeMap<String, NotificationHubRecord>,
+    /// How many hubs this store has ever registered. Doubles as the next
+    /// record's [`NotificationHubRecord::sequence`], so a listing's order and its
+    /// page tokens survive a deregister and a re-register of the same region.
+    pub hubs_registered: u64,
 }
 
 impl ComAmazonawsNotificationsNotificationsState {
@@ -145,6 +257,73 @@ impl ComAmazonawsNotificationsNotificationsState {
         records.sort_by_key(|record| record.sequence);
         records
     }
+
+    /// Materialise every hub transition the clock has already made due, as of
+    /// `now`: a `REGISTERING` hub becomes `ACTIVE` (stamped with the instant its
+    /// activation fell due), and a `DEREGISTERING` hub leaves the store.
+    ///
+    /// Every hub operation calls this first, including the reporting ones: the
+    /// step was owed at that instant whether or not anybody called, so applying
+    /// it is not a mutation this request chose. Nothing here sleeps or depends on
+    /// a request's shape.
+    pub fn settle_due_hubs(&mut self, now: SystemTime) {
+        self.hubs.retain(|_, hub| {
+            let Some(due_at) = hub.due_at else {
+                return true;
+            };
+            if due_at > now {
+                return true;
+            }
+            hub.due_at = None;
+            match hub.status.as_str() {
+                NOTIFICATION_HUB_STATUS_REGISTERING => {
+                    hub.status = NOTIFICATION_HUB_STATUS_ACTIVE.to_string();
+                    hub.reason = HUB_REASON_ACTIVE.to_string();
+                    hub.last_activation_time = Some(::aws_smithy_types::DateTime::from(due_at));
+                    true
+                }
+                // The deregister this hub was holding has fallen due, so the
+                // record is gone: a listing stops reporting it.
+                NOTIFICATION_HUB_STATUS_DEREGISTERING => false,
+                // A settled status owes nothing.
+                _ => true,
+            }
+        });
+    }
+
+    /// Whether another hub fits under [`MAX_NOTIFICATION_HUBS`]. A register that
+    /// cannot must be refused with the modelled quota error, not served by
+    /// growing the store. Call [`Self::settle_due_hubs`] first, or a hub the
+    /// clock has already removed still counts against the cap.
+    pub fn has_hub_capacity(&self) -> bool {
+        self.hubs.len() < MAX_NOTIFICATION_HUBS
+    }
+
+    /// Insert a hub for `region` in `REGISTERING`, with its activation due
+    /// [`HUB_TRANSITION_SPAN`] after `now`, and return it.
+    pub fn register_hub(&mut self, region: &str, now: SystemTime) -> &NotificationHubRecord {
+        self.hubs_registered += 1;
+        let record = NotificationHubRecord {
+            region: region.to_string(),
+            status: NOTIFICATION_HUB_STATUS_REGISTERING.to_string(),
+            reason: HUB_REASON_REGISTERING.to_string(),
+            creation_time: ::aws_smithy_types::DateTime::from(now),
+            // A hub has never been active at the instant it is registered; the
+            // clock stamps this when `REGISTERING` falls due.
+            last_activation_time: None,
+            due_at: Some(now + HUB_TRANSITION_SPAN),
+            sequence: self.hubs_registered,
+        };
+        self.hubs.entry(region.to_string()).or_insert(record)
+    }
+
+    /// Every stored hub in registration order — the order `ListNotificationHubs`
+    /// reports and pages through.
+    pub fn hubs_in_registration_order(&self) -> Vec<&NotificationHubRecord> {
+        let mut records: Vec<&NotificationHubRecord> = self.hubs.values().collect();
+        records.sort_by_key(|record| record.sequence);
+        records
+    }
 }
 
 /// A random value fixed for the life of the process, so configuration ids are
@@ -183,6 +362,37 @@ fn nanos_since_epoch() -> u128 {
 pub fn page_token_tag() -> u64 {
     static TAG: OnceLock<u64> = OnceLock::new();
     *TAG.get_or_init(random_u64)
+}
+
+/// Encode the resume point of a listing page as a `nextToken`.
+///
+/// The token is this process's [`page_token_tag`] followed by the cursor the
+/// listing resumes from (the creation or registration sequence of the last record
+/// on the page). Rendered through the `hex` codec so the token is an opaque
+/// fixed-width string of word characters, within the modelled `NextToken` length
+/// (1..4096) and pattern (`^[\w+-/=]+$`). The tag is what makes a
+/// forged-but-well-formed cursor distinguishable from one this emulator issued.
+///
+/// Shared by every paginated listing in this service, so one token format is
+/// minted and verified in one place.
+pub fn encode_page_token(cursor: u64) -> String {
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&page_token_tag().to_be_bytes());
+    bytes[8..].copy_from_slice(&cursor.to_be_bytes());
+    hex::encode(bytes)
+}
+
+/// Recover the cursor from a `nextToken` [`encode_page_token`] issued. `None` for
+/// a token this process did not issue — wrong length, not hex, or carrying
+/// another tag — which a handler refuses as a validation failure rather than
+/// silently restarting the listing from the beginning.
+pub fn decode_page_token(token: &str) -> Option<u64> {
+    let bytes: [u8; 16] = hex::decode(token).ok()?.try_into().ok()?;
+    let tag = u64::from_be_bytes(bytes[..8].try_into().ok()?);
+    if tag != page_token_tag() {
+        return None;
+    }
+    Some(u64::from_be_bytes(bytes[8..].try_into().ok()?))
 }
 
 /// The wall-clock instant a record is stamped with, as the modelled timestamp type.
