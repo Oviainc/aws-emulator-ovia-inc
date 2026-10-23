@@ -21,8 +21,10 @@
 //! (over the whole modelled `ProcessingType` enum plus the absent member), which rule
 //! of several matches and in which order they are declared, how many schema fields a
 //! matching key groups, whether the input source asks for normalization and in what
-//! way two values differ, and the `resolutionType` of the workflow. The recorded case
-//! — one record submitted twice, expecting one Match ID — is a single row of the
+//! way two values differ, the `resolutionType` of the workflow, and each of the three
+//! states the optional `enableRealTimeMatching` member has on the wire — absent, `true`
+//! and `false` — of which only the explicit `false` refuses the writer. The recorded
+//! case — one record submitted twice, expecting one Match ID — is a single row of the
 //! first table. Two further suites pin the bounds the emulator enforces on this
 //! data-plane path: the modelled batch maximum, the modelled enum of processing
 //! modes, and the per-workflow index bound that `DeleteMatchingWorkflow` releases.
@@ -782,6 +784,206 @@ async fn get_match_id_reads_the_group_generate_match_id_wrote_and_changes_nothin
     );
 }
 
+/// One rule-based `resolutionTechniques` (plus the optional `incrementalRunConfig`
+/// the request may carry) and whether `GenerateMatchId` is defined over the workflow
+/// created from it.
+struct RealTimeMatchingCase {
+    case: &'static str,
+    workflow_name: &'static str,
+    techniques: Value,
+    /// `incrementalRunConfig.incrementalRunType`, present only when `Some`
+    /// (`IncrementalRunType` admits only `IMMEDIATE`,
+    /// `smithy_query(query="shape",shape="IncrementalRunType")`).
+    incremental_run_type: Option<&'static str>,
+    /// Does `GenerateMatchId` answer for this workflow, or refuse it?
+    serves: bool,
+}
+
+/// The `enableRealTimeMatching` table: every state the member has on the wire.
+///
+/// `ResolutionTechniques$enableRealTimeMatching` is an OPTIONAL `Boolean` with no
+/// modelled `@default` (`smithy_query(query="shape",shape="ResolutionTechniques")`), so
+/// a `CreateMatchingWorkflow` request can leave it absent, set it `true` or set it
+/// `false`. Only the explicit `false` is a statement that real-time matching is off, so
+/// only that row is refused; the rows differ further along the optional
+/// `ruleBasedProperties.matchPurpose` (`MATCH_PURPOSE_VALUES` →
+/// `IDENTIFIER_GENERATION | INDEXING`), the number of matching rules, and whether the
+/// request carries an `incrementalRunConfig`, none of which the rule depends on.
+fn real_time_matching_cases() -> Vec<RealTimeMatchingCase> {
+    /// The two-rule shape one row uses, so the table does not test a single rule only.
+    fn two_rules() -> Value {
+        json!([
+            { "ruleName": "by email", "matchingKeys": ["email"] },
+            { "ruleName": "by fullname", "matchingKeys": ["fullname"] },
+        ])
+    }
+    /// `rule_based`, with `ruleBasedProperties.matchPurpose` set.
+    fn with_match_purpose(rules: Value, purpose: &str, enable: Option<bool>) -> Value {
+        let mut techniques = rule_based(rules, enable);
+        techniques["ruleBasedProperties"]["matchPurpose"] = json!(purpose);
+        techniques
+    }
+
+    vec![
+        RealTimeMatchingCase {
+            case: "enableRealTimeMatching absent",
+            workflow_name: "wf-rt-absent",
+            techniques: rule_based(by_email(), None),
+            incremental_run_type: None,
+            serves: true,
+        },
+        RealTimeMatchingCase {
+            case: "enableRealTimeMatching absent, matchPurpose IDENTIFIER_GENERATION and an \
+                   immediate incremental run",
+            workflow_name: "wf-rt-absent-idgen",
+            techniques: with_match_purpose(by_email(), "IDENTIFIER_GENERATION", None),
+            incremental_run_type: Some("IMMEDIATE"),
+            serves: true,
+        },
+        RealTimeMatchingCase {
+            case: "enableRealTimeMatching absent, two rules and matchPurpose INDEXING",
+            workflow_name: "wf-rt-absent-indexing",
+            techniques: with_match_purpose(two_rules(), "INDEXING", None),
+            incremental_run_type: None,
+            serves: true,
+        },
+        RealTimeMatchingCase {
+            case: "enableRealTimeMatching true",
+            workflow_name: "wf-rt-on",
+            techniques: rule_based(by_email(), Some(true)),
+            incremental_run_type: None,
+            serves: true,
+        },
+        RealTimeMatchingCase {
+            case: "enableRealTimeMatching true, matchPurpose IDENTIFIER_GENERATION",
+            workflow_name: "wf-rt-on-idgen",
+            techniques: with_match_purpose(by_email(), "IDENTIFIER_GENERATION", Some(true)),
+            incremental_run_type: Some("IMMEDIATE"),
+            serves: true,
+        },
+        RealTimeMatchingCase {
+            case: "enableRealTimeMatching explicitly false",
+            workflow_name: "wf-rt-off",
+            techniques: rule_based(by_email(), Some(false)),
+            incremental_run_type: None,
+            serves: false,
+        },
+        RealTimeMatchingCase {
+            case: "enableRealTimeMatching explicitly false, matchPurpose \
+                   IDENTIFIER_GENERATION",
+            workflow_name: "wf-rt-off-idgen",
+            techniques: with_match_purpose(by_email(), "IDENTIFIER_GENERATION", Some(false)),
+            incremental_run_type: Some("IMMEDIATE"),
+            serves: false,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn only_an_explicitly_disabled_enable_real_time_matching_refuses_generate_match_id() {
+    let emulator = Emulator::new();
+    let schema = emulator.create_schema_mapping(&schema_request()).await;
+    assert_eq!(
+        schema.status, 200,
+        "seeding the schema mapping failed: {schema:?}"
+    );
+
+    for case in real_time_matching_cases() {
+        let label = case.case;
+        let mut request = workflow_request(case.workflow_name, case.techniques, None);
+        if let Some(run_type) = case.incremental_run_type {
+            request["incrementalRunConfig"] = json!({ "incrementalRunType": run_type });
+        }
+        let created = emulator.create_matching_workflow(&request).await;
+        assert_eq!(
+            created.status, 200,
+            "case {label:?}: seeding the workflow failed: {created:?}"
+        );
+
+        let shared_email = json!({ "email": "dup@example.com" });
+        let first = generate_match_id(
+            &emulator,
+            case.workflow_name,
+            json!([record("rec-a", shared_email.clone())]),
+            None,
+        )
+        .await;
+
+        if !case.serves {
+            assert_eq!(
+                first.status, 400,
+                "case {label:?}: expected HTTP 400 from GenerateMatchId, got {first:?}"
+            );
+            assert_eq!(
+                first.error_code.as_deref(),
+                Some("ValidationException"),
+                "case {label:?}: expected a ValidationException, got {first:?}"
+            );
+            let read = get_match_id(&emulator, case.workflow_name, shared_email, None).await;
+            assert_eq!(
+                read.body.get("matchId"),
+                None,
+                "case {label:?}: the refused call must have indexed nothing, got {:?}",
+                read.body
+            );
+            continue;
+        }
+
+        // The served rows carry the invariant the data plane exists for: records the
+        // workflow's rules join share one Match ID, an unrelated record gets another,
+        // and the reader answers the same group the writer reported.
+        let first_id = string_member(&only_group(label, &first), "matchId");
+        assert_match_id_shape(label, &first_id);
+
+        let second = generate_match_id(
+            &emulator,
+            case.workflow_name,
+            json!([record("rec-b", shared_email.clone())]),
+            None,
+        )
+        .await;
+        let second_group = only_group(label, &second);
+        assert_eq!(
+            string_member(&second_group, "matchId"),
+            first_id,
+            "case {label:?}: a record sharing the rule's matching key must answer the same \
+             matchId as {first_id:?}, got {second_group:?}"
+        );
+        assert_eq!(
+            group_record_ids(label, &second_group),
+            vec!["rec-a", "rec-b"],
+            "case {label:?}: both records must be in the group, got {second_group:?}"
+        );
+
+        let unrelated = generate_match_id(
+            &emulator,
+            case.workflow_name,
+            json!([record("rec-c", json!({ "email": "other@example.com" }))]),
+            None,
+        )
+        .await;
+        let unrelated_group = only_group(label, &unrelated);
+        let unrelated_id = string_member(&unrelated_group, "matchId");
+        assert_match_id_shape(label, &unrelated_id);
+        assert_ne!(
+            unrelated_id, first_id,
+            "case {label:?}: an unrelated record must open its own group, got {first_id:?} again"
+        );
+
+        let read = get_match_id(&emulator, case.workflow_name, shared_email, None).await;
+        assert_eq!(
+            read.status, 200,
+            "case {label:?}: expected GetMatchId to answer, got {read:?}"
+        );
+        assert_eq!(
+            read.body.get("matchId").and_then(Value::as_str),
+            Some(first_id.as_str()),
+            "case {label:?}: GetMatchId must read back {first_id:?}, got {:?}",
+            read.body
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_workflow_that_cannot_serve_real_time_matching_refuses_both_operations() {
     let emulator = Emulator::new();
@@ -791,8 +993,10 @@ async fn a_workflow_that_cannot_serve_real_time_matching_refuses_both_operations
     // The class: a workflow this pair is not defined over. The rows span the rest of
     // the modelled `ResolutionType` enum (`ML_MATCHING | PROVIDER`, from
     // `smithy_query(query="shape",shape="ResolutionType")`) and, for a RULE_MATCHING
-    // workflow, `enableRealTimeMatching` absent and explicitly false — the member that
-    // governs whether `GenerateMatchId` may be used with the workflow.
+    // workflow, `enableRealTimeMatching` explicitly false — the ONE state of that
+    // member that says real-time matching is off. An ABSENT member is not that state;
+    // `only_an_explicitly_disabled_enable_real_time_matching_refuses_generate_match_id`
+    // owns the whole three-state table.
     let provider_arn = "arn:aws:entityresolution:us-east-1::providerservice/testprovider/assignment";
     let cases: Vec<(&str, &str, Value, bool)> = vec![
         (
@@ -809,12 +1013,6 @@ async fn a_workflow_that_cannot_serve_real_time_matching_refuses_both_operations
                 "providerProperties": { "providerServiceArn": provider_arn },
             }),
             false,
-        ),
-        (
-            "a rule-based workflow with enableRealTimeMatching absent",
-            "wf-no-realtime",
-            rule_based(by_email(), None),
-            true,
         ),
         (
             "a rule-based workflow with enableRealTimeMatching false",

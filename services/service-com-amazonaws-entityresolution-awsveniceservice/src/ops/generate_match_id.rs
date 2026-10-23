@@ -258,9 +258,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         // Match IDs come from the workflow's matching RULES, so only a RULE_MATCHING
-        // workflow can serve this operation, and only with real-time matching enabled
-        // ("When you enable real-time matching, you can use the GenerateMatchId
-        // operation with the workflow").
+        // workflow can serve this operation.
         if workflow.resolution_techniques.resolution_type != crate::state::RULE_MATCHING {
             return Err(GenerateMatchIdErrorModeled::ValidationException(ValidationException {
                 message: Some(crate::state::messages::generate_match_id_not_rule_based(
@@ -270,7 +268,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
-        if !crate::state::real_time_matching_enabled(&workflow) {
+        // Real-time matching is refused only where the workflow's creator EXPLICITLY
+        // turned it off. `enableRealTimeMatching` is an optional Boolean with no
+        // modelled default, so an ABSENT member is not a statement that real-time
+        // matching is off, and the model states no rule under which omitting it makes
+        // this operation refuse: a rule-based workflow created without the member is
+        // served. "When you enable real-time matching, you can use the GenerateMatchId
+        // operation with the workflow" is what keeps the refusal for the explicit
+        // `false`.
+        if crate::state::real_time_matching_explicitly_disabled(&workflow) {
             return Err(GenerateMatchIdErrorModeled::ValidationException(ValidationException {
                 message: Some(
                     crate::state::messages::generate_match_id_real_time_matching_disabled(
