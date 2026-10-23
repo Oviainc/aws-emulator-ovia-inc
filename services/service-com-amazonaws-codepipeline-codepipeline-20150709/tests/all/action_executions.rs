@@ -8,8 +8,14 @@
 //! execution per action the executed pipeline version begins with — the actions of its
 //! first stage at that stage's lowest `runOrder` — and the listing reports those from
 //! the store, most recently started first, paging over them with an opaque cursor.
-//! Nothing in this emulator runs an action, so no record carries an outcome and no
-//! later `runOrder` or stage starts.
+//! Nothing later `runOrder` or stage has started yet, so no record for one is reported.
+//!
+//! Every action here is a `Custom`-owned source action, because such an action's work is
+//! performed by a job worker that reports its outcome through the API rather than by the
+//! clock: the records this suite asserts about therefore stay exactly as the start left
+//! them, which is what lets it assert "started, no outcome yet" without racing the
+//! engine. The worker lifecycle itself is the sibling suite
+//! (`tests/all/custom_action_jobs.rs`).
 //!
 //! The harness comes from the sibling suite (`tests/all/pipeline_lifecycle.rs`), so
 //! every assertion here goes through the same router the production emulator builds.
@@ -28,13 +34,19 @@ const UNSTORED_EXECUTION_ID: &str = "00000000-0000-4000-8000-000000000000";
 
 /// One `ActionDeclaration`, with the `runOrder` it declares (`None` for a declaration
 /// that names none).
+///
+/// A `Custom`-owned source action: its work is performed by a job worker of this
+/// account, so an execution that reaches it waits for that worker (`PollForJobs` ->
+/// `AcknowledgeJob` -> `PutJobSuccessResult`) instead of being carried on by the clock.
+/// That is what lets this suite assert "started, no outcome yet" without racing the
+/// engine; the worker lifecycle itself is `tests/all/custom_action_jobs.rs`.
 fn action(name: &str, run_order: Option<i64>) -> Value {
     let mut action = json!({
         "name": name,
         "actionTypeId": {
             "category": "Source",
-            "owner": "AWS",
-            "provider": "S3",
+            "owner": "Custom",
+            "provider": "MySource",
             "version": "1",
         },
         "configuration": {"S3Bucket": "my-bucket", "S3ObjectKey": "app.zip"},
@@ -722,7 +734,7 @@ async fn a_record_reports_the_input_its_declaration_configures() {
             "the declared action type id",
             "Inherits",
             "actionTypeId",
-            json!({"category": "Source", "owner": "AWS", "provider": "S3", "version": "1"}),
+            json!({"category": "Source", "owner": "Custom", "provider": "MySource", "version": "1"}),
         ),
         (
             "the declared configuration",

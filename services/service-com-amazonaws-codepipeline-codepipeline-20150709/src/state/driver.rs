@@ -16,7 +16,7 @@ use std::io::Read as _;
 use std::time::SystemTime;
 
 use super::execution::{
-    is_terminal_status, resolve_placeholders, transition_held, ArtifactRef, Job, JobOutcome,
+    is_terminal_status, transition_held, ArtifactRef, Job, JobOutcome,
     ACTION_STEP, CLAIM_TIMEOUT, FAILURE_CONFIGURATION_ERROR, FAILURE_JOB_FAILED,
     MAX_ADVANCE_STEPS, MAX_ARCHIVE_ENTRIES, MAX_EXTRACTED_BYTES, MAX_EXTRACTED_ENTRY_BYTES,
     STATUS_FAILED, STATUS_STOPPED, STATUS_STOPPING, STATUS_SUCCEEDED, TRANSITION_INBOUND,
@@ -415,13 +415,10 @@ fn start_action(
         .into_iter()
         .map(|artifact| artifact.name)
         .collect();
-    let config: BTreeMap<String, String> = declared
-        .configuration
-        .clone()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(key, value)| (key, resolve_placeholders(&value, &variables)))
-        .collect();
+    // One helper resolves a configuration for the engine and for the job worker alike,
+    // so the two cannot read one action's configuration differently.
+    let config: BTreeMap<String, String> =
+        super::execution::resolved_configuration(&declared, &variables);
     let _ = namespace;
 
     if category == CATEGORY_APPROVAL {

@@ -5,7 +5,9 @@
 //! Retrieves the tags associated with the AWS resource `ResourceARN` names, a page at a
 //! time: the tag set stored on that resource's own record — the one `CreateRule`'s
 //! `Tags` and `TagResource` write — walked in `Key` order so a `NextMarker` taken on
-//! one page resumes at the right place on the next.
+//! one page resumes at the right place on the next. The marker is reported on EVERY
+//! successful response, empty once the listing is complete, as the recorded responses
+//! carry it.
 //!
 //! ## Shape of an operation
 //!
@@ -218,9 +220,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 value: value.clone(),
             })
             .collect();
-        // The marker is the first tag AFTER this page, so `NextMarker` is present
-        // exactly when one remains.
-        let next_marker = remaining.next().map(|(key, _)| key.clone());
+        // This listing reports its pagination state POSITIVELY: `NextMarker` is on every
+        // successful response — the key of the first tag AFTER this page while one
+        // remains, and EMPTY once the listing is complete, which is what the recorded
+        // responses carry. A client therefore learns it reached the end from the marker's
+        // emptiness, never from the key's absence. (The empty value is recorded behaviour,
+        // not a modelled one: `ListTagsForResourceResponse$NextMarker` is `length 1..1224,
+        // pattern \S`, which an empty string does not satisfy — and responses are not
+        // constraint-validated, only requests are. The emulator never feeds an empty
+        // marker back as input: a complete listing has no next page to ask for.)
+        let next_marker = Some(
+            remaining
+                .next()
+                .map_or_else(String::new, |(key, _)| key.clone()),
+        );
 
         Ok(ListTagsForResourceOutput {
             next_marker,

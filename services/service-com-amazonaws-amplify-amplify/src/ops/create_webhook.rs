@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWebhook
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWebhook`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWebhook::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +143,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWebhook` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWebhookErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWebhook"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateWebhookErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the Amplify emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        // One instant for both stamps: a webhook Amplify has only just created has
+        // not been updated since, so `createTime` and `updateTime` are equal.
+        let created = crate::state::now();
+
+        let mut store = state.lock();
+
+        // A webhook is created UNDER an app (`POST /apps/{appId}/webhooks`), so an
+        // unknown `appId` is a 404 rather than an app created on the way. The
+        // webhook's `branchName` is the branch its trigger targets — a name, not a
+        // reference this operation resolves — so the app is the only entity whose
+        // absence this create can report.
+        let absent_app = || {
+            CreateWebhookErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message(
+                    crate::state::APP_ENTITY,
+                    &input.app_id,
+                )),
+            })
+        };
+        let held = store.apps.get(&input.app_id).ok_or_else(absent_app)?.webhooks.len();
+
+        // Both refusals are decided BEFORE anything is minted or stored, so a
+        // refused create leaves the store exactly as it was and one app's webhook
+        // map cannot grow without limit.
+        if held >= MAX_WEBHOOKS_PER_APP {
+            return Err(CreateWebhookErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Number of webhooks exceeds the limit of {MAX_WEBHOOKS_PER_APP} for app {}",
+                        input.app_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The id is unique across the store, which is what lets `GetWebhook` find a
+        // webhook from its id alone; the token minted with it authorises the URL.
+        let (webhook_id, token) = store.mint_webhook_id();
+
+        let webhook = Webhook {
+            webhook_arn: ::emulator_server::emulator_arn(
+                "amplify",
+                &region,
+                &format!("apps/{}/webhooks/{webhook_id}", input.app_id),
+            ),
+            // The URL a caller POSTs to to trigger the branch's build: the webhook's
+            // id names which webhook, and the token is what authorises the trigger,
+            // so the URL is as unguessable as the token minted with the id.
+            webhook_url: format!(
+                "https://webhooks.amplify.{region}.amazonaws.com/prod/webhooks\
+                 ?id={webhook_id}&token={token}"
+            ),
+            webhook_id,
+            app_id: Some(input.app_id.clone()),
+            branch_name: input.branch_name,
+            // `description` is @required with a `length` minimum of 0, so a request
+            // that omits it leaves the webhook with the empty description rather
+            // than with no member at all.
+            description: input.description.unwrap_or_default(),
+            create_time: created,
+            update_time: created,
+        };
+
+        // The app record itself is NOT touched: `App$webhookCreateTime` is when
+        // Amplify created a webhook IN the app's connected Git repository, which
+        // creating an incoming build trigger does not do.
+        store
+            .apps
+            .get_mut(&input.app_id)
+            .ok_or_else(absent_app)?
+            .webhooks
+            .insert(webhook.webhook_id.clone(), webhook.clone());
+
+        Ok(CreateWebhookOutput { webhook })
     }
 }
+
+/// How many webhooks one app may hold at once, past which `CreateWebhook` answers the
+/// modelled `LimitExceededException` (HTTP 429, "A resource could not be created
+/// because service quotas were exceeded").
+///
+/// CHOSEN, not a published quota: the bound is `ListWebhooks`' modelled `maxResults`
+/// maximum (`range 0..50`, from
+/// `smithy_query(query="operation",operation="ListWebhooks")`), which is the largest
+/// page that operation can serve. It keeps one app's webhook map from growing without
+/// limit, and the refusal is the modelled one a real account past its quota gets.
+const MAX_WEBHOOKS_PER_APP: usize = 50;
