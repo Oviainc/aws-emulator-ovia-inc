@@ -250,6 +250,37 @@ const MIN_PAGE_SIZE: i32 = 1;
 /// other what the member may carry.
 const DEFAULT_PAGE_SIZE: i32 = 400;
 
+/// Project a record's stored policies onto the modelled `Policies`.
+///
+/// Each list is reported in `PolicyName` order (the store's own key order), and every
+/// member is reported — as an empty list where the record holds no policy of that kind —
+/// because AWS reports the structure for every load balancer. The `match` is exhaustive
+/// over [`crate::state::PolicyKind`], so an operation that adds a policy kind has to say
+/// which list it belongs in.
+fn policies(record: &crate::state::LoadBalancer) -> Policies {
+    let mut lb_cookie_stickiness: Vec<LBCookieStickinessPolicy> = Vec::new();
+    for policy in record.policies.values() {
+        match policy.kind {
+            crate::state::PolicyKind::LbCookieStickiness {
+                cookie_expiration_period,
+            } => lb_cookie_stickiness.push(LBCookieStickinessPolicy {
+                policy_name: Some(policy.name.clone()),
+                cookie_expiration_period: Some(cookie_expiration_period),
+            }),
+        }
+    }
+
+    Policies {
+        // `CreateAppCookieStickinessPolicy` is still a scaffold, so no record holds an
+        // application-controlled stickiness policy yet.
+        app_cookie_stickiness_policies: Some(Vec::new()),
+        lb_cookie_stickiness_policies: Some(lb_cookie_stickiness),
+        // "The policies other than the stickiness policies": `CreateLoadBalancerPolicy`
+        // is still a scaffold, so no record holds one.
+        other_policies: Some(Vec::new()),
+    }
+}
+
 /// Project one stored record into the modelled `LoadBalancerDescription`.
 fn describe(record: &crate::state::LoadBalancer) -> LoadBalancerDescription {
     LoadBalancerDescription {
@@ -273,13 +304,9 @@ fn describe(record: &crate::state::LoadBalancer) -> LoadBalancerDescription {
                 })
                 .collect(),
         ),
-        // No policy or backend-server operation is implemented yet, so a record carries
-        // none of either; the members are still reported, as empty sets.
-        policies: Some(Policies {
-            app_cookie_stickiness_policies: Some(Vec::new()),
-            lb_cookie_stickiness_policies: Some(Vec::new()),
-            other_policies: Some(Vec::new()),
-        }),
+        // Answered from the policies the record HOLDS, so a policy a create persisted is
+        // what a later describe reports.
+        policies: Some(policies(record)),
         backend_server_descriptions: Some(Vec::new()),
         availability_zones: Some(record.availability_zones.clone()),
         subnets: Some(record.subnets.clone()),

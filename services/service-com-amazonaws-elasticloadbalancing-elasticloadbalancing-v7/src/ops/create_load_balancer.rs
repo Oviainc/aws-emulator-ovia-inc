@@ -329,6 +329,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             vpc_id: None,
             instances: crate::state::InstanceSet::default(),
             health_check,
+            // A policy is created by its own operation, so a load balancer holds none
+            // until a caller creates one.
+            policies: ::std::collections::BTreeMap::new(),
             // The service defaults, so `DescribeLoadBalancerAttributes` reports the same
             // attribute set AWS reports for a load balancer nobody has modified.
             attributes: crate::state::AttributeConfig::default(),

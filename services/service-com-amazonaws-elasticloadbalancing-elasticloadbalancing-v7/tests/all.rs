@@ -23,5 +23,7 @@ mod shared_endpoint_api_version_dispatch;
 mod shared_endpoint_api_versions;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/stickiness_policies.rs"]
+mod stickiness_policies;
 #[path = "all/wire.rs"]
 mod wire;
