@@ -17,6 +17,12 @@
 //! the clock already made due. Nothing sleeps, and no read invents a transition that
 //! was not owed.
 //!
+//! An update to a function is owed the same way. `UpdateFunctionCode` and
+//! `UpdateFunctionConfiguration` report `LastUpdateStatus` `InProgress` on the call that
+//! accepted the change, and [`FunctionRecord::begin_update`] stores the instant the move
+//! to `Successful` becomes due, which `materialize` applies exactly as it applies the
+//! move to `Active`.
+//!
 //! The resource-policy slice hangs off the same record. A function's resource-based
 //! policy is attached to the ARN the permission names, so [`FunctionRecord::policies`]
 //! holds one [`PolicyRecord`] per qualifier a statement was added to — the
@@ -110,7 +116,8 @@ pub const LAST_UPDATE_STATUS_SUCCESSFUL: &str = "Successful";
 /// provisions an instance of the function and its supporting resources. [...] During
 /// this time, you can't modify the function, but you can still invoke it. The
 /// LastUpdateStatus [...] fields in the response from GetFunctionConfiguration indicate
-/// when the update is complete".
+/// when the update is complete". A code update is a change to the same function, so
+/// `UpdateFunctionCode` reports it too; see [`FunctionRecord::begin_update`].
 pub const LAST_UPDATE_STATUS_IN_PROGRESS: &str = "InProgress";
 
 /// How long after `CreateFunction` the move from `Pending` to `Active` becomes due.
@@ -121,8 +128,9 @@ pub const LAST_UPDATE_STATUS_IN_PROGRESS: &str = "InProgress";
 /// the `Pending` state the model documents and the state errors that go with it.
 pub const ACTIVATION_DELAY: Duration = Duration::from_millis(500);
 
-/// How long after `UpdateFunctionConfiguration` the move from
-/// [`LAST_UPDATE_STATUS_IN_PROGRESS`] to [`LAST_UPDATE_STATUS_SUCCESSFUL`] becomes due.
+/// How long after an accepted update (of a function's code or of its configuration) the
+/// move from [`LAST_UPDATE_STATUS_IN_PROGRESS`] to [`LAST_UPDATE_STATUS_SUCCESSFUL`]
+/// becomes due.
 ///
 /// An EMULATOR-CHOSEN span, for the same reason as [`ACTIVATION_DELAY`]: the real time
 /// to provision a new instance of the function is not in the model ("If your function
@@ -278,6 +286,15 @@ pub struct CodeRecord {
     pub s3_key: Option<String>,
     /// The S3 object version of the deployment package.
     pub s3_object_version: Option<String>,
+    /// How the deployment package is stored, when the caller said: `COPY` (the default,
+    /// "Uploads a copy of your deployment package to Lambda") or `REFERENCE` ("Lambda
+    /// references the deployment package from the specified Amazon S3 bucket"). See
+    /// [`S3_OBJECT_STORAGE_MODE_COPY`] and [`S3_OBJECT_STORAGE_MODE_REFERENCE`].
+    pub s3_object_storage_mode: Option<String>,
+    /// The ARN of the customer managed KMS key the .zip deployment package is encrypted
+    /// with, when the caller named one; `FunctionCodeLocation$SourceKMSKeyArn` reports
+    /// it back.
+    pub source_kms_key_arn: Option<String>,
     /// The container image URI, for an `Image` package.
     pub image_uri: Option<String>,
 }
@@ -287,6 +304,113 @@ impl CodeRecord {
     #[must_use]
     pub fn is_image(&self) -> bool {
         self.image_uri.is_some()
+    }
+}
+
+/// The members of a request that name a deployment package.
+///
+/// `CreateFunction` carries them on its `Code` member and `UpdateFunctionCode` carries
+/// them on the request itself, but they name the same package in the same forms, so both
+/// resolve them through [`resolve_package_code`] rather than each deciding for itself
+/// what a package may be.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PackageMembers<'a> {
+    /// `ZipFile` — the deployment package bytes, uploaded inline.
+    pub zip_file: Option<&'a [u8]>,
+    /// `S3Bucket` — the bucket holding the deployment package.
+    pub s3_bucket: Option<&'a str>,
+    /// `S3Key` — the key of the deployment package.
+    pub s3_key: Option<&'a str>,
+    /// `S3ObjectVersion` — "For versioned objects, the version of the deployment package
+    /// object to use."
+    pub s3_object_version: Option<&'a str>,
+    /// `S3ObjectStorageMode` — `COPY` or `REFERENCE`.
+    pub s3_object_storage_mode: Option<&'a str>,
+    /// `ImageUri` — the container image in the Amazon ECR registry.
+    pub image_uri: Option<&'a str>,
+    /// `SourceKMSKeyArn` — the customer managed key the .zip package is encrypted with.
+    pub source_kms_key_arn: Option<&'a str>,
+}
+
+impl PackageMembers<'_> {
+    /// Whether any member that only an S3-sourced package has was named.
+    fn names_s3_object(&self) -> bool {
+        self.s3_bucket.is_some()
+            || self.s3_key.is_some()
+            || self.s3_object_version.is_some()
+            || self.s3_object_storage_mode.is_some()
+    }
+}
+
+/// The [`CodeRecord`] `package_type` admits for `members`, or the message of the refusal.
+///
+/// The model states the rule on both operations: "If the function's package type is
+/// Image, then you must specify the code package in ImageUri as the URI of a container
+/// image in the Amazon ECR registry. If the function's package type is Zip, then you must
+/// specify the deployment package as a .zip file archive. Enter the Amazon S3 bucket and
+/// key of the code .zip file location. You can also provide the function code inline
+/// using the ZipFile field."
+pub fn resolve_package_code(
+    package_type: &str,
+    members: PackageMembers<'_>,
+) -> Result<CodeRecord, String> {
+    if package_type == PACKAGE_TYPE_IMAGE {
+        let Some(image_uri) = members.image_uri else {
+            return Err(
+                "ImageUri is required for a function whose PackageType is Image".to_string(),
+            );
+        };
+        if members.zip_file.is_some() || members.names_s3_object() {
+            return Err(
+                "Only ImageUri may name the code of a function whose PackageType is Image"
+                    .to_string(),
+            );
+        }
+        return Ok(CodeRecord {
+            image_uri: Some(image_uri.to_string()),
+            ..CodeRecord::default()
+        });
+    }
+
+    if members.image_uri.is_some() {
+        return Err(
+            "ImageUri may only name the code of a function whose PackageType is Image"
+                .to_string(),
+        );
+    }
+    match (members.zip_file, members.s3_bucket, members.s3_key) {
+        (Some(zip_file), None, None) if !members.names_s3_object() => {
+            // `AccountLimit$CodeSizeZipped` is "The maximum size of a deployment package
+            // when it's uploaded directly to Lambda", which is the ceiling on these
+            // bytes — and, since they are held in memory here, on the store too.
+            if i64::try_from(zip_file.len()).unwrap_or(i64::MAX) > CODE_SIZE_ZIPPED_LIMIT {
+                return Err(format!(
+                    "ZipFile must be smaller than {CODE_SIZE_ZIPPED_LIMIT} bytes for a direct \
+                     upload; use S3Bucket and S3Key for a larger deployment package"
+                ));
+            }
+            Ok(CodeRecord {
+                zip_bytes: Some(zip_file.to_vec()),
+                source_kms_key_arn: members.source_kms_key_arn.map(str::to_string),
+                ..CodeRecord::default()
+            })
+        }
+        (None, Some(bucket), Some(key)) => Ok(CodeRecord {
+            s3_bucket: Some(bucket.to_string()),
+            s3_key: Some(key.to_string()),
+            s3_object_version: members.s3_object_version.map(str::to_string),
+            s3_object_storage_mode: members.s3_object_storage_mode.map(str::to_string),
+            source_kms_key_arn: members.source_kms_key_arn.map(str::to_string),
+            ..CodeRecord::default()
+        }),
+        // Either neither form was named, or both were: the inline bytes and the S3
+        // object each name a whole package, so a request carrying members of both names
+        // no single one.
+        _ => Err(
+            "The code must name either ZipFile or both S3Bucket and S3Key for a function \
+             whose PackageType is Zip"
+                .to_string(),
+        ),
     }
 }
 
@@ -853,7 +977,8 @@ pub struct FunctionRecord {
     /// The model's `LastUpdateStatus`, first set once creation completes.
     pub last_update_status: Option<String>,
     /// When the move from [`LAST_UPDATE_STATUS_IN_PROGRESS`] to
-    /// [`LAST_UPDATE_STATUS_SUCCESSFUL`] becomes due, while an update is in flight.
+    /// [`LAST_UPDATE_STATUS_SUCCESSFUL`] becomes due, while an update is in flight. Set
+    /// by [`FunctionRecord::begin_update`].
     pub last_update_due: Option<SystemTime>,
     /// When the move to [`STATE_ACTIVE`] becomes due.
     pub active_due: SystemTime,
@@ -905,7 +1030,12 @@ impl FunctionRecord {
             self.state = STATE_ACTIVE.to_string();
             self.state_reason = None;
             self.state_reason_code = None;
-            self.last_update_status = Some(LAST_UPDATE_STATUS_SUCCESSFUL.to_string());
+            // "This is first set to Successful after function creation completes" — an
+            // update accepted while the function was still being provisioned is settled
+            // by its own due instant below, so creation completing does not settle it.
+            if self.last_update_status.is_none() {
+                self.last_update_status = Some(LAST_UPDATE_STATUS_SUCCESSFUL.to_string());
+            }
         }
         if self.last_update_due.is_some_and(|due| now >= due) {
             self.last_update_status = Some(LAST_UPDATE_STATUS_SUCCESSFUL.to_string());
@@ -923,6 +1053,39 @@ impl FunctionRecord {
                     AsyncInvocationOutcome::Failed(ASYNC_NOT_EXECUTED_REASON.to_string());
             }
         }
+    }
+
+    /// Record that an update to this function's code or configuration was accepted at
+    /// `now`: the model's `LastUpdateStatus` is [`LAST_UPDATE_STATUS_IN_PROGRESS`] until
+    /// the clock makes the move to [`LAST_UPDATE_STATUS_SUCCESSFUL`] due,
+    /// [`UPDATE_DELAY`] later.
+    pub fn begin_update(&mut self, now: SystemTime) {
+        self.last_update_status = Some(LAST_UPDATE_STATUS_IN_PROGRESS.to_string());
+        self.last_update_due = Some(now + UPDATE_DELAY);
+    }
+
+    /// Freeze `config` as this function's next published version, answering the number
+    /// it got.
+    ///
+    /// Versions are numbered from 1 upwards and a number is never reused, so the next
+    /// one follows the highest ever published rather than the count held. `None` when no
+    /// further number can be assigned.
+    pub fn publish_next_version(
+        &mut self,
+        config: FunctionConfig,
+        now: SystemTime,
+    ) -> Option<u64> {
+        let version = self.latest_version.checked_add(1)?;
+        self.versions.insert(
+            version,
+            FunctionVersionRecord {
+                version,
+                config,
+                created: iso8601(now),
+            },
+        );
+        self.latest_version = version;
+        Some(version)
     }
 
     /// Whether an update of this function is still being applied — the window
@@ -1172,11 +1335,27 @@ impl FunctionRecord {
                 &self.config.name,
                 &self.config.revision_id,
             )),
-            resolved_s3_object: self.code.s3_bucket.as_ref().map(|bucket| ResolvedS3Object {
-                s3_bucket: Some(bucket.clone()),
-                s3_key: self.code.s3_key.clone(),
-                s3_object_version: self.code.s3_object_version.clone(),
-            }),
+            // "The resolved Amazon S3 object that contains the deployment package" — in
+            // `REFERENCE` mode that object is the caller's, because "Lambda references
+            // the deployment package from the specified Amazon S3 bucket". In the default
+            // `COPY` mode Lambda "uploads a copy of your deployment package" and serves it
+            // from storage of its own, so the caller's object is no longer where the
+            // package is served from and none is reported — the same rule
+            // [`LayerVersionRecord::content`] applies to a layer archive.
+            resolved_s3_object: self
+                .code
+                .s3_bucket
+                .clone()
+                .filter(|_| {
+                    self.code.s3_object_storage_mode.as_deref()
+                        == Some(S3_OBJECT_STORAGE_MODE_REFERENCE)
+                })
+                .map(|bucket| ResolvedS3Object {
+                    s3_bucket: Some(bucket),
+                    s3_key: self.code.s3_key.clone(),
+                    s3_object_version: self.code.s3_object_version.clone(),
+                }),
+            source_kms_key_arn: self.code.source_kms_key_arn.clone(),
             ..FunctionCodeLocation::default()
         }
     }
