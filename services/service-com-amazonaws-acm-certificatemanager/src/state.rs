@@ -15,6 +15,12 @@
 //! [`acme_endpoint_detail`], and a freshly created endpoint is `CREATING` until the
 //! transition the clock owes it falls due, exactly as a pending certificate is.
 //!
+//! Beside the endpoints, one [`AcmeAccountRecord`] per ACME account registered with
+//! one of them, keyed by the (endpoint ARN, account URL) pair every ACME-account
+//! operation addresses an account by. `ListAcmeAccounts` reports that endpoint's
+//! records through [`acme_account_summary`], and deleting an endpoint drops the
+//! accounts registered with it ([`ComAmazonawsAcmCertificatemanagerState::remove_acme_endpoint`]).
+//!
 //! Beside the certificates sits the account-level singleton
 //! [`AccountConfiguration`]: `PutAccountConfiguration` writes it and
 //! `GetAccountConfiguration` reports it, so that round trip reads one record too.
@@ -31,10 +37,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AcmCertificateMetadata, AcmeEndpoint, CertificateAuthority, CertificateDetail,
-    CertificateMetadata, CertificateOptions, CertificateSearchResult, CertificateSummary,
-    DistinguishedName, DomainValidation, ExpiryEventsConfiguration, ExtendedKeyUsage, GeneralName,
-    HttpRedirect, KeyUsage, ResourceRecord, Tag, X509Attributes,
+    AcmCertificateMetadata, AcmeAccountSummary, AcmeEndpoint, CertificateAuthority,
+    CertificateDetail, CertificateMetadata, CertificateOptions, CertificateSearchResult,
+    CertificateSummary, DistinguishedName, DomainValidation, ExpiryEventsConfiguration,
+    ExtendedKeyUsage, GeneralName, HttpRedirect, KeyUsage, ResourceRecord, Tag, X509Attributes,
 };
 
 /// This service's SigV4 signing name, and the `acm` segment of every ARN it mints.
@@ -277,6 +283,21 @@ pub const ACME_ENDPOINT_STORE_LIMIT: usize = 1_000;
 /// by whichever call next touches the store (see
 /// [`ComAmazonawsAcmCertificatemanagerState::materialize_due`]).
 pub const ACME_ENDPOINT_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
+
+/// `AcmeAccountStatus` of a registered ACME account that may request and revoke
+/// certificates: the status an account carries until it is deactivated or revoked
+/// (`smithy_query(query="shape", shape="com.amazonaws.acm#AcmeAccountStatus")`
+/// declares `VALID | DEACTIVATED | REVOKED`).
+pub const ACME_ACCOUNT_STATUS_VALID: &str = "VALID";
+
+/// `AcmeAccountStatus` of an ACME account its own client deactivated (RFC 8555 §7.3.6
+/// account deactivation), which ACM reports beside the status it reaches when ACM
+/// revokes it.
+pub const ACME_ACCOUNT_STATUS_DEACTIVATED: &str = "DEACTIVATED";
+
+/// `AcmeAccountStatus` of an ACME account `RevokeAcmeAccount` has revoked, which
+/// "prevent[s] it from requesting or revoking certificates" (`RevokeAcmeAccount` doc).
+pub const ACME_ACCOUNT_STATUS_REVOKED: &str = "REVOKED";
 
 /// The account-level configuration `PutAccountConfiguration` writes and
 /// `GetAccountConfiguration` reports. One per account, so the state holds a
@@ -715,6 +736,39 @@ impl AcmeEndpointRecord {
     }
 }
 
+/// One ACME account registered with one of this account's ACME endpoints.
+///
+/// "ACME accounts are created when clients use external account binding credentials
+/// to register" (`ListAcmeAccounts` doc), i.e. by an ACME client's own `newAccount`
+/// request to the endpoint's directory URL (RFC 8555 §7.3) — no operation in this
+/// service's model creates one. So this map is written by whatever serves that
+/// registration, and every ACME-account operation (`ListAcmeAccounts` today) REPORTS
+/// these records rather than echoing its own request.
+///
+/// An account is identified by the key it registered with, which is why the record
+/// carries the thumbprint of that key beside the `AccountUrl` the server assigned it.
+#[derive(Debug, Clone)]
+pub struct AcmeAccountRecord {
+    /// The ACME endpoint the account is registered with: the ARN half of this
+    /// record's key in [`ComAmazonawsAcmCertificatemanagerState::acme_accounts`].
+    pub acme_endpoint_arn: String,
+    /// The server-assigned URL of the account resource ([`acme_account_url`]), which
+    /// is how every ACME-account operation addresses it.
+    pub account_url: String,
+    /// "The thumbprint of the public key associated with the ACME account"
+    /// (`AcmeAccount$PublicKeyThumbprint` doc) — the account's identity.
+    pub public_key_thumbprint: String,
+    /// An `AcmeAccountStatus` value.
+    pub status: String,
+    /// The external account binding the registration presented, when it presented
+    /// one (`AcmeAccount$AcmeExternalAccountBindingArn` doc).
+    pub acme_external_account_binding_arn: Option<String>,
+    /// The contact URIs the account registered with; empty when it registered none,
+    /// which an endpoint whose `Contact` is `NOT_REQUIRED` admits.
+    pub contacts: Vec<String>,
+    pub created_at: SystemTime,
+}
+
 /// What one `CreateAcmeEndpoint` idempotency token has already created.
 #[derive(Debug, Clone)]
 pub struct AcmeEndpointIdempotency {
@@ -743,6 +797,14 @@ pub struct ComAmazonawsAcmCertificatemanagerState {
     /// resolves to the endpoint it created, and the two operations' tokens must not
     /// be able to collide.
     pub acme_endpoint_idempotency: HashMap<String, AcmeEndpointIdempotency>,
+    /// (ACME endpoint ARN, account URL) -> the ACME account registered with that
+    /// endpoint under that URL. Keyed by the pair because an ACME account is addressed
+    /// by the two together (`DescribeAcmeAccount` and `RevokeAcmeAccount` both take
+    /// `AcmeEndpointArn` + `AccountUrl`), and a `BTreeMap` on the pair so one
+    /// endpoint's accounts are a contiguous range walked in one deterministic order —
+    /// which is the order `ListAcmeAccounts` pages through
+    /// ([`Self::acme_accounts_of`]).
+    pub acme_accounts: BTreeMap<(String, String), AcmeAccountRecord>,
     /// The account's expiry-events configuration, as the last successful
     /// `PutAccountConfiguration` wrote it, and `None` until one has — when ACM is
     /// running the account on the documented default,
@@ -807,7 +869,28 @@ impl ComAmazonawsAcmCertificatemanagerState {
         let removed = self.acme_endpoints.remove(arn)?;
         self.acme_endpoint_idempotency
             .retain(|_, seen| seen.acme_endpoint_arn != arn);
+        // An ACME account exists only on the endpoint it registered with, so the
+        // endpoint's accounts go with it: "after deletion, the endpoint URL is no
+        // longer accessible" (`DeleteAcmeEndpoint` doc), and an account left behind
+        // would be reachable through an ARN with no record behind it.
+        self.acme_accounts
+            .retain(|(endpoint_arn, _), _| endpoint_arn != arn);
         Some(removed)
+    }
+
+    /// Every ACME account registered with `acme_endpoint_arn`, in the order
+    /// `ListAcmeAccounts` pages through them (by account URL).
+    ///
+    /// A range scan over the key pair's first half, so the walk touches only that
+    /// endpoint's accounts however many other endpoints the store holds.
+    pub fn acme_accounts_of<'a>(
+        &'a self,
+        acme_endpoint_arn: &'a str,
+    ) -> impl Iterator<Item = &'a AcmeAccountRecord> + 'a {
+        self.acme_accounts
+            .range((acme_endpoint_arn.to_string(), String::new())..)
+            .take_while(move |((endpoint_arn, _), _)| endpoint_arn == acme_endpoint_arn)
+            .map(|(_, account)| account)
     }
 
     /// Drop `arn`'s record and every idempotency entry that resolves to it, so a
@@ -870,6 +953,19 @@ pub fn acme_endpoint_arn(region: &str, endpoint_id: &str) -> String {
 /// (RFC 8555 §7.1.1).
 pub fn acme_endpoint_url(region: &str, endpoint_id: &str) -> String {
     format!("https://{endpoint_id}.acme.{region}.amazonaws.com/directory")
+}
+
+/// The URL of the ACME account resource an endpoint assigned a registration.
+///
+/// `AcmeAccount$AccountUrl` is documented only as "The URL of the ACME account", and
+/// nothing in this service's model lets a caller propose one, so what matters is the
+/// invariant: the URL is SERVER-ASSIGNED, sits under the same host as the endpoint's
+/// own directory URL ([`acme_endpoint_url`]), and is unique per account. It names the
+/// `account` resource an ACME server hands back in the `Location` header of a
+/// successful `newAccount` (RFC 8555 §7.3), which the client then uses as its account
+/// URL.
+pub fn acme_account_url(region: &str, endpoint_id: &str, account_id: &str) -> String {
+    format!("https://{endpoint_id}.acme.{region}.amazonaws.com/acct/{account_id}")
 }
 
 /// The `ResourceNotFoundException` message for an ACME endpoint ARN that no stored
@@ -991,6 +1087,41 @@ pub const NOT_ISSUED_MESSAGE: &str = "The selected certificate is not Issued and
 /// repair an opaque value, it can only restart the walk. Rendered here so every
 /// paginated read that answers this class reports the same sentence.
 pub const INVALID_NEXT_TOKEN_MESSAGE: &str = "Invalid next token.";
+
+/// The byte that separates the two halves of a parent-scoped pagination cursor
+/// ([`encode_page_cursor`]). It is outside every ARN pattern this service mints, and
+/// outside a domain name or an `https` URL, so it cannot occur inside either value it
+/// joins.
+pub const PAGE_CURSOR_SEPARATOR: char = '\u{1f}';
+
+/// The opaque `NextToken` for the position a page of one parent resource's
+/// sub-resources stopped at.
+///
+/// It carries the PARENT the page was cut from as well as the position in it, so a
+/// token issued for one parent cannot resume another's list, where the same position
+/// would name a different place. Hex-encoded, so the token is opaque to the caller and
+/// satisfies the `^[\u0009\u000A\u000D\u0020-\u00FF]*$` pattern a `NextToken` member
+/// carries whatever the two values contain.
+///
+/// Rendered here so every paginated read that walks a parent's sub-resources in one
+/// key's order issues ONE token form, with [`decode_page_cursor`] as its only reader.
+/// (The certificate listings page in an order built from several keys at once, so they
+/// frame their own cursors.)
+pub fn encode_page_cursor(parent: &str, position: &str) -> String {
+    hex::encode(format!("{parent}{PAGE_CURSOR_SEPARATOR}{position}"))
+}
+
+/// The position inside a `NextToken` [`encode_page_cursor`] issued for `parent`, or
+/// `None` when the token did not come from it for that parent — which every caller
+/// refuses with [`INVALID_NEXT_TOKEN_MESSAGE`].
+///
+/// Every step is fallible on purpose: the token is caller-supplied, so no value read
+/// out of it may panic a handler or silently resume somebody else's list.
+pub fn decode_page_cursor(token: &str, parent: &str) -> Option<String> {
+    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    let (named_parent, position) = decoded.split_once(PAGE_CURSOR_SEPARATOR)?;
+    (named_parent == parent && !position.is_empty()).then(|| position.to_string())
+}
 
 /// The `ValidationException` message for an operation asked of a certificate export
 /// was never allowed for, built from the ARN the request asked for.
@@ -1560,6 +1691,26 @@ pub fn acme_endpoint_detail(endpoint: &AcmeEndpointRecord) -> AcmeEndpoint {
             .then(|| tag_list(&endpoint.certificate_tags)),
         created_at: Some(to_date_time(endpoint.created_at)),
         updated_at: Some(to_date_time(endpoint.updated_at)),
+    }
+}
+
+/// A stored ACME account as `ListAcmeAccounts`' `AcmeAccountSummary`.
+///
+/// Every member is read off the record: the summary and `DescribeAcmeAccount`'s
+/// `AcmeAccount` carry the same members, so both project this one record and cannot
+/// disagree. `AcmeExternalAccountBindingArn` is present only for an account that
+/// registered against a binding, and `Contacts` only for one that registered contact
+/// information — "the contact information for the ACME account"
+/// (`AcmeAccountSummary$Contacts` doc), which an endpoint whose `Contact` is
+/// `NOT_REQUIRED` need not have.
+pub fn acme_account_summary(account: &AcmeAccountRecord) -> AcmeAccountSummary {
+    AcmeAccountSummary {
+        account_url: Some(account.account_url.clone()),
+        public_key_thumbprint: Some(account.public_key_thumbprint.clone()),
+        status: Some(account.status.clone()),
+        created_at: Some(to_date_time(account.created_at)),
+        acme_external_account_binding_arn: account.acme_external_account_binding_arn.clone(),
+        contacts: (!account.contacts.is_empty()).then(|| account.contacts.clone()),
     }
 }
 
