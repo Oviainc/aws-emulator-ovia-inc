@@ -13,8 +13,6 @@
 //! `connection_lifecycle` suite's helpers (`router`, `call`, `create`), so these tests
 //! exercise the same path a signed SDK request takes.
 
-use std::sync::Arc;
-
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_codeconnections_codeconnections_20231201::ops::types::SyncBlockerContext;
@@ -22,7 +20,7 @@ use service_com_amazonaws_codeconnections_codeconnections_20231201::state::{
     ComAmazonawsCodeconnectionsCodeconnections20231201State, StoredSyncBlocker,
 };
 
-use super::connection_lifecycle::{PROVIDER_TYPES, REGION, call, create, router};
+use super::connection_lifecycle::{PROVIDER_TYPES, REGION, call, create, router, router_with_engine};
 
 /// The only value the modeled `SyncConfigurationType` enum accepts, from
 /// `smithy_query(query="shape", shape="SyncConfigurationType")`.
@@ -1267,21 +1265,6 @@ async fn deleting_a_sync_configuration_is_idempotent() {
             case.label
         );
     }
-}
-
-/// One emulator holding only this service, plus the engine its state lives in — so a
-/// test can seed a resource only the SERVICE mints (a sync blocker) and then drive the
-/// operation that reads it over the wire.
-fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_codeconnections_codeconnections_20231201::EmulatedService::new(
-            Arc::clone(&engine),
-        ),
-    );
-    (router, engine)
 }
 
 /// One sync blocker a test seeds into state, and the reason it then resolves it with.
