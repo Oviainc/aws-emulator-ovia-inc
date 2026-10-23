@@ -15,6 +15,8 @@
 mod audit_records;
 #[path = "all/dashboard_lifecycle.rs"]
 mod dashboard_lifecycle;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/scheduled_report_lifecycle.rs"]
 mod scheduled_report_lifecycle;
 #[path = "all/state_roundtrip.rs"]

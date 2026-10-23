@@ -32,14 +32,17 @@ fn expected_principal() -> String {
 }
 
 /// One dispatched request's answer.
-struct Reply {
-    status: u16,
-    body: Value,
+///
+/// `pub(crate)`, like [`Emulator`], so the other suites in this test target drive the
+/// emulator through this one harness instead of each declaring its own.
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
 }
 
 impl Reply {
     /// The restJson1 error code (`__type`), or `""` on a success body.
-    fn error_code(&self) -> &str {
+    pub(crate) fn error_code(&self) -> &str {
         self.body
             .get("__type")
             .and_then(Value::as_str)
@@ -62,30 +65,36 @@ impl Reply {
 
 /// The emulator under test: one engine, one service, one router — exactly what
 /// `core/router` assembles in production.
-struct Emulator {
+///
+/// `pub(crate)` because every suite in this test target shares it; the engine is kept
+/// beside the router so a suite can inspect (or seed) the very store the handlers read.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
         router.register_service(
-            service_com_amazonaws_ssmincidents_ssmincidents::EmulatedService::new(engine),
+            service_com_amazonaws_ssmincidents_ssmincidents::EmulatedService::new(Arc::clone(
+                &engine,
+            )),
         );
-        Self { router }
+        Self { router, engine }
     }
 
-    async fn post(&self, path: &str, body: Value) -> Reply {
+    pub(crate) async fn post(&self, path: &str, body: Value) -> Reply {
         self.call("POST", path, Some(body)).await
     }
 
-    async fn get(&self, path: &str) -> Reply {
+    pub(crate) async fn get(&self, path: &str) -> Reply {
         self.call("GET", path, None).await
     }
 
-    async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Reply {
+    pub(crate) async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Reply {
         let payload = body
             .map(|value| bytes::Bytes::from(serde_json::to_vec(&value).expect("serialize body")))
             .unwrap_or_default();

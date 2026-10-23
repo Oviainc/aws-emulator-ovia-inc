@@ -203,6 +203,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // `CommitId` carries no modelled length, so an EMPTY id reaches the handler
+        // and names no commit at all: the service has a dedicated error for "A commit
+        // ID was not specified", which is what an empty value is.
+        if input.commit_id.is_empty() {
+            return Err(CreateBranchErrorModeled::CommitIdRequiredException(
+                CommitIdRequiredException {
+                    message: Some("a commit ID was not specified".to_string()),
+                },
+            )
+            .into());
+        }
         if !crate::state::is_object_id(&input.commit_id) {
             return Err(CreateBranchErrorModeled::InvalidCommitIdException(
                 InvalidCommitIdException {

@@ -10,15 +10,16 @@
 //! compute each one way instead of once per handler.
 
 use crate::ops::types::{
-    AccessPoint, AsyncOperation, AsyncRequestParameters, AsyncResponseDetails,
-    CreateMultiRegionAccessPointInput2, DeleteMultiRegionAccessPointInput2,
+    AccessPoint, AsyncOperation, AsyncRequestParameters, AsyncResponseDetails, CreateJobInput,
+    CreateMultiRegionAccessPointInput2, DeleteMultiRegionAccessPointInput2, JobDescriptor,
+    JobManifest, JobManifestGenerator, JobOperation, JobReport,
     MultiRegionAccessPointRegionalResponse, MultiRegionAccessPointReport,
-    MultiRegionAccessPointsAsyncResponse, PublicAccessBlockConfiguration, RegionReport,
+    MultiRegionAccessPointsAsyncResponse, PublicAccessBlockConfiguration, RegionReport, S3Tag,
     StorageLensConfiguration, StorageLensTag, Tag, VpcConfiguration, ASYNC_OPERATION_NAME_VALUES,
-    MULTI_REGION_ACCESS_POINT_STATUS_VALUES, NETWORK_ORIGIN_VALUES,
+    JOB_STATUS_VALUES, MULTI_REGION_ACCESS_POINT_STATUS_VALUES, NETWORK_ORIGIN_VALUES,
 };
 use std::collections::BTreeMap;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// One stored access point: everything `GetAccessPoint`, `ListAccessPoints` and
 /// `GetAccessPointPolicy` report, recorded by `CreateAccessPoint`.
@@ -151,6 +152,165 @@ pub const STORAGE_LENS_CONFIGURATION_QUOTA: usize = 1_000;
 pub const MAX_STORAGE_LENS_TAGS: usize = 50;
 
 // ---------------------------------------------------------------------------
+// S3 Batch Operations jobs
+//
+// `CreateJob` records a job here and every job operation reads the one record
+// it stored: `DescribeJob` reports it, the job tagging operations read and
+// replace its tag set, and `UpdateJobPriority` / `UpdateJobStatus` move its
+// members (those four are still scaffolds with their own gap issues).
+// ---------------------------------------------------------------------------
+
+/// `JobStatus` of a job the service has accepted and not yet prepared — the
+/// status a `CreateJob` that needs no confirmation leaves the job in.
+pub const JOB_STATUS_NEW: &str = "New";
+
+/// `JobStatus` of a job that has been prepared and is waiting for its tasks to
+/// be run.
+pub const JOB_STATUS_READY: &str = "Ready";
+
+/// `JobStatus` of a job that is waiting for confirmation before it runs, which
+/// is what `JobDescriptor$SuspendedCause` documents a created job enters when
+/// confirmation is required: "When you create the job, it enters the Suspended
+/// state to await confirmation before running."
+pub const JOB_STATUS_SUSPENDED: &str = "Suspended";
+
+/// The `SuspendedCause` of a job held in [`JOB_STATUS_SUSPENDED`] by its own
+/// `ConfirmationRequired`, from the sentence above: it is awaiting
+/// confirmation. `SuspendedCause` is a plain string in the model (len 1..1024),
+/// so the model names no catalog of causes.
+pub const SUSPENDED_AWAITING_CONFIRMATION: &str = "AwaitingConfirmation";
+
+/// How long a created job takes to leave [`JOB_STATUS_NEW`].
+///
+/// A span chosen by this emulator (AWS documents no duration for it), inside
+/// the 250–750 ms band this project fixes for a transition the clock owes. It
+/// is never zero, so a caller that describes the job straight after creating it
+/// still sees `New`.
+pub const JOB_PREPARATION: Duration = Duration::from_millis(500);
+
+/// How many jobs the store holds before `CreateJob` refuses another.
+///
+/// S3 Batch Operations publishes an adjustable quota on jobs, and this emulator
+/// models neither Service Quotas nor an account's adjustments — so this is the
+/// emulator's OWN bound on the store rather than a claim about any account's
+/// limit. It is set far above any workflow an emulator serves, and it is what
+/// stops the job store growing without end: every member of a job record is
+/// length-bounded by the model, and a repeated `CreateJob` carrying one
+/// `ClientRequestToken` adds no record at all.
+pub const JOB_QUOTA: usize = 1_000;
+
+/// How a stored job is keyed: the owning account id and the job id, which is
+/// the pair a job id is unique within.
+pub type JobKey = (String, String);
+
+/// One stored S3 Batch Operations job: every member `DescribeJob` reports,
+/// recorded by `CreateJob`.
+#[derive(Debug, Clone)]
+pub struct JobRecord {
+    /// The service-assigned job id, which is also the second half of the key.
+    pub job_id: String,
+    /// The account that created the job — the first half of the key, kept on
+    /// the record so a record passed on its own still names its owner.
+    pub account_id: String,
+    /// The job's ARN, assigned by this service (see [`job_arn`]).
+    pub arn: String,
+    /// The job's current status: one of [`JOB_STATUS_VALUES`].
+    pub status: String,
+    pub confirmation_required: Option<bool>,
+    pub description: Option<String>,
+    /// The manifest the create named, if it named one rather than a generator.
+    pub manifest: Option<JobManifest>,
+    /// The manifest generator the create named, if it named one rather than a
+    /// manifest.
+    pub manifest_generator: Option<JobManifestGenerator>,
+    pub operation: JobOperation,
+    pub priority: i32,
+    pub report: JobReport,
+    pub role_arn: String,
+    pub creation_time: ::aws_smithy_types::DateTime,
+    pub suspended_date: Option<::aws_smithy_types::DateTime>,
+    pub suspended_cause: Option<String>,
+    /// The reason carried by the last `UpdateJobStatus`; `None` until one
+    /// arrives, which is what `DescribeJob` reports as an absent member.
+    pub status_update_reason: Option<String>,
+    /// When the job reached a terminal status; `None` while it has not.
+    pub termination_date: Option<::aws_smithy_types::DateTime>,
+    /// The job's tag set, as `CreateJob` was given it. The job tagging
+    /// operations (`GetJobTagging`, `PutJobTagging`, `DeleteJobTagging`) are
+    /// still scaffolds with their own gap issues, and will read this field
+    /// rather than a second copy.
+    pub tags: Vec<S3Tag>,
+    /// The `ClientRequestToken` the create carried, which is what makes a
+    /// repeated create idempotent rather than a second job.
+    pub client_request_token: String,
+    /// A digest of the create parameters BESIDE the token (see
+    /// [`create_job_fingerprint`]), so a repeat of the same token can be told
+    /// from a different request reusing it.
+    pub request_fingerprint: String,
+    /// When the transition out of [`JOB_STATUS_NEW`] falls due; `None` once it
+    /// has been materialised (or when the job was never in `New`). Stored as an
+    /// instant rather than slept for.
+    pub status_due_at: Option<SystemTime>,
+}
+
+impl JobRecord {
+    /// The record as the `JobDescriptor` shape `DescribeJob` returns.
+    ///
+    /// `ProgressSummary` and `FailureReasons` are absent: this emulator runs no
+    /// batch tasks, so there is no task count or failure to report — and a
+    /// synthesised one would be a claim about work nothing did.
+    pub fn descriptor(&self) -> JobDescriptor {
+        JobDescriptor {
+            job_id: Some(self.job_id.clone()),
+            confirmation_required: self.confirmation_required,
+            description: self.description.clone(),
+            job_arn: Some(self.arn.clone()),
+            status: Some(self.status.clone()),
+            manifest: self.manifest.clone(),
+            operation: Some(self.operation.clone()),
+            priority: self.priority,
+            progress_summary: None,
+            status_update_reason: self.status_update_reason.clone(),
+            failure_reasons: None,
+            report: Some(self.report.clone()),
+            creation_time: Some(self.creation_time),
+            termination_date: self.termination_date,
+            role_arn: Some(self.role_arn.clone()),
+            suspended_date: self.suspended_date,
+            suspended_cause: self.suspended_cause.clone(),
+            manifest_generator: self.manifest_generator.clone(),
+            // A generated manifest is described only once a generator has
+            // actually written one, and nothing in this emulator does.
+            generated_manifest_descriptor: None,
+        }
+    }
+
+    /// Apply the transition the clock already owed this job at `now`: a job
+    /// leaves [`JOB_STATUS_NEW`] for [`JOB_STATUS_READY`] once its preparation
+    /// span has passed.
+    ///
+    /// This materialises a change that was due at the same instant whether or
+    /// not anybody called — it is not a move made because the job was read.
+    fn materialize_due(&mut self, now: SystemTime) {
+        if self.status != JOB_STATUS_NEW {
+            return;
+        }
+        if self.status_due_at.is_some_and(|due| due <= now) {
+            self.status = job_status(JOB_STATUS_READY);
+            self.status_due_at = None;
+        }
+    }
+}
+
+/// The spelling of a job status that goes on the wire: the one the generated
+/// [`JOB_STATUS_VALUES`] carries (from the model's `JobStatus` enum), found by
+/// VALUE rather than by position, so neither a reordering of the generated list
+/// nor a typo in a constant above can change what is returned.
+pub fn job_status(wanted: &'static str) -> String {
+    modelled_value(JOB_STATUS_VALUES, wanted)
+}
+
+// ---------------------------------------------------------------------------
 // Multi-Region Access Points, and the asynchronous requests that manage them.
 // ---------------------------------------------------------------------------
 
@@ -207,6 +367,95 @@ fn modelled_value(values: &[&'static str], wanted: &'static str) -> String {
         .find(|value| *value == wanted)
         .unwrap_or(wanted)
         .to_string()
+}
+
+/// The ARN of a job: the `job/<job-id>` resource in this service's ARN
+/// namespace (`s3`, per the model's `awsService.arnNamespace`), which is the
+/// form `JobDescriptor$JobArn` states
+/// (`^arn:[^:]+:s3:[a-zA-Z0-9\-]+:\d{12}:job\/`).
+///
+/// The account segment comes from [`::emulator_server::emulator_arn`], the
+/// single source of truth for the canonical emulator account.
+pub fn job_arn(region: &str, job_id: &str) -> String {
+    ::emulator_server::emulator_arn("s3", region, &format!("job/{job_id}"))
+}
+
+/// A digest of everything a `CreateJob` asked for EXCEPT its
+/// `ClientRequestToken` and the account it names, which is what lets a repeat
+/// of one token be answered with the job it already created while a DIFFERENT
+/// request reusing that token is refused.
+///
+/// The members are rendered with `Debug` — the one total, structural rendering
+/// every modelled shape in this service derives — and hashed with SHA-256, so
+/// two creates agree here exactly when they asked for the same job. The input
+/// is destructured rather than field-accessed, so a member the model adds to
+/// `CreateJobRequest` is a compile error here rather than a difference two
+/// creates could disagree on unnoticed.
+pub fn create_job_fingerprint(input: &CreateJobInput) -> String {
+    use sha2::Digest;
+
+    let CreateJobInput {
+        // Not part of the fingerprint: the token is what this digest is
+        // compared ACROSS, and the account id is already the scope the token is
+        // looked up in.
+        account_id: _,
+        client_request_token: _,
+        confirmation_required,
+        operation,
+        report,
+        manifest,
+        description,
+        priority,
+        role_arn,
+        tags,
+        manifest_generator,
+    } = input;
+    let rendered = format!(
+        "{operation:?}\u{1f}{report:?}\u{1f}{manifest:?}\u{1f}{manifest_generator:?}\u{1f}\
+         {description:?}\u{1f}{priority:?}\u{1f}{role_arn:?}\u{1f}{confirmation_required:?}\u{1f}\
+         {tags:?}"
+    );
+    hex::encode(sha2::Sha256::digest(rendered.as_bytes()))
+}
+
+/// A fresh job id, in the shape S3 Batch Operations gives one: a version-4
+/// UUID, `8-4-4-4-12` lowercase hex with the version and variant bits RFC 4122
+/// §4.4 fixes — 36 characters, which is the maximum the modelled `JobId` (len
+/// 5..36, pattern `^[a-zA-Z0-9\-\_]+$`) admits.
+///
+/// The 128 bits come from three sources hashed together with SHA-256: the
+/// OS-seeded randomness a `RandomState` draws, the system clock in nanoseconds,
+/// and `sequence` — a counter the store hands out, so two creates in the same
+/// nanosecond cannot collide. A job id names a resource; a credential would
+/// come from the credential store instead, never from here.
+fn new_job_uuid(sequence: u64) -> String {
+    use sha2::Digest;
+    use std::collections::hash_map::RandomState;
+    use std::hash::BuildHasher;
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(RandomState::new().hash_one(sequence).to_le_bytes());
+    hasher.update(nanos.to_le_bytes());
+    hasher.update(sequence.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    // RFC 4122 §4.4: the version nibble is 4, and the variant's two top bits
+    // are `10`.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let rendered = hex::encode(bytes);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &rendered[0..8],
+        &rendered[8..12],
+        &rendered[12..16],
+        &rendered[16..20],
+        &rendered[20..32]
+    )
 }
 
 /// One of [`STATUS_CREATING`], [`STATUS_READY`] or [`STATUS_DELETING`], spelled
@@ -414,6 +663,21 @@ pub struct ComAmazonawsS3controlAwss3controlservicev20180820State {
     pub storage_lens_configurations:
         BTreeMap<StorageLensConfigurationKey, StorageLensConfigurationRecord>,
 
+    /// S3 Batch Operations jobs by (account id, job id).
+    ///
+    /// A `BTreeMap` for the same reason as `access_points`: `ListJobs` is
+    /// `@paginated`, and a page token can only resume a scan whose order does
+    /// not change between calls.
+    ///
+    /// BOUNDED: `CreateJob` refuses past [`JOB_QUOTA`] records, and a repeated
+    /// create carrying one `ClientRequestToken` adds none; every member of a
+    /// record is length-bounded by the model.
+    pub jobs: BTreeMap<JobKey, JobRecord>,
+
+    /// How many job ids this store has minted, so two ids are distinct even
+    /// when the clock reports the same nanosecond (see [`new_job_uuid`]).
+    minted_job_ids: u64,
+
     /// Multi-Region Access Points by (account id, name).
     ///
     /// A `BTreeMap` for the same reason as `access_points`:
@@ -437,6 +701,44 @@ pub struct ComAmazonawsS3controlAwss3controlservicev20180820State {
 }
 
 impl ComAmazonawsS3controlAwss3controlservicev20180820State {
+    /// A fresh job id for a job this store is about to hold, over this store's
+    /// own counter (see [`new_job_uuid`]).
+    pub fn new_job_id(&mut self) -> String {
+        self.minted_job_ids = self.minted_job_ids.wrapping_add(1);
+        new_job_uuid(self.minted_job_ids)
+    }
+
+    /// Apply every job transition the clock already owed at `now`.
+    ///
+    /// Called by the operations that report or move a job, so what they answer
+    /// is what the clock had already made due — never a move caused by the read
+    /// itself. The scan is over the whole job store, which [`JOB_QUOTA`]
+    /// bounds.
+    pub fn materialize_due_jobs(&mut self, now: SystemTime) {
+        for job in self.jobs.values_mut() {
+            job.materialize_due(now);
+        }
+    }
+
+    /// The job `job_id` names under `account_id`, or `None` when that account
+    /// owns no such job.
+    pub fn job(&self, account_id: &str, job_id: &str) -> Option<&JobRecord> {
+        self.jobs
+            .get(&(account_id.to_string(), job_id.to_string()))
+    }
+
+    /// The job this account already created with `client_request_token`, if
+    /// any: the record a repeated create is answered from.
+    pub fn job_by_client_request_token(
+        &self,
+        account_id: &str,
+        client_request_token: &str,
+    ) -> Option<&JobRecord> {
+        self.jobs.values().find(|job| {
+            job.account_id == account_id && job.client_request_token == client_request_token
+        })
+    }
+
     /// Materialise every Multi-Region Access Point transition the clock already
     /// owes at `now`: a creating access point reaches `READY`, and a deleting
     /// one is released.
@@ -845,6 +1147,23 @@ pub fn too_many_storage_lens_configurations<E>() -> crate::scaffolded::Scaffolde
             "This emulator holds the maximum of {STORAGE_LENS_CONFIGURATION_QUOTA} \
              Storage Lens configurations."
         ),
+    )
+}
+
+/// `InvalidRequest` (HTTP 400): the account the request names owns no job of
+/// that id.
+///
+/// The model binds `NotFoundException` to `DescribeJob`, but the recorded
+/// behaviour of this service for a well-formed id that names no job is the
+/// S3-style XML envelope with code `InvalidRequest` and HTTP 400 (example
+/// message "Job not found"), so that is what the job-id surface answers —
+/// uniformly, so `DescribeJob` and the job tagging operations cannot drift on
+/// it.
+pub fn job_not_found<E>(job_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "InvalidRequest",
+        400,
+        format!("Job not found: {job_id}"),
     )
 }
 

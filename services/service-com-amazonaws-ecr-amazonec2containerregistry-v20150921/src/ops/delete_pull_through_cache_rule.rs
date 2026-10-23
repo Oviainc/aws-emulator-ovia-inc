@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePullThroughCacheRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeletePullThroughCacheRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeletePullThroughCacheRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the pull through cache rule the registry holds for one `ecrRepositoryPrefix`,
+//! reporting the record as it stood at the moment it was removed. The rule table in
+//! [`crate::state`] is the single record every pull through cache rule operation reads,
+//! so after this call `DescribePullThroughCacheRules`, `UpdatePullThroughCacheRule` and
+//! `ValidatePullThroughCacheRule` no longer find that prefix either.
 //!
 //! ## Shape of an operation
 //!
@@ -129,6 +126,14 @@ impl From<DeletePullThroughCacheRuleErrorModeled> for DeletePullThroughCacheRule
     }
 }
 
+/// The rule this operation removes lives in [`crate::state`], so the shared failures
+/// those helpers raise are mapped onto this operation's own modelled error here.
+fn invalid_parameter(fault: crate::state::Fault) -> DeletePullThroughCacheRuleErrorModeled {
+    DeletePullThroughCacheRuleErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(fault.message().to_string()),
+    })
+}
+
 /// The `DeletePullThroughCacheRule` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -163,20 +168,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeletePullThroughCacheRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeletePullThroughCacheRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeletePullThroughCacheRule"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeletePullThroughCacheRuleErrorModeled::ServerException(
+                ServerException {
+                    message: Some("the ecr registry store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `registryId` names the registry holding the rule; this emulator serves exactly
+        // one registry — its own account's.
+        crate::state::check_registry(input.registry_id.as_ref()).map_err(invalid_parameter)?;
+
+        let mut store = state.lock();
+        // A delete addresses a rule by its prefix, whichever way the trailing slash the
+        // prefix documentation calls assumed is written, and removes it from the one rule
+        // table every pull through cache rule operation reads. A prefix no rule answers
+        // to is refused rather than reported as deleted, so a delete is not idempotent:
+        // the second one cannot find the rule the first removed.
+        let key = crate::state::normalize_prefix(&input.ecr_repository_prefix);
+        let Some(rule) = store.pull_through_cache_rules.remove(&key) else {
+            return Err(
+                DeletePullThroughCacheRuleErrorModeled::PullThroughCacheRuleNotFoundException(
+                    PullThroughCacheRuleNotFoundException {
+                        message: Some(crate::state::pull_through_cache_rule_not_found_message(
+                            &input.ecr_repository_prefix,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Everything reported back is the record that was just removed, read off the
+        // stored rule rather than echoed from the request, so a delete and the create it
+        // undoes cannot disagree. `upstreamRegistry` is not among this operation's output
+        // members, so the removed rule's copy of it is not reported.
+        Ok(DeletePullThroughCacheRuleOutput {
+            ecr_repository_prefix: rule.ecr_repository_prefix,
+            upstream_registry_url: rule.upstream_registry_url,
+            created_at: rule.created_at,
+            registry_id: rule.registry_id,
+            credential_arn: rule.credential_arn,
+            custom_role_arn: rule.custom_role_arn,
+            upstream_repository_prefix: rule.upstream_repository_prefix,
+        })
     }
 }
+

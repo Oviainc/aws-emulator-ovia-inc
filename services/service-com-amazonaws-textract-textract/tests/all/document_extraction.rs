@@ -136,7 +136,18 @@ fn collapse(text: &str) -> String {
 
 /// Every invariant a Textract block graph holds, whatever the document or the
 /// requested features.
-pub(crate) fn assert_block_graph(case: &str, body: &Value, blocks: &[Value]) {
+///
+/// `expected_confidence` is the one value every block of this answer must report, when
+/// the caller knows it: a document whose text was read VERBATIM reports
+/// `state::EXTRACTED_TEXT_CONFIDENCE`, while a raster reports the confidence its
+/// recogniser measured, which only the service knows. Either way every block of ONE
+/// answer reports the SAME value, because they all describe one document's text.
+pub(crate) fn assert_block_graph(
+    case: &str,
+    body: &Value,
+    blocks: &[Value],
+    expected_confidence: Option<f32>,
+) {
     let pages = body
         .get("DocumentMetadata")
         .and_then(|m| m.get("Pages"))
@@ -170,6 +181,9 @@ pub(crate) fn assert_block_graph(case: &str, body: &Value, blocks: &[Value]) {
         page_blocks.len()
     );
 
+    // Every block of one answer describes one document's text, so they all report that
+    // document's one confidence; the first one seen fixes it for the rest.
+    let mut shared_confidence: Option<f64> = None;
     for block in blocks {
         // `BLOCK_TYPE_VALUES` / `RELATIONSHIP_TYPE_VALUES` / `ENTITY_TYPE_VALUES` are
         // the BlockType, RelationshipType and EntityType enums of the Smithy model.
@@ -219,11 +233,16 @@ pub(crate) fn assert_block_graph(case: &str, body: &Value, blocks: &[Value]) {
                 "case {case:?}: block {} Confidence is {confidence}, outside Percent's 0..=100",
                 block_id(block)
             );
+            let expected = expected_confidence
+                .map(f64::from)
+                .or(shared_confidence)
+                .unwrap_or(confidence);
+            shared_confidence = Some(expected);
             assert!(
-                (confidence - f64::from(state::EXTRACTED_TEXT_CONFIDENCE)).abs() < 0.001,
-                "case {case:?}: block {} must report the one documented confidence {}, got {confidence}",
-                block_id(block),
-                state::EXTRACTED_TEXT_CONFIDENCE
+                (confidence - expected).abs() < 0.001,
+                "case {case:?}: block {} must report this document's one confidence \
+                 {expected}, got {confidence}",
+                block_id(block)
             );
         }
         for rel in block
@@ -421,7 +440,12 @@ async fn detect_document_text_reports_the_text_the_document_holds() {
             "case {:?}: expected blocks, got {body}",
             case.name
         );
-        assert_block_graph(case.name, &body, &blocks);
+        assert_block_graph(
+            case.name,
+            &body,
+            &blocks,
+            Some(state::EXTRACTED_TEXT_CONFIDENCE),
+        );
         assert_text_detection_only(case.name, &blocks);
         assert_eq!(
             body.get("DetectDocumentTextModelVersion")
@@ -483,9 +507,10 @@ async fn detect_document_text_reports_the_text_the_document_holds() {
 async fn detect_document_text_refuses_a_document_whose_text_it_cannot_read() {
     let router = harness();
 
-    // A PNG signature followed by bytes that are not text: a real raster, which this
-    // emulator runs no OCR engine for.
-    let png = [
+    // A PNG signature followed by bytes that are not a PNG body: a document in a format
+    // Textract accepts, which cannot be decoded — `BadDocumentException`, not
+    // "unsupported format".
+    let truncated_png = [
         0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x01, 0x02, 0xFF,
     ];
     // Over `state::MAX_BLOCKS_PER_DOCUMENT` once expanded: one LINE and one WORD each.
@@ -494,8 +519,13 @@ async fn detect_document_text_refuses_a_document_whose_text_it_cannot_read() {
 
     let cases: Vec<(&str, Value, &str)> = vec![
         (
-            "a raster this emulator cannot OCR",
-            json!({ "Bytes": aws_smithy_types::base64::encode(png) }),
+            "a truncated PNG, which is a supported format this service cannot decode",
+            json!({ "Bytes": aws_smithy_types::base64::encode(truncated_png) }),
+            "BadDocumentException",
+        ),
+        (
+            "bytes in no format this service reads",
+            json!({ "Bytes": aws_smithy_types::base64::encode([0x00u8, 0x01, 0x02, 0xFF]) }),
             "UnsupportedDocumentException",
         ),
         (
@@ -678,7 +708,12 @@ async fn analyze_document_block_set_follows_the_requested_feature_types() {
         }
 
         let blocks = blocks_of(&body);
-        assert_block_graph(case.name, &body, &blocks);
+        assert_block_graph(
+            case.name,
+            &body,
+            &blocks,
+            Some(state::EXTRACTED_TEXT_CONFIDENCE),
+        );
         assert_eq!(
             body.get("AnalyzeDocumentModelVersion")
                 .and_then(Value::as_str),
@@ -875,7 +910,7 @@ async fn a_document_wider_than_the_page_grid_still_lays_out() {
             blocks.len()
         );
         // assert_block_graph checks every bounding box stays inside 0..=1.
-        assert_block_graph(&case, &body, &blocks);
+        assert_block_graph(&case, &body, &blocks, Some(state::EXTRACTED_TEXT_CONFIDENCE));
     }
 }
 

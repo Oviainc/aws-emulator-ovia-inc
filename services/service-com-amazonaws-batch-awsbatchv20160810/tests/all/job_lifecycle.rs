@@ -35,7 +35,7 @@ use service_com_amazonaws_batch_awsbatchv20160810::{state, EmulatedService};
 const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 Credential=AKIDTEST/20240101/us-east-1/batch/aws4_request, SignedHeaders=host, Signature=0000";
 
 /// The region of the credential scope above.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The `JobStatus` values, in the order AWS Batch moves a job through them. Source: the
 /// model's `com.amazonaws.batch#JobStatus` enum
@@ -65,6 +65,9 @@ fn status_rank(status: &str) -> u8 {
 /// client reaches it.
 pub(crate) struct Batch {
     router: smithy_server_runtime::MultiServiceRouter,
+    /// The SAME engine the mounted service holds, so a test can read or seed the store
+    /// the handlers read and write.
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Batch {
@@ -72,8 +75,17 @@ impl Batch {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = smithy_server_runtime::MultiServiceRouter::new();
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// This emulator's persisted store, reached exactly as a handler reaches it
+    /// (`state::service_state`) — for a test that must seed a record whose creating
+    /// operation is still a scaffold.
+    pub(crate) fn store(
+        &self,
+    ) -> engine::ServiceState<state::ComAmazonawsBatchAwsbatchv20160810State> {
+        state::service_state(&*self.engine).expect("the batch store is reachable")
     }
 
     /// POST `uri` with `body` as JSON; answer the status and the decoded body.

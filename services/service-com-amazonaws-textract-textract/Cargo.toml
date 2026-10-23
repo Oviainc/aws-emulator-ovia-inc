@@ -24,6 +24,14 @@ tracing = { workspace = true }
 # Document identity digests and deterministic block ids / pagination cursors.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Decodes the raster document formats Textract accepts (PNG, JPEG, TIFF) into pixels.
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "tiff",
+] }
+# Public-domain 8x8 ASCII glyph bitmaps, used as the recogniser's match templates.
+font8x8 = "0.3"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeServiceJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeServiceJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one service job from the persisted record `SubmitServiceJob` stored and
+//! `TerminateServiceJob` ends: a pure read, so two calls at the same instant answer
+//! identically. A `jobId` the service holds no service job for is a `ClientException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeServiceJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +179,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeServiceJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeServiceJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeServiceJob"))
+        use crate::state as batch;
+
+        let _ = ctx;
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(DescribeServiceJobErrorModeled::ServerException(
+                batch::unreachable_state(),
+            )
+            .into());
+        };
+        let now = batch::now_millis();
+        let mut state = state.lock();
+        // A read: this only materialises what the clock already owed at `now`, so a
+        // later caller sees exactly what this caller saw.
+        state.materialize_due(now);
+
+        let Some(job) = state.service_jobs.get(&input.job_id) else {
+            return Err(DescribeServiceJobErrorModeled::ClientException(
+                batch::client_exception(format!("Service job {} does not exist", input.job_id)),
+            )
+            .into());
+        };
+
+        Ok(DescribeServiceJobOutput {
+            job_arn: Some(job.job_arn.clone()),
+            job_id: job.job_id.clone(),
+            job_name: job.job_name.clone(),
+            job_queue: job.job_queue_arn.clone(),
+            service_job_type: job.service_job_type.clone(),
+            status: job.status.clone(),
+            status_reason: job.status_reason.clone(),
+            created_at: Some(job.created_at),
+            scheduled_at: job.scheduled_at,
+            // Modelled as required, so it is always serialized; 0 until the job starts,
+            // which a job no runtime here ever dispatched never does.
+            started_at: job.started_at.unwrap_or_default(),
+            stopped_at: job.stopped_at,
+            is_terminated: Some(job.is_terminated),
+            share_identifier: job.share_identifier.clone(),
+            quota_share_name: job.quota_share_name.clone(),
+            scheduling_priority: job.scheduling_priority,
+            service_request_payload: job.service_request_payload.clone(),
+            retry_strategy: job.retry_strategy.clone(),
+            timeout_config: job.timeout_config.clone(),
+            preemption_configuration: job.preemption_configuration.clone(),
+            tags: job.tags.clone(),
+            // A service job's work is dispatched to another service, which nothing here
+            // runs, so no attempt, capacity usage or preemption is invented for it.
+            attempts: None,
+            latest_attempt: None,
+            capacity_usage: None,
+            preemption_summary: None,
+        })
     }
 }

@@ -180,9 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .or(input.app_registry_arn)
                 .unwrap_or_default();
             return Err(GetApplicationErrorModeled::ValidationException(
-                crate::state::validation(format!(
-                    "No SAP application is registered for {reference} in this account and Region"
-                )),
+                crate::state::no_registered_application(&reference),
             )
             .into());
         };

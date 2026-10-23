@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListReplicationSets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListReplicationSets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListReplicationSets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -77,6 +68,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{clamped_page_size, ReplicationSetEntry, MAX_REPLICATION_SET_ARNS_PER_PAGE};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -110,6 +103,33 @@ impl From<ListReplicationSetsErrorModeled> for ListReplicationSetsError {
     fn from(modeled: ListReplicationSetsErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// The version tag every `ListReplicationSets` pagination token carries, so a token
+/// from anywhere else — another list operation of this service, or a bare number — is
+/// recognisably not one this operation issued.
+const PAGE_TOKEN_VERSION: &str = "ssmi-rs1";
+
+/// An opaque `nextToken` naming the replication set a page ended on: its creation
+/// instant and its ARN, which together are its position in the list order
+/// ([`ReplicationSetEntry::list_order_key`]).
+fn encode_page_token(entry: &ReplicationSetEntry) -> String {
+    let ((secs, nanos), arn) = entry.list_order_key();
+    hex::encode(format!("{PAGE_TOKEN_VERSION}|{secs}|{nanos}|{arn}"))
+}
+
+/// The position [`encode_page_token`] encoded, or `None` for anything this operation
+/// did not issue.
+fn decode_page_token(token: &str) -> Option<((i64, u32), String)> {
+    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    let mut fields = decoded.splitn(4, '|');
+    if fields.next()? != PAGE_TOKEN_VERSION {
+        return None;
+    }
+    let secs = fields.next()?.parse::<i64>().ok()?;
+    let nanos = fields.next()?.parse::<u32>().ok()?;
+    let arn = fields.next()?;
+    (!arn.is_empty()).then(|| ((secs, nanos), arn.to_string()))
 }
 
 /// The `ListReplicationSets` operation.
@@ -148,18 +168,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListReplicationSets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListReplicationSetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListReplicationSets"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListReplicationSetsErrorModeled::InternalServerException(InternalServerException {
+                message: "the ssm-incidents state store is unavailable".to_string(),
+            })
+        })?;
+        let state = state.lock();
+
+        // @readonly: every ARN reported here is the key of a replication set this
+        // service persisted, so an account that holds none answers an EMPTY list — a
+        // success, not an error — and nothing is written on this path.
+        let mut sets: Vec<&ReplicationSetEntry> = state.replication_sets.values().collect();
+        sets.sort_by_key(|entry| entry.list_order_key());
+
+        // `maxResults` is CLAMPED to the service's ceiling, not merely defaulted from
+        // it, so no number a request carries can size this page or its allocation.
+        let page_size = clamped_page_size(input.max_results, MAX_REPLICATION_SET_ARNS_PER_PAGE);
+
+        // A page resumes strictly AFTER the set the previous page ended on, named by
+        // its own sort key rather than by an index — so a set created or deleted
+        // between two pages cannot make the next page skip or repeat an unrelated one.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(decode_page_token(token).ok_or_else(|| {
+                ListReplicationSetsErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "nextToken is not a pagination token this service issued: {token}"
+                    ),
+                })
+            })?),
+        };
+
+        let remaining = sets.iter().skip_while(|entry| match &resume_after {
+            None => false,
+            Some((at, arn)) => entry.list_order_key() <= (*at, arn.as_str()),
+        });
+        let mut page: Vec<&ReplicationSetEntry> = Vec::new();
+        let mut more = false;
+        for entry in remaining {
+            if page.len() == page_size {
+                more = true;
+                break;
+            }
+            page.push(entry);
+        }
+
+        // The token names the set this page ended on, and is absent on the last page so
+        // a client's paging loop terminates.
+        let next_token = page
+            .last()
+            .filter(|_| more)
+            .map(|entry| encode_page_token(entry));
+
+        Ok(ListReplicationSetsOutput {
+            replication_set_arns: page.iter().map(|entry| entry.arn.clone()).collect(),
+            next_token,
+        })
     }
 }

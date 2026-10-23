@@ -274,6 +274,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Reading the document and deriving its blocks happens OUTSIDE the state lock,
         // so one caller's work is never serialised in front of another caller's request.
+        //
+        // No inline bytes here: a `DocumentLocation` names an S3 object only, so this
+        // read does no decoding or recognition — it refuses the object this emulator's
+        // Amazon S3 cannot serve yet — and so it is not the CPU-bound path that
+        // `crate::state::read_document` puts on the blocking pool.
         let stored = state.lock().stored_content(&key);
         let read = match stored {
             Some(content) => Ok(content),

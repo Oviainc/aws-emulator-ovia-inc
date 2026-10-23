@@ -41,3 +41,5 @@ mod on_premises_tagging;
 mod state_roundtrip;
 #[path = "all/stop_deployment.rs"]
 mod stop_deployment;
+#[path = "all/update_application.rs"]
+mod update_application;

@@ -88,6 +88,16 @@ const REFUSAL_CODES: &[(&str, AbsentAnswer, InvalidAnswer)] = &[
         )),
         Some("InvalidApplicationNameException"),
     ),
+    // `UpdateApplication`'s rename target: an `ApplicationName` like the others,
+    // and that operation models the same pair of codes for it.
+    (
+        "newApplicationName",
+        Some((
+            "ApplicationNameRequiredException",
+            crate::state::APPLICATION_NAME_MISSING,
+        )),
+        Some("InvalidApplicationNameException"),
+    ),
     (
         "deploymentGroupName",
         Some((

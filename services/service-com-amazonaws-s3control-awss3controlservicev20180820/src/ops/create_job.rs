@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates an S3 Batch Operations job and records it in this service's state,
+//! keyed by (account id, job id), so `DescribeJob` — and the job operations
+//! still scaffolded beside it — serve the one record this call stored. The job
+//! id is assigned by the service and returned; the job is left in the status a
+//! created job has: `Suspended` while it awaits confirmation, otherwise `New`,
+//! which the clock moves on to `Ready`.
 //!
 //! ## Shape of an operation
 //!
@@ -102,6 +100,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    JobRecord, JOB_PREPARATION, JOB_QUOTA, JOB_STATUS_NEW, JOB_STATUS_SUSPENDED,
+    SUSPENDED_AWAITING_CONFIRMATION,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -173,18 +176,217 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateJob"))
+        // "Jobs must be created with either a manifest file or a
+        // ManifestGenerator, but not both" —
+        // `CreateJobRequest$ManifestGenerator`. Neither member is modelled
+        // `@required`, so the boundary validator cannot refuse either half of
+        // this; the service does.
+        match (&input.manifest, &input.manifest_generator) {
+            (Some(_), Some(_)) => {
+                return Err(bad_request(
+                    "A job is created with either Manifest or ManifestGenerator, but not both.",
+                ))
+            }
+            (None, None) => {
+                return Err(bad_request(
+                    "A job is created with either Manifest or ManifestGenerator; \
+                     the request carries neither.",
+                ))
+            }
+            _ => {}
+        }
+
+        // `JobOperation` is "the action that you want this job to perform on
+        // every object listed in the manifest" — ONE action, carried in one of
+        // the structure's otherwise-optional members, so a request naming none
+        // or several names no one action.
+        let actions = named_actions(&input.operation);
+        if actions.len() != 1 {
+            return Err(bad_request(format!(
+                "Operation names exactly one action; the request names {}{}.",
+                actions.len(),
+                if actions.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", actions.join(", "))
+                }
+            )));
+        }
+
+        // `JobReport$Bucket` is where "the specified job-completion report will
+        // be stored", so a report the job is asked to generate
+        // (`JobReport$Enabled`) needs a bucket to store it in.
+        if input.report.enabled
+            && input
+                .report
+                .bucket
+                .as_ref()
+                .is_none_or(|bucket| bucket.is_empty())
+        {
+            return Err(bad_request(
+                "Report.Enabled is true, so Report.Bucket must name the bucket the \
+                 job-completion report is stored in.",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::state_unavailable());
+        };
+
+        // What the request asked for, apart from its token: two creates
+        // carrying one token agree here exactly when they asked for the same
+        // job.
+        let fingerprint = crate::state::create_job_fingerprint(&input);
+
+        let mut store = state.lock();
+
+        // `ClientRequestToken` is "an idempotency token to ensure that you
+        // don't accidentally submit the same request twice": the same request
+        // under a token already used is answered with the job that token
+        // created, so no second job exists; a DIFFERENT request reusing it is
+        // the modelled `IdempotencyException`.
+        if let Some(existing) =
+            store.job_by_client_request_token(&input.account_id, &input.client_request_token)
+        {
+            if existing.request_fingerprint == fingerprint {
+                return Ok(CreateJobOutput {
+                    job_id: Some(existing.job_id.clone()),
+                });
+            }
+            let message = format!(
+                "ClientRequestToken {} was already used to create job {}, with different \
+                 job parameters.",
+                input.client_request_token, existing.job_id
+            );
+            return Err(CreateJobErrorModeled::IdempotencyException(IdempotencyException {
+                message: Some(message),
+            })
+            .into());
+        }
+
+        // The store is bounded: past its quota a create is refused rather than
+        // adding another record, so a caller cannot grow this process's state
+        // without end by varying the account id or the token.
+        if store.jobs.len() >= JOB_QUOTA {
+            return Err(CreateJobErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    message: Some(format!(
+                        "This emulator holds the maximum of {JOB_QUOTA} S3 Batch Operations jobs."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::signing_region(ctx.parts());
+        let job_id = store.new_job_id();
+        let now = ::std::time::SystemTime::now();
+        let creation_time = ::aws_smithy_types::DateTime::from(now);
+        // `ConfirmationRequired` is modelled with no default, so a request that
+        // does not name it asks for no confirmation.
+        let confirmation_required = input.confirmation_required.unwrap_or(false);
+
+        let record = JobRecord {
+            arn: crate::state::job_arn(&region, &job_id),
+            // A job created with confirmation required "enters the Suspended
+            // state to await confirmation before running"
+            // (`JobDescriptor$SuspendedCause`); any other created job enters
+            // `New`, and the clock owes it the move to `Ready`.
+            status: crate::state::job_status(if confirmation_required {
+                JOB_STATUS_SUSPENDED
+            } else {
+                JOB_STATUS_NEW
+            }),
+            suspended_date: confirmation_required.then_some(creation_time),
+            suspended_cause: confirmation_required
+                .then(|| SUSPENDED_AWAITING_CONFIRMATION.to_string()),
+            status_due_at: if confirmation_required {
+                // Nothing but a confirmation moves a suspended job, so the
+                // clock owes it nothing.
+                None
+            } else {
+                now.checked_add(JOB_PREPARATION)
+            },
+            job_id: job_id.clone(),
+            account_id: input.account_id.clone(),
+            confirmation_required: Some(confirmation_required),
+            description: input.description.clone(),
+            manifest: input.manifest.clone(),
+            manifest_generator: input.manifest_generator.clone(),
+            operation: input.operation.clone(),
+            priority: input.priority,
+            report: input.report.clone(),
+            role_arn: input.role_arn.clone(),
+            creation_time,
+            // A job that has just been created has not terminated, and carries
+            // no status update reason until an `UpdateJobStatus` gives it one.
+            termination_date: None,
+            status_update_reason: None,
+            tags: input.tags.clone().unwrap_or_default(),
+            client_request_token: input.client_request_token.clone(),
+            request_fingerprint: fingerprint,
+        };
+
+        let output = CreateJobOutput {
+            job_id: Some(record.job_id.clone()),
+        };
+        store.jobs.insert((input.account_id.clone(), job_id), record);
+        Ok(output)
     }
+}
+
+/// Refuse the request with the modelled `BadRequestException` (HTTP 400): it is
+/// well-formed against the model but asks for no one job.
+fn bad_request(message: impl Into<String>) -> CreateJobError {
+    CreateJobErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The actions `operation` names, by the member names `JobOperation` declares.
+///
+/// Destructured rather than field-accessed, so an action the model adds to
+/// `JobOperation` is a compile error here rather than an action silently
+/// accepted beside another.
+fn named_actions(operation: &JobOperation) -> Vec<&'static str> {
+    let JobOperation {
+        lambda_invoke,
+        s3_put_object_copy,
+        s3_put_object_acl,
+        s3_put_object_tagging,
+        s3_delete_object_tagging,
+        s3_initiate_restore_object,
+        s3_put_object_legal_hold,
+        s3_put_object_retention,
+        s3_replicate_object,
+        s3_compute_object_checksum,
+        s3_update_object_encryption,
+    } = operation;
+    [
+        ("LambdaInvoke", lambda_invoke.is_some()),
+        ("S3PutObjectCopy", s3_put_object_copy.is_some()),
+        ("S3PutObjectAcl", s3_put_object_acl.is_some()),
+        ("S3PutObjectTagging", s3_put_object_tagging.is_some()),
+        ("S3DeleteObjectTagging", s3_delete_object_tagging.is_some()),
+        (
+            "S3InitiateRestoreObject",
+            s3_initiate_restore_object.is_some(),
+        ),
+        ("S3PutObjectLegalHold", s3_put_object_legal_hold.is_some()),
+        ("S3PutObjectRetention", s3_put_object_retention.is_some()),
+        ("S3ReplicateObject", s3_replicate_object.is_some()),
+        (
+            "S3ComputeObjectChecksum",
+            s3_compute_object_checksum.is_some(),
+        ),
+        (
+            "S3UpdateObjectEncryption",
+            s3_update_object_encryption.is_some(),
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, named)| *named)
+    .map(|(name, _)| name)
+    .collect()
 }

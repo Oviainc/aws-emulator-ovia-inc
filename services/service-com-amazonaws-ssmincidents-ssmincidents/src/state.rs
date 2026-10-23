@@ -2,13 +2,18 @@
 
 //! Engine state for the com-amazonaws-ssmincidents-ssmincidents service.
 //!
-//! Two resources live here, keyed by their ARN so every read path resolves the same
+//! Three resources live here, keyed by their ARN so every read path resolves the same
 //! object a write path stored:
 //!
 //! * `response_plans` — what `CreateResponsePlan` mints and `GetResponsePlan` serves.
 //! * `incident_records` — what `StartIncident` creates, `GetIncidentRecord` /
 //!   `ListIncidentRecords` report, `UpdateIncidentRecord` mutates and
 //!   `DeleteIncidentRecord` removes.
+//! * `replication_sets` — the account's Incident Manager replication set(s), which
+//!   `ListReplicationSets` reports. AWS holds at most ONE per account; the map is
+//!   keyed by ARN like the other two so every replication-set read path resolves the
+//!   same stored object, and the creating path is the single place that invariant is
+//!   enforced.
 //!
 //! `idempotency` records the ARN each `@idempotencyToken` minted the first time, so a
 //! replayed `clientToken` answers with the same ARN instead of creating a second
@@ -20,7 +25,8 @@ use aws_smithy_types::DateTime;
 
 use crate::ops::types::{
     Action, ChatChannel, IncidentRecord, IncidentRecordSource, IncidentRecordSummary,
-    IncidentTemplate, Integration, NotificationTargetItem, RelatedItem, TimelineEvent,
+    IncidentTemplate, Integration, NotificationTargetItem, RegionInfo, RelatedItem,
+    TimelineEvent,
 };
 
 /// The `IncidentRecordStatus` value a freshly started incident carries.
@@ -59,6 +65,14 @@ pub const QUOTA_CODE_INCIDENT_RECORDS: &str = "IncidentRecordsPerAccount";
 /// request carries can size a response or the allocation that builds it — whatever any
 /// other layer does or does not refuse.
 pub const MAX_INCIDENT_RECORDS_PER_PAGE: i32 = 100;
+
+/// The largest page `ListReplicationSets` may answer with, and the page size it uses
+/// when the request names none: its `maxResults` targets the same `MaxResults` shape
+/// (`range 1..100`), and `ReplicationSetArnList` declares no length of its own.
+///
+/// Applied as a CEILING through [`clamped_page_size`], for the same reason as
+/// [`MAX_INCIDENT_RECORDS_PER_PAGE`].
+pub const MAX_REPLICATION_SET_ARNS_PER_PAGE: i32 = 100;
 
 /// The most filters one `ListIncidentRecords` request may carry: the model's
 /// `FilterList` is `length ..5`. Re-checked in the handler so the records x filters
@@ -193,11 +207,23 @@ pub fn now() -> DateTime {
 /// `maxResults`, or [`MAX_INCIDENT_RECORDS_PER_PAGE`] when the request carried none —
 /// never more than that ceiling, and never a non-positive count.
 pub fn page_size(max_results: Option<i32>) -> usize {
-    let requested = max_results.unwrap_or(MAX_INCIDENT_RECORDS_PER_PAGE);
+    clamped_page_size(max_results, MAX_INCIDENT_RECORDS_PER_PAGE)
+}
+
+/// How many items one page of any paginated list in this service may carry: the
+/// request's `maxResults`, clamped to `ceiling`, which is also the size used when the
+/// request carried no `maxResults` or a non-positive one.
+///
+/// Shared by this service's list operations, so each page — and the allocation that
+/// builds it — is sized by the service's own ceiling rather than by a number the
+/// request carries, whatever any other layer does or does not refuse.
+pub fn clamped_page_size(max_results: Option<i32>, ceiling: i32) -> usize {
+    let ceiling = ceiling.max(0);
+    let requested = max_results.unwrap_or(ceiling);
     if requested <= 0 {
-        return MAX_INCIDENT_RECORDS_PER_PAGE as usize;
+        return ceiling as usize;
     }
-    requested.min(MAX_INCIDENT_RECORDS_PER_PAGE) as usize
+    requested.min(ceiling) as usize
 }
 
 /// The principal ARN this service records in `lastModifiedBy` and
@@ -224,13 +250,54 @@ pub fn incident_record_arn(plan_name: &str, id: &str) -> String {
     )
 }
 
+/// An Incident Manager replication set as it is persisted: the account-level resource
+/// naming the Regions Incident Manager data is replicated to.
+///
+/// Every modelled `ReplicationSet` member is held, so a read path reports the stored
+/// object instead of recomputing it: `ListReplicationSets` reads `arn` and
+/// `created_time` (its list order) and the rest is what the replication-set
+/// `Get`/`Update` paths serve.
+#[derive(Debug, Clone)]
+pub struct ReplicationSetEntry {
+    pub arn: String,
+    /// Each Region in the set, keyed by Region name, with that Region's status and
+    /// optional `sseKmsKeyId` — the modelled `RegionInfoMap`.
+    pub region_map: HashMap<String, RegionInfo>,
+    /// One of `REPLICATION_SET_STATUS_VALUES` (see `ops::types::shared_types`).
+    pub status: String,
+    pub deletion_protected: bool,
+    pub created_time: DateTime,
+    pub created_by: String,
+    pub last_modified_time: DateTime,
+    pub last_modified_by: String,
+}
+
+impl ReplicationSetEntry {
+    /// Sort key giving the stored replication sets one total order — oldest first,
+    /// ties broken by ARN — so paging over the same state twice visits them in the
+    /// same order. The model documents no order for `replicationSetArns` (an account
+    /// holds at most one set), so this is the emulator's stable order, not a claim
+    /// about AWS.
+    pub fn list_order_key(&self) -> ((i64, u32), &str) {
+        (timestamp_key(&self.created_time), self.arn.as_str())
+    }
+}
+
+/// `arn:aws:ssm-incidents::<account>:replication-set/<id>` — as with the other ARNs
+/// this service mints, the Region segment is empty because the namespace is replicated
+/// rather than regional.
+pub fn replication_set_arn(id: &str) -> String {
+    ::engine::emulator_arn("ssm-incidents", "", &format!("replication-set/{id}"))
+}
+
 /// Per-service state for com-amazonaws-ssmincidents-ssmincidents. A handler reaches it through [`service_state`].
 ///
 /// Every map here is bounded: `response_plans` by [`MAX_RESPONSE_PLANS`],
 /// `incident_records` by [`MAX_INCIDENT_RECORDS`] (both consulted before a create
-/// inserts) and `idempotency` by [`MAX_IDEMPOTENCY_ENTRIES`] with oldest-first
-/// eviction, so no sequence of requests can make this process hold memory without
-/// limit.
+/// inserts), `replication_sets` by the one replication set AWS permits an account
+/// (enforced where a set is created) and `idempotency` by
+/// [`MAX_IDEMPOTENCY_ENTRIES`] with oldest-first eviction, so no sequence of requests
+/// can make this process hold memory without limit.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSsmincidentsSsmincidentsState {
     /// Response plans, keyed by response-plan ARN. Bounded by [`MAX_RESPONSE_PLANS`].
@@ -238,6 +305,11 @@ pub struct ComAmazonawsSsmincidentsSsmincidentsState {
     /// Incident records, keyed by incident-record ARN. Bounded by
     /// [`MAX_INCIDENT_RECORDS`].
     pub incident_records: HashMap<String, IncidentRecordEntry>,
+    /// The account's replication set(s), keyed by replication-set ARN, as
+    /// `ListReplicationSets` reports them. AWS permits at most one per account, so
+    /// this map is bounded by the operation that creates one: no request adds a
+    /// second.
+    pub replication_sets: HashMap<String, ReplicationSetEntry>,
     /// `<operation>:<clientToken>` -> the ARN that token minted the first time.
     /// Bounded by [`MAX_IDEMPOTENCY_ENTRIES`].
     pub idempotency: HashMap<String, String>,

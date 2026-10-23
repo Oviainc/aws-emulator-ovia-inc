@@ -23,9 +23,11 @@
 //! - `override_operation` — serve a request the model's routing key cannot name
 //!   correctly. The default returns `None`, so every request resolves through the
 //!   generated routing table. Return `Some(op)` to route one yourself.
-//! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//! - `override_refusal` — EDITED HERE. A request refused for violating a modelled
+//!   `@pattern` reports that pattern as the EXPRESSION a value has to satisfy, without
+//!   the `^`/`$` anchors the model spells it with. Everything else about the refusal —
+//!   the envelope, the clause, the echoed value, the error code — stays the
+//!   framework's. See "How a `@pattern` is reported" below.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -39,11 +41,92 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! # How a `@pattern` is reported
+//!
+//! A constraint-violation message is BUILT FROM THE REQUEST —
+//! `N validation error(s) detected: Value '<what was sent>' at '<member path>' failed to
+//! satisfy constraint: <requirement>` — and for a `@pattern` the requirement AWS states
+//! is the regular expression a value must satisfy, WITHOUT the leading `^` and trailing
+//! `$` a model writes to turn Smithy's unanchored find into a whole-string match. That
+//! anchoring is how the model demands the whole value, not part of the expression a
+//! client shows a user or re-compiles to explain the rejection.
+//!
+//! So [`unanchored`] drops a whole-expression anchor pair from the REPORTED text only.
+//! The MATCH is untouched: the framework still checks the fully anchored pattern the
+//! model declares, so a value that would satisfy the expression only as a substring is
+//! still refused. The rule holds for every pattern-constrained member this service
+//! models — `FeatureGroupNameOrArn` (the feature group name of all seven operations,
+//! whether it arrives as an `@httpLabel` or nested inside a batch entry), `FeatureName`,
+//! and `ValueAsString`, whose `.*` carries no anchors and is therefore reported exactly
+//! as declared — because the clause is rendered from the violation rather than from a
+//! per-operation string.
+//!
+//! Everything else stays the framework's, deliberately: the envelope and its violation
+//! count ([`aws_smithy_schema_server::constraints::envelope`]), the clause wording, the
+//! echoed value, and the `ValidationException` code a client branches on. A refusal with
+//! no `@pattern` violation in it is not reworded at all.
+//!
+//! This is the SAME rule ~24 other service crates in this tree carry inlined
+//! (`grep -rln 'fn unanchored' services/*/src`); `services/common/src/validation.rs`
+//! ("Still to migrate here") is where it belongs, and migrating all of them is one
+//! change of its own rather than a side effect of this service's issue, so it is
+//! inlined here with this note, exactly as that module asks.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The wire error code for a request refused before any handler ran: the framework's
+/// own code for a constraint violation, restated here because [`Refused`] replaces the
+/// code and the message together. Every operation of this service also declares the
+/// modelled `ValidationError` with `@httpError` 400, which a handler answers with; the
+/// pre-handler refusal keeps the framework's `ValidationException`, which is what a
+/// client sees in `x-amzn-errortype`.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// A `@pattern` expression without the anchors a model may spell it with.
+///
+/// Only a `^…$` PAIR bracketing the whole expression is dropped: `^` alone, or `$`
+/// alone, is an expression anchored at one end — a different language, not an anchored
+/// spelling of this one — and an anchor left INSIDE after the pair is removed means the
+/// pair bracketed one branch of an alternation (`^a$|^b$`) rather than the whole
+/// expression, so such a pattern is reported exactly as the model spells it. A trailing
+/// `$` escaped by a backslash is a literal dollar sign, not the end anchor, so it stays.
+fn unanchored(pattern: &str) -> &str {
+    let Some(body) = pattern.strip_prefix('^') else {
+        return pattern;
+    };
+    let Some(body) = without_end_anchor(body) else {
+        return pattern;
+    };
+    if body.contains('^') || body.contains('$') {
+        return pattern;
+    }
+    body
+}
+
+/// `pattern` without its end anchor, or `None` when it carries none. A trailing `$`
+/// preceded by an ODD number of backslashes is escaped — a literal dollar sign inside
+/// the expression — so it is not an anchor.
+fn without_end_anchor(pattern: &str) -> Option<&str> {
+    let body = pattern.strip_suffix('$')?;
+    let escapes = body.len() - body.trim_end_matches('\\').len();
+    (escapes % 2 == 0).then_some(body)
+}
+
+/// The same violation with a `@pattern` reported unanchored; every other class is
+/// returned untouched, so the requirement each one words stays the framework's.
+fn as_stated(violation: &Violation) -> Violation {
+    let ViolationKind::Pattern(pattern) = &violation.kind else {
+        return violation.clone();
+    };
+    Violation {
+        kind: ViolationKind::Pattern(unanchored(pattern).to_string()),
+        ..violation.clone()
+    }
+}
 
 /// The `com-amazonaws-sagemakerfeaturestoreruntime-amazonsagemakerfeaturestoreruntime` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -110,16 +193,33 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it. The ONE thing this service states differently is how a `@pattern`
+        // requirement is rendered — the expression without the anchors the model spells
+        // it with (see "How a `@pattern` is reported" in the module docs).
+        let Refusal::Invalid(violations) = refusal else {
+            // Authentication is the framework's to word: the request never reached an
+            // operation, so there is nothing of this service's own to say about it.
+            return None;
+        };
+        // Nothing else is worded differently, so a refusal carrying no `@pattern`
+        // violation keeps the framework's own rendering rather than being re-rendered
+        // here: the blast radius stays on the one rule above.
+        if !violations
+            .iter()
+            .any(|violation| matches!(violation.kind, ViolationKind::Pattern(_)))
+        {
+            return None;
+        }
+        let stated: Vec<Violation> = violations.iter().map(as_stated).collect();
+        Some(Refused {
+            code: VALIDATION_EXCEPTION.to_string(),
+            // The framework's own envelope and clause (`1 validation error detected:
+            // Value '<sent>' at '<path>' failed to satisfy constraint: …`), rendered
+            // from the restated violations, so the count and the wording stay in the
+            // one place that owns them and only the pattern text differs.
+            message: aws_smithy_schema_server::constraints::envelope(&stated)?,
+        })
     }
 
     fn override_routing_error(
@@ -148,5 +248,76 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{as_stated, unanchored};
+    use smithy_server_runtime::{Violation, ViolationKind};
+
+    /// The anchoring a model spells a `@pattern` with is dropped only when the `^…$`
+    /// pair brackets the WHOLE expression; every other form is the expression itself
+    /// and is reported as the model writes it. The first three rows are this service's
+    /// own modelled patterns (`FeatureGroupNameOrArn`, `FeatureName`, `ValueAsString`,
+    /// from `smithy_query(query="shape")` on each); the rest are the forms the rule has
+    /// to leave alone, which this model does not happen to contain.
+    #[test]
+    fn a_pattern_loses_only_a_whole_expression_anchor_pair() {
+        let cases = [
+            (
+                "the feature group name or ARN",
+                r"^(arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:feature-group/)?([a-zA-Z0-9]([-_]*[a-zA-Z0-9]){0,63})$",
+                r"(arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:feature-group/)?([a-zA-Z0-9]([-_]*[a-zA-Z0-9]){0,63})",
+            ),
+            (
+                "a feature name",
+                "^[a-zA-Z0-9]([-_]*[a-zA-Z0-9]){0,63}$",
+                "[a-zA-Z0-9]([-_]*[a-zA-Z0-9]){0,63}",
+            ),
+            ("an unanchored expression", ".*", ".*"),
+            ("anchored at the start only", "^arn:", "^arn:"),
+            ("anchored at the end only", "[0-9]+$", "[0-9]+$"),
+            ("no anchor at all", r"\d{3}", r"\d{3}"),
+            ("a fully anchored alternation", "^a$|^b$", "^a$|^b$"),
+            ("an escaped trailing dollar", r"^cost\$", r"^cost\$"),
+            ("an escaped dollar before the anchor", r"^cost\\$", r"cost\\"),
+            ("the empty expression", "", ""),
+        ];
+        for (case, modelled, expected) in cases {
+            let actual = unanchored(modelled);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// Only the `@pattern` class is restated: the clause of every other constraint —
+    /// and the member path and the echoed value of a pattern clause — stays exactly
+    /// what the framework rendered.
+    #[test]
+    fn only_a_pattern_clause_is_restated() {
+        let outside_pattern = Violation {
+            path: "identifiers.1.member.featureGroupName".to_string(),
+            kind: ViolationKind::Pattern("^[a-zA-Z0-9]+$".to_string()),
+            value: Some("not a valid name!!".to_string()),
+        };
+        assert_eq!(
+            as_stated(&outside_pattern).message(),
+            "Value 'not a valid name!!' at 'identifiers.1.member.featureGroupName' failed to \
+             satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9]+",
+            "the pattern loses its anchors; the path and the echoed value do not change"
+        );
+        let out_of_range = Violation {
+            path: "maxResults".to_string(),
+            kind: ViolationKind::MaxValue("100".to_string()),
+            value: Some("1000".to_string()),
+        };
+        assert_eq!(
+            as_stated(&out_of_range),
+            out_of_range,
+            "a non-pattern violation is untouched"
+        );
     }
 }

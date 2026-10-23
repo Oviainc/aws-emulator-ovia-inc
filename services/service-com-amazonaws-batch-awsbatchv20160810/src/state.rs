@@ -41,7 +41,8 @@ use crate::ops::types::{
     ConsumableResourceProperties, ContainerDetail, ContainerOverrides, ContainerProperties,
     EcsProperties, EcsSettings, EksConfiguration, JobDefinition, JobDependency,
     JobStateTimeLimitAction, JobTimeout, KeyValuePair, NodeProperties, ResourceRequirement,
-    RetryStrategy, ServerException, ServiceEnvironmentOrder,
+    RetryStrategy, ServerException, ServiceEnvironmentOrder, ServiceJobPreemptionConfiguration,
+    ServiceJobRetryStrategy, ServiceJobTimeout,
 };
 
 /// This service's ARN namespace and sigv4 signing name (`OPERATIONS.md`).
@@ -96,6 +97,11 @@ pub mod limits {
     /// `CreateConsumableResource` is a request anyone can repeat, so the store answers the
     /// modelled `ClientException` past this point rather than growing without bound.
     pub const MAX_CONSUMABLE_RESOURCES: usize = 500;
+
+    /// Service jobs kept at once, the same emulator bound as [`MAX_JOBS`] and with the
+    /// same eviction-before-refusal rule
+    /// ([`super::ComAmazonawsBatchAwsbatchv20160810State::insert_service_job`]).
+    pub const MAX_SERVICE_JOBS: usize = 500;
 }
 
 /// The `ClientException` message a request past one of [`limits`] answers with.
@@ -231,6 +237,15 @@ pub const JOB_SUCCEEDED: &str = "SUCCEEDED";
 /// Terminal `JobStatus`: the job did not complete successfully.
 pub const JOB_FAILED: &str = "FAILED";
 
+// `ServiceJobStatus` values. A separate enum from `JobStatus` in the model
+// (`smithy_query(query="shape", shape="ServiceJobStatus")`: SUBMITTED, PENDING,
+// RUNNABLE, SCHEDULED, STARTING, RUNNING, SUCCEEDED, FAILED), so a service job's
+// statuses are named — and tested for terminality — on their own.
+/// Terminal `ServiceJobStatus`: the service job completed successfully.
+pub const SERVICE_JOB_SUCCEEDED: &str = "SUCCEEDED";
+/// Terminal `ServiceJobStatus`: the service job did not complete successfully.
+pub const SERVICE_JOB_FAILED: &str = "FAILED";
+
 /// A fresh identifier in the shape AWS Batch gives a job id and a compute environment
 /// `uuid`: a version-4 UUID, `8-4-4-4-12` lowercase hex with the version and variant bits
 /// RFC 4122 §4.4 fixes.
@@ -320,6 +335,12 @@ pub fn service_environment_arn(region: &str, name: &str) -> String {
         region,
         &format!("service-environment/{name}"),
     )
+}
+
+/// `arn:aws:batch:<region>:<account>:service-job/<job id>` — the ARN a service job
+/// carries, the resource kind AWS Batch names a service job with.
+pub fn service_job_arn(region: &str, job_id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("service-job/{job_id}"))
 }
 
 /// The resource part of an ARN (everything after the account field), or `None`
@@ -484,6 +505,44 @@ impl ConsumableResource {
 /// Whether a `JobStatus` is one a job never leaves.
 pub fn is_terminal_status(status: &str) -> bool {
     matches!(status, JOB_SUCCEEDED | JOB_FAILED)
+}
+
+/// A service job, as `SubmitServiceJob` accepted it: the record `DescribeServiceJob`
+/// reports and `TerminateServiceJob` ends.
+///
+/// A service job's work is dispatched to another service (`ServiceJobType` is
+/// `SAGEMAKER_TRAINING`), which this emulator does not run, so no attempt, capacity
+/// usage or preemption is ever invented for one: those members stay absent.
+#[derive(Debug, Clone, Default)]
+pub struct ServiceJob {
+    pub job_id: String,
+    pub job_arn: String,
+    pub job_name: String,
+    /// The ARN of the queue the job was submitted to, which is what
+    /// `DescribeServiceJob$jobQueue` reports ("The ARN of the job queue").
+    pub job_queue_arn: String,
+    pub service_job_type: String,
+    pub status: String,
+    pub status_reason: Option<String>,
+    pub created_at: i64,
+    pub scheduled_at: Option<i64>,
+    pub started_at: Option<i64>,
+    pub stopped_at: Option<i64>,
+    /// Whether a `TerminateServiceJob` is what ended this job.
+    pub is_terminated: bool,
+    pub share_identifier: Option<String>,
+    pub quota_share_name: Option<String>,
+    pub scheduling_priority: Option<i32>,
+    pub service_request_payload: Option<String>,
+    pub retry_strategy: Option<ServiceJobRetryStrategy>,
+    pub timeout_config: Option<ServiceJobTimeout>,
+    pub preemption_configuration: Option<ServiceJobPreemptionConfiguration>,
+    pub tags: Option<HashMap<String, String>>,
+}
+
+/// Whether a `ServiceJobStatus` is one a service job never leaves.
+pub fn is_terminal_service_job_status(status: &str) -> bool {
+    matches!(status, SERVICE_JOB_SUCCEEDED | SERVICE_JOB_FAILED)
 }
 
 /// What a job's dependencies allow right now.
@@ -666,6 +725,9 @@ pub struct ComAmazonawsBatchAwsbatchv20160810State {
     pub consumable_resources_by_arn: HashMap<String, String>,
     /// Job ids per queue ARN, in submission order, backing `ListJobs`.
     pub jobs_by_queue: HashMap<String, Vec<String>>,
+    /// Service jobs by service job id, the records `DescribeServiceJob` reports and
+    /// `TerminateServiceJob` ends. Bounded by [`limits::MAX_SERVICE_JOBS`].
+    pub service_jobs: HashMap<String, ServiceJob>,
     /// The jobs with a clock-owed transition still pending, ordered by the instant it
     /// falls due, so [`ComAmazonawsBatchAwsbatchv20160810State::materialize_due`] visits
     /// the jobs that are actually due instead of re-scanning the store.
@@ -1024,6 +1086,62 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             self.jobs_due.insert((due, id));
         }
         Ok(())
+    }
+
+    /// Persist a service job, bounded by [`limits::MAX_SERVICE_JOBS`].
+    ///
+    /// Makes room first by evicting the service jobs that have been terminal longest — a
+    /// terminal service job is one no later call can move again — and answers
+    /// `Err(message)`, for the modelled `ClientException`, when every service job in a
+    /// full store is still live.
+    pub fn insert_service_job(&mut self, job: ServiceJob) -> Result<(), String> {
+        if self.service_jobs.len() >= limits::MAX_SERVICE_JOBS {
+            self.evict_terminal_service_jobs(
+                self.service_jobs.len() + 1 - limits::MAX_SERVICE_JOBS,
+            );
+        }
+        if self.service_jobs.len() >= limits::MAX_SERVICE_JOBS {
+            return Err(quota_message("service jobs", limits::MAX_SERVICE_JOBS));
+        }
+        self.service_jobs.insert(job.job_id.clone(), job);
+        Ok(())
+    }
+
+    /// Drop up to `wanted` of the service jobs that have been terminal longest.
+    fn evict_terminal_service_jobs(&mut self, wanted: usize) {
+        let mut evictable: Vec<(i64, String)> = self
+            .service_jobs
+            .values()
+            .filter(|job| is_terminal_service_job_status(&job.status))
+            .map(|job| (job.stopped_at.unwrap_or(job.created_at), job.job_id.clone()))
+            .collect();
+        evictable.sort();
+        for (_, id) in evictable.into_iter().take(wanted) {
+            self.service_jobs.remove(&id);
+        }
+    }
+
+    /// Terminate the service job `id`, if the store holds one that can still be ended.
+    ///
+    /// A service job that has not reached a terminal `ServiceJobStatus` ends `FAILED` at
+    /// `now`, carrying `reason` as its `statusReason` and `isTerminated` — the two members
+    /// `DescribeServiceJob` documents for exactly this (`reason`: "A message to attach to
+    /// the service job that explains the reason for terminating it. This message is
+    /// returned by DescribeServiceJob operations on the service job."; `isTerminated`:
+    /// "Indicates whether the service job has been terminated."). A service job already in
+    /// a terminal status is left exactly as it is, so the first reason to end it is the one
+    /// it keeps, and an `id` the store holds no service job for changes nothing at all.
+    pub fn terminate_service_job(&mut self, id: &str, reason: &str, now: i64) {
+        let Some(job) = self.service_jobs.get_mut(id) else {
+            return;
+        };
+        if is_terminal_service_job_status(&job.status) {
+            return;
+        }
+        job.status = SERVICE_JOB_FAILED.to_string();
+        job.status_reason = Some(reason.to_string());
+        job.stopped_at = Some(now);
+        job.is_terminated = true;
     }
 
     /// Terminate or cancel `id`, and answer whether the job exists.

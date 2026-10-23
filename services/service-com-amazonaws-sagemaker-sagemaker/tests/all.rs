@@ -61,6 +61,8 @@ mod pipeline_execution;
 mod pipeline_lifecycle;
 #[path = "all/processing_job_lifecycle.rs"]
 mod processing_job_lifecycle;
+#[path = "all/servicecatalog_portfolio_status.rs"]
+mod servicecatalog_portfolio_status;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/studio_app_lifecycle.rs"]

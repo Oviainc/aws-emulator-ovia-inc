@@ -450,7 +450,7 @@ async fn cancelling_a_job_the_service_does_not_hold_succeeds_and_changes_nothing
 
 /// `id` with its last hex digit changed, so the result has the shape of a job id this
 /// service mints but names no job.
-fn flip_last_hex_digit(id: &str) -> String {
+pub(crate) fn flip_last_hex_digit(id: &str) -> String {
     let mut flipped: Vec<char> = id.chars().collect();
     if let Some(last) = flipped.last_mut() {
         *last = if *last == '0' { '1' } else { '0' };

@@ -25,5 +25,7 @@ mod job_definition_registry;
 mod job_lifecycle;
 #[path = "all/service_environment.rs"]
 mod service_environment;
+#[path = "all/service_job_termination.rs"]
+mod service_job_termination;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

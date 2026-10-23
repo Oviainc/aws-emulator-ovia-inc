@@ -1225,6 +1225,16 @@ pub fn model_package_lookup_key(identifier: &str) -> &str {
 /// Per-service state for com-amazonaws-sagemaker-sagemaker. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSagemakerSagemakerState {
+    /// Whether this account's SageMaker Service Catalog portfolio is enabled, as
+    /// `EnableSagemakerServicecatalogPortfolio` and
+    /// `DisableSagemakerServicecatalogPortfolio` set it and
+    /// `GetSagemakerServicecatalogPortfolioStatus` reports it, through
+    /// [`Self::servicecatalog_portfolio_status`].
+    ///
+    /// Account-level, so it is a single flag rather than a map: the three operations take
+    /// no input and name no resource. `Default` is `false` — an account that has never
+    /// enabled the portfolio reads `Disabled`, the only other member of the modelled enum.
+    pub servicecatalog_portfolio_enabled: bool,
     /// Keyed by `ModelName`.
     pub models: BTreeMap<String, Model>,
     /// Keyed by `EndpointConfigName`.
@@ -1307,6 +1317,18 @@ pub struct ComAmazonawsSagemakerSagemakerState {
 }
 
 impl ComAmazonawsSagemakerSagemakerState {
+    /// The account's Service Catalog portfolio status, as the modelled
+    /// `SagemakerServicecatalogStatus` enum names it: its two members are `Enabled` and
+    /// `Disabled` (`ops::types::SAGEMAKER_SERVICECATALOG_STATUS_VALUES`, generated from
+    /// the model shape), and this is the one place either is named.
+    pub fn servicecatalog_portfolio_status(&self) -> &'static str {
+        if self.servicecatalog_portfolio_enabled {
+            "Enabled"
+        } else {
+            "Disabled"
+        }
+    }
+
     /// Whether another model fits, i.e. the store is below [`MODEL_QUOTA`].
     pub fn models_below_quota(&self) -> bool {
         self.models.len() < MODEL_QUOTA
