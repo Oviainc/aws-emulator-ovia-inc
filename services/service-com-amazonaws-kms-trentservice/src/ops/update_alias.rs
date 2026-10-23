@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAlias
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAlias`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: points an EXISTING alias at another KMS key. This is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAlias::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The alias's identity — its name, its ARN and its creation date — does not move:
+//! "you cannot use UpdateAlias to change an alias name". What moves is the key the
+//! name resolves to, so every later `KeyId` lookup of that alias reaches the NEW key,
+//! and the alias's `LastUpdatedDate` records when it was associated with it.
+//!
+//! "The current and new KMS key must be the same type (both symmetric or both
+//! asymmetric or both HMAC), and they must have the same key usage", which is checked
+//! here rather than silently repointing the name at a key the caller's code cannot use
+//! the same way.
 //!
 //! ## Shape of an operation
 //!
@@ -205,18 +208,156 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAlias` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAliasErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(store_unavailable());
+        };
+
+        // "Specify the key ID or key ARN of the KMS key"
+        // (`smithy_query(query="doc",shape="UpdateAliasRequest",member="TargetKeyId")`):
+        // the new target is a KEY, so an alias as the target is refused rather than
+        // resolved — one alias never chains to another. The operation models no error
+        // for a target of the wrong kind, so it is the synthetic 400
+        // `ValidationException`, exactly as `CreateAlias` answers it.
+        if crate::state::names_an_alias(&input.target_key_id) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "TargetKeyId must name a KMS key, not an alias: {}",
+                input.target_key_id
+            )));
+        }
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+
+        // "Associates an EXISTING KMS alias with a different KMS key": this operation
+        // never creates one, so a name this endpoint holds no alias for is a
+        // `NotFoundException` and nothing is written. `CreateAlias` is how a name is
+        // first taken.
+        let Some(current_target) = state
+            .alias(&region, &input.alias_name)
+            .map(|alias| alias.target_key_id.clone())
+        else {
+            return Err(UpdateAliasErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::alias_not_found_message(
+                    &region,
+                    &input.alias_name,
+                )),
+            })
+            .into());
+        };
+
+        // The new target, in this Region: "The KMS key must be in the same Amazon Web
+        // Services account and Region as the alias." This operation models no
+        // `InvalidArnException`, so an identifier that is not a KMS ARN at all is
+        // reported as a target that was not found.
+        let target = match state.resolve(&region, &input.target_key_id) {
+            crate::state::KeyRef::Found(key) => key,
+            crate::state::KeyRef::NotFound | crate::state::KeyRef::MalformedArn => {
+                return Err(UpdateAliasErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::key_not_found_message(
+                        &region,
+                        &input.target_key_id,
+                    )),
+                })
+                .into());
+            }
+        };
+
+        // "The KMS key that you use for this operation must be in a compatible key
+        // state": a key whose deletion is scheduled is not, and stays as it is until
+        // `CancelKeyDeletion` restores it.
+        if target.key_state == crate::state::KEY_STATE_PENDING_DELETION {
+            return Err(UpdateAliasErrorModeled::KMSInvalidStateException(
+                KMSInvalidStateException {
+                    message: Some(crate::state::invalid_state_message(target)),
+                },
+            )
+            .into());
+        }
+        let target_key_id = target.key_id.clone();
+        let target_arn = target.arn.clone();
+        let target_spec = target.key_spec.clone();
+        let target_usage = target.key_usage.clone();
+
+        // "The current and new KMS key must be the same type (both symmetric or both
+        // asymmetric or both HMAC), and they must have the same key usage. This
+        // restriction prevents errors in code that uses aliases." KMS models no error
+        // for breaking it, so it is the synthetic 400 `ValidationException`, naming
+        // both keys and what differs. A target the alias already points at trivially
+        // satisfies it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAlias"))
+        // Keys are never removed from this store, so the alias's current target is
+        // always present; if it ever were not, there would be nothing to compare the
+        // new target against.
+        let mismatch = state
+            .key_in(&region, &current_target)
+            .and_then(|current| {
+                let same_type = match (
+                    crate::state::key_spec_profile(&current.key_spec)
+                        .map(crate::state::KeySpecProfile::family),
+                    crate::state::key_spec_profile(&target_spec)
+                        .map(crate::state::KeySpecProfile::family),
+                ) {
+                    (Some(current_family), Some(target_family)) => current_family == target_family,
+                    // A `KeySpec` this service has no profile for: compare the specs
+                    // themselves, which is strictly narrower than comparing families,
+                    // rather than reading two unknown types as compatible.
+                    _ => current.key_spec == target_spec,
+                };
+                if same_type && current.key_usage == target_usage {
+                    return None;
+                }
+                Some(format!(
+                    "The new target KMS key must be the same type and have the same key \
+                     usage as the current target KMS key: {} is {} with key usage {}, and \
+                     {} is {} with key usage {}.",
+                    current.arn,
+                    current.key_spec,
+                    current.key_usage,
+                    target_arn,
+                    target_spec,
+                    target_usage,
+                ))
+            });
+        if let Some(message) = mismatch {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        // A key's aliases are bounded, so moving a name onto a key that already holds
+        // the quota is refused with the modelled quota error rather than growing it
+        // past the bound. Moving a name onto the key it already names changes no
+        // count, so it is not refused.
+        if target_key_id != current_target {
+            let held = state.alias_count_for_key(&region, &target_key_id);
+            if held >= crate::state::MAX_ALIASES_PER_KEY {
+                return Err(UpdateAliasErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "The request was rejected because a quota was exceeded: a KMS key \
+                             carries at most {} aliases, and this key already has {held}.",
+                            crate::state::MAX_ALIASES_PER_KEY
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The one write: the name now resolves to the new key, from the next request
+        // on. The alias was found above, so this cannot be absent.
+        if let Some(alias) = state.alias_mut(&region, &input.alias_name) {
+            alias.repoint(target_key_id);
+        }
+
+        // "This operation does not return a response. To get the alias that you
+        // updated, use the ListAliases operation."
+        Ok(UpdateAliasOutput)
     }
+}
+
+/// The state store is missing, which is a server fault rather than a bad request.
+fn store_unavailable() -> UpdateAliasError {
+    UpdateAliasErrorModeled::KMSInternalException(KMSInternalException {
+        message: Some("the KMS state store is unavailable".to_string()),
+    })
+    .into()
 }

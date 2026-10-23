@@ -195,6 +195,13 @@ impl Dsql {
         .await
     }
 
+    /// `ListStreams`: `GET /stream/{clusterIdentifier}`, with whatever
+    /// `@httpQuery` string the case needs (`?max-results=..&next-token=..`).
+    pub async fn list_streams(&self, cluster_identifier: &str, query: &str) -> Answer {
+        self.call("GET", &format!("/stream/{cluster_identifier}{query}"), None)
+            .await
+    }
+
     pub async fn tag_resource(&self, resource_arn: &str, body: Value) -> Answer {
         // `resourceArn` is an `@httpLabel`, so its colons and slashes travel
         // percent-encoded the way an SDK sends them.

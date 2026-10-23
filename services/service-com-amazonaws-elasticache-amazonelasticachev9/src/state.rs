@@ -280,12 +280,6 @@ pub fn is_valid_cluster_id(value: &str) -> bool {
     is_valid_identifier(value, CLUSTER_ID_MAX_LEN)
 }
 
-/// True when `value` satisfies `ReplicationGroupId`'s documented constraints;
-/// see [`is_valid_identifier`].
-pub fn is_valid_replication_group_id(value: &str) -> bool {
-    is_valid_identifier(value, REPLICATION_GROUP_ID_MAX_LEN)
-}
-
 /// True when `value` can name a snapshot: 1 to 255 alphanumeric characters or
 /// hyphens.
 ///
@@ -1604,6 +1598,162 @@ pub fn is_subnet_id(value: &str) -> bool {
     value
         .strip_prefix("subnet-")
         .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_alphanumeric()))
+}
+
+/// How many hex characters an identifier of the account's EC2 network carries:
+/// a subnet its long form (`subnet-0bb1c79de3example`), a VPC EC2's short one
+/// (`vpc-0a1b2c3d`).
+const SUBNET_ID_HEX_LEN: usize = 17;
+/// See [`SUBNET_ID_HEX_LEN`].
+const VPC_ID_HEX_LEN: usize = 8;
+
+/// One subnet of the account's EC2 network in one Region: the identifier a
+/// request names, the VPC it belongs to and the Availability Zone it sits in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountSubnet {
+    /// The EC2 subnet identifier, as a request names it.
+    pub subnet_id: String,
+    /// The VPC this subnet belongs to.
+    pub vpc_id: String,
+    /// The Availability Zone this subnet sits in.
+    pub availability_zone: String,
+}
+
+/// The id of the account's default VPC in `region`.
+///
+/// AWS gives an account a default VPC in every Region and this emulator models
+/// no other, so the id is DERIVED from the Region name — stable, so every read
+/// reports the same VPC, and holding no state, so nothing has to be seeded or
+/// reset. This is the contract `services/common/src/network.rs` states for
+/// every service that places a resource in a subnet, implemented here constant
+/// for constant, so a client that creates an ElastiCache subnet group and a DAX
+/// one "in the same subnet" is talking to one account.
+pub fn default_vpc_id(region: &str) -> String {
+    use ::sha2::Digest;
+    let digest = ::hex::encode(::sha2::Sha256::digest(region.as_bytes()));
+    format!("vpc-{}", &digest[..VPC_ID_HEX_LEN])
+}
+
+/// How many Availability Zones a Region's default VPC has a default subnet in.
+///
+/// The account's network is the SAME fact for every service that places a
+/// resource in a subnet, so this is the count
+/// `services/common/src/network.rs` states — "a Region's default subnets sit one
+/// per Availability Zone, in the zones named `<region>a`, `<region>b`,
+/// `<region>c`" — and NOT the number of them ElastiCache selects for a
+/// serverless cache that names none ([`default_subnet_count`], which selects a
+/// SUBSET of these).
+const DEFAULT_SUBNETS_PER_REGION: usize = 3;
+
+/// The subnets that exist in `region`: the default VPC's default subnet in each
+/// Availability Zone of that Region.
+///
+/// AWS creates the default VPC with "a size /16 IPv4 CIDR block and a default
+/// subnet in each Availability Zone" (EC2's `CreateDefaultVpc`), so these
+/// subnets are facts of the account's Region rather than resources an
+/// ElastiCache request creates, and each sits in the zone [`availability_zone`]
+/// names. Each identifier is derived from its zone name, so a Region always
+/// reports the same subnets and [`resolve_subnet`] can tell an identifier that
+/// names one from an identifier that names nothing at all.
+///
+/// The subnets ElastiCache SELECTS for a serverless cache that names none are
+/// the first [`default_subnet_count`] of these, so what it selects is always
+/// something a request could have named itself.
+pub fn region_subnets(region: &str) -> Vec<AccountSubnet> {
+    use ::sha2::Digest;
+    let vpc_id = default_vpc_id(region);
+    (0..DEFAULT_SUBNETS_PER_REGION)
+        .map(|index| {
+            let availability_zone = availability_zone(region, index);
+            let digest = ::hex::encode(::sha2::Sha256::digest(availability_zone.as_bytes()));
+            AccountSubnet {
+                subnet_id: format!("subnet-{}", &digest[..SUBNET_ID_HEX_LEN]),
+                vpc_id: vpc_id.clone(),
+                availability_zone,
+            }
+        })
+        .collect()
+}
+
+/// The subnets ElastiCache selects for a resource in `region` whose request
+/// named none: the first [`default_subnet_count`] of the Region's own
+/// ([`region_subnets`]).
+pub fn selected_default_subnets(region: &str) -> Vec<AccountSubnet> {
+    let mut subnets = region_subnets(region);
+    subnets.truncate(default_subnet_count(region));
+    subnets
+}
+
+/// The subnet `subnet_id` names in `region`, or `None` when no subnet of that
+/// Region carries that identifier — which is what lets a request naming it be
+/// refused instead of stored.
+///
+/// EC2's own subnet operations still answer 501 in this emulator; when they are
+/// implemented, this is the one place that has to start consulting the stored
+/// subnets beside the derived ones.
+pub fn resolve_subnet(region: &str, subnet_id: &str) -> Option<AccountSubnet> {
+    region_subnets(region)
+        .into_iter()
+        .find(|subnet| subnet.subnet_id == subnet_id)
+}
+
+/// The subnet ids among `subnet_ids` that name no subnet of `region`, in the
+/// order the request listed them.
+pub fn unresolved_subnets<'a, I>(region: &str, subnet_ids: I) -> Vec<&'a str>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let known = region_subnets(region);
+    subnet_ids
+        .into_iter()
+        .filter(|id| !known.iter().any(|subnet| subnet.subnet_id == *id))
+        .collect()
+}
+
+/// How ElastiCache words a request naming subnets the account does not have,
+/// built from the offending ids: `Some input subnets in :[<ids>] are invalid.`
+pub fn invalid_subnets_message(subnet_ids: &[&str]) -> String {
+    format!("Some input subnets in :[{}] are invalid.", subnet_ids.join(", "))
+}
+
+/// The length bound a LOOKUP applies to an identifier before resolving it:
+/// ElastiCache's own identifier bound (`CacheClusterId`: "A name must contain
+/// from 1 to 50 alphanumeric characters or hyphens"), which is also the bound
+/// the service states when it refuses an over-long `ReplicationGroupId` on a
+/// describe ("Replication Group ID cannot be longer than 50 characters").
+///
+/// A CREATE applies the stricter bound its own member documents — see
+/// [`REPLICATION_GROUP_ID_MAX_LEN`], 40 characters, because creating a
+/// replication group also mints the member cluster ids from the group id — so
+/// an id between the two bounds is refused by a create and merely not found by
+/// a lookup.
+pub const LOOKUP_IDENTIFIER_MAX_LEN: usize = CLUSTER_ID_MAX_LEN;
+
+/// Why `value` cannot name a resource of this service, or `None` when it can:
+/// the refusal a lookup answers BEFORE it resolves the identifier, so a value
+/// that no resource could ever carry is reported as the bad parameter it is
+/// rather than as a resource that does not exist.
+///
+/// `prose` is how the service names the member in the length refusal
+/// ("Replication Group ID"), `parameter` how it names it in the identifier-rule
+/// refusal ("ReplicationGroupIdentifier"); both texts are the service's own.
+pub fn identifier_refusal(
+    prose: &str,
+    parameter: &str,
+    value: &str,
+    max_len: usize,
+) -> Option<String> {
+    if value.len() > max_len {
+        return Some(format!("{prose} cannot be longer than {max_len} characters."));
+    }
+    if is_valid_identifier(value, max_len) {
+        return None;
+    }
+    Some(format!(
+        "The parameter {parameter} is not a valid identifier. Identifiers must begin with a \
+         letter; must contain only ASCII letters, digits, and hyphens; and must not end with a \
+         hyphen or contain two consecutive hyphens."
+    ))
 }
 
 /// The ARN of a cache cluster: `arn:aws:elasticache:<region>:<account>:cluster:<id>`.
@@ -3571,9 +3721,10 @@ pub struct CacheSubnetGroupRecord {
     pub name: String,
     pub description: String,
     pub subnets: Vec<SubnetRecord>,
-    /// The VPC the group's subnets belong to, minted once by
-    /// [`ComAmazonawsElasticacheAmazonelasticachev9State::mint_vpc_id`] because
-    /// the emulator models no EC2 VPCs to read one from.
+    /// The VPC the group's subnets belong to: the VPC of the subnets the group
+    /// was created with, which is the account's default VPC in that Region
+    /// ([`default_vpc_id`]) because every subnet [`region_subnets`] reports
+    /// belongs to it.
     pub vpc_id: String,
     pub arn: String,
     /// The tags `CreateCacheSubnetGroup` was given; see
@@ -5883,10 +6034,6 @@ pub struct ComAmazonawsElasticacheAmazonelasticachev9State {
     pub serverless_caches: BTreeMap<String, ServerlessCacheRecord>,
     /// The counter endpoint DNS labels are minted from.
     pub dns_token_seq: u64,
-    /// The counter VPC ids are minted from.
-    pub vpc_seq: u64,
-    /// The counter the default subnet ids of a serverless cache are minted from.
-    pub subnet_seq: u64,
     /// The reserved-cache-node offerings this service publishes, keyed for the
     /// same stable total order. Stocked from [`offering_catalog`] when the store
     /// is created, because the catalog is the service's own and no operation
@@ -5934,8 +6081,6 @@ impl Default for ComAmazonawsElasticacheAmazonelasticachev9State {
             users: built_in_users(),
             cache_engine_versions: published_cache_engine_versions(),
             dns_token_seq: 0,
-            vpc_seq: 0,
-            subnet_seq: 0,
             reserved_cache_nodes_offerings: offering_catalog(),
             engine_default_parameters: published_engine_default_parameters(),
             reserved_cache_nodes: BTreeMap::new(),
@@ -5966,23 +6111,6 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
     pub fn mint_dns_token(&mut self) -> String {
         self.dns_token_seq = self.dns_token_seq.wrapping_add(1);
         format!("{:06x}", self.dns_token_seq & 0xff_ffff)
-    }
-
-    /// Mint the VPC id a new subnet group reports: `vpc-` and eight lowercase
-    /// hex digits, the form EC2 uses.
-    pub fn mint_vpc_id(&mut self) -> String {
-        self.vpc_seq = self.vpc_seq.wrapping_add(1);
-        format!("vpc-{:08x}", self.vpc_seq & 0xffff_ffff)
-    }
-
-    /// Mint the id of one subnet ElastiCache selects for a serverless cache the
-    /// request gave no `SubnetIds`: `subnet-` and eight lowercase hex digits,
-    /// the form EC2 uses. The emulator models no EC2 subnets to read one from,
-    /// so the selected ids are minted once and STORED on the record, which is
-    /// what makes every later read report the same subnets.
-    pub fn mint_subnet_id(&mut self) -> String {
-        self.subnet_seq = self.subnet_seq.wrapping_add(1);
-        format!("subnet-{:08x}", self.subnet_seq & 0xffff_ffff)
     }
 
     /// Build and store a serverless-cache record, returning what was stored.

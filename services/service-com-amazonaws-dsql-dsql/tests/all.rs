@@ -29,6 +29,8 @@ mod resource_tags;
 mod state_roundtrip;
 #[path = "all/stream_lifecycle.rs"]
 mod stream_lifecycle;
+#[path = "all/stream_listing.rs"]
+mod stream_listing;
 #[path = "all/stream_target_authorization.rs"]
 mod stream_target_authorization;
 #[path = "all/tag_resource.rs"]

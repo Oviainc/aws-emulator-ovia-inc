@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/fleet_attributes.rs"]
 mod fleet_attributes;
+#[path = "all/game_session_queues.rs"]
+mod game_session_queues;
 #[path = "all/hosting_loop.rs"]
 mod hosting_loop;
 #[path = "all/server_process_capacity.rs"]

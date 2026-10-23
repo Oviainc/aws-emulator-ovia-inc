@@ -12,8 +12,12 @@
 //!
 //! The table spans the class the rule generalises over: the operation, the
 //! member, where the member sits (top level, inside a nested structure, inside a
-//! list or map), and which kind of constraint was broken. The ARN/role-ARN rows
-//! the issue recorded are four rows among them.
+//! list or map), and which kind of constraint was broken.
+//!
+//! The ARN-typed members are NOT here: this service validates the ARNs a request
+//! carries with its own validators, which state their own field name and
+//! message, so that rule and its table live in `arn_validation_errors`. Every
+//! row below therefore holds a well-formed ARN wherever it needs one.
 //!
 //! Every case drives the real wire path through the shared `Harness` (see
 //! `workflow_lifecycle`), so what is asserted is what a client sees.
@@ -23,13 +27,15 @@ use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::ops::types::VALID
 use crate::workflow_lifecycle::{role_arn, Harness};
 
 /// The region every case signs with, and so the region a valid ARN carries.
-const REGION: &str = "us-east-1";
+///
+/// `pub(crate)` so the ARN suite signs and builds ARNs in the same region.
+pub(crate) const REGION: &str = "us-east-1";
 
 /// A `WorkflowArn`/`TaggableResourceArn` that satisfies the modelled pattern
 /// (`smithy_query(query="shape", shape="WorkflowArn")`). No workflow by this ARN
 /// exists, which is deliberate: a well-formed ARN must NOT be refused as a
 /// validation failure.
-fn valid_workflow_arn() -> String {
+pub(crate) fn valid_workflow_arn() -> String {
     format!("arn:aws:airflow-serverless:{REGION}:000000000000:workflow/demo-0123456789")
 }
 
@@ -40,7 +46,7 @@ fn valid_workflow_version() -> String {
 
 /// A `DefinitionS3Location` whose members carry no modelled constraint, used as
 /// the valid filler for the create/update rows.
-fn good_definition() -> serde_json::Value {
+pub(crate) fn good_definition() -> serde_json::Value {
     serde_json::json!({"Bucket": "defs", "ObjectKey": "dags/v.yaml"})
 }
 
@@ -73,16 +79,6 @@ fn refusal_cases() -> Vec<Case> {
     let arn = valid_workflow_arn();
     vec![
         // ---- @pattern on a top-level string ----
-        case(
-            "CreateWorkflow RoleArn is not an IAM role ARN",
-            "CreateWorkflow",
-            serde_json::json!({
-                "Name": "badRole",
-                "DefinitionS3Location": good_definition(),
-                "RoleArn": "not-a-valid-role-arn",
-            }),
-            &["RoleArn"],
-        ),
         case(
             "CreateWorkflow Name starts with a character the pattern excludes",
             "CreateWorkflow",
@@ -210,22 +206,17 @@ fn refusal_cases() -> Vec<Case> {
         ),
         // ---- several offending members in one request ----
         case(
-            "CreateWorkflow with both Name and RoleArn outside their patterns",
+            "CreateWorkflow with both Name and Description outside their constraints",
             "CreateWorkflow",
             serde_json::json!({
                 "Name": "-bad-name",
                 "DefinitionS3Location": good_definition(),
-                "RoleArn": "nope",
+                "RoleArn": role_arn(),
+                "Description": "",
             }),
-            &["Name", "RoleArn"],
+            &["Name", "Description"],
         ),
         // ---- the same rule on the other operations ----
-        case(
-            "GetWorkflow WorkflowArn is not an ARN",
-            "GetWorkflow",
-            serde_json::json!({"WorkflowArn": "not-an-arn"}),
-            &["WorkflowArn"],
-        ),
         case(
             "GetWorkflow WorkflowVersion is not 32 characters",
             "GetWorkflow",
@@ -233,29 +224,15 @@ fn refusal_cases() -> Vec<Case> {
             &["WorkflowVersion"],
         ),
         case(
-            "DeleteWorkflow WorkflowArn has a malformed region segment",
-            "DeleteWorkflow",
-            serde_json::json!({
-                "WorkflowArn":
-                    "arn:aws:airflow-serverless:REGION:000000000000:workflow/demo-0123456789",
-            }),
-            &["WorkflowArn"],
-        ),
-        case(
-            "UpdateWorkflow RoleArn is not an IAM role ARN",
+            "UpdateWorkflow Description is empty, below DescriptionString's minimum of 1",
             "UpdateWorkflow",
             serde_json::json!({
                 "WorkflowArn": arn.clone(),
                 "DefinitionS3Location": good_definition(),
-                "RoleArn": "arn:aws:iam::000000000000:user/not-a-role",
+                "RoleArn": role_arn(),
+                "Description": "",
             }),
-            &["RoleArn"],
-        ),
-        case(
-            "StartWorkflowRun WorkflowArn is not an ARN",
-            "StartWorkflowRun",
-            serde_json::json!({"WorkflowArn": "workflow/demo"}),
-            &["WorkflowArn"],
+            &["Description"],
         ),
         case(
             "StartWorkflowRun WorkflowVersion is empty, below VersionId's minimum",
@@ -286,40 +263,16 @@ fn refusal_cases() -> Vec<Case> {
             &["TaskInstanceId"],
         ),
         case(
-            "ListWorkflowRuns WorkflowArn is not an ARN",
-            "ListWorkflowRuns",
-            serde_json::json!({"WorkflowArn": "not-an-arn"}),
-            &["WorkflowArn"],
-        ),
-        case(
             "ListWorkflowRuns WorkflowVersion is empty, below VersionId's minimum",
             "ListWorkflowRuns",
             serde_json::json!({"WorkflowArn": arn.clone(), "WorkflowVersion": ""}),
             &["WorkflowVersion"],
         ),
         case(
-            "ListWorkflowVersions WorkflowArn is not an ARN",
-            "ListWorkflowVersions",
-            serde_json::json!({"WorkflowArn": "arn:aws:iam::000000000000:role/r"}),
-            &["WorkflowArn"],
-        ),
-        case(
             "ListTaskInstances RunId breaks the IdString pattern",
             "ListTaskInstances",
             serde_json::json!({"WorkflowArn": arn.clone(), "RunId": ".run"}),
             &["RunId"],
-        ),
-        case(
-            "ListTagsForResource ResourceArn is not an ARN",
-            "ListTagsForResource",
-            serde_json::json!({"ResourceArn": "not-an-arn"}),
-            &["ResourceArn"],
-        ),
-        case(
-            "TagResource ResourceArn is not an ARN",
-            "TagResource",
-            serde_json::json!({"ResourceArn": "not-an-arn", "Tags": {"team": "data"}}),
-            &["ResourceArn"],
         ),
         case(
             "TagResource tag value one past TagValue's maximum of 256",
@@ -329,12 +282,6 @@ fn refusal_cases() -> Vec<Case> {
                 "Tags": {"big": "v".repeat(257)},
             }),
             &["Tags.big"],
-        ),
-        case(
-            "UntagResource ResourceArn is not an ARN",
-            "UntagResource",
-            serde_json::json!({"ResourceArn": "not-an-arn", "TagKeys": ["team"]}),
-            &["ResourceArn"],
         ),
         case(
             "UntagResource TagKeys is empty, below the TagKeys minimum of 1",

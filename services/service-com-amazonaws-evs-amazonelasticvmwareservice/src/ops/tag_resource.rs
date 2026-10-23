@@ -158,13 +158,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             TagResourceErrorModeled::InternalServerException(InternalServerException {
                 message: "The Amazon EVS environment store is unavailable.".to_string(),
             })
         })?;
+        // Authorization first: AWS decides it at the IAM layer, BEFORE the resource the
+        // request names is evaluated. This surface addresses the resource by ARN, so the
+        // ARN the decision is made against is the one the request gave.
+        if let Some(denied) = crate::state::authorization::denied(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            Some(&input.resource_arn),
+        ) {
+            return Err(denied);
+        }
         let mut state = state.lock();
         state.materialise_due_transitions();
 

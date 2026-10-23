@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetListing
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetListing`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetListing::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one catalog listing a `CreateListingChangeSet` PUBLISHED in a persisted
+//! domain, from the stored record and nothing else — so a listing this emulator never
+//! published is a 404, and a read changes nothing a later caller sees.
+//!
+//! "If you specify a listing version, only details that are specific to that version
+//! are returned" (smithy_query operation="GetListing"): `listingRevision` selects WHICH
+//! recorded revision — which snapshot of the published entity — the `item`, `name` and
+//! `description` come from, and its `@default` of `latest`
+//! ([`crate::state::LISTING_REVISION_LATEST`]) selects the newest one. A revision the
+//! listing does not have names no stored resource.
+//!
+//! The listing's own members — when it was created and last changed, by whom, and its
+//! `status` — belong to the listing rather than to one snapshot of it, so they are the
+//! same whichever revision is asked for.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +169,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetListing` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetListingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetListing"))
+        use crate::state::{
+            date_time, listing_item, now_ms, ResourceKind, LISTING_REVISION_LATEST,
+        };
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetListingErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        store.settle_clock(now_ms());
+
+        let listing = store
+            .live_domain(&input.domain_identifier)
+            .ok_or_else(|| {
+                GetListingErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: ResourceKind::Domain.not_found_message(),
+                })
+            })?
+            .listings
+            .get(&input.identifier)
+            .ok_or_else(|| {
+                GetListingErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: ResourceKind::Listing.not_found_message(),
+                })
+            })?;
+        // The modelled `@default` is `latest`, so a request that names no revision
+        // arrives carrying it; an empty one names nothing and is read the same way.
+        let revision = if input.listing_revision.is_empty()
+            || input.listing_revision == LISTING_REVISION_LATEST
+        {
+            listing.latest_revision()
+        } else {
+            listing.revision(&input.listing_revision)
+        };
+        let revision = revision.ok_or_else(|| {
+            GetListingErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: ResourceKind::Listing.not_found_message(),
+            })
+        })?;
+
+        Ok(GetListingOutput {
+            domain_id: listing.domain_id.clone(),
+            id: listing.id.clone(),
+            listing_revision: revision.revision.to_string(),
+            created_at: Some(date_time(listing.created_at_ms)),
+            created_by: Some(listing.created_by.clone()),
+            updated_at: Some(date_time(listing.updated_at_ms)),
+            updated_by: Some(listing.updated_by.clone()),
+            item: Some(listing_item(listing, revision)),
+            name: Some(revision.name.clone()),
+            description: revision.description.clone(),
+            status: Some(listing.status.clone()),
+        })
     }
 }
+

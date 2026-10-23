@@ -323,12 +323,9 @@ async fn a_scaffolded_operation_still_answers_501() {
     // Rows: operations this crate has not implemented yet, control plane and data
     // plane (`grep -l 'SCAFFOLDED, NOT IMPLEMENTED' src/ops/`).
     let cases: Vec<(&str, Value)> = vec![
-        (
-            "UpdateAlias",
-            json!({"AliasName": "alias/demo", "TargetKeyId": key_id}),
-        ),
+        ("ListResourceTags", json!({"KeyId": key_id})),
         ("GetKeyPolicy", json!({"KeyId": key_id, "PolicyName": "default"})),
-        ("ListAliases", json!({})),
+        ("EnableKeyRotation", json!({"KeyId": key_id})),
         (
             "GenerateDataKey",
             json!({"KeyId": key_id, "KeySpec": "AES_256"}),

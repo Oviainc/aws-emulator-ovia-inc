@@ -13,6 +13,11 @@
 //! [`flows`](ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::flows)
 //! map the same way, with [`FlowRecord::to_create_output`] /
 //! [`FlowRecord::to_get_output`] as its single projections.
+//!
+//! The knowledge-base lifecycle (`CreateKnowledgeBase`, `GetKnowledgeBase`) is
+//! backed by the
+//! [`knowledge_bases`](ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::knowledge_bases)
+//! map, with [`KnowledgeBaseRecord::to_knowledge_base`] as its single projection.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -21,7 +26,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     Agent, AgentSummary, CreateFlowOutput, CustomOrchestration, FlowDefinition, FlowValidation,
-    GetFlowOutput, GuardrailConfiguration, MemoryConfiguration, PromptOverrideConfiguration,
+    GetFlowOutput, GuardrailConfiguration, KnowledgeBase, KnowledgeBaseConfiguration,
+    MemoryConfiguration, PromptOverrideConfiguration, StorageConfiguration,
 };
 
 /// The region an ARN carries when the request is unsigned, so it names no
@@ -346,6 +352,205 @@ pub fn flow_id_from_identifier(identifier: &str) -> Option<&str> {
     is_flow_id(id).then_some(id)
 }
 
+/// The most knowledge bases this store holds; past it `CreateKnowledgeBase`
+/// answers the modelled `ServiceQuotaExceededException` instead of growing.
+///
+/// Amazon Bedrock publishes an adjustable quota on knowledge bases per account
+/// per Region, and this emulator models neither Service Quotas nor an account's
+/// adjustments — so this is the emulator's OWN bound on the store, set far above
+/// any workflow an emulator serves, and it is what stops the knowledge-base
+/// state growing without end.
+pub const KNOWLEDGE_BASE_QUOTA: usize = 1_000;
+
+/// How long after `CreateKnowledgeBase` a knowledge base leaves `CREATING` for
+/// `ACTIVE`.
+///
+/// CHOSEN, not documented: AWS publishes no duration for knowledge-base
+/// creation. It is deliberately non-zero so a caller that reads the knowledge
+/// base back immediately still observes the transient `CREATING` status the
+/// modelled `KnowledgeBaseStatus` declares ("CREATING – The knowledge base is
+/// being created"), and short enough that a client script converges promptly.
+pub const KNOWLEDGE_BASE_ACTIVATION_SPAN: Duration = Duration::from_millis(500);
+
+/// The `KnowledgeBaseType` discriminator of a self-managed vector knowledge
+/// base: the one `CreateKnowledgeBase` documents a vector store for ("For
+/// self-managed knowledge bases, provide the configuration for your vector
+/// store in the storageConfiguration object").
+pub const VECTOR_KNOWLEDGE_BASE_TYPE: &str = "VECTOR";
+
+/// Every modelled `KnowledgeBaseType` value, paired with the
+/// `KnowledgeBaseConfiguration` member that carries that kind's details.
+///
+/// Source: the `KnowledgeBaseType` enum and the `KnowledgeBaseConfiguration`
+/// structure of this service's Smithy model
+/// (`smithy_query(query="shape",shape="KnowledgeBaseType,KnowledgeBaseConfiguration")`).
+pub const KNOWLEDGE_BASE_CONFIGURATION_MEMBERS: [(&str, &str); 4] = [
+    ("VECTOR", "vectorKnowledgeBaseConfiguration"),
+    ("KENDRA", "kendraKnowledgeBaseConfiguration"),
+    ("SQL", "sqlKnowledgeBaseConfiguration"),
+    ("MANAGED", "managedKnowledgeBaseConfiguration"),
+];
+
+/// Why a `knowledgeBaseConfiguration` (with its `storageConfiguration`) cannot
+/// back a knowledge base. Each variant is a bad request, answered with the
+/// modelled `ValidationException`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KnowledgeBaseConfigurationProblem {
+    /// `type` is none of the modelled `KnowledgeBaseType` values.
+    UnknownType(String),
+    /// `type` names a kind whose own configuration member was not supplied.
+    MissingConfigurationMember {
+        knowledge_base_type: String,
+        member: &'static str,
+    },
+    /// A self-managed vector knowledge base with no vector store configured.
+    MissingStorageConfiguration,
+}
+
+impl KnowledgeBaseConfigurationProblem {
+    /// The refusal's message: it names the member and the constraint the
+    /// request failed, so it is built from the request rather than quoted.
+    pub fn message(&self) -> String {
+        match self {
+            Self::UnknownType(value) => {
+                let admitted: Vec<&str> = KNOWLEDGE_BASE_CONFIGURATION_MEMBERS
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .collect();
+                format!(
+                    "Value '{value}' at 'knowledgeBaseConfiguration.type' failed to satisfy \
+                     constraint: Member must satisfy enum value set: [{}]",
+                    admitted.join(", ")
+                )
+            }
+            Self::MissingConfigurationMember {
+                knowledge_base_type,
+                member,
+            } => format!(
+                "knowledgeBaseConfiguration.{member} is required for a \
+                 knowledgeBaseConfiguration.type of {knowledge_base_type}"
+            ),
+            Self::MissingStorageConfiguration => format!(
+                "storageConfiguration is required for a knowledgeBaseConfiguration.type of \
+                 {VECTOR_KNOWLEDGE_BASE_TYPE}"
+            ),
+        }
+    }
+}
+
+/// Whether `configuration` names a kind this service can store, and whether the
+/// request supplied everything that kind needs. `None` when it did.
+///
+/// The `type` member is a discriminator: it names which of
+/// `KnowledgeBaseConfiguration`'s sibling members carries that kind's details,
+/// and for a self-managed vector knowledge base it also makes
+/// `storageConfiguration` — the vector store — a requirement, which a managed,
+/// Kendra or SQL knowledge base has no use for.
+pub fn knowledge_base_configuration_problem(
+    configuration: &KnowledgeBaseConfiguration,
+    storage_configuration: Option<&StorageConfiguration>,
+) -> Option<KnowledgeBaseConfigurationProblem> {
+    let knowledge_base_type = configuration.r#type.as_str();
+    let member = KNOWLEDGE_BASE_CONFIGURATION_MEMBERS
+        .iter()
+        .find(|(name, _)| *name == knowledge_base_type)
+        .map(|(_, member)| *member);
+    let Some(member) = member else {
+        return Some(KnowledgeBaseConfigurationProblem::UnknownType(
+            knowledge_base_type.to_string(),
+        ));
+    };
+
+    let supplied = match knowledge_base_type {
+        "VECTOR" => configuration.vector_knowledge_base_configuration.is_some(),
+        "KENDRA" => configuration.kendra_knowledge_base_configuration.is_some(),
+        "SQL" => configuration.sql_knowledge_base_configuration.is_some(),
+        _ => configuration.managed_knowledge_base_configuration.is_some(),
+    };
+    if !supplied {
+        return Some(
+            KnowledgeBaseConfigurationProblem::MissingConfigurationMember {
+                knowledge_base_type: knowledge_base_type.to_string(),
+                member,
+            },
+        );
+    }
+
+    if knowledge_base_type == VECTOR_KNOWLEDGE_BASE_TYPE && storage_configuration.is_none() {
+        return Some(KnowledgeBaseConfigurationProblem::MissingStorageConfiguration);
+    }
+
+    None
+}
+
+/// The `KnowledgeBaseStatus` values this slice of the service can hold, named as
+/// the model's `KnowledgeBaseStatus` enum names them on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnowledgeBaseStatus {
+    /// `CreateKnowledgeBase` accepted; the knowledge base reaches
+    /// [`KnowledgeBaseStatus::Active`] once [`KNOWLEDGE_BASE_ACTIVATION_SPAN`]
+    /// has elapsed.
+    Creating,
+    /// The knowledge base is ready to be queried.
+    Active,
+}
+
+impl KnowledgeBaseStatus {
+    /// The member value for the modelled `KnowledgeBaseStatus` enum.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Creating => "CREATING",
+            Self::Active => "ACTIVE",
+        }
+    }
+}
+
+/// One stored knowledge base: the single source of truth for every
+/// knowledge-base operation.
+#[derive(Debug, Clone)]
+pub struct KnowledgeBaseRecord {
+    pub knowledge_base_id: String,
+    pub name: String,
+    pub knowledge_base_arn: String,
+    pub description: Option<String>,
+    pub role_arn: String,
+    pub knowledge_base_configuration: KnowledgeBaseConfiguration,
+    pub storage_configuration: Option<StorageConfiguration>,
+    pub status: KnowledgeBaseStatus,
+    /// A status the CLOCK owes this knowledge base, and the instant it comes
+    /// due. A reporting operation may materialise it once that instant has
+    /// passed; it never invents a transition of its own.
+    pub pending_status: Option<(SystemTime, KnowledgeBaseStatus)>,
+    /// Reasons the last API operation on the knowledge base failed; empty while
+    /// nothing has failed.
+    pub failure_reasons: Vec<String>,
+    pub tags: HashMap<String, String>,
+    pub client_token: Option<String>,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+}
+
+impl KnowledgeBaseRecord {
+    /// This record as the modelled `KnowledgeBase` shape: every member is
+    /// populated from the stored record, never from the request being served.
+    pub fn to_knowledge_base(&self) -> KnowledgeBase {
+        KnowledgeBase {
+            knowledge_base_id: self.knowledge_base_id.clone(),
+            name: self.name.clone(),
+            knowledge_base_arn: self.knowledge_base_arn.clone(),
+            description: self.description.clone(),
+            role_arn: self.role_arn.clone(),
+            knowledge_base_configuration: self.knowledge_base_configuration.clone(),
+            storage_configuration: self.storage_configuration.clone(),
+            status: self.status.as_wire().to_string(),
+            created_at: to_date_time(self.created_at),
+            updated_at: to_date_time(self.updated_at),
+            failure_reasons: (!self.failure_reasons.is_empty())
+                .then(|| self.failure_reasons.clone()),
+        }
+    }
+}
+
 /// A `ListAgents` resume cursor, decoded back into the ordering it names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageCursor {
@@ -388,6 +593,13 @@ pub struct ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
     /// `clientToken` -> `flowId`, so a retried `CreateFlow` carrying the same
     /// `@idempotencyToken` returns the flow it already created.
     pub flow_client_tokens: HashMap<String, String>,
+    /// Every knowledge base that exists, keyed by its 10-character
+    /// `knowledgeBaseId`.
+    pub knowledge_bases: HashMap<String, KnowledgeBaseRecord>,
+    /// `clientToken` -> `knowledgeBaseId`, so a retried `CreateKnowledgeBase`
+    /// carrying the same `@idempotencyToken` returns the knowledge base it
+    /// already created.
+    pub knowledge_base_client_tokens: HashMap<String, String>,
     /// Feeds id minting; never returned to a caller.
     id_sequence: u64,
 }
@@ -443,6 +655,19 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
         None
     }
 
+    /// Mint an unused `knowledgeBaseId`, which the modelled `Id` shape
+    /// constrains to the same `^[0-9a-zA-Z]{10}$` as an `agentId`. `None` when
+    /// every one of [`MINT_ATTEMPTS`] draws collided.
+    pub fn mint_knowledge_base_id(&mut self, now: SystemTime) -> Option<String> {
+        for _ in 0..MINT_ATTEMPTS {
+            let id = self.next_id_candidate(now);
+            if !self.knowledge_bases.contains_key(&id) {
+                return Some(id);
+            }
+        }
+        None
+    }
+
     /// Apply every status transition the CLOCK has already made due.
     ///
     /// Called by the reporting operations as well as the mutating ones: a change
@@ -454,6 +679,14 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
                 if now >= due {
                     agent.agent_status = next;
                     agent.pending_status = None;
+                }
+            }
+        }
+        for knowledge_base in self.knowledge_bases.values_mut() {
+            if let Some((due, next)) = knowledge_base.pending_status {
+                if now >= due {
+                    knowledge_base.status = next;
+                    knowledge_base.pending_status = None;
                 }
             }
         }

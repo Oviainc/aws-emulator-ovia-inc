@@ -187,7 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        use crate::state::{date_time, now_ms};
+        use crate::state::{date_time, now_ms, ENTITY_TYPE_ASSET};
         let _ = ctx;
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
@@ -198,20 +198,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle_clock(now_ms());
 
-        let asset = store
-            .live_domain(&input.domain_identifier)
-            .ok_or_else(|| {
-                GetAssetErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: format!("Domain {} was not found", input.domain_identifier),
-                })
-            })?
-            .assets
-            .get(&input.identifier)
-            .ok_or_else(|| {
-                GetAssetErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: format!("Asset {} was not found", input.identifier),
-                })
-            })?;
+        let domain = store.live_domain(&input.domain_identifier).ok_or_else(|| {
+            GetAssetErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("Domain {} was not found", input.domain_identifier),
+            })
+        })?;
+        let asset = domain.assets.get(&input.identifier).ok_or_else(|| {
+            GetAssetErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("Asset {} was not found", input.identifier),
+            })
+        })?;
         // A revision the asset does not have names no stored resource.
         if let Some(wanted) = input.revision.as_deref() {
             if wanted != asset.revision {
@@ -246,9 +242,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             governed_glossary_terms: None,
             owning_project_id: asset.owning_project_id.clone(),
             domain_id: asset.domain_id.clone(),
-            // An asset is published into the catalog by `CreateListingChangeSet`, so no
-            // stored asset has a listing yet.
-            listing: None,
+            // An asset is published into the catalog by `CreateListingChangeSet`, which
+            // records the listing this reports: its id, and the status it is in now.
+            // An asset nobody published has none.
+            listing: domain
+                .listing_for_entity(ENTITY_TYPE_ASSET, &asset.id)
+                .map(|listing| AssetListingDetails {
+                    listing_id: listing.id.clone(),
+                    listing_status: listing.status.clone(),
+                }),
             forms_output: asset
                 .forms
                 .iter()

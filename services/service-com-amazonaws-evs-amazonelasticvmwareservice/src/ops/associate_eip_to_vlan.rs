@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateEipToVlan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateEipToVlan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Associates an Elastic IP address with the public HCX VLAN of a stored environment:
+//! the association is recorded on that VLAN in [`crate::state`] and reported in the
+//! `Vlan` this operation answers with, so `ListEnvironmentVlans` reports the same
+//! association afterwards.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateEipToVlan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rules it enforces, each from the documentation quoted under "Modeled contract"
+//! below:
+//!
+//! 1. The `environmentId` names an environment this service holds, in the Region the
+//!    request was addressed to — otherwise the modelled `ResourceNotFoundException`.
+//! 2. `vlanName` is `hcx`: "hcx is the only accepted VLAN name at this time".
+//! 3. That VLAN is public: the operation is "only allowed for public HCX VLANs at this
+//!    time", and a VLAN is public only when the create asked for it through
+//!    `isHcxPublic`.
+//! 4. The operation is `@idempotent`: associating an allocation the VLAN already
+//!    carries reports the association it has rather than adding a second one.
+//!
+//! The association's `ipAddress` is the Elastic IP address the account's Amazon EC2
+//! store holds for the allocation ([`crate::state::ec2_resources`]). An allocation that
+//! store does not hold leaves the member absent, because this service has no address of
+//! its own to report for it.
 //!
 //! ## Shape of an operation
 //!
@@ -97,12 +109,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-evs-amazonelasticvmware
 // here — hence the `AssociateEipToVlanError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.evs#AssociateEipToVlan")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.evs#AssociateEipToVlan",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum AssociateEipToVlanErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
+    /// Widened in from the service's own error set (this operation does not list it):
+    /// the one honest answer when this service's store cannot be reached at all.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -156,18 +174,154 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateEipToVlan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateEipToVlanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateEipToVlan"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AssociateEipToVlanErrorModeled::InternalServerException(InternalServerException {
+                message: "The Amazon EVS environment store is unavailable.".to_string(),
+            })
+        })?;
+        // `clientToken` is read and ignored on purpose: "This parameter is not used in
+        // Amazon EVS currently. If you supply input for this parameter, it will have no
+        // effect." (`clientToken` doc). The operation is idempotent through the stored
+        // associations instead — see the `already_associated` branch below.
+        let _ = &input.client_token;
+        let region = crate::state::request_region(ctx.parts());
+        let environment_arn = crate::state::environment_arn(&region, &input.environment_id);
+        // Authorization first: AWS decides it at the IAM layer, before the resource the
+        // request names is evaluated, so the ARN is the one the REQUEST names.
+        if let Some(denied) = crate::state::authorization::denied(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            Some(&environment_arn),
+        ) {
+            return Err(denied);
+        }
+        // The Elastic IP address behind the allocation, read from Amazon EC2's own store
+        // before this service's lock is taken, so only one store is ever held at a time.
+        let ip_address =
+            crate::state::ec2_resources::elastic_ip_address(&*self.engine, &input.allocation_id);
+        let modified_at_ms = crate::state::now_ms();
+
+        let mut state = state.lock();
+        // Reporting only: this materialises the state changes the clock already owed,
+        // which were due whether or not anybody called, so the VLAN is in the state that
+        // is due at this instant before the association is evaluated.
+        state.materialise_due_transitions();
+
+        // Regional resource: an environment exists at the endpoint of the Region it was
+        // created in. One that has reached DELETED is gone as far as this operation is
+        // concerned: "The resource might not be specified correctly, or it may have a
+        // state of DELETED" (`ResourceNotFoundException` doc).
+        let environment = state
+            .environment_in_region(&region, &input.environment_id)
+            .filter(|environment| environment.state != crate::state::STATE_DELETED)
+            .ok_or_else(|| {
+                AssociateEipToVlanErrorModeled::ResourceNotFoundException(
+                    crate::state::environment_not_found(&input.environment_id),
+                )
+            })?;
+
+        // "hcx is the only accepted VLAN name at this time" (`vlanName` doc): every
+        // other VLAN of the environment, and every name that is no VLAN at all, is
+        // refused with the operation's modelled ValidationException.
+        if input.vlan_name != crate::state::HCX_FUNCTION {
+            return Err(AssociateEipToVlanErrorModeled::ValidationException(
+                crate::state::field_validation_error(
+                    "vlanName",
+                    &format!(
+                        "must be {}, the only VLAN an Elastic IP address can be associated \
+                         with at this time",
+                        crate::state::HCX_FUNCTION
+                    ),
+                ),
+            )
+            .into());
+        }
+        let hcx = environment
+            .vlans
+            .iter()
+            .find(|vlan| vlan.function_name == crate::state::HCX_FUNCTION)
+            .ok_or_else(|| {
+                AssociateEipToVlanErrorModeled::ValidationException(
+                    crate::state::field_validation_error(
+                        "vlanName",
+                        "names no VLAN of this environment",
+                    ),
+                )
+            })?;
+        // "This operation is only allowed for public HCX VLANs at this time": a VLAN is
+        // public only when the create asked for it through `isHcxPublic`.
+        if !hcx.is_public {
+            return Err(AssociateEipToVlanErrorModeled::ValidationException(
+                crate::state::field_validation_error(
+                    "vlanName",
+                    "names a private VLAN; an Elastic IP address can only be associated with \
+                     a public HCX VLAN",
+                ),
+            )
+            .into());
+        }
+        // `@idempotent`: an allocation this VLAN already carries keeps the association
+        // it has, and the call reports that association rather than adding a second one.
+        let already_associated = hcx.eip_associations.iter().any(|association| {
+            association.allocation_id.as_deref() == Some(input.allocation_id.as_str())
+        });
+        // The store's own bound on how many associations one VLAN holds: the caller
+        // chooses the `allocationId`, so this is the growth that has to be refused
+        // rather than admitted. Refused with the operation's modelled
+        // ValidationException, naming the member whose value cannot be admitted: the
+        // operation models no quota error.
+        if !already_associated
+            && hcx.eip_associations.len() >= crate::state::MAX_EIP_ASSOCIATIONS_PER_VLAN
+        {
+            return Err(AssociateEipToVlanErrorModeled::ValidationException(
+                crate::state::field_validation_error(
+                    "allocationId",
+                    &format!(
+                        "cannot be associated: this VLAN already carries the {} Elastic IP \
+                         associations it can hold; disassociate one first",
+                        crate::state::MAX_EIP_ASSOCIATIONS_PER_VLAN
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        let association = (!already_associated).then(|| EipAssociation {
+            association_id: Some(state.mint_eip_association_id()),
+            allocation_id: Some(input.allocation_id.clone()),
+            ip_address,
+        });
+        // The environment was found above, so this lookup resolves; answering honestly
+        // beats reporting a VLAN this call did not change as if it had.
+        let environment = state
+            .environment_in_region_mut(&region, &input.environment_id)
+            .ok_or_else(|| {
+                AssociateEipToVlanErrorModeled::InternalServerException(InternalServerException {
+                    message: format!(
+                        "The environment {} is no longer available.",
+                        input.environment_id
+                    ),
+                })
+            })?;
+        let vlan = environment
+            .vlans
+            .iter_mut()
+            .find(|vlan| vlan.function_name == crate::state::HCX_FUNCTION)
+            .ok_or_else(|| {
+                AssociateEipToVlanErrorModeled::InternalServerException(InternalServerException {
+                    message: "The HCX VLAN of this environment is no longer available."
+                        .to_string(),
+                })
+            })?;
+        if let Some(association) = association {
+            vlan.eip_associations.push(association);
+            vlan.modified_at_ms = modified_at_ms;
+        }
+        let vlan = vlan.to_wire();
+        if !already_associated {
+            environment.modified_at_ms = modified_at_ms;
+        }
+        Ok(AssociateEipToVlanOutput { vlan: Some(vlan) })
     }
 }

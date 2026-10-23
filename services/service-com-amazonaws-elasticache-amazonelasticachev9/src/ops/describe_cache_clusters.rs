@@ -221,6 +221,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // With `CacheClusterId` the answer is that one cluster, or the modelled
         // not-found; pagination does not apply to a single-resource lookup.
         if let Some(id) = input.cache_cluster_id.as_deref() {
+            // The FORM of the identifier first, for the same reason as in
+            // `describe_replication_groups`: a value no cluster could ever
+            // carry is a bad parameter value rather than a missing cluster.
+            if let Some(message) = crate::state::identifier_refusal(
+                "Cache Cluster ID",
+                "CacheClusterIdentifier",
+                id,
+                crate::state::LOOKUP_IDENTIFIER_MAX_LEN,
+            ) {
+                return Err(
+                    DescribeCacheClustersErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                );
+            }
             let key = id.to_ascii_lowercase();
             let Some(cluster) = store.cache_clusters.get(&key) else {
                 return Err(DescribeCacheClustersErrorModeled::CacheClusterNotFoundFault(

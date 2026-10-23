@@ -16,9 +16,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AnywhereConfiguration, CertificateConfiguration, FleetAttributes, GameProperty, GameSession,
-    IpPermission, LocationState, PlayerGatewayConfiguration, PlayerSession,
-    ResourceCreationLimitPolicy, RuntimeConfiguration, Tag,
+    AnywhereConfiguration, CertificateConfiguration, FilterConfiguration, FleetAttributes,
+    GameProperty, GameSession, GameSessionQueue, GameSessionQueueDestination, IpPermission,
+    LocationState, PlayerGatewayConfiguration, PlayerLatencyPolicy, PlayerSession,
+    PriorityConfiguration, ResourceCreationLimitPolicy, RuntimeConfiguration, Tag,
 };
 
 /// `ComputeType` values the model declares (`smithy_query shape=ComputeType`).
@@ -114,6 +115,61 @@ pub const MAX_FLEETS_PER_ACCOUNT: usize = 100;
 /// can exist, so no legitimate request is refused — and naming more than that can only
 /// be repetition, which would otherwise let one request drive an unbounded response.
 pub const MAX_FLEET_IDS_PER_REQUEST: usize = MAX_FLEETS_PER_ACCOUNT;
+
+/// How many game session queues this emulator holds before `CreateGameSessionQueue`
+/// answers the modelled `LimitExceededException` ("The requested operation would cause
+/// the resource to exceed the allowed service limit").
+///
+/// Like [`MAX_FLEETS_PER_ACCOUNT`], Amazon GameLift Servers caps queues per account per
+/// Region while this emulator keeps ONE store for the account, so the cap is
+/// account-wide. The model carries no quota, so the count is CHOSEN: far above any
+/// realistic script, and the bound that keeps the queue store from growing without limit.
+pub const MAX_GAME_SESSION_QUEUES_PER_ACCOUNT: usize = 50;
+
+/// How many queue identifiers one `DescribeGameSessionQueues` request may name.
+///
+/// The model bounds `GameSessionQueueNameOrArnList` neither above nor below, and each
+/// entry that is an ARN is resolved by a scan of the queue store, so the work one request
+/// can ask for is the PRODUCT of the list length and the stored queue count. This count
+/// is CHOSEN, exactly as [`MAX_FLEET_IDS_PER_REQUEST`] is: it is
+/// [`MAX_GAME_SESSION_QUEUES_PER_ACCOUNT`], the most distinct queues that can exist, so
+/// no legitimate request is refused — and naming more than that can only be repetition.
+pub const MAX_QUEUE_NAMES_PER_REQUEST: usize = MAX_GAME_SESSION_QUEUES_PER_ACCOUNT;
+
+/// How many destinations one game session queue may list.
+///
+/// `GameSessionQueueDestinationList` carries no modelled length, and a stored queue holds
+/// the list verbatim for as long as the queue exists, so this count is CHOSEN: far above
+/// any realistic queue — a destination is a fleet or alias of the account, which
+/// [`MAX_FLEETS_PER_ACCOUNT`] already bounds — and the bound that keeps one request from
+/// deciding how much a stored record occupies.
+pub const MAX_QUEUE_DESTINATIONS: usize = MAX_FLEETS_PER_ACCOUNT;
+
+/// How many player latency policies one game session queue may list.
+///
+/// `PlayerLatencyPolicyList` carries no modelled length either, and the policies are
+/// "evaluated in order starting with the lowest maximum latency value" to "gradually
+/// relax the cap over time", so a queue needs a handful. This count is CHOSEN for the
+/// same reason as [`MAX_QUEUE_DESTINATIONS`]: it bounds what one request can make a
+/// stored record occupy.
+pub const MAX_QUEUE_PLAYER_LATENCY_POLICIES: usize = 10;
+
+/// The bounds a game session queue's `TimeoutInSeconds` must lie within.
+///
+/// `CreateGameSessionQueue$TimeoutInSeconds` and `GameSessionQueue$TimeoutInSeconds`
+/// carry the same note: "The minimum value is 10 and the maximum value is 600." The
+/// modelled `WholeNumber` range bounds the member only below (`0..`), so the documented
+/// bounds are enforced here.
+pub const QUEUE_TIMEOUT_RANGE_SECONDS: (i32, i32) = (10, 600);
+
+/// The `TimeoutInSeconds` a queue created without one carries.
+///
+/// `CreateGameSessionQueue$TimeoutInSeconds`' doc: "If you don't specify a request
+/// timeout, the queue uses a default value." Neither the model nor the docs name that
+/// value, so it is CHOSEN: the documented maximum
+/// ([`QUEUE_TIMEOUT_RANGE_SECONDS`]`.1`), the most permissive setting, which keeps a
+/// placement request queued for as long as the service allows before it times out.
+pub const DEFAULT_QUEUE_TIMEOUT_SECONDS: i32 = QUEUE_TIMEOUT_RANGE_SECONDS.1;
 
 /// The port range a fleet that opens no inbound permissions draws game-session ports
 /// from, and the range an opened one must lie within. `IpPermission$FromPort`'s doc:
@@ -245,6 +301,8 @@ pub enum PageKind {
     Fleets,
     /// `DescribeGameSessions`.
     GameSessions,
+    /// `DescribeGameSessionQueues`.
+    GameSessionQueues,
 }
 
 impl PageKind {
@@ -253,6 +311,7 @@ impl PageKind {
         match self {
             Self::Fleets => 'f',
             Self::GameSessions => 'g',
+            Self::GameSessionQueues => 'q',
         }
     }
 }
@@ -693,11 +752,63 @@ impl PlayerSessionRecord {
     }
 }
 
+/// A game session placement queue, as `CreateGameSessionQueue` persisted it.
+///
+/// `GameSessionQueue` is "configuration for a game session placement mechanism": every
+/// member of it is a setting the request supplied or the service decided, so the record
+/// holds them all and [`GameSessionQueueRecord::to_modelled`] is the one projection every
+/// read of the queue is served from.
+#[derive(Debug, Clone)]
+pub struct GameSessionQueueRecord {
+    pub name: String,
+    pub queue_arn: String,
+    pub timeout_in_seconds: i32,
+    pub player_latency_policies: Vec<PlayerLatencyPolicy>,
+    pub destinations: Vec<GameSessionQueueDestination>,
+    pub filter_configuration: Option<FilterConfiguration>,
+    pub priority_configuration: Option<PriorityConfiguration>,
+    pub custom_event_data: Option<String>,
+    pub notification_target: Option<String>,
+    /// The labels assigned to the queue resource. `GameSessionQueue` has no `Tags`
+    /// member — tags are read back through `ListTagsForResource` — so they are held on
+    /// the record and reported by no projection of it yet.
+    pub tags: Vec<Tag>,
+    pub creation_time: SystemTime,
+    /// The Region of the request that created the queue, which its ARN names.
+    pub region: String,
+}
+
+impl GameSessionQueueRecord {
+    /// This queue as the modelled `GameSessionQueue`.
+    ///
+    /// The two list members are always reported — empty for a queue configured with
+    /// none, since "a queue can't make placements without at least one destination" is a
+    /// property of an empty list, not of an absent one — while the two optional
+    /// configuration structures are reported only when the queue carries them.
+    pub fn to_modelled(&self) -> GameSessionQueue {
+        GameSessionQueue {
+            name: Some(self.name.clone()),
+            game_session_queue_arn: Some(self.queue_arn.clone()),
+            timeout_in_seconds: Some(self.timeout_in_seconds),
+            player_latency_policies: Some(self.player_latency_policies.clone()),
+            destinations: Some(self.destinations.clone()),
+            filter_configuration: self.filter_configuration.clone(),
+            priority_configuration: self.priority_configuration.clone(),
+            custom_event_data: self.custom_event_data.clone(),
+            notification_target: self.notification_target.clone(),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-gamelift-gamelift. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsGameliftGameliftState {
     /// Fleets by `FleetId`.
     pub fleets: HashMap<String, Fleet>,
+    /// Game session queues by `Name`: "Queue names must be unique within each Region",
+    /// and this store — like the fleet store — is the account's one store, so the name
+    /// is the queue's key.
+    pub game_session_queues: HashMap<String, GameSessionQueueRecord>,
     /// Game sessions by their full-ARN `GameSessionId`.
     pub game_sessions: HashMap<String, GameSessionRecord>,
     /// Player sessions by `PlayerSessionId`.
@@ -870,6 +981,36 @@ impl ComAmazonawsGameliftGameliftState {
                 .then_with(|| left.game_session_id.cmp(&right.game_session_id))
         });
         sessions
+    }
+
+    /// The `Name` of the queue a `GameSessionQueueNameOrArn` names, or `None` when no
+    /// stored queue matches it.
+    ///
+    /// `GameSessionQueueArn`'s doc: "In a Amazon GameLift Servers game session queue ARN,
+    /// the resource ID matches the `Name` value", so either form selects the same queue.
+    pub fn resolve_queue_name(&self, name_or_arn: &str) -> Option<String> {
+        if name_or_arn.starts_with("arn:") {
+            self.game_session_queues
+                .values()
+                .find(|queue| queue.queue_arn == name_or_arn)
+                .map(|queue| queue.name.clone())
+        } else {
+            self.game_session_queues
+                .get(name_or_arn)
+                .map(|queue| queue.name.clone())
+        }
+    }
+
+    /// Every stored game session queue, oldest first, so a paginated walk is stable
+    /// across calls.
+    pub fn game_session_queues_in_order(&self) -> Vec<&GameSessionQueueRecord> {
+        let mut queues: Vec<&GameSessionQueueRecord> = self.game_session_queues.values().collect();
+        queues.sort_by(|left, right| {
+            left.creation_time
+                .cmp(&right.creation_time)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        queues
     }
 
     /// An address for a newly provisioned fleet instance, held by no stored fleet.

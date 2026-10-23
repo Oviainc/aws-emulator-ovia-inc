@@ -27,6 +27,8 @@ mod resource_policy_lifecycle;
 mod rule_groups_namespace_lifecycle;
 #[path = "all/rule_groups_namespace_listing.rs"]
 mod rule_groups_namespace_listing;
+#[path = "all/rule_groups_namespace_update.rs"]
+mod rule_groups_namespace_update;
 #[path = "all/scraper_listing.rs"]
 mod scraper_listing;
 #[path = "all/state_roundtrip.rs"]

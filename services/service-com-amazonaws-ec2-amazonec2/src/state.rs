@@ -99,6 +99,22 @@
 //! Keyed by `VolumeId` in a [`BTreeMap`], the same stable order the VPC and subnet stores
 //! are kept in, so a pagination token can name the id the next page starts at.
 //!
+//! ## EBS volume modifications
+//!
+//! [`ComAmazonawsEc2Amazonec2State::volume_modifications`] holds, per `VolumeId`, the most
+//! recent modification of that volume as a [`VolumeModificationRecord`]: the modelled
+//! [`VolumeModification`] every operation that reports one answers with, plus the instants
+//! the clock owes it its `modifying` -> `optimizing` -> `completed` moves. The state, the
+//! progress and the end time are facts of the modification's age rather than of the request
+//! that started it, so [`VolumeModificationRecord::view_at`] derives all three on read
+//! instead of storing a word two writers could disagree about — the same arrangement
+//! [`VolumeRecord`] uses for a volume's own `State`, on the same monotonic clock and the
+//! same [`TRANSITION_DELAY`].
+//!
+//! One volume has at most ONE record: "Describes the most recent volume modification
+//! request for the specified EBS volumes" (`DescribeVolumesModifications`), so a later
+//! modification of the same volume replaces the record rather than adding one beside it.
+//!
 //! ## Verified Access trust providers
 //!
 //! [`ComAmazonawsEc2Amazonec2State::verified_access_trust_providers`] holds the account's
@@ -392,6 +408,16 @@
 //! [`ComAmazonawsEc2Amazonec2State::complete_due_import_image_tasks`]; only the PERCENTAGE
 //! of progress an active task reports is derived per read, being a fact of elapsed time
 //! that no store could hold.
+//!
+//! ## Placement groups
+//!
+//! [`ComAmazonawsEc2Amazonec2State::placement_groups`] holds the account's placement
+//! groups as the modelled [`PlacementGroup`] shape itself, keyed by `GroupId`, for the
+//! reason [`ComAmazonawsEc2Amazonec2State::vpcs`] holds VPCs that way: `CreatePlacementGroup`
+//! and `DescribePlacementGroups` answer the same shape, so storing it is what stops them
+//! reporting one group differently. A placement group is "a logical grouping of instances"
+//! (`CreatePlacementGroup`) with nothing to provision, so it is stored `available` and no
+//! clock-owed move is recorded for it.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -404,10 +430,12 @@ use crate::ops::types::{
     CapacityBlock, ExportTask, FpgaImage, FpgaImageState, ImageUsageReport, LoadPermission,
     StorageLocation, VolumeRecycleBinInfo,
     CreateVolumeOutput, DescribeFastLaunchImagesSuccessItem, DisableFastLaunchOutput,
+    VolumeModification,
     EbsBlockDevice, EnableFastLaunchOutput, GroupIdentifier, Host, INSTANCE_TYPE_VALUES, Image,
     ImageCriterion, Instance, InstanceApplicationStatus, IpamPool,
     InstanceState, InstanceTypeOffering, IpPermission, IpRange, LOCATION_TYPE_VALUES,
     LaunchTemplate, MacHost, Monitoring, OperatorResponse, PeeringAttachmentStatus, Placement,
+    PlacementGroup,
     PrivateDnsNameOptionsOnLaunch,
     DnsEntry, PayerResponsibilityEntry,
     RequestLaunchTemplateData, RunInstancesOutput, SecondaryNetwork,
@@ -848,6 +876,11 @@ pub const INVALID_SNAPSHOT_ID_MALFORMED: &str = "InvalidSnapshotID.Malformed";
 /// `InvalidParameterValue`.
 pub const VOLUME_LIMIT_EXCEEDED: &str = "VolumeLimitExceeded";
 
+/// EC2's error code for a request that named an EBS volume this account holds no
+/// modification for: the volume resolves, so it is the MODIFICATION that is missing, and
+/// an absent modification is an error rather than an empty answer.
+pub const INVALID_VOLUME_MODIFICATION_NOT_FOUND: &str = "InvalidVolumeModification.NotFound";
+
 /// EC2's error code for a failure of the emulator itself, never for anything a request
 /// carries: a 5xx is retryable to an SDK's retry classifier.
 pub const INTERNAL_ERROR: &str = "InternalError";
@@ -1145,6 +1178,15 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// A `CreateVolume` `ClientToken` and the volume id it minted, so a repeat of the
     /// same request answers with that volume instead of creating a second one.
     pub volume_client_tokens: HashMap<String, String>,
+    /// The most recent modification of each EBS volume that has one, by `VolumeId` — see
+    /// the module docs. Ordered by that id, which is the order
+    /// `DescribeVolumesModifications` reports and pages over.
+    ///
+    /// Keyed by a volume of [`Self::volumes`], so this store can never hold more records
+    /// than that one holds volumes ([`MAX_STORED_VOLUMES`]), and every string a record
+    /// carries is either derived here or a value the modelled `VolumeType` enum admits —
+    /// nothing caller-sized — so no byte charge is made for one.
+    pub volume_modifications: BTreeMap<String, VolumeModificationRecord>,
     /// Every secondary network the account holds, by `SecondaryNetworkId` — see the module
     /// docs. Ordered by id, which is the order `DescribeSecondaryNetworks` reports and
     /// pages over.
@@ -1300,6 +1342,15 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// same request answers with that task instead of starting a second import: "The token
     /// to enable idempotency for VM import requests" (`ImportImageRequest$ClientToken`).
     pub import_image_task_client_tokens: HashMap<String, String>,
+    /// The account's placement groups, as the modelled [`PlacementGroup`] shape every
+    /// operation that reports one answers with, keyed by `GroupId` in a [`BTreeMap`] — the
+    /// same stable order the other stores are kept in, which is the order
+    /// `DescribePlacementGroups` reports them in. A placement group is a Region-scoped
+    /// logical grouping with no network of its own, so nothing is stored beside the
+    /// modelled shape: every fact a reader needs ("the name", "the state", "the strategy",
+    /// "the number of partitions", "the spread level", "the ARN", "any tags applied to the
+    /// placement group" — [`PlacementGroup`]) is a member of it.
+    pub placement_groups: BTreeMap<String, PlacementGroup>,
     /// The state of the account's *block public access for snapshots* setting — see the
     /// module docs.
     ///
@@ -1342,6 +1393,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             id_counter: 0,
             volumes: BTreeMap::new(),
             volume_client_tokens: HashMap::new(),
+            volume_modifications: BTreeMap::new(),
             secondary_networks: BTreeMap::new(),
             secondary_network_client_tokens: HashMap::new(),
             byoip_cidrs: BTreeMap::new(),
@@ -1374,6 +1426,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             vpc_block_public_access_exclusions: BTreeMap::new(),
             import_image_tasks: BTreeMap::new(),
             import_image_task_client_tokens: HashMap::new(),
+            placement_groups: BTreeMap::new(),
             // "Public sharing is not blocked" is where an account that has never called
             // `EnableSnapshotBlockPublicAccess` sits.
             snapshot_block_public_access: SNAPSHOT_BLOCK_PUBLIC_ACCESS_UNBLOCKED,
@@ -4799,6 +4852,137 @@ pub fn unresolvable_snapshot_id<E>(snapshot_id: &str) -> crate::scaffolded::Scaf
 /// `VolumeLimitExceeded`, EC2's own volumes-per-Region quota code.
 pub fn volume_limit_exceeded<E>(message: impl Into<String>) -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_error(VOLUME_LIMIT_EXCEEDED, 400, message)
+}
+
+// =============================================================================
+// EBS volume modifications
+// =============================================================================
+
+/// A modification that has been accepted and whose change is being applied:
+/// `VolumeModificationState`'s `modifying`
+/// (`smithy_query(query="shape",shape="VolumeModificationState")`).
+pub const VOLUME_MODIFICATION_STATE_MODIFYING: &str = "modifying";
+
+/// A modification whose change is in place and whose volume is being brought to its new
+/// performance: `VolumeModificationState`'s `optimizing`.
+pub const VOLUME_MODIFICATION_STATE_OPTIMIZING: &str = "optimizing";
+
+/// A modification that is finished: `VolumeModificationState`'s `completed`. The fourth
+/// value of the catalog, `failed`, is never stored here — nothing in this emulator fails a
+/// modification after it has been accepted; a change it cannot apply is refused at the
+/// call that asks for it.
+pub const VOLUME_MODIFICATION_STATE_COMPLETED: &str = "completed";
+
+/// The `Progress` a finished modification reports: "The modification progress, from 0 to
+/// 100 percent complete" (`VolumeModification$Progress`).
+pub const VOLUME_MODIFICATION_PROGRESS_COMPLETE: i64 = 100;
+
+/// One EBS volume's most recent modification: the modelled [`VolumeModification`] every
+/// operation that reports one answers with, plus the instants the clock owes it its
+/// `modifying` -> `optimizing` -> `completed` moves.
+///
+/// The view holds no `ModificationState`, `Progress` or `EndTime`: all three are facts of
+/// the modification's age, so [`VolumeModificationRecord::view_at`] derives them rather
+/// than letting two writers store two different answers — the arrangement
+/// [`VolumeRecord`] uses for a volume's own `State`.
+#[derive(Debug, Clone)]
+pub struct VolumeModificationRecord {
+    /// The modification as the model shapes it: the volume it belongs to, its original
+    /// values, its target values and its `StartTime`. `ModificationState`, `Progress` and
+    /// `EndTime` are left for [`Self::view_at`] to fill.
+    pub view: VolumeModification,
+    /// The instant the modification started, which [`Self::progress_at`] measures from.
+    pub started_at: Instant,
+    /// The instant from which this modification's `modifying` -> `optimizing` move is
+    /// due. Monotonic ([`Instant`]), because it is only ever compared against the clock
+    /// and never reported, so a wall-clock adjustment cannot move a finished
+    /// modification back to `modifying`.
+    pub optimizing_at: Instant,
+    /// The instant from which its `optimizing` -> `completed` move is due.
+    pub completed_at: Instant,
+    /// The wall-clock instant the modification finishes on, which it reports as its
+    /// `EndTime` once it has: the modification ended when that move fell due, not when
+    /// somebody next asked about it.
+    pub ends_at: SystemTime,
+}
+
+impl VolumeModificationRecord {
+    /// A modification of `view` that starts now: `modifying`, due `optimizing` one
+    /// [`TRANSITION_DELAY`] later and `completed` one further [`TRANSITION_DELAY`] after
+    /// that.
+    ///
+    /// Each move falls due a span after the move before it, read off the same monotonic
+    /// clock as every other clock-owed transition in this crate and recorded rather than
+    /// slept for, so a caller that reads straight after the call that started the
+    /// modification still observes it `modifying`.
+    pub fn starting_now(view: VolumeModification) -> Self {
+        let started_at = Instant::now();
+        Self {
+            view,
+            started_at,
+            optimizing_at: started_at + TRANSITION_DELAY,
+            completed_at: started_at + TRANSITION_DELAY * 2,
+            ends_at: SystemTime::now() + TRANSITION_DELAY * 2,
+        }
+    }
+
+    /// The modification's `VolumeModificationState` at `now`.
+    pub fn state_at(&self, now: Instant) -> &'static str {
+        if now < self.optimizing_at {
+            VOLUME_MODIFICATION_STATE_MODIFYING
+        } else if now < self.completed_at {
+            VOLUME_MODIFICATION_STATE_OPTIMIZING
+        } else {
+            VOLUME_MODIFICATION_STATE_COMPLETED
+        }
+    }
+
+    /// How far along the modification is at `now`, "from 0 to 100 percent complete"
+    /// (`VolumeModification$Progress`): the share of the span between its start and its
+    /// completion that the clock has passed, and [`VOLUME_MODIFICATION_PROGRESS_COMPLETE`]
+    /// once it is `completed`.
+    pub fn progress_at(&self, now: Instant) -> i64 {
+        let whole = self.completed_at.saturating_duration_since(self.started_at);
+        let elapsed = now.saturating_duration_since(self.started_at);
+        if whole.is_zero() || elapsed >= whole {
+            return VOLUME_MODIFICATION_PROGRESS_COMPLETE;
+        }
+        let percent = elapsed
+            .as_nanos()
+            .saturating_mul(u128::try_from(VOLUME_MODIFICATION_PROGRESS_COMPLETE).unwrap_or(100))
+            / whole.as_nanos();
+        i64::try_from(percent)
+            .unwrap_or(VOLUME_MODIFICATION_PROGRESS_COMPLETE)
+            .clamp(0, VOLUME_MODIFICATION_PROGRESS_COMPLETE)
+    }
+
+    /// This modification as of `now`: the stored view with the state, the progress and the
+    /// end time the clock has reached. A read observes the moves the clock already owed
+    /// without writing anything, so it cannot change what a later caller sees.
+    ///
+    /// `EndTime` is "the modification completion or failure time"
+    /// (`VolumeModification$EndTime`), so a modification that has not finished reports
+    /// none at all.
+    pub fn view_at(&self, now: Instant) -> VolumeModification {
+        let mut view = self.view.clone();
+        view.modification_state = Some(self.state_at(now).to_string());
+        view.progress = Some(self.progress_at(now));
+        view.end_time = (now >= self.completed_at).then(|| system_time_to_date_time(self.ends_at));
+        view
+    }
+}
+
+/// Refuse a request that named an EBS volume this account holds no modification for, the
+/// way EC2 does: HTTP 400 `InvalidVolumeModification.NotFound`, whose message names the
+/// volume the request asked about — the one thing about the refusal that is not fixed text.
+pub fn invalid_volume_modification_not_found<E>(
+    volume_id: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_VOLUME_MODIFICATION_NOT_FOUND,
+        400,
+        format!("Modification for volume '{volume_id}' does not exist."),
+    )
 }
 
 // =============================================================================
@@ -10262,6 +10446,13 @@ impl ComAmazonawsEc2Amazonec2State {
     /// instant. In each case NOTHING was removed and nothing stored — every fallible step is
     /// taken before the first mutation — so a refused move leaves the volume where it was
     /// instead of losing it between the two stores.
+    ///
+    /// The byte accounting is symmetric, the way [`Self::remove_fpga_image`] is: the bytes
+    /// the create charged for the volume are given back as it leaves the store, and the
+    /// entry that takes its place is charged for itself
+    /// ([`volume_recycle_bin_entry_payload_bytes`]), so a repeated create-then-delete
+    /// sequence advances the byte budget rather than trading a charged volume for a free
+    /// entry.
     pub fn move_volume_to_recycle_bin(
         &mut self,
         volume_id: &str,
@@ -10614,15 +10805,31 @@ pub struct SecondarySubnetSpec {
 }
 
 impl ComAmazonawsEc2Amazonec2State {
-    /// Store a secondary subnet, and answer the `SecondarySubnetId` it was given.
+    /// Is there room for another secondary subnet in this store
+    /// ([`MAX_STORED_SECONDARY_SUBNETS`])?
+    ///
+    /// A create asks this so it can refuse with the quota code instead of overshooting the
+    /// ceiling; [`Self::insert_secondary_subnet`] asks it again, so a writer that forgets
+    /// the gate still cannot grow the store past it.
+    pub fn has_secondary_subnet_capacity(&self) -> bool {
+        self.secondary_subnets.len() < MAX_STORED_SECONDARY_SUBNETS
+    }
+
+    /// Store a secondary subnet, and answer the `SecondarySubnetId` it was given — or
+    /// `None` when this store is already at [`MAX_STORED_SECONDARY_SUBNETS`], which a
+    /// handler answers with [`secondary_subnet_limit_exceeded`].
     ///
     /// Everything the service itself owns is derived here rather than taken from the
     /// caller — the subnet's id, the ARN built from it, the owning account, and the
     /// association id of each IPv4 CIDR block — so two writers cannot report the same
     /// secondary subnet differently. Like [`Self::insert_subnet`], the caller-chosen bytes
     /// the record holds are charged against the store's byte budget here, so no writer can
-    /// store them uncharged.
-    pub fn insert_secondary_subnet(&mut self, spec: SecondarySubnetSpec) -> String {
+    /// store them uncharged, and the ceiling is checked BEFORE any id is minted, so a
+    /// refused write consumes nothing at all.
+    pub fn insert_secondary_subnet(&mut self, spec: SecondarySubnetSpec) -> Option<String> {
+        if !self.has_secondary_subnet_capacity() {
+            return None;
+        }
         let secondary_subnet_id = self.next_id(SECONDARY_SUBNET_ID_PREFIX);
         let mut ipv4_cidr_block_associations = Vec::with_capacity(spec.ipv4_cidr_blocks.len());
         for block in spec.ipv4_cidr_blocks {
@@ -10654,14 +10861,34 @@ impl ComAmazonawsEc2Amazonec2State {
         self.add_stored_bytes(secondary_subnet_payload_bytes(&secondary_subnet));
         self.secondary_subnets
             .insert(secondary_subnet_id.clone(), secondary_subnet);
-        secondary_subnet_id
+        Some(secondary_subnet_id)
     }
 }
 
-/// The caller-chosen bytes one stored secondary subnet holds: its tags, the CIDR block of
-/// each association, and the state reasons. The ids, the ARN, the owning account, the
-/// states and the network type are derived by this module or bounded by the model, so they
-/// are fixed-size.
+/// How many secondary subnets this emulator stores before a write of another is refused.
+///
+/// CHOSEN, like [`MAX_SECONDARY_NETWORKS`] and [`MAX_STORED_RECORDS_PER_STORE`] and for
+/// the same
+/// reason the module gives for every other ceiling: nothing in this emulator reclaims a
+/// stored secondary subnet, so this store needs a ceiling that is not the process's memory.
+/// It is the same ceiling the other record stores keep.
+pub const MAX_STORED_SECONDARY_SUBNETS: usize = MAX_STORED_RECORDS_PER_STORE;
+
+/// Refuse a create that would take the store past [`MAX_STORED_SECONDARY_SUBNETS`]: HTTP
+/// 400, with the same quota code family a secondary network's own ceiling answers with.
+pub fn secondary_subnet_limit_exceeded<E>(message: impl Into<String>) -> Scaffolded<E> {
+    Scaffolded::service_error(SECONDARY_NETWORK_LIMIT_EXCEEDED, 400, message)
+}
+
+/// The bytes one stored secondary subnet is charged: its tags, the CIDR block of each
+/// association, and the state reasons, plus [`STORED_RECORD_OVERHEAD_BYTES`] for the
+/// record itself.
+/// The ids, the ARN, the owning account, the states and the network type are derived by
+/// this module or bounded by the model, so they are fixed-size.
+///
+/// The fixed overhead is what makes a subnet written with no tags, no IPv4 CIDR block and
+/// no state reason cost something: a count ceiling alone leaves a zero-payload record free
+/// against [`MAX_STORED_BYTES`], so repeated writes would advance no budget at all.
 ///
 /// The ONE definition of that charge, the way [`vpc_endpoint_connection_payload_bytes`] is
 /// for a VPC endpoint connection: a writer charges exactly it, and a removal path must give
@@ -10677,12 +10904,15 @@ pub fn secondary_subnet_payload_bytes(secondary_subnet: &SecondarySubnet) -> usi
         })
         .sum();
     tag_list_bytes(secondary_subnet.tags.as_deref().unwrap_or_default())
-        + association_bytes
-        + secondary_subnet
-            .state_reason
-            .as_deref()
-            .unwrap_or_default()
-            .len()
+        .saturating_add(association_bytes)
+        .saturating_add(
+            secondary_subnet
+                .state_reason
+                .as_deref()
+                .unwrap_or_default()
+                .len(),
+        )
+        .saturating_add(STORED_RECORD_OVERHEAD_BYTES)
 }
 
 // ---------------------------------------------------------------------------
@@ -10938,6 +11168,273 @@ impl ComAmazonawsEc2Amazonec2State {
             },
         );
         stored
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Placement groups
+// ---------------------------------------------------------------------------
+
+/// The id prefix of a placement group, as AWS mints one: `pg-<hex>`.
+///
+/// [`ComAmazonawsEc2Amazonec2State::next_id`] appends the 17 lowercase hexadecimal digits
+/// every EC2 resource id of the long form carries.
+pub const PLACEMENT_GROUP_ID_PREFIX: &str = "pg";
+
+/// A placement group that can be launched into: the `PlacementGroupState` enum's
+/// `available` member.
+///
+/// A placement group is "a logical grouping of instances" (`CreatePlacementGroup`) — there
+/// is no hardware to bring up for it — so it is the state a group is created in and the
+/// only state this emulator ever reports one in.
+pub const PLACEMENT_GROUP_STATE_AVAILABLE: &str = "available";
+
+/// The `ResourceType` a `CreatePlacementGroup` tag specification may name: the placement
+/// group it creates (the modelled `ResourceType` enum's `placement-group` member).
+pub const RESOURCE_TYPE_PLACEMENT_GROUP: &str = "placement-group";
+
+/// The `PlacementStrategy` member a partition placement group is created with: the one
+/// strategy `CreatePlacementGroupRequest$PartitionCount` is "valid only when" set to.
+pub const PLACEMENT_STRATEGY_PARTITION: &str = "partition";
+
+/// The `PlacementStrategy` member a spread placement group is created with: the strategy
+/// `SpreadLevel` — "determines how placement groups spread instances" — belongs to.
+pub const PLACEMENT_STRATEGY_SPREAD: &str = "spread";
+
+/// The `PlacementStrategy` member a cluster placement group is created with: the one
+/// strategy `CreatePlacementGroupRequest$ParentGroupId` is "valid only when" set to.
+pub const PLACEMENT_STRATEGY_CLUSTER: &str = "cluster";
+
+/// The `SpreadLevel` member a spread placement group gets when the request names none:
+/// `rack`, the level with "no usage restrictions", as opposed to `host`, which "you can use
+/// only with Outpost placement groups" (`CreatePlacementGroupRequest$SpreadLevel`).
+pub const SPREAD_LEVEL_RACK: &str = "rack";
+
+/// "Up to 255 ASCII characters" (`CreatePlacementGroupRequest$GroupName`).
+pub const MAX_PLACEMENT_GROUP_NAME_CHARS: usize = 255;
+
+/// The most partitions a partition placement group may be created with.
+///
+/// "A partition placement group can have a maximum of seven partitions per Availability
+/// Zone" (Amazon EC2 User Guide, "Partition placement groups").
+pub const MAX_PLACEMENT_GROUP_PARTITION_COUNT: i32 = 7;
+
+/// The fewest partitions a partition placement group may be created with: a count of
+/// partitions is a count, so it is at least one.
+pub const MIN_PLACEMENT_GROUP_PARTITION_COUNT: i32 = 1;
+
+/// The partition count a partition placement group gets when the request names none.
+///
+/// AWS documents no default for `CreatePlacementGroupRequest$PartitionCount`, so this is
+/// the emulator's choice: the smallest count that actually partitions the group, since a
+/// partition group "places groups of instances in different partitions, where instances in
+/// one partition do not share the same hardware with instances in another partition"
+/// (`CreatePlacementGroup`) and one partition has no other partition to differ from.
+pub const DEFAULT_PLACEMENT_GROUP_PARTITION_COUNT: i32 = 2;
+
+/// The largest number of placement groups this store holds.
+///
+/// "Placement groups per Region: 500" (Amazon EC2 service quotas).
+/// [`ComAmazonawsEc2Amazonec2State::has_placement_group_capacity`] is the predicate a
+/// writer asks before inserting; a create past it refuses with
+/// [`placement_group_limit_exceeded`].
+pub const MAX_PLACEMENT_GROUPS: usize = 500;
+
+/// The code EC2 answers for a placement group name the account already holds a group
+/// under: "the specified placement group already exists in your account" (AWS's
+/// `InvalidPlacementGroup.Duplicate` error-code entry).
+pub const INVALID_PLACEMENT_GROUP_DUPLICATE: &str = "InvalidPlacementGroup.Duplicate";
+
+/// The code EC2 answers for a placement group a request named that the account holds
+/// none of: "the specified placement group cannot be found" (AWS's
+/// `InvalidPlacementGroup.Unknown` error-code entry).
+pub const INVALID_PLACEMENT_GROUP_UNKNOWN: &str = "InvalidPlacementGroup.Unknown";
+
+/// The code a create past [`MAX_PLACEMENT_GROUPS`] answers with: "you've reached the limit
+/// on the number of placement groups you can have" (AWS's `PlacementGroupLimitExceeded`
+/// error-code entry).
+pub const PLACEMENT_GROUP_LIMIT_EXCEEDED: &str = "PlacementGroupLimitExceeded";
+
+/// Refuse a second placement group with a name the account already holds: HTTP 400
+/// [`INVALID_PLACEMENT_GROUP_DUPLICATE`]. The name "must be unique within the scope of your
+/// account for the Region" (`CreatePlacementGroupRequest$GroupName`).
+pub fn invalid_placement_group_duplicate<E>(group_name: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_PLACEMENT_GROUP_DUPLICATE,
+        400,
+        format!("The placement group '{group_name}' already exists"),
+    )
+}
+
+/// Refuse a placement group a request named that the account holds none of: HTTP 400
+/// [`INVALID_PLACEMENT_GROUP_UNKNOWN`]. `group` is the name or the id the request named,
+/// whichever could not be resolved.
+pub fn invalid_placement_group_unknown<E>(group: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_PLACEMENT_GROUP_UNKNOWN,
+        400,
+        format!("The placement group '{group}' does not exist"),
+    )
+}
+
+/// Refuse a create that would take the store past [`MAX_PLACEMENT_GROUPS`]: HTTP 400
+/// [`PLACEMENT_GROUP_LIMIT_EXCEEDED`].
+pub fn placement_group_limit_exceeded<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        PLACEMENT_GROUP_LIMIT_EXCEEDED,
+        400,
+        format!("The maximum number of placement groups has been reached ({MAX_PLACEMENT_GROUPS})"),
+    )
+}
+
+/// The caller-chosen bytes one stored placement group holds, plus the fixed overhead the
+/// record itself costs.
+///
+/// Only the members whose length the REQUEST chose are counted on top of
+/// [`STORED_RECORD_OVERHEAD_BYTES`]: the id and the ARN are minted by
+/// [`ComAmazonawsEc2Amazonec2State::insert_placement_group`], and the state, strategy and
+/// spread level are words out of this module's own catalogs. The ONE definition of that
+/// charge, the way [`vpc_endpoint_connection_payload_bytes`] is for a connection: the
+/// writer charges exactly it and `CreatePlacementGroup` reserves exactly it, so the budget
+/// a create checks cannot drift from what the insert takes, and a group with no tags is not
+/// free against [`MAX_STORED_BYTES`].
+pub fn placement_group_spec_bytes(spec: &PlacementGroupSpec) -> usize {
+    STORED_RECORD_OVERHEAD_BYTES
+        .saturating_add(spec.group_name.len())
+        .saturating_add(tag_list_bytes(&spec.tags))
+        .saturating_add(spec.parent_group_id.as_ref().map_or(0, String::len))
+}
+
+/// What a writer must say to store a placement group; everything else about the record —
+/// the id, the ARN, the state — is derived by
+/// [`ComAmazonawsEc2Amazonec2State::insert_placement_group`].
+#[derive(Debug, Clone)]
+pub struct PlacementGroupSpec {
+    /// "A name for the placement group" (`CreatePlacementGroupRequest$GroupName`).
+    pub group_name: String,
+    /// "The placement strategy" (`CreatePlacementGroupRequest$Strategy`), as a
+    /// `&'static str` out of the modelled `PlacementStrategy` catalog
+    /// ([`placement_strategy`]), so the stored word is never the request's own text.
+    pub strategy: &'static str,
+    /// "The number of partitions" a partition group was created with, and `None` for every
+    /// other strategy: `PartitionCount` is "valid only when Strategy is set to partition"
+    /// (`CreatePlacementGroupRequest$PartitionCount`).
+    pub partition_count: Option<i32>,
+    /// "The spread level for the placement group" a spread group was created with, and
+    /// `None` for every other strategy, out of the modelled `SpreadLevel` catalog
+    /// ([`spread_level`]).
+    pub spread_level: Option<&'static str>,
+    /// "The ID of the parent placement group" (`PlacementGroup$ParentGroupId`), resolved
+    /// against this store, when the request named one.
+    pub parent_group_id: Option<String>,
+    /// The Region the request was signed for, which the group's ARN names.
+    pub region: String,
+    /// The tags the request's `TagSpecifications` assign to the group.
+    pub tags: Vec<Tag>,
+}
+
+/// The modelled `PlacementStrategy` member `requested` names, or `None` when it names
+/// none.
+///
+/// The catalog is the generated [`crate::ops::types::PLACEMENT_STRATEGY_VALUES`], so this
+/// crate holds no second copy of it. Answering a `&'static str` out of that catalog is what
+/// keeps request text out of the store.
+pub fn placement_strategy(requested: &str) -> Option<&'static str> {
+    crate::ops::types::PLACEMENT_STRATEGY_VALUES
+        .iter()
+        .copied()
+        .find(|strategy| *strategy == requested)
+}
+
+/// The modelled `SpreadLevel` member `requested` names, or `None` when it names none.
+///
+/// The catalog is the generated [`crate::ops::types::SPREAD_LEVEL_VALUES`], for the reason
+/// [`placement_strategy`] gives.
+pub fn spread_level(requested: &str) -> Option<&'static str> {
+    crate::ops::types::SPREAD_LEVEL_VALUES
+        .iter()
+        .copied()
+        .find(|level| *level == requested)
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another placement group fits inside the store's ceiling
+    /// ([`MAX_PLACEMENT_GROUPS`]).
+    ///
+    /// The same contract as [`Self::has_vpc_capacity`]: a create asks first and refuses
+    /// with [`placement_group_limit_exceeded`] when it answers `false`.
+    pub fn has_placement_group_capacity(&self) -> bool {
+        self.placement_groups.len() < MAX_PLACEMENT_GROUPS
+    }
+
+    /// The id of the placement group named `group_name`, if the account holds one.
+    ///
+    /// A name "must be unique within the scope of your account for the Region"
+    /// (`CreatePlacementGroupRequest$GroupName`), so this answers at most one group: it is
+    /// both what a create asks before storing a duplicate and how a request that names a
+    /// group by name (`DeletePlacementGroup`, `DescribePlacementGroups$GroupNames`)
+    /// resolves it. Compared byte for byte, the name being an opaque identifier the model
+    /// publishes no case rule for.
+    pub fn placement_group_id_for_name(&self, group_name: &str) -> Option<String> {
+        self.placement_groups
+            .iter()
+            .find(|(_, group)| group.group_name.as_deref() == Some(group_name))
+            .map(|(group_id, _)| group_id.clone())
+    }
+
+    /// Store a placement group and answer it as it was stored — or `None` when the store is
+    /// at [`MAX_PLACEMENT_GROUPS`] and nothing was stored.
+    ///
+    /// The one way a placement group is stored, so the id it carries, the ARN it reports,
+    /// the state it starts in and the bytes it charges cannot be built two ways, and the
+    /// ceiling is asked HERE as well as by the caller — the contract every writer of this
+    /// module follows, so a writer that forgets the gate cannot grow the store without
+    /// bound. What comes back is the stored view itself, so a create answers exactly what a
+    /// later `DescribePlacementGroups` reports without reading the store a second time.
+    pub fn insert_placement_group(
+        &mut self,
+        spec: PlacementGroupSpec,
+    ) -> Option<PlacementGroup> {
+        if !self.has_placement_group_capacity() {
+            return None;
+        }
+        let group_id = self.next_id(PLACEMENT_GROUP_ID_PREFIX);
+        // Charged from the spec, so the quantity is exactly the one `CreatePlacementGroup`
+        // reserved against the byte budget before calling this.
+        self.add_stored_bytes(placement_group_spec_bytes(&spec));
+        let group = PlacementGroup {
+            group_id: Some(group_id.clone()),
+            group_name: Some(spec.group_name.clone()),
+            // "A logical grouping of instances" has nothing to provision, so it is
+            // available as soon as it exists.
+            state: Some(PLACEMENT_GROUP_STATE_AVAILABLE.to_string()),
+            strategy: Some(spec.strategy.to_string()),
+            partition_count: spec.partition_count,
+            spread_level: spec.spread_level.map(str::to_string),
+            // "The Amazon Resource Name (ARN) of the placement group"
+            // (`PlacementGroup$GroupArn`): an EC2 ARN in the Region the request was signed
+            // for, under the `placement-group` resource type, naming the group by NAME —
+            // the form `PlacementGroupArn`'s own pattern publishes
+            // (`arn:aws:ec2:<region>:<account>:placement-group/<name>`).
+            group_arn: Some(::engine::emulator_arn(
+                "ec2",
+                &spec.region,
+                &format!("{RESOURCE_TYPE_PLACEMENT_GROUP}/{group_name}", group_name = spec.group_name),
+            )),
+            // "Reserved for future use" (`PlacementGroup$LinkedGroupId`), and "the service
+            // provider that manages the Placement Group" (`PlacementGroup$Operator`), whose
+            // request member is "reserved for internal use": AWS publishes no rule by which
+            // a customer request gives a group either, and no service provider manages a
+            // group an account created for itself, so this emulator reports neither rather
+            // than inventing a meaning for them.
+            linked_group_id: None,
+            operator: None,
+            parent_group_id: spec.parent_group_id,
+            tags: Some(spec.tags),
+        };
+        let stored = group.clone();
+        self.placement_groups.insert(group_id, group);
+        Some(stored)
     }
 }
 
@@ -11247,4 +11744,3 @@ pub fn allowed_images_settings_full<E>(region: &str, full: AllowedImagesSettings
         )),
     }
 }
-

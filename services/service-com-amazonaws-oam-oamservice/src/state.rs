@@ -22,11 +22,15 @@
 //! within the region the request was signed for: an ARN names its region, and a
 //! regional endpoint only ever sees its own region's resources.
 //!
+//! A sink also carries the resource policy `PutSinkPolicy` attaches to it and
+//! `GetSinkPolicy` reports, held on the sink's own record so the two answer from one
+//! stored copy of it and deleting the sink takes its policy with it.
+//!
 //! A few stored members are not reported by any operation in this slice — a sink's
-//! `policy` and `created_at`, a link's `sink_id` and `created_at`. They are written
-//! where the resource is created so the slices that read them (`Put`/`GetSinkPolicy`,
-//! the tagging operations and `ListSinks`, all still 501 stubs) read the same record
-//! rather than a second copy of it.
+//! `created_at`, a link's `sink_id` and `created_at`. They are written where the
+//! resource is created so the slices that read them (the tagging operations and
+//! `ListSinks`, still 501 stubs) read the same record rather than a second copy of
+//! it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -473,6 +477,130 @@ pub fn unmodelled_resource_type(resource_types: &[String]) -> Option<&str> {
         .iter()
         .map(String::as_str)
         .find(|supplied| !crate::ops::types::RESOURCE_TYPE_VALUES.contains(supplied))
+}
+
+/// The most bytes of sink policy document this emulator will attach to a sink.
+///
+/// Emulator resource guard, NOT an AWS quota: the modelled `SinkPolicy` string
+/// (`smithy_query(query="shape",shape="SinkPolicy")`) carries no `@length`, so
+/// nothing else bounds how much caller-supplied text one stored sink can hold. A
+/// longer document is refused with the modelled `InvalidParameterException` instead
+/// of being stored.
+pub const MAX_SINK_POLICY_BYTES: usize = 32 * 1024;
+
+/// The message a refused sink policy document is reported with.
+///
+/// The service judges the document as a whole rather than one member of it, and the
+/// recorded behaviour of every refused `PutSinkPolicy` carries this one fixed
+/// string, so the refusal names nothing from the request — the document is
+/// caller-controlled text and never echoed back.
+pub const POLICY_VALIDATION_FAILED: &str = "Policy validation failed";
+
+/// The `Effect` values a policy statement may carry.
+///
+/// The IAM policy grammar declares exactly these two, case-sensitively, for every
+/// statement of every policy document.
+pub const POLICY_EFFECTS: &[&str] = &["Allow", "Deny"];
+
+/// The message this service's not-found refusals carry.
+///
+/// Fixed and identifier-independent: the model states no text for
+/// `ResourceNotFoundException`
+/// (`smithy_query(query="shape",shape="ResourceNotFoundException")` reports only
+/// `Message` / `x-amzn-ErrorType` at HTTP 404), and every not-found path the
+/// behavioural recording of this service covers answers this one constant string. A
+/// not-found refusal therefore never embeds the identifier the request asked about.
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource not found.";
+
+/// Why `policy` is not a sink policy document this service will attach, or `None`
+/// when it is one.
+///
+/// A sink policy is an IAM **resource**-based policy: `PutSinkPolicy`'s `Policy`
+/// member is documented as "The JSON policy to use… The policy must be in JSON
+/// string format", and the operation's own documentation describes it as granting
+/// permissions to source accounts. So the document must be a JSON object whose
+/// `Statement` is a statement object or a non-empty array of them, and each
+/// statement must say whether it allows or denies (`Effect`, exactly one of
+/// [`POLICY_EFFECTS`]), WHO it applies to (`Principal` or `NotPrincipal`) and WHAT
+/// it applies to (`Action` or `NotAction`). The principal is what makes a document a
+/// resource policy rather than an identity policy, so a statement without one grants
+/// nobody anything and the whole document is refused. `Resource` is not required:
+/// a policy attached to a sink is already scoped to that sink.
+///
+/// Parsed with `serde_json`, so what judges the document is a real JSON parser and
+/// never a match on its text. A document this refuses is not stored at all, so a
+/// later `GetSinkPolicy` can never hand back something the service would not have
+/// accepted.
+pub fn sink_policy_rejection(policy: &str) -> Option<String> {
+    if policy.len() > MAX_SINK_POLICY_BYTES {
+        return Some(format!(
+            "Policy is {} bytes, past the {MAX_SINK_POLICY_BYTES} bytes this emulator stores",
+            policy.len()
+        ));
+    }
+    let refused = || Some(POLICY_VALIDATION_FAILED.to_string());
+    let Ok(document) = serde_json::from_str::<serde_json::Value>(policy) else {
+        return refused();
+    };
+    let Some(statements) = document.as_object().and_then(policy_statements) else {
+        return refused();
+    };
+    if statements
+        .iter()
+        .any(|statement| !is_resource_policy_statement(statement))
+    {
+        return refused();
+    }
+    None
+}
+
+/// The statements of a policy document, or `None` when its `Statement` element is
+/// absent or is neither a statement object nor a non-empty array of them.
+fn policy_statements(
+    document: &serde_json::Map<String, serde_json::Value>,
+) -> Option<Vec<&serde_json::Value>> {
+    match document.get("Statement")? {
+        serde_json::Value::Array(items) if !items.is_empty() => Some(items.iter().collect()),
+        statement @ serde_json::Value::Object(_) => Some(vec![statement]),
+        _ => None,
+    }
+}
+
+/// Whether one statement is a resource-policy statement, as
+/// [`sink_policy_rejection`] states the rule.
+fn is_resource_policy_statement(statement: &serde_json::Value) -> bool {
+    let Some(statement) = statement.as_object() else {
+        return false;
+    };
+    let effect_declared = statement
+        .get("Effect")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|effect| POLICY_EFFECTS.contains(&effect));
+    effect_declared
+        && names_something(statement, "Principal", "NotPrincipal")
+        && names_something(statement, "Action", "NotAction")
+}
+
+/// Whether a statement carries `element` or its negated form `negated`, with a value
+/// that names something.
+///
+/// A policy element names something when it is a non-empty string (`"*"`), a
+/// non-empty list of them, or a non-empty object keyed by principal type
+/// (`{"AWS": [..]}`); an empty or absent one names nobody and nothing.
+fn names_something(
+    statement: &serde_json::Map<String, serde_json::Value>,
+    element: &str,
+    negated: &str,
+) -> bool {
+    [element, negated]
+        .iter()
+        .filter_map(|name| statement.get(*name))
+        .any(|value| match value {
+            serde_json::Value::String(text) => !text.trim().is_empty(),
+            serde_json::Value::Array(items) => !items.is_empty(),
+            serde_json::Value::Object(map) => !map.is_empty(),
+            _ => false,
+        })
 }
 
 /// The region this request was signed for, from its SigV4 credential scope; the

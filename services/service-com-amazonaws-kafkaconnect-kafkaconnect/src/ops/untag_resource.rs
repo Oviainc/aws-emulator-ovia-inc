@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the named tag keys from whichever resource the ARN names. Each key is
+//! removed on its own — a key the request does not name keeps the value it had,
+//! and a key the resource does not carry is a no-op, the way the modelled
+//! `@idempotent` trait on this operation calls for — so every later
+//! `ListTagsForResource` answers with exactly the keys that survived.
 //!
 //! ## Shape of an operation
 //!
@@ -145,25 +142,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "UntagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // The model states no `@http` code for this operation (`code` is DEFAULTED
+    // to 200 by Smithy, not declared), and the recorded wire responses of the
+    // real service answer a 2xx that is not 200: replaying them reports this
+    // operation's exact status diverging while its class matches. AWS answers
+    // these void tag writes 204 No Content — which is what the sibling MSK model
+    // (`com.amazonaws.kafka#TagResource`/`UntagResource`, the same pair over the
+    // same `/v1/tags/{resourceArn}` URIs) states outright.
+    const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the kafkaconnect store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let _ = ctx;
+        let mut state = store.lock();
+        state.settle_due();
+
+        // The same ARN-keyed seam `TagResource` and `ListTagsForResource` use, so
+        // an untag is applied to the one stored tag map a later read answers
+        // from. Per key: only the named keys go, and a key that was never there
+        // is no failure, so the call is safe to retry.
+        match state.remove_tags(&input.resource_arn, &input.tag_keys) {
+            Ok(()) => Ok(UntagResourceOutput {}),
+            Err(_) => Err(UntagResourceErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::invalid_parameter_because(
+                    "resourceArn",
+                    crate::state::RESOURCE_DOES_NOT_EXIST,
+                )),
+            })
+            .into()),
+        }
     }
 }

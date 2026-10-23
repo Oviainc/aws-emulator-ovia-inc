@@ -390,7 +390,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             .then_some(group.metric_filter_count),
                         stored_bytes: (!pattern_search).then_some(group.stored_bytes),
                         kms_key_id: group.kms_key_id.clone().filter(|_| !pattern_search),
-                        data_protection_status: None,
+                        data_protection_status: group
+                            .data_protection_status()
+                            .filter(|_| !pattern_search)
+                            .map(str::to_string),
                         inherited_properties: None,
                         log_group_class: (!pattern_search)
                             .then(|| group.log_group_class.clone()),
