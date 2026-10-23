@@ -173,9 +173,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 StartConfigurationRecorderErrorModeled::NoSuchConfigurationRecorderException(
                     NoSuchConfigurationRecorderException {
-                        message: Some(format!(
-                            "there is no configuration recorder named '{name}'"
-                        )),
+                        message: Some(
+                            crate::state::NO_SUCH_CONFIGURATION_RECORDER.to_string(),
+                        ),
                     },
                 )
                 .into(),
@@ -189,9 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 StartConfigurationRecorderErrorModeled::NoAvailableDeliveryChannelException(
                     NoAvailableDeliveryChannelException {
                         message: Some(
-                            "there is no delivery channel available to receive configuration \
-                             items; use PutDeliveryChannel to create one"
-                                .to_string(),
+                            crate::state::NO_DELIVERY_CHANNEL_TO_START_RECORDER.to_string(),
                         ),
                     },
                 )

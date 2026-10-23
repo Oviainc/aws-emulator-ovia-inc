@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateProject
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateProject`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Changes the settings of a build project held in [`crate::state`]: this is the ONLY
+//! file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateProject::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every optional member of the input is the REPLACEMENT for the project setting it
+//! names, so a member the request carries overwrites the stored setting whole and a
+//! member it omits leaves the stored setting exactly as it was; the project's name, its
+//! ARN, its `created` instant and everything another operation owns (its webhook, its
+//! visibility) are never touched here. A successful update moves `lastModified`; a
+//! refused one persists nothing at all.
 //!
 //! ## Shape of an operation
 //!
@@ -198,18 +198,203 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateProject` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateProjectErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateProject"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable through the router, which always builds the shared
+            // `InMemoryEngine`: this service models no server fault, and 501 is the
+            // only honest answer for "this emulator cannot serve the call at all".
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateProject (this engine carries no CodeBuild state)",
+            ));
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_millis();
+        let name = input.name.clone();
+        let arn = crate::state::project_arn(&region, &name);
+
+        let mut guard = state.lock();
+        let Some(stored) = guard.projects.get(&name).cloned() else {
+            // Each refusal is audited like the successful write, and the lock is
+            // dropped first, so a log consumer never waits on this request's critical
+            // section — the same discipline `CreateReportGroup` follows.
+            drop(guard);
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::NotFound,
+                Some(&arn),
+            );
+            return Err(UpdateProjectErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Project cannot be found: {arn}")),
+                },
+            )
+            .into());
+        };
+
+        // The merge runs on a COPY of the stored record, written back only once every
+        // check below has passed: a refused update leaves the project it named exactly
+        // as it was, `lastModified` included.
+        let mut project = stored.project;
+        let created_millis = stored.created_millis;
+        let stored_modified_millis = stored.last_modified_millis;
+        apply_update(&mut project, input);
+
+        // The RESULTING configuration, not the request alone, is what has to be a valid
+        // project source, so the check reads the merged record: replacing `source` with
+        // one that carries no inline buildspec is refused exactly when the result would
+        // be a project with no buildspec to build from.
+        if let Some(message) = project
+            .source
+            .as_ref()
+            .and_then(crate::state::inline_buildspec_violation)
+        {
+            drop(guard);
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::ValidationRefused,
+                Some(&arn),
+            );
+            return Err(UpdateProjectErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // `lastModified` reports when the project was last changed, so a successful
+        // update has to move it. The service clock is millisecond-resolution, so two
+        // updates landing inside one millisecond would otherwise report the same
+        // instant for two different records: the stamp is the later of now and one
+        // millisecond past the stored stamp, which keeps it strictly increasing per
+        // project without ever running behind the clock.
+        let last_modified_millis = now.max(stored_modified_millis + 1);
+        project.last_modified = Some(crate::state::datetime(last_modified_millis));
+
+        guard.projects.insert(
+            name,
+            crate::state::StoredProject {
+                project: project.clone(),
+                created_millis,
+                last_modified_millis,
+            },
+        );
+        drop(guard);
+
+        crate::state::audit(
+            Self::NAME,
+            ctx.parts(),
+            crate::state::AuditOutcome::ProjectUpdated,
+            Some(&arn),
+        );
+
+        Ok(UpdateProjectOutput {
+            project: Some(project),
+        })
+    }
+}
+
+/// The `concurrentBuildLimit` value that REMOVES the limit rather than setting one.
+///
+/// Documented on this operation's own member: "The maximum number of concurrent builds
+/// that are allowed for this project. [...] To remove this limit, set this value to
+/// -1." So -1 is not a stored limit of minus one — it clears the setting, and a later
+/// read reports no `concurrentBuildLimit` at all.
+const CONCURRENT_BUILD_LIMIT_REMOVAL: i32 = -1;
+
+/// Apply one `UpdateProject` request's members to the stored project.
+///
+/// AWS describes each optional member as the replacement for the setting it names ("A
+/// new or replacement description of the build project", "Information to be changed
+/// about the build output artifacts"), so a member the request carries replaces the
+/// stored setting WHOLE — a structure member is not merged field by field — and a member
+/// it omits leaves the stored setting alone.
+///
+/// The input is DESTRUCTURED rather than read member by member, so a member the model
+/// gains later fails to compile here instead of being silently dropped.
+fn apply_update(project: &mut Project, input: UpdateProjectInput) {
+    let UpdateProjectInput {
+        // The project is identified by this name, and AWS documents the name itself as
+        // unchangeable: "You cannot change a build project's name."
+        name: _,
+        description,
+        source,
+        secondary_sources,
+        source_version,
+        secondary_source_versions,
+        artifacts,
+        secondary_artifacts,
+        cache,
+        environment,
+        service_role,
+        timeout_in_minutes,
+        queued_timeout_in_minutes,
+        encryption_key,
+        tags,
+        vpc_config,
+        badge_enabled,
+        logs_config,
+        file_system_locations,
+        build_batch_config,
+        concurrent_build_limit,
+        auto_retry_limit,
+    } = input;
+
+    replace(&mut project.description, description);
+    replace(&mut project.source, source);
+    replace(&mut project.secondary_sources, secondary_sources);
+    replace(&mut project.source_version, source_version);
+    replace(
+        &mut project.secondary_source_versions,
+        secondary_source_versions,
+    );
+    replace(&mut project.artifacts, artifacts);
+    replace(&mut project.secondary_artifacts, secondary_artifacts);
+    replace(&mut project.cache, cache);
+    replace(&mut project.environment, environment);
+    replace(&mut project.service_role, service_role);
+    replace(&mut project.timeout_in_minutes, timeout_in_minutes);
+    replace(
+        &mut project.queued_timeout_in_minutes,
+        queued_timeout_in_minutes,
+    );
+    replace(&mut project.encryption_key, encryption_key);
+    replace(&mut project.tags, tags);
+    replace(&mut project.vpc_config, vpc_config);
+    replace(&mut project.logs_config, logs_config);
+    replace(&mut project.file_system_locations, file_system_locations);
+    replace(&mut project.build_batch_config, build_batch_config);
+    replace(&mut project.auto_retry_limit, auto_retry_limit);
+
+    // `badgeEnabled` is the request's flag and `badge` is the stored view of it, the
+    // same way CreateProject stores it. `badgeRequestUrl` is left as stored in both
+    // directions, and a project that had no badge gets none: that URL addresses a
+    // public badge endpoint this emulator does not serve, so CreateProject mints no
+    // such URL either and this call invents nothing it could not serve.
+    if let Some(badge_enabled) = badge_enabled {
+        project
+            .badge
+            .get_or_insert_with(ProjectBadge::default)
+            .badge_enabled = badge_enabled;
+    }
+
+    // The one member with a documented removal value; see
+    // [`CONCURRENT_BUILD_LIMIT_REMOVAL`]. Any OTHER value is stored as sent: the model
+    // declares no `@range` on `concurrentBuildLimit` and AWS documents no bound for it
+    // beyond the removal sentinel, so this emulator invents neither.
+    match concurrent_build_limit {
+        Some(CONCURRENT_BUILD_LIMIT_REMOVAL) => project.concurrent_build_limit = None,
+        Some(limit) => project.concurrent_build_limit = Some(limit),
+        None => {}
+    }
+}
+
+/// Overwrite `held` with `update` when the request carried that member, and leave it
+/// alone when it did not: an absent member means "unchanged", never "clear it".
+fn replace<T>(held: &mut Option<T>, update: Option<T>) {
+    if update.is_some() {
+        *held = update;
     }
 }

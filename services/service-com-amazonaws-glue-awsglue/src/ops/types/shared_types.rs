@@ -138,6 +138,10 @@ pub struct PartitionError {
 pub struct ErrorDetail {
     pub error_code: Option<String>,
     pub error_message: Option<String>,
+    /// The awsJson1.1 type discriminator the Data Catalog writes onto this nested
+    /// structure — this shape's own name. Stamped by
+    /// `crate::state::catalog_error_detail`, which is how every per-item error is built.
+    pub __type: Option<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.glue#AlreadyExistsException")]
@@ -2382,6 +2386,10 @@ pub struct IcebergOptimizationProperties {
 pub struct PrincipalPermissions {
     pub principal: Option<DataLakePrincipal>,
     pub permissions: Option<Vec<String>>,
+    /// The awsJson1.1 type discriminator the Data Catalog writes onto this nested
+    /// structure — this shape's own name. Stamped by the read projection (see
+    /// `crate::state::tagged_principal_permissions`), never carried over from a request.
+    pub __type: Option<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.glue#DataLakePrincipal")]
@@ -3397,6 +3405,10 @@ pub struct Database {
     pub target_database: Option<DatabaseIdentifier>,
     pub catalog_id: Option<String>,
     pub federated_database: Option<FederatedDatabase>,
+    /// The id of the Data Catalog that owns this database.
+    pub catalog_identifier: Option<String>,
+    /// The opaque, catalog-assigned id of this database.
+    pub database_id: Option<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.glue#DataCatalogEncryptionSettings")]
@@ -3672,6 +3684,13 @@ pub struct Table {
     pub iceberg_table_metadata: Option<IcebergTableMetadata>,
     pub status: Option<Box<TableStatus>>,
     pub rls_properties: Option<RLSProperties>,
+    /// The id of the Data Catalog that owns this table.
+    pub catalog_identifier: Option<String>,
+    /// The catalog-assigned id of the database this table belongs to — the same value
+    /// that database's `Database$DatabaseId` reports.
+    pub database_id: Option<String>,
+    /// Whether a row-level filter is in force on this table.
+    pub is_row_filtering_enabled: Option<bool>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.glue#ViewDefinition")]
