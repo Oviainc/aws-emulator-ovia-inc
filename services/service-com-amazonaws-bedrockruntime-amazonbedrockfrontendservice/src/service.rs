@@ -40,18 +40,53 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+use crate::ops::converse_stream::ConverseStream;
+use crate::ops::invoke_model_with_response_stream::InvokeModelWithResponseStream;
+use service_common::event_stream::EventStreamRoute;
+// `request_path`: the one reader of a request URI's path, shared rather than inlined
+// again here.
+use service_common::request_path;
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+/// Whether `path` is `/model/{modelId}/{tail}` — the URI space every inference
+/// operation of this service binds — and, if so, its `{tail}`.
+///
+/// `{modelId}` is a single `@httpLabel` segment, so the tail is the third segment
+/// and there is nothing after it.
+fn inference_route(path: &str) -> Option<&str> {
+    let mut segments = path.trim_start_matches('/').split('/');
+    let ("model", Some(model_id), Some(tail), None) = (
+        segments.next()?,
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return None;
+    };
+    (!model_id.is_empty() && !tail.is_empty()).then_some(tail)
+}
 
 /// The `com-amazonaws-bedrockruntime-amazonbedrockfrontendservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
+///
+/// Besides the generated entry it holds this service's two event-stream
+/// operations. They are NOT in the entry's routing table in a servable form: the
+/// generated `ErasedOperation` shim of an operation whose output is a `@streaming`
+/// union declines the request (it cannot drive `serialize_as_event_stream<P>`
+/// through an object-safe `run`), so each one is held here behind an
+/// [`EventStreamRoute`] and routed by [`EmulatedService::override_operation`] —
+/// which the router consults FIRST, before the generated table.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    converse_stream: EventStreamRoute<ConverseStream<Eng>>,
+    invoke_model_with_response_stream:
+        EventStreamRoute<InvokeModelWithResponseStream<Eng>>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -60,7 +95,11 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            converse_stream: EventStreamRoute(ConverseStream::new(Arc::clone(&engine))),
+            invoke_model_with_response_stream: EventStreamRoute(
+                InvokeModelWithResponseStream::new(engine),
+            ),
         }
     }
 }
@@ -103,12 +142,20 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // The two event-stream operations the generated routing table cannot
+        // serve. Routed by the method and the URI the model gives each one, so
+        // every other request — including `InvokeModelWithBidirectionalStream`,
+        // which this slice does not implement — still resolves through the
+        // generated table and keeps answering the framework's "modeled but not
+        // served" response rather than being half-served here.
+        if req.method() != http::Method::POST.as_str() {
+            return None;
+        }
+        match inference_route(request_path(req.uri()))? {
+            "converse-stream" => Some(&self.converse_stream),
+            "invoke-with-response-stream" => Some(&self.invoke_model_with_response_stream),
+            _ => None,
+        }
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

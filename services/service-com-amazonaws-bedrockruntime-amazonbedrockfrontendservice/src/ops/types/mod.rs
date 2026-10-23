@@ -17,12 +17,14 @@
 pub mod apply_guardrail_types;
 pub mod converse_types;
 pub mod count_tokens_types;
+pub mod event_padding;
 pub mod get_async_invoke_types;
 pub mod invoke_guardrail_checks_types;
 pub mod invoke_model_types;
 pub mod list_async_invokes_types;
 pub mod shared_types;
 pub mod start_async_invoke_types;
+pub mod streaming_types;
 
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use apply_guardrail_types::*;
@@ -30,6 +32,8 @@ pub use apply_guardrail_types::*;
 pub use converse_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use count_tokens_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use event_padding::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_async_invoke_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
@@ -42,4 +46,6 @@ pub use list_async_invokes_types::*;
 pub use shared_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use start_async_invoke_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use streaming_types::*;
 

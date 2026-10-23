@@ -187,19 +187,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // interpret is a 400, one naming a model or resource that is not
         // available here a 404 (see
         // `crate::state::resolve_model_for_inference`).
-        if let Err(rejection) = state.lock().resolve_model_for_inference(&input.model_id) {
-            return Err(match rejection {
-                crate::state::ModelRejection::Invalid(message) => {
-                    CountTokensErrorModeled::ValidationException(ValidationException {
-                        message: Some(message),
-                    })
+        let supports_count_tokens = match state.lock().resolve_model_for_inference(&input.model_id) {
+            Ok(model) => model.supports_count_tokens,
+            Err(rejection) => {
+                return Err(match rejection {
+                    crate::state::ModelRejection::Invalid(message) => {
+                        CountTokensErrorModeled::ValidationException(ValidationException {
+                            message: Some(message),
+                        })
+                    }
+                    crate::state::ModelRejection::NotFound(message) => {
+                        CountTokensErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException {
+                                message: Some(message),
+                            },
+                        )
+                    }
                 }
-                crate::state::ModelRejection::NotFound(message) => {
-                    CountTokensErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                        message: Some(message),
-                    })
-                }
+                .into())
             }
+        };
+        // The count is the MODEL's own tokenizer's, so the operation is served
+        // only for a model AWS publishes it for (`CountTokens` "Supported
+        // models"); for any other model the service refuses the count instead of
+        // answering one computed with a different tokenizer.
+        if !supports_count_tokens {
+            return Err(CountTokensErrorModeled::ValidationException(ValidationException {
+                message: Some("The provided model doesn't support counting tokens.".to_string()),
+            })
             .into());
         }
 

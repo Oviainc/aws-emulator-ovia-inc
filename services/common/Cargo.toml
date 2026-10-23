@@ -12,6 +12,7 @@ emulator-server = { workspace = true }
 http = { workspace = true }
 # `front_door`: the operation wrapper, the schema it reads a member's HTTP binding
 # off, the constraint walk it runs and the request/response types it serves.
+# `event_stream` is driven through the same traits.
 # `validation`: the same `Schema` / `ShapeSerializer` seam, used to re-walk a built
 # input, and the `Violation` / constraint-path vocabulary the framework's own
 # constraint walk reports in. `shared_path`: `percent_decode`, which it reads a

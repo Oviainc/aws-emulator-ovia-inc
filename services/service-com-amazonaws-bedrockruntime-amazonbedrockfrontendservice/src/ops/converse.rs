@@ -309,83 +309,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A conversation is a non-empty sequence of turns that starts with the
-        // user and alternates user/assistant.
-        let messages = match input.messages.as_ref() {
-            Some(messages) if !messages.is_empty() => messages,
-            _ => {
-                return Err(validation(
-                    "The messages field must contain at least one message.".to_string(),
-                ))
-            }
-        };
-        for (turn, message) in messages.iter().enumerate() {
-            let expected = if turn % 2 == 0 { "user" } else { "assistant" };
-            if message.role != expected {
-                return Err(validation(format!(
-                    "A conversation must start with a user message and then alternate between \
-                     user and assistant roles: expected role {expected} at messages[{turn}], \
-                     got {}.",
-                    message.role
-                )));
-            }
-        }
+        // user and alternates user/assistant — the rule `ConverseStream` states
+        // too, so both read it from `crate::state`.
+        crate::state::validate_conversation(input.messages.as_ref()).map_err(validation)?;
 
-        let input_tokens = crate::state::converse_input_tokens(
+        let turn = crate::state::converse_turn(
+            &model,
             input.system.as_ref(),
             input.messages.as_ref(),
             input.tool_config.as_ref(),
+            input
+                .inference_config
+                .as_ref()
+                .and_then(|config| config.max_tokens),
         );
-
-        // The model's own ceiling caps `inferenceConfig.maxTokens`, and hitting
-        // the cap is what makes the turn stop on `max_tokens` instead of
-        // `end_turn`.
-        let requested_max = input
-            .inference_config
-            .as_ref()
-            .and_then(|config| config.max_tokens)
-            .and_then(|max| u32::try_from(max).ok())
-            .unwrap_or(model.max_output_tokens);
-        let max_output_tokens = requested_max.min(model.max_output_tokens);
-
-        let full_text = crate::state::emulated_completion_text(
-            &model.model_id,
-            u32::try_from(messages.len()).unwrap_or(u32::MAX),
-            input_tokens,
-        );
-        let truncated = crate::state::count_text_tokens(&full_text) > max_output_tokens;
-        let text = if truncated {
-            crate::state::truncate_to_tokens(&full_text, max_output_tokens)
-        } else {
-            full_text
-        };
-        let output_tokens = crate::state::count_text_tokens(&text);
 
         state
             .lock()
             .log_invocation(crate::state::InvocationLogEntry {
                 model_id: model.model_id.clone(),
                 kind: crate::state::InvokeKind::Converse,
-                input_tokens,
-                output_tokens,
+                input_tokens: turn.input_tokens,
+                output_tokens: turn.output_tokens,
                 at_millis: crate::state::now_millis(),
             });
 
         Ok(ConverseOutput {
             output: ConverseOutput2::Message(Message {
                 role: "assistant".to_string(),
-                content: vec![ContentBlock::Text(text)],
+                content: vec![ContentBlock::Text(turn.text.clone())],
             }),
-            stop_reason: if truncated { "max_tokens" } else { "end_turn" }.to_string(),
-            usage: TokenUsage {
-                input_tokens: crate::state::token_count_i32(input_tokens),
-                output_tokens: crate::state::token_count_i32(output_tokens),
-                total_tokens: crate::state::token_count_i32(
-                    input_tokens.saturating_add(output_tokens),
-                ),
-                cache_read_input_tokens: None,
-                cache_write_input_tokens: None,
-                cache_details: None,
-            },
+            stop_reason: turn.stop_reason().to_string(),
+            usage: turn.usage(),
             metrics: ConverseMetrics {
                 latency_ms: i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
             },

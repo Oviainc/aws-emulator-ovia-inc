@@ -242,3 +242,135 @@ fn bedrock_runtime_claims_exactly_the_path_space_its_model_binds() {
         );
     }
 }
+
+/// RULE: a request this service claims is routed by the URI its MODEL binds —
+/// `override_operation` takes over exactly the two operations whose output is a
+/// `@streaming` union (which the generated object-safe routing table cannot serve) and
+/// leaves every other modelled route to that table.
+///
+/// The rows are every `/model/{modelId}/…` route the model publishes
+/// (`smithy_query(query="digest")`: `converse`, `converse-stream`, `invoke`,
+/// `invoke-with-response-stream`, `invoke-with-bidirectional-stream`, `count-tokens`),
+/// a route outside that path space, and tails/methods the model binds nothing for. Each
+/// row is checked BOTH ways: against `override_operation` and against the framework's own
+/// route matcher over this service's routing table
+/// (`service_common::addresses_modeled_route`), so the two literal tails routed by hand
+/// cannot drift away from the model — a tail this service overrides that resolves to no
+/// route, or a routable streaming operation it fails to override, fails here.
+#[test]
+fn override_operation_routes_exactly_the_modelled_event_stream_uris() {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let service = EmulatedService::new(engine);
+
+    // (case, method, path, overridden here, resolved by the generated routing table)
+    let rows: [(&str, &str, &str, bool, bool); 10] = [
+        (
+            "ConverseStream, a @streaming output",
+            "POST",
+            "/model/amazon.nova-pro-v1%3A0/converse-stream",
+            true,
+            true,
+        ),
+        (
+            "InvokeModelWithResponseStream, a @streaming output",
+            "POST",
+            "/model/amazon.nova-pro-v1%3A0/invoke-with-response-stream",
+            true,
+            true,
+        ),
+        (
+            "Converse, served by the generated table",
+            "POST",
+            "/model/amazon.nova-pro-v1%3A0/converse",
+            false,
+            true,
+        ),
+        (
+            "InvokeModel, served by the generated table",
+            "POST",
+            "/model/amazon.nova-pro-v1%3A0/invoke",
+            false,
+            true,
+        ),
+        (
+            "CountTokens, served by the generated table",
+            "POST",
+            "/model/amazon.nova-pro-v1%3A0/count-tokens",
+            false,
+            true,
+        ),
+        // The model binds this route, but the generated table wires no operation for it
+        // (its INPUT is a `@streaming` union too, which the scaffold does not generate),
+        // so the framework's route matcher resolves nothing and the request keeps
+        // answering the framework's "modeled but not served" response. This service must
+        // not override it either: a half-served bidirectional stream would be worse than
+        // that answer.
+        (
+            "InvokeModelWithBidirectionalStream: modelled, wired nowhere",
+            "POST",
+            "/model/amazon.nova-pro-v1%3A0/invoke-with-bidirectional-stream",
+            false,
+            false,
+        ),
+        (
+            "StartAsyncInvoke, outside the /model path space",
+            "POST",
+            "/async-invoke",
+            false,
+            true,
+        ),
+        (
+            "a tail the model binds nothing for",
+            "POST",
+            "/model/amazon.nova-pro-v1%3A0/converse-streamx",
+            false,
+            false,
+        ),
+        (
+            "a streaming tail on the wrong method",
+            "GET",
+            "/model/amazon.nova-pro-v1%3A0/converse-stream",
+            false,
+            false,
+        ),
+        (
+            "a deeper path under a streaming tail",
+            "POST",
+            "/model/amazon.nova-pro-v1%3A0/converse-stream/extra",
+            false,
+            false,
+        ),
+    ];
+
+    for (case, method, path, overridden, routable) in rows {
+        let mut request = aws_smithy_runtime_api::http::Request::new(
+            aws_smithy_types::body::SdkBody::empty(),
+        );
+        request
+            .set_uri(format!("https://emulator.local{path}").as_str())
+            .expect("set the uri");
+        request.set_method(method).expect("set the method");
+        let actual = service.override_operation(&request).is_some();
+        assert_eq!(
+            actual, overridden,
+            "case {case:?}: expected override_operation().is_some() == {overridden} for \
+             {method} {path}, got {actual}"
+        );
+
+        let parts = http::Request::builder()
+            .method(method)
+            .uri(format!("https://emulator.local{path}"))
+            .header("host", "emulator.local")
+            .header("authorization", authorization("bedrock"))
+            .body(bytes::Bytes::new())
+            .expect("build the request")
+            .into_parts()
+            .0;
+        let bound = service_common::addresses_modeled_route(&parts, service.definition());
+        assert_eq!(
+            bound, routable,
+            "case {case:?}: expected the routing table to resolve {method} {path} == \
+             {routable}, got {bound}"
+        );
+    }
+}
