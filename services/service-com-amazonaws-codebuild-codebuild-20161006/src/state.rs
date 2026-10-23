@@ -3,7 +3,8 @@
 //! Engine state for the com-amazonaws-codebuild-codebuild-20161006 service.
 //!
 //! Every implemented CodeBuild operation computes its answer from the records
-//! here: `CreateProject` writes a [`Project`], `CreateFleet` writes a
+//! here: `CreateProject` writes a [`Project`] and `UpdateProjectVisibility`
+//! rewrites that project's visibility, `CreateFleet` writes a
 //! [`StoredFleet`], `CreateWebhook` writes that
 //! project's [`crate::ops::types::Webhook`], `StartBuild` writes a
 //! [`StoredBuild`], `StartBuildBatch` writes a [`StoredBuildBatch`],
@@ -1701,6 +1702,47 @@ pub fn token_is_resource_arn(auth_type: &str) -> bool {
 /// `arn:aws:codebuild:<region>:<account>:build/<id>`.
 pub fn build_arn(region: &str, id: &str) -> String {
     ::emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("build/{id}"))
+}
+
+/// The project name an `arn:<partition>:codebuild:<region>:<account>:project/<name>`
+/// ARN identifies, or `None` when the value is not a CodeBuild project ARN.
+///
+/// The inverse of [`project_arn`]'s resource segment, for an operation that addresses
+/// a project by ARN rather than by name: the name is what this store is keyed by. It
+/// answers the SYNTAX question only — whether the value is a project ARN of this
+/// service at all — so a caller that resolves a record still keeps it only if its
+/// STORED ARN is exactly the one asked for, the way
+/// [`ComAmazonawsCodebuildCodebuild20161006State::report_group_by_arn`] does; that is
+/// what keeps an ARN for another partition, region or account from resolving to a
+/// local record. A project name cannot contain `:` (the model's `@pattern` on
+/// `CreateProjectInput$name`), so the six ARN fields split cleanly.
+pub fn project_name_from_arn(arn: &str) -> Option<&str> {
+    // Walked field by field rather than collected, so resolving an ARN allocates
+    // nothing.
+    let mut fields = arn.splitn(6, ':');
+    if fields.next()? != "arn" || fields.next()?.is_empty() || fields.next()? != ARN_NAMESPACE {
+        return None;
+    }
+    // The region and the account are not checked here; see above.
+    fields.next()?;
+    fields.next()?;
+    let name = fields.next()?.strip_prefix("project/")?;
+    (!name.is_empty()).then_some(name)
+}
+
+/// A public project's `publicProjectAlias` — "the project identifier used with the
+/// public build APIs".
+///
+/// DERIVED, not drawn from a generator, for the same reason [`build_uuid`] is: AWS
+/// documents no format for the alias (the model types it only as `NonEmptyString`), so
+/// this emulator mints it as the first 16 bytes of the SHA-256 of the project's ARN,
+/// hex-encoded. It is therefore a function of the project alone — stable across reads,
+/// the same again when a project is re-published, and distinct for distinct projects —
+/// rather than a value that changes per run. The digest is SHA-256 (`sha2`), already a
+/// dependency of this crate.
+pub fn public_project_alias(project_arn: &str) -> String {
+    use ::sha2::Digest;
+    ::hex::encode(&::sha2::Sha256::digest(project_arn.as_bytes())[..16])
 }
 
 /// `arn:aws:codebuild:<region>:<account>:fleet/<id>`, where `id` is a fleet's

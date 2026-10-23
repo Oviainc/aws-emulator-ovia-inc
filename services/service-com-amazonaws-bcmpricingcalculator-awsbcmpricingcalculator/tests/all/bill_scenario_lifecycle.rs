@@ -44,7 +44,21 @@ pub(crate) struct Emulator {
 }
 
 impl Emulator {
+    /// One emulator whose store presents an account that MAY plan bills
+    /// (`AccountClass::Management`, the organization's payer account).
+    ///
+    /// Stated rather than defaulted: the bill-planning surface — the bill scenarios and
+    /// the write of the rate-type preferences — is gated on the caller's account class,
+    /// and a store's default class is `AccountClass::Member`, which is refused. Every
+    /// suite that exercises what that surface DOES therefore builds its emulator here;
+    /// the gate itself is pinned in `tests/all/account_class_gate.rs`, over all three
+    /// classes.
     pub(crate) fn new() -> Self {
+        Self::with_account_class(state::AccountClass::Management)
+    }
+
+    /// One emulator whose store presents an account of `class`.
+    pub(crate) fn with_account_class(class: state::AccountClass) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // These requests carry an unsigned `Authorization` header: it is here to name
@@ -52,7 +66,11 @@ impl Emulator {
         // not to be verified.
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
-        Self { router, engine }
+        let emulator = Self { router, engine };
+        // The same store the service's operations reach, the way every suite here
+        // reaches it.
+        emulator.engine.state::<ServiceState>().lock().account_class = class;
+        emulator
     }
 
     pub(crate) async fn call(&self, operation: &str, body: Value) -> (u16, Value) {

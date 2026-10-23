@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateProjectVisibility
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateProjectVisibility`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateProjectVisibility::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation changes the stored visibility of the build project its
+//! `projectArn` names, so every later read of that project (`BatchGetProjects`, and
+//! `ListProjects`' modified-time order) reports the change. See
+//! [`UpdateProjectVisibility::handle`].
 //!
 //! ## Shape of an operation
 //!
@@ -163,23 +159,195 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UPDATE_PROJECT_VISIBILITY_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Change the named project's build visibility, and persist it.
+    ///
+    /// A mutation, as the model's own doc says ("Changes the public visibility for a
+    /// project"): the requested `projectVisibility` becomes the project's stored
+    /// visibility, a project whose builds are public carries the `publicProjectAlias`
+    /// "used with the public build APIs" and a private one carries none, and
+    /// `resourceAccessRole` is replaced when the request names a valid IAM role ARN.
+    /// The project's `lastModified` moves forward, because the project changed, and the
+    /// call is audited the way every other state-changing CodeBuild call here is.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateProjectVisibility` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateProjectVisibilityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateProjectVisibility"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateProjectVisibility (this engine carries no CodeBuild state)",
+            ));
+        };
+
+        // `projectVisibility` targets `ProjectVisibilityType`, whose only values are
+        // PUBLIC_READ and PRIVATE (`smithy_query(query="shape",
+        // shape="ProjectVisibilityType")`). AWS enums are open on the wire, so a value
+        // outside that pair can reach a handler; persisting one would leave the project
+        // in a visibility no reader can interpret, so it is refused with this
+        // operation's own client-input error instead.
+        if !matches!(input.project_visibility.as_str(), "PUBLIC_READ" | "PRIVATE") {
+            // Each refusal is audited like the successful write, the way
+            // `UpdateProject` and `CreateProject` audit theirs.
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::ValidationRefused,
+                Some(&input.project_arn),
+            );
+            return Err(UpdateProjectVisibilityErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Invalid projectVisibility: {} (expected one of PRIVATE, PUBLIC_READ)",
+                        input.project_visibility
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // This operation addresses the project by ARN, not by name, so the name has to
+        // come back out of the ARN before the store can be read. An input that is not a
+        // CodeBuild project ARN names no project at all, which is a malformed input
+        // rather than a missing resource.
+        let Some(name) = crate::state::project_name_from_arn(&input.project_arn) else {
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::ValidationRefused,
+                Some(&input.project_arn),
+            );
+            return Err(UpdateProjectVisibilityErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Invalid projectArn: {} (expected \
+                         arn:<partition>:codebuild:<region>:<account>:project/<name>)",
+                        input.project_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // `resourceAccessRole` is "The ARN of the IAM role that enables CodeBuild to
+        // access the CloudWatch Logs and Amazon S3 artifacts for the project's builds",
+        // so a value that is not an IAM role ARN cannot be one. The model types the
+        // member only as `NonEmptyString`, so the boundary cannot refuse it and this is
+        // where the refusal belongs.
+        let invalid_role = input
+            .resource_access_role
+            .as_deref()
+            .is_some_and(|role| !is_iam_role_arn(role));
+        if invalid_role {
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::ValidationRefused,
+                Some(&input.project_arn),
+            );
+            return Err(UpdateProjectVisibilityErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Invalid resourceAccessRole: {} (expected \
+                         arn:<partition>:iam::<account>:role/<name>)",
+                        input.resource_access_role.unwrap_or_default()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let now = crate::state::now_millis();
+        let mut guard = state.lock();
+        // Resolved the way the other ARN-addressed records of this service are
+        // (`report_group_by_arn`, `settled_fleet`): the name resolves the entry, and
+        // the candidate is kept only if its STORED ARN is exactly the one asked for, so
+        // an ARN for another partition, region or account can never resolve to a local
+        // project.
+        let resolved = guard
+            .projects
+            .get_mut(name)
+            .filter(|stored| stored.project.arn.as_deref() == Some(input.project_arn.as_str()));
+        let Some(stored) = resolved else {
+            // The lock is dropped before the record is written, so a log consumer never
+            // waits on this request's critical section.
+            drop(guard);
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::NotFound,
+                Some(&input.project_arn),
+            );
+            return Err(
+                UpdateProjectVisibilityErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("Project cannot be found: {}", input.project_arn)),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The stored ARN is what identifies the project, and the request's ARN equals
+        // it by the check above.
+        let project_arn = input.project_arn.clone();
+        // The alias is what the public build APIs address a project by, so it exists
+        // exactly while that project's builds are public.
+        let public_project_alias = (input.project_visibility == "PUBLIC_READ")
+            .then(|| crate::state::public_project_alias(&project_arn));
+
+        stored.project.project_visibility = Some(input.project_visibility.clone());
+        stored.project.public_project_alias = public_project_alias.clone();
+        // An absent `resourceAccessRole` leaves the stored role alone: the member is
+        // optional, so omitting it asks for no change to it, and it is the role
+        // CodeBuild uses to reach the logs and artifacts of builds that already ran.
+        if input.resource_access_role.is_some() {
+            stored.project.resource_access_role = input.resource_access_role.clone();
+        }
+        // `lastModified` reports when the project was last changed, so a successful
+        // update has to move it. As in `UpdateProject`, the stamp is the later of now
+        // and one millisecond past the stored stamp, which keeps it strictly increasing
+        // per project on a millisecond-resolution clock without ever running behind it.
+        let last_modified_millis = now.max(stored.last_modified_millis + 1);
+        stored.project.last_modified = Some(crate::state::datetime(last_modified_millis));
+        stored.last_modified_millis = last_modified_millis;
+        drop(guard);
+
+        crate::state::audit(
+            Self::NAME,
+            ctx.parts(),
+            crate::state::AuditOutcome::ProjectUpdated,
+            Some(&project_arn),
+        );
+
+        Ok(UpdateProjectVisibilityOutput {
+            project_arn: Some(project_arn),
+            project_visibility: Some(input.project_visibility),
+            public_project_alias,
+        })
     }
+}
+
+/// Whether `candidate` is an IAM role ARN — `arn:<partition>:iam::<account>:role/<name>`,
+/// where the name may carry a path (`role/service-role/<name>`).
+///
+/// IAM is a global service, so a role ARN's region field is empty; that, the `iam`
+/// service segment and the `role/` resource type are what distinguish a role ARN from
+/// any other ARN a caller might pass as `resourceAccessRole`.
+///
+/// The FORM is all that is checked, deliberately: whether the role exists and whether
+/// CodeBuild may assume it are questions about an IAM account this emulator does not
+/// hold, so a syntactically valid role ARN is accepted here where AWS would also weigh
+/// the role's existence and trust policy.
+fn is_iam_role_arn(candidate: &str) -> bool {
+    let mut fields = candidate.splitn(6, ':');
+    let scope_ok = fields.next() == Some("arn")
+        && fields.next().is_some_and(|partition| !partition.is_empty())
+        && fields.next() == Some("iam")
+        && fields.next() == Some("")
+        && fields.next().is_some_and(|account| !account.is_empty());
+    scope_ok
+        && fields
+            .next()
+            .and_then(|resource| resource.strip_prefix("role/"))
+            .is_some_and(|name| !name.is_empty())
 }

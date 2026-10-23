@@ -9,8 +9,8 @@
 //! later read of that comment, reports it with `deleted` true, no `content`, and
 //! the id, author, creation date and reactions it already had; a second call
 //! against the same comment, and any attempt to read, edit or react to it, is
-//! refused with `CommentDeletedException` and the service's fixed sentence for the
-//! action it refused, which carries no value from the request. Other comments are
+//! refused with `CommentDeletedException` and the sentence that exception is
+//! recorded with, which carries no value from the request. Other comments are
 //! untouched.
 //!
 //! The table below spans the class that rule covers — content kind and size
@@ -22,20 +22,10 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::comment_deleted_refusals::comment_deleted_message;
 use crate::comment_lifecycle::{fixture, Fixture, MAX_COMMENT_CHARACTERS, OTHER_ACCESS_KEY_ID, PATH};
 use crate::repository_lifecycle::{ok, string_at};
 use crate::wire::{ok_as, refusal_as, DEFAULT_ACCESS_KEY_ID};
-
-/// The sentence `CommentDeletedException` carries, by the action it refused: a
-/// fixed text with no value from the request in it. The `delete` row is the answer
-/// AWS gives a repeated `DeleteCommentContent`; the others are the same sentence
-/// led by the action the operation refused.
-fn comment_deleted_message(refused_action: &str) -> String {
-    let mut message = format!("You cannot {refused_action} this comment.");
-    message.push_str(" The specified comment has already been marked as deleted.");
-    message.push_str(" Verify that you specified a valid comment ID, and then try again.");
-    message
-}
 
 /// The code AND message of a refused call, as the shared `wire` harness parses
 /// them: every error this suite asserts is a modelled 400.
@@ -257,26 +247,18 @@ async fn deleting_a_comments_content_keeps_the_comment_and_refuses_a_second_dele
 
         // "You cannot edit or delete a deleted comment": the second deletion is
         // refused rather than repeated, and so is every other call about it. The
-        // message is the service's fixed sentence for the refused action.
-        for (operation, action, input) in [
-            (
-                "DeleteCommentContent",
-                "delete",
-                json!({ "commentId": comment_id }),
-            ),
-            (
-                "GetComment",
-                "retrieve",
-                json!({ "commentId": comment_id }),
-            ),
+        // message is the sentence the exception is recorded with — see
+        // [`comment_deleted_message`], the one place this suite and its sibling
+        // state it.
+        for (operation, input) in [
+            ("DeleteCommentContent", json!({ "commentId": comment_id })),
+            ("GetComment", json!({ "commentId": comment_id })),
             (
                 "UpdateComment",
-                "modify",
                 json!({ "commentId": comment_id, "content": "after the deletion" }),
             ),
             (
                 "PutCommentReaction",
-                "react to",
                 json!({ "commentId": comment_id, "reactionValue": ":heart:" }),
             ),
         ] {
@@ -288,7 +270,7 @@ async fn deleting_a_comments_content_keeps_the_comment_and_refuses_a_second_dele
             );
             assert_eq!(
                 message,
-                comment_deleted_message(action),
+                comment_deleted_message(operation),
                 "case {label:?}: {operation} on a deleted comment: unexpected message {message:?}"
             );
             assert!(
