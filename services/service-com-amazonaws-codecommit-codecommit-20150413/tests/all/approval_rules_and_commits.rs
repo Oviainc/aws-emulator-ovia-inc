@@ -565,7 +565,11 @@ async fn a_created_approval_rule_template_is_read_back_from_state() {
         );
         assert_eq!(
             template.get("approvalRuleTemplateDescription").and_then(Value::as_str),
-            case.description.as_deref(),
+            // An empty description is held as NO description: CodeCommit reports
+            // `approvalRuleTemplateDescription` absent rather than as an empty
+            // string (the recorded behaviour the corpus names
+            // "approval-rule-template-empty-description-normalized-to-absent").
+            case.description.as_deref().filter(|text| !text.is_empty()),
             "case {label:?}: the description is the one created"
         );
         for member in ["creationDate", "lastModifiedDate"] {

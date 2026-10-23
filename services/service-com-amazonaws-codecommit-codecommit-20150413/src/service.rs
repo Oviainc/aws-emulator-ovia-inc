@@ -201,6 +201,49 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
             "InvalidOrderException",
             "The specified sort order is not valid.",
         ),
+        (
+            "approvalRuleTemplateName" | "oldApprovalRuleTemplateName" | "newApprovalRuleTemplateName",
+            _,
+        ) if missing => (
+            "ApprovalRuleTemplateNameRequiredException",
+            "An approval rule template name is required, but was not specified.",
+        ),
+        (
+            "approvalRuleTemplateName" | "oldApprovalRuleTemplateName" | "newApprovalRuleTemplateName",
+            ViolationKind::MinLength(_),
+        ) => (
+            // A name that is present but empty names no template either, so it is
+            // the same failure as not specifying one.
+            "ApprovalRuleTemplateNameRequiredException",
+            "An approval rule template name is required, but was not specified.",
+        ),
+        (
+            "approvalRuleTemplateName" | "oldApprovalRuleTemplateName" | "newApprovalRuleTemplateName",
+            _,
+        ) => (
+            "InvalidApprovalRuleTemplateNameException",
+            "The name of the approval rule template is not valid. Template names must be between 1 and 100 valid characters in length.",
+        ),
+        // `newRuleContent` is deliberately NOT listed: UpdatePullRequestApprovalRuleContent
+        // spells its member that way too, and that operation models
+        // `ApprovalRuleContentRequiredException` / `InvalidApprovalRuleContentException`
+        // instead, so one name-keyed row cannot speak for both.
+        ("approvalRuleTemplateContent", _) if missing => (
+            "ApprovalRuleTemplateContentRequiredException",
+            "The content for the approval rule template is empty. You must provide some content for an approval rule template. The content cannot be null.",
+        ),
+        ("approvalRuleTemplateContent", ViolationKind::MinLength(_)) => (
+            "ApprovalRuleTemplateContentRequiredException",
+            "The content for the approval rule template is empty. You must provide some content for an approval rule template. The content cannot be null.",
+        ),
+        ("approvalRuleTemplateContent", _) => (
+            "InvalidApprovalRuleTemplateContentException",
+            "The content of the approval rule template is not valid.",
+        ),
+        ("approvalRuleTemplateDescription", _) => (
+            "InvalidApprovalRuleTemplateDescriptionException",
+            "The description for the approval rule template is not valid because it exceeds the maximum characters allowed for a description.",
+        ),
         ("nextToken", _) => (
             "InvalidContinuationTokenException",
             "The specified continuation token is not valid.",

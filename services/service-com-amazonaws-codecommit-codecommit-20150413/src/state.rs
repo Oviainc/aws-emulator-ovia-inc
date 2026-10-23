@@ -808,7 +808,12 @@ impl ApprovalRuleTemplateRecord {
         Self {
             template_id: approval_rule_template_id(name, created),
             name: name.to_string(),
-            description,
+            // CodeCommit holds no empty description: a template created with one
+            // simply has none, so `approvalRuleTemplateDescription` is absent on
+            // every later read rather than reported as an empty string (the
+            // recorded behaviour the corpus names
+            // "approval-rule-template-empty-description-normalized-to-absent").
+            description: description.filter(|text| !text.is_empty()),
             content,
             creation_date: created,
             last_modified_date: created,
