@@ -30,8 +30,11 @@ const SIGNED_FOR_AMPLIFY: &str = "AWS4-HMAC-SHA256 \
      SignedHeaders=host;x-amz-date, Signature=0000";
 
 /// The account id every emulated ARN carries, and the region the harness signs for.
-const ACCOUNT_ID: &str = "000000000000";
-const REGION: &str = "us-east-1";
+///
+/// `pub(crate)` for the same reason as [`Emulator`]: a sibling suite asserting an ARN
+/// reads the one account and region this harness signs for rather than repeating them.
+pub(crate) const ACCOUNT_ID: &str = "000000000000";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// One response, reduced to what a client branches on.
 ///
@@ -166,6 +169,18 @@ impl Emulator {
             Some(request),
         )
         .await
+    }
+
+    /// A webhook created on `app_id`.
+    pub(crate) async fn create_webhook(&self, app_id: &str, request: &Value) -> Reply {
+        self.call("POST", &format!("/apps/{app_id}/webhooks"), Some(request))
+            .await
+    }
+
+    /// The webhook `webhook_id` names \u2014 addressed by its own id, not through an app.
+    pub(crate) async fn get_webhook(&self, webhook_id: &str) -> Reply {
+        self.call("GET", &format!("/webhooks/{webhook_id}"), None)
+            .await
     }
 
     /// Create an app and return its minted `appId`.
