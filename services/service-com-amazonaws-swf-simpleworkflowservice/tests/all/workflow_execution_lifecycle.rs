@@ -135,7 +135,7 @@ pub(crate) fn string_at(body: &Value, pointer: &str) -> String {
         .to_string()
 }
 
-fn i64_at(body: &Value, pointer: &str) -> i64 {
+pub(crate) fn i64_at(body: &Value, pointer: &str) -> i64 {
     body.pointer(pointer)
         .and_then(Value::as_i64)
         .unwrap_or_else(|| panic!("expected an integer at {pointer} of {body:?}"))
@@ -1136,7 +1136,12 @@ async fn one_open_run_per_workflow_id_and_a_new_run_after_it_closes() {
 // ---------------------------------------------------------------------------
 
 /// Read a whole history in one call.
-async fn whole_history(emulator: &Emulator, domain: &str, workflow_id: &str, run_id: &str) -> Vec<Value> {
+pub(crate) async fn whole_history(
+    emulator: &Emulator,
+    domain: &str,
+    workflow_id: &str,
+    run_id: &str,
+) -> Vec<Value> {
     let body = emulator
         .ok(
             "whole history",

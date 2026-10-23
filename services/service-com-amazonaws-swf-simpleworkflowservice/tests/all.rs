@@ -19,6 +19,8 @@ mod domain_deprecation;
 mod domain_tagging;
 #[path = "all/list_open_workflow_executions.rs"]
 mod list_open_workflow_executions;
+#[path = "all/request_cancel_workflow_execution.rs"]
+mod request_cancel_workflow_execution;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/workflow_execution_lifecycle.rs"]
