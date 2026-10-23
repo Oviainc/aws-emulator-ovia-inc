@@ -31,6 +31,8 @@ mod job_queue_updates;
 mod scheduling_policies;
 #[path = "all/service_environment.rs"]
 mod service_environment;
+#[path = "all/service_job_submission.rs"]
+mod service_job_submission;
 #[path = "all/service_job_termination.rs"]
 mod service_job_termination;
 #[path = "all/state_roundtrip.rs"]

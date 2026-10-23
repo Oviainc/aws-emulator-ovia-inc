@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SubmitServiceJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SubmitServiceJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Submits a service job to a job queue of type `SAGEMAKER_TRAINING` and persists it in
+//! [`crate::state`]: the queue is resolved by name or ARN, the record is minted in the
+//! non-terminal `SUBMITTED` status with a fresh job id and ARN, and `DescribeServiceJob`
+//! reads it back. A `clientToken` makes the submit idempotent. A queue that resolves to
+//! nothing, a queue that is not of type `SAGEMAKER_TRAINING`, a `jobName`,
+//! `schedulingPriority` or `retryStrategy.attempts` outside what the member documents, a
+//! `clientToken` reused for a different request and a full store are each the modelled
+//! `ClientException` (HTTP 400).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SubmitServiceJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The work itself is NOT run: nothing here runs SageMaker AI, so the clock walks the
+//! job `SUBMITTED` -> `RUNNABLE` and then ends it in the modelled failure state with
+//! [`crate::state::NO_SERVICE_JOB_RUNTIME_REASON`], inventing no `scheduledAt`,
+//! `startedAt`, attempt or capacity usage.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +180,205 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SubmitServiceJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SubmitServiceJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state as batch;
+
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(
+                SubmitServiceJobErrorModeled::ServerException(batch::unreachable_state()).into(),
+            );
+        };
+        let region = batch::request_region(ctx);
+        let now = batch::now_millis();
+        let mut state = state.lock();
+        state.materialize_due(now);
+
+        // `jobName` is a plain `String` in the model, so the framework admits anything:
+        // the charset and length the member documents are applied here.
+        if !batch::is_valid_job_name(&input.job_name) {
+            return Err(SubmitServiceJobErrorModeled::ClientException(batch::client_exception(
+                format!(
+                    "jobName must be 1 to {} letters, numbers, hyphens (-) or underscores (_)",
+                    batch::MAX_JOB_NAME_LEN
+                ),
+            ))
+            .into());
+        }
+
+        // "The scheduling priority of the service job. Valid values are integers between
+        // 0 and 9999." — a plain `Integer` in the model, so the bound is applied here.
+        if let Some(priority) = input
+            .scheduling_priority
+            .filter(|priority| {
+                !(batch::MIN_SCHEDULING_PRIORITY..=batch::MAX_SCHEDULING_PRIORITY)
+                    .contains(priority)
+            })
+        {
+            return Err(SubmitServiceJobErrorModeled::ClientException(batch::client_exception(
+                format!(
+                    "schedulingPriority {priority} must be between {} and {}",
+                    batch::MIN_SCHEDULING_PRIORITY,
+                    batch::MAX_SCHEDULING_PRIORITY
+                ),
+            ))
+            .into());
+        }
+
+        // `ServiceJobRetryStrategy$attempts`: "You can specify between 1 and 10
+        // attempts." Also a plain `Integer`.
+        if let Some(attempts) = input
+            .retry_strategy
+            .as_ref()
+            .map(|strategy| strategy.attempts)
+            .filter(|attempts| {
+                !(batch::MIN_SERVICE_JOB_RETRY_ATTEMPTS..=batch::MAX_SERVICE_JOB_RETRY_ATTEMPTS)
+                    .contains(attempts)
+            })
+        {
+            return Err(SubmitServiceJobErrorModeled::ClientException(batch::client_exception(
+                format!(
+                    "retryStrategy.attempts {attempts} must be between {} and {}",
+                    batch::MIN_SERVICE_JOB_RETRY_ATTEMPTS,
+                    batch::MAX_SERVICE_JOB_RETRY_ATTEMPTS
+                ),
+            ))
+            .into());
+        }
+
+        // "You can specify either the name or the ARN of the queue."
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SubmitServiceJob"))
+        // A reference that answers to no queue is the service's own lookup missing, so it
+        // carries the bare `JobQueue <reference> not found.` wording
+        // (`state::not_found_exception`) rather than the frontend wrapper the refusals
+        // below use: the message is built from the reference the caller gave.
+        let Some(queue) = state.job_queue(&input.job_queue) else {
+            return Err(SubmitServiceJobErrorModeled::ClientException(
+                batch::not_found_exception("JobQueue", &input.job_queue),
+            )
+            .into());
+        };
+        let queue_arn = queue.arn.clone();
+        let queue_type = queue.job_queue_type.clone();
+
+        // "The job queue must have the type SAGEMAKER_TRAINING."
+        if queue_type.as_deref() != Some(batch::JOB_QUEUE_TYPE_SAGEMAKER_TRAINING) {
+            return Err(SubmitServiceJobErrorModeled::ClientException(batch::client_exception(
+                format!(
+                    "Job queue {queue_arn} must have the type {} to accept a service job",
+                    batch::JOB_QUEUE_TYPE_SAGEMAKER_TRAINING
+                ),
+            ))
+            .into());
+        }
+
+        // `clientToken` "is used to ensure idempotency of requests. If this parameter is
+        // specified and two submit requests with identical payloads and clientTokens are
+        // received, these requests are considered the same request and the second request
+        // is rejected": the identical repeat is the SAME request, so it resolves to the
+        // job the first one minted and mints nothing; a token reused for a DIFFERENT
+        // request is refused, because the service cannot honour one token for two jobs.
+        let digest = request_digest(&input);
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(existing) = state.service_job_by_client_token(token) {
+                if existing.request_digest.as_deref() == Some(digest.as_str()) {
+                    return Ok(SubmitServiceJobOutput {
+                        job_arn: Some(existing.job_arn.clone()),
+                        job_id: existing.job_id.clone(),
+                        job_name: existing.job_name.clone(),
+                    });
+                }
+                return Err(SubmitServiceJobErrorModeled::ClientException(
+                    batch::client_exception(format!(
+                        "clientToken {token} was already used for a different \
+                         SubmitServiceJob request"
+                    )),
+                )
+                .into());
+            }
+        }
+
+        let job_id = state.new_uuid();
+        let arn = batch::service_job_arn(&region, &job_id);
+        let job = batch::ServiceJob {
+            job_id: job_id.clone(),
+            job_arn: arn.clone(),
+            job_name: input.job_name.clone(),
+            // `DescribeServiceJob$jobQueue` is "The ARN of the job queue", so the record
+            // keeps the ARN the request's name or ARN resolved to.
+            job_queue_arn: queue_arn,
+            service_job_type: input.service_job_type,
+            status: batch::SERVICE_JOB_SUBMITTED.to_string(),
+            status_reason: None,
+            created_at: now,
+            // Nothing has dispatched this job's work, so it has neither been scheduled
+            // nor started, and nothing has stopped it.
+            scheduled_at: None,
+            started_at: None,
+            stopped_at: None,
+            next_phase_due_at: Some(now + batch::JOB_PHASE_MILLIS),
+            is_terminated: false,
+            share_identifier: input.share_identifier,
+            quota_share_name: input.quota_share_name,
+            scheduling_priority: input.scheduling_priority,
+            service_request_payload: Some(input.service_request_payload),
+            retry_strategy: input.retry_strategy,
+            timeout_config: input.timeout_config,
+            preemption_configuration: input.preemption_configuration,
+            tags: input.tags,
+            client_token: input.client_token,
+            request_digest: Some(digest),
+        };
+        // The service jobs store is bounded (`state::limits::MAX_SERVICE_JOBS`): room is
+        // made by evicting the service jobs that have been terminal longest, and a store
+        // full of live ones refuses the submit with the modelled 400 rather than growing.
+        state.insert_service_job(job).map_err(|message| {
+            SubmitServiceJobError::from(SubmitServiceJobErrorModeled::ClientException(
+                batch::client_exception(message),
+            ))
+        })?;
+
+        Ok(SubmitServiceJobOutput {
+            job_arn: Some(arn),
+            job_name: input.job_name,
+            job_id,
+        })
     }
+}
+
+/// A digest of everything a `SubmitServiceJob` request asks for, so an identical repeat
+/// of a `clientToken` can be told apart from the same token carrying a different payload
+/// ("two submit requests with identical payloads and `clientToken`s").
+///
+/// SHA-256 over the request's members (the `sha2` crate, hex-encoded with `hex`, as
+/// [`crate::state::new_uuid`] does), each separated by a NUL so two members cannot run
+/// together into the same bytes. `tags` is a map, whose iteration order is not stable, so
+/// it is collected into a `BTreeMap` first: the digest must depend on what the request
+/// says, never on how it happened to be iterated.
+fn request_digest(input: &SubmitServiceJobInput) -> String {
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
+
+    let tags: BTreeMap<&str, &str> = input
+        .tags
+        .iter()
+        .flatten()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    let mut hasher = Sha256::new();
+    for part in [
+        input.job_name.clone(),
+        input.job_queue.clone(),
+        input.service_job_type.clone(),
+        input.service_request_payload.clone(),
+        input.share_identifier.clone().unwrap_or_default(),
+        input.quota_share_name.clone().unwrap_or_default(),
+        format!("{:?}", input.scheduling_priority),
+        format!("{:?}", input.retry_strategy),
+        format!("{:?}", input.timeout_config),
+        format!("{:?}", input.preemption_configuration),
+        format!("{tags:?}"),
+    ] {
+        hasher.update(part.as_bytes());
+        hasher.update([0_u8]);
+    }
+    hex::encode(hasher.finalize())
 }

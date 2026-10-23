@@ -32,6 +32,12 @@
 //! ends in the modelled failure state with [`NO_CONTAINER_RUNTIME_REASON`] as its
 //! `statusReason`, and no `startedAt`, attempt or `exitCode` is invented. Everything
 //! around it — accepting, resolving, scheduling, listing, terminating — is real.
+//!
+//! A SERVICE job's work is not run either, for the same reason: nothing here runs
+//! SageMaker AI, so a service job `SubmitServiceJob` accepted walks the same
+//! clock-owed chain (`SUBMITTED` -> `RUNNABLE`) and then ends in the modelled failure
+//! state with [`NO_SERVICE_JOB_RUNTIME_REASON`], with no `scheduledAt`, `startedAt`,
+//! attempt or capacity usage invented for it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -121,6 +127,16 @@ pub fn quota_message(resource: &str, maximum: usize) -> String {
 pub const NO_CONTAINER_RUNTIME_REASON: &str =
     "This emulator has no container runtime, so the job's container was never started";
 
+/// `statusReason` of a service job whose work nothing here dispatched.
+///
+/// A service job's work runs on another service (`ServiceJobType` is
+/// `SAGEMAKER_TRAINING`), which this emulator does not run and the engine contract
+/// (`vendor/engine/src/lib.rs`) forbids pretending to: so the run the caller asked for
+/// ends in the modelled failure state saying exactly that, and no `scheduledAt`,
+/// `startedAt`, attempt or capacity usage is invented for it.
+pub const NO_SERVICE_JOB_RUNTIME_REASON: &str =
+    "This emulator does not run SageMaker AI, so the service job was never dispatched";
+
 /// `statusReason` of a job released by a dependency that failed.
 pub const DEPENDENT_JOB_FAILED_REASON: &str = "Dependent Job failed";
 
@@ -188,6 +204,20 @@ pub const MAX_JOB_DEFINITION_NAME_LEN: usize = 128;
 /// letters, numbers, hyphens (-), and underscores (_)." The model types the member as a
 /// plain `String`, so the framework cannot refuse a bad one.
 pub const MAX_SERVICE_ENVIRONMENT_NAME_LEN: usize = 128;
+
+/// The longest `jobName` the service accepts, from the member's doc (`SubmitJob$jobName`,
+/// `SubmitServiceJob$jobName`): "It can be up to 128 characters long. It can contain
+/// uppercase and lowercase letters, numbers, hyphens (-), and underscores (_)." The model
+/// types the member as a plain `String`, so the framework cannot refuse a bad one.
+pub const MAX_JOB_NAME_LEN: usize = 128;
+
+/// The fewest attempts `ServiceJobRetryStrategy$attempts` accepts, from the member's doc:
+/// "You can specify between 1 and 10 attempts." The model types it as a plain `Integer`,
+/// so the bound is applied in the handler.
+pub const MIN_SERVICE_JOB_RETRY_ATTEMPTS: i32 = 1;
+/// The most attempts `ServiceJobRetryStrategy$attempts` accepts; see
+/// [`MIN_SERVICE_JOB_RETRY_ATTEMPTS`].
+pub const MAX_SERVICE_JOB_RETRY_ATTEMPTS: i32 = 10;
 
 /// The longest scheduling policy `name` the service accepts, from the member's doc: "The
 /// name of the fair-share scheduling policy. It can be up to 128 letters long. It can
@@ -309,10 +339,21 @@ pub const JOB_FAILED: &str = "FAILED";
 // (`smithy_query(query="shape", shape="ServiceJobStatus")`: SUBMITTED, PENDING,
 // RUNNABLE, SCHEDULED, STARTING, RUNNING, SUCCEEDED, FAILED), so a service job's
 // statuses are named — and tested for terminality — on their own.
+/// `ServiceJobStatus` of a service job the service has accepted but not yet placed —
+/// the status `SubmitServiceJob` hands a fresh service job back in.
+pub const SERVICE_JOB_SUBMITTED: &str = "SUBMITTED";
+/// `ServiceJobStatus` of a service job the scheduler may place.
+pub const SERVICE_JOB_RUNNABLE: &str = "RUNNABLE";
 /// Terminal `ServiceJobStatus`: the service job completed successfully.
 pub const SERVICE_JOB_SUCCEEDED: &str = "SUCCEEDED";
 /// Terminal `ServiceJobStatus`: the service job did not complete successfully.
 pub const SERVICE_JOB_FAILED: &str = "FAILED";
+
+/// `JobQueueType` of a queue that runs service jobs, which is the type
+/// `SubmitServiceJob$jobQueue` documents ("The job queue must have the type
+/// `SAGEMAKER_TRAINING`"). One of the model's `JobQueueType` values
+/// (`smithy_query(query="shape", shape="JobQueueType")`).
+pub const JOB_QUEUE_TYPE_SAGEMAKER_TRAINING: &str = "SAGEMAKER_TRAINING";
 
 /// A fresh identifier in the shape AWS Batch gives a job id and a compute environment
 /// `uuid`: a version-4 UUID, `8-4-4-4-12` lowercase hex with the version and variant bits
@@ -628,6 +669,10 @@ pub struct ServiceJob {
     pub scheduled_at: Option<i64>,
     pub started_at: Option<i64>,
     pub stopped_at: Option<i64>,
+    /// When the next clock-owed transition falls due, and `None` once the job owes none
+    /// (it reached a terminal status, or it was seeded in one of the modelled statuses
+    /// this emulator never moves a job into).
+    pub next_phase_due_at: Option<i64>,
     /// Whether a `TerminateServiceJob` is what ended this job.
     pub is_terminated: bool,
     pub share_identifier: Option<String>,
@@ -638,6 +683,15 @@ pub struct ServiceJob {
     pub timeout_config: Option<ServiceJobTimeout>,
     pub preemption_configuration: Option<ServiceJobPreemptionConfiguration>,
     pub tags: Option<HashMap<String, String>>,
+    /// The `clientToken` the `SubmitServiceJob` that minted this job carried, if any:
+    /// what makes a repeat of that submit resolve to THIS record instead of minting a
+    /// second one ("This token is used to ensure idempotency of requests").
+    pub client_token: Option<String>,
+    /// A digest of the submit request that minted this job, so a `clientToken` repeated
+    /// with a DIFFERENT payload can be told apart from the identical replay the member's
+    /// doc describes ("two submit requests with identical payloads and `clientToken`s").
+    /// `None` for a record no submit request minted.
+    pub request_digest: Option<String>,
 }
 
 /// Whether a `ServiceJobStatus` is one a service job never leaves.
@@ -726,6 +780,13 @@ pub fn is_valid_resource_name(value: &str, max_len: usize) -> bool {
 /// (the member's own doc). See [`is_valid_resource_name`].
 pub fn is_valid_job_definition_name(value: &str) -> bool {
     is_valid_resource_name(value, MAX_JOB_DEFINITION_NAME_LEN)
+}
+
+/// Whether `value` is a `jobName` the service accepts: up to [`MAX_JOB_NAME_LEN`]
+/// letters, numbers, hyphens and underscores (the member's own doc). See
+/// [`is_valid_resource_name`].
+pub fn is_valid_job_name(value: &str) -> bool {
+    is_valid_resource_name(value, MAX_JOB_NAME_LEN)
 }
 
 /// Whether `value` is a `serviceEnvironmentName` the service accepts: up to
@@ -1118,6 +1179,38 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             }
         }
         self.advance_jobs(now);
+        self.advance_service_jobs(now);
+    }
+
+    /// Advance the service jobs the clock owes a transition at `now`.
+    ///
+    /// A service job's work is dispatched to another service, which nothing here runs, so
+    /// the chain is the same shape as a job's and just as short: `SUBMITTED` ->
+    /// `RUNNABLE` -> `FAILED` with [`NO_SERVICE_JOB_RUNTIME_REASON`], each step
+    /// [`JOB_PHASE_MILLIS`] after the one before it. A record owes at most those two
+    /// moves, and the store is capped by [`limits::MAX_SERVICE_JOBS`], so the work one
+    /// call does is bounded. Nothing is invented on the way: a job that was never
+    /// dispatched gets no `scheduledAt`, `startedAt` or attempt.
+    fn advance_service_jobs(&mut self, now: i64) {
+        for job in self.service_jobs.values_mut() {
+            while let Some(due) = job.next_phase_due_at.filter(|due| *due <= now) {
+                match job.status.as_str() {
+                    SERVICE_JOB_SUBMITTED => {
+                        job.status = SERVICE_JOB_RUNNABLE.to_string();
+                        job.next_phase_due_at = Some(due + JOB_PHASE_MILLIS);
+                    }
+                    SERVICE_JOB_RUNNABLE => {
+                        job.status = SERVICE_JOB_FAILED.to_string();
+                        job.status_reason = Some(NO_SERVICE_JOB_RUNTIME_REASON.to_string());
+                        job.stopped_at = Some(due);
+                        job.next_phase_due_at = None;
+                    }
+                    // Every other modelled status is one this emulator never moves a
+                    // record into, so nothing is owed from it.
+                    _ => job.next_phase_due_at = None,
+                }
+            }
+        }
     }
 
     /// Advance the jobs the clock owes a transition at `now`.
@@ -1295,6 +1388,18 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         Ok(())
     }
 
+    /// The service job a `clientToken` already minted, if this store holds one.
+    ///
+    /// `SubmitServiceJob`'s `clientToken` "is used to ensure idempotency of requests", so
+    /// a submit resolves its token here before minting anything. Scans the service jobs,
+    /// which [`limits::MAX_SERVICE_JOBS`] bounds, so no second index can drift out of
+    /// step with the records it would point at.
+    pub fn service_job_by_client_token(&self, token: &str) -> Option<&ServiceJob> {
+        self.service_jobs
+            .values()
+            .find(|job| job.client_token.as_deref() == Some(token))
+    }
+
     /// Drop up to `wanted` of the service jobs that have been terminal longest.
     fn evict_terminal_service_jobs(&mut self, wanted: usize) {
         let mut evictable: Vec<(i64, String)> = self
@@ -1330,6 +1435,8 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         job.status_reason = Some(reason.to_string());
         job.stopped_at = Some(now);
         job.is_terminated = true;
+        // Terminal: the clock owes the job nothing more.
+        job.next_phase_due_at = None;
     }
 
     /// Terminate or cancel `id`, and answer whether the job exists.
@@ -1761,6 +1868,21 @@ pub fn client_exception(detail: impl AsRef<str>) -> ClientException {
 pub fn unreachable_state() -> ServerException {
     ServerException {
         message: Some(UNREACHABLE_STATE.to_string()),
+    }
+}
+
+/// A `ClientException` for a reference that resolves to no resource, worded the way the
+/// Batch service layer words a not-found: `<Kind> <reference> not found.`
+///
+/// This is the OTHER wording a Batch `ClientException` carries. A refusal the frontend
+/// raises is wrapped by [`client_exception_message`]; a lookup the service itself performs
+/// and misses answers this bare, request-derived sentence naming the kind of resource and
+/// the reference the caller gave — the observed wording of, for instance,
+/// `SubmitServiceJob` against a `jobQueue` nothing answers to. The rule is the sentence,
+/// not any one reference: the caller's own text is what fills it.
+pub fn not_found_exception(kind: &str, reference: &str) -> ClientException {
+    ClientException {
+        message: Some(format!("{kind} {reference} not found.")),
     }
 }
 

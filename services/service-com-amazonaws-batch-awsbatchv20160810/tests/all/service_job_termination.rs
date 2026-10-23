@@ -22,12 +22,12 @@
 //! alphabet, the six forms an unknown id can take, and a record carrying every optional
 //! member beside one carrying only the required ones.
 //!
-//! `SubmitServiceJob` — the operation that mints a service job — is still a scaffold
-//! (its own issue, `issues/things-that-do-not-work/20261022T221856Z-batch-submitservicejob-stub.md`),
-//! so a test that needs a service job to terminate seeds the record through the state
-//! API that operation will use
-//! (`ComAmazonawsBatchAwsbatchv20160810State::insert_service_job`), which is the same
-//! store both handlers under test read.
+//! A seeded record is how a row reaches a status `SubmitServiceJob` cannot mint: that
+//! operation accepts a service job in `SUBMITTED` only, so a test that needs one of the
+//! other modelled `ServiceJobStatus` values writes the record through the same state API
+//! the handler uses (`ComAmazonawsBatchAwsbatchv20160810State::insert_service_job`),
+//! which is the same store both handlers under test read. The submit path itself is
+//! covered end to end in `tests/all/service_job_submission.rs`.
 
 use serde_json::{json, Value};
 
@@ -102,6 +102,9 @@ fn seed(batch: &Batch, status: &str, filled: Filled) -> ServiceJob {
         scheduled_at: dispatched.then_some(created_at + 10),
         started_at: running.then_some(created_at + 20),
         stopped_at: terminal.then_some(created_at + 30),
+        // A seeded record owes the clock nothing: the row under test is the status it
+        // was seeded in, which only a call may move.
+        next_phase_due_at: None,
         is_terminated: false,
         share_identifier: (filled == Filled::Everything).then(|| "share-a".to_string()),
         quota_share_name: (filled == Filled::Everything).then(|| "quota-a".to_string()),
@@ -125,6 +128,10 @@ fn seed(batch: &Batch, status: &str, filled: Filled) -> ServiceJob {
             .into_iter()
             .collect()
         }),
+        // No `SubmitServiceJob` request minted this record, so it carries neither the
+        // token nor the digest of one.
+        client_token: None,
+        request_digest: None,
     };
     store
         .insert_service_job(job.clone())
