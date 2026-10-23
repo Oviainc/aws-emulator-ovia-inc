@@ -775,6 +775,84 @@ async fn repeating_a_client_request_token_returns_the_first_classifier() {
     }
 }
 
+/// The classifier idempotency index is a VIEW of the persisted records, not a store
+/// that grows on its own: it can never hold more entries than there are classifiers
+/// for it to point at, whatever sequence of creations a caller makes.
+///
+/// The rows are the sequences that put pressure on that invariant, each a different
+/// way a creation can land on an ARN that already names a record: the same name and
+/// version submitted again under a FRESH token every time (which the service refuses
+/// as `ResourceInUseException`, so no record and no index entry may appear), the same
+/// name under ONE token (a replay, which returns the first ARN and creates nothing),
+/// and a fresh name each time (one record per request).
+#[tokio::test]
+async fn the_idempotency_index_never_outgrows_the_classifiers_it_points_at() {
+    for (case, names, repeats, fresh_token) in [
+        ("one classifier, a fresh token each time", 1usize, 4usize, true),
+        ("one classifier, one token repeated", 1, 4, false),
+        ("a fresh classifier each time", 4, 1, true),
+        ("three classifiers, fresh tokens", 3, 3, true),
+    ] {
+        let comprehend = Comprehend::new();
+        let mut request = 0;
+        for name in 0..names {
+            for repeat in 0..repeats {
+                request += 1;
+                let mut body = creation("only the required members");
+                body["DocumentClassifierName"] = json!(format!("index-bound-{name}"));
+                body["ClientRequestToken"] = json!(if fresh_token {
+                    format!("tok-{request}")
+                } else {
+                    format!("tok-{name}")
+                });
+                let (status, response) =
+                    comprehend.call("CreateDocumentClassifier", &body).await;
+
+                // A repeat under a NEW token addresses an ARN that already names a
+                // record, which the service refuses; under the SAME token it is a
+                // replay of the first creation.
+                let expected_status = if repeat > 0 && fresh_token { 400 } else { 200 };
+                assert_eq!(
+                    status, expected_status,
+                    "case {case:?} request {request}: expected {expected_status}, got \
+                     {status}: {response}"
+                );
+                if status == 400 {
+                    assert_eq!(
+                        error_code(&response),
+                        "ResourceInUseException",
+                        "case {case:?} request {request}: expected ResourceInUseException, \
+                         got {response}"
+                    );
+                }
+
+                let state = service_state(&**comprehend.engine())
+                    .expect("the comprehend store is reachable from the shared engine");
+                let (records, indexed) = {
+                    let store = state.lock();
+                    (
+                        store.document_classifiers.len(),
+                        store.classifier_idempotency_tokens.len(),
+                    )
+                };
+                assert!(
+                    indexed <= records,
+                    "case {case:?} after {request} request(s): the idempotency index must \
+                     not outgrow the records it points at, got {indexed} entries for \
+                     {records} classifier(s)"
+                );
+                assert_eq!(
+                    records,
+                    name + 1,
+                    "case {case:?} after {request} request(s): expected {} persisted \
+                     classifier(s), got {records}",
+                    name + 1
+                );
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_creation_that_points_the_training_at_nothing_is_refused() {
     let comprehend = Comprehend::new();
