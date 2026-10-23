@@ -11,7 +11,7 @@
 //! resumes after the last domain emitted; an ARN with no record behind it draws
 //! `ResourceNotFoundException` and a parameter that is not valid (an ARN that is not a
 //! certificate's, a token this service did not issue for that certificate) draws
-//! `InvalidArgsException`.
+//! `ValidationException`.
 //!
 //! The tables span what the rule generalises over: every `ValidationMethod` and the
 //! absence of one, one name as against several, plain and wildcard names, every page
@@ -45,6 +45,9 @@ const PRIVATE_CA_ARN: &str =
 
 /// The byte `NextToken` joins its two keys with, as the handler encodes it.
 const CURSOR_SEPARATOR: char = '\u{1f}';
+
+/// The one sentence this service reports for a pagination token it did not issue.
+const INVALID_NEXT_TOKEN: &str = "Invalid next token.";
 
 /// One row of the projection table: what it is, the `RequestCertificate` body, the
 /// names the certificate covers in stored order, and the `ValidationMethod` its
@@ -508,7 +511,7 @@ async fn unresolvable_arns_are_refused() {
         (
             "a nested resource below a certificate",
             format!("arn:aws:acm:{REGION}:{ACCOUNT}:certificate/abcdef/extra"),
-            "InvalidArgsException",
+            "ValidationException",
             format!("arn:aws:acm:{REGION}:{ACCOUNT}:certificate/abcdef/extra is not a valid ARN"),
         ),
     ];
@@ -598,8 +601,13 @@ async fn forged_next_tokens_are_refused() {
             list_validations(&router, &json!({ "CertificateArn": arn, "NextToken": token })).await;
         assert_eq!(
             (status, error_code(&response).as_str()),
-            (400, "InvalidArgsException"),
-            "case {case}: expected 400 InvalidArgsException for {token:?}, got {status} {response}"
+            (400, "ValidationException"),
+            "case {case}: expected 400 ValidationException for {token:?}, got {status} {response}"
+        );
+        let message = error_message(&response);
+        assert_eq!(
+            message, INVALID_NEXT_TOKEN,
+            "case {case}: expected the refusal sentence {INVALID_NEXT_TOKEN:?}, got {message:?}"
         );
         assert!(
             !response["DomainValidationSummaryList"].is_array(),

@@ -15,9 +15,12 @@
 //!
 //! Two refusals are the operation's own:
 //!
-//! * a certificate ACM has not issued — one whose validation is still running, or
-//!   whose request failed — has no issued certificate to reconfigure, so it answers
-//!   `InvalidStateException`;
+//! * a certificate ACM has not issued — one whose validation is still running, one
+//!   whose request failed, one that has been revoked — has no issued certificate to
+//!   reconfigure, so the request does not satisfy this operation's constraints and is
+//!   refused with `ValidationException`, the shape this operation models for that
+//!   class; the refusal is a property of the request, not a processing state a client
+//!   should retry, so it is not `InvalidStateException`;
 //! * `Export` "cannot [be updated] after the the certificate is created"
 //!   (`CertificateOptions$Export` doc), so a request naming a different value than the
 //!   certificate carries is refused with `ValidationException`.
@@ -226,13 +229,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The options this operation updates are those of an ISSUED certificate: a
-        // request ACM is still validating has not produced one yet, and a request that
-        // failed never will, so in either case processing has not reached a state in
-        // which the certificate can be reconfigured. ACM answers the one sentence it
-        // reports for that whole class ([`crate::state::NOT_ISSUED_MESSAGE`]).
+        // request ACM is still validating has not produced one yet, a request that
+        // failed never will, and a revoked or expired one no longer has a certificate
+        // to reconfigure. Every such status is the same refusal: the request does not
+        // satisfy this operation's constraints, which is `ValidationException` — not
+        // `InvalidStateException`, the "processing has reached an invalid state" a
+        // client retries. ACM answers the one sentence it reports for that whole class
+        // ([`crate::state::NOT_ISSUED_MESSAGE`]).
         if certificate.status != crate::state::STATUS_ISSUED {
-            return Err(UpdateCertificateOptionsErrorModeled::InvalidStateException(
-                InvalidStateException {
+            return Err(UpdateCertificateOptionsErrorModeled::ValidationException(
+                ValidationException {
                     message: Some(crate::state::NOT_ISSUED_MESSAGE.to_string()),
                 },
             )

@@ -21,7 +21,85 @@ pub struct SearchCertificatesInput {
     pub sort_order: String,
 }
 
-#[smithy_macros::smithy(union_for = "com.amazonaws.acm#CertificateFilterStatement")]
+/// The namespace every shape in this file belongs to, as the hand-written member
+/// schemas below name it.
+const NAMESPACE: &str = "com.amazonaws.acm";
+
+/// ACM's refusal for a union a request set more than one member of, built FROM the
+/// request: the union's name, the exactly-one-member constraint, and the members the
+/// request actually set, in the order it set them.
+///
+/// A Smithy union carries exactly one member, so a body setting two is ambiguous and
+/// is refused while it is read — the only place the arity is still knowable. The
+/// member list is the only place a caller can learn WHICH members collided, so the
+/// sentence names them rather than describing the violation in the abstract.
+pub fn exactly_one_member_message(union_name: &str, present: &[&str]) -> String {
+    format!(
+        "Each {union_name} must contain exactly one member. A {union_name} in your \
+         request contains the members [{members}].",
+        members = present.join(", ")
+    )
+}
+
+/// The members of one union a request set, in the order it set them.
+///
+/// Collected across the WHOLE body of the union rather than refused at the second
+/// member, so the refusal can list every member that collided instead of the first
+/// two the codec happened to reach.
+#[derive(Debug, Default)]
+pub struct UnionArity {
+    present: Vec<&'static str>,
+}
+
+impl UnionArity {
+    /// Record that the request set `member` of this union.
+    pub fn saw(&mut self, member: &'static str) {
+        self.present.push(member);
+    }
+
+    /// The value of the single member the request set.
+    ///
+    /// More than one member is [`exactly_one_member_message`]; none is the sentence
+    /// the generated readers render for an empty union, which this change does not
+    /// touch — AWS's wording for it is not recorded.
+    pub fn exactly_one<T>(
+        &self,
+        union_name: &str,
+        value: Option<T>,
+    ) -> ::std::result::Result<T, ::aws_smithy_schema::serde::SerdeError> {
+        if self.present.len() > 1 {
+            return ::std::result::Result::Err(
+                ::aws_smithy_schema::serde::SerdeError::custom(exactly_one_member_message(
+                    union_name,
+                    &self.present,
+                )),
+            );
+        }
+        value.ok_or_else(|| {
+            ::aws_smithy_schema::serde::SerdeError::custom(format!(
+                "union '{union_name}' had no member set"
+            ))
+        })
+    }
+}
+
+// The four input unions below are hand-written rather than
+// `#[smithy_macros::smithy(union_for = ...)]` for ONE reason: the macro's reader
+// refuses a union carrying more than one member with its own internal sentence
+// (`union '<Shape>' had more than one member set`), which names no member and is not
+// built from the request, where ACM states that refusal from the request itself
+// ([`exactly_one_member_message`]). They are exactly the unions of this service's
+// INPUT whose model declares more than one member, so they are exactly the ones a
+// request can set two members of; the single-member input unions (`SubjectFilter`,
+// `SubjectAlternativeNameFilter`, `PrevalidationOptions`, `CertificateAuthority`) stay
+// macro-generated, since no request can set two members of a union that has one.
+//
+// Everything else mirrors the macro's output for a union: one `M_<MEMBER>` member
+// schema per member (index = that member's position in the model's member list), a
+// `SCHEMA` naming them in order, the `<SHAPE>_SCHEMA` alias, and the
+// serialize/deserialize pair. Constraint traits are absent here exactly as they are
+// absent from the macro's union members.
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum CertificateFilterStatement {
@@ -31,7 +109,214 @@ pub enum CertificateFilterStatement {
     Filter(CertificateFilter),
 }
 
-#[smithy_macros::smithy(union_for = "com.amazonaws.acm#CertificateFilter")]
+/// One member schema of [`CertificateFilterStatement`], named and indexed as the model
+/// orders it.
+macro_rules! certificate_filter_statement_member {
+    ($name:literal, $ty:ident, $index:literal) => {
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                concat!("com.amazonaws.acm#CertificateFilterStatement$", $name),
+                NAMESPACE,
+                $name,
+            ),
+            ::aws_smithy_schema::ShapeType::$ty,
+            $name,
+            $index,
+        )
+    };
+}
+
+impl CertificateFilterStatement {
+    /// The union's own name, as its refusal states it.
+    const UNION: &'static str = "CertificateFilterStatement";
+
+    pub const M_AND: ::aws_smithy_schema::Schema =
+        certificate_filter_statement_member!("And", List, 0);
+    pub const M_OR: ::aws_smithy_schema::Schema =
+        certificate_filter_statement_member!("Or", List, 1);
+    pub const M_NOT: ::aws_smithy_schema::Schema =
+        certificate_filter_statement_member!("Not", Union, 2);
+    pub const M_FILTER: ::aws_smithy_schema::Schema =
+        certificate_filter_statement_member!("Filter", Union, 3);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.acm#CertificateFilterStatement",
+            NAMESPACE,
+            "CertificateFilterStatement",
+        ),
+        ::aws_smithy_schema::ShapeType::Union,
+        &[
+            &Self::M_AND,
+            &Self::M_OR,
+            &Self::M_NOT,
+            &Self::M_FILTER,
+        ],
+    );
+}
+
+pub static CERTIFICATE_FILTER_STATEMENT_SCHEMA: &::aws_smithy_schema::Schema =
+    &CertificateFilterStatement::SCHEMA;
+
+/// The budget one `CertificateFilterStatement` body is read within: how deep the
+/// reader has recursed and how many statement nodes it has built.
+///
+/// `CertificateFilterStatement` is SELF-REFERENTIAL — `And`/`Or` carry a list of
+/// statements and `Not` carries one — so its reader recurses on the native stack once
+/// per nested statement, at a depth the REQUEST decides. A stack overflow is an abort
+/// the server's error path never sees, so the bound cannot be left to the handler that
+/// runs after the body is read: it belongs here, where the recursion happens. The two
+/// bounds are the service's own
+/// ([`crate::ops::search_certificates::MAX_STATEMENT_DEPTH`] and
+/// [`crate::ops::search_certificates::MAX_STATEMENT_NODES`]), stated in the same two
+/// sentences that walk reports, so a statement past either is refused with one wording
+/// wherever it is caught.
+///
+/// Thread-local because the reader's signature is the `DeserializableStruct` trait's
+/// and carries nothing of its own: one body is read to completion on one thread
+/// without yielding, so the budget belongs to that read. The counter is reset when the
+/// outermost statement is entered, so one request can never spend another's budget.
+mod statement_budget {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// How many nested statements the reader is currently inside.
+        static DEPTH: Cell<usize> = const { Cell::new(0) };
+        /// How many statement nodes the current body has built.
+        static NODES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// One statement node's claim on the budget, released when the node's read
+    /// returns — on the error path as much as the success path, since `Drop` runs
+    /// while the `?` unwinds the reader.
+    pub(super) struct Claim;
+
+    impl Claim {
+        /// Claim one node at one more level of nesting, or the refusal for a body that
+        /// is past either bound.
+        pub(super) fn enter()
+        -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+            let depth = DEPTH.get() + 1;
+            // The outermost statement of a body starts its node count: the previous
+            // body's count is no part of this one's.
+            let nodes = if depth == 1 { 1 } else { NODES.get() + 1 };
+            if depth > crate::ops::search_certificates::MAX_STATEMENT_DEPTH {
+                return Err(::aws_smithy_schema::serde::SerdeError::custom(
+                    crate::ops::search_certificates::statement_depth_message(),
+                ));
+            }
+            if nodes > crate::ops::search_certificates::MAX_STATEMENT_NODES {
+                return Err(::aws_smithy_schema::serde::SerdeError::custom(
+                    crate::ops::search_certificates::statement_nodes_message(),
+                ));
+            }
+            DEPTH.set(depth);
+            NODES.set(nodes);
+            Ok(Self)
+        }
+    }
+
+    impl Drop for Claim {
+        fn drop(&mut self) {
+            DEPTH.set(DEPTH.get().saturating_sub(1));
+        }
+    }
+}
+
+/// One `CertificateFilterStatementList`, read element by element as a nested
+/// statement; a failure inside an element is reported against that element's position,
+/// as the generated readers report it.
+fn read_statement_list(
+    d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    member: &::aws_smithy_schema::Schema,
+) -> ::std::result::Result<
+    Vec<CertificateFilterStatement>,
+    ::aws_smithy_schema::serde::SerdeError,
+> {
+    let mut items: Vec<CertificateFilterStatement> = Vec::new();
+    let mut position = 0usize;
+    d.read_list(member, &mut |dl| {
+        position += 1;
+        items.push(
+            <CertificateFilterStatement as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(dl)?,
+        );
+        Ok(())
+    })
+    .map_err(|e| ::aws_smithy_schema_server::within_list_element(e, position))?;
+    Ok(items)
+}
+
+/// One `CertificateFilterStatementList` on the wire: each element written against the
+/// nested statement's own schema, as the generated writers write a list of unions.
+fn write_statement_list(
+    s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    member: &::aws_smithy_schema::Schema,
+    items: &[CertificateFilterStatement],
+) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+    s.write_list(member, &|sl| {
+        for item in items.iter() {
+            sl.write_struct(&CertificateFilterStatement::SCHEMA, item)?;
+        }
+        Ok(())
+    })
+}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for CertificateFilterStatement {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        match self {
+            Self::And(v) => write_statement_list(s, &Self::M_AND, v)?,
+            Self::Or(v) => write_statement_list(s, &Self::M_OR, v)?,
+            Self::Not(v) => s.write_struct(&Self::M_NOT, &**v)?,
+            Self::Filter(v) => s.write_struct(&Self::M_FILTER, v)?,
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for CertificateFilterStatement {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        // This reader recurses once per nested statement, so the depth of the native
+        // stack it uses is decided by the request until this claim bounds it (see
+        // [`statement_budget`]). Held for the whole read, including the nested reads
+        // below, and released when it returns.
+        let _claim = statement_budget::Claim::enter()?;
+        let mut arity = UnionArity::default();
+        let mut set: Option<Self> = None;
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => {
+                    arity.saw("And");
+                    set = Some(Self::And(read_statement_list(d, &Self::M_AND)?));
+                }
+                Some(1) => {
+                    arity.saw("Or");
+                    set = Some(Self::Or(read_statement_list(d, &Self::M_OR)?));
+                }
+                Some(2) => {
+                    arity.saw("Not");
+                    set = Some(Self::Not(::std::boxed::Box::new(
+                        <Self as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(d)?,
+                    )));
+                }
+                Some(3) => {
+                    arity.saw("Filter");
+                    set = Some(Self::Filter(
+                        <CertificateFilter as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(d)?,
+                    ));
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        arity.exactly_one(Self::UNION, set)
+    }
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum CertificateFilter {
@@ -40,7 +325,100 @@ pub enum CertificateFilter {
     AcmCertificateMetadataFilter(AcmCertificateMetadataFilter),
 }
 
-#[smithy_macros::smithy(union_for = "com.amazonaws.acm#X509AttributeFilter")]
+/// One member schema of [`CertificateFilter`], named and indexed as the model orders
+/// it.
+macro_rules! certificate_filter_member {
+    ($name:literal, $ty:ident, $index:literal) => {
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                concat!("com.amazonaws.acm#CertificateFilter$", $name),
+                NAMESPACE,
+                $name,
+            ),
+            ::aws_smithy_schema::ShapeType::$ty,
+            $name,
+            $index,
+        )
+    };
+}
+
+impl CertificateFilter {
+    const UNION: &'static str = "CertificateFilter";
+
+    pub const M_CERTIFICATE_ARN: ::aws_smithy_schema::Schema =
+        certificate_filter_member!("CertificateArn", String, 0);
+    pub const M_X509_ATTRIBUTE_FILTER: ::aws_smithy_schema::Schema =
+        certificate_filter_member!("X509AttributeFilter", Union, 1);
+    pub const M_ACM_CERTIFICATE_METADATA_FILTER: ::aws_smithy_schema::Schema =
+        certificate_filter_member!("AcmCertificateMetadataFilter", Union, 2);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.acm#CertificateFilter",
+            NAMESPACE,
+            "CertificateFilter",
+        ),
+        ::aws_smithy_schema::ShapeType::Union,
+        &[
+            &Self::M_CERTIFICATE_ARN,
+            &Self::M_X509_ATTRIBUTE_FILTER,
+            &Self::M_ACM_CERTIFICATE_METADATA_FILTER,
+        ],
+    );
+}
+
+pub static CERTIFICATE_FILTER_SCHEMA: &::aws_smithy_schema::Schema = &CertificateFilter::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for CertificateFilter {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        match self {
+            Self::CertificateArn(v) => s.write_string(&Self::M_CERTIFICATE_ARN, v.as_str())?,
+            Self::X509AttributeFilter(v) => s.write_struct(&Self::M_X509_ATTRIBUTE_FILTER, v)?,
+            Self::AcmCertificateMetadataFilter(v) => {
+                s.write_struct(&Self::M_ACM_CERTIFICATE_METADATA_FILTER, v)?
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for CertificateFilter {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut arity = UnionArity::default();
+        let mut set: Option<Self> = None;
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => {
+                    arity.saw("CertificateArn");
+                    set = Some(Self::CertificateArn(
+                        d.read_string(&Self::M_CERTIFICATE_ARN)?,
+                    ));
+                }
+                Some(1) => {
+                    arity.saw("X509AttributeFilter");
+                    set = Some(Self::X509AttributeFilter(
+                        <X509AttributeFilter as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(d)?,
+                    ));
+                }
+                Some(2) => {
+                    arity.saw("AcmCertificateMetadataFilter");
+                    set = Some(Self::AcmCertificateMetadataFilter(
+                        <AcmCertificateMetadataFilter as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(d)?,
+                    ));
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        arity.exactly_one(Self::UNION, set)
+    }
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum X509AttributeFilter {
@@ -52,6 +430,145 @@ pub enum X509AttributeFilter {
     SerialNumber(String),
     NotAfter(TimestampRange),
     NotBefore(TimestampRange),
+}
+
+/// One member schema of [`X509AttributeFilter`], named and indexed as the model orders
+/// it.
+macro_rules! x509_attribute_filter_member {
+    ($name:literal, $ty:ident, $index:literal) => {
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                concat!("com.amazonaws.acm#X509AttributeFilter$", $name),
+                NAMESPACE,
+                $name,
+            ),
+            ::aws_smithy_schema::ShapeType::$ty,
+            $name,
+            $index,
+        )
+    };
+}
+
+impl X509AttributeFilter {
+    const UNION: &'static str = "X509AttributeFilter";
+
+    pub const M_SUBJECT: ::aws_smithy_schema::Schema =
+        x509_attribute_filter_member!("Subject", Union, 0);
+    pub const M_SUBJECT_ALTERNATIVE_NAME: ::aws_smithy_schema::Schema =
+        x509_attribute_filter_member!("SubjectAlternativeName", Union, 1);
+    pub const M_EXTENDED_KEY_USAGE: ::aws_smithy_schema::Schema =
+        x509_attribute_filter_member!("ExtendedKeyUsage", String, 2);
+    pub const M_KEY_USAGE: ::aws_smithy_schema::Schema =
+        x509_attribute_filter_member!("KeyUsage", String, 3);
+    pub const M_KEY_ALGORITHM: ::aws_smithy_schema::Schema =
+        x509_attribute_filter_member!("KeyAlgorithm", String, 4);
+    pub const M_SERIAL_NUMBER: ::aws_smithy_schema::Schema =
+        x509_attribute_filter_member!("SerialNumber", String, 5);
+    pub const M_NOT_AFTER: ::aws_smithy_schema::Schema =
+        x509_attribute_filter_member!("NotAfter", Structure, 6);
+    pub const M_NOT_BEFORE: ::aws_smithy_schema::Schema =
+        x509_attribute_filter_member!("NotBefore", Structure, 7);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.acm#X509AttributeFilter",
+            NAMESPACE,
+            "X509AttributeFilter",
+        ),
+        ::aws_smithy_schema::ShapeType::Union,
+        &[
+            &Self::M_SUBJECT,
+            &Self::M_SUBJECT_ALTERNATIVE_NAME,
+            &Self::M_EXTENDED_KEY_USAGE,
+            &Self::M_KEY_USAGE,
+            &Self::M_KEY_ALGORITHM,
+            &Self::M_SERIAL_NUMBER,
+            &Self::M_NOT_AFTER,
+            &Self::M_NOT_BEFORE,
+        ],
+    );
+}
+
+pub static X509_ATTRIBUTE_FILTER_SCHEMA: &::aws_smithy_schema::Schema =
+    &X509AttributeFilter::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for X509AttributeFilter {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        match self {
+            Self::Subject(v) => s.write_struct(&Self::M_SUBJECT, v)?,
+            Self::SubjectAlternativeName(v) => {
+                s.write_struct(&Self::M_SUBJECT_ALTERNATIVE_NAME, v)?
+            }
+            Self::ExtendedKeyUsage(v) => s.write_string(&Self::M_EXTENDED_KEY_USAGE, v.as_str())?,
+            Self::KeyUsage(v) => s.write_string(&Self::M_KEY_USAGE, v.as_str())?,
+            Self::KeyAlgorithm(v) => s.write_string(&Self::M_KEY_ALGORITHM, v.as_str())?,
+            Self::SerialNumber(v) => s.write_string(&Self::M_SERIAL_NUMBER, v.as_str())?,
+            Self::NotAfter(v) => s.write_struct(&Self::M_NOT_AFTER, v)?,
+            Self::NotBefore(v) => s.write_struct(&Self::M_NOT_BEFORE, v)?,
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for X509AttributeFilter {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut arity = UnionArity::default();
+        let mut set: Option<Self> = None;
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => {
+                    arity.saw("Subject");
+                    set = Some(Self::Subject(
+                        <SubjectFilter as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(d)?,
+                    ));
+                }
+                Some(1) => {
+                    arity.saw("SubjectAlternativeName");
+                    set = Some(Self::SubjectAlternativeName(
+                        <SubjectAlternativeNameFilter as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(d)?,
+                    ));
+                }
+                Some(2) => {
+                    arity.saw("ExtendedKeyUsage");
+                    set = Some(Self::ExtendedKeyUsage(
+                        d.read_string(&Self::M_EXTENDED_KEY_USAGE)?,
+                    ));
+                }
+                Some(3) => {
+                    arity.saw("KeyUsage");
+                    set = Some(Self::KeyUsage(d.read_string(&Self::M_KEY_USAGE)?));
+                }
+                Some(4) => {
+                    arity.saw("KeyAlgorithm");
+                    set = Some(Self::KeyAlgorithm(d.read_string(&Self::M_KEY_ALGORITHM)?));
+                }
+                Some(5) => {
+                    arity.saw("SerialNumber");
+                    set = Some(Self::SerialNumber(d.read_string(&Self::M_SERIAL_NUMBER)?));
+                }
+                Some(6) => {
+                    arity.saw("NotAfter");
+                    set = Some(Self::NotAfter(
+                        <TimestampRange as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(d)?,
+                    ));
+                }
+                Some(7) => {
+                    arity.saw("NotBefore");
+                    set = Some(Self::NotBefore(
+                        <TimestampRange as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(d)?,
+                    ));
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        arity.exactly_one(Self::UNION, set)
+    }
 }
 
 #[smithy_macros::smithy(union_for = "com.amazonaws.acm#SubjectFilter")]
@@ -89,7 +606,6 @@ pub struct TimestampRange {
     pub end: Option<::aws_smithy_types::DateTime>,
 }
 
-#[smithy_macros::smithy(union_for = "com.amazonaws.acm#AcmCertificateMetadataFilter")]
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum AcmCertificateMetadataFilter {
@@ -104,6 +620,169 @@ pub enum AcmCertificateMetadataFilter {
     CertificateKeyPairOrigin(String),
     AcmeEndpointArn(String),
     AcmeAccountId(String),
+}
+
+/// One member schema of [`AcmCertificateMetadataFilter`], named and indexed as the
+/// model orders it.
+macro_rules! acm_certificate_metadata_filter_member {
+    ($name:literal, $ty:ident, $index:literal) => {
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                concat!("com.amazonaws.acm#AcmCertificateMetadataFilter$", $name),
+                NAMESPACE,
+                $name,
+            ),
+            ::aws_smithy_schema::ShapeType::$ty,
+            $name,
+            $index,
+        )
+    };
+}
+
+impl AcmCertificateMetadataFilter {
+    const UNION: &'static str = "AcmCertificateMetadataFilter";
+
+    pub const M_STATUS: ::aws_smithy_schema::Schema =
+        acm_certificate_metadata_filter_member!("Status", String, 0);
+    pub const M_RENEWAL_STATUS: ::aws_smithy_schema::Schema =
+        acm_certificate_metadata_filter_member!("RenewalStatus", String, 1);
+    pub const M_TYPE: ::aws_smithy_schema::Schema =
+        acm_certificate_metadata_filter_member!("Type", String, 2);
+    pub const M_IN_USE: ::aws_smithy_schema::Schema =
+        acm_certificate_metadata_filter_member!("InUse", Boolean, 3);
+    pub const M_EXPORTED: ::aws_smithy_schema::Schema =
+        acm_certificate_metadata_filter_member!("Exported", Boolean, 4);
+    pub const M_EXPORT_OPTION: ::aws_smithy_schema::Schema =
+        acm_certificate_metadata_filter_member!("ExportOption", String, 5);
+    pub const M_MANAGED_BY: ::aws_smithy_schema::Schema =
+        acm_certificate_metadata_filter_member!("ManagedBy", String, 6);
+    pub const M_VALIDATION_METHOD: ::aws_smithy_schema::Schema =
+        acm_certificate_metadata_filter_member!("ValidationMethod", String, 7);
+    pub const M_CERTIFICATE_KEY_PAIR_ORIGIN: ::aws_smithy_schema::Schema =
+        acm_certificate_metadata_filter_member!("CertificateKeyPairOrigin", String, 8);
+    pub const M_ACME_ENDPOINT_ARN: ::aws_smithy_schema::Schema =
+        acm_certificate_metadata_filter_member!("AcmeEndpointArn", String, 9);
+    pub const M_ACME_ACCOUNT_ID: ::aws_smithy_schema::Schema =
+        acm_certificate_metadata_filter_member!("AcmeAccountId", String, 10);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.acm#AcmCertificateMetadataFilter",
+            NAMESPACE,
+            "AcmCertificateMetadataFilter",
+        ),
+        ::aws_smithy_schema::ShapeType::Union,
+        &[
+            &Self::M_STATUS,
+            &Self::M_RENEWAL_STATUS,
+            &Self::M_TYPE,
+            &Self::M_IN_USE,
+            &Self::M_EXPORTED,
+            &Self::M_EXPORT_OPTION,
+            &Self::M_MANAGED_BY,
+            &Self::M_VALIDATION_METHOD,
+            &Self::M_CERTIFICATE_KEY_PAIR_ORIGIN,
+            &Self::M_ACME_ENDPOINT_ARN,
+            &Self::M_ACME_ACCOUNT_ID,
+        ],
+    );
+}
+
+pub static ACM_CERTIFICATE_METADATA_FILTER_SCHEMA: &::aws_smithy_schema::Schema =
+    &AcmCertificateMetadataFilter::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for AcmCertificateMetadataFilter {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        match self {
+            Self::Status(v) => s.write_string(&Self::M_STATUS, v.as_str())?,
+            Self::RenewalStatus(v) => s.write_string(&Self::M_RENEWAL_STATUS, v.as_str())?,
+            Self::Type(v) => s.write_string(&Self::M_TYPE, v.as_str())?,
+            Self::InUse(v) => s.write_boolean(&Self::M_IN_USE, *v)?,
+            Self::Exported(v) => s.write_boolean(&Self::M_EXPORTED, *v)?,
+            Self::ExportOption(v) => s.write_string(&Self::M_EXPORT_OPTION, v.as_str())?,
+            Self::ManagedBy(v) => s.write_string(&Self::M_MANAGED_BY, v.as_str())?,
+            Self::ValidationMethod(v) => s.write_string(&Self::M_VALIDATION_METHOD, v.as_str())?,
+            Self::CertificateKeyPairOrigin(v) => {
+                s.write_string(&Self::M_CERTIFICATE_KEY_PAIR_ORIGIN, v.as_str())?
+            }
+            Self::AcmeEndpointArn(v) => s.write_string(&Self::M_ACME_ENDPOINT_ARN, v.as_str())?,
+            Self::AcmeAccountId(v) => s.write_string(&Self::M_ACME_ACCOUNT_ID, v.as_str())?,
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for AcmCertificateMetadataFilter {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut arity = UnionArity::default();
+        let mut set: Option<Self> = None;
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => {
+                    arity.saw("Status");
+                    set = Some(Self::Status(d.read_string(&Self::M_STATUS)?));
+                }
+                Some(1) => {
+                    arity.saw("RenewalStatus");
+                    set = Some(Self::RenewalStatus(
+                        d.read_string(&Self::M_RENEWAL_STATUS)?,
+                    ));
+                }
+                Some(2) => {
+                    arity.saw("Type");
+                    set = Some(Self::Type(d.read_string(&Self::M_TYPE)?));
+                }
+                Some(3) => {
+                    arity.saw("InUse");
+                    set = Some(Self::InUse(d.read_boolean(&Self::M_IN_USE)?));
+                }
+                Some(4) => {
+                    arity.saw("Exported");
+                    set = Some(Self::Exported(d.read_boolean(&Self::M_EXPORTED)?));
+                }
+                Some(5) => {
+                    arity.saw("ExportOption");
+                    set = Some(Self::ExportOption(d.read_string(&Self::M_EXPORT_OPTION)?));
+                }
+                Some(6) => {
+                    arity.saw("ManagedBy");
+                    set = Some(Self::ManagedBy(d.read_string(&Self::M_MANAGED_BY)?));
+                }
+                Some(7) => {
+                    arity.saw("ValidationMethod");
+                    set = Some(Self::ValidationMethod(
+                        d.read_string(&Self::M_VALIDATION_METHOD)?,
+                    ));
+                }
+                Some(8) => {
+                    arity.saw("CertificateKeyPairOrigin");
+                    set = Some(Self::CertificateKeyPairOrigin(
+                        d.read_string(&Self::M_CERTIFICATE_KEY_PAIR_ORIGIN)?,
+                    ));
+                }
+                Some(9) => {
+                    arity.saw("AcmeEndpointArn");
+                    set = Some(Self::AcmeEndpointArn(
+                        d.read_string(&Self::M_ACME_ENDPOINT_ARN)?,
+                    ));
+                }
+                Some(10) => {
+                    arity.saw("AcmeAccountId");
+                    set = Some(Self::AcmeAccountId(
+                        d.read_string(&Self::M_ACME_ACCOUNT_ID)?,
+                    ));
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        arity.exactly_one(Self::UNION, set)
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.acm#SearchCertificatesResponse")]

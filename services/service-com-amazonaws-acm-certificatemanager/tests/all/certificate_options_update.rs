@@ -10,7 +10,8 @@
 //! that method while leaving the certificate's own status and each domain's validation
 //! status alone. It applies only to a certificate ACM has ISSUED: while the request is
 //! still being validated, or once it has failed, there is no issued certificate to
-//! reconfigure and ACM answers `InvalidStateException`. `Export` is fixed at creation
+//! reconfigure and the request does not satisfy the operation's constraints, so ACM
+//! answers `ValidationException`. `Export` is fixed at creation
 //! ("You cannot update the value of `Export` after the the certificate is created",
 //! `CertificateOptions$Export` doc), so asking for a different value is refused with
 //! `ValidationException` while asking for the one in force is accepted.
@@ -44,10 +45,10 @@ const ACM_VALIDATIONS_ZONE: &str = "acm-validations.aws";
 /// shows (`http://example.com/.well-known/pki-validation/abc.txt`).
 const HTTP_VALIDATION_PATH: &str = "/.well-known/pki-validation/";
 
-/// The one sentence ACM reports with `InvalidStateException` when an operation needs
-/// an issued, valid certificate and the request names one that is neither — taken from
-/// ACM's recorded behaviour, which names neither the certificate nor its status, so
-/// the refusal reads the same whatever status drew it.
+/// The one sentence ACM reports when an operation needs an issued, valid certificate
+/// and the request names one that is neither — taken from ACM's recorded behaviour,
+/// which names neither the certificate nor its status, so the refusal reads the same
+/// whatever status drew it.
 const NOT_ISSUED_MESSAGE: &str = "The selected certificate is not Issued and/or Valid.";
 
 /// One certificate to migrate: what it is, the `RequestCertificate` body (always a
@@ -615,7 +616,7 @@ async fn export_cannot_be_updated_after_creation() {
 
 /// RULE: only a certificate ACM has ISSUED can be reconfigured — a request still being
 /// validated has produced no certificate yet and a failed one never will, so either is
-/// refused with HTTP 400 `InvalidStateException` and nothing is written.
+/// refused with HTTP 400 `ValidationException` and nothing is written.
 #[tokio::test]
 async fn options_cannot_be_updated_unless_the_certificate_is_issued() {
     // Rows: the request, whether its validation outcome is held off (leaving the
@@ -684,8 +685,8 @@ async fn options_cannot_be_updated_unless_the_certificate_is_issued() {
         let (status, response) = update_options(&router, &arn, options).await;
         assert_eq!(
             (status, error_code(&response).as_str()),
-            (400, "InvalidStateException"),
-            "case {case}: expected 400 InvalidStateException for a {expected_status} \
+            (400, "ValidationException"),
+            "case {case}: expected 400 ValidationException for a {expected_status} \
              certificate, got {status} {response}"
         );
         let message = error_message(&response);
@@ -756,8 +757,8 @@ async fn options_cannot_be_updated_once_the_certificate_is_revoked() {
         update_options(&router, &arn, &json!({ "ValidationMethod": "HTTP" })).await;
     assert_eq!(
         (status, error_code(&response).as_str()),
-        (400, "InvalidStateException"),
-        "case once revoked: expected 400 InvalidStateException, got {status} {response}"
+        (400, "ValidationException"),
+        "case once revoked: expected 400 ValidationException, got {status} {response}"
     );
     let message = error_message(&response);
     assert_eq!(

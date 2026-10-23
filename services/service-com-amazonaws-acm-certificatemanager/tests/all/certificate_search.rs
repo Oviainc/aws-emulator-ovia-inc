@@ -627,12 +627,28 @@ async fn a_search_result_reports_the_stored_record() {
                 "case {case}: {member} must agree with DescribeCertificate, got {metadata} vs {detail}"
             );
         }
-        for member in ["KeyAlgorithm", "NotBefore", "NotAfter"] {
+        for member in ["NotBefore", "NotAfter"] {
             assert_eq!(
                 attributes[member], detail[member],
                 "case {case}: {member} must agree with DescribeCertificate, got {attributes} vs {detail}"
             );
         }
+        // `KeyAlgorithm` is the one member the two readers state in different
+        // spellings: a search result reports the value its own
+        // `X509AttributeFilter.KeyAlgorithm` selects on — the model enum's value
+        // (`EC_prime256v1`) — while the certificate's detail reports the X.509
+        // descriptor (`EC-prime256v1`). They are the same algorithm, so the
+        // detail's spelling is the reported one with its first separator restored.
+        let described_algorithm = detail["KeyAlgorithm"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case}: no KeyAlgorithm in {detail}"))
+            .replacen('-', "_", 1);
+        assert_eq!(
+            attributes["KeyAlgorithm"].as_str(),
+            Some(described_algorithm.as_str()),
+            "case {case}: KeyAlgorithm must be the described algorithm in the enum's \
+             spelling, got {attributes} vs {detail}"
+        );
         // The subject common name of an ACM certificate is its domain name.
         assert_eq!(
             attributes["Subject"]["CommonName"], detail["DomainName"],
@@ -1111,17 +1127,12 @@ async fn an_over_nested_statement_is_refused() {
         );
     }
 
-    // Past the bound: refused with the same status and code, by this handler up to
-    // the depth the deserializer itself accepts and by the deserializer's own nesting
-    // limit beyond it — hence the message is only pinned for the rows the handler
-    // answers.
-    let refused: &[(usize, Option<&str>)] = &[
-        (21, Some("nest at most")),
-        (50, Some("nest at most")),
-        (120, Some("nest at most")),
-        (500, None),
-    ];
-    for (levels, fragment) in refused {
+    // Past the bound: refused with the same status and code, and with the one sentence
+    // the service states for that bound — by the READER, which recurses on the native
+    // stack as it builds the statement and so enforces the bound before the statement
+    // becomes a value at all, however much deeper the request nests.
+    let refused: &[usize] = &[21, 50, 120, 500];
+    for levels in refused {
         let body = json!({ "FilterStatement": nested_statement(*levels) });
         let (status, response) = call(&router, "SearchCertificates", &body).await;
         assert_eq!(
@@ -1133,12 +1144,10 @@ async fn an_over_nested_statement_is_refused() {
             "ValidationException",
             "case {levels} levels: expected a ValidationException, got {response}"
         );
-        if let Some(fragment) = fragment {
-            assert!(
-                error_message(&response).contains(fragment),
-                "case {levels} levels: the message must state the bound, got {response}"
-            );
-        }
+        assert!(
+            error_message(&response).contains("nest at most"),
+            "case {levels} levels: the message must state the bound, got {response}"
+        );
     }
 }
 
