@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListContinuousDeploymentPolicies
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListContinuousDeploymentPolicies`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListContinuousDeploymentPolicies::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the persisted continuous deployment policies, one page at a time:
+//! `MaxItems` is the page size, `Marker` is the policy id the previous page ended at, and
+//! `NextMarker` arrives exactly when policies remain.
 //!
 //! ## Shape of an operation
 //!
@@ -79,6 +74,9 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::ops::Bound;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -150,18 +148,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListContinuousDeploymentPolicies` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListContinuousDeploymentPoliciesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListContinuousDeploymentPolicies"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+
+        // "You can optionally specify the maximum number of items to receive in the
+        // response" — a page holds at least one item, so a non-positive size names no
+        // page at all. The size served is bounded above by this emulator's own page
+        // ceiling, the same one every listing of this service is bounded by.
+        let max_items = input.max_items.unwrap_or(crate::state::MAX_ITEMS);
+        let Some(page_size) = crate::state::page_size(input.max_items) else {
+            return Err(ListContinuousDeploymentPoliciesErrorModeled::InvalidArgument(
+                crate::state::invalid_max_items(),
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // Materialise whatever the clock already owes the rest of this service's state,
+        // so one read never leaves another resource reporting a stale status.
+        store.settle(SystemTime::now());
+
+        // "set this field's value to the value of NextMarker from the current page's
+        // response": the marker is a policy id this service handed out. A value that is
+        // not one was never a resume point (`InvalidArgument`), and one that is but names
+        // no stored policy is a policy that does not exist — the only resource this
+        // listing can be about, and the reason it models `NoSuchContinuousDeploymentPolicy`.
+        if let Some(marker) = input.marker.as_deref() {
+            if !crate::state::is_minted_uuid(marker) {
+                return Err(ListContinuousDeploymentPoliciesErrorModeled::InvalidArgument(
+                    InvalidArgument {
+                        message: Some(format!(
+                            "Marker {marker} is not a continuous deployment policy id returned \
+                             by ListContinuousDeploymentPolicies"
+                        )),
+                    },
+                )
+                .into());
+            }
+            if store.continuous_deployment_policy(marker).is_none() {
+                return Err(
+                    ListContinuousDeploymentPoliciesErrorModeled::NoSuchContinuousDeploymentPolicy(
+                        crate::state::no_such_continuous_deployment_policy(),
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // `Marker` names where the previous page ENDED, so this page starts after it:
+        // walking the pages enumerates every policy exactly once. The store is ordered by
+        // id, so the resume point is a range bound rather than a scan.
+        let start = match input.marker.as_deref() {
+            Some(marker) => Bound::Excluded(marker),
+            None => Bound::Unbounded,
+        };
+        let mut items: Vec<ContinuousDeploymentPolicySummary> = Vec::new();
+        let mut more_remain = false;
+        for (_, stored) in store
+            .continuous_deployment_policies
+            .range::<str, _>((start, Bound::Unbounded))
+        {
+            if items.len() >= page_size {
+                more_remain = true;
+                break;
+            }
+            items.push(ContinuousDeploymentPolicySummary {
+                continuous_deployment_policy: stored.to_policy(),
+            });
+        }
+
+        Ok(ListContinuousDeploymentPoliciesOutput {
+            continuous_deployment_policy_list: Some(ContinuousDeploymentPolicyList {
+                // "Indicates the next page of continuous deployment policies": present
+                // exactly when policies remain, carrying the id this page ended at.
+                next_marker: if more_remain {
+                    items
+                        .last()
+                        .map(|summary| summary.continuous_deployment_policy.id.clone())
+                } else {
+                    None
+                },
+                // "The maximum number of continuous deployment policies that were
+                // specified in your request."
+                max_items,
+                // "The total number of continuous deployment policies in your Amazon Web
+                // Services account, regardless of the MaxItems value" — the whole
+                // collection, not the length of this page.
+                quantity: i32::try_from(store.continuous_deployment_policies.len())
+                    .unwrap_or(i32::MAX),
+                // A page that lists nothing carries no `Items` element at all, rather
+                // than an empty one — as every other listing of this service answers.
+                items: if items.is_empty() { None } else { Some(items) },
+            }),
+        })
     }
 }

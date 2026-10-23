@@ -685,6 +685,24 @@ pub(crate) fn is_version_token(value: &str) -> bool {
     is_distribution_id(value)
 }
 
+/// The shape of every id CloudFront mints as a UUID — a key value store, a cache,
+/// origin request, response headers or continuous deployment policy: five lowercase-hex
+/// groups of 8-4-4-4-12 characters. One predicate here, so each suite that reads such an
+/// id asserts the SAME shape rather than carrying its own copy.
+pub(crate) fn is_minted_uuid(value: &str) -> bool {
+    let groups: Vec<&str> = value.split('-').collect();
+    groups.len() == 5
+        && groups
+            .iter()
+            .zip([8usize, 4, 4, 4, 12])
+            .all(|(group, width)| {
+                group.len() == width
+                    && group
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            })
+}
+
 // ---------------------------------------------------------------------------
 // The rules
 // ---------------------------------------------------------------------------

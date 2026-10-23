@@ -43,7 +43,9 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     ActiveTrustedKeyGroups, ActiveTrustedSigners, AllowedMethods, CacheBehavior, CacheBehaviors,
     CachedMethods, CloudFrontOriginAccessIdentity, CloudFrontOriginAccessIdentityConfig,
-    CNAMEAlreadyExists, CustomErrorResponse, CustomErrorResponses, CustomOriginConfig,
+    CNAMEAlreadyExists, ContinuousDeploymentPolicy, ContinuousDeploymentPolicyConfig,
+    ContinuousDeploymentSingleHeaderConfig, ContinuousDeploymentSingleWeightConfig,
+    CustomErrorResponse, CustomErrorResponses, CustomOriginConfig,
     Customizations, DefaultCacheBehavior, Distribution, DistributionConfig, DistributionSummary,
     DistributionTenant, DomainResult, EntityAlreadyExists, EntityNotFound, ForwardedValues,
     FunctionAssociations, GeoRestriction, Invalidation, InvalidationBatch, InvalidationSummary,
@@ -53,8 +55,9 @@ use crate::ops::types::{
     NoSuchResponseHeadersPolicy, Origin, OriginRequestPolicy, OriginRequestPolicyAlreadyExists,
     OriginRequestPolicyConfig, OriginSslProtocols, Parameter, ParameterDefinition, Paths,
     ResponseHeadersPolicy,
-    ResponseHeadersPolicyAlreadyExists, ResponseHeadersPolicyConfig, Restrictions, Signer,
-    StringSchemaConfig, Tag, Tags, TrustedKeyGroups, TrustedSigners, ViewerCertificate,
+    ResponseHeadersPolicyAlreadyExists, ResponseHeadersPolicyConfig, Restrictions,
+    SessionStickinessConfig, Signer, StringSchemaConfig, Tag, Tags, TrafficConfig,
+    TrustedKeyGroups, TrustedSigners, ViewerCertificate,
 };
 
 /// `Distribution$Status` while a configuration is still propagating to the edge
@@ -283,6 +286,53 @@ pub const KVS_PROVISIONING_DELAY: Duration = Duration::from_millis(500);
 /// plane's own ceiling on distinct stores, so a store this service accepts is one that
 /// service can also hold.
 pub const MAX_KEY_VALUE_STORES: usize = 1_000;
+
+/// The most continuous deployment policies this emulator holds.
+///
+/// CHOSEN by this emulator, for the same reason as [`MAX_KEY_VALUE_STORES`]: a policy
+/// record is what `GetContinuousDeploymentPolicy` answers from, so it cannot be evicted,
+/// and the create path is refused at this entry count with the modelled
+/// `TooManyContinuousDeploymentPolicies` ("You have reached the maximum number of
+/// continuous deployment policies for this Amazon Web Services account") instead of
+/// growing further. The VALUE is this emulator's bound rather than a published quota.
+pub const MAX_CONTINUOUS_DEPLOYMENT_POLICIES: usize = 20;
+
+/// The largest share of production traffic a continuous deployment policy may send to a
+/// staging distribution.
+///
+/// `ContinuousDeploymentSingleWeightConfig$Weight` is documented as "The percentage of
+/// traffic to send to a staging distribution, expressed as a decimal number between 0 and
+/// 0.15", so a weight outside that closed interval is no weight this parameter takes.
+pub const MAX_TRAFFIC_WEIGHT: f32 = 0.15;
+
+/// The smallest share of production traffic the same member takes, from the same
+/// sentence ("between 0 and 0.15").
+pub const MIN_TRAFFIC_WEIGHT: f32 = 0.0;
+
+/// The shortest session stickiness TTL a continuous deployment policy may name.
+///
+/// `SessionStickinessConfig$IdleTTL` and `$MaximumTTL` are each documented as "Allowed
+/// values are 300–3600 seconds (5–60 minutes)", so this bound covers both members.
+pub const MIN_SESSION_STICKINESS_TTL: i32 = 300;
+
+/// The longest session stickiness TTL either member takes, from the same sentence.
+pub const MAX_SESSION_STICKINESS_TTL: i32 = 3_600;
+
+/// The most staging distribution domain names one continuous deployment policy names.
+///
+/// `StagingDistributionDnsNames` carries no `@length` in the model, so this is the
+/// EMULATOR's bound rather than a published quota — the one caller-chosen LENGTH a
+/// `ContinuousDeploymentPolicyConfig` carries, bounded on the way in like every other
+/// count this service stores ([`MAX_CACHE_BEHAVIORS`], [`MAX_INVALIDATION_PATHS`]): the
+/// list is persisted whole and later compared name by name against every stored policy,
+/// so the work a create does is bounded by this times
+/// [`MAX_CONTINUOUS_DEPLOYMENT_POLICIES`] rather than by a length the request picks. It
+/// is small because a continuous deployment policy routes traffic to ONE staging
+/// distribution — the member's own documentation is singular ("The CloudFront domain name
+/// of the staging distribution. For example: `d111111abcdef8.cloudfront.net`") — while
+/// still admitting a handful, which is what keeps this a resource bound rather than a
+/// fidelity claim about a count AWS refuses.
+pub const MAX_STAGING_DISTRIBUTION_DNS_NAMES: usize = 10;
 
 /// The most origin access identities this emulator holds.
 ///
@@ -1015,6 +1065,57 @@ impl StoredKeyValueStore {
     }
 }
 
+/// One CloudFront continuous deployment policy, as this emulator persists it.
+///
+/// The record is the single source of truth for the policy's id, its configuration as
+/// submitted, its `LastModifiedTime` and its version token, so the create, a later read
+/// and a later listing all answer from it rather than from the request being served.
+///
+/// Nothing here is owed by the clock: `ContinuousDeploymentPolicy` carries no status
+/// member, so a policy CloudFront has accepted is complete the moment it is stored.
+#[derive(Debug, Clone)]
+pub struct StoredContinuousDeploymentPolicy {
+    /// `ContinuousDeploymentPolicy$Id`, minted at creation. Also the key this policy is
+    /// held under, and the path segment `GetContinuousDeploymentPolicy` addresses it by.
+    pub id: String,
+    /// `ContinuousDeploymentPolicy$LastModifiedTime`: when the policy last changed.
+    pub last_modified_time: SystemTime,
+    /// The version token the last mutation handed back, and the single source of truth
+    /// for every `If-Match` check against this policy.
+    pub etag: String,
+    /// `ContinuousDeploymentPolicyConfig` as submitted, stored whole: a later read
+    /// answers from this record, never from the request that is being served.
+    pub config: ContinuousDeploymentPolicyConfig,
+}
+
+impl StoredContinuousDeploymentPolicy {
+    /// The `ContinuousDeploymentPolicy` projection every continuous deployment policy
+    /// operation returns, read from the one stored record.
+    pub fn to_policy(&self) -> ContinuousDeploymentPolicy {
+        ContinuousDeploymentPolicy {
+            id: self.id.clone(),
+            last_modified_time: ::aws_smithy_types::DateTime::from(self.last_modified_time),
+            continuous_deployment_policy_config: self.config.clone(),
+        }
+    }
+
+    /// The staging distribution domain names this policy routes traffic to — the names
+    /// that make a staging distribution one a policy already covers.
+    pub fn staging_distribution_dns_names(&self) -> &[String] {
+        staging_distribution_dns_names(&self.config)
+    }
+}
+
+/// The staging distribution domain names a configuration names, in the order it states
+/// them. An absent `Items` names none, whatever `Quantity` says.
+pub fn staging_distribution_dns_names(config: &ContinuousDeploymentPolicyConfig) -> &[String] {
+    config
+        .staging_distribution_dns_names
+        .items
+        .as_deref()
+        .unwrap_or_default()
+}
+
 /// One CloudFront distribution tenant, as this emulator persists it.
 ///
 /// A tenant is "a distribution tenant" of ONE multi-tenant distribution: it holds the
@@ -1264,6 +1365,11 @@ pub struct ComAmazonawsCloudfrontCloudfront20200531State {
     /// and a repeated name an `EntityAlreadyExists`. A `BTreeMap` for the same reason as
     /// `distributions`: one stable total order for a listing to page through.
     pub key_value_stores: BTreeMap<String, StoredKeyValueStore>,
+    /// Every continuous deployment policy this emulator holds, keyed by its id — the
+    /// identifier `GetContinuousDeploymentPolicy` addresses one by. A `BTreeMap` for the
+    /// same reason as `distributions`: one stable total order for
+    /// `ListContinuousDeploymentPolicies`'s `Marker` to index into.
+    pub continuous_deployment_policies: BTreeMap<String, StoredContinuousDeploymentPolicy>,
     /// Every distribution tenant this emulator holds, keyed by tenant id. A `BTreeMap`
     /// for the same reason as `distributions`: one stable total order a listing pages
     /// through.
@@ -1334,6 +1440,54 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     /// The distribution `id` names, or `None` when the store holds none.
     pub fn distribution(&self, id: &str) -> Option<&StoredDistribution> {
         self.distributions.get(id)
+    }
+
+    /// The continuous deployment policy `id` names, or `None` when the store holds none.
+    pub fn continuous_deployment_policy(
+        &self,
+        id: &str,
+    ) -> Option<&StoredContinuousDeploymentPolicy> {
+        self.continuous_deployment_policies.get(id)
+    }
+
+    /// The policy that already routes traffic to one of `dns_names`, or `None` when no
+    /// stored policy names any of them.
+    ///
+    /// `StagingDistributionInUse` is documented as "A continuous deployment policy for
+    /// this staging distribution already exists", so a staging distribution takes part in
+    /// at most ONE policy and this is what decides whether a create may claim it.
+    ///
+    /// The request's names are indexed into a set ONCE, so the scan costs one set lookup
+    /// per stored name rather than a walk of the request's list per stored name: the work
+    /// is linear in the two lengths, each of which is bounded
+    /// ([`MAX_STAGING_DISTRIBUTION_DNS_NAMES`] per policy,
+    /// [`MAX_CONTINUOUS_DEPLOYMENT_POLICIES`] policies).
+    pub fn policy_using_staging_distribution(
+        &self,
+        dns_names: &[String],
+    ) -> Option<&StoredContinuousDeploymentPolicy> {
+        let claimed: BTreeSet<&str> = dns_names.iter().map(String::as_str).collect();
+        self.continuous_deployment_policies.values().find(|policy| {
+            policy
+                .staging_distribution_dns_names()
+                .iter()
+                .any(|held| claimed.contains(held.as_str()))
+        })
+    }
+
+    /// The policy whose stored configuration is `config`, or `None` when none is.
+    ///
+    /// `ContinuousDeploymentPolicyAlreadyExists` is documented as "A continuous deployment
+    /// policy with this configuration already exists", so this is what separates a create
+    /// that repeats a policy already in the store from one that claims a staging
+    /// distribution another policy holds.
+    pub fn policy_with_config(
+        &self,
+        config: &ContinuousDeploymentPolicyConfig,
+    ) -> Option<&StoredContinuousDeploymentPolicy> {
+        self.continuous_deployment_policies
+            .values()
+            .find(|policy| same_policy_config(&policy.config, config))
     }
 
     /// The distribution tenant `identifier` names, or `None` when the store holds none.
@@ -1628,6 +1782,24 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
                 .key_value_stores
                 .values()
                 .any(|store| store.id == candidate)
+            {
+                break candidate;
+            }
+        }
+    }
+
+    /// Allocate a continuous deployment policy id no stored policy holds.
+    ///
+    /// The same UUID mint [`ComAmazonawsCloudfrontCloudfront20200531State::mint_uuid`]
+    /// serves every resource CloudFront identifies by one: the policy-shaped resources of
+    /// its control plane (cache policies, origin request policies, continuous deployment
+    /// policies) carry a UUID rather than the `E`+13 token a distribution carries.
+    pub fn allocate_continuous_deployment_policy_id(&mut self) -> String {
+        loop {
+            let candidate = self.mint_uuid();
+            if !self
+                .continuous_deployment_policies
+                .contains_key(&candidate)
             {
                 break candidate;
             }
@@ -1948,6 +2120,12 @@ pub fn key_value_store_path(name: &str) -> String {
     format!("/2020-05-31/key-value-store/{name}")
 }
 
+/// The path of a continuous deployment policy resource under this service's API version.
+/// The resource is addressed by id, as `GetContinuousDeploymentPolicy`'s `{Id}` label is.
+pub fn continuous_deployment_policy_path(id: &str) -> String {
+    format!("/2020-05-31/continuous-deployment-policy/{id}")
+}
+
 /// The ARN of a distribution tenant. CloudFront is a GLOBAL service, so the ARN's region
 /// segment is empty: `arn:aws:cloudfront::<account>:distribution-tenant/<Id>`, the
 /// resource type this service's own `/distribution-tenant` routes name.
@@ -2165,6 +2343,30 @@ pub fn is_version_token(value: &str) -> bool {
     is_distribution_id(value)
 }
 
+/// Whether `value` has the shape every id this service MINTS AS A UUID takes
+/// ([`ComAmazonawsCloudfrontCloudfront20200531State::mint_uuid`]): the 8-4-4-4-12
+/// lowercase hex of a UUID.
+///
+/// Nothing here is specific to one resource kind — a key value store, a response headers
+/// policy and a continuous deployment policy all carry an id of this shape — so one
+/// predicate serves every listing whose `Marker` is such an id.
+/// `ListContinuousDeploymentPolicies`'s `Marker` is a policy id and the model constrains
+/// it no further than `string`, so this is what tells a resume point the service issued
+/// from a value a client made up.
+pub fn is_minted_uuid(value: &str) -> bool {
+    let groups: Vec<&str> = value.split('-').collect();
+    groups.len() == 5
+        && groups
+            .iter()
+            .zip([8usize, 4, 4, 4, 12])
+            .all(|(group, width)| {
+                group.len() == width
+                    && group
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            })
+}
+
 /// Whether `value` is `prefix` followed by [`ID_BODY_LEN`] characters of the id
 /// alphabet.
 fn is_prefixed_token(value: &str, prefix: char) -> bool {
@@ -2242,6 +2444,95 @@ pub fn same_batch(left: &InvalidationBatch, right: &InvalidationBatch) -> bool {
 /// compare equal, and that test fails the moment it does.
 pub fn same_config(left: &DistributionConfig, right: &DistributionConfig) -> bool {
     format!("{left:?}") == format!("{right:?}")
+}
+
+/// Whether two continuous deployment policy configurations ask for the same thing, which
+/// is what decides whether a create repeats a policy the store already holds.
+///
+/// Compared MEMBER BY MEMBER over the whole configuration rather than through a rendering
+/// of it: `ContinuousDeploymentPolicyConfig` reaches few enough shapes to spell the
+/// comparison out, so a create costs no allocation per stored policy (unlike
+/// [`same_config`], which renders a `DistributionConfig`'s ~45 shapes because deriving
+/// `PartialEq` on them is not available here). Every member a caller can submit takes
+/// part, down to the members a request left out.
+pub fn same_policy_config(
+    left: &ContinuousDeploymentPolicyConfig,
+    right: &ContinuousDeploymentPolicyConfig,
+) -> bool {
+    left.enabled == right.enabled
+        && left.staging_distribution_dns_names.quantity
+            == right.staging_distribution_dns_names.quantity
+        && staging_distribution_dns_names(left) == staging_distribution_dns_names(right)
+        && same_traffic_config(left.traffic_config.as_ref(), right.traffic_config.as_ref())
+}
+
+/// Whether two optional traffic configurations ask for the same routing. An absent one
+/// matches only an absent one: a configuration that names no `TrafficConfig` is not the
+/// configuration that names one.
+fn same_traffic_config(left: Option<&TrafficConfig>, right: Option<&TrafficConfig>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            left.r#type == right.r#type
+                && same_single_weight_config(
+                    left.single_weight_config.as_ref(),
+                    right.single_weight_config.as_ref(),
+                )
+                && same_single_header_config(
+                    left.single_header_config.as_ref(),
+                    right.single_header_config.as_ref(),
+                )
+        }
+        _ => false,
+    }
+}
+
+/// Whether two optional single-weight configurations name the same share of traffic.
+///
+/// The weights are compared by their BITS: two configurations are the same request again
+/// only if the weight submitted is the same value, and the bit pattern is what says so
+/// without an approximate comparison between floats.
+fn same_single_weight_config(
+    left: Option<&ContinuousDeploymentSingleWeightConfig>,
+    right: Option<&ContinuousDeploymentSingleWeightConfig>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            left.weight.to_bits() == right.weight.to_bits()
+                && same_session_stickiness_config(
+                    left.session_stickiness_config.as_ref(),
+                    right.session_stickiness_config.as_ref(),
+                )
+        }
+        _ => false,
+    }
+}
+
+/// Whether two optional session stickiness configurations name the same session window.
+fn same_session_stickiness_config(
+    left: Option<&SessionStickinessConfig>,
+    right: Option<&SessionStickinessConfig>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            left.idle_ttl == right.idle_ttl && left.maximum_ttl == right.maximum_ttl
+        }
+        _ => false,
+    }
+}
+
+/// Whether two optional single-header configurations select the same requests.
+fn same_single_header_config(
+    left: Option<&ContinuousDeploymentSingleHeaderConfig>,
+    right: Option<&ContinuousDeploymentSingleHeaderConfig>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => left.header == right.header && left.value == right.value,
+        _ => false,
+    }
 }
 
 /// Whether two origin access identity configurations ask for the same thing, which is
@@ -2988,6 +3279,199 @@ pub fn batch_quantity_mismatch(batch: &InvalidationBatch) -> Option<String> {
 /// How many paths an invalidation batch names, which [`MAX_INVALIDATION_PATHS`] bounds.
 pub fn batch_path_count(batch: &InvalidationBatch) -> usize {
     items_len(&batch.paths.items)
+}
+
+/// `TrafficConfig$Type` selecting a share of traffic, from
+/// [`crate::ops::types::CONTINUOUS_DEPLOYMENT_POLICY_TYPE_VALUES`] — the values the model
+/// says the member accepts.
+pub const TRAFFIC_TYPE_SINGLE_WEIGHT: &str = "SingleWeight";
+
+/// `TrafficConfig$Type` selecting requests by header, from the same enum.
+pub const TRAFFIC_TYPE_SINGLE_HEADER: &str = "SingleHeader";
+
+/// The prefix `ContinuousDeploymentSingleHeaderConfig$Header` must carry: "The request
+/// header name that you want CloudFront to send to your staging distribution. The header
+/// must contain the prefix `aws-cf-cd-`."
+pub const SINGLE_HEADER_PREFIX: &str = "aws-cf-cd-";
+
+/// The modelled `InconsistentQuantities` message for a continuous deployment policy
+/// configuration whose `StagingDistributionDnsNames.Quantity` disagrees with the number of
+/// domain names it carries, or `None`.
+///
+/// The one wrapper a `ContinuousDeploymentPolicyConfig` reaches, checked under the same
+/// rule every other CloudFront list wrapper is ([`quantity_disagreement`]).
+pub fn policy_config_quantity_mismatch(
+    config: &ContinuousDeploymentPolicyConfig,
+) -> Option<String> {
+    let names = &config.staging_distribution_dns_names;
+    quantity_disagreement(
+        "StagingDistributionDnsNames",
+        names.quantity,
+        items_len(&names.items),
+    )
+}
+
+/// Why a continuous deployment policy configuration is unusable, as the sentence the
+/// modelled `InvalidArgument` carries — or `None` when every member is within what the
+/// model and the documentation allow.
+///
+/// Each sentence is BUILT FROM THE REQUEST: it names the member and the constraint it
+/// broke, which is the one thing the caller cannot work out for itself. The constraints
+/// are the documented ones:
+///
+/// * `TrafficConfig$Type` "The type of traffic configuration" selects WHICH of the two
+///   traffic configurations applies, so the one it names has to be there — and the value
+///   has to be one the enum admits;
+/// * `ContinuousDeploymentSingleHeaderConfig$Header` "must contain the prefix
+///   `aws-cf-cd-`";
+/// * `ContinuousDeploymentSingleWeightConfig$Weight` is "expressed as a decimal number
+///   between 0 and 0.15";
+/// * `SessionStickinessConfig$IdleTTL` and `$MaximumTTL` each have "Allowed values …
+///   300–3600 seconds", and `IdleTTL` "must be less than or equal to `MaximumTTL`";
+/// * `StagingDistributionDnsNames` carries at most
+///   [`MAX_STAGING_DISTRIBUTION_DNS_NAMES`] domain names — the one caller-chosen LENGTH
+///   in this configuration, bounded on the way IN like every other count this service
+///   stores ([`MAX_CACHE_BEHAVIORS`], [`MAX_INVALIDATION_PATHS`]).
+pub fn policy_config_invalid_argument(
+    config: &ContinuousDeploymentPolicyConfig,
+) -> Option<String> {
+    // The LENGTH of the submitted domain name list is caller-chosen, and the record is
+    // stored and later scanned name by name, so the count is refused FIRST — before any
+    // other member is walked, before the store is locked and before anything is minted.
+    // `Quantity` is taken into the count as well, defensively: it is the SAME bound, not a
+    // second rule, and `policy_config_quantity_mismatch` has already refused a `Quantity`
+    // that disagrees with `Items` by the time a handler reaches here, so the two spellings
+    // cannot disagree — this one simply does not depend on that order.
+    let names = &config.staging_distribution_dns_names;
+    let stated = i64::from(names.quantity).max(i64::try_from(items_len(&names.items)).unwrap_or(0));
+    if stated > i64::try_from(MAX_STAGING_DISTRIBUTION_DNS_NAMES).unwrap_or(i64::MAX) {
+        return Some(format!(
+            "StagingDistributionDnsNames names {stated} staging distribution domain names; at \
+             most {MAX_STAGING_DISTRIBUTION_DNS_NAMES} are allowed."
+        ));
+    }
+    // `None` from this function means "nothing to refuse", so each absent OPTIONAL member
+    // below ends the walk rather than failing it: a configuration that names no traffic
+    // configuration, or no session stickiness, has no constraint left to break. The `?` is
+    // what clippy's `question_mark` lint requires here, so it reads as that early end.
+    let traffic = config.traffic_config.as_ref()?;
+    let kind = traffic.r#type.as_str();
+    if kind == TRAFFIC_TYPE_SINGLE_WEIGHT {
+        let Some(weight_config) = traffic.single_weight_config.as_ref() else {
+            return Some(format!(
+                "TrafficConfig.Type {TRAFFIC_TYPE_SINGLE_WEIGHT} requires \
+                 TrafficConfig.SingleWeightConfig."
+            ));
+        };
+        let weight = weight_config.weight;
+        if !(MIN_TRAFFIC_WEIGHT..=MAX_TRAFFIC_WEIGHT).contains(&weight) {
+            return Some(format!(
+                "TrafficConfig.SingleWeightConfig.Weight ({weight}) must be a decimal number \
+                 between {MIN_TRAFFIC_WEIGHT} and {MAX_TRAFFIC_WEIGHT}."
+            ));
+        }
+        // No session stickiness named: nothing left to refuse (see above).
+        let stickiness = weight_config.session_stickiness_config.as_ref()?;
+        for (member, ttl) in [
+            ("IdleTTL", stickiness.idle_ttl),
+            ("MaximumTTL", stickiness.maximum_ttl),
+        ] {
+            if !(MIN_SESSION_STICKINESS_TTL..=MAX_SESSION_STICKINESS_TTL).contains(&ttl) {
+                return Some(format!(
+                    "TrafficConfig.SingleWeightConfig.SessionStickinessConfig.{member} ({ttl}) \
+                     must be between {MIN_SESSION_STICKINESS_TTL} and \
+                     {MAX_SESSION_STICKINESS_TTL} seconds."
+                ));
+            }
+        }
+        if stickiness.idle_ttl > stickiness.maximum_ttl {
+            return Some(format!(
+                "TrafficConfig.SingleWeightConfig.SessionStickinessConfig.IdleTTL ({}) must be \
+                 less than or equal to MaximumTTL ({}).",
+                stickiness.idle_ttl, stickiness.maximum_ttl
+            ));
+        }
+        return None;
+    }
+    if kind == TRAFFIC_TYPE_SINGLE_HEADER {
+        let Some(header_config) = traffic.single_header_config.as_ref() else {
+            return Some(format!(
+                "TrafficConfig.Type {TRAFFIC_TYPE_SINGLE_HEADER} requires \
+                 TrafficConfig.SingleHeaderConfig."
+            ));
+        };
+        if !header_config.header.starts_with(SINGLE_HEADER_PREFIX) {
+            return Some(format!(
+                "TrafficConfig.SingleHeaderConfig.Header ({}) must contain the prefix \
+                 {SINGLE_HEADER_PREFIX}.",
+                header_config.header
+            ));
+        }
+        return None;
+    }
+    // A value outside `ContinuousDeploymentPolicyType` is already refused at the request
+    // boundary by the model's own enum constraint, so this is the fallback for a `Type`
+    // that reached here some other way — never a second spelling of that refusal.
+    Some(format!(
+        "TrafficConfig.Type ({kind}) must be one of {}.",
+        crate::ops::types::CONTINUOUS_DEPLOYMENT_POLICY_TYPE_VALUES.join(", ")
+    ))
+}
+
+/// `NoSuchContinuousDeploymentPolicy`'s message: the sentence the model states on the
+/// shape itself, "The continuous deployment policy doesn't exist."
+pub const NO_SUCH_CONTINUOUS_DEPLOYMENT_POLICY_MESSAGE: &str =
+    "The continuous deployment policy doesn't exist.";
+
+/// The modelled `NoSuchContinuousDeploymentPolicy` for a policy id the store does not
+/// hold. Fixed service text, for the same reason [`no_such_distribution`] is.
+pub fn no_such_continuous_deployment_policy() -> crate::ops::types::NoSuchContinuousDeploymentPolicy
+{
+    crate::ops::types::NoSuchContinuousDeploymentPolicy {
+        message: Some(NO_SUCH_CONTINUOUS_DEPLOYMENT_POLICY_MESSAGE.to_string()),
+    }
+}
+
+/// The modelled `StagingDistributionInUse` (HTTP 409) for a create whose staging
+/// distribution another policy already routes traffic to — "A continuous deployment
+/// policy for this staging distribution already exists" — naming that policy, the one
+/// piece of detail the caller cannot work out for itself.
+pub fn staging_distribution_in_use(policy_id: &str) -> crate::ops::types::StagingDistributionInUse {
+    crate::ops::types::StagingDistributionInUse {
+        message: Some(format!(
+            "A continuous deployment policy for this staging distribution already exists: \
+             {policy_id}"
+        )),
+    }
+}
+
+/// The modelled `ContinuousDeploymentPolicyAlreadyExists` (HTTP 409) for a create
+/// repeating a configuration the store already holds — "A continuous deployment policy
+/// with this configuration already exists" — naming the policy that holds it.
+pub fn continuous_deployment_policy_already_exists(
+    policy_id: &str,
+) -> crate::ops::types::ContinuousDeploymentPolicyAlreadyExists {
+    crate::ops::types::ContinuousDeploymentPolicyAlreadyExists {
+        message: Some(format!(
+            "A continuous deployment policy with this configuration already exists: {policy_id}"
+        )),
+    }
+}
+
+/// The modelled `TooManyContinuousDeploymentPolicies` (HTTP 400) for a create at this
+/// emulator's bound ([`MAX_CONTINUOUS_DEPLOYMENT_POLICIES`]).
+///
+/// The sentence states the BOUND and nothing else: the status and the code are the
+/// contract, the text is free, and it advises no remedy — deleting a policy is
+/// `DeleteContinuousDeploymentPolicy`, still a scaffold in this emulator.
+pub fn too_many_continuous_deployment_policies()
+-> crate::ops::types::TooManyContinuousDeploymentPolicies {
+    crate::ops::types::TooManyContinuousDeploymentPolicies {
+        message: Some(format!(
+            "This emulator holds at most {MAX_CONTINUOUS_DEPLOYMENT_POLICIES} continuous \
+             deployment policies for one account"
+        )),
+    }
 }
 
 /// `NoSuchDistribution`'s message: the sentence the model states on the shape itself,

@@ -32,7 +32,9 @@ use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::distribution_lifecycle::{call, emulator, Answer, Node, ACCOUNT_ID, API_VERSION, HOST};
+use crate::distribution_lifecycle::{
+    call, emulator, is_minted_uuid, Answer, Node, ACCOUNT_ID, API_VERSION, HOST,
+};
 
 // ---------------------------------------------------------------------------
 // Calling the key value store surface
@@ -167,24 +169,6 @@ fn create_table() -> Vec<Create> {
 // Reading what the service minted
 // ---------------------------------------------------------------------------
 
-/// Whether `value` has the shape of the UUID CloudFront mints as a key value store id:
-/// five lowercase-hex groups of 8-4-4-4-12 characters. The id is the resource part of
-/// the store's ARN, which is how the key value store DATA plane addresses one store, so
-/// the shape is part of the contract rather than cosmetic.
-fn is_key_value_store_id(value: &str) -> bool {
-    let groups: Vec<&str> = value.split('-').collect();
-    groups.len() == 5
-        && groups
-            .iter()
-            .zip([8usize, 4, 4, 4, 12])
-            .all(|(group, width)| {
-                group.len() == width
-                    && group
-                        .bytes()
-                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-            })
-}
-
 /// Whether `value` has the shape of a CloudFront version token (`ETag`): `E` followed by
 /// 13 uppercase alphanumerics, the shape this service's own ids and tokens take.
 fn is_version_token(value: &str) -> bool {
@@ -227,7 +211,7 @@ fn assert_record(
 
     let id = member(store, "Id", case, raw);
     assert!(
-        is_key_value_store_id(&id),
+        is_minted_uuid(&id),
         "case {case} ({context}): expected a UUID Id, got {id:?}"
     );
 

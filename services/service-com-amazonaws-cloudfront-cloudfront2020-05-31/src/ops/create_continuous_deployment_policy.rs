@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateContinuousDeploymentPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateContinuousDeploymentPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateContinuousDeploymentPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Persists one continuous deployment policy: the configuration as submitted, under a
+//! freshly minted id and version token, so a later read or listing answers from that
+//! record rather than from the request that created it.
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +82,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use crate::state::StoredContinuousDeploymentPolicy;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -160,18 +159,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateContinuousDeploymentPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateContinuousDeploymentPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateContinuousDeploymentPolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+
+        let config = input.continuous_deployment_policy_config;
+
+        // "The value of Quantity and the size of Items don't match." The one list wrapper
+        // this configuration carries is checked before anything is minted for it.
+        if let Some(message) = crate::state::policy_config_quantity_mismatch(&config) {
+            return Err(
+                CreateContinuousDeploymentPolicyErrorModeled::InconsistentQuantities(
+                    InconsistentQuantities {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A member outside what the documentation allows for it (the traffic
+        // configuration the stated `Type` selects, the weight's range, the session
+        // stickiness TTLs) is "An argument is invalid", named member by member.
+        if let Some(reason) = crate::state::policy_config_invalid_argument(&config) {
+            return Err(CreateContinuousDeploymentPolicyErrorModeled::InvalidArgument(
+                InvalidArgument {
+                    message: Some(format!("An argument is invalid: {reason}")),
+                },
+            )
+            .into());
+        }
+
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // "A continuous deployment policy with this configuration already exists": a
+        // create repeating a configuration the store already holds names that policy
+        // rather than storing a second copy of it.
+        if let Some(existing) = store.policy_with_config(&config) {
+            let existing_id = existing.id.clone();
+            return Err(
+                CreateContinuousDeploymentPolicyErrorModeled::ContinuousDeploymentPolicyAlreadyExists(
+                    crate::state::continuous_deployment_policy_already_exists(&existing_id),
+                )
+                .into(),
+            );
+        }
+
+        // "A continuous deployment policy for this staging distribution already exists":
+        // a staging distribution takes part in at most ONE policy, so a create naming a
+        // domain name another policy already routes traffic to is refused.
+        let dns_names = crate::state::staging_distribution_dns_names(&config).to_vec();
+        if let Some(holder) = store.policy_using_staging_distribution(&dns_names) {
+            let holder_id = holder.id.clone();
+            return Err(
+                CreateContinuousDeploymentPolicyErrorModeled::StagingDistributionInUse(
+                    crate::state::staging_distribution_in_use(&holder_id),
+                )
+                .into(),
+            );
+        }
+
+        // "You have reached the maximum number of continuous deployment policies for this
+        // Amazon Web Services account." The store grows only here and a policy cannot be
+        // evicted (a later read has to answer with what this create returned), so the
+        // bound is an entry count refused BEFORE anything is minted.
+        if store.continuous_deployment_policies.len()
+            >= crate::state::MAX_CONTINUOUS_DEPLOYMENT_POLICIES
+        {
+            return Err(
+                CreateContinuousDeploymentPolicyErrorModeled::TooManyContinuousDeploymentPolicies(
+                    crate::state::too_many_continuous_deployment_policies(),
+                )
+                .into(),
+            );
+        }
+
+        let id = store.allocate_continuous_deployment_policy_id();
+        let etag = store.next_etag();
+        let stored = StoredContinuousDeploymentPolicy {
+            id: id.clone(),
+            last_modified_time: now,
+            etag: etag.clone(),
+            // Stored whole: every later read of this policy answers from this record,
+            // never from the request that was served.
+            config,
+        };
+        let policy = stored.to_policy();
+        let location =
+            crate::state::location_uri(&crate::state::continuous_deployment_policy_path(&id));
+        store.continuous_deployment_policies.insert(id, stored);
+
+        Ok(CreateContinuousDeploymentPolicyOutput {
+            // "A continuous deployment policy" — the record just persisted.
+            continuous_deployment_policy: Some(policy),
+            // "The location of the continuous deployment policy."
+            location: Some(location),
+            // "The version identifier for the current version of the continuous
+            // deployment policy" — what an `If-Match` against it is checked against.
+            e_tag: Some(etag),
+        })
     }
 }

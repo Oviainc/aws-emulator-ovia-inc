@@ -36,7 +36,9 @@ use service_com_amazonaws_cloudfront_cloudfront2020_05_31::ops::types::{
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::MAX_RESPONSE_HEADERS_POLICIES;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::distribution_lifecycle::{call, emulator, Answer, Node, API_VERSION, HOST};
+use crate::distribution_lifecycle::{
+    call, emulator, is_minted_uuid, Answer, Node, API_VERSION, HOST,
+};
 
 // ---------------------------------------------------------------------------
 // Calling the response headers policy surface
@@ -509,19 +511,12 @@ fn policy_table() -> Vec<Policy> {
 /// lowercase-hex groups of 8-4-4-4-12 characters.
 ///
 /// `pub(crate)`: every CloudFront policy kind is identified by a UUID in this shape, so a
-/// sibling suite checks one the same way rather than growing a copy of this.
+/// sibling suite checks one the same way rather than growing a copy of this. The shape
+/// itself is the harness's [`crate::distribution_lifecycle::is_minted_uuid`] — every
+/// resource this service identifies by a UUID carries the same one — so there is ONE
+/// predicate behind both names.
 pub(crate) fn is_policy_id(value: &str) -> bool {
-    let groups: Vec<&str> = value.split('-').collect();
-    groups.len() == 5
-        && groups
-            .iter()
-            .zip([8usize, 4, 4, 4, 12])
-            .all(|(group, width)| {
-                group.len() == width
-                    && group
-                        .bytes()
-                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-            })
+    is_minted_uuid(value)
 }
 
 /// Whether `value` has the shape of a CloudFront version token (`ETag`): `E` followed by
@@ -1078,7 +1073,7 @@ async fn create_persists_the_policy_the_get_then_reports() {
         let document = created.root();
         let id = text(document, "Id", case, "the create", &created.raw);
         assert!(
-            is_policy_id(&id),
+            is_minted_uuid(&id),
             "case {case}: expected a UUID Id, got {id:?}"
         );
         let last_modified = text(
