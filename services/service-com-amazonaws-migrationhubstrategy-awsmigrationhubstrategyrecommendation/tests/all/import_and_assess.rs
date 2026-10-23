@@ -182,7 +182,9 @@ fn reported_as(member: &str) -> Option<&'static str> {
         "s3key" => "/inputS3Key",
         "s3bucketForReportData" => "/statusReportS3Bucket",
         // `GetImportFileTaskResponse` carries neither: the source type and the import
-        // groups are reported by ListServers / ListApplicationComponents, both stubs.
+        // groups belong to the resources the import brings in — the groups are what
+        // ListServers' `groupIdFilter` scopes a list by (see `server_inventory.rs`), and
+        // ListApplicationComponents is still a stub.
         "dataSourceType" | "groupId" => return None,
         other => {
             panic!("this test names a StartImportFileTask member with no mapping: {other:?}")

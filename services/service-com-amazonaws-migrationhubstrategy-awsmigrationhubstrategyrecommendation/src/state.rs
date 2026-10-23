@@ -13,6 +13,10 @@
 //! Every one of those operations computes its answer from the record below — there is
 //! exactly one copy of each resource, and the `DataCollectionDetails` an assessment
 //! reports is derived from the counters it stores, never canned.
+//!
+//! Beside them sits the account's **server inventory** ([`ServerRecord`]), which
+//! `ListServers` reports: the servers an import file task ingested, each carrying the
+//! import groups it came in with.
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -20,7 +24,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AssessmentTarget, DataCollectionDetails, GetImportFileTaskOutput, Group,
-    ImportFileTaskInformation, ResourceNotFoundException, ValidationException,
+    ImportFileTaskInformation, OSInfo, RecommendationSet, ResourceNotFoundException, ServerDetail,
+    ServerError, SystemInfo, ValidationException,
 };
 
 /// `ImportFileTaskStatus`'s non-terminal import status: the status a task carries from
@@ -178,33 +183,45 @@ pub struct ImportTaskPage {
     pub next_token: Option<String>,
 }
 
-/// The largest page `ListImportFileTask` serves, and the page size it uses when the
-/// caller names none.
+/// The largest page a list operation of this service serves, and the page size it uses
+/// when the caller names none.
 ///
-/// `ListImportFileTaskRequest$maxResults` documents "The total number of items to
-/// return. The maximum value is 100." The member carries no `@range`, so the boundary
-/// validator passes any integer and the bound is enforced where the page is taken.
+/// Every `maxResults` member the service takes documents the same bound —
+/// `ListImportFileTaskRequest$maxResults` "The total number of items to return. The
+/// maximum value is 100.", `ListServersRequest$maxResults` "The maximum number of items
+/// to include in the response. The maximum value is 100." The members carry no `@range`,
+/// so the boundary validator passes any integer and the bound is enforced where the page
+/// is taken.
 pub const MAX_LIST_PAGE_SIZE: i32 = 100;
 
-/// The marker every pagination token this service mints carries, so a token minted
-/// elsewhere (or invented by a caller) is recognised as foreign rather than resolved
-/// against this store.
-const PAGE_TOKEN_MARKER: &str = "migrationhubstrategy:import-file-task:";
+/// The marker a `ListImportFileTask` cursor carries, so a token minted elsewhere (or
+/// invented by a caller) is recognised as foreign rather than resolved against this
+/// store.
+pub const IMPORT_TASK_PAGE_MARKER: &str = "migrationhubstrategy:import-file-task:";
 
-/// Encode the id a page stopped after as an opaque `nextToken`.
+/// The marker a `ListServers` cursor carries.
+///
+/// A token names a position in ONE list, so each list has its own marker and a token
+/// issued for another list is foreign here — the two never resolve against each other's
+/// records.
+pub const SERVER_PAGE_MARKER: &str = "migrationhubstrategy:servers:";
+
+/// Encode the key a page stopped at as an opaque `nextToken` carrying `marker`.
 ///
 /// Hex round-trips exactly and is non-empty for a non-empty key, so the token satisfies
-/// the member's `@length(0, 1024)` and `.*\S.*`, and the next call resolves it against
-/// the same map — no server-side cursor table.
-pub fn encode_page_token(key: &str) -> String {
-    hex::encode(format!("{PAGE_TOKEN_MARKER}{key}").as_bytes())
+/// the `nextToken` members' `@length` and `.*\S.*`, and the next call resolves it against
+/// the same map — no server-side cursor table. One codec for every list of this service,
+/// so the token shape cannot drift between them; the marker is what tells the lists
+/// apart.
+pub fn encode_page_token(marker: &str, key: &str) -> String {
+    hex::encode(format!("{marker}{key}").as_bytes())
 }
 
-/// The id an [`encode_page_token`] token names; `None` for anything this service did not
-/// mint, including well-formed hex carrying no [`PAGE_TOKEN_MARKER`].
-pub fn decode_page_token(token: &str) -> Option<String> {
+/// The key an [`encode_page_token`] token carrying `marker` names; `None` for anything
+/// this service did not mint, including well-formed hex carrying another list's marker.
+pub fn decode_page_token(marker: &str, token: &str) -> Option<String> {
     let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
-    decoded.strip_prefix(PAGE_TOKEN_MARKER).map(str::to_string)
+    decoded.strip_prefix(marker).map(str::to_string)
 }
 
 /// One assessment of an on-premises environment, as this emulator persists it.
@@ -300,6 +317,169 @@ impl Assessment {
     }
 }
 
+/// The `ServerCriteria` value that names no member to filter on, so a request carrying it
+/// (or no `serverCriteria` at all) filters nothing.
+///
+/// From `ServerCriteria`'s value list (`SERVER_CRITERIA_VALUES`): every other value names
+/// a member of the server record, and `NOT_DEFINED` is the one that does not.
+pub const SERVER_CRITERIA_NOT_DEFINED: &str = "NOT_DEFINED";
+
+/// `SortOrder`'s ascending value, which is the order a list is reported in when the
+/// request names no `sort`.
+pub const SORT_ASCENDING: &str = "ASC";
+
+/// `SortOrder`'s descending value.
+pub const SORT_DESCENDING: &str = "DESC";
+
+/// One server of this account's portfolio, as this emulator persists it.
+///
+/// A server enters the portfolio when an import file task ingests it — that ingestion
+/// (and the record counts behind it) is filed separately as the import-loop issue, which
+/// is why a freshly booted emulator holds no server at all. This record is what the read
+/// path computes from: `ListServers` reports it as a [`ServerDetail`], filters it by the
+/// member a `ServerCriteria` names, and scopes it by the import groups it came in with.
+///
+/// Every member is what the import stored, so nothing here is derived from the request
+/// that reads it.
+#[derive(Debug, Clone, Default)]
+pub struct ServerRecord {
+    /// `ServerDetail$id` — a `ResourceId` (`^[0-9a-b]+`, up to 44 characters). It is also
+    /// this server's key in [`ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState::servers`],
+    /// which is what gives a list a stable total order to sort and paginate over.
+    pub id: String,
+    /// `ServerDetail$name`.
+    pub name: Option<String>,
+    /// `ServerDetail$serverType`.
+    pub server_type: Option<String>,
+    /// `SystemInfo$osInfo$type` — one of `OSType`'s values.
+    pub os_type: Option<String>,
+    /// `SystemInfo$osInfo$version` — the free-text operating system the server reports.
+    pub os_version: Option<String>,
+    /// `SystemInfo$fileSystemType`.
+    pub file_system_type: Option<String>,
+    /// `SystemInfo$cpuArchitecture`.
+    pub cpu_architecture: Option<String>,
+    /// `ServerDetail$dataCollectionStatus` — one of `RunTimeAssessmentStatus`'s values.
+    pub data_collection_status: Option<String>,
+    /// `ServerDetail$statusMessage`.
+    pub status_message: Option<String>,
+    /// `RecommendationSet$strategy` — one of `Strategy`'s values, once an analysis
+    /// recommended one.
+    pub strategy: Option<String>,
+    /// `RecommendationSet$targetDestination` — one of `TargetDestination`'s values.
+    pub target_destination: Option<String>,
+    /// `ServerError$serverErrorCategory` — one of `ServerErrorCategory`'s values, for a
+    /// server whose analysis failed.
+    pub error_category: Option<String>,
+    /// `ServerDetail$lastAnalyzedTimestamp`.
+    pub last_analyzed: Option<SystemTime>,
+    /// The import groups this server came in with — `StartImportFileTaskRequest$groupId`
+    /// of the import that brought it in. Not a member of `ServerDetail`: it is what
+    /// `ListServers`'s `groupIdFilter` scopes a list by.
+    pub group_id: Vec<Group>,
+}
+
+impl ServerRecord {
+    /// The `ServerDetail` a read reports for this server: this record's own members, and
+    /// nothing for the ones no part of this emulator produces.
+    ///
+    /// `listAntipatternSeveritySummary`, `antipatternReport*` and
+    /// `applicationComponentStrategySummary` are left unset rather than filled with a
+    /// shape nothing computed — no anti-pattern report is generated and application
+    /// components are a resource of their own — and the nested structures are reported
+    /// only when the record holds something to put in them, so a server the import knew
+    /// nothing about does not come back as a tree of empty objects.
+    pub fn to_server_detail(&self) -> ServerDetail {
+        let os_info = (self.os_type.is_some() || self.os_version.is_some()).then(|| OSInfo {
+            r#type: self.os_type.clone(),
+            version: self.os_version.clone(),
+        });
+        let system_info = (os_info.is_some()
+            || self.file_system_type.is_some()
+            || self.cpu_architecture.is_some())
+        .then(|| SystemInfo {
+            os_info,
+            file_system_type: self.file_system_type.clone(),
+            // The import brings no interface, address or mask with it, so there is no
+            // network information to report.
+            network_info_list: None,
+            cpu_architecture: self.cpu_architecture.clone(),
+        });
+        let recommendation_set = (self.strategy.is_some() || self.target_destination.is_some())
+            .then(|| RecommendationSet {
+                // No transformation tool is recommended: nothing in this emulator picks
+                // one.
+                transformation_tool: None,
+                target_destination: self.target_destination.clone(),
+                strategy: self.strategy.clone(),
+            });
+        ServerDetail {
+            id: Some(self.id.clone()),
+            name: self.name.clone(),
+            recommendation_set,
+            data_collection_status: self.data_collection_status.clone(),
+            status_message: self.status_message.clone(),
+            list_antipattern_severity_summary: None,
+            system_info,
+            application_component_strategy_summary: None,
+            antipattern_report_s3_object: None,
+            antipattern_report_status: None,
+            antipattern_report_status_message: None,
+            server_type: self.server_type.clone(),
+            last_analyzed_timestamp: self.last_analyzed.map(::aws_smithy_types::DateTime::from),
+            server_error: self.error_category.clone().map(|category| ServerError {
+                server_error_category: Some(category),
+            }),
+        }
+    }
+
+    /// True when this server satisfies `criteria` = `value`.
+    ///
+    /// Each `ServerCriteria` value names ONE member of the server record and the value is
+    /// compared to it for equality — `filterValue` is documented as "the filter value,
+    /// which is based on the type of server criteria … if `serverCriteria` is `OS_NAME`,
+    /// and the `filterValue` is equal to `WindowsServer`, then `ListServers` returns all
+    /// of the servers matching the OS name `WindowsServer`". `OS_NAME` is the one criteria
+    /// whose member the model splits in two — `SystemInfo$osInfo` carries an `OSType` and
+    /// a free-text version — so a value equal to either selects the server.
+    ///
+    /// [`SERVER_CRITERIA_NOT_DEFINED`] names no member, so it selects every server. A
+    /// value `ServerCriteria` does not declare selects none; a caller never sees that,
+    /// because the handler refuses an undeclared criteria before it gets here.
+    pub fn matches_criteria(&self, criteria: &str, value: &str) -> bool {
+        match criteria {
+            SERVER_CRITERIA_NOT_DEFINED => true,
+            "SERVER_ID" => self.id == value,
+            "OS_NAME" => {
+                self.os_type.as_deref() == Some(value) || self.os_version.as_deref() == Some(value)
+            }
+            "STRATEGY" => self.strategy.as_deref() == Some(value),
+            "DESTINATION" => self.target_destination.as_deref() == Some(value),
+            "ANALYSIS_STATUS" => self.data_collection_status.as_deref() == Some(value),
+            "ERROR_CATEGORY" => self.error_category.as_deref() == Some(value),
+            _ => false,
+        }
+    }
+
+    /// True when this server came in with one of `groups`.
+    ///
+    /// A `Group` is a (`name`, `value`) pair — "The object containing information about
+    /// distinct imports or groups" — so a server is in a filter's group only when both
+    /// halves agree, and several groups in a filter widen the selection rather than
+    /// narrowing it: `groupIdFilter` names the groups whose servers to report.
+    ///
+    /// An EMPTY slice answers `false`, which is why a caller that named no group at all
+    /// must not reach here: naming no group scopes nothing, so the handler applies this
+    /// only to a non-empty filter.
+    pub fn in_any_group(&self, groups: &[Group]) -> bool {
+        groups.iter().any(|wanted| {
+            self.group_id
+                .iter()
+                .any(|held| held.name == wanted.name && held.value == wanted.value)
+        })
+    }
+}
+
 /// Per-service state for com-amazonaws-migrationhubstrategy-awsmigrationhubstrategyrecommendation. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState {
@@ -308,6 +488,10 @@ pub struct ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendation
     pub import_tasks: BTreeMap<String, ImportFileTask>,
     /// Every assessment, keyed by its id.
     pub assessments: BTreeMap<String, Assessment>,
+    /// Every server of this account's portfolio, keyed by its id — the inventory
+    /// `ListServers` reports. A `BTreeMap` is what gives that list a stable total order
+    /// to sort and paginate over, and it is empty until an import ingests a server.
+    pub servers: BTreeMap<String, ServerRecord>,
     /// The id of the most recently started assessment, which is what
     /// `GetLatestAssessmentId` answers. `None` until one is started.
     pub latest_assessment_id: Option<String>,
@@ -407,7 +591,8 @@ impl ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState 
 
         let after = match next_token {
             Some(token) => {
-                let resume_after = decode_page_token(token).ok_or_else(page_token_not_accepted)?;
+                let resume_after = decode_page_token(IMPORT_TASK_PAGE_MARKER, token)
+                    .ok_or_else(page_token_not_accepted)?;
                 if !self.import_tasks.contains_key(&resume_after) {
                     return Err(page_token_not_accepted());
                 }
@@ -425,7 +610,7 @@ impl ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState 
             last = Some(id.clone());
         }
         let next_token = match (rest.next(), last) {
-            (Some(_), Some(key)) => Some(encode_page_token(&key)),
+            (Some(_), Some(key)) => Some(encode_page_token(IMPORT_TASK_PAGE_MARKER, &key)),
             _ => None,
         };
 

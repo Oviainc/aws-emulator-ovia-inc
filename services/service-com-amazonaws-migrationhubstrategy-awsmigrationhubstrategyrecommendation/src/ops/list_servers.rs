@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListServers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListServers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListServers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports this account's server inventory — the servers an import brought into the
+//! portfolio ([`crate::state::ServerRecord`]) — filtered, ordered and paged as the
+//! request asks. It is a REPORT: it writes nothing, so two identical calls answer the
+//! same thing and a later caller sees exactly what this one did.
 //!
 //! ## Shape of an operation
 //!
@@ -90,6 +86,14 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    decode_page_token, encode_page_token, invalid_request_body, page_token_not_accepted,
+    ServerRecord, MAX_LIST_PAGE_SIZE, SERVER_CRITERIA_NOT_DEFINED, SERVER_PAGE_MARKER,
+    SORT_ASCENDING, SORT_DESCENDING,
+};
+
+use ::sha2::{Digest, Sha256};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -122,6 +126,187 @@ pub type ListServersError = crate::scaffolded::Scaffolded<ListServersErrorModele
 impl From<ListServersErrorModeled> for ListServersError {
     fn from(modeled: ListServersErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
+    }
+}
+
+/// What a `nextToken` carries, beside the marker: the list the page was taken from, and
+/// the server the next page starts at.
+///
+/// A token names a position in ONE list, so it carries a fingerprint of the SELECTION the
+/// list was taken under — the criteria and value, the order, and the groups. Handed back
+/// with a different selection it is refused, rather than resuming at whatever position
+/// that server happens to have in some other list. The page SIZE is deliberately not part
+/// of it: `maxResults` is documented per call ("if a previous call to this action returned
+/// 100 items, but you set maxResults to 10"), so changing it between pages is the
+/// caller's business.
+struct Cursor {
+    selection: String,
+    resume_at: String,
+}
+
+impl Cursor {
+    /// This cursor as the opaque `nextToken` the caller hands back, through the service's
+    /// one page-token codec.
+    fn to_token(&self) -> String {
+        encode_page_token(
+            SERVER_PAGE_MARKER,
+            &format!("{}:{}", self.selection, self.resume_at),
+        )
+    }
+
+    /// The cursor a token carries, or `None` for anything this operation did not mint.
+    fn from_token(token: &str) -> Option<Self> {
+        let payload = decode_page_token(SERVER_PAGE_MARKER, token)?;
+        let (selection, resume_at) = payload.split_once(':')?;
+        Some(Self {
+            selection: selection.to_string(),
+            resume_at: resume_at.to_string(),
+        })
+    }
+}
+
+/// A fingerprint of the selection a list was taken under: which servers it holds and in
+/// which order, independent of how they are paged.
+///
+/// A digest rather than the members themselves, so a token stays well inside
+/// `NextToken`'s `@length(0, 2048)` however many groups the filter names — and so it
+/// carries nothing a caller could read its own filter back out of.
+fn selection_fingerprint(
+    filter: Option<(&str, &str)>,
+    descending: bool,
+    groups: &[Group],
+) -> String {
+    // The group filter is a SET: the same groups in another order select the same
+    // servers, so the fingerprint must not depend on the order they were sent in.
+    let mut named: Vec<String> = groups
+        .iter()
+        .map(|group| {
+            format!(
+                "{:?}={:?}",
+                group.name.as_deref().unwrap_or_default(),
+                group.value.as_deref().unwrap_or_default()
+            )
+        })
+        .collect();
+    named.sort();
+    let (criteria, value) = filter.unwrap_or((SERVER_CRITERIA_NOT_DEFINED, ""));
+    let order = if descending {
+        SORT_DESCENDING
+    } else {
+        SORT_ASCENDING
+    };
+    let digest = <Sha256 as Digest>::digest(
+        format!("{criteria:?}/{value:?}/{order}/{}", named.join(",")).as_bytes(),
+    );
+    // Half the digest: the fingerprint only has to tell two selections of one account's
+    // inventory apart, and a shorter token is a shorter `nextToken`.
+    ::hex::encode(&digest[..16])
+}
+
+/// The page the request asks for: how many servers it takes, and the cursor it resumes
+/// from.
+struct Page {
+    size: usize,
+    resume_at: Option<String>,
+}
+
+/// This operation's refusal of a request the model admits member by member but that it
+/// cannot act on, in the service's own wording.
+fn refused() -> ListServersError {
+    ListServersErrorModeled::ValidationException(invalid_request_body()).into()
+}
+
+/// This operation's refusal of a `nextToken` it cannot resolve, worded the way the
+/// service words any unresolvable parameter — the same refusal `ListImportFileTask`
+/// answers for a cursor of its own that resolves to nothing.
+fn token_refused() -> ListServersError {
+    ListServersErrorModeled::ValidationException(page_token_not_accepted()).into()
+}
+
+/// Hold `maxResults` to the documented maximum and `nextToken` to a token this operation
+/// issued for THIS selection.
+///
+/// `maxResults` is documented "The maximum number of items to include in the response.
+/// The maximum value is 100" and its target shape carries no `@range`, so a request past
+/// that bound (or one asking for a page of nothing) is refused here rather than silently
+/// clamped: a caller that asked for more than the service gives has to learn it cannot
+/// have it. An absent `maxResults` takes the documented maximum.
+fn page_of(
+    max_results: Option<i32>,
+    next_token: Option<String>,
+    selection: &str,
+) -> Result<Page, ListServersError> {
+    let size = match max_results {
+        None => MAX_LIST_PAGE_SIZE,
+        Some(requested) if (1..=MAX_LIST_PAGE_SIZE).contains(&requested) => requested,
+        Some(_) => return Err(refused()),
+    };
+    let resume_at = match next_token {
+        None => None,
+        Some(token) => {
+            let cursor = Cursor::from_token(&token).ok_or_else(token_refused)?;
+            if cursor.selection != selection {
+                return Err(token_refused());
+            }
+            Some(cursor.resume_at)
+        }
+    };
+    Ok(Page {
+        size: usize::try_from(size).unwrap_or(0),
+        resume_at,
+    })
+}
+
+/// The (criteria, value) pair the request filters on, or `None` when it filters nothing.
+///
+/// A `serverCriteria` other than `NOT_DEFINED` names the member to compare, so it needs a
+/// `filterValue` to compare against and is refused without one; `NOT_DEFINED` (and an
+/// absent criteria) names no member, so it filters nothing and needs no value. Enum
+/// membership is checked here because the boundary validator does not enforce it: a value
+/// `ServerCriteria` does not declare is refused rather than quietly matching no server.
+fn filter_of<'a>(
+    criteria: Option<&'a str>,
+    filter_value: Option<&'a str>,
+) -> Result<Option<(&'a str, &'a str)>, ListServersError> {
+    let criteria = criteria.unwrap_or(SERVER_CRITERIA_NOT_DEFINED);
+    if !SERVER_CRITERIA_VALUES.contains(&criteria) {
+        return Err(refused());
+    }
+    if criteria == SERVER_CRITERIA_NOT_DEFINED {
+        return Ok(None);
+    }
+    let value = filter_value.ok_or_else(refused)?;
+    Ok(Some((criteria, value)))
+}
+
+/// Whether the list is reported in descending order.
+///
+/// `sort` is documented "Specifies whether to sort by ascending (ASC) or descending (DESC)
+/// order" and names no key, so the order is taken over the one total order every server
+/// has — its id, which is also what a page resumes at. An absent `sort` is ascending. A
+/// `SortOrder` value the model does not declare is refused, for the same reason as an
+/// undeclared criteria.
+fn descending(sort: Option<&str>) -> Result<bool, ListServersError> {
+    match sort {
+        None | Some(SORT_ASCENDING) => Ok(false),
+        Some(SORT_DESCENDING) => Ok(true),
+        Some(_) => Err(refused()),
+    }
+}
+
+/// Refuse a `groupIdFilter` entry whose `name` is not a `GroupName` the model declares —
+/// again a value the boundary validator lets through.
+fn check_group_filter(groups: &[Group]) -> Result<(), ListServersError> {
+    let declared = |group: &Group| {
+        group
+            .name
+            .as_deref()
+            .is_none_or(|name| GROUP_NAME_VALUES.contains(&name))
+    };
+    if groups.iter().all(declared) {
+        Ok(())
+    } else {
+        Err(refused())
     }
 }
 
@@ -161,18 +346,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListServers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListServersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListServers"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListServersErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the migrationhub-strategy server inventory is unavailable".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // Every refusal is decided from the request alone, before the store is read.
+        let filter = filter_of(input.server_criteria.as_deref(), input.filter_value.as_deref())?;
+        let descending = descending(input.sort.as_deref())?;
+        let groups = input.group_id_filter.unwrap_or_default();
+        check_group_filter(&groups)?;
+        // The selection this call takes its list under: a token is only good for the
+        // same one.
+        let selection = selection_fingerprint(filter, descending, &groups);
+        let page = page_of(input.max_results, input.next_token, &selection)?;
+
+        // A read: the store is only looked at here, so running ListServers changes
+        // nothing a later caller sees.
+        let store = state.lock();
+        let selected: Vec<&ServerRecord> = store
+            .servers
+            .values()
+            // `groupIdFilter` scopes the list to the servers that came in with one of the
+            // groups it names; an absent or empty filter scopes nothing.
+            .filter(|server| groups.is_empty() || server.in_any_group(&groups))
+            // and the (criteria, value) pair selects on the member the criteria names.
+            .filter(|server| match filter {
+                None => true,
+                Some((criteria, value)) => server.matches_criteria(criteria, value),
+            })
+            .collect();
+
+        // `servers` is keyed by id, so iterating it already gives the ascending order;
+        // `DESC` is that order reversed.
+        let ordered: Vec<&ServerRecord> = if descending {
+            selected.into_iter().rev().collect()
+        } else {
+            selected
+        };
+
+        // Where this page starts: at the id the cursor names, which is the first server
+        // the previous page did not report. The cursor already proved it was issued for
+        // this selection, so an id the list no longer holds means the record went away
+        // between pages, and the token is refused rather than answered from the top.
+        let start = match page.resume_at {
+            None => 0,
+            Some(resume_at) => ordered
+                .iter()
+                .position(|server| server.id == resume_at)
+                .ok_or_else(token_refused)?,
+        };
+        let end = start.saturating_add(page.size).min(ordered.len());
+        let server_infos: Vec<ServerDetail> = ordered[start..end]
+            .iter()
+            .map(|server| server.to_server_detail())
+            .collect();
+        // The cursor the next page resumes from, or none once this page ended the list.
+        let next_token = ordered.get(end).map(|server| {
+            Cursor {
+                selection,
+                resume_at: server.id.clone(),
+            }
+            .to_token()
+        });
+
+        Ok(ListServersOutput {
+            server_infos: Some(server_infos),
+            next_token,
+        })
     }
 }
