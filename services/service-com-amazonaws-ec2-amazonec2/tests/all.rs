@@ -96,6 +96,8 @@ mod network_insights_access_scope_analyses;
 mod network_performance_data;
 #[path = "all/placement_groups.rs"]
 mod placement_groups;
+#[path = "all/principal_id_format.rs"]
+mod principal_id_format;
 #[path = "all/regions.rs"]
 mod regions;
 #[path = "all/route_servers.rs"]

@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribePrincipalIdFormat
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribePrincipalIdFormat`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribePrincipalIdFormat::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation reports
+//!
+//! The longer-ID (17-character ID) settings of the account's principals: "the root user
+//! and all IAM roles and IAM users that have explicitly specified a longer ID
+//! (17-character ID) preference". The root user is therefore always reported and every
+//! other principal only once something has set a preference for it
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::principal_id_formats`]), while a
+//! principal's setting for a type it has not overridden comes from the root user's, which
+//! falls back to [`crate::state::DEFAULT_USE_LONG_IDS`]
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::use_long_ids_for`]).
+//!
+//! A REPORT: it writes nothing, so two calls with the same request answer the same thing.
+//! `ModifyIdentityIdFormat` is what writes a principal's preference.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +163,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribePrincipalIdFormat` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribePrincipalIdFormatErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribePrincipalIdFormat"))
+        use crate::state;
+
+        // The ID format settings are facts of the account's principals, and this store is
+        // per account (`crate::state`'s module docs), so nothing outside the request's own
+        // members is read and `ctx` carries nothing this operation needs.
+        let _ = ctx;
+
+        let store = state::require_service_state(&*self.engine)?;
+
+        // "If you have the required permissions, the error response is DryRunOperation"
+        // (`DryRun`): every caller of this emulator holds them, so a dry run stops HERE,
+        // before anything is read, and reports nothing.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // "The token to request the next page of results" (`$NextToken`) — anything else
+        // is refused rather than read as a cursor, and refused before the members that
+        // select what to report, so whether a bogus token is caught never depends on the
+        // rest of the request.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                state::decode_page_token(token)
+                    .ok_or_else(|| state::invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        // "The type of resource: bundle | conversion-task | …" (`$Resources`) narrows WHICH
+        // statuses each principal is reported with. A type the model's own list does not
+        // hold is refused rather than ignored, so a misspelled one cannot read as "every
+        // type"; the catalog is then filtered by the request, which both de-duplicates a
+        // type named twice and keeps the one stable order statuses are reported in.
+        let mut wanted = ::std::collections::BTreeSet::new();
+        for requested in input.resources.as_deref().unwrap_or_default() {
+            wanted.insert(
+                state::longer_id_resource_type(requested)
+                    .ok_or_else(state::invalid_resource_type_unknown)?,
+            );
+        }
+        let resources: Vec<&'static str> = if wanted.is_empty() {
+            state::LONGER_ID_RESOURCE_TYPES.to_vec()
+        } else {
+            state::LONGER_ID_RESOURCE_TYPES
+                .into_iter()
+                .filter(|resource| wanted.contains(resource))
+                .collect()
+        };
+
+        // A REPORT: the principals are read out of the store and nothing is written back,
+        // so this call cannot change what a later caller sees.
+        let principals = store.lock().principal_id_formats(&resources);
+
+        // `MaxResults` bounds one page of THAT set and the cursor names the ARN the next
+        // page starts at, so a token always advances in the ARN order
+        // `principal_id_formats` reports in. The model's `range 1..1000` on `MaxResults`
+        // has already refused anything outside it, so the only value that cannot convert
+        // is one the boundary validator would have rejected.
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => principals
+                .partition_point(|principal| principal.arn.as_deref().unwrap_or_default() < cursor),
+        };
+        let page = principals.get(from..).unwrap_or_default();
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(DEFAULT_MAX_RESULTS);
+
+        // "This value is null when there are no more results to return"
+        // (`DescribePrincipalIdFormatResult$NextToken`): a token only when a principal
+        // follows this page.
+        let next_token = page.get(limit).map(|principal| {
+            state::encode_page_token(principal.arn.as_deref().unwrap_or_default())
+        });
+
+        Ok(DescribePrincipalIdFormatOutput {
+            principals: Some(page.iter().take(limit).cloned().collect()),
+            next_token,
+        })
     }
 }
+
+/// The page size a request that names no `MaxResults` gets: the largest the model
+/// publishes for this operation (`DescribePrincipalIdFormatMaxResults`, `range 1..1000`),
+/// which is also the most one call can report.
+const DEFAULT_MAX_RESULTS: usize = 1000;
