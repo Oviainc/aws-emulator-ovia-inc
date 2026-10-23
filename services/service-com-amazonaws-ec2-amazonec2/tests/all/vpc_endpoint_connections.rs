@@ -858,6 +858,75 @@ async fn a_page_size_above_the_maximum_returns_at_most_one_thousand() {
     }
 }
 
+/// The store's count ceiling is STRUCTURAL: `insert_vpc_endpoint_connection` asks it
+/// itself, so a writer that forgets [`Ec2State::has_vpc_endpoint_connection_capacity`]
+/// still cannot grow the store past [`ec2::state::MAX_STORED_VPC_ENDPOINT_CONNECTIONS`] —
+/// nothing reclaims a stored connection.
+///
+/// A connection REPLACING the one already stored under the same `VpcEndpointId` does not
+/// grow the store, so it is admitted even at the ceiling.
+#[test]
+fn the_connection_store_refuses_to_grow_past_its_count_ceiling() {
+    use ec2::state::MAX_STORED_VPC_ENDPOINT_CONNECTIONS;
+
+    let engine = engine::InMemoryEngine::new();
+    let store = engine.state::<Ec2State>();
+    let mut guard = store.lock();
+    let service_id = guard.next_id("vpce-svc");
+    let spec = |endpoint_id: String| VpcEndpointConnectionSpec {
+        service_id: service_id.clone(),
+        vpc_endpoint_id: endpoint_id,
+        vpc_endpoint_owner: OTHER_ACCOUNT.to_string(),
+        vpc_endpoint_state: "PendingAcceptance".to_string(),
+        creation_timestamp: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_400),
+        vpc_endpoint_region: REGION.to_string(),
+        ip_address_type: Some("ipv4".to_string()),
+        dns_entries: Vec::new(),
+        network_load_balancer_arns: Vec::new(),
+        gateway_load_balancer_arns: Vec::new(),
+        payer_responsibilities: Vec::new(),
+        tags: Vec::new(),
+    };
+
+    let mut last = String::new();
+    for index in 0..MAX_STORED_VPC_ENDPOINT_CONNECTIONS {
+        let endpoint_id = guard.next_id("vpce");
+        last = endpoint_id.clone();
+        assert!(
+            guard
+                .insert_vpc_endpoint_connection(spec(endpoint_id))
+                .is_some(),
+            "case {index}: a connection below the ceiling must be stored"
+        );
+    }
+    assert!(
+        !guard.has_vpc_endpoint_connection_capacity(1),
+        "a store at {} connections must report itself full",
+        guard.vpc_endpoint_connections.len()
+    );
+    let beyond = guard.next_id("vpce");
+    assert_eq!(
+        guard.insert_vpc_endpoint_connection(spec(beyond)),
+        None,
+        "a connection past the ceiling must be refused, not stored"
+    );
+    assert_eq!(
+        guard.vpc_endpoint_connections.len(),
+        MAX_STORED_VPC_ENDPOINT_CONNECTIONS,
+        "the refused connection must leave the store at its ceiling"
+    );
+    // Replacing a connection already stored under the same endpoint id is still admitted.
+    assert!(
+        guard.insert_vpc_endpoint_connection(spec(last.clone())).is_some(),
+        "replacing the connection under {last:?} does not grow the store, so it is admitted"
+    );
+    assert_eq!(
+        guard.vpc_endpoint_connections.len(),
+        MAX_STORED_VPC_ENDPOINT_CONNECTIONS,
+        "a replacement must not grow the store"
+    );
+}
+
 /// A `NextToken` this service did not issue is refused with `InvalidPaginationToken`,
 /// rather than read as a cursor.
 #[tokio::test]

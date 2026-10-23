@@ -171,6 +171,22 @@
 //! `RejectVpcEndpointConnections`), which is an action rather than an instant, so —
 //! unlike a `pending` VPC — nothing beside it records a clock-owed transition.
 //!
+//! ## VPC Block Public Access exclusions
+//!
+//! [`ComAmazonawsEc2Amazonec2State::vpc_block_public_access_exclusions`] holds the
+//! account's VPC BPA exclusions as [`VpcBlockPublicAccessExclusionRecord`]s, keyed by
+//! `ExclusionId` in a [`BTreeMap`] so the describe path has one stable order and a
+//! pagination token can name the id the next page starts at. The record is the modelled
+//! [`VpcBlockPublicAccessExclusion`] every operation that reports one answers with, plus
+//! the two facts that shape carries no member for: the VPC or subnet the exclusion is
+//! applied to ([`ExclusionTarget`] — "a mode that can be applied to a single VPC or
+//! subnet"), and the move the clock owes it ([`ExclusionTransition`]), since
+//! `CreateVpcBlockPublicAccessExclusion` answers an exclusion in the non-terminal
+//! `create-in-progress` state and the clock owes it `create-complete` one
+//! [`TRANSITION_DELAY`] later — the same span, off the same monotonic clock, as an
+//! instance's [`PendingTransition`] and a `pending` VPC's `available` move, applied by
+//! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`].
+//!
 //! ## AMIs: the published catalog, plus whatever a writer stores
 //!
 //! [`ComAmazonawsEc2Amazonec2State::images`] holds the AMIs the account can see as the
@@ -300,7 +316,8 @@ use crate::ops::types::{
     Subnet, Tag,
     TagSpecification,
     TransitGateway, TransitGatewayOptions, TransitGatewayRequestOptions, TransitGatewayRouteTable,
-    UserIdGroupPair, Vpc, VpcCidrBlockAssociation, VpcCidrBlockState, VpcEndpointConnection,
+    UserIdGroupPair, Vpc, VpcBlockPublicAccessExclusion, VpcCidrBlockAssociation, VpcCidrBlockState,
+    VpcEndpointConnection,
 };
 use crate::scaffolded::Scaffolded;
 
@@ -1087,6 +1104,10 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// module docs. Ordered by endpoint id, which is the order
     /// `DescribeVpcEndpointConnections` reports and pages over.
     pub vpc_endpoint_connections: BTreeMap<String, VpcEndpointConnection>,
+    /// Every VPC Block Public Access exclusion the account holds, by `ExclusionId` — see
+    /// the module docs. Ordered by id, which is the order
+    /// `DescribeVpcBlockPublicAccessExclusions` reports and pages over.
+    pub vpc_block_public_access_exclusions: BTreeMap<String, VpcBlockPublicAccessExclusionRecord>,
     /// Every import image task the account has started, by `ImportTaskId` — see the module
     /// docs. Ordered by id, which is the order `DescribeImportImageTasks` reports and pages
     /// over.
@@ -1150,6 +1171,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             dedicated_hosts: BTreeMap::new(),
             dedicated_host_client_tokens: HashMap::new(),
             vpc_endpoint_connections: BTreeMap::new(),
+            vpc_block_public_access_exclusions: BTreeMap::new(),
             import_image_tasks: BTreeMap::new(),
             import_image_task_client_tokens: HashMap::new(),
             // "Public sharing is not blocked" is where an account that has never called
@@ -2104,10 +2126,11 @@ impl ComAmazonawsEc2Amazonec2State {
     /// has one — an instance's next state, a `pending` VPC becoming `available` with
     /// its IPv6 association moving `associating` -> `associated`, a `pending` subnet
     /// becoming `available`, a `pending` transit gateway with the route tables that come up
-    /// with it, a Windows fast launch configuration reaching `enabled` or finishing the
-    /// cleanup a disable started, and a `pending-deprovision` BYOIP range reaching the end
-    /// of its release — leaving the account, or landing in `failed-deprovision` when
-    /// addresses are still allocated from it.
+    /// with it, a VPC BPA exclusion reaching `create-complete`, a Windows fast launch
+    /// configuration reaching `enabled` or finishing the cleanup a disable started, and a
+    /// `pending-deprovision` BYOIP range reaching the end of its release — leaving the
+    /// account, or landing in `failed-deprovision` when addresses are still allocated from
+    /// it.
     ///
     /// An `active` import image task becoming `completed` with the AMI it created is one of
     /// them too; it is documented on [`Self::complete_due_import_image_tasks`], which this
@@ -2158,6 +2181,25 @@ impl ComAmazonawsEc2Amazonec2State {
             // The transition is applied once; nothing is owed on this subnet any more.
             false
         });
+        // A VPC BPA exclusion `CreateVpcBlockPublicAccessExclusion` answered as
+        // `create-in-progress` reaches `create-complete` once its due instant has passed,
+        // whether or not anybody called — the same contract as a `pending` VPC's move
+        // above.
+        for record in self.vpc_block_public_access_exclusions.values_mut() {
+            let due = record
+                .pending
+                .as_ref()
+                .filter(|pending| now >= pending.due_at)
+                .cloned();
+            if let Some(pending) = due {
+                record.view.state = Some(pending.to.to_string());
+                // The exclusion changed when the move fell due, not when somebody next
+                // asked about it, so "when the exclusion was last updated"
+                // (`VpcBlockPublicAccessExclusion$LastUpdateTimestamp`) is the due instant.
+                record.view.last_update_timestamp = Some(system_time_to_date_time(pending.at));
+                record.pending = None;
+            }
+        }
         // The end of a release `DeprovisionByoipCidr` started: at its due instant the
         // range either stops being one of the account's ranges or lands in
         // `failed-deprovision`, whether or not anybody called again.
@@ -6846,25 +6888,31 @@ pub enum FastLaunchMove {
     Discontinued,
 }
 
-/// A move the clock owes one configuration, with the instants it falls due on.
+/// A move the clock owes one stored resource, with the instants it falls due on.
+///
+/// ONE definition for every resource kind whose next state is owed to the clock rather than
+/// to a caller: the `T` is what that kind becomes ([`FastLaunchMove`] for a Windows fast
+/// launch configuration, a `&'static str` catalog word for a VPC BPA exclusion). An
+/// instance's [`PendingTransition`] is deliberately NOT one of these — it carries no
+/// wall-clock instant, an instance reporting no transition time.
 #[derive(Debug, Clone)]
-pub struct FastLaunchTransition {
-    /// What the configuration becomes.
-    pub to: FastLaunchMove,
+pub struct ClockTransition<T> {
+    /// What the resource becomes.
+    pub to: T,
     /// The instant from which the move is due. Monotonic ([`Instant`]), because it is only
     /// ever compared against the clock and never reported, so a wall-clock adjustment
-    /// cannot move a configuration back to `enabling`.
+    /// cannot move a resource back to the state it is leaving.
     pub due_at: Instant,
-    /// The wall-clock instant the move falls due, which the configuration reports as its
-    /// `StateTransitionTime` once the move has been applied — the state changed when the
+    /// The wall-clock instant the move falls due, which the resource reports as the time it
+    /// reached the new state once the move has been applied — the state changed when the
     /// move fell due, not when somebody next asked about it.
     pub at: SystemTime,
 }
 
-impl FastLaunchTransition {
+impl<T> ClockTransition<T> {
     /// A move to `to`, due [`TRANSITION_DELAY`] from now: the span this crate gives every
     /// clock-owed transition, recorded rather than slept for.
-    pub fn starting_now(to: FastLaunchMove) -> Self {
+    pub fn starting_now(to: T) -> Self {
         Self {
             to,
             due_at: Instant::now() + TRANSITION_DELAY,
@@ -6872,6 +6920,10 @@ impl FastLaunchTransition {
         }
     }
 }
+
+/// The move the clock owes one Windows fast launch configuration: a [`ClockTransition`] to
+/// the next [`FastLaunchMove`], reported as the configuration's `StateTransitionTime`.
+pub type FastLaunchTransition = ClockTransition<FastLaunchMove>;
 
 /// One image's Windows fast launch configuration: the modelled
 /// [`DescribeFastLaunchImagesSuccessItem`] every operation that reports one answers with,
@@ -7997,7 +8049,8 @@ impl ComAmazonawsEc2Amazonec2State {
     /// [`Self::has_vpc_endpoint_connection_capacity`], so a writer that forgets the gate
     /// cannot grow the store without bound either. A writer that sees `None` refuses the
     /// request with EC2's own quota code rather than reporting a connection it does not
-    /// hold.
+    /// hold. A connection REPLACING the one already stored under the same `VpcEndpointId`
+    /// does not grow the store, so it is admitted whatever the count.
     pub fn insert_vpc_endpoint_connection(
         &mut self,
         spec: VpcEndpointConnectionSpec,
@@ -8050,6 +8103,7 @@ pub fn vpc_endpoint_connection_payload_bytes(connection: &VpcEndpointConnection)
     let arn_bytes = |arns: Option<&Vec<String>>| -> usize {
         arns.into_iter().flatten().map(String::len).sum()
     };
+    let text_bytes = |value: Option<&String>| -> usize { value.map_or(0, String::len) };
     let dns_bytes: usize = connection
         .dns_entries
         .iter()
@@ -8073,6 +8127,8 @@ pub fn vpc_endpoint_connection_payload_bytes(connection: &VpcEndpointConnection)
         .saturating_add(arn_bytes(connection.network_load_balancer_arns.as_ref()))
         .saturating_add(arn_bytes(connection.gateway_load_balancer_arns.as_ref()))
         .saturating_add(dns_bytes)
+        .saturating_add(text_bytes(connection.vpc_endpoint_owner.as_ref()))
+        .saturating_add(text_bytes(connection.vpc_endpoint_region.as_ref()))
 }
 
 /// The fixed overhead one stored VPC endpoint connection costs whatever it carries: the
@@ -8157,6 +8213,262 @@ impl ComAmazonawsEc2Amazonec2State {
     pub fn set_snapshot_block_public_access_state(&mut self, state: &'static str) -> &'static str {
         self.snapshot_block_public_access = state;
         self.snapshot_block_public_access
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VPC Block Public Access exclusions
+// ---------------------------------------------------------------------------
+
+/// The id prefix of a VPC BPA exclusion, as AWS mints one: `vpcbpa-exclude-<hex>`.
+///
+/// [`ComAmazonawsEc2Amazonec2State::next_id`] appends the 17 lowercase hexadecimal digits
+/// every EC2 resource id of the long form carries.
+pub const VPC_BPA_EXCLUSION_ID_PREFIX: &str = "vpcbpa-exclude";
+
+/// An exclusion AWS is still putting in place: the `VpcBlockPublicAccessExclusionState`
+/// enum's `create-in-progress` member, which is what
+/// `CreateVpcBlockPublicAccessExclusion` answers with until [`TRANSITION_DELAY`] has
+/// passed.
+pub const VPC_BPA_EXCLUSION_STATE_CREATE_IN_PROGRESS: &str = "create-in-progress";
+
+/// An exclusion that is in place: the `VpcBlockPublicAccessExclusionState` enum's
+/// `create-complete` member, the state the clock owes a `create-in-progress` one.
+pub const VPC_BPA_EXCLUSION_STATE_CREATE_COMPLETE: &str = "create-complete";
+
+/// The `ResourceType` a `CreateVpcBlockPublicAccessExclusion` tag specification may name:
+/// the exclusion it creates (the modelled `ResourceType` enum's
+/// `vpc-block-public-access-exclusion` member).
+pub const RESOURCE_TYPE_VPC_BLOCK_PUBLIC_ACCESS_EXCLUSION: &str =
+    "vpc-block-public-access-exclusion";
+
+/// The largest number of VPC BPA exclusions this in-memory store holds.
+///
+/// A capacity bound in the same style as [`MAX_VPCS`], not an AWS quota: each exclusion is
+/// a record in this process's memory, so the number a caller can create has to be finite.
+/// [`ComAmazonawsEc2Amazonec2State::has_vpc_bpa_exclusion_capacity`] is the predicate a
+/// writer asks before inserting; a create past it refuses with
+/// [`vpc_bpa_exclusion_limit_exceeded`].
+pub const MAX_VPC_BPA_EXCLUSIONS: usize = 1_000;
+
+/// The code a create past [`MAX_VPC_BPA_EXCLUSIONS`] answers with.
+///
+/// EC2 names every per-resource quota refusal `<Resource>LimitExceeded`
+/// ([`VPC_LIMIT_EXCEEDED`], [`SUBNET_LIMIT_EXCEEDED`], [`SECURITY_GROUP_LIMIT_EXCEEDED`],
+/// [`ADDRESS_LIMIT_EXCEEDED`]), and EC2's model declares no error shapes at all, so this
+/// resource's code follows that convention.
+pub const VPC_BPA_EXCLUSION_LIMIT_EXCEEDED: &str = "VpcBlockPublicAccessExclusionLimitExceeded";
+
+/// The code EC2 answers for an exclusion id the account holds no exclusion under.
+///
+/// The same `Invalid<Resource>Id.NotFound` convention as
+/// [`INVALID_LAUNCH_TEMPLATE_ID_NOT_FOUND`].
+pub const INVALID_VPC_BPA_EXCLUSION_ID_NOT_FOUND: &str =
+    "InvalidVpcBlockPublicAccessExclusionId.NotFound";
+
+/// What a VPC BPA exclusion is applied to: "a mode that can be applied to a single VPC or
+/// subnet" (`VpcBlockPublicAccessExclusion`).
+///
+/// The modelled shape carries no member for it — the exclusion reports its own ARN, not
+/// the excluded resource's id — so it is stored beside the record under the same id, the
+/// way [`ComAmazonawsEc2Amazonec2State::vpc_attributes`] holds what a [`Vpc`] has no member
+/// for. Which resource an exclusion covers is what makes a second exclusion for the same
+/// VPC or subnet a conflict, and what a delete has to know to release it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExclusionTarget {
+    /// "A VPC ID" (`CreateVpcBlockPublicAccessExclusionRequest$VpcId`).
+    Vpc(String),
+    /// "A subnet ID" (`CreateVpcBlockPublicAccessExclusionRequest$SubnetId`).
+    Subnet(String),
+}
+
+impl ExclusionTarget {
+    /// The id of the excluded VPC or subnet.
+    pub fn resource_id(&self) -> &str {
+        match self {
+            Self::Vpc(id) | Self::Subnet(id) => id,
+        }
+    }
+
+    /// The modelled `ResourceType` word for the excluded resource, so a refusal can name
+    /// what it is as well as which.
+    pub fn resource_type(&self) -> &'static str {
+        match self {
+            Self::Vpc(_) => RESOURCE_TYPE_VPC,
+            Self::Subnet(_) => RESOURCE_TYPE_SUBNET,
+        }
+    }
+}
+
+/// The move the clock owes one exclusion: a [`ClockTransition`] to the
+/// `VpcBlockPublicAccessExclusionState` member it becomes, reported as the exclusion's
+/// `LastUpdateTimestamp`.
+///
+/// The `to` is a `&'static str` so only a word from this module's own catalog constants can
+/// be stored — never a request's text.
+pub type ExclusionTransition = ClockTransition<&'static str>;
+
+/// One VPC BPA exclusion: the modelled [`VpcBlockPublicAccessExclusion`] every operation
+/// that reports one answers with, plus the two facts that shape carries no member for.
+///
+/// `CreateVpcBlockPublicAccessExclusion`, `DescribeVpcBlockPublicAccessExclusions`,
+/// `ModifyVpcBlockPublicAccessExclusion` and `DeleteVpcBlockPublicAccessExclusion` all
+/// answer with that one shape, so the one stored view is what all of them report and they
+/// cannot describe one exclusion differently.
+#[derive(Debug, Clone)]
+pub struct VpcBlockPublicAccessExclusionRecord {
+    /// The exclusion as the model shapes it, carrying the state reached so far.
+    pub view: VpcBlockPublicAccessExclusion,
+    /// The VPC or subnet this exclusion is applied to.
+    pub target: ExclusionTarget,
+    /// The move the clock owes this exclusion, while one is owed.
+    pub pending: Option<ExclusionTransition>,
+}
+
+impl VpcBlockPublicAccessExclusionRecord {
+    /// The exclusion's `VpcBlockPublicAccessExclusionState` as it was last reported.
+    pub fn state(&self) -> &str {
+        self.view.state.as_deref().unwrap_or_default()
+    }
+
+    /// The exclusion's own id.
+    pub fn exclusion_id(&self) -> &str {
+        self.view.exclusion_id.as_deref().unwrap_or_default()
+    }
+}
+
+/// What a writer must say to store a VPC BPA exclusion; everything else about the record
+/// is derived by [`ComAmazonawsEc2Amazonec2State::insert_vpc_block_public_access_exclusion`].
+#[derive(Debug, Clone)]
+pub struct VpcBlockPublicAccessExclusionSpec {
+    /// The VPC or subnet the exclusion is applied to.
+    pub target: ExclusionTarget,
+    /// "The exclusion mode for internet gateway traffic"
+    /// (`VpcBlockPublicAccessExclusion$InternetGatewayExclusionMode`), as a `&'static str`
+    /// out of the modelled catalog ([`internet_gateway_exclusion_mode`]) so the stored
+    /// word is never the request's own text.
+    pub internet_gateway_exclusion_mode: &'static str,
+    /// The Region the request was signed for, which the exclusion's ARN names.
+    pub region: String,
+    /// The tags the request's `TagSpecifications` assign to the exclusion.
+    pub tags: Vec<Tag>,
+}
+
+/// The modelled `InternetGatewayExclusionMode` member `requested` names, or `None` when it
+/// names none.
+///
+/// The catalog is the generated [`crate::ops::types::INTERNET_GATEWAY_EXCLUSION_MODE_VALUES`],
+/// so this crate holds no second copy of it. Answering a `&'static str` out of that catalog
+/// is what keeps request text out of the store.
+pub fn internet_gateway_exclusion_mode(requested: &str) -> Option<&'static str> {
+    crate::ops::types::INTERNET_GATEWAY_EXCLUSION_MODE_VALUES
+        .iter()
+        .copied()
+        .find(|mode| *mode == requested)
+}
+
+/// Refuse a create that would take the store past [`MAX_VPC_BPA_EXCLUSIONS`]: HTTP 400
+/// [`VPC_BPA_EXCLUSION_LIMIT_EXCEEDED`].
+pub fn vpc_bpa_exclusion_limit_exceeded<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        VPC_BPA_EXCLUSION_LIMIT_EXCEEDED,
+        400,
+        format!(
+            "The maximum number of VPC Block Public Access exclusions has been reached \
+             ({MAX_VPC_BPA_EXCLUSIONS})"
+        ),
+    )
+}
+
+/// Refuse an exclusion id a request named that the account holds no exclusion under: HTTP
+/// 400 [`INVALID_VPC_BPA_EXCLUSION_ID_NOT_FOUND`].
+pub fn invalid_vpc_bpa_exclusion_id_not_found<E>(exclusion_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_VPC_BPA_EXCLUSION_ID_NOT_FOUND,
+        400,
+        format!("The VPC Block Public Access exclusion ID '{exclusion_id}' does not exist"),
+    )
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another VPC BPA exclusion fits inside the store's ceiling
+    /// ([`MAX_VPC_BPA_EXCLUSIONS`]).
+    ///
+    /// The same contract as [`Self::has_vpc_capacity`]: a create asks first and refuses
+    /// with [`vpc_bpa_exclusion_limit_exceeded`] when it answers `false`.
+    pub fn has_vpc_bpa_exclusion_capacity(&self) -> bool {
+        self.vpc_block_public_access_exclusions.len() < MAX_VPC_BPA_EXCLUSIONS
+    }
+
+    /// The id of the exclusion already applied to `target`, if the account holds one.
+    ///
+    /// An exclusion is "a mode that can be applied to a single VPC or subnet"
+    /// (`VpcBlockPublicAccessExclusion`), so one resource carries one mode: a second
+    /// exclusion for the same VPC or subnet would leave two modes in force on it with no
+    /// rule saying which wins. A create asks this first and refuses rather than storing a
+    /// conflict.
+    pub fn vpc_bpa_exclusion_for_target(&self, target: &ExclusionTarget) -> Option<&str> {
+        self.vpc_block_public_access_exclusions
+            .values()
+            .find(|record| record.target == *target)
+            .map(VpcBlockPublicAccessExclusionRecord::exclusion_id)
+    }
+
+    /// Store a VPC BPA exclusion and answer it as it was stored.
+    ///
+    /// The one way an exclusion is stored, so the id it carries, the ARN it reports, the
+    /// state it starts in, the move the clock owes it and the bytes it charges cannot be
+    /// built two ways. An exclusion is answered in the non-terminal `create-in-progress`
+    /// state, so the clock owes it `create-complete` one [`TRANSITION_DELAY`] later.
+    ///
+    /// What comes back is the stored view itself, so a create answers exactly what a later
+    /// `DescribeVpcBlockPublicAccessExclusions` will report without reading the store a
+    /// second time.
+    pub fn insert_vpc_block_public_access_exclusion(
+        &mut self,
+        spec: VpcBlockPublicAccessExclusionSpec,
+    ) -> VpcBlockPublicAccessExclusion {
+        let exclusion_id = self.next_id(VPC_BPA_EXCLUSION_ID_PREFIX);
+        // "When the exclusion was created"
+        // (`VpcBlockPublicAccessExclusion$CreationTimestamp`); the exclusion has not
+        // changed since, so that is also when it was last updated.
+        let created_at = system_time_to_date_time(SystemTime::now());
+        let view = VpcBlockPublicAccessExclusion {
+            exclusion_id: Some(exclusion_id.clone()),
+            internet_gateway_exclusion_mode: Some(spec.internet_gateway_exclusion_mode.to_string()),
+            // "The ARN of the exclusion" (`VpcBlockPublicAccessExclusion$ResourceArn`),
+            // which the `resource-arn` filter of the describe calls "the Amazon Resource
+            // Name (ARN) of a exclusion" too: an EC2 ARN in the Region the request was
+            // signed for, under the `vpc-block-public-access-exclusion` resource type the
+            // modelled `ResourceType` catalog publishes for this resource.
+            resource_arn: Some(::engine::emulator_arn(
+                "ec2",
+                &spec.region,
+                &format!("{RESOURCE_TYPE_VPC_BLOCK_PUBLIC_ACCESS_EXCLUSION}/{exclusion_id}"),
+            )),
+            state: Some(VPC_BPA_EXCLUSION_STATE_CREATE_IN_PROGRESS.to_string()),
+            // "The reason for the current exclusion state": nothing has gone wrong with
+            // this one, so there is nothing to report.
+            reason: None,
+            creation_timestamp: Some(created_at),
+            last_update_timestamp: Some(created_at),
+            // "When the exclusion was deleted": it has not been.
+            deletion_timestamp: None,
+            tags: Some(spec.tags),
+        };
+        self.add_stored_bytes(tag_list_bytes(view.tags.as_deref().unwrap_or_default()));
+        let stored = view.clone();
+        self.vpc_block_public_access_exclusions.insert(
+            exclusion_id,
+            VpcBlockPublicAccessExclusionRecord {
+                view,
+                target: spec.target,
+                pending: Some(ExclusionTransition::starting_now(
+                    VPC_BPA_EXCLUSION_STATE_CREATE_COMPLETE,
+                )),
+            },
+        );
+        stored
     }
 }
 

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateVpcBlockPublicAccessExclusion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateVpcBlockPublicAccessExclusion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: applies a VPC BPA exclusion to the single VPC or subnet the request names,
+//! stores it as the modelled [`VpcBlockPublicAccessExclusion`] shape beside the resource it
+//! excludes (see [`crate::state::VpcBlockPublicAccessExclusionRecord`]), and answers it in
+//! `create-in-progress` with the instant the clock owes it `create-complete` recorded
+//! beside it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateVpcBlockPublicAccessExclusion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +148,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateVpcBlockPublicAccessExclusion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateVpcBlockPublicAccessExclusionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateVpcBlockPublicAccessExclusion"))
+        use crate::state;
+
+        // "The exclusion mode for internet gateway traffic"
+        // (`InternetGatewayExclusionMode`), held to the modelled catalog, and stored as the
+        // catalog's own word rather than the request's text.
+        let Some(mode) =
+            state::internet_gateway_exclusion_mode(&input.internet_gateway_exclusion_mode)
+        else {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({requested}) for parameter internetGatewayExclusionMode is invalid. \
+                 Valid values are {valid}",
+                requested = input.internet_gateway_exclusion_mode,
+                valid = INTERNET_GATEWAY_EXCLUSION_MODE_VALUES.join(", "),
+            )));
+        };
+
+        // "A VPC BPA exclusion is a mode that can be applied to a single VPC or subnet"
+        // (`VpcBlockPublicAccessExclusion`): one exclusion covers one resource, so exactly
+        // one of the two id members names it — neither leaves the action with nothing to
+        // exclude, and both name two resources for one exclusion. A member that is PRESENT
+        // but empty names no resource, which is a bad value for that member rather than an
+        // absent one, so it is refused as such instead of being read as unset.
+        for (member, value) in [("vpcId", &input.vpc_id), ("subnetId", &input.subnet_id)] {
+            if value.as_deref() == Some("") {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value () for parameter {member} is invalid. It cannot be empty"
+                )));
+            }
+        }
+        let vpc_id = input.vpc_id.as_deref();
+        let subnet_id = input.subnet_id.as_deref();
+        let target = match (vpc_id, subnet_id) {
+            (Some(vpc_id), None) => state::ExclusionTarget::Vpc(vpc_id.to_string()),
+            (None, Some(subnet_id)) => state::ExclusionTarget::Subnet(subnet_id.to_string()),
+            (None, None) => {
+                return Err(state::missing_parameter(
+                    "Either 'subnetId' or 'vpcId' must be specified",
+                ));
+            }
+            (Some(_), Some(_)) => {
+                return Err(state::invalid_parameter_combination(
+                    "You cannot specify both 'subnetId' and 'vpcId'",
+                ));
+            }
+        };
+
+        // The tags to assign to the exclusion — "you must specify the resource type to tag,
+        // otherwise the request will fail" (`TagSpecification`), and the only type this
+        // action tags is the exclusion it creates. The tag payload's own bounds are applied
+        // by the one shared reader every create holds its tags to.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_VPC_BLOCK_PUBLIC_ACCESS_EXCLUSION,
+            Self::NAME,
+        )?;
+        // The caller-chosen bytes this exclusion would add to the store, charged against
+        // the crate's one byte budget below. Everything else it retains is a word the
+        // service chose or an id read back out of another store.
+        let payload_bytes = state::tag_list_bytes(&tags);
+
+        let exclusions = state::require_service_state(&*self.engine)?;
+        let region = state::request_region(ctx.parts());
+        let mut store = exclusions.lock();
+
+        // The resource the exclusion is applied to has to be one the account holds: "you
+        // can create BPA exclusions for VPCs and subnets", and an id naming neither is the
+        // same refusal every other action gives for it.
+        match &target {
+            state::ExclusionTarget::Vpc(id) => {
+                if !store.vpcs.contains_key(id.as_str()) {
+                    return Err(state::invalid_vpc_id_not_found(id));
+                }
+            }
+            state::ExclusionTarget::Subnet(id) => {
+                if !store.subnets.contains_key(id.as_str()) {
+                    return Err(state::invalid_subnet_id_not_found(id));
+                }
+            }
+        }
+
+        // One resource carries one mode, so a resource that already has an exclusion cannot
+        // be given a second one: two modes would be in force on it with no rule saying
+        // which applies.
+        if let Some(existing) = store.vpc_bpa_exclusion_for_target(&target) {
+            return Err(state::invalid_parameter_value(format!(
+                "The {resource_type} '{resource_id}' already has the VPC Block Public Access \
+                 exclusion '{existing}'",
+                resource_type = target.resource_type(),
+                resource_id = target.resource_id(),
+            )));
+        }
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds tags the caller chose the length of.
+        if !store.has_vpc_bpa_exclusion_capacity() {
+            return Err(state::vpc_bpa_exclusion_limit_exceeded());
+        }
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(crate::scaffolded::Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                 data, so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`DryRun`).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The exclusion as it was stored, so this operation and
+        // `DescribeVpcBlockPublicAccessExclusions` cannot drift apart.
+        let stored = store.insert_vpc_block_public_access_exclusion(
+            state::VpcBlockPublicAccessExclusionSpec {
+                target,
+                internet_gateway_exclusion_mode: mode,
+                region,
+                tags,
+            },
+        );
+        Ok(CreateVpcBlockPublicAccessExclusionOutput {
+            vpc_block_public_access_exclusion: Some(stored),
+        })
     }
 }

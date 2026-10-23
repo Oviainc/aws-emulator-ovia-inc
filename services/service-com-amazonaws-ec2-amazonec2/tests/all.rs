@@ -82,6 +82,8 @@ mod transit_gateway_lifecycle;
 mod volume_lifecycle;
 #[path = "all/vpc_attributes.rs"]
 mod vpc_attributes;
+#[path = "all/vpc_block_public_access_exclusions.rs"]
+mod vpc_block_public_access_exclusions;
 #[path = "all/vpc_endpoint_connections.rs"]
 mod vpc_endpoint_connections;
 #[path = "all/vpc_lifecycle.rs"]
