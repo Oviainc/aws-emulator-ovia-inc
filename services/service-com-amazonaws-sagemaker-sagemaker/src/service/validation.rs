@@ -274,8 +274,13 @@ mod tests {
             ("anchored at the end only", "[0-9]+$", "[0-9]+$"),
             ("no anchor at all", r"\d{3}", r"\d{3}"),
             ("an escaped trailing dollar", r"^[a-z]+\$$", r"[a-z]+\$"),
-            ("a fully anchored alternation", "^a$|^b$", "^a$|^b$"),
-            ("a half-anchored alternation", "^a|b$", "^a|b$"),
+            // The pair is dropped POSITIONALLY — see
+            // `service_common::validation::unanchored`, which this module reads the rule
+            // from: the published expression is the service's own with that pair written
+            // around it, so an alternation does not keep it (a lambdacore recording shows
+            // AWS dropping it from a top-level alternation).
+            ("a fully anchored alternation", "^a$|^b$", "a$|^b"),
+            ("a half-anchored alternation", "^a|b$", "a|b"),
             ("an alternation inside a group", "^(a|b)$", "(a|b)"),
             ("a negated character class", r"^[^/]+$", r"[^/]+"),
             ("a class holding a literal dollar", "^[a-z$]+$", "[a-z$]+"),

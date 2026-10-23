@@ -111,9 +111,10 @@ mod tests {
         // Each row is (case, the model's pattern, the expression the clause must state) —
         // exactly what `crate::validation::unanchored` renders, which is the single
         // implementation of that rule and is table-tested in its own module. These rows
-        // only pin that this restatement goes THROUGH it: a wrapping pair is dropped, and
-        // anything else (a lone anchor, an alternation's own anchors) stays verbatim.
-        let rows: [(&str, &str, &str); 4] = [
+        // only pin that this restatement goes THROUGH it: an outer pair is dropped, and
+        // anything else (a lone anchor, an alternation's own interior anchors) stays
+        // verbatim.
+        let rows: [(&str, &str, &str); 5] = [
             (
                 "a wrapping pair",
                 r"^[a-zA-Z0-9]([-_]*[a-zA-Z0-9]){0,63}$",
@@ -123,8 +124,15 @@ mod tests {
             ("a trailing anchor only", r"[0-9]{12}$", r"[0-9]{12}$"),
             (
                 "an alternation whose branches carry the anchors",
+                r"(^a$)|(^b$)",
+                r"(^a$)|(^b$)",
+            ),
+            // The row this one previously stated as unchanged: without the parentheses the
+            // branches SHARE the outer pair, which the rule drops positionally.
+            (
+                "an alternation sharing the outer pair",
                 r"^a$|^b$",
-                r"^a$|^b$",
+                r"a$|^b",
             ),
         ];
         for (case, pattern, expected) in rows {
