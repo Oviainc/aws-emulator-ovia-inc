@@ -37,5 +37,7 @@ mod sentiment_jobs;
 mod state_roundtrip;
 #[path = "all/sync_inference.rs"]
 mod sync_inference;
+#[path = "all/syntax.rs"]
+mod syntax;
 #[path = "all/targeted_sentiment.rs"]
 mod targeted_sentiment;

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DetectSyntax
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DetectSyntax`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DetectSyntax::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. The document is segmented into tokens on word boundaries (the UAX#29
+//! word rules over the Unicode character properties the standard library exposes) and
+//! every token is labelled in-process by the lexicon-and-morphology part-of-speech
+//! tagger below, over the modelled `PartOfSpeechTagType` set — so the token list, its
+//! offsets, its tags and its confidences are all computed from the submitted text
+//! rather than matched out of the request. A `LanguageCode` the tagger has no lexicon
+//! for is answered with the modelled `UnsupportedLanguageException`.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +81,581 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
+
+/// The largest `Text` this operation accepts, in UTF-8 bytes: the real-time quota
+/// Comprehend publishes for a single-document inference call, stated once for every
+/// real-time inference operation in [`crate::state::REALTIME_TEXT_QUOTA_BYTES`].
+/// Anything larger is refused with the `TextSizeLimitExceededException` the
+/// operation declares.
+const MAX_TEXT_BYTES: usize = crate::state::REALTIME_TEXT_QUOTA_BYTES;
+
+/// The `SyntaxLanguageCode` values the in-process tagger has a lexicon for.
+///
+/// The lexicon and the morphological rules below are English. Every other value the
+/// modelled `SyntaxLanguageCode` enum names is answered with the modelled
+/// `UnsupportedLanguageException` rather than with a token list no analysis of that
+/// language produced.
+const TAGGABLE_LANGUAGES: &[&str] = &["en"];
+
+/// Confidence reported for a token whose class follows from its Unicode general
+/// categories alone (punctuation, symbol, digits): nothing about it is ambiguous.
+const SCORE_NON_WORD: f32 = 0.99;
+
+/// Confidence for a token carrying a non-linguistic marker (`@`, `:`, `/`, `\`, `_`),
+/// reported as the modelled `O` tag.
+const SCORE_NON_LINGUISTIC: f32 = 0.95;
+
+/// Confidence for a digit-initial token that also carries letters — an ordinal or a
+/// measurement (`3rd`, `1980s`, `5km`).
+const SCORE_MIXED_NUMERIC: f32 = 0.85;
+
+/// Confidence for a closed-class word that only one word list claims.
+const SCORE_UNAMBIGUOUS: f32 = 0.99;
+
+/// Confidence for a word more than one word list claims, so the tag is the most
+/// frequent of its readings rather than the only one (`that`, `to`, `so`, `have`).
+const SCORE_AMBIGUOUS: f32 = 0.8;
+
+/// Confidence for a word recognised as an inflected form of a lexicon verb
+/// (`barks`, `stopped`, `making`).
+const SCORE_INFLECTED_VERB: f32 = 0.9;
+
+/// Confidence for a token tagged from the stem left after stripping an English
+/// clitic (`don't` -> `do`, `it's` -> `it`).
+const SCORE_CLITIC: f32 = 0.8;
+
+/// Confidence for a capitalised word away from the start of a sentence, or an
+/// all-capital acronym: the proper-noun heuristic.
+const SCORE_PROPER_NOUN: f32 = 0.9;
+
+/// Confidence for a word classified by a derivational suffix alone.
+const SCORE_MORPHOLOGY: f32 = 0.85;
+
+/// Confidence for the open-class default: an unknown word with no suffix the rules
+/// below recognise is reported as a common noun.
+const SCORE_DEFAULT_NOUN: f32 = 0.6;
+
+/// Characters that end a sentence, after which a capitalised word is no longer
+/// evidence of a proper noun. A line break does too, and is handled where
+/// whitespace is skipped, since no token is reported for it.
+const SENTENCE_FINAL: &[char] = &['.', '!', '?', '…'];
+
+/// The articles. A word straight after one of them heads a noun phrase, so a verb
+/// reading of it is demoted to a common noun — the one contextual rule the tagger
+/// applies (`the train`, `the running of the bulls`).
+const ARTICLES: &[&str] = &["a", "an", "the"];
+
+/// The connector a word can carry inside it. A token holding one is an identifier
+/// (`user_id`) rather than a word, so it is reported with the modelled `O` tag —
+/// "Other: words that are non-linguistic". An address or a URL carries characters
+/// the word rules below break on, so it is reported as the several tokens those
+/// rules make of it rather than as one `O` token.
+const NON_LINGUISTIC_MARKERS: &[char] = &['_'];
+
+/// Characters that continue a word when a word character stands on either side of
+/// them, from the UAX#29 word rules: `MidLetter`, so a contraction (`don't`) stays
+/// one token, and `MidNum`, so a figure (`25.50`, `1,000`) does.
+const MID_LETTER: &[char] = &['\'', '\u{2019}'];
+const MID_NUM: &[char] = &['.', ',', ':'];
+
+/// The characters a plain-text document carries whose Unicode general category is a
+/// Symbol (`Sc`, `Sm`, `Sk`, `So`). A token holding no letter and no digit is
+/// reported `SYM` when it carries one of these and `PUNCT` otherwise.
+const SYMBOLS: &[char] = &[
+    '$', '+', '<', '=', '>', '^', '`', '|', '~', '¢', '£', '¤', '¥', '¦', '¨', '¬', '¯', '°',
+    '±', '´', '¶', '×', '÷', '€', '₹', '₽', '₩', '₪', '©', '®', '™', '√', '∞', '≈', '≠', '≤',
+    '≥', '∑', '∂', 'µ',
+];
+
+/// English clitics UAX#29 keeps attached to their host word. The stem before the
+/// clitic decides the tag.
+const CLITICS: &[&str] = &["n't", "'s", "'re", "'m", "'ve", "'ll", "'d", "’s", "n’t"];
+
+// ---------------------------------------------------------------------------
+// The closed-class lexicon.
+//
+// One list per modelled `PartOfSpeechTagType` value, each list holding the English
+// words of that class. The class a list names is the Universal Dependencies v2
+// definition of the tag (https://universaldependencies.org/u/pos/), which is the tag
+// set Comprehend reports; the words are the frequent members of each closed class.
+// ---------------------------------------------------------------------------
+
+/// Auxiliary and modal verbs, including the negative contractions UAX#29 keeps whole.
+const AUXILIARIES: &[&str] = &[
+    "am", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had", "having", "do",
+    "does", "did", "doing", "will", "would", "shall", "should", "can", "cannot", "could", "may",
+    "might", "must", "ought", "don't", "doesn't", "didn't", "isn't", "aren't", "wasn't", "weren't",
+    "can't", "couldn't", "won't", "wouldn't", "shouldn't", "haven't", "hasn't", "hadn't",
+    "mustn't", "needn't", "ain't",
+];
+
+/// Determiners, including the possessive and demonstrative ones.
+const DETERMINERS: &[&str] = &[
+    "a", "an", "the", "this", "that", "these", "those", "my", "your", "his", "her", "its", "our",
+    "their", "some", "any", "no", "every", "each", "all", "both", "few", "several", "many", "much",
+    "another", "either", "neither", "which", "what", "whose", "enough", "such", "most", "half",
+];
+
+/// Personal, possessive, reflexive, relative and indefinite pronouns.
+const PRONOUNS: &[&str] = &[
+    "i", "me", "mine", "myself", "you", "yours", "yourself", "yourselves", "he", "him", "his",
+    "himself", "she", "her", "hers", "herself", "it", "its", "itself", "we", "us", "ours",
+    "ourselves", "they", "them", "theirs", "themselves", "who", "whom", "whoever", "whomever",
+    "what", "which", "that", "this", "these", "those", "someone", "somebody", "something",
+    "anyone", "anybody", "anything", "everyone", "everybody", "everything", "nobody", "nothing",
+    "none", "oneself",
+];
+
+/// Prepositions and postpositions.
+const PREPOSITIONS: &[&str] = &[
+    "of", "in", "to", "for", "with", "on", "at", "from", "by", "about", "as", "into", "through",
+    "after", "over", "between", "out", "against", "during", "without", "before", "under",
+    "around", "among", "above", "below", "across", "behind", "beyond", "within", "upon", "onto",
+    "near", "off", "since", "until", "till", "toward", "towards", "besides", "despite", "along",
+    "beside", "inside", "outside", "per", "via", "down", "up", "throughout", "underneath",
+    "unlike", "versus", "amid", "atop", "except", "aboard", "beneath", "opposite", "past",
+];
+
+/// Particles: the negator and the possessive clitic.
+const PARTICLES: &[&str] = &["not", "n't", "'s", "n’t", "’s"];
+
+/// Subordinating conjunctions.
+const SUBORDINATING_CONJUNCTIONS: &[&str] = &[
+    "that", "if", "because", "although", "though", "while", "whereas", "unless", "since",
+    "whether", "when", "where", "whenever", "wherever", "after", "before", "until", "as", "than",
+    "lest", "albeit",
+];
+
+/// Coordinating conjunctions. `CCONJ` is the tag Comprehend reports for them; the
+/// modelled enum also carries the deprecated `CONJ` spelling, which is never emitted.
+const COORDINATING_CONJUNCTIONS: &[&str] = &["and", "or", "but", "nor", "yet", "so", "plus"];
+
+/// Adverbs that no derivational suffix identifies (the `-ly` rule below covers the
+/// rest).
+const ADVERBS: &[&str] = &[
+    "very", "really", "quite", "too", "also", "just", "only", "even", "still", "already",
+    "always", "never", "often", "sometimes", "usually", "rarely", "seldom", "soon", "again",
+    "now", "then", "here", "there", "today", "tomorrow", "yesterday", "tonight", "well", "maybe",
+    "perhaps", "almost", "nearly", "together", "instead", "however", "therefore", "thus", "far",
+    "back", "away", "ever", "once", "twice", "indeed", "rather", "somewhat", "anyway", "else",
+    "hence", "how", "why", "likewise", "meanwhile", "moreover", "nevertheless", "nonetheless",
+    "otherwise", "overall", "abroad", "ahead", "everywhere", "somewhere", "anywhere", "nowhere",
+    "afterwards", "beforehand", "sometime", "altogether", "hardly", "barely", "merely", "upward",
+    "downward", "enough", "yes", "no",
+];
+
+/// Interjections.
+const INTERJECTIONS: &[&str] = &[
+    "oh", "ah", "aha", "ha", "wow", "hey", "hello", "hi", "bye", "goodbye", "yes", "yeah", "yep",
+    "nope", "ok", "okay", "please", "thanks", "oops", "ouch", "hmm", "uh", "um", "huh", "bravo",
+    "alas", "hooray", "hurray", "ugh", "eh", "yay", "gosh", "whoa",
+];
+
+/// Cardinal numerals spelled out as words; digits are classified by Unicode category.
+const NUMBER_WORDS: &[&str] = &[
+    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+    "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen",
+    "nineteen", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety",
+    "hundred", "thousand", "million", "billion", "trillion", "dozen",
+];
+
+/// Frequent adjectives, including the irregular comparatives and superlatives the
+/// `-er`/`-est` rules would miss.
+const ADJECTIVES: &[&str] = &[
+    "good", "bad", "big", "small", "large", "little", "new", "old", "young", "great", "high",
+    "low", "long", "short", "early", "late", "right", "wrong", "same", "different", "other",
+    "own", "important", "able", "sure", "clear", "easy", "hard", "free", "full", "empty",
+    "strong", "weak", "happy", "sad", "angry", "hot", "cold", "warm", "cool", "fast", "slow",
+    "quick", "lazy", "red", "blue", "green", "yellow", "black", "white", "brown", "grey", "gray",
+    "purple", "pink", "beautiful", "ugly", "nice", "best", "better", "worse", "worst", "less",
+    "least", "cheap", "expensive", "rich", "poor", "true", "false", "real", "main", "major",
+    "minor", "local", "whole", "entire", "single", "double", "dead", "alive", "light", "dark",
+    "heavy", "deep", "wide", "narrow", "thick", "thin", "clean", "dirty", "dry", "wet", "loud",
+    "quiet", "soft", "sharp", "smooth", "sweet", "salty", "bitter", "tall", "huge", "tiny",
+    "safe", "sick", "tired", "busy", "ready", "famous", "modern", "ancient", "foreign", "native",
+    "legal", "correct", "simple", "complex", "difficult", "serious", "funny", "strange", "usual",
+    "normal", "perfect", "certain", "likely", "aware", "afraid", "alone",
+];
+
+/// Frequent verbs: the base form plus the irregular inflections the morphological
+/// rules below cannot derive from it. Regular `-s`, `-ed` and `-ing` forms of these
+/// stems are recognised by [`Tagger::is_inflected_verb`].
+const VERBS: &[&str] = &[
+    "have", "has", "had", "having", "do", "does", "did", "doing", "go", "goes", "went", "gone",
+    "say", "said", "get", "got", "gotten", "make", "made", "know", "knew", "known", "think",
+    "thought", "take", "took", "taken", "see", "saw", "seen", "come", "came", "want", "use",
+    "find", "found", "give", "gave", "given", "tell", "told", "work", "call", "try", "ask",
+    "need", "feel", "felt", "become", "became", "leave", "left", "put", "mean", "meant", "keep",
+    "kept", "let", "begin", "began", "begun", "seem", "help", "talk", "turn", "start", "show",
+    "showed", "shown", "hear", "heard", "play", "run", "ran", "move", "like", "live", "believe",
+    "hold", "held", "bring", "brought", "happen", "write", "wrote", "written", "sit", "sat",
+    "stand", "stood", "lose", "lost", "pay", "paid", "meet", "met", "set", "learn", "learnt",
+    "lead", "led", "understand", "understood", "watch", "follow", "stop", "speak", "spoke",
+    "spoken", "read", "grow", "grew", "grown", "open", "walk", "win", "won", "offer", "love",
+    "buy", "bought", "wait", "serve", "die", "send", "sent", "build", "built", "stay", "fall",
+    "fell", "fallen", "cut", "reach", "eat", "ate", "eaten", "drink", "drank", "drunk", "sleep",
+    "slept", "jump", "sing", "sang", "sung", "swim", "swam", "swum", "drive", "drove", "driven",
+    "fly", "flew", "flown", "teach", "taught", "catch", "caught", "break", "broke", "broken",
+    "choose", "chose", "chosen", "forget", "forgot", "forgotten", "sell", "sold", "ride", "rode",
+    "ridden", "rise", "rose", "risen", "draw", "drew", "drawn", "wear", "wore", "worn", "throw",
+    "threw", "thrown", "hit", "bark", "rain", "snow", "visit", "study", "cook", "clean", "close",
+    "carry", "add", "allow", "appear", "apply", "argue", "arrive", "beat", "behave", "belong",
+    "change", "check", "claim", "consider", "contain", "continue", "cost", "cover",
+    "create", "decide", "deliver", "depend", "describe", "design", "develop", "discover",
+    "discuss", "enjoy", "enter", "exist", "expect", "explain", "fill", "finish", "fix", "focus",
+    "force", "forgive", "gather", "guess", "handle", "hurt", "imagine", "improve", "include",
+    "increase", "introduce", "join", "kill", "laugh", "lie", "lift", "listen", "look",
+    "manage", "mark", "measure", "mention", "mind", "miss", "notice", "obtain", "occur", "order",
+    "pass", "perform", "pick", "plan", "point", "prefer", "prepare", "present", "prevent",
+    "produce", "promise", "protect", "prove", "provide", "pull", "push", "raise", "reduce",
+    "refer", "reflect", "regard", "relate", "release", "remain", "remember", "remove", "repeat",
+    "replace", "reply", "report", "require", "rest", "return", "reveal", "save", "search",
+    "seek", "sought", "select", "share", "shoot", "shot", "shout", "sign", "smile", "sound",
+    "spend", "spent", "spread", "state", "stick", "stuck", "store", "suffer", "suggest",
+    "support", "suppose", "surprise", "survive", "tend", "test", "thank", "touch",
+    "train", "travel", "treat", "trust", "update", "upload", "vote", "wake", "woke",
+    "wash", "waste", "wonder", "worry", "wrap", "yield",
+];
+
+/// The word lists in the order a word more than one of them claims is resolved. The
+/// first list that holds a word decides its tag; a later claim only lowers the
+/// reported confidence to [`SCORE_AMBIGUOUS`], so the ambiguity is derived from the
+/// lexicon rather than asserted word by word.
+const LEXICON: &[(&str, &[&str])] = &[
+    ("AUX", AUXILIARIES),
+    ("DET", DETERMINERS),
+    ("PRON", PRONOUNS),
+    ("ADP", PREPOSITIONS),
+    ("PART", PARTICLES),
+    ("SCONJ", SUBORDINATING_CONJUNCTIONS),
+    ("CCONJ", COORDINATING_CONJUNCTIONS),
+    ("ADV", ADVERBS),
+    ("INTJ", INTERJECTIONS),
+    ("NUM", NUMBER_WORDS),
+    ("ADJ", ADJECTIVES),
+    ("VERB", VERBS),
+];
+
+/// English derivational suffixes and the class each one marks, scanned in this order
+/// so a longer suffix is matched before a shorter one it ends with.
+const SUFFIX_RULES: &[(&str, &str)] = &[
+    ("tion", "NOUN"),
+    ("sion", "NOUN"),
+    ("ment", "NOUN"),
+    ("ness", "NOUN"),
+    ("ship", "NOUN"),
+    ("hood", "NOUN"),
+    ("ance", "NOUN"),
+    ("ence", "NOUN"),
+    ("able", "ADJ"),
+    ("ible", "ADJ"),
+    ("ical", "ADJ"),
+    ("less", "ADJ"),
+    ("ity", "NOUN"),
+    ("ism", "NOUN"),
+    ("ist", "NOUN"),
+    ("ure", "NOUN"),
+    ("age", "NOUN"),
+    ("ery", "NOUN"),
+    ("ing", "VERB"),
+    ("ize", "VERB"),
+    ("ise", "VERB"),
+    ("ify", "VERB"),
+    ("ate", "VERB"),
+    ("ous", "ADJ"),
+    ("ful", "ADJ"),
+    ("ive", "ADJ"),
+    ("ish", "ADJ"),
+    ("ary", "ADJ"),
+    ("est", "ADJ"),
+    ("ic", "ADJ"),
+    ("al", "ADJ"),
+    ("ly", "ADV"),
+    ("ed", "VERB"),
+    ("er", "NOUN"),
+    ("or", "NOUN"),
+    ("fy", "VERB"),
+];
+
+/// The part-of-speech tagger: the lexicon indexed by word, plus the verb stems the
+/// inflectional rules derive forms from.
+#[derive(Debug)]
+struct Tagger {
+    /// Word -> (modelled tag, confidence), built from [`LEXICON`].
+    lexicon: HashMap<&'static str, (&'static str, f32)>,
+    /// The verb stems of [`VERBS`], for recognising regular inflections.
+    verb_stems: HashSet<&'static str>,
+}
+
+/// The shared tagger. Built once: indexing the lexicon is far more expensive than
+/// tagging one document, and it is immutable afterwards.
+fn tagger() -> &'static Tagger {
+    static TAGGER: OnceLock<Tagger> = OnceLock::new();
+    TAGGER.get_or_init(Tagger::build)
+}
+
+impl Tagger {
+    /// Index [`LEXICON`] in precedence order, marking a word more than one class
+    /// claims as ambiguous.
+    fn build() -> Self {
+        let mut lexicon: HashMap<&'static str, (&'static str, f32)> = HashMap::new();
+        for (tag, words) in LEXICON {
+            for word in *words {
+                match lexicon.get_mut(*word) {
+                    // A later class claims a word an earlier one already holds: keep
+                    // the earlier (more frequent) reading, report it as ambiguous.
+                    Some(entry) if entry.0 != *tag => entry.1 = SCORE_AMBIGUOUS,
+                    Some(_) => {}
+                    None => {
+                        lexicon.insert(*word, (tag, SCORE_UNAMBIGUOUS));
+                    }
+                }
+            }
+        }
+        Self {
+            lexicon,
+            verb_stems: VERBS.iter().copied().collect(),
+        }
+    }
+
+    /// The modelled tag and confidence for one token.
+    ///
+    /// `sentence_initial` says whether the token opens a sentence, where
+    /// capitalisation carries no proper-noun evidence; `after_article` says whether
+    /// the token straight before it was an article, which opens a noun phrase.
+    fn tag(&self, token: &str, sentence_initial: bool, after_article: bool) -> (&'static str, f32) {
+        let (tag, score) = self.classify(token, sentence_initial);
+        // The one contextual rule: a word straight after an article heads a noun
+        // phrase, so a verb reading of it is a common noun instead (`the train`).
+        if after_article && tag == "VERB" {
+            return ("NOUN", SCORE_AMBIGUOUS);
+        }
+        (tag, score)
+    }
+
+    /// The tag and confidence `token` carries on its own, before context.
+    fn classify(&self, token: &str, sentence_initial: bool) -> (&'static str, f32) {
+        let mut letters = false;
+        let mut digits = false;
+        let mut symbols = false;
+        let mut marker = false;
+        for character in token.chars() {
+            letters |= character.is_alphabetic();
+            digits |= character.is_numeric();
+            symbols |= SYMBOLS.contains(&character);
+            marker |= NON_LINGUISTIC_MARKERS.contains(&character);
+        }
+
+        // Tokens carrying neither letters nor digits are punctuation, or symbols when
+        // any of their characters is a Unicode Symbol (`$`, `+`, `=`).
+        if !letters && !digits {
+            return if symbols {
+                ("SYM", SCORE_NON_WORD)
+            } else {
+                ("PUNCT", SCORE_NON_WORD)
+            };
+        }
+        // A word carrying an address, URL, path or identifier marker is non-linguistic.
+        if letters && marker {
+            return ("O", SCORE_NON_LINGUISTIC);
+        }
+        if digits {
+            // All digits (and the separators inside a figure): a numeral. Digits
+            // followed by letters: an ordinal or a measurement, still a numeral.
+            if !letters {
+                return ("NUM", SCORE_NON_WORD);
+            }
+            if token.starts_with(|c: char| c.is_numeric()) {
+                return ("NUM", SCORE_MIXED_NUMERIC);
+            }
+        }
+
+        let lower = token.to_lowercase();
+        if let Some((tag, score)) = self.lexicon.get(lower.as_str()) {
+            return (tag, *score);
+        }
+        // A clitic UAX#29 kept attached: the stem before it decides the tag.
+        if let Some(stem) = strip_clitic(&lower) {
+            if let Some((tag, _)) = self.lexicon.get(stem) {
+                return (tag, SCORE_CLITIC);
+            }
+        }
+        // A regular inflection of a lexicon verb (`barks`, `stopped`, `making`).
+        if self.is_inflected_verb(&lower) {
+            return ("VERB", SCORE_INFLECTED_VERB);
+        }
+        // Capitalisation away from the start of a sentence, and all-capital acronyms,
+        // mark a proper noun.
+        if is_acronym(token) || (!sentence_initial && starts_uppercase(token)) {
+            return ("PROPN", SCORE_PROPER_NOUN);
+        }
+        // Derivational morphology, then the open-class default.
+        let length = lower.chars().count();
+        for (suffix, tag) in SUFFIX_RULES {
+            // Longer than the suffix it is matched on, counted in characters like
+            // every other length in this handler.
+            if length > suffix.chars().count() + 1 && lower.ends_with(suffix) {
+                return (tag, SCORE_MORPHOLOGY);
+            }
+        }
+        ("NOUN", SCORE_DEFAULT_NOUN)
+    }
+
+    /// Whether `word` is a regular `-s`, `-ed` or `-ing` inflection of a verb the
+    /// lexicon holds.
+    fn is_inflected_verb(&self, word: &str) -> bool {
+        inflection_stems(word)
+            .iter()
+            .any(|stem| self.verb_stems.contains(stem.as_str()))
+    }
+}
+
+/// The stems a regular English inflection of `word` could have been formed from:
+/// `-s`/`-es`/`-ies`, `-ed`/`-d` and `-ing`, each also undoing a doubled final
+/// consonant and a dropped silent `e`.
+fn inflection_stems(word: &str) -> Vec<String> {
+    let mut stems = Vec::new();
+    fn push_variants(stems: &mut Vec<String>, stem: &str) {
+        // Counted in characters, like every other length in this handler.
+        if stem.chars().count() < 2 {
+            return;
+        }
+        stems.push(stem.to_string());
+        stems.push(format!("{stem}e"));
+        let mut characters = stem.chars().rev();
+        if let (Some(last), Some(previous)) = (characters.next(), characters.next()) {
+            if last == previous && last.is_alphabetic() {
+                stems.push(stem[..stem.len() - last.len_utf8()].to_string());
+            }
+        }
+    }
+
+    if let Some(stem) = word.strip_suffix("ies") {
+        stems.push(format!("{stem}y"));
+    }
+    for suffix in ["ing", "es", "ed", "s", "d"] {
+        if let Some(stem) = word.strip_suffix(suffix) {
+            push_variants(&mut stems, stem);
+        }
+    }
+    stems
+}
+
+/// `word` without a trailing English clitic, when it carries one.
+fn strip_clitic(word: &str) -> Option<&str> {
+    CLITICS.iter().find_map(|clitic| {
+        word.strip_suffix(clitic)
+            .filter(|stem| stem.chars().count() >= 2)
+    })
+}
+
+/// Whether the token starts with an upper-case letter.
+fn starts_uppercase(token: &str) -> bool {
+    token.chars().next().is_some_and(char::is_uppercase)
+}
+
+/// Whether the token is an all-capital acronym of at least two letters.
+fn is_acronym(token: &str) -> bool {
+    token.chars().filter(|c| c.is_alphabetic()).count() >= 2
+        && token.chars().all(|c| !c.is_alphabetic() || c.is_uppercase())
+}
+
+/// Whether `character` belongs to a word: a letter, a digit, or the connector
+/// UAX#29 keeps inside one (`ExtendNumLet`, so `user_id` stays one token).
+fn is_word_character(character: char) -> bool {
+    character.is_alphanumeric() || character == '_'
+}
+
+/// The index just past the word starting at `start` in `characters`.
+///
+/// A word is a run of word characters, which a joiner continues when a character of
+/// the same kind stands on either side of it: an apostrophe between letters
+/// (`MidLetter`) or a separator between digits (`MidNum`). Every other character is
+/// a token of its own, so punctuation is split off one mark at a time.
+fn word_end(characters: &[(usize, char)], start: usize) -> usize {
+    let mut index = start + 1;
+    while index < characters.len() {
+        let character = characters[index].1;
+        if is_word_character(character) {
+            index += 1;
+            continue;
+        }
+        let previous = characters[index - 1].1;
+        let joins = match characters.get(index + 1).map(|(_, next)| *next) {
+            Some(next) if MID_LETTER.contains(&character) => {
+                previous.is_alphabetic() && next.is_alphabetic()
+            }
+            Some(next) if MID_NUM.contains(&character) => {
+                previous.is_numeric() && next.is_numeric()
+            }
+            _ => false,
+        };
+        if !joins {
+            break;
+        }
+        index += 2;
+    }
+    index
+}
+
+/// Segment `text` into the syntax tokens `DetectSyntax` reports.
+///
+/// Boundaries are word boundaries, so a figure (`3.14`) and a contraction (`don't`)
+/// each stay whole while punctuation is split off; whitespace carries no token.
+/// `TokenId` is the token's 1-based position in the document and the offsets are a
+/// half-open range of zero-based character positions, so slicing the document by them
+/// returns the token's own `Text`.
+fn syntax_tokens(text: &str) -> Vec<SyntaxToken> {
+    let tagger = tagger();
+    let characters: Vec<(usize, char)> = text.char_indices().collect();
+    let mut tokens: Vec<SyntaxToken> = Vec::new();
+    let mut index = 0usize;
+    let mut sentence_initial = true;
+    let mut after_article = false;
+
+    while index < characters.len() {
+        let (byte, character) = characters[index];
+        if character.is_whitespace() {
+            // No token is reported for whitespace, but a line break still ends a
+            // sentence for the capitalisation heuristic.
+            sentence_initial |= character == '\n';
+            index += 1;
+            continue;
+        }
+
+        // `index` counts CHARACTERS, so it is the offset the response reports; the
+        // byte index beside it is only used to slice the token out of the document.
+        let begin = index;
+        let end = if is_word_character(character) {
+            word_end(&characters, index)
+        } else {
+            index + 1
+        };
+        let end_byte = characters.get(end).map_or(text.len(), |(byte, _)| *byte);
+        let piece = &text[byte..end_byte];
+        index = end;
+
+        let (tag, score) = tagger.tag(piece, sentence_initial, after_article);
+        sentence_initial = piece.chars().all(|c| SENTENCE_FINAL.contains(&c));
+        after_article = ARTICLES.contains(&piece.to_lowercase().as_str());
+
+        tokens.push(SyntaxToken {
+            token_id: Some(tokens.len() as i32 + 1),
+            text: Some(piece.to_string()),
+            begin_offset: Some(begin as i32),
+            end_offset: Some(end as i32),
+            part_of_speech: Some(PartOfSpeechTag {
+                tag: Some(tag.to_string()),
+                score: Some(score),
+            }),
+        });
+    }
+
+    tokens
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -153,18 +727,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DetectSyntax` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DetectSyntaxErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DetectSyntax"))
+        // Synchronous inference holds no state: the token list is a function of
+        // `Text` and `LanguageCode` alone, so repeating a call returns the same
+        // tokens and nothing a later caller reads is changed.
+        let _ = (ctx, &self.engine);
+
+        // The model's `@length` floor of 1 is enforced at the boundary; the byte
+        // quota is not modelled at all, so it is enforced here, through the one
+        // size check and the one size-report message every real-time inference
+        // operation shares.
+        if let Some(message) = crate::state::text_size_refusal(&input.text, MAX_TEXT_BYTES) {
+            return Err(DetectSyntaxErrorModeled::TextSizeLimitExceededException(
+                TextSizeLimitExceededException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // Membership of the `SyntaxLanguageCode` enum is enforced at the boundary;
+        // whether this emulator's tagger has a lexicon for that language is not.
+        if !TAGGABLE_LANGUAGES.contains(&input.language_code.as_str()) {
+            return Err(DetectSyntaxErrorModeled::UnsupportedLanguageException(
+                UnsupportedLanguageException {
+                    message: Some(format!(
+                        "This emulator's syntax engine cannot process the language '{}'. \
+                         Supported languages: {}.",
+                        input.language_code,
+                        TAGGABLE_LANGUAGES.join(", ")
+                    )),
+                },
+            )
+            .into());
+        }
+
+        Ok(DetectSyntaxOutput {
+            syntax_tokens: Some(syntax_tokens(&input.text)),
+        })
     }
 }
