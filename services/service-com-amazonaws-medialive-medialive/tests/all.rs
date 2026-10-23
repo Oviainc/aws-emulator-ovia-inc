@@ -62,6 +62,9 @@ mod multiplex_lifecycle;
 #[path = "all/multiplex_programs.rs"]
 mod multiplex_programs;
 
+#[path = "all/multiplex_start.rs"]
+mod multiplex_start;
+
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 
