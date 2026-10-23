@@ -7,8 +7,14 @@ publish = false
 build = "build.rs"
 
 [dependencies]
-# The shared request-claim rule for a SigV4 signing name several services share.
+# The shared request-claim rule for a SigV4 signing name several services share, and the
+# one evaluation of an IAM identity-based policy this service authorizes a caller with.
 service-common = { path = "../common" }
+# The caller's identity, from the same registry `sts:GetCallerIdentity` answers from, and
+# the identity-based policies the account holds for it. Read-only: this service writes
+# neither store.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 engine = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }

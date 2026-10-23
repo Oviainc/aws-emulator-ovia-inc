@@ -336,23 +336,28 @@ pub struct GuardrailConfiguration {
     pub guardrail_version: String,
 }
 
+// `PartialEq` on the invocation-step payload tree (this union and everything reachable
+// from it): `PutInvocationStep` is `@idempotent`, so a write under an `invocationStepId`
+// that already names a stored step has to tell a REPLAY of the same content from a
+// CONFLICTING rewrite of it, and that comparison is value equality of the stored payload
+// against the submitted one. Nothing else about these shapes changes.
 #[smithy_macros::smithy(union_for = "com.amazonaws.bedrockagentruntime#InvocationStepPayload")]
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum InvocationStepPayload {
     contentBlocks(Vec<BedrockSessionContentBlock>),
 }
 
 #[smithy_macros::smithy(union_for = "com.amazonaws.bedrockagentruntime#BedrockSessionContentBlock")]
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum BedrockSessionContentBlock {
     Text(String),
     Image(ImageBlock),
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentruntime#ImageBlock")]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ImageBlock {
     pub format: String,
     pub source: ImageSource,
@@ -360,14 +365,14 @@ pub struct ImageBlock {
 
 #[smithy_macros::smithy(union_for = "com.amazonaws.bedrockagentruntime#ImageSource")]
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ImageSource {
     Bytes(Vec<u8>),
     s3Location(S3Location),
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentruntime#S3Location")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct S3Location {
     pub uri: String,
 }

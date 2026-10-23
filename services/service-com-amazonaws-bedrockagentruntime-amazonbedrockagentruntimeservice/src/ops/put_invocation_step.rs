@@ -4,7 +4,9 @@
 //! IMPLEMENTED: stores one invocation step, payload union and all, under the named
 //! session and invocation. AWS documents that an ended session's content can still
 //! be read but not added to (`smithy_query(query="doc",shape="EndSession")`), so a
-//! session that is not `ACTIVE` is a 409 `ConflictException`.
+//! session that is not `ACTIVE` is a 409 `ConflictException`. The operation is
+//! `@idempotent`, so a write under an `invocationStepId` already stored is a replay
+//! when it carries the same content and a 409 `ConflictException` when it does not.
 //!
 //! ## Shape of an operation
 //!
@@ -167,7 +169,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        if let Err(denied) = crate::state::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::session_resource_arn(ctx, &input.session_identifier),
+        ) {
+            return Err(PutInvocationStepErrorModeled::AccessDeniedException(denied).into());
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(PutInvocationStepErrorModeled::InternalServerException(
                 InternalServerException {
@@ -221,28 +230,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let step_id = input
             .invocation_step_id
             .unwrap_or_else(crate::state::new_uuid);
-        // An explicit `invocationStepId` that already exists overwrites that step and
-        // keeps its position in the store order, so a rewrite does not reshuffle a
-        // listing; a new id takes the next position.
-        let order = match invocation.steps.get(&step_id) {
-            Some(existing) => existing.order,
-            None => {
-                if invocation.steps.len() >= crate::state::MAX_STEPS_PER_INVOCATION {
-                    // Resource guard, not an AWS quota: see `state::MAX_SESSIONS`.
-                    return Err(PutInvocationStepErrorModeled::ServiceQuotaExceededException(
-                        ServiceQuotaExceededException {
-                            message: Some(format!(
-                                "Invocation {} holds the maximum of {} invocation steps this emulator keeps.",
-                                invocation.invocation_id,
-                                crate::state::MAX_STEPS_PER_INVOCATION
-                            )),
-                        },
-                    )
-                    .into());
-                }
-                crate::state::next_order(&mut store.order_counter)
+        // An explicit `invocationStepId` that already names a stored step is a REPLAY
+        // when it carries the same content, and a CONFLICT when it does not: the id is
+        // the step's identity, so one caller's step is never silently rewritten by
+        // another's. A replay stores nothing new — the stored record already IS the
+        // write — so it answers the stored id and leaves the session untouched.
+        if let Some(existing) = invocation.steps.get(&step_id) {
+            if existing.invocation_step_time == input.invocation_step_time
+                && existing.payload == input.payload
+            {
+                return Ok(PutInvocationStepOutput {
+                    invocation_step_id: step_id,
+                });
             }
-        };
+            return Err(PutInvocationStepErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Invocation step {step_id} already exists in invocation {} with different \
+                     content.",
+                    invocation.invocation_id
+                )),
+            })
+            .into());
+        }
+        if invocation.steps.len() >= crate::state::MAX_STEPS_PER_INVOCATION {
+            // Resource guard, not an AWS quota: see `state::MAX_SESSIONS`.
+            return Err(PutInvocationStepErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "Invocation {} holds the maximum of {} invocation steps this emulator keeps.",
+                        invocation.invocation_id,
+                        crate::state::MAX_STEPS_PER_INVOCATION
+                    )),
+                },
+            )
+            .into());
+        }
+        let order = crate::state::next_order(&mut store.order_counter);
         invocation.steps.insert(
             step_id.clone(),
             crate::state::InvocationStepRecord {

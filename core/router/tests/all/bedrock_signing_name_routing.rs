@@ -33,8 +33,10 @@
 //! `/listTagsForResource`; Bedrock Agent and Bedrock Agent Runtime both bind `/agents`,
 //! `/flows`, `/knowledgebases` and `/tags` — the segment separates nothing, and
 //! `service_common::bedrock` splits those spaces once for both sides: by the whole
-//! modelled route where the two bind different routes, and by a declared owner where
-//! they bind the identical ones.
+//! modelled route where the two bind different routes, by the resource TYPE the ARN in
+//! the path names where the routes are identical but the label is a resource ARN
+//! (`/tags/{resourceArn}`), and by a declared owner where nothing in the request tells
+//! them apart.
 //!
 //! This suite pins that: the claim table (who claims what), the property that the six
 //! models' path spaces overlap ONLY where that rule declares a split, and that a request
@@ -366,8 +368,9 @@ fn each_service_sharing_the_bedrock_signing_name_claims_only_its_own_surface() {
         },
         Row {
             // The agent pair bind `/tags/{resourceArn}` IDENTICALLY on all three methods,
-            // so nothing in the request tells them apart and the segment has a declared
-            // owner — the build-time plane that owns the resources being tagged.
+            // so neither the method nor the URI template tells them apart — the ARN in
+            // the path does, because the two models' `TaggableResourcesArn` patterns name
+            // disjoint resource types. An `agent` ARN is the build-time plane's.
             case: "the tagging path both agent models bind",
             method: "GET",
             path: "/tags/arn%3Aaws%3Abedrock%3Aus-east-1%3A%3Aagent%2Fa1",
@@ -378,6 +381,41 @@ fn each_service_sharing_the_bedrock_signing_name_claims_only_its_own_surface() {
             case: "the same tagging path as a POST",
             method: "POST",
             path: "/tags/arn%3Aaws%3Abedrock%3Aus-east-1%3A%3Aagent%2Fa1",
+            target: None,
+            claimants: vec![AGENT],
+        },
+        Row {
+            // A `session` ARN is the data plane's: `session` is the ONLY resource type
+            // the `bedrock-agent-runtime` model's own taggable-resource pattern admits.
+            case: "the tagging path with a session ARN",
+            method: "POST",
+            path: "/tags/arn%3Aaws%3Abedrock%3Aus-west-2%3A000000000000%3Asession%2F\
+                   0cabde93-58b4-4d68-b230-90df328e1acb",
+            target: None,
+            claimants: vec![AGENT_RUNTIME],
+        },
+        Row {
+            case: "reading a session's tags",
+            method: "GET",
+            path: "/tags/arn%3Aaws%3Abedrock%3Aus-west-2%3A000000000000%3Asession%2F\
+                   0cabde93-58b4-4d68-b230-90df328e1acb",
+            target: None,
+            claimants: vec![AGENT_RUNTIME],
+        },
+        Row {
+            case: "removing a session's tags",
+            method: "DELETE",
+            path: "/tags/arn%3Aaws%3Abedrock%3Aus-west-2%3A000000000000%3Asession%2F\
+                   0cabde93-58b4-4d68-b230-90df328e1acb?tagKeys=k",
+            target: None,
+            claimants: vec![AGENT_RUNTIME],
+        },
+        Row {
+            // A label that names no resource of this family falls to the declared owner,
+            // so such a request still reaches exactly one claimant.
+            case: "the tagging path with a label that is no bedrock ARN",
+            method: "GET",
+            path: "/tags/not-an-arn",
             target: None,
             claimants: vec![AGENT],
         },

@@ -2,9 +2,10 @@
 
 //! @op CreateInvocation
 //! IMPLEMENTED: persists an invocation under the session named by
-//! `sessionIdentifier` (a bare session UUID or a session ARN). The model marks the
-//! operation `@idempotent`, so repeating it with an `invocationId` that already
-//! exists reports the stored record rather than minting a second one.
+//! `sessionIdentifier` (a bare session UUID or a session ARN). `(sessionId,
+//! invocationId)` is a key: a create under an `invocationId` the session already
+//! holds is refused with the modelled 409 `ConflictException`, so exactly one caller
+//! claims an id.
 //!
 //! ## Shape of an operation
 //!
@@ -166,7 +167,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        if let Err(denied) = crate::state::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::session_resource_arn(ctx, &input.session_identifier),
+        ) {
+            return Err(CreateInvocationErrorModeled::AccessDeniedException(denied).into());
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateInvocationErrorModeled::InternalServerException(
                 InternalServerException {
@@ -208,37 +216,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .invocation_id
             .unwrap_or_else(crate::state::new_uuid);
         let session_id = session.session_id.clone();
-        if !session.invocations.contains_key(&invocation_id) {
-            if session.invocations.len() >= crate::state::MAX_INVOCATIONS_PER_SESSION {
-                // Resource guard, not an AWS quota: see `state::MAX_SESSIONS`.
-                return Err(CreateInvocationErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException {
-                        message: Some(format!(
-                            "Session {session_id} holds the maximum of {} invocations this emulator keeps.",
-                            crate::state::MAX_INVOCATIONS_PER_SESSION
-                        )),
-                    },
-                )
-                .into());
-            }
-            let order = crate::state::next_order(&mut store.order_counter);
-            let now = crate::state::now();
-            session.invocations.insert(
-                invocation_id.clone(),
-                crate::state::Invocation {
-                    invocation_id: invocation_id.clone(),
-                    session_id: session_id.clone(),
-                    description: input.description,
-                    created_at: now,
-                    steps: ::std::collections::BTreeMap::new(),
-                    order,
-                },
-            );
-            session.last_updated_at = now;
+        // `(sessionId, invocationId)` is a KEY: creating an invocation CLAIMS that id in
+        // the session, so a second create under an id the session already holds is
+        // refused with the modelled 409 rather than handing two callers the same
+        // invocation. The whole handler holds the store lock, so the check and the
+        // insert are one atomic claim and exactly one of N concurrent creates wins.
+        if session.invocations.contains_key(&invocation_id) {
+            return Err(CreateInvocationErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Invocation {invocation_id} already exists in session {session_id}."
+                )),
+            })
+            .into());
         }
+        if session.invocations.len() >= crate::state::MAX_INVOCATIONS_PER_SESSION {
+            // Resource guard, not an AWS quota: see `state::MAX_SESSIONS`.
+            return Err(CreateInvocationErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "Session {session_id} holds the maximum of {} invocations this emulator keeps.",
+                        crate::state::MAX_INVOCATIONS_PER_SESSION
+                    )),
+                },
+            )
+            .into());
+        }
+        let order = crate::state::next_order(&mut store.order_counter);
+        let now = crate::state::now();
+        session.invocations.insert(
+            invocation_id.clone(),
+            crate::state::Invocation {
+                invocation_id: invocation_id.clone(),
+                session_id: session_id.clone(),
+                description: input.description,
+                created_at: now,
+                steps: ::std::collections::BTreeMap::new(),
+                order,
+            },
+        );
+        session.last_updated_at = now;
 
-        // Report the PERSISTED record: on a repeat call that is the original
-        // invocation, with the `createdAt` it was first stored with.
+        // Report the PERSISTED record, read back out of the store, so nothing can be
+        // answered that did not reach it.
         let Some(stored) = session.invocations.get(&invocation_id) else {
             return Err(CreateInvocationErrorModeled::InternalServerException(
                 InternalServerException {

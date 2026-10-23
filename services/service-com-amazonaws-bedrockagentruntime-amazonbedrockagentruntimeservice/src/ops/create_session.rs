@@ -193,6 +193,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         let created_at = crate::state::now();
 
+        // Authorization is decided against the ARN of the session this call is about to
+        // mint — the resource an identity-based policy for `bedrock:CreateSession` names
+        // — and before anything is written.
+        if let Err(denied) = crate::state::authorize(&*self.engine, ctx, Self::NAME, &session_arn) {
+            return Err(CreateSessionErrorModeled::AccessDeniedException(denied).into());
+        }
+
         let mut guard = state.lock();
         if guard.sessions.len() >= crate::state::MAX_SESSIONS {
             // Resource guard, not an AWS quota: see `state::MAX_SESSIONS`. The store

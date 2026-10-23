@@ -96,10 +96,28 @@ pub(crate) fn error_code(body: &Value) -> &str {
     body.get("__type").and_then(Value::as_str).unwrap_or("")
 }
 
-/// A timestamp member's value as epoch seconds, whichever JSON number form the
-/// codec rendered it in.
+/// A `date-time` timestamp member's value as epoch seconds.
+///
+/// Every `DateTimestamp` member of this service carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape",shape="InvocationStep")`), so its wire form is an RFC
+/// 3339 string: a value that is not one reads as `None` and the assertion naming it
+/// fails.
 fn seconds(value: &Value) -> Option<f64> {
-    value.as_f64()
+    let rendered = value.as_str()?;
+    ::aws_smithy_types::DateTime::from_str(
+        rendered,
+        ::aws_smithy_types::date_time::Format::DateTime,
+    )
+    .ok()
+    .map(|instant| instant.as_secs_f64())
+}
+
+/// `epoch_seconds` as the RFC 3339 `date-time` string a client sends for a
+/// `@timestampFormat("date-time")` member.
+fn date_time(epoch_seconds: i64) -> String {
+    ::aws_smithy_types::DateTime::from_secs(epoch_seconds)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .expect("an epoch-seconds instant renders as RFC 3339")
 }
 
 /// Percent-encode a `sessionIdentifier` for use as a non-greedy `@httpLabel`: a
@@ -298,9 +316,8 @@ pub(crate) async fn create_invocation(
 
 /// Write one invocation step and return its invocationStepId.
 ///
-/// `step_time` is epoch seconds: that is the timestamp encoding this framework's
-/// JSON codec speaks, since the generated member schemas carry no
-/// `@timestampFormat` override.
+/// `step_time` is epoch seconds, sent as the RFC 3339 `date-time` string the member's
+/// `@timestampFormat("date-time")` requires.
 pub(crate) async fn put_step(
     router: &MultiServiceRouter,
     identifier: &str,
@@ -315,7 +332,7 @@ pub(crate) async fn put_step(
         &path,
         json!({
             "invocationIdentifier": invocation_id,
-            "invocationStepTime": step_time,
+            "invocationStepTime": date_time(step_time),
             "payload": payload,
         }),
     )
@@ -455,8 +472,8 @@ async fn the_session_workflow_runs_end_to_end_and_reports_persisted_state() {
         "GetSession: a new session is ACTIVE, got {session:?}"
     );
     assert!(
-        session["lastUpdatedAt"].is_number(),
-        "GetSession: lastUpdatedAt must be present, got {session:?}"
+        seconds(&session["lastUpdatedAt"]).is_some(),
+        "GetSession: lastUpdatedAt must be present as an RFC 3339 date-time, got {session:?}"
     );
 
     // 7. DeleteSession is refused while the session is ACTIVE.
@@ -724,73 +741,118 @@ async fn an_invocation_step_payload_round_trips_unchanged_for_every_union_shape(
     }
 }
 
-/// RULE: a step written under an `invocationStepId` that already exists REPLACES that
-/// step rather than adding one, and the replacement is what later reads see.
+/// RULE: `PutInvocationStep` is `@idempotent`, so a write under an `invocationStepId`
+/// that already names a stored step is accepted only as a REPLAY of that step's own
+/// content; a write that would change the stored content is refused with the modelled
+/// `ConflictException` (409) and the stored step is left as it was.
 #[tokio::test]
-async fn writing_an_existing_step_id_replaces_that_step_in_place() {
+async fn rewriting_a_stored_step_id_with_other_content_is_refused() {
     let router = router();
     let (session_id, _) = create_session(&router, Value::Null).await;
     let invocation_id = create_invocation(&router, &session_id, json!({})).await;
+    let stored = json!({ "contentBlocks": [{ "text": "draft" }] });
+    let stored_time: i64 = 1_777_957_505;
     let step_id = put_step(
         &router,
         &session_id,
         &invocation_id,
-        1_777_957_505,
-        &json!({ "contentBlocks": [{ "text": "draft" }] }),
+        stored_time,
+        &stored,
     )
     .await;
 
-    let replacement = json!({ "contentBlocks": [{ "text": "final" }, { "text": "addendum" }] });
-    let (status, out) = call(
-        &router,
-        "PUT",
-        &format!("/sessions/{}/invocationSteps/", label(&session_id)),
-        json!({
-            "invocationIdentifier": invocation_id,
-            "invocationStepId": step_id,
-            "invocationStepTime": 1_777_961_166,
-            "payload": replacement,
-        }),
-    )
-    .await;
-    assert_eq!(
-        (status, out["invocationStepId"].as_str()),
-        (201, Some(step_id.as_str())),
-        "rewriting a step must keep its id, got {status} {out:?}"
-    );
-
-    let (status, got) = call(
-        &router,
-        "POST",
-        &format!(
-            "/sessions/{}/invocationSteps/{step_id}",
-            label(&session_id)
-        ),
-        json!({ "invocationIdentifier": invocation_id }),
-    )
-    .await;
-    assert_eq!(status, 200, "GetInvocationStep: expected 200, got {status} {got:?}");
-    assert_eq!(
+    // (case, invocationStepTime, payload, expected status, expected error code)
+    let rows: Vec<(&str, i64, Value, u16, &str)> = vec![
         (
-            &got["invocationStep"]["payload"],
-            seconds(&got["invocationStep"]["invocationStepTime"])
+            "the same content again: an idempotent replay",
+            stored_time,
+            stored.clone(),
+            201,
+            "",
         ),
-        (&replacement, Some(1_777_961_166.0)),
-        "the replacement must be what is read back, got {got:?}"
-    );
+        (
+            "a different payload under the same id",
+            stored_time,
+            json!({ "contentBlocks": [{ "text": "final" }, { "text": "addendum" }] }),
+            409,
+            "ConflictException",
+        ),
+        (
+            "one more content block under the same id",
+            stored_time,
+            json!({ "contentBlocks": [{ "text": "draft" }, { "text": "draft" }] }),
+            409,
+            "ConflictException",
+        ),
+        (
+            "the same payload at a different instant",
+            1_777_961_166,
+            stored.clone(),
+            409,
+            "ConflictException",
+        ),
+    ];
 
-    let (status, listed) = call(
-        &router,
-        "POST",
-        &format!("/sessions/{}/invocationSteps/", label(&session_id)),
-        json!({ "invocationIdentifier": invocation_id }),
-    )
-    .await;
-    assert_eq!(
-        (status, listed["invocationStepSummaries"].as_array().map(Vec::len)),
-        (200, Some(1)),
-        "a rewrite must not add a second step, got {status} {listed:?}"
-    );
+    for (case, step_time, payload, expected_status, expected_code) in rows {
+        let (status, out) = call(
+            &router,
+            "PUT",
+            &format!("/sessions/{}/invocationSteps/", label(&session_id)),
+            json!({
+                "invocationIdentifier": invocation_id,
+                "invocationStepId": step_id,
+                "invocationStepTime": date_time(step_time),
+                "payload": payload,
+            }),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&out)),
+            (expected_status, expected_code),
+            "case {case:?}: expected {expected_status} {expected_code:?}, got {status} {out:?}"
+        );
+        if expected_status == 201 {
+            assert_eq!(
+                out["invocationStepId"].as_str(),
+                Some(step_id.as_str()),
+                "case {case:?}: a replay must answer the stored id, got {out:?}"
+            );
+        }
+
+        // Whatever the answer, the stored step is still the one first written.
+        let (status, got) = call(
+            &router,
+            "POST",
+            &format!(
+                "/sessions/{}/invocationSteps/{step_id}",
+                label(&session_id)
+            ),
+            json!({ "invocationIdentifier": invocation_id }),
+        )
+        .await;
+        assert_eq!(status, 200, "case {case:?}: GetInvocationStep expected 200, got {got:?}");
+        assert_eq!(
+            (
+                &got["invocationStep"]["payload"],
+                seconds(&got["invocationStep"]["invocationStepTime"])
+            ),
+            (&stored, Some(stored_time as f64)),
+            "case {case:?}: the stored step must be unchanged, got {got:?}"
+        );
+
+        let (status, listed) = call(
+            &router,
+            "POST",
+            &format!("/sessions/{}/invocationSteps/", label(&session_id)),
+            json!({ "invocationIdentifier": invocation_id }),
+        )
+        .await;
+        assert_eq!(
+            (status, listed["invocationStepSummaries"].as_array().map(Vec::len)),
+            (200, Some(1)),
+            "case {case:?}: neither a replay nor a refusal adds a step, got {status} {listed:?}"
+        );
+    }
 }
 
 /// Walk every page of ListInvocationSteps, returning the ids seen in order and the
@@ -1309,7 +1371,7 @@ async fn an_unknown_session_invocation_or_step_is_a_modelled_404() {
             format!("/sessions/{absent}/invocationSteps/"),
             json!({
                 "invocationIdentifier": invocation_id,
-                "invocationStepTime": 1_783_501_811,
+                "invocationStepTime": date_time(1_783_501_811),
                 "payload": { "contentBlocks": [{ "text": "x" }] },
             }),
         ),
@@ -1319,7 +1381,7 @@ async fn an_unknown_session_invocation_or_step_is_a_modelled_404() {
             format!("/sessions/{session_id}/invocationSteps/"),
             json!({
                 "invocationIdentifier": absent,
-                "invocationStepTime": 1_783_501_811,
+                "invocationStepTime": date_time(1_783_501_811),
                 "payload": { "contentBlocks": [{ "text": "x" }] },
             }),
         ),
@@ -1390,7 +1452,8 @@ async fn an_ended_session_is_readable_but_no_longer_writable() {
         "EndSession: expected 200 ENDED, got {status} {ended:?}"
     );
 
-    // EndSession is @idempotent: repeating it reports the same ended session.
+    // The ACTIVE -> ENDED transition is one-way: a second EndSession has no transition
+    // to perform and is refused.
     let (status, again) = call(
         &router,
         "PATCH",
@@ -1399,9 +1462,14 @@ async fn an_ended_session_is_readable_but_no_longer_writable() {
     )
     .await;
     assert_eq!(
-        (status, &again),
-        (200, &ended),
-        "EndSession is idempotent: the second call must answer as the first, got {status} {again:?}"
+        (status, error_code(&again)),
+        (409, "ConflictException"),
+        "EndSession on an ENDED session must be refused, got {status} {again:?}"
+    );
+    assert_eq!(
+        ended["sessionStatus"].as_str(),
+        Some("ENDED"),
+        "the first EndSession is the one that performed the transition, got {ended:?}"
     );
 
     // Writes are refused.
@@ -1418,7 +1486,7 @@ async fn an_ended_session_is_readable_but_no_longer_writable() {
             format!("/sessions/{session_id}/invocationSteps/"),
             json!({
                 "invocationIdentifier": invocation_id,
-                "invocationStepTime": 1_783_501_812,
+                "invocationStepTime": date_time(1_783_501_812),
                 "payload": { "contentBlocks": [{ "text": "after the end" }] },
             }),
         ),
@@ -1468,10 +1536,11 @@ async fn an_ended_session_is_readable_but_no_longer_writable() {
     );
 }
 
-/// RULE: CreateInvocation is `@idempotent` — repeating it with an `invocationId` that
-/// is already stored reports the stored record, and does not add a second invocation.
+/// RULE: `(sessionId, invocationId)` is a key — a create under an `invocationId` the
+/// session already holds is refused with the modelled `ConflictException` (409), so
+/// exactly one caller claims an id and no second invocation is added under it.
 #[tokio::test]
-async fn repeating_create_invocation_with_a_known_id_reports_the_stored_invocation() {
+async fn a_second_create_invocation_with_a_known_id_is_refused() {
     let router = router();
     let (session_id, _) = create_session(&router, Value::Null).await;
     let chosen = "0123abcd-4567-89ef-0123-456789abcdef";
@@ -1490,20 +1559,29 @@ async fn repeating_create_invocation_with_a_known_id_reports_the_stored_invocati
         "CreateInvocation must use the supplied invocationId, got {status} {first:?}"
     );
 
-    let (status, second) = call(
-        &router,
-        "PUT",
-        &path,
-        json!({ "invocationId": chosen, "description": "turn-1" }),
-    )
-    .await;
-    assert_eq!(
-        (status, &second),
-        (201, &first),
-        "a repeat must report the stored invocation unchanged, got {status} {second:?}"
-    );
+    // The rows differ in what the SECOND create carries: the same body, a different
+    // description, and no description at all. The id is claimed, so each is refused.
+    let rows: Vec<(&str, Value)> = vec![
+        (
+            "the same body again",
+            json!({ "invocationId": chosen, "description": "turn-1" }),
+        ),
+        (
+            "a different description",
+            json!({ "invocationId": chosen, "description": "turn-2" }),
+        ),
+        ("no description at all", json!({ "invocationId": chosen })),
+    ];
+    for (case, body) in rows {
+        let (status, refused) = call(&router, "PUT", &path, body).await;
+        assert_eq!(
+            (status, error_code(&refused)),
+            (409, "ConflictException"),
+            "case {case:?}: expected 409 ConflictException, got {status} {refused:?}"
+        );
+    }
 
-    // And the step written under it lands on the one stored invocation.
+    // And the one claimed invocation is still there, holding the step written under it.
     put_step(
         &router,
         &session_id,
@@ -1824,7 +1902,7 @@ async fn a_write_past_a_declared_store_maximum_is_refused_not_allocated() {
         &format!("/sessions/{session_id}/invocationSteps/"),
         json!({
             "invocationIdentifier": invocation_id,
-            "invocationStepTime": 1_783_501_811,
+            "invocationStepTime": date_time(1_783_501_811),
             "payload": { "contentBlocks": [{ "text": "one too many" }] },
         }),
     )
@@ -1836,7 +1914,7 @@ async fn a_write_past_a_declared_store_maximum_is_refused_not_allocated() {
          {MAX_STEPS_PER_INVOCATION} must be refused, got {status} {refused:?}"
     );
 
-    // A rewrite of an existing step is not growth, so it is still accepted at the cap.
+    // A REPLAY of a stored step is not growth, so it is still accepted at the cap.
     let (_, listed) = call(
         &steps_router,
         "POST",
@@ -1844,9 +1922,10 @@ async fn a_write_past_a_declared_store_maximum_is_refused_not_allocated() {
         json!({ "invocationIdentifier": invocation_id }),
     )
     .await;
-    let existing = listed["invocationStepSummaries"][0]["invocationStepId"]
+    let summary = &listed["invocationStepSummaries"][0];
+    let existing = summary["invocationStepId"]
         .as_str()
-        .unwrap_or_else(|| panic!("ListInvocationSteps: no step to rewrite in {listed:?}"))
+        .unwrap_or_else(|| panic!("ListInvocationSteps: no step to replay in {listed:?}"))
         .to_string();
     let (status, out) = call(
         &steps_router,
@@ -1855,15 +1934,15 @@ async fn a_write_past_a_declared_store_maximum_is_refused_not_allocated() {
         json!({
             "invocationIdentifier": invocation_id,
             "invocationStepId": existing,
-            "invocationStepTime": 1_783_501_900,
-            "payload": { "contentBlocks": [{ "text": "rewritten at the cap" }] },
+            "invocationStepTime": date_time(1_783_501_811),
+            "payload": { "contentBlocks": [{ "text": "step-0" }] },
         }),
     )
     .await;
     assert_eq!(
         (status, out["invocationStepId"].as_str()),
         (201, Some(existing.as_str())),
-        "case steps: rewriting a stored step adds nothing, so it must still be accepted at \
+        "case steps: replaying a stored step adds nothing, so it must still be accepted at \
          the cap, got {status} {out:?}"
     );
 }

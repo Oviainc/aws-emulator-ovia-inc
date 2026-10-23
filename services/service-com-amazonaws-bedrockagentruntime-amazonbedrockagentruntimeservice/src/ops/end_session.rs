@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EndSession
-//! IMPLEMENTED: flips the stored session's status to `ENDED`. The model marks the
-//! operation `@idempotent`, so a session that is already ended is reported as it
-//! stands rather than refused.
+//! IMPLEMENTED: performs the session's one-way `ACTIVE` -> `ENDED` transition. The
+//! transition is gated on the current status, so a session that is not `ACTIVE` is
+//! refused with the modelled 409 `ConflictException` instead of being reported as
+//! though this call had ended it.
 //!
 //! ## Shape of an operation
 //!
@@ -157,7 +158,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        if let Err(denied) = crate::state::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::session_resource_arn(ctx, &input.session_identifier),
+        ) {
+            return Err(EndSessionErrorModeled::AccessDeniedException(denied).into());
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(EndSessionErrorModeled::InternalServerException(
                 InternalServerException {
@@ -182,10 +190,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        if session.status == crate::state::SessionStatus::Active {
-            session.status = crate::state::SessionStatus::Ended;
-            session.last_updated_at = crate::state::now();
+        // ACTIVE -> ENDED is a one-way transition this call PERFORMS, so it is gated on
+        // the current status: a session that is not ACTIVE is already past the
+        // transition and the call is refused with the modelled 409 rather than
+        // answering as though it had performed one. The whole handler holds the store
+        // lock, so exactly one of N concurrent calls performs it.
+        if session.status != crate::state::SessionStatus::Active {
+            return Err(EndSessionErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Session {} has status {} and cannot be ended.",
+                    session.session_id,
+                    session.status.as_wire()
+                )),
+            })
+            .into());
         }
+        session.status = crate::state::SessionStatus::Ended;
+        session.last_updated_at = crate::state::now();
 
         Ok(EndSessionOutput {
             session_id: session.session_id.clone(),

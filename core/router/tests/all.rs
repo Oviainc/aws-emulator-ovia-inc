@@ -27,6 +27,8 @@ mod aws_marketplace_signing_name_routing;
 mod bedrock_agentcore_gateway_lambda_target;
 #[path = "all/bedrock_agentcore_signing_name_routing.rs"]
 mod bedrock_agentcore_signing_name_routing;
+#[path = "all/bedrock_agent_runtime_session_authorization.rs"]
+mod bedrock_agent_runtime_session_authorization;
 #[path = "all/bedrock_signing_name_routing.rs"]
 mod bedrock_signing_name_routing;
 #[path = "all/boot_serve.rs"]

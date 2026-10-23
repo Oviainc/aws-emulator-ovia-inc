@@ -9,12 +9,22 @@
 //! `ListInvocations`, `ListInvocationSteps`) resolves its `sessionIdentifier`
 //! through the ONE helper [`session_id_from_identifier`], so they all agree on what
 //! a bare UUID and a session ARN mean.
+//!
+//! Beside the store, this module carries the one AUTHORIZATION decision every
+//! session-scoped operation makes before it answers ([`authorize`]): who the caller is,
+//! and whether that caller's identity-based permissions cover `bedrock:<Operation>` on
+//! the session. It lives here, not in a handler, because all of them must decide it the
+//! same way.
 
 use std::collections::BTreeMap;
+use std::time::SystemTime;
 
 use ::aws_smithy_types::DateTime;
 
-use crate::ops::types::InvocationStepPayload;
+use service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam_state;
+use service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_state;
+
+use crate::ops::types::{AccessDeniedException, InvocationStepPayload};
 
 /// The region an ARN carries when the request is unsigned, so no SigV4 credential
 /// scope names one. Matches the region every generated emulator defaults to (see
@@ -43,6 +53,14 @@ pub const MAX_INVOCATIONS_PER_SESSION: usize = 1_000;
 
 /// Resource guard: the most steps one invocation holds. See [`MAX_SESSIONS`].
 pub const MAX_STEPS_PER_INVOCATION: usize = 1_000;
+
+/// Resource guard: the most tags one session holds, taken from the model's own bound on
+/// a single tagging request (`smithy_query(query="operation",operation="TagResource")` ->
+/// `tags` is `TagsMap`, `length {min: 1, max: 200}`). `TagResource` merges into a stored
+/// map, so without a ceiling repeated calls with fresh keys would grow one session's map
+/// without bound; past it the write answers its modelled `ServiceQuotaExceededException`.
+/// An emulator limit, not an AWS published quota.
+pub const MAX_TAGS_PER_SESSION: usize = 200;
 
 /// The `maxResults` bounds this service's session listings declare
 /// (`smithy_query(query="operation",operation="ListInvocationSteps,ListInvocations")`
@@ -122,10 +140,11 @@ pub struct Session {
     /// different answers they are.
     pub session_metadata: Option<BTreeMap<String, String>>,
     pub encryption_key_arn: Option<String>,
-    /// The `tags` `CreateSession` was given, stored so nothing the caller supplied is
-    /// dropped. WRITE-ONLY for now: `TagResource`, `UntagResource` and
-    /// `ListTagsForResource` are still the scaffold's 501, so no implemented
-    /// operation reads this map yet — it becomes live when those land.
+    /// The session's tags: what `CreateSession` was given, merged by `TagResource` and
+    /// pruned by `UntagResource`, and what `ListTagsForResource` reports. A session ARN
+    /// is the ONLY resource this service's `TaggableResourcesArn` admits
+    /// (`smithy_query(query="operation",operation="TagResource")` -> `resourceArn`), so
+    /// this map is the whole tag plane.
     pub tags: BTreeMap<String, String>,
     pub invocations: BTreeMap<String, Invocation>,
     /// Store order, as for [`InvocationStepRecord::order`].
@@ -283,4 +302,278 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsBedrockagentruntimeAmazonbedrockagentruntimeserviceState>)
+}
+
+/// The ARN of the session a `sessionIdentifier` names, which is the RESOURCE an
+/// authorization decision about a session-scoped call is made against.
+///
+/// An identifier that is already a session ARN IS that resource; a bare session id names
+/// the session in the region the caller signed for and this emulator's account, the same
+/// ARN `CreateSession` mints. Built without a store lookup, so the decision is made
+/// before — and independently of — whether the session exists.
+pub fn session_resource_arn(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    identifier: &str,
+) -> String {
+    if identifier.starts_with("arn:") {
+        return identifier.to_string();
+    }
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        &request_region(ctx),
+        &format!("session/{identifier}"),
+    )
+}
+
+/// The IAM service prefix this service's actions carry: `bedrock:GetSession`,
+/// `bedrock:PutInvocationStep`, … It is the ARN namespace, not the endpoint prefix
+/// (`smithy_query(query="service_info")` -> `awsService.arnNamespace`), exactly as
+/// [`ARN_NAMESPACE`] is.
+pub const ACTION_PREFIX: &str = ARN_NAMESPACE;
+
+/// Authorize this request, the one way every session-scoped operation does it.
+///
+/// `operation` is the operation's name (`Self::NAME` in a handler), which names the IAM
+/// action `bedrock:<Operation>`; `resource` is the ARN the request acts on (the session's
+/// ARN). `Ok(())` when the caller may make the call, and the modelled
+/// `AccessDeniedException` (HTTP 403) when it may not.
+///
+/// The decision has two halves, and neither is invented here:
+///
+/// * WHO the caller is comes from the same source `sts:GetCallerIdentity` answers from —
+///   the STS session registry, keyed by the access key id the request signed with
+///   ([`caller`]) — so the principal a refusal blames is the one the caller reads back
+///   from STS for its own credentials.
+/// * WHAT that caller may do comes from the identity-based policy documents the IAM store
+///   holds for it (a role's inline policies and the default version of each managed policy
+///   attached to it; a user's inline policies), evaluated by the ONE shared reading of an
+///   IAM document (`service_common::iam_authorization`). IAM's default is deny, so a
+///   principal the account grants nothing authorizes nothing. A session has no
+///   resource-based policy of its own — the model gives this service no
+///   `PutResourcePolicy` — so the identity-based decision is the whole decision.
+///
+/// THE SAME RULE, AND THE SAME READING OF IT, as
+/// `services/service-com-amazonaws-rum-rum/src/state/authorization.rs`, which is the
+/// in-tree precedent: the two agree on the account's own credential, on an attachment this
+/// emulator cannot read, and on an expired credential (below). The gathering is not shared
+/// in `services/common` because it reads the IAM and STS service stores, and
+/// `services/common` is a dependency of nearly every service crate — putting those two
+/// crates behind it would place them in every service's build graph. Only the DECISION,
+/// which needs no store, lives there.
+///
+/// Three callers are not principals the IAM store holds policies for, and each is
+/// answered the way that precedent answers it:
+///
+/// * the account's own published credential (the long-term key this emulator hands out),
+///   which is the position AWS account root credentials are in: allowed;
+/// * a principal with an AWS-MANAGED policy attached, whose document the IAM store
+///   deliberately does not hold (`iam_state::AWS_MANAGED_POLICY_ACCOUNT`): allowed,
+///   because refusing on a grant this emulator cannot read would deny access AWS permits;
+/// * an expired session credential, which speaks for nobody: refused.
+pub fn authorize<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    operation: &str,
+    resource: &str,
+) -> Result<(), AccessDeniedException> {
+    use ::service_common::iam_authorization as iam;
+
+    let action = format!("{ACTION_PREFIX}:{operation}");
+    let caller = caller(engine, ctx);
+    if caller.unbounded {
+        return Ok(());
+    }
+    // A session carries no resource-based policy, so the identity-based decision is the
+    // whole one and `NotStated` is IAM's implicit deny.
+    let request = iam::Request::new(&action, resource, &[]);
+    let identity = iam::identity_decision(&caller.documents, &request);
+    if iam::is_allowed(identity, iam::Decision::NotStated) {
+        return Ok(());
+    }
+    let reason = if identity == iam::Decision::Denied {
+        format!("with an explicit deny in an identity-based policy for the {action} action")
+    } else {
+        format!("because no identity-based policy allows the {action} action")
+    };
+    Err(AccessDeniedException {
+        // Built from the request: the principal that signed it, the action it performs
+        // and the resource it names. AWS words this refusal the same way, and a client
+        // reads the principal and the action out of it to fix its policy.
+        message: Some(format!(
+            "User: {} is not authorized to perform: {action} on resource: {resource} {reason}",
+            caller.arn
+        )),
+    })
+}
+
+/// The principal a request speaks for, and everything the decision is made from.
+#[derive(Debug, Clone)]
+pub struct Caller {
+    /// The principal's ARN, as `sts:GetCallerIdentity` reports it — what a refusal names.
+    pub arn: String,
+    /// The identity-based policy documents in force on the principal.
+    pub documents: Vec<String>,
+    /// Set when the identity side cannot refuse this caller: the account's own published
+    /// credential, or a principal carrying a grant this emulator cannot read (see
+    /// [`authorize`]).
+    pub unbounded: bool,
+}
+
+/// The principal THIS request speaks for, and the identity-based policies in force on it.
+///
+/// Read from the same source `sts:GetCallerIdentity` answers from — the STS session the
+/// request's access key id names — so the principal an authorization decision is made
+/// about, and the one a refusal blames, is the one the caller reads back from STS for its
+/// own credentials. `resolve_caller` materialises the session expiries the clock has
+/// already made due before it answers, a write owed at the same instant whether or not
+/// anybody called, which is why a REPORTING operation may make this decision.
+pub fn caller<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+) -> Caller {
+    let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
+    let identity = match sts_state::service_state(engine) {
+        Some(sts) => sts_state::resolve_caller(
+            &mut sts.lock(),
+            &access_key_id,
+            SystemTime::now(),
+            ctx.credential_store(),
+        ),
+        // No STS store on this engine: the only identity a request can present is the
+        // account's own published credential.
+        None => Ok(sts_state::ambient_identity()),
+    };
+    let identity = match identity {
+        Ok(identity) => identity,
+        // The session credential has expired, so it speaks for nobody: no documents and
+        // nothing unbounded, which refuses every action it asks for.
+        Err(expired) => {
+            return Caller {
+                arn: format!("an expired session credential ({})", expired.access_key_id),
+                documents: Vec::new(),
+                unbounded: false,
+            }
+        }
+    };
+
+    let mut caller = Caller {
+        unbounded: identity.arn == sts_state::ambient_identity().arn,
+        arn: identity.arn,
+        documents: Vec::new(),
+    };
+    let Some(iam) = iam_state::service_state(engine) else {
+        return caller;
+    };
+    let store = iam.lock();
+    if let Some(role_name) = assumed_role_name(&caller.arn) {
+        let role_key = iam_state::name_key(role_name);
+        caller
+            .documents
+            .extend(inline_documents(&store.role_inline_policies, &role_key));
+        for attached in store
+            .role_attached_policies
+            .get(&role_key)
+            .into_iter()
+            .flatten()
+        {
+            match store
+                .policy_by_arn(attached)
+                .and_then(default_version_document)
+            {
+                Some(document) => caller.documents.push(document),
+                // Only an AWS-MANAGED policy is a grant this emulator cannot read; an
+                // attachment naming a customer-managed policy the account does not hold
+                // grants nothing, because the account IS the authority on its own.
+                None if is_aws_managed_policy(attached) => caller.unbounded = true,
+                None => {}
+            }
+        }
+    } else if let Some(user_name) = iam_user_name(&caller.arn) {
+        caller.documents.extend(inline_documents(
+            &store.user_inline_policies,
+            &iam_state::name_key(user_name),
+        ));
+    }
+    caller
+}
+
+/// Whether `arn` names an AWS-MANAGED policy: one whose account segment is IAM's `aws`,
+/// so it belongs to AWS rather than to this account and the IAM store holds no document
+/// for it. Read through IAM's own ARN parser, so this service and IAM agree on what an
+/// AWS-managed policy ARN is.
+fn is_aws_managed_policy(arn: &str) -> bool {
+    iam_state::parse_policy_arn(arn)
+        .is_some_and(|policy| policy.account == iam_state::AWS_MANAGED_POLICY_ACCOUNT)
+}
+
+/// The role name an STS assumed-role session ARN names.
+///
+/// `sts:AssumeRole` reports the session as
+/// `arn:<partition>:sts::<account>:assumed-role/<role name>/<session name>`
+/// (`sts_state::sts_arn`), so the role is the first segment after `assumed-role/`. `None`
+/// for any other ARN form.
+fn assumed_role_name(arn: &str) -> Option<&str> {
+    let resource = arn_resource(arn, "sts")?;
+    let name = resource.strip_prefix("assumed-role/")?.split('/').next()?;
+    (!name.is_empty()).then_some(name)
+}
+
+/// The user name an IAM user ARN names: the LAST segment of `user/<path…>/<name>`, since
+/// the path is optional and only the last segment is the name.
+fn iam_user_name(arn: &str) -> Option<&str> {
+    let resource = arn_resource(arn, "iam")?;
+    let name = resource.strip_prefix("user/")?.split('/').next_back()?;
+    (!name.is_empty()).then_some(name)
+}
+
+/// The resource part of an ARN whose service segment is `service`.
+///
+/// An ARN is `arn:<partition>:<service>:<region>:<account>:<resource>`, and the resource
+/// may itself carry colons, so only the first five fields are split off.
+fn arn_resource<'a>(arn: &'a str, service: &str) -> Option<&'a str> {
+    let mut fields = arn.splitn(6, ':');
+    let (Some("arn"), Some(_partition), Some(named), Some(_region), Some(_account), Some(resource)) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return None;
+    };
+    (named == service).then_some(resource)
+}
+
+/// The inline policy documents one entity holds, from the IAM store's
+/// `<entity> -> <policy name> -> policy` map.
+fn inline_documents(
+    policies: &BTreeMap<String, BTreeMap<String, iam_state::InlinePolicy>>,
+    entity_key: &str,
+) -> Vec<String> {
+    policies
+        .get(entity_key)
+        .map(|held| {
+            held.values()
+                .map(|policy| policy.policy_document.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The document of a managed policy's DEFAULT version — the one in force on every entity
+/// it is attached to. `None` when the store holds no document for it.
+fn default_version_document(managed: &iam_state::ManagedPolicy) -> Option<String> {
+    let default = managed.policy.default_version_id.as_deref();
+    managed
+        .versions
+        .values()
+        .find(|version| default.is_some() && version.version_id.as_deref() == default)
+        .or_else(|| {
+            managed
+                .versions
+                .values()
+                .find(|version| version.is_default_version)
+        })
+        .and_then(|version| version.document.clone())
 }

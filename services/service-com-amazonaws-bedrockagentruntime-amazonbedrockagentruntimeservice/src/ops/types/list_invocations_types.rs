@@ -26,11 +26,29 @@ pub struct ListInvocationsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentruntime#InvocationSummary")]
+/// `InvocationSummary`. Its schema and codec come from [`session_schema_and_codec!`]
+/// rather than `#[smithy_macros::smithy(shape = ...)]` because `createdAt` carries
+/// `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape",shape="InvocationSummary")`), which the derive does not
+/// put on a member schema — see `types/date_time_wire.rs` for that whole story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct InvocationSummary {
     pub session_id: String,
     pub invocation_id: String,
     pub created_at: ::aws_smithy_types::DateTime,
 }
+
+session_schema_and_codec!(
+    InvocationSummary,
+    INVOCATION_SUMMARY_SCHEMA,
+    "com.amazonaws.bedrockagentruntime#InvocationSummary",
+    "com.amazonaws.bedrockagentruntime",
+    "InvocationSummary",
+    (M_SESSION_ID, session_id, "sessionId", 0, req, string),
+    (M_INVOCATION_ID, invocation_id, "invocationId", 1, req, string),
+    (M_CREATED_AT, created_at, "createdAt", 2, req, date_time),
+);
 

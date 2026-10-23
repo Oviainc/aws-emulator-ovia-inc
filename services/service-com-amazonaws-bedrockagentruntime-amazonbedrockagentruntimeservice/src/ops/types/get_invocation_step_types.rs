@@ -25,7 +25,14 @@ pub struct GetInvocationStepOutput {
     pub invocation_step: InvocationStep,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentruntime#InvocationStep")]
+/// `InvocationStep`. Its schema and codec come from [`session_schema_and_codec!`] rather
+/// than `#[smithy_macros::smithy(shape = ...)]` because `invocationStepTime` carries
+/// `@timestampFormat("date-time")` (`smithy_query(query="shape",shape="InvocationStep")`),
+/// which the derive does not put on a member schema — see `types/date_time_wire.rs` for
+/// that whole story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct InvocationStep {
     pub session_id: String,
@@ -34,4 +41,38 @@ pub struct InvocationStep {
     pub invocation_step_time: ::aws_smithy_types::DateTime,
     pub payload: InvocationStepPayload,
 }
+
+session_schema_and_codec!(
+    InvocationStep,
+    INVOCATION_STEP_SCHEMA,
+    "com.amazonaws.bedrockagentruntime#InvocationStep",
+    "com.amazonaws.bedrockagentruntime",
+    "InvocationStep",
+    (M_SESSION_ID, session_id, "sessionId", 0, req, string),
+    (M_INVOCATION_ID, invocation_id, "invocationId", 1, req, string),
+    (
+        M_INVOCATION_STEP_ID,
+        invocation_step_id,
+        "invocationStepId",
+        2,
+        req,
+        string
+    ),
+    (
+        M_INVOCATION_STEP_TIME,
+        invocation_step_time,
+        "invocationStepTime",
+        3,
+        req,
+        date_time
+    ),
+    (
+        M_PAYLOAD,
+        payload,
+        "payload",
+        4,
+        req,
+        union_of(InvocationStepPayload)
+    ),
+);
 

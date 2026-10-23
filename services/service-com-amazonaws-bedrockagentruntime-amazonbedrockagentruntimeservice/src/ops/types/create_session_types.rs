@@ -19,7 +19,14 @@ pub struct CreateSessionInput {
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentruntime#CreateSessionResponse")]
+/// `CreateSessionResponse`. Its schema and codec come from
+/// [`session_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `createdAt` carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape",shape="CreateSessionResponse")`), which the derive does
+/// not put on a member schema — see `types/date_time_wire.rs` for that whole story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct CreateSessionOutput {
     pub session_id: String,
@@ -27,4 +34,16 @@ pub struct CreateSessionOutput {
     pub session_status: String,
     pub created_at: ::aws_smithy_types::DateTime,
 }
+
+session_schema_and_codec!(
+    CreateSessionOutput,
+    CREATE_SESSION_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrockagentruntime#CreateSessionResponse",
+    "com.amazonaws.bedrockagentruntime",
+    "CreateSessionResponse",
+    (M_SESSION_ID, session_id, "sessionId", 0, req, string),
+    (M_SESSION_ARN, session_arn, "sessionArn", 1, req, string),
+    (M_SESSION_STATUS, session_status, "sessionStatus", 2, req, string),
+    (M_CREATED_AT, created_at, "createdAt", 3, req, date_time),
+);
 

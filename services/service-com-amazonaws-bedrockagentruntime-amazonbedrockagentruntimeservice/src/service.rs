@@ -89,9 +89,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // first three the two models bind DIFFERENT routes, so this service claims only
         // the routes its own model binds (`POST /knowledgebases/{id}/retrieve`, the flow
         // execution paths, the agent memory and invocation paths); under `tags` both bind
-        // the identical three routes, so that segment is the build-time plane's by
-        // declaration. `None` for the RPC argument: every operation here is bound to a
-        // URI.
+        // the identical three routes, so the ARN in the path decides — the two models'
+        // `TaggableResourcesArn` patterns name disjoint resource types, and a `session`
+        // ARN is this service's. `None` for the RPC argument: every operation here is
+        // bound to a URI.
         service_common::bedrock::claims_request(
             parts,
             self.definition(),
