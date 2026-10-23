@@ -35,6 +35,8 @@ mod config_rule_evaluation_status;
 mod config_service_linked_recorder;
 #[path = "all/config_setup_and_rule_loop.rs"]
 mod config_setup_and_rule_loop;
+#[path = "all/config_stored_queries.rs"]
+mod config_stored_queries;
 #[path = "all/config_tagging.rs"]
 mod config_tagging;
 #[path = "all/discovered_resources.rs"]

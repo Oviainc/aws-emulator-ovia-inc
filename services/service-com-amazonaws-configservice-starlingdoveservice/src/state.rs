@@ -24,7 +24,7 @@ use crate::ops::types::{
     ExecutionControls, OrganizationAggregationSource, PendingAggregationRequest, RecordingGroup,
     RecordingMode, RecordingStrategy, RemediationConfiguration, RemediationParameterValue,
     ResourceDetails, ResourceEvaluation, ResourceIdentifier, RetentionConfiguration, Scope, Source,
-    Tag,
+    StoredQuery, Tag,
 };
 
 /// The ARN namespace of this service (`awsService.arnNamespace` in the model), used
@@ -325,6 +325,13 @@ pub const AGGREGATION_AUTHORIZATIONS_QUOTA: usize = 5_000;
 /// it matches the `ConfigRuleNames` length maximum (0..25) the same operation
 /// declares.
 pub const DESCRIBE_CONFIG_RULES_PAGE_SIZE: usize = 25;
+
+/// The most stored queries this account and Region can hold (`PutStoredQuery`: "You
+/// can create upto 300 queries in a single Amazon Web Services account and a single
+/// Amazon Web Services Region"). A request that would create one past it is refused
+/// with `ValidationException`, which is the error the model lists for "You are trying
+/// to create more than 300 queries".
+pub const STORED_QUERIES_QUOTA: usize = 300;
 
 /// The timeout an evaluation runs under when the request asks for none
 /// (`StartResourceEvaluationRequest$EvaluationTimeout`: "The timeout for an
@@ -1569,6 +1576,39 @@ impl AggregationAuthorizationEntry {
     }
 }
 
+/// One persisted stored query (`StoredQuery`).
+#[derive(Debug, Clone, Default)]
+pub struct StoredQueryEntry {
+    /// The `QueryName` this query is keyed by: "The QueryName must be unique for a
+    /// single Amazon Web Services account and a single Amazon Web Services Region".
+    pub name: String,
+    /// The `QueryId` Config assigned when the query was created. It is part of the
+    /// query's ARN and never changes once minted, so an update in place keeps it.
+    pub id: String,
+    pub arn: String,
+    pub description: Option<String>,
+    pub expression: String,
+    /// The tags the query was CREATED with (`PutStoredQuery`: "Tags are added at
+    /// creation and cannot be updated ... tags will not be updated, even if they are
+    /// different"), and whatever the tagging operations have since made of them: they
+    /// are the one tag set of this resource, reached through
+    /// [`ComAmazonawsConfigserviceStarlingdoveserviceState::tags_of`].
+    pub tags: TagSet,
+}
+
+impl StoredQueryEntry {
+    /// The modelled `StoredQuery`, read back out of state.
+    pub fn to_shape(&self) -> StoredQuery {
+        StoredQuery {
+            query_id: Some(self.id.clone()),
+            query_arn: Some(self.arn.clone()),
+            query_name: self.name.clone(),
+            description: self.description.clone(),
+            expression: Some(self.expression.clone()),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-configservice-starlingdoveservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsConfigserviceStarlingdoveserviceState {
@@ -1601,6 +1641,15 @@ pub struct ComAmazonawsConfigserviceStarlingdoveserviceState {
     /// Source of the next configuration recorder id, so every recorder Config
     /// creates here gets a distinct one.
     pub next_recorder_seq: u64,
+    /// Stored queries, keyed by `QueryName` — unique per account per Region, which is
+    /// what one engine's store stands for. A `BTreeMap` so a list of them pages over a
+    /// stable ordering and a page token survives inserts and deletes.
+    ///
+    /// BOUNDED at [`STORED_QUERIES_QUOTA`] entries: `PutStoredQuery` refuses a NEW
+    /// query past that quota, so no sequence of calls can grow this map further.
+    pub stored_queries: BTreeMap<String, StoredQueryEntry>,
+    /// Source of the next `QueryId` suffix, so every stored query gets a distinct id.
+    pub next_stored_query_seq: u64,
     /// Connectors to third-party cloud service providers, keyed by connector ARN. The
     /// ARN carries both the Region the connector belongs to and its name, so the key
     /// is what identifies one connector of one account in one Region. A `BTreeMap` so
@@ -1780,6 +1829,9 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
         {
             return Some(&aggregator.tags);
         }
+        if let Some(stored_query) = self.stored_queries.values().find(|entry| entry.arn == arn) {
+            return Some(&stored_query.tags);
+        }
         None
     }
 
@@ -1798,6 +1850,13 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
             .find(|entry| entry.arn == arn)
         {
             return Some(&mut aggregator.tags);
+        }
+        if let Some(stored_query) = self
+            .stored_queries
+            .values_mut()
+            .find(|entry| entry.arn == arn)
+        {
+            return Some(&mut stored_query.tags);
         }
         None
     }
@@ -1862,6 +1921,42 @@ fn splitmix64(seq: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     z ^ (z >> 31)
+}
+
+/// The ARN resource type of a stored query, as Config spells it in the ARNs it mints
+/// (`QueryArn`'s pattern: `stored-query/<name>/query-<id>`).
+pub const STORED_QUERY_ARN_RESOURCE_TYPE: &str = "stored-query";
+
+/// The ARN of a stored query:
+/// `arn:aws:config:<region>:<account>:stored-query/<name>/query-<id>`, the form
+/// `QueryArn`'s pattern requires — both the query's name and the id Config assigned it
+/// are part of the ARN.
+pub fn stored_query_arn(region: &str, name: &str, id: &str) -> String {
+    ::emulator_server::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{STORED_QUERY_ARN_RESOURCE_TYPE}/{name}/query-{id}"),
+    )
+}
+
+/// The `QueryId` Config assigns the `seq`-th stored query created in this emulator:
+/// sixteen base-36 characters, which satisfies `QueryId`'s 1..36 length and `^\S+$`
+/// pattern and is ARN-safe.
+///
+/// [`splitmix64`] is a bijection on `u64`, so distinct sequence numbers give distinct
+/// ids; it is only there to spread the digits, because an id is opaque and a caller
+/// must not be able to read a creation order out of it.
+pub fn mint_stored_query_id(seq: u64) -> String {
+    base36(splitmix64(seq), 16)
+}
+
+/// How Config words `ResourceNotFoundException` for a request that named a stored
+/// query this account does not hold.
+///
+/// The message is BUILT FROM THE REQUEST — it quotes the `QueryName` the caller sent —
+/// so every operation that refuses an absent stored query words it the same way.
+pub fn no_such_stored_query_message(name: &str) -> String {
+    format!("The stored query '{name}' provided in the request does not exist.")
 }
 
 /// The DNS suffix every Amazon Web Services service principal ends with, which is

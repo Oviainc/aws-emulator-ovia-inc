@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutStoredQuery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutStoredQuery`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutStoredQuery::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Saves a new stored query or updates an existing one in [`crate::state`], keyed by
+//! `QueryName`. A new query is assigned and persisted a `QueryId` and a `QueryArn`, so
+//! `GetStoredQuery` reads back exactly what was saved; an update in place keeps the
+//! identity and the tags the query was created with and answers the same ARN.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +157,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutStoredQuery` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutStoredQueryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutStoredQuery"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        let requested = &input.stored_query;
+
+        // "The mandatory fields are QueryName and Expression." `QueryName` is a required
+        // member, so the request walk has already refused a request without one (and one
+        // whose name breaks the modelled pattern or length); `Expression` is optional in
+        // the shape, so a missing one is refused here. Its modelled minimum length of 1
+        // is what refuses a present-but-empty expression before this handler runs.
+        let name = requested.query_name.as_str();
+        let Some(expression) = requested
+            .expression
+            .as_deref()
+            .filter(|expression| !expression.is_empty())
+        else {
+            return Err(PutStoredQueryErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "StoredQuery.Expression is a mandatory field and must not be empty"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // A query this account already holds is updated in place; only a NEW one has to
+        // fit under this Region's stored-query quota.
+        if let Some(existing) = store.stored_queries.get_mut(name) {
+            existing.expression = expression.to_string();
+            // "When you are updating a query, you must provide a query name but updating
+            // the description is optional": a request that carries a description sets it,
+            // and one that carries none leaves the stored description as it was. The
+            // query's identity (its id and ARN) and its tags are not the caller's to
+            // change — "tags will not be updated, even if they are different".
+            if let Some(description) = requested.description.as_deref() {
+                existing.description = Some(description.to_string());
+            }
+            return Ok(PutStoredQueryOutput {
+                query_arn: Some(existing.arn.clone()),
+            });
+        }
+
+        if store.stored_queries.len() >= crate::state::STORED_QUERIES_QUOTA {
+            return Err(PutStoredQueryErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "this account already has the maximum of {} stored queries in this \
+                         Region",
+                        crate::state::STORED_QUERIES_QUOTA,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let sequence = store.next_stored_query_seq;
+        // A u64 counter cannot be exhausted by API calls, so it never reissues an id;
+        // saturating rather than wrapping keeps that true by construction.
+        store.next_stored_query_seq = sequence.saturating_add(1);
+        // The id and the ARN are Config's to assign, never read off the request: a
+        // `QueryId` or `QueryArn` the caller sent is ignored.
+        let id = crate::state::mint_stored_query_id(sequence);
+        let arn = crate::state::stored_query_arn(&region, name, &id);
+        store.stored_queries.insert(
+            name.to_string(),
+            crate::state::StoredQueryEntry {
+                name: name.to_string(),
+                id,
+                arn: arn.clone(),
+                description: requested.description.clone(),
+                expression: expression.to_string(),
+                // The tags a create carries are this resource's tag set, reached by
+                // the tagging operations through the store's one ARN-to-tags path.
+                tags: crate::state::tag_set(input.tags.as_deref().unwrap_or_default()),
+            },
+        );
+
+        Ok(PutStoredQueryOutput {
+            query_arn: Some(arn),
+        })
     }
 }
