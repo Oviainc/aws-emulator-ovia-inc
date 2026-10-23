@@ -29,6 +29,15 @@
 //! read of the state NOW — so the live surface (a create of the same `Name`, a tag
 //! write, an update, a second delete) sees it as gone.
 //!
+//! The procurement-portal plane keeps its preferences in
+//! [`ComAmazonawsInvoicingInvoicingState::procurement_portal_preferences`]: a preference is
+//! created by `CreateProcurementPortalPreference`, read back by
+//! `GetProcurementPortalPreference` and validated through
+//! `SendProcurementPortalValidation` / `VerifyProcurementPortalValidation`, each one stored
+//! as the modelled `ProcurementPortalPreference` a reader reports, so its `Version`,
+//! `CreateDate` and `LastUpdateDate` are what the last write left rather than anything
+//! computed per read.
+//!
 //! Beside the invoice units sits the INVOICE registry [`ComAmazonawsInvoicingInvoicingState::invoices`],
 //! the one copy of the invoices this emulator holds, which `ListInvoiceSummaries`
 //! reports. An invoice is ISSUED by AWS out of a billing period's activity: no
@@ -88,17 +97,17 @@ pub struct ComAmazonawsInvoicingInvoicingState {
     idempotent_record_order: VecDeque<IdempotencyKey>,
     /// Every procurement portal preference this emulator holds, keyed by its
     /// `ProcurementPortalPreferenceArn` — the one copy of a preference, so the
-    /// operations of the portal-validation flow cannot disagree about whether one
-    /// exists. A `BTreeMap` so a listing walks a stable, deterministic order and a
-    /// pagination token (a position in that order) stays meaningful across calls.
+    /// operations of the portal plane cannot disagree about whether one exists. A
+    /// `BTreeMap` so a listing walks a stable, deterministic order and a pagination token
+    /// (a position in that order) stays meaningful across calls.
     ///
     /// Empty until a create puts a preference here:
-    /// `CreateProcurementPortalPreference` is the operation that does so, and
+    /// `CreateProcurementPortalPreference` is the operation that does so,
+    /// `GetProcurementPortalPreference` reads one back and
     /// `ListProcurementPortalPreferences` reports exactly what it stored. An ARN naming
-    /// no preference resolves to nothing — which is what
-    /// `SendProcurementPortalValidation` and `VerifyProcurementPortalValidation` report
-    /// as the modelled `ResourceNotFoundException`, rather than claiming a validation
-    /// state for a preference that does not exist.
+    /// no preference resolves to nothing — which is what every reader of this plane
+    /// reports as the modelled `ResourceNotFoundException`, rather than claiming a
+    /// configuration or a validation state for a preference that does not exist.
     pub procurement_portal_preferences: BTreeMap<String, StoredProcurementPortalPreference>,
     /// Source of invoice-unit ids for ARN minting.
     next_invoice_unit_id: u64,
@@ -410,6 +419,8 @@ impl ComAmazonawsInvoicingInvoicingState {
 pub struct StoredProcurementPortalPreference {
     /// The preference itself, as the modelled `ProcurementPortalPreference` a reader
     /// reports it with — one copy, so two readers of one preference cannot disagree.
+    /// `Version`, `CreateDate` and `LastUpdateDate` are members of it, so a read answers
+    /// with exactly what the last write left.
     pub preference: ProcurementPortalPreference,
     /// The validation `SendProcurementPortalValidation` last issued for this
     /// preference, if any. `None` means no validation has been requested, so there is
