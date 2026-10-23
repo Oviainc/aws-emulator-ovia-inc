@@ -13,6 +13,14 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+/// Whether a document is the file format a request declared it to be — the check the
+/// test-harness operations (`TestConversion`, `TestMapping`) share.
+///
+/// Declared here, rather than beside `state` in `src/lib.rs`, because `lib.rs` is
+/// generated and cannot take a hand-written `mod`.
+#[path = "documents.rs"]
+pub mod documents;
+
 use crate::ops::types::{
     CapabilityConfiguration, CapabilityOptions, EdiType, InputConversion, Mapping,
     OutputConversion, S3Location, SampleDocuments, Tag,
@@ -157,6 +165,12 @@ pub struct Transformer {
     pub created_at: ::aws_smithy_types::DateTime,
     pub modified_at: Option<::aws_smithy_types::DateTime>,
     pub tags: Vec<Tag>,
+    /// Digest of the create request that minted this transformer, so a replay of its
+    /// `@idempotencyToken` can tell "the same request again" (answer with this record)
+    /// from "a different request under a token already used" (the modelled conflict).
+    /// Carried on the record rather than in a second map, so it cannot drift from the
+    /// resource it describes.
+    pub request_digest: String,
 }
 
 /// A partnership: one trading partner, under a profile, bound to a set of capabilities.
@@ -314,14 +328,10 @@ impl ComAmazonawsB2biB2biState {
         {
             return Some(&mut partnership.tags);
         }
-        if let Some(transformer) = self
-            .transformers
+        self.transformers
             .values_mut()
             .find(|transformer| transformer.transformer_arn == arn)
-        {
-            return Some(&mut transformer.tags);
-        }
-        None
+            .map(|transformer| &mut transformer.tags)
     }
 
     /// Drop every remembered token that minted `id`, called when `id`'s resource is
@@ -418,10 +428,98 @@ pub fn now() -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now())
 }
 
+/// The tag-key prefix AWS reserves for its own tags across every service: a caller may
+/// not create or edit a key that starts with it, in any casing.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` claims the reserved prefix. Compared case-INSENSITIVELY, as AWS reserves
+/// the namespace rather than the spelling.
+///
+/// The comparison is over BYTES: a tag key is modelled `len 1..128` with no pattern, so it
+/// can be any UTF-8 text, and slicing such a string by a byte offset would panic when that
+/// offset falls inside a multi-byte character. Taking the bytes answers `false` for those
+/// keys instead, which is correct — a key whose first four bytes are not `aws:` does not
+/// claim the namespace.
+fn claims_reserved_prefix(key: &str) -> bool {
+    key.as_bytes()
+        .get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX.as_bytes()))
+}
+
+/// Why a tag write was refused, with nothing written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagWriteRefused {
+    /// The write would leave the resource holding this many tags, above
+    /// [`MAX_TAGS_PER_RESOURCE`].
+    TooManyTags(usize),
+    /// A key in the request starts with [`RESERVED_TAG_KEY_PREFIX`].
+    ReservedKeyPrefix,
+}
+
+/// Merge `incoming` into `held`: a key already present takes the incoming value, a key
+/// that is new is appended, and every other held tag is left where it is.
+///
+/// The AWS tagging contract for every resource type — `TagResource` "attaches a
+/// key-value pair to a resource", so tagging an already-tagged resource updates that
+/// key rather than duplicating it or dropping the others.
+///
+/// The two conditions that make a write impossible are checked HERE, before anything is
+/// written, so no caller of this helper can grow a resource's tag set past what the
+/// model allows itself to report back, and `held` is left exactly as it was on a
+/// refusal. Each tag's own key and value lengths are modelled (`TagKey len 1..128`,
+/// `TagValue len 0..256`) and so are already enforced by the boundary validator; the
+/// tags a CREATE call supplies are stored by that create handler and bounded by the
+/// same modelled list length.
+pub fn merge_tags(held: &mut Vec<Tag>, incoming: Vec<Tag>) -> Result<(), TagWriteRefused> {
+    if incoming.iter().any(|tag| claims_reserved_prefix(&tag.key)) {
+        return Err(TagWriteRefused::ReservedKeyPrefix);
+    }
+
+    // The keys that are genuinely NEW: a key already held is updated in place, and a key
+    // repeated inside one request is one key.
+    let mut added: Vec<&str> = Vec::new();
+    for tag in &incoming {
+        if !held.iter().any(|existing| existing.key == tag.key)
+            && !added.contains(&tag.key.as_str())
+        {
+            added.push(tag.key.as_str());
+        }
+    }
+    let would_hold = held.len() + added.len();
+    if would_hold > MAX_TAGS_PER_RESOURCE {
+        return Err(TagWriteRefused::TooManyTags(would_hold));
+    }
+
+    for tag in incoming {
+        match held.iter_mut().find(|existing| existing.key == tag.key) {
+            Some(existing) => existing.value = tag.value,
+            None => held.push(tag),
+        }
+    }
+    Ok(())
+}
+
+/// Whether `region` is shaped like an AWS region code (`us-east-1`, `ap-southeast-4`):
+/// lower-case letters, digits and hyphens, and short enough that an ARN carrying it
+/// stays inside the modelled `ResourceArn len 1..255`.
+fn is_region_shaped(region: &str) -> bool {
+    !region.is_empty()
+        && region.len() <= 32
+        && region
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
 /// The region this request was signed for, for the ARNs the response carries.
+///
+/// The value comes from the caller's own SigV4 credential scope, so it is checked
+/// against the region grammar before it is interpolated into an ARN: a scope naming
+/// something that is not a region (or nothing at all) falls back to [`DEFAULT_REGION`]
+/// rather than letting caller-chosen text reshape the ARN's colon-delimited fields.
 pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
+        .filter(|region| is_region_shaped(region))
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 

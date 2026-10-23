@@ -9,6 +9,11 @@
 //! members that replace them is refused with the modelled `ValidationException` rather
 //! than stored.
 //!
+//! `clientToken` is an `@idempotencyToken`: a repeat carrying the same token AND the same
+//! parameters answers with the transformer the first call created (so any number of
+//! concurrent retries leave exactly one transformer behind), while a repeat carrying that
+//! token and asking for something DIFFERENT is the modelled `ConflictException`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -305,8 +310,85 @@ fn store_full() -> CreateTransformerError {
     .into()
 }
 
+/// The modelled refusal for a repeat of a `clientToken` that asks for something else.
+///
+/// An `@idempotencyToken` makes a retry safe, so one token names ONE request: a second
+/// request under a token this store already minted a transformer for cannot be served as
+/// a replay (the parameters differ) and must not mint a second transformer either, which
+/// is what `ConflictException` (HTTP 409) is modelled for on this operation.
+fn token_already_used(existing: &crate::state::Transformer) -> CreateTransformerError {
+    CreateTransformerErrorModeled::ConflictException(ConflictException {
+        message: format!(
+            "this clientToken already created transformer {} with different parameters",
+            existing.transformer_id
+        ),
+    })
+    .into()
+}
+
+/// A digest of everything this create request asks for, as the `@idempotencyToken`
+/// replay check compares it.
+///
+/// Derived from the typed members' own `Debug` rendering, with the tag list sorted so
+/// two requests differing only in tag ORDER are the same request. `clientToken` itself
+/// is excluded (it is the key, not part of the payload), and the digest is hashed
+/// rather than kept verbatim because `mappingTemplate` alone can be 350 000 bytes.
+///
+/// A `Debug` rendering is enough precisely because this digest is never compared with one
+/// from anywhere else: it is only ever compared with a digest THIS process computed, over
+/// records held in this process's own memory, so it needs to distinguish two requests
+/// rather than to be stable across builds.
+fn request_digest(input: &CreateTransformerInput) -> String {
+    use sha2::Digest;
+
+    // Destructured, not field-accessed, so the member set is EXHAUSTIVE at compile time:
+    // a member added to `CreateTransformerInput` by a model update breaks this line
+    // instead of being silently left out of the digest (which would answer a genuinely
+    // different request as an idempotent replay). `client_token` is the key rather than
+    // part of the payload, so it is the one member deliberately excluded.
+    let CreateTransformerInput {
+        name,
+        client_token: _,
+        tags,
+        file_format,
+        mapping_template,
+        edi_type,
+        sample_document,
+        input_conversion,
+        mapping,
+        output_conversion,
+        sample_documents,
+    } = input;
+
+    let mut tags: Vec<(&str, &str)> = tags
+        .iter()
+        .flatten()
+        .map(|tag| (tag.key.as_str(), tag.value.as_str()))
+        .collect();
+    tags.sort_unstable();
+
+    let rendered = format!(
+        "{:?}",
+        (
+            name,
+            file_format,
+            mapping_template,
+            edi_type,
+            sample_document,
+            input_conversion,
+            mapping,
+            output_conversion,
+            sample_documents,
+            &tags,
+        )
+    );
+    let mut digest = sha2::Sha256::new();
+    digest.update(rendered.as_bytes());
+    ::hex::encode(digest.finalize())
+}
+
 /// The response for a stored transformer — every member read back off the record, so a
-/// create and a later `GetTransformer` cannot disagree.
+/// create, a replay of its `clientToken` and a later `GetTransformer` cannot disagree.
 fn stored_transformer_response(transformer: &crate::state::Transformer) -> CreateTransformerOutput {
     CreateTransformerOutput {
         transformer_id: transformer.transformer_id.clone(),
@@ -392,13 +474,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // sharing a token cannot each mint one.
         //
         // That recording also has the LOSING racers answered with `ConflictException`.
-        // Serialised behind the state lock there are no losers here: every racer sees the
-        // one transformer the first of them created, which satisfies the "exactly one
-        // transformer" property the recording turns on. The separate, still-open
-        // transformer-operations issue
-        // (`20261022T031134Z-b2bi-tagging-test-harness-and-transformer-operations-answer.md`,
-        // cause 5) owns the in-flight `ConflictException` wording, which needs a
-        // genuinely asynchronous create to be observable at all.
+        // Serialised behind the state lock there are no losers to answer: a racer either
+        // mints the one transformer or replays it, which is what makes "exactly one
+        // transformer" hold. The conflict the token CAN produce is the one that is
+        // observable here: a token this store has already minted a transformer for, used
+        // again for a DIFFERENT request. The digest below is what tells the two apart.
+        let digest = request_digest(&input);
         let idempotency_key = input
             .client_token
             .as_deref()
@@ -409,7 +490,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .get(key)
                 .and_then(|id| state.transformers.get(id))
             {
-                return Ok(stored_transformer_response(existing));
+                if existing.request_digest == digest {
+                    return Ok(stored_transformer_response(existing));
+                }
+                return Err(token_already_used(existing));
             }
         }
 
@@ -445,6 +529,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: crate::state::now(),
             modified_at: None,
             tags: input.tags.unwrap_or_default(),
+            request_digest: digest,
         };
 
         let response = stored_transformer_response(&transformer);
