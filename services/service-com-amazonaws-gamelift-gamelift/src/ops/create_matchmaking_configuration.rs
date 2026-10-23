@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMatchmakingConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMatchmakingConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMatchmakingConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates the matchmaker the request describes and persists it, so this response and
+//! every later read of the configuration (`DescribeMatchmakingConfigurations`) are served
+//! from the one stored record. The rule set the configuration matches with must be one
+//! that exists — "a matchmaking configuration can only use rule sets that are defined in
+//! the same Region" — so a `RuleSetName` that resolves to no stored rule set is refused
+//! and nothing is stored.
 //!
 //! ## Shape of an operation
 //!
@@ -240,18 +238,196 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMatchmakingConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMatchmakingConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state::MAX_MATCHMAKING_CONFIGURATIONS_PER_ACCOUNT;
+
+        let invalid = |message: String| -> Self::Error {
+            CreateMatchmakingConfigurationErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        };
+
+        // Every cross-member rule the request can break is refused BEFORE any state is
+        // locked and before anything is stored.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMatchmakingConfiguration"))
+        // `GameSessionQueueArns`' doc: "A matchmaking configuration supports only one
+        // queue; if you specify more than one ARN, the request fails with an
+        // InvalidRequestException. If FlexMatchMode is set to STANDALONE, do not set this
+        // parameter."
+        let queue_arns = input.game_session_queue_arns.clone().unwrap_or_default();
+        if queue_arns.len() > 1 {
+            return Err(invalid(format!(
+                "GameSessionQueueArns names {} queues; a matchmaking configuration supports only \
+                 one queue.",
+                queue_arns.len()
+            )));
+        }
+        let standalone = input.flex_match_mode.as_deref() == Some(FLEX_MATCH_MODE_STANDALONE);
+        if standalone && !queue_arns.is_empty() {
+            return Err(invalid(format!(
+                "GameSessionQueueArns must not be set when FlexMatchMode is \
+                 {FLEX_MATCH_MODE_STANDALONE}: that mode returns match information instead of \
+                 starting a game session."
+            )));
+        }
+        // `BackfillMode`'s doc: "Automatic backfill is not available when FlexMatchMode is
+        // set to STANDALONE."
+        if standalone && input.backfill_mode.as_deref() == Some(BACKFILL_MODE_AUTOMATIC) {
+            return Err(invalid(format!(
+                "BackfillMode {BACKFILL_MODE_AUTOMATIC} is not available when FlexMatchMode is \
+                 {FLEX_MATCH_MODE_STANDALONE}."
+            )));
+        }
+
+        // A resource's tags are a key-value MAP, so one key cannot carry two values;
+        // `TaggingFailedException`'s doc: "This may be due to invalid tag format".
+        let tags = input.tags.clone().unwrap_or_default();
+        let mut keys = ::std::collections::HashSet::new();
+        if let Some(duplicate) = tags.iter().find(|tag| !keys.insert(tag.key.clone())) {
+            return Err(
+                CreateMatchmakingConfigurationErrorModeled::TaggingFailedException(
+                    TaggingFailedException {
+                        message: Some(format!(
+                            "Tags assigns the key {} more than once; a resource's tags carry each \
+                             key at most once.",
+                            duplicate.key
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateMatchmakingConfigurationErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some("the GameLift emulator state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.tick(now);
+
+        // `RuleSetName`'s doc: "A unique identifier for the matchmaking rule set to use
+        // with this configuration. You can use either the rule set name or ARN value. A
+        // matchmaking configuration can only use rule sets that are defined in the same
+        // Region." So the configuration can only be created on a rule set that EXISTS:
+        // this is the cross-resource check that makes a typo'd rule set a refused request
+        // instead of a matchmaker that can never match. The recorded service answers it
+        // with `InvalidRequestException` (the parameter value is the thing that is wrong),
+        // and nothing is stored.
+        let Some(rule_set_name) = state.resolve_rule_set_name(&input.rule_set_name) else {
+            return Err(invalid(format!(
+                "RuleSet with name {} does not exist",
+                input.rule_set_name
+            )));
+        };
+        let Some(rule_set_arn) = state
+            .matchmaking_rule_sets
+            .get(&rule_set_name)
+            .map(|rule_set| rule_set.rule_set_arn.clone())
+        else {
+            return Err(invalid(format!(
+                "RuleSet with name {} does not exist",
+                input.rule_set_name
+            )));
+        };
+
+        // "A unique identifier for the matchmaking configuration[,] used to identify the
+        // configuration associated with a matchmaking request or ticket": a second create
+        // cannot take the name of a configuration that exists, so a stored matchmaker is
+        // never replaced by one a later request describes.
+        if state.matchmaking_configurations.contains_key(&input.name) {
+            return Err(invalid(format!(
+                "A matchmaking configuration named {} already exists; a configuration name \
+                 identifies one configuration.",
+                input.name
+            )));
+        }
+        if state.matchmaking_configurations.len() >= MAX_MATCHMAKING_CONFIGURATIONS_PER_ACCOUNT {
+            return Err(
+                CreateMatchmakingConfigurationErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "The account already has the maximum of \
+                             {MAX_MATCHMAKING_CONFIGURATIONS_PER_ACCOUNT} matchmaking \
+                             configurations."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let region = crate::state::request_region(ctx);
+        // `MatchmakingConfiguration$ConfigurationArn` doc: "Format is
+        // `arn:aws:gamelift:<region>::matchmakingconfiguration/<matchmaking configuration
+        // name>`[;] the resource ID matches the Name value."
+        let configuration_arn = crate::state::gamelift_arn(
+            &region,
+            &format!("matchmakingconfiguration/{}", input.name),
+        );
+        let record = crate::state::MatchmakingConfigurationRecord {
+            name: input.name.clone(),
+            configuration_arn,
+            description: input.description.clone(),
+            // The queue a match is started through is NOT resolved here: "queues can be
+            // located in any Region", so an ARN naming a queue of another Region names
+            // nothing in this store and is still a legitimate destination.
+            game_session_queue_arns: queue_arns,
+            request_timeout_seconds: input.request_timeout_seconds,
+            acceptance_timeout_seconds: input.acceptance_timeout_seconds,
+            acceptance_required: input.acceptance_required,
+            rule_set_name,
+            rule_set_arn,
+            notification_target: input.notification_target.clone(),
+            additional_player_count: input.additional_player_count,
+            custom_event_data: input.custom_event_data.clone(),
+            game_properties: input.game_properties.clone().unwrap_or_default(),
+            game_session_data: input.game_session_data.clone(),
+            backfill_mode: input.backfill_mode.clone(),
+            flex_match_mode: input.flex_match_mode.clone(),
+            tags,
+            creation_time: now,
+            region,
+        };
+        state
+            .matchmaking_configurations
+            .insert(input.name.clone(), record);
+
+        // Report the STORED record, so this response and every later describe of the same
+        // configuration can only agree.
+        let Some(stored) = state.matchmaking_configurations.get(&input.name) else {
+            return Err(
+                CreateMatchmakingConfigurationErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some(
+                            "the new matchmaking configuration could not be read back".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        Ok(CreateMatchmakingConfigurationOutput {
+            configuration: Some(stored.to_modelled()),
+        })
     }
 }
+
+/// The `FlexMatchMode` that forms matches without starting a game session: that member's
+/// own doc — "STANDALONE - FlexMatch forms matches and returns match information,
+/// including players and team assignments, in a MatchmakingSucceeded event." Both values
+/// come from the modelled enum (`smithy_query shape=FlexMatchMode`), which
+/// `FLEX_MATCH_MODE_VALUES` carries.
+const FLEX_MATCH_MODE_STANDALONE: &str = "STANDALONE";
+
+/// The `BackfillMode` that has Amazon GameLift Servers create backfill requests itself
+/// (`smithy_query shape=BackfillMode`), which the STANDALONE mode cannot combine with.
+const BACKFILL_MODE_AUTOMATIC: &str = "AUTOMATIC";

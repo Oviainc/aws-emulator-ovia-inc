@@ -2,12 +2,13 @@
 
 //! @op StartNextPendingJobExecution
 //!
-//! Takes the thing's next pending (`IN_PROGRESS` or `QUEUED`) execution, moves it
-//! to `IN_PROGRESS`, applies the request's `statusDetails` and step timeout,
-//! increments `versionNumber` and returns the stored execution with its job
-//! document. A thing with no pending execution gets a 200 whose `execution` is
-//! JSON `null` — the response document always carries the modelled member (see
-//! [`super::types::ResponseDocument`]).
+//! Takes the thing's next pending (`IN_PROGRESS` or `QUEUED`) execution. A QUEUED
+//! one is STARTED: moved to `IN_PROGRESS`, the request's `statusDetails` and step
+//! timeout applied, `versionNumber` incremented. An execution the thing already has
+//! in progress is merely re-handed, unchanged. Either way the stored execution is
+//! returned with its job document. A thing with no pending execution gets a 200 whose
+//! `execution` is JSON `null` — the response document always carries the modelled
+//! member (see [`super::types::ResponseDocument`]).
 //!
 //! ## Shape of an operation
 //!
@@ -82,7 +83,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{MAX_STEP_TIMEOUT_MINUTES, MIN_STEP_TIMEOUT_MINUTES};
+use crate::state::{MAX_STEP_TIMEOUT_MINUTES, MIN_STEP_TIMEOUT_MINUTES, STATUS_IN_PROGRESS};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -189,6 +190,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A `statusDetails` map is checked against the bounds a job execution's
+        // details carry before anything is looked up: a supplied map REPLACES the
+        // stored one, so the check is on the request alone and a map the record
+        // cannot hold is refused without touching any execution.
+        if let Err(reason) = crate::state::check_status_details(input.status_details.as_ref()) {
+            return Err(
+                StartNextPendingJobExecutionErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(reason),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let mut state = state.lock();
         // Pending is "IN_PROGRESS or QUEUED", as this operation documents; an
         // already-started execution is resumed before a queued one is started.
@@ -214,27 +230,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             };
-            // The details are checked and applied BEFORE anything else moves, so
-            // a map the record cannot hold leaves the execution untouched.
-            if let Err(reason) = record.try_merge_status_details(input.status_details.as_ref()) {
-                return Err(
-                    StartNextPendingJobExecutionErrorModeled::InvalidRequestException(
-                        InvalidRequestException {
-                            message: Some(reason),
-                        },
-                    )
-                    .into(),
-                );
+            // An execution the thing already has IN_PROGRESS is merely re-handed:
+            // this call starts nothing, so it writes nothing — the device gets the
+            // same version, the same `startedAt` and the same details it was handed
+            // before, and the version it holds stays usable as an
+            // `expectedVersion`. Only a QUEUED -> IN_PROGRESS start is a device
+            // update, and only it applies this request's details and step timeout.
+            if record.status != STATUS_IN_PROGRESS {
+                // Checked above, so it cannot fail here; a refusal would still
+                // leave the execution untouched.
+                if let Err(reason) = record.try_replace_status_details(input.status_details.as_ref())
+                {
+                    return Err(
+                        StartNextPendingJobExecutionErrorModeled::InvalidRequestException(
+                            InvalidRequestException {
+                                message: Some(reason),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                // `start` moves the status to `IN_PROGRESS` and stamps `startedAt`
+                // on the first start, arming the job's in-progress timer with it.
+                record.start(now);
+                record.arm_step_timer(input.step_timeout_in_minutes, now);
+                record.last_updated_at = now;
+                // Starting the execution IS a device update, so the version moves.
+                record.version_number += 1;
             }
-            // `start` moves the status to `IN_PROGRESS`; `startedAt` is when the
-            // execution started, so resuming one that is already in progress keeps
-            // its original start time — and the job's in-progress timer, which that
-            // first start armed.
-            record.start(now);
-            record.arm_step_timer(input.step_timeout_in_minutes, now);
-            record.last_updated_at = now;
-            // This IS a device update, so the version moves.
-            record.version_number += 1;
             // The device needs the job document to run the job, so it is always
             // part of this response.
             crate::state::to_job_execution(record, true, now)

@@ -12,7 +12,8 @@
 //! `smithy_query(query="operation",operation="PutInvocationStep")` ->
 //! `invocationStepTime`, and `smithy_query(query="shape",shape="CreateSessionResponse,
 //! GetSessionResponse,UpdateSessionResponse,CreateInvocationResponse,InvocationStep,
-//! InvocationStepSummary")` -> `createdAt`, `lastUpdatedAt`, `invocationStepTime`. Each
+//! InvocationStepSummary,SessionSummary")` -> `createdAt`, `lastUpdatedAt`,
+//! `invocationStepTime`. Each
 //! one reports `"timestampFormat": "date-time"`.
 //!
 //! The first test drives the whole plane over a TABLE of instants; the second reads the
@@ -341,11 +342,12 @@ fn every_modelled_date_time_member_schema_declares_the_date_time_format() {
     use aws_smithy_schema::{Schema, ShapeType};
     use runtime::ops::types::{
         CreateInvocationOutput, CreateSessionOutput, GetSessionOutput, InvocationStep,
-        InvocationStepSummary, InvocationSummary, PutInvocationStepInput, UpdateSessionOutput,
+        InvocationStepSummary, InvocationSummary, PutInvocationStepInput, SessionSummary,
+        UpdateSessionOutput,
     };
 
     // (case, the shape's schema)
-    let rows: [(&str, &Schema); 8] = [
+    let rows: [(&str, &Schema); 9] = [
         ("PutInvocationStepRequest", &PutInvocationStepInput::SCHEMA),
         ("CreateSessionResponse", &CreateSessionOutput::SCHEMA),
         ("GetSessionResponse", &GetSessionOutput::SCHEMA),
@@ -354,6 +356,7 @@ fn every_modelled_date_time_member_schema_declares_the_date_time_format() {
         ("InvocationStep", &InvocationStep::SCHEMA),
         ("InvocationStepSummary", &InvocationStepSummary::SCHEMA),
         ("InvocationSummary", &InvocationSummary::SCHEMA),
+        ("SessionSummary", &SessionSummary::SCHEMA),
     ];
 
     for (case, schema) in rows {

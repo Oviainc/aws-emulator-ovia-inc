@@ -70,3 +70,5 @@ mod config_deliver_config_snapshot;
 mod aggregate_resource_config;
 #[path = "all/resource_evaluation_surface.rs"]
 mod resource_evaluation_surface;
+#[path = "all/delete_service_linked_recorder.rs"]
+mod delete_service_linked_recorder;
