@@ -33,3 +33,5 @@ mod rule_group_lifecycle;
 mod rule_group_mutations;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/subnet_associations.rs"]
+mod subnet_associations;
