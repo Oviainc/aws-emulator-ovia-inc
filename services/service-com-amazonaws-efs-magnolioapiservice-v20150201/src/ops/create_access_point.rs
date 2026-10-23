@@ -245,14 +245,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The idempotency rule `ClientToken` carries: an access point minted for this
         // token already exists, so the call is refused with the id of that one rather
         // than minting a second access point.
+        //
+        // The refusal carries the two members the model marks required and NOTHING else:
+        // the optional `Message` is left absent, because no rule produces a sentence for
+        // this error class (it is neither documented nor modelled) and the recorded AWS
+        // refusal sends no `Message` member at all. The actionable datum — WHICH access
+        // point already holds the token — travels in the required `AccessPointId`, so
+        // nothing is lost by it. Contrast `FileSystemAlreadyExists`, whose recorded
+        // refusal DOES carry a request-derived sentence; see
+        // `crate::state::file_system_already_exists_message`.
         if let Some(existing) = state.access_point_tokens.get(&input.client_token) {
             return Err(CreateAccessPointErrorModeled::AccessPointAlreadyExists(
                 AccessPointAlreadyExists {
                     error_code: "AccessPointAlreadyExists".to_string(),
-                    message: Some(efs::access_point_already_exists_message(
-                        existing,
-                        &input.client_token,
-                    )),
+                    message: None,
                     access_point_id: existing.clone(),
                 },
             )
