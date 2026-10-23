@@ -292,10 +292,12 @@ pub const DEFAULT_MAXIMUM_AUTOMATIC_ATTEMPTS: i32 = 5;
 /// If you do not select a number, the default is 60 seconds").
 pub const DEFAULT_RETRY_ATTEMPT_SECONDS: i64 = 60;
 
-/// How many resource identifiers one `ListDiscoveredResources` page carries when the
-/// request asks for no limit of its own (`ListDiscoveredResourcesRequest$limit`: "The
-/// maximum number of resource identifiers returned on each page. The default is 100.
-/// ... If you specify 0, Config uses the default").
+/// How many entries one discovered-resource page carries when the request asks for no
+/// limit of its own — resource identifiers for `ListDiscoveredResources`
+/// (`ListDiscoveredResourcesRequest$limit`: "The maximum number of resource
+/// identifiers returned on each page. The default is 100. ... If you specify 0, Config
+/// uses the default"), `ResourceCount` objects for `GetDiscoveredResourceCounts`
+/// ("By default, Config lists 100 ResourceCount objects on each page").
 pub const DISCOVERED_RESOURCES_DEFAULT_LIMIT: i32 = 100;
 
 /// The largest `limit` a discovered-resource page may ask for
@@ -1019,6 +1021,20 @@ pub struct DiscoveredResourceEntry {
     /// (`ResourceIdentifier$resourceDeletionTime`: "The time that the resource was
     /// deleted").
     pub deleted_at: Option<SystemTime>,
+    /// The `SchemaVersionId` the resource's configuration item was recorded under,
+    /// for a resource whose configuration state `PutResourceConfig` recorded.
+    pub schema_version_id: Option<String>,
+    /// The `Configuration` document as it was recorded, byte for byte.
+    pub configuration: Option<String>,
+    /// The tags the configuration item was recorded with
+    /// (`PutResourceConfigRequest$Tags`).
+    pub tags: BTreeMap<String, String>,
+    /// When Config first recorded a configuration item for this resource, and when it
+    /// last did. The first instant is kept across a re-record of the same resource,
+    /// which only moves the last one. Both are `None` for a resource no configuration
+    /// item has been recorded for.
+    pub first_recorded_at: Option<SystemTime>,
+    pub last_recorded_at: Option<SystemTime>,
 }
 
 impl DiscoveredResourceEntry {
@@ -1219,10 +1235,10 @@ pub struct ComAmazonawsConfigserviceStarlingdoveserviceState {
     /// A deleted resource stays in the inventory carrying its deletion time, because a
     /// discovered-resource read can be asked to include deleted resources.
     ///
-    /// Nothing WRITES the inventory yet: the operations that record a resource's
-    /// configuration item (`PutResourceConfig`) and record its deletion
-    /// (`DeleteResourceConfig`) are still scaffolds, each with a stub issue of its own,
-    /// so an account that has called neither has discovered nothing and a
+    /// `PutResourceConfig` is what WRITES the inventory, recording the configuration
+    /// state of one custom resource; `DeleteResourceConfig`, which records a
+    /// resource's deletion, is still a scaffold with a stub issue of its own, so an
+    /// account that has recorded nothing has discovered nothing and a
     /// discovered-resource read reports an empty page for every type.
     pub discovered_resources: BTreeMap<(String, String), DiscoveredResourceEntry>,
     /// Retention configurations, keyed by `RetentionConfigurationName`. A `BTreeMap`
@@ -1252,6 +1268,53 @@ pub struct ComAmazonawsConfigserviceStarlingdoveserviceState {
 }
 
 impl ComAmazonawsConfigserviceStarlingdoveserviceState {
+    /// The configuration recorder that is RECORDING right now, if any: Config
+    /// discovers resources only while a recorder is turned on.
+    pub fn recording_recorder(&self) -> Option<&RecorderEntry> {
+        self.recorder_status
+            .values()
+            .filter(|status| status.recording)
+            .find_map(|status| self.recorders.get(&status.name))
+    }
+
+    /// How many discovered resources Config holds of each resource type it is
+    /// RECORDING, in the order `GetDiscoveredResourceCounts` reports them: descending
+    /// by the number of resources (`ResourceCounts`: "Each object is listed in
+    /// descending order by the number of resources"), and by resource type among the
+    /// types with equally many, so the ordering — and therefore a page token — is
+    /// total.
+    ///
+    /// A type the recording recorder does not record contributes nothing, and no type
+    /// at all is reported while no recorder is recording.
+    pub fn discovered_resource_counts(&self) -> Vec<(String, i64)> {
+        let mut per_type: BTreeMap<&str, i64> = BTreeMap::new();
+        for entry in self.discovered_resources.values() {
+            // A resource Config recorded the deletion of is no longer one of the
+            // resources it is recording, so it contributes to no count.
+            if entry.deleted_at.is_some() {
+                continue;
+            }
+            *per_type.entry(entry.resource_type.as_str()).or_default() += 1;
+        }
+        // Which recorder is recording is one question for the whole call, so resolve
+        // it once rather than per resource type.
+        let recording_group = self
+            .recording_recorder()
+            .map(|recorder| recorder.recording_group.as_ref());
+        let records = |resource_type: &str| match recording_group {
+            None => false,
+            Some(None) => true,
+            Some(Some(group)) => group_records_resource_type(group, resource_type),
+        };
+        let mut counts: Vec<(String, i64)> = per_type
+            .into_iter()
+            .filter(|(resource_type, _)| records(resource_type))
+            .map(|(resource_type, count)| (resource_type.to_string(), count))
+            .collect();
+        counts.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        counts
+    }
+
     /// The tags of the resource `arn` identifies, or `None` when this store holds no
     /// resource with that ARN.
     ///
@@ -1552,6 +1615,63 @@ pub fn default_recording_group() -> RecordingGroup {
     }
 }
 
+/// The recording strategy a recording group RECORDS UNDER: the one the group states
+/// itself, or the one its resource type lists imply ([`implied_recording_strategy`]).
+pub fn recording_strategy_of(group: &RecordingGroup) -> &str {
+    group
+        .recording_strategy
+        .as_ref()
+        .and_then(|strategy| strategy.use_only.as_deref())
+        .filter(|use_only| !use_only.is_empty())
+        .unwrap_or_else(|| implied_recording_strategy(group))
+}
+
+/// Whether a recording group covers `resource_type`: only the types an inclusion
+/// group enumerates, every type an exclusion group does not exclude, and every type
+/// under `ALL_SUPPORTED_RESOURCE_TYPES`.
+pub fn group_records_resource_type(group: &RecordingGroup, resource_type: &str) -> bool {
+    let listed = |resource_types: Option<&[String]>| {
+        resource_types
+            .unwrap_or_default()
+            .iter()
+            .any(|listed| listed == resource_type)
+    };
+    match recording_strategy_of(group) {
+        RECORDING_STRATEGY_INCLUSION => listed(group.resource_types.as_deref()),
+        RECORDING_STRATEGY_EXCLUSION => !listed(
+            group
+                .exclusion_by_resource_types
+                .as_ref()
+                .and_then(|exclusion| exclusion.resource_types.as_deref()),
+        ),
+        // `ALL_SUPPORTED_RESOURCE_TYPES`, and any strategy this emulator does not
+        // know: the recorder records every type it discovers.
+        _ => true,
+    }
+}
+
+/// The recording strategy a group's own resource type lists imply: the exclusion
+/// strategy when the group excludes resource types, the inclusion strategy when it
+/// enumerates them, and `ALL_SUPPORTED_RESOURCE_TYPES` otherwise.
+fn implied_recording_strategy(group: &RecordingGroup) -> &'static str {
+    let excludes = group
+        .exclusion_by_resource_types
+        .as_ref()
+        .and_then(|exclusion| exclusion.resource_types.as_deref())
+        .is_some_and(|resource_types| !resource_types.is_empty());
+    let includes = group
+        .resource_types
+        .as_deref()
+        .is_some_and(|resource_types| !resource_types.is_empty());
+    if excludes {
+        RECORDING_STRATEGY_EXCLUSION
+    } else if includes {
+        RECORDING_STRATEGY_INCLUSION
+    } else {
+        RECORDING_STRATEGY_ALL_SUPPORTED
+    }
+}
+
 /// The recording group a recorder RECORDS WITH, derived from the one a request
 /// carried (or its absence).
 ///
@@ -1563,26 +1683,10 @@ pub fn default_recording_group() -> RecordingGroup {
 /// group excludes nothing. A value the request carried is kept as it was sent.
 pub fn materialised_recording_group(requested: Option<RecordingGroup>) -> RecordingGroup {
     let mut group = requested.unwrap_or_else(default_recording_group);
-    let excludes = group
-        .exclusion_by_resource_types
-        .as_ref()
-        .and_then(|exclusion| exclusion.resource_types.as_deref())
-        .is_some_and(|resource_types| !resource_types.is_empty());
-    let includes = group
-        .resource_types
-        .as_deref()
-        .is_some_and(|resource_types| !resource_types.is_empty());
 
     if group.recording_strategy.is_none() {
-        let use_only = if excludes {
-            RECORDING_STRATEGY_EXCLUSION
-        } else if includes {
-            RECORDING_STRATEGY_INCLUSION
-        } else {
-            RECORDING_STRATEGY_ALL_SUPPORTED
-        };
         group.recording_strategy = Some(RecordingStrategy {
-            use_only: Some(use_only.to_string()),
+            use_only: Some(implied_recording_strategy(&group).to_string()),
         });
     }
     if group.exclusion_by_resource_types.is_none() {

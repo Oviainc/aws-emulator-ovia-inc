@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDiscoveredResourceCounts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDiscoveredResourceCounts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDiscoveredResourceCounts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports how many discovered resources of each resource type Config is recording in
+//! this account and Region, counted out of the inventory in [`crate::state`] that
+//! `PutResourceConfig` writes: descending by the number of resources, paged at the
+//! requested `limit`, and empty while no configuration recorder is recording.
 //!
 //! ## Shape of an operation
 //!
@@ -121,6 +116,36 @@ use super::types::*;
 // `GetDiscoveredResourceCountsError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-configservice-starlingdoveservice.json");
 
+/// The separator inside this operation's page token. A resource type name is made of
+/// alphanumeric segments joined by `::`, so it can never carry this byte and the split
+/// is unambiguous.
+const RESOURCE_COUNT_TOKEN_SEPARATOR: char = '|';
+
+/// Encode the place a page resumes at — the number of resources and the resource type
+/// of the first entry it should report — as an opaque `NextToken`, with the base64
+/// codec [`crate::state::encode_page_token`] carries.
+///
+/// The whole sort key is in the token, not an offset, so a page resumes at the same
+/// place even when resources are recorded or deleted between pages.
+fn encode_resource_count_token(count: i64, resource_type: &str) -> String {
+    crate::state::encode_page_token(&format!(
+        "{count}{RESOURCE_COUNT_TOKEN_SEPARATOR}{resource_type}"
+    ))
+}
+
+/// The count and resource type a `NextToken` resumes at, or `None` when the token is
+/// not one [`encode_resource_count_token`] produced: a count no inventory can hold is
+/// not one of ours either.
+fn decode_resource_count_token(token: &str) -> Option<(i64, String)> {
+    let decoded = crate::state::decode_page_token(token)?;
+    let (count, resource_type) = decoded.split_once(RESOURCE_COUNT_TOKEN_SEPARATOR)?;
+    if resource_type.is_empty() {
+        return None;
+    }
+    let count: i64 = count.parse().ok()?;
+    (count >= 0).then_some((count, resource_type.to_string()))
+}
+
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
 // here — hence the `GetDiscoveredResourceCountsError` alias below. An operation that models no errors
@@ -185,18 +210,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDiscoveredResourceCounts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDiscoveredResourceCountsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDiscoveredResourceCounts"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // A limit outside the allowable range is what `InvalidLimitException` reports.
+        // No REQUEST reaches this: the modelled `@range(0..100)` on `limit` is refused
+        // at the boundary first, so this is defence in depth for a direct caller of
+        // `handle`, and it words the condition the way mainline's sibling
+        // `list_discovered_resources` handler does.
+        if !(0..=crate::state::DISCOVERED_RESOURCES_MAX_LIMIT).contains(&input.limit) {
+            return Err(
+                GetDiscoveredResourceCountsErrorModeled::InvalidLimitException(
+                    InvalidLimitException {
+                        message: Some(format!(
+                            "limit {} is outside the allowable range 0..{}",
+                            input.limit,
+                            crate::state::DISCOVERED_RESOURCES_MAX_LIMIT,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "If you specify 0, Config uses the default" page size.
+        let page_size = if input.limit == 0 {
+            crate::state::DISCOVERED_RESOURCES_DEFAULT_LIMIT
+        } else {
+            input.limit
+        } as usize;
+
+        // The token is opaque: anything this operation did not issue is malformed.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match decode_resource_count_token(token) {
+                Some(resume_at) => Some(resume_at),
+                None => {
+                    return Err(
+                        GetDiscoveredResourceCountsErrorModeled::InvalidNextTokenException(
+                            InvalidNextTokenException {
+                                message: Some(
+                                    "the specified nextToken is not valid; use the nextToken \
+                                     a previous GetDiscoveredResourceCounts response returned"
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        // No `resourceTypes` means every resource type Config is recording here. The
+        // member is `ResourceTypes`, a list the model bounds at `@length(min: 0, max:
+        // 20)`, so the narrowing below compares at most twenty requested names against
+        // the counted types.
+        let requested = input.resource_types.unwrap_or_default();
+        // The store is read under the lock and NOTHING else happens there: the counts
+        // come back owned, and this statement ends — releasing the guard — before the
+        // request's own narrowing runs over them.
+        let counted = state.lock().discovered_resource_counts();
+        let selected: Vec<(String, i64)> = counted
+            .into_iter()
+            .filter(|(resource_type, _)| {
+                requested.is_empty() || requested.iter().any(|asked| asked == resource_type)
+            })
+            .collect();
+
+        // The total counts every selected type, not just the ones on this page: it is
+        // "the total number of resources that Config is recording", narrowed to the
+        // requested resource types when the request named any.
+        let total_discovered_resources = selected.iter().map(|(_, count)| *count).sum();
+
+        // The ordering is (count descending, resource type ascending) and a token
+        // carries that whole key, so a page resumes at the first entry that does not
+        // sort ahead of it.
+        let sorts_ahead_of_resume = |count: i64, resource_type: &str| match resume_at.as_ref() {
+            None => false,
+            Some((resume_count, resume_type)) => {
+                count > *resume_count
+                    || (count == *resume_count && resource_type < resume_type.as_str())
+            }
+        };
+
+        let mut resource_counts = Vec::new();
+        let mut next_token = None;
+        for (resource_type, count) in &selected {
+            if sorts_ahead_of_resume(*count, resource_type) {
+                continue;
+            }
+            if resource_counts.len() == page_size {
+                next_token = Some(encode_resource_count_token(*count, resource_type));
+                break;
+            }
+            resource_counts.push(ResourceCount {
+                resource_type: Some(resource_type.clone()),
+                count: *count,
+            });
+        }
+
+        Ok(GetDiscoveredResourceCountsOutput {
+            total_discovered_resources,
+            resource_counts: Some(resource_counts),
+            next_token,
+        })
     }
 }
