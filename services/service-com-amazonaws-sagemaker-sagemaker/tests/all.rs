@@ -15,6 +15,8 @@
 mod ai_benchmark_job_lifecycle;
 #[path = "all/ai_workload_config_lifecycle.rs"]
 mod ai_workload_config_lifecycle;
+#[path = "all/algorithm_lifecycle.rs"]
+mod algorithm_lifecycle;
 #[path = "all/app_image_config_registry.rs"]
 mod app_image_config_registry;
 #[path = "all/artifact_deletion.rs"]

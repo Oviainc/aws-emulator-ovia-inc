@@ -112,6 +112,12 @@ pub const DEFAULT_ARCHITECTURE: &str = "x86_64";
 /// names no tracing configuration, because X-Ray then samples nothing of its own.
 pub const DEFAULT_TRACING_MODE: &str = "PassThrough";
 
+/// The `RecursiveLoop` configuration a function has before anyone sets one, which the
+/// model's own `RecursiveLoop` member documentation states twice — on
+/// `GetFunctionRecursionConfig`'s output and on `PutFunctionRecursionConfig`'s input:
+/// "By default, Lambda sets your function's configuration to Terminate."
+pub const DEFAULT_RECURSIVE_LOOP: &str = "Terminate";
+
 /// The `FunctionCodeLocation` `RepositoryType` of a .zip file archive package: Lambda
 /// keeps the archive in its own S3 bucket and vends a download location for it.
 pub const REPOSITORY_TYPE_S3: &str = "S3";
@@ -624,6 +630,13 @@ pub struct FunctionRecord {
     pub tags: BTreeMap<String, String>,
     /// The reserved concurrency, when `PutFunctionConcurrency` has set one.
     pub reserved_concurrent_executions: Option<i32>,
+    /// The function's recursive loop detection configuration, one of the model's
+    /// `RecursiveLoop` values. It is a function-level setting rather than a
+    /// version-specific one — `GetFunctionRecursionConfig` and
+    /// `PutFunctionRecursionConfig` both take an `UnqualifiedFunctionName`, whose
+    /// pattern admits no qualifier — so it lives on the record beside the function's
+    /// other function-level settings and starts at [`DEFAULT_RECURSIVE_LOOP`].
+    pub recursive_loop: String,
     /// The highest version published so far; 0 when none has been.
     pub latest_version: u64,
     /// The published versions, ordered by version number.

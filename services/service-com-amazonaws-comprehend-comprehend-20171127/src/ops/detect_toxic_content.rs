@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DetectToxicContent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DetectToxicContent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DetectToxicContent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Toxicity analysis runs in-process through the `rustrict` English
+//! profanity/abuse engine, so every score is computed from the submitted segment
+//! rather than matched out of the request. One `ToxicLabels` entry is produced per
+//! input segment, in input order, and a `LanguageCode` the engine has no lexicon
+//! for is answered with the modelled `UnsupportedLanguageException`.
 //!
 //! ## Shape of an operation
 //!
@@ -84,6 +81,115 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use rustrict::{Censor, Type};
+
+/// The largest single `TextSegment$Text` this operation accepts, in UTF-8 bytes:
+/// this service's one quota table entry for toxicity analysis
+/// ([`crate::state::TOXIC_CONTENT_SEGMENT_QUOTA_BYTES`], which carries the modelled
+/// documentation the value is read from). A string past it is refused with the
+/// `TextSizeLimitExceededException` the operation declares, through the one
+/// size-report message every real-time inference operation here shares.
+const MAX_SEGMENT_BYTES: usize = crate::state::TOXIC_CONTENT_SEGMENT_QUOTA_BYTES;
+
+/// The most text strings one request may carry.
+///
+/// From the modelled documentation of `DetectToxicContentRequest$TextSegments`:
+/// "A list of up to 10 text strings. Each string has a maximum size of 1 KB, and
+/// the maximum size of the list is 10 KB." The model's `@length` carries only the
+/// floor of 1, so the ceiling is enforced here. The documented 10 KB ceiling on the
+/// whole list needs no separate check: this count of strings at
+/// [`MAX_SEGMENT_BYTES`] each is exactly it, so refusing on the count and on the
+/// per-string size enforces it.
+const MAX_SEGMENTS: usize = 10;
+
+/// The `LanguageCode` values this operation analyses.
+///
+/// Both the modelled member documentation ("Currently, English is the only
+/// supported language") and the in-process engine, whose word lists and
+/// substitution rules are English, agree on this set. Every other value the
+/// `LanguageCode` enum names is answered with the modelled
+/// `UnsupportedLanguageException` rather than with scores no analysis produced.
+const ANALYSABLE_LANGUAGES: &[&str] = &["en"];
+
+/// The confidence reported for a category the engine placed at each of the three
+/// severity levels it distinguishes.
+///
+/// `ToxicContent$Score` and `ToxicLabels$Toxicity` are modelled as "zero to one,
+/// where one is the highest confidence", and the engine's verdict per category is
+/// one of three ordered severity levels rather than a continuous number — so each
+/// level is reported as the midpoint of its third of that range: mild (0, 1/3],
+/// moderate (1/3, 2/3], severe (2/3, 1].
+const MILD_SCORE: f32 = 1.0 / 6.0;
+const MODERATE_SCORE: f32 = 0.5;
+const SEVERE_SCORE: f32 = 5.0 / 6.0;
+
+/// The modelled `ToxicContentType` values this emulator's engine can place, each
+/// paired with the engine category that detects it.
+///
+/// The engine classifies a string as profane, offensive (slurs and discriminatory
+/// language), sexual and mean (demeaning, insulting); those are reported as
+/// `PROFANITY`, `HATE_SPEECH`, `SEXUAL` and `INSULT`. The three remaining modelled
+/// types — `GRAPHIC`, `HARASSMENT_OR_ABUSE` and `VIOLENCE_OR_THREAT` — have no
+/// detector in this engine, so no label for them is ever reported: a score for a
+/// category nothing analysed would be invented. Listed in the modelled enum's own
+/// order (`TOXIC_CONTENT_TYPE_VALUES`), so the reported `Labels` order is stable.
+const DETECTABLE_CATEGORIES: [(&str, Type); 4] = [
+    ("HATE_SPEECH", Type::OFFENSIVE),
+    ("INSULT", Type::MEAN),
+    ("PROFANITY", Type::PROFANE),
+    ("SEXUAL", Type::SEXUAL),
+];
+
+/// The confidence the analysis places in `category`, or `None` when the engine
+/// placed no content of that category in the string.
+fn category_score(analysis: Type, category: Type) -> Option<f32> {
+    if analysis.is(category & Type::SEVERE) {
+        Some(SEVERE_SCORE)
+    } else if analysis.is(category & Type::MODERATE) {
+        Some(MODERATE_SCORE)
+    } else if analysis.is(category & Type::MILD) {
+        Some(MILD_SCORE)
+    } else {
+        None
+    }
+}
+
+/// Analyse one text segment into the modelled per-string result.
+///
+/// `Labels` carries one entry per modelled content type the engine placed in the
+/// string, with the confidence of that placement. `Toxicity` is the overall
+/// confidence that the string carries toxic content of ANY type: the per-type
+/// confidences are independent pieces of evidence, so it is the complement of the
+/// product of their complements. That makes it at least as large as the strongest
+/// single confidence, larger when several types are placed, and exactly zero for a
+/// string the engine placed nothing in — which comes back with no labels, rather
+/// than with an invented floor.
+fn analyse_segment(text: &str) -> ToxicLabels {
+    let analysis = Censor::from_str(text).analyze();
+
+    let labels: Vec<ToxicContent> = DETECTABLE_CATEGORIES
+        .into_iter()
+        .filter_map(|(name, category)| {
+            category_score(analysis, category).map(|score| ToxicContent {
+                name: Some(name.to_string()),
+                score: Some(score),
+            })
+        })
+        .collect();
+
+    let not_toxic: f32 = labels
+        .iter()
+        .filter_map(|label| label.score)
+        .map(|score| 1.0 - score)
+        .product();
+    let toxicity = (1.0 - not_toxic).clamp(0.0, 1.0);
+
+    ToxicLabels {
+        labels: Some(labels),
+        toxicity: Some(toxicity),
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -155,18 +261,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DetectToxicContent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DetectToxicContentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DetectToxicContent"))
+        // Synchronous inference holds no state: the answer is a function of
+        // `TextSegments` and `LanguageCode` alone, so repeating a call returns the
+        // same scores and no later caller sees a difference.
+        let _ = (ctx, &self.engine);
+
+        // The list's `@length` floor of 1 and each segment's own are enforced at the
+        // boundary; the count and the per-string byte ceiling the model documents in
+        // prose are not, so they are enforced here.
+        if input.text_segments.len() > MAX_SEGMENTS {
+            return Err(DetectToxicContentErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "TextSegments carries {} text strings, which exceeds the limit of \
+                         {MAX_SEGMENTS} for DetectToxicContent.",
+                        input.text_segments.len()
+                    )),
+                    // No `Reason` or `Detail` is claimed: the modelled
+                    // `InvalidRequestReason` has the single value `INVALID_DOCUMENT`
+                    // and every `InvalidRequestDetailReason` value describes a
+                    // document this service could not read (size, type, page count,
+                    // Textract access) — none of them states that the list carried
+                    // too many strings, which the message says instead.
+                    reason: None,
+                    detail: None,
+                },
+            )
+            .into());
+        }
+
+        // The per-string byte quota is not modelled either, so it is enforced here
+        // through the one size check and the one size-report message every real-time
+        // inference operation in this service shares: it reports the quota that
+        // applies and the submitted string's UTF-8 byte length, which is the pair a
+        // client re-chunks against.
+        if let Some(message) = input
+            .text_segments
+            .iter()
+            .find_map(|segment| crate::state::text_size_refusal(&segment.text, MAX_SEGMENT_BYTES))
+        {
+            return Err(
+                DetectToxicContentErrorModeled::TextSizeLimitExceededException(
+                    TextSizeLimitExceededException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Membership of the `LanguageCode` enum is enforced at the boundary; whether
+        // this emulator's toxicity engine can read that language is not.
+        if !ANALYSABLE_LANGUAGES.contains(&input.language_code.as_str()) {
+            return Err(DetectToxicContentErrorModeled::UnsupportedLanguageException(
+                UnsupportedLanguageException {
+                    message: Some(format!(
+                        "This emulator's toxicity engine cannot process the language \
+                         '{}'. Supported languages: {}.",
+                        input.language_code,
+                        ANALYSABLE_LANGUAGES.join(", ")
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "The API response contains a results list that matches the size of the
+        // input list": one entry per segment, in input order.
+        let result_list = input
+            .text_segments
+            .iter()
+            .map(|segment| analyse_segment(&segment.text))
+            .collect();
+
+        Ok(DetectToxicContentOutput {
+            result_list: Some(result_list),
+        })
     }
 }

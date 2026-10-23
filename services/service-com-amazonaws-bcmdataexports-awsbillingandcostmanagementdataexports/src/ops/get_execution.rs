@@ -15,8 +15,7 @@
 //! — a query run against the billing data and a file written to the caller's S3 bucket —
 //! and this emulator runs no such delivery, so nothing records an execution and this
 //! operation reports what `crate::state::StoredExecution` holds rather than a status for
-//! work nothing performed. `ListExecutions`, which pages over the same store, is still a
-//! stub and carries its own issue.
+//! work nothing performed. `ListExecutions` pages over the same store.
 //!
 //! ## Shape of an operation
 //!

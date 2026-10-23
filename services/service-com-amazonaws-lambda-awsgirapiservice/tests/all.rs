@@ -17,6 +17,8 @@ mod account_settings;
 mod function_configuration;
 #[path = "all/function_lifecycle.rs"]
 mod function_lifecycle;
+#[path = "all/function_recursion_config.rs"]
+mod function_recursion_config;
 #[path = "all/function_url_config.rs"]
 mod function_url_config;
 #[path = "all/layer_versions.rs"]

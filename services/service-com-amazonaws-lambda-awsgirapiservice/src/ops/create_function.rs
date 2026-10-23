@@ -501,6 +501,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into_iter()
                 .collect(),
             reserved_concurrent_executions: None,
+            // "By default, Lambda sets your function's configuration to Terminate",
+            // so a new function detects recursive loops until a caller says otherwise.
+            recursive_loop: crate::state::DEFAULT_RECURSIVE_LOOP.to_string(),
             latest_version: 0,
             versions: ::std::collections::BTreeMap::new(),
             // A new function has no resource-based policy until `AddPermission` adds a

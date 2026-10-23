@@ -78,7 +78,8 @@
 //!
 //! ## Service-wide rules that are not state
 //!
-//! [`REALTIME_TEXT_QUOTA_BYTES`], [`DOMINANT_LANGUAGE_TEXT_QUOTA_BYTES`] and
+//! [`REALTIME_TEXT_QUOTA_BYTES`], [`DOMINANT_LANGUAGE_TEXT_QUOTA_BYTES`],
+//! [`PII_TEXT_QUOTA_BYTES`], [`TOXIC_CONTENT_SEGMENT_QUOTA_BYTES`] and
 //! [`text_size_refusal`] are the ONE per-document size quota table and the ONE
 //! size-report refusal the real-time (synchronous) inference operations share, so no
 //! two of them can disagree about the quota or about what a refusal tells the
@@ -1565,6 +1566,21 @@ pub const DOMINANT_LANGUAGE_TEXT_QUOTA_BYTES: usize = 100_000;
 /// BYTES: a 100001-byte document is refused with `TextSizeLimitExceededException`,
 /// a 100000-byte one is accepted.
 pub const PII_TEXT_QUOTA_BYTES: usize = 100_000;
+
+/// The per-string quota `DetectToxicContent` accepts, in UTF-8 bytes.
+///
+/// Toxicity analysis is the real-time family that takes a LIST of strings rather
+/// than one document, and its own modelled member documentation states the per-string
+/// maximum — `DetectToxicContentRequest$TextSegments`: "A list of up to 10 text
+/// strings. Each string has a maximum size of 1 KB, and the maximum size of the list
+/// is 10 KB." That rounding is read here exactly as
+/// [`DOMINANT_LANGUAGE_TEXT_QUOTA_BYTES`] and [`PII_TEXT_QUOTA_BYTES`] read theirs, as
+/// a decimal count of BYTES: a 1001-byte string is refused with
+/// `TextSizeLimitExceededException`, a 1000-byte one is accepted. The same reading is
+/// what makes the two documented ceilings agree — ten strings of this quota each are
+/// exactly the documented 10 KB the whole list may carry — so no separate check of
+/// the list's total size is needed.
+pub const TOXIC_CONTENT_SEGMENT_QUOTA_BYTES: usize = 1_000;
 
 /// The `LanguageCode` values Comprehend's PII analysis accepts.
 ///

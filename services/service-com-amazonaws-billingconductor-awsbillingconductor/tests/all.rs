@@ -21,6 +21,8 @@ mod payer_account_gate;
 mod payer_gate_precedes_idempotency_existence_and_assembly;
 #[path = "all/percentage_custom_line_item_resource_associations.rs"]
 mod percentage_custom_line_item_resource_associations;
+#[path = "all/pricing_plan_update.rs"]
+mod pricing_plan_update;
 #[path = "all/pricing_rule_core_loop.rs"]
 mod pricing_rule_core_loop;
 #[path = "all/pricing_rule_lifecycle.rs"]

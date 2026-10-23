@@ -474,15 +474,22 @@ pub const APP_STATUS_PENDING: &str = "Pending";
 /// See [`APP_STATUS_PENDING`].
 pub const APP_STATUS_IN_SERVICE: &str = "InService";
 
-/// The `ModelPackageGroupStatus` a model package group carries once `CreateModelPackageGroup`
-/// has returned.
+/// The `Completed` status this service's resources report, shared by the two modelled
+/// enums that name it.
 ///
-/// A model group is a registry container, not a provisioned resource: the call that creates
-/// it is synchronous, and the group is immediately usable (a model package can be registered
-/// into it on the very next call). So it is born in this TERMINAL status and the clock owes
-/// it no later transition — the modelled enum's `Pending`/`InProgress` describe a group
-/// whose creation is still in flight, which never happens here.
+/// It is the `ModelPackageGroupStatus` a model package group carries once
+/// `CreateModelPackageGroup` has returned: a model group is a registry container, not a
+/// provisioned resource — the call that creates it is synchronous, and the group is
+/// immediately usable (a model package can be registered into it on the very next call).
+/// So it is born in this TERMINAL status and the clock owes it no later transition — the
+/// modelled enum's `Pending`/`InProgress` describe a group whose creation is still in
+/// flight, which never happens here.
 pub const STATUS_COMPLETED: &str = "Completed";
+
+// The algorithm slice lives in its own module file, re-exported so handlers keep naming
+// `crate::state::...`: see `state/algorithms.rs`.
+pub mod algorithms;
+pub use algorithms::*;
 
 // ---------------------------------------------------------------------------
 // The hub slice: the records `ListHubContents` reports. Kept here, beside the first
@@ -1486,6 +1493,8 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     pub endpoint_configs: BTreeMap<String, EndpointConfig>,
     /// Keyed by `EndpointName`.
     pub endpoints: BTreeMap<String, Endpoint>,
+    /// Keyed by `AlgorithmName`.
+    pub algorithms: BTreeMap<String, Algorithm>,
     /// AutoML jobs V2, keyed by [`entity_key`] of their `AutoMLJobName`.
     pub auto_ml_jobs_v2: BTreeMap<String, AutoMLJobV2>,
     /// Lineage contexts, keyed by `ContextArn`: `ContextName` is documented unique to an

@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetFunctionRecursionConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetFunctionRecursionConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetFunctionRecursionConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the `RecursiveLoop` setting the function record in [`crate::state`] holds —
+//! [`crate::state::DEFAULT_RECURSIVE_LOOP`] until a `PutFunctionRecursionConfig` call
+//! has stored another one.
+//!
+//! The operation is `@readonly`: it resolves the `FunctionName` to one stored record
+//! through [`crate::state::resolve_function`] and answers out of what is stored. The
+//! only thing that resolution writes is the `Pending` -> `Active` move the CLOCK
+//! already made due, which would have been owed at the same instant even if nobody had
+//! called.
+//!
+//! The setting is function-level: `FunctionName` is an `UnqualifiedFunctionName`, whose
+//! pattern admits no `:qualifier`, so every call reads the one setting the function has.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +155,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetFunctionRecursionConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetFunctionRecursionConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetFunctionRecursionConfig"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetFunctionRecursionConfigErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some("Lambda state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+        // An `UnqualifiedFunctionName` carries no qualifier, so no `Qualifier` is passed
+        // here and resolution reports the function record itself.
+        let (record, _version) = crate::state::resolve_function(
+            &mut store,
+            &input.function_name,
+            None,
+            &region,
+            ::std::time::SystemTime::now(),
+        )
+        .map_err(|failure| match failure {
+            crate::state::ResolveFailure::Malformed(message) => {
+                GetFunctionRecursionConfigErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+            crate::state::ResolveFailure::NotFound(message) => {
+                GetFunctionRecursionConfigErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+        })?;
+
+        Ok(GetFunctionRecursionConfigOutput {
+            recursive_loop: Some(record.recursive_loop.clone()),
+        })
     }
 }

@@ -203,6 +203,11 @@ impl Emulator {
             .await
     }
 
+    /// `POST /resource/scan` with the given request body.
+    pub async fn start_resource_scan(&self, body: Value) -> Reply {
+        self.send("POST", "/resource/scan", Some(body)).await
+    }
+
     /// `POST /tags/{resourceArn}` with the given tag map.
     pub async fn tag_resource(&self, resource_arn: &str, tags: &Value) -> Reply {
         self.send(

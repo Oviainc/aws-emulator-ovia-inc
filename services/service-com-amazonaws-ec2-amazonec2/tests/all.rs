@@ -92,6 +92,9 @@ mod state_roundtrip;
 mod transit_gateway_acceptance;
 #[path = "all/transit_gateway_lifecycle.rs"]
 mod transit_gateway_lifecycle;
+// The Verified Access trust provider slice: create, then read it back.
+#[path = "all/verified_access_trust_providers.rs"]
+mod verified_access_trust_providers;
 #[path = "all/volume_lifecycle.rs"]
 mod volume_lifecycle;
 #[path = "all/vpc_attributes.rs"]

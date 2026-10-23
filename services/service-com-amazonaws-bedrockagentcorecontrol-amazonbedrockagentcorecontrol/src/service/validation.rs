@@ -626,13 +626,13 @@ mod tests {
         }
     }
 
-    /// RULE 3 goes through the tree's one `unanchored`: a pair wrapping the whole
-    /// expression is dropped, and anything else is quoted as the model spells it.
+    /// RULE 3 goes through the tree's one `unanchored`: the model's outer `^`/`$` pair is
+    /// dropped positionally, and an expression without one is quoted as the model spells it.
     #[test]
     fn a_pattern_is_quoted_without_its_whole_value_anchors() {
         // (case, the model's expression, what the clause quotes). The rows span this
         // model's own pattern shapes and the shapes the rule must leave alone.
-        let rows: [(&str, &str, &str); 6] = [
+        let rows: [(&str, &str, &str); 7] = [
             (
                 "a name's character class",
                 "^[a-zA-Z][a-zA-Z0-9_]{0,47}$",
@@ -650,7 +650,14 @@ mod tests {
             ),
             ("anchored at the start only", "^arn:aws:", "^arn:aws:"),
             ("anchored at the end only", "[0-9]{12}$", "[0-9]{12}$"),
-            ("a fully anchored alternation", "^a$|^b$", "^a$|^b$"),
+            // The outer pair is dropped POSITIONALLY — see
+            // `service_common::validation::unanchored`, the tree's one implementation of
+            // this rule: the published expression is the service's own with that pair
+            // written around it, so a top-level alternation does not keep it (a lambdacore
+            // recording shows AWS dropping it from one). An expression that anchors inside
+            // its branches has no outer pair and is quoted verbatim.
+            ("a fully anchored alternation", "^a$|^b$", "a$|^b"),
+            ("anchors inside the branches", "(^a$)|(^b$)", "(^a$)|(^b$)"),
         ];
         for (case, modelled, expected) in rows {
             let stated = requirement_of(&ViolationKind::Pattern(modelled.to_owned()))

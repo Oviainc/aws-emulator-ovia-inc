@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagStream
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagStream`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagStream::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +149,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagStream` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagStreamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagStream"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagStreamErrorModeled::ClientLimitExceededException(
+                ClientLimitExceededException {
+                    message: Some("The stream store is unavailable. Try again later.".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        store.settle_clock();
+
+        // Every key must be a `TagKey` and every value a `TagValue`; the request
+        // walk checks neither side of a MAP, so the modelled bounds and character
+        // classes are enforced before anything is written (see
+        // `crate::state::tag_key_violation`).
+        if let Some(violation) = input.tags.iter().find_map(|(key, value)| {
+            crate::state::tag_key_violation("tags", key)
+                .or_else(|| crate::state::tag_value_violation("tags", value))
+        }) {
+            return Err(
+                TagStreamErrorModeled::InvalidArgumentException(InvalidArgumentException {
+                    message: Some(violation),
+                })
+                .into(),
+            );
+        }
+
+        let stream = store
+            .resolve_mut(input.stream_name.as_deref(), input.stream_arn.as_deref())
+            .map_err(lookup_error)?;
+
+        // Tagging is a MERGE: a key the stream already carries takes the new value,
+        // a key it does not is added. The per-resource ceiling is therefore checked
+        // against the UNION, not against the request alone (whose size the modeled
+        // `@length` on `ResourceTags` already bounds), and nothing is written when
+        // the union would exceed it.
+        let merged = stream
+            .tags
+            .keys()
+            .map(String::as_str)
+            .chain(input.tags.keys().map(String::as_str))
+            .collect::<::std::collections::BTreeSet<_>>()
+            .len();
+        if merged > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(
+                TagStreamErrorModeled::TagsPerResourceExceededLimitException(
+                    TagsPerResourceExceededLimitException {
+                        message: Some(format!(
+                            "You have exceeded the limit of tags that you can associate with \
+                             the resource. A Kinesis video stream can support up to {} tags; \
+                             this request would leave the stream with {merged}.",
+                            crate::state::MAX_TAGS_PER_RESOURCE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        for (key, value) in input.tags {
+            stream.tags.insert(key, value);
+        }
+
+        // `Version` is the stream's optimistic-concurrency token for the metadata
+        // `UpdateStream`/`UpdateDataRetention` exchange, which is what the model ties
+        // it to (`CurrentVersion`); tags are not part of that metadata, so tagging
+        // leaves the version alone.
+        Ok(TagStreamOutput {})
     }
+}
+
+/// State the failure to resolve a `StreamName`/`StreamARN` pair as this operation's
+/// own modeled error: absent or contradictory identifiers are a bad argument (400),
+/// a well-formed identifier for no stored stream is a missing resource (404).
+fn lookup_error(error: crate::state::StreamLookupError) -> TagStreamError {
+    match error {
+        crate::state::StreamLookupError::NoIdentifier => {
+            TagStreamErrorModeled::InvalidArgumentException(InvalidArgumentException {
+                message: Some("Either StreamName or StreamARN must be specified.".to_string()),
+            })
+        }
+        crate::state::StreamLookupError::Mismatch => {
+            TagStreamErrorModeled::InvalidArgumentException(InvalidArgumentException {
+                message: Some("StreamName and StreamARN refer to different streams.".to_string()),
+            })
+        }
+        crate::state::StreamLookupError::NotFound => {
+            TagStreamErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some("The requested stream is not found or not active.".to_string()),
+            })
+        }
+    }
+    .into()
 }

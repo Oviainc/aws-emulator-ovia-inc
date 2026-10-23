@@ -56,6 +56,8 @@ const CHILD_IDENTITY_MEMBERS: &[&str] = &[
 const PRINCIPAL: &str = "arn:aws:iam::000000000000:role/not-found-probe";
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/eksCapabilityRole";
 const VIEW_POLICY: &str = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy";
+/// The node role a `CreateNodegroup` row passes to its nodes.
+const NODE_ROLE: &str = "arn:aws:iam::000000000000:role/eksNodeRole";
 
 /// One request, as a row of the tables: the operation it calls and the HTTP shape an
 /// SDK would send for it (`OPERATIONS.md` carries each route).
@@ -169,6 +171,16 @@ fn cluster_resolving(cluster: &str) -> Vec<Row> {
             "POST",
             format!("/clusters/{name}/addons"),
             serde_json::json!({ "addonName": "vpc-cni" }),
+        ),
+        row(
+            "CreateNodegroup",
+            "POST",
+            format!("/clusters/{name}/node-groups"),
+            serde_json::json!({
+                "nodegroupName": "probe-nodegroup",
+                "nodeRole": NODE_ROLE,
+                "subnets": ["subnet-aaaa1111"],
+            }),
         ),
         row(
             "ListCapabilities",
