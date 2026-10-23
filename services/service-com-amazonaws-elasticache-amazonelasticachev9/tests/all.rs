@@ -33,6 +33,8 @@ mod serverless_cache_describe;
 mod service_updates;
 #[path = "all/serverless_cache_lifecycle.rs"]
 mod serverless_cache_lifecycle;
+#[path = "all/snapshot_copies.rs"]
+mod snapshot_copies;
 #[path = "all/snapshots.rs"]
 mod snapshots;
 #[path = "all/state_roundtrip.rs"]

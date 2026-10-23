@@ -4177,6 +4177,40 @@ impl SnapshotRecord {
         }
     }
 
+    /// A copy of this snapshot stored under another name.
+    ///
+    /// A copy is "a copy of an existing snapshot", so everything that describes
+    /// WHAT was captured — the source cluster's id and configuration, the
+    /// instant the data was taken at, and the per-node snapshots — is carried
+    /// over unchanged rather than re-read from the live cluster or re-stamped
+    /// with the copy's own clock: copying does not retake the snapshot. Only the
+    /// copy's own identity (name and ARN), its fresh status, its provenance and
+    /// the members the copy request itself carries (KMS key, tags) differ.
+    ///
+    /// A copy is always a MANUAL snapshot, whatever the source's
+    /// `SnapshotSource` was: copying an automated backup is how the ElastiCache
+    /// User Guide has a caller keep it past its retention limit, and a manual
+    /// snapshot is the one that "does not expire".
+    pub fn copy_to(&self, new: SnapshotCopy) -> SnapshotRecord {
+        SnapshotRecord {
+            arn: snapshot_arn(&new.region, &new.target_snapshot_name),
+            snapshot_name: new.target_snapshot_name,
+            status: STATUS_CREATING.to_string(),
+            pending_status: Some(PendingTransition {
+                due: new.now + SNAPSHOT_TRANSITION,
+                status: STATUS_AVAILABLE.to_string(),
+            }),
+            source: SNAPSHOT_SOURCE_MANUAL.to_string(),
+            // "The ID of the KMS key used to encrypt the target snapshot": the
+            // copy keeps the source's key when the request names none.
+            kms_key_id: new.kms_key_id.or_else(|| self.kms_key_id.clone()),
+            // `Tags` are "a list of tags to be added to this resource" — the
+            // copy's own, not the source's.
+            tags: new.tags,
+            ..self.clone()
+        }
+    }
+
     /// Materialise the status change the clock owes this snapshot, if `now` is
     /// past its due instant. The one write a reporting operation may make; see
     /// [`CacheClusterRecord::settle`].
@@ -4428,6 +4462,24 @@ pub struct NewSnapshot {
     /// The VPC of the source cluster's subnet group, resolved by the caller
     /// (which holds the store) rather than guessed here.
     pub vpc_id: Option<String>,
+    pub tags: Vec<(String, String)>,
+    pub now: SystemTime,
+}
+
+/// The values a copied snapshot carries that are not the source snapshot's —
+/// one argument so [`SnapshotRecord::copy_to`] does not take a row of
+/// positional strings.
+#[derive(Debug, Clone)]
+pub struct SnapshotCopy {
+    /// `CopySnapshot$TargetSnapshotName`, already lowercased: "this value is
+    /// stored as a lowercase string".
+    pub target_snapshot_name: String,
+    /// The region the copy's ARN names — the request's, as every other ARN this
+    /// service mints.
+    pub region: String,
+    /// `CopySnapshot$KmsKeyId`, "the ID of the KMS key used to encrypt the
+    /// target snapshot", or `None` to keep the source snapshot's.
+    pub kms_key_id: Option<String>,
     pub tags: Vec<(String, String)>,
     pub now: SystemTime,
 }
@@ -5365,6 +5417,20 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
         let cluster = self.cache_clusters.get_mut(id)?;
         cluster.settle(now);
         Some(cluster)
+    }
+
+    /// The snapshot `name` names (the stored, lowercased name), with any status
+    /// change the clock owes it already materialised — the snapshot counterpart
+    /// of [`Self::settled_cluster_mut`], so an operation that branches on a
+    /// snapshot's status reads the status it is owed at this instant.
+    pub fn settled_snapshot_mut(
+        &mut self,
+        name: &str,
+        now: SystemTime,
+    ) -> Option<&mut SnapshotRecord> {
+        let snapshot = self.snapshots.get_mut(name)?;
+        snapshot.settle(now);
+        Some(snapshot)
     }
 
     /// Materialise every status change the clock owes, for a caller that is

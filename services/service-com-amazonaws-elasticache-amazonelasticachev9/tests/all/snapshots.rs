@@ -29,7 +29,7 @@ type FilterCase = (
 
 /// Take one snapshot named `name` of `cluster`, with whatever else `extra`
 /// names.
-async fn create_snapshot(
+pub(crate) async fn create_snapshot(
     emulator: &Emulator,
     name: &str,
     cluster: &str,
@@ -41,12 +41,12 @@ async fn create_snapshot(
 }
 
 /// Describe snapshots under `filters`.
-async fn describe_snapshots(emulator: &Emulator, filters: &[(&str, &str)]) -> Reply {
+pub(crate) async fn describe_snapshots(emulator: &Emulator, filters: &[(&str, &str)]) -> Reply {
     emulator.call("DescribeSnapshots", &params(filters)).await
 }
 
 /// The `SnapshotName`s a describe reported, in the order it reported them.
-fn reported_names(reply: &Reply) -> Vec<&str> {
+pub(crate) fn reported_names(reply: &Reply) -> Vec<&str> {
     reply.all("Snapshot/SnapshotName")
 }
 

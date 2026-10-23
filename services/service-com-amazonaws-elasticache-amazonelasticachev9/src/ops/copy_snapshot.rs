@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CopySnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CopySnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CopySnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: this operation makes a copy of a stored snapshot under a new name and
+//! persists it, so a later `DescribeSnapshots` reports both. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -196,18 +190,159 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CopySnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CopySnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CopySnapshot"))
+        // This operation MUTATES: it "makes a copy of an existing snapshot", so
+        // it mints a second snapshot record from a stored one. The source
+        // snapshot itself is only read.
+        let region = crate::state::request_region(ctx.parts());
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // Both names are identities of stored snapshots, and a snapshot name
+        // "is stored as a lowercase string" — so the lookup and the new
+        // record's key are the lowercased forms.
+        let source_snapshot_name = input.source_snapshot_name.to_ascii_lowercase();
+        let target_snapshot_name = input.target_snapshot_name.to_ascii_lowercase();
+        if !crate::state::is_valid_snapshot_name(&target_snapshot_name) {
+            return Err(CopySnapshotErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(format!(
+                        "Invalid value {} for TargetSnapshotName: a name must contain from 1 to \
+                         255 alphanumeric characters or hyphens.",
+                        input.target_snapshot_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let tags = match crate::state::tag_pairs(input.tags) {
+            Ok(tags) => tags,
+            Err(crate::state::TagRefusal::TooMany(count)) => {
+                return Err(CopySnapshotErrorModeled::TagQuotaPerResourceExceeded(
+                    TagQuotaPerResourceExceeded {
+                        message: Some(format!(
+                            "{count} tags were supplied; the maximum number of tags permitted on a \
+                             resource is {}.",
+                            crate::state::MAX_TAGS_PER_RESOURCE
+                        )),
+                    },
+                )
+                .into())
+            }
+            Err(crate::state::TagRefusal::MissingKey) => {
+                return Err(CopySnapshotErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(
+                            "Invalid value for Tags: a tag's Key may not be null.".to_string(),
+                        ),
+                    },
+                )
+                .into())
+            }
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The copy is derived from the SOURCE record, with the status change the
+        // clock already owed that record materialised first, so the state check
+        // below reads the status the source is owed at this instant.
+        let copy = {
+            let Some(source) = store.settled_snapshot_mut(&source_snapshot_name, now) else {
+                return Err(CopySnapshotErrorModeled::SnapshotNotFoundFault(
+                    SnapshotNotFoundFault {
+                        message: Some(format!(
+                            "Snapshot {} not found.",
+                            input.source_snapshot_name
+                        )),
+                    },
+                )
+                .into());
+            };
+            // Only a settled snapshot can be copied: one still `creating`, or
+            // already `copying`, `restoring` or `deleting`, has no finished copy
+            // to take — which is what `InvalidSnapshotStateFault` ("the current
+            // state of the snapshot does not allow the requested operation to
+            // occur") refuses.
+            if source.status != crate::state::STATUS_AVAILABLE {
+                return Err(CopySnapshotErrorModeled::InvalidSnapshotStateFault(
+                    InvalidSnapshotStateFault {
+                        message: Some(format!(
+                            "Snapshot {} is in {} state, not available.",
+                            input.source_snapshot_name, source.status
+                        )),
+                    },
+                )
+                .into());
+            }
+            // `TargetBucket` is "used only when exporting a snapshot for
+            // external access": ElastiCache writes the snapshot's data into an
+            // Amazon S3 bucket it has been granted permissions on. This
+            // emulator serves no cache data plane, so there is no snapshot data
+            // to export and no granted bucket to export it to — the export is
+            // refused with the modelled bad-parameter error rather than
+            // answered with a copy that claims an object nobody wrote. It is
+            // refused HERE, after the source has been resolved, so a request
+            // that also names a source the store does not hold is answered with
+            // the not-found that names the missing resource.
+            if let Some(bucket) = input.target_bucket.as_deref() {
+                return Err(CopySnapshotErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "Invalid value {bucket} for TargetBucket: this emulator cannot export \
+                             a snapshot to Amazon S3."
+                        )),
+                    },
+                )
+                .into());
+            }
+            source.copy_to(crate::state::SnapshotCopy {
+                target_snapshot_name: target_snapshot_name.clone(),
+                region,
+                kms_key_id: input.kms_key_id,
+                tags,
+                now,
+            })
+        };
+
+        // "ElastiCache does not permit overwriting a snapshot, therefore this
+        // name must be unique within its context" — a taken name is refused
+        // rather than replacing the snapshot stored under it. Copying a snapshot
+        // onto its own name lands here too, because the source is itself stored
+        // under that name.
+        if store.snapshots.contains_key(&target_snapshot_name) {
+            return Err(CopySnapshotErrorModeled::SnapshotAlreadyExistsFault(
+                SnapshotAlreadyExistsFault {
+                    message: Some(format!(
+                        "Snapshot {} already exists.",
+                        input.target_snapshot_name
+                    )),
+                },
+            )
+            .into());
+        }
+        // The store is bounded: past its quota a copy adds no record, which is
+        // what `SnapshotQuotaExceededFault` refuses.
+        if store.snapshots.len() >= crate::state::SNAPSHOT_QUOTA {
+            return Err(CopySnapshotErrorModeled::SnapshotQuotaExceededFault(
+                SnapshotQuotaExceededFault {
+                    message: Some(format!(
+                        "This account already holds the maximum of {} snapshots.",
+                        crate::state::SNAPSHOT_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A copy is NOT ready: it answers `creating`, and the clock owes it
+        // `available` once the transition span has passed. The response is read
+        // back out of the store, so it reports the persisted record.
+        Ok(CopySnapshotOutput {
+            snapshot: Some(store.insert_snapshot(copy).to_modeled(true)),
+        })
     }
 }
