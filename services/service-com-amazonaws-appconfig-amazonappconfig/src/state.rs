@@ -421,6 +421,8 @@ const ID_LENGTH: usize = 7;
 pub struct PredefinedStrategy {
     /// The strategy id, which for a predefined strategy is also its name.
     pub id: &'static str,
+    /// What the published table says the strategy is for.
+    pub description: &'static str,
     /// Total time the rollout lasts.
     pub deployment_duration_in_minutes: i32,
     /// How the percentage of targets grows over that time.
@@ -432,14 +434,18 @@ pub struct PredefinedStrategy {
 }
 
 /// AppConfig's predefined deployment strategies, from the AWS AppConfig User Guide's
-/// "Predefined deployment strategies" table. Each row's deployment duration and
-/// growth factor are the ones the strategy's own name states — `Linear20Percent`
-/// `Every6Minutes` adds 20% of targets every 6 minutes, i.e. five steps across a
-/// 30-minute deployment — and `AppConfig.AllAtOnce` reaches every target at once with
-/// a 10-minute bake time.
+/// "Predefined deployment strategies" table — in the order that table publishes them,
+/// which is the order a listing of the catalogue reports them in. Every column of that
+/// table is a published AWS fact rather than a value this emulator may choose: the
+/// `description` is the table's "Description" ("Quick", "Test/Demo", "AWS Recommended"),
+/// and the deployment duration, growth type, growth factor and final bake time are the
+/// table's own — `Linear20Percent` `Every6Minutes` adds 20% of targets every 6 minutes,
+/// i.e. five steps across its 30-minute deployment, and then bakes for 30 minutes, while
+/// `AppConfig.AllAtOnce` reaches every target at once and bakes for 10.
 pub const PREDEFINED_DEPLOYMENT_STRATEGIES: &[PredefinedStrategy] = &[
     PredefinedStrategy {
         id: "AppConfig.AllAtOnce",
+        description: "Quick",
         deployment_duration_in_minutes: 0,
         growth_type: GROWTH_LINEAR,
         growth_factor: 100.0,
@@ -447,6 +453,7 @@ pub const PREDEFINED_DEPLOYMENT_STRATEGIES: &[PredefinedStrategy] = &[
     },
     PredefinedStrategy {
         id: "AppConfig.Linear50PercentEvery30Seconds",
+        description: "Test/Demo",
         deployment_duration_in_minutes: 1,
         growth_type: GROWTH_LINEAR,
         growth_factor: 50.0,
@@ -454,6 +461,7 @@ pub const PREDEFINED_DEPLOYMENT_STRATEGIES: &[PredefinedStrategy] = &[
     },
     PredefinedStrategy {
         id: "AppConfig.Canary10Percent20Minutes",
+        description: "AWS Recommended",
         deployment_duration_in_minutes: 20,
         growth_type: GROWTH_EXPONENTIAL,
         growth_factor: 10.0,
@@ -461,12 +469,21 @@ pub const PREDEFINED_DEPLOYMENT_STRATEGIES: &[PredefinedStrategy] = &[
     },
     PredefinedStrategy {
         id: "AppConfig.Linear20PercentEvery6Minutes",
+        description: "AWS Recommended",
         deployment_duration_in_minutes: 30,
         growth_type: GROWTH_LINEAR,
         growth_factor: 20.0,
-        final_bake_time_in_minutes: 10,
+        final_bake_time_in_minutes: 30,
     },
 ];
+
+/// The prefix a catalogue cursor key carries for a predefined strategy, and the one it
+/// carries for a strategy this account created. `'0'` sorts before `'1'`, which is what
+/// puts the published table ahead of the account's own strategies. See
+/// [`ComAmazonawsAppconfigAmazonappconfigState::all_strategies`].
+const PREDEFINED_STRATEGY_KEY_PREFIX: char = '0';
+/// See [`PREDEFINED_STRATEGY_KEY_PREFIX`].
+const CREATED_STRATEGY_KEY_PREFIX: char = '1';
 
 /// A deployment strategy: the rollout schedule a deployment follows.
 #[derive(Debug, Clone)]
@@ -492,7 +509,7 @@ impl From<&PredefinedStrategy> for DeploymentStrategy {
             id: predefined.id.to_string(),
             // A predefined strategy's name is its id; it is not replicated anywhere.
             name: predefined.id.to_string(),
-            description: None,
+            description: Some(predefined.description.to_string()),
             deployment_duration_in_minutes: predefined.deployment_duration_in_minutes,
             growth_type: predefined.growth_type.to_string(),
             growth_factor: predefined.growth_factor,
@@ -1190,6 +1207,59 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
         self.deployment_strategies.values()
     }
 
+    /// The whole deployment-strategy catalogue this account can deploy with, in the order
+    /// a listing reports it, each entry beside the key that order is a TOTAL order on.
+    ///
+    /// The catalogue is AppConfig's predefined `AppConfig.*` strategies in the order the
+    /// published table carries them ([`PREDEFINED_DEPLOYMENT_STRATEGIES`]), followed by
+    /// every strategy this account created, in ascending id order. A key is derived from
+    /// the entry itself — its position in the published table, or its id — and never from
+    /// how many entries precede it, so a strategy created between two pages of a walk
+    /// shifts no later page.
+    ///
+    /// This is [`resolve_strategy`] read over the whole catalogue rather than for one id —
+    /// including its precedence: a created strategy holding an id a predefined one also
+    /// holds takes that slot, so the catalogue reports each id exactly once and never with
+    /// a record `resolve_strategy` would not answer for it. `ListDeploymentStrategies` is
+    /// the caller this exists for.
+    ///
+    /// [`resolve_strategy`]: ComAmazonawsAppconfigAmazonappconfigState::resolve_strategy
+    pub fn all_strategies(&self) -> Vec<(String, DeploymentStrategy)> {
+        let mut catalogue: Vec<(String, DeploymentStrategy)> = PREDEFINED_DEPLOYMENT_STRATEGIES
+            .iter()
+            .enumerate()
+            .map(|(position, predefined)| {
+                let strategy = self
+                    .deployment_strategies
+                    .get(predefined.id)
+                    .cloned()
+                    .unwrap_or_else(|| DeploymentStrategy::from(predefined));
+                (
+                    format!("{PREDEFINED_STRATEGY_KEY_PREFIX}{position:04}"),
+                    strategy,
+                )
+            })
+            .collect();
+        // Ascending by id, and without the ids already reported in a predefined slot.
+        let created: BTreeMap<&str, &DeploymentStrategy> = self
+            .deployment_strategies
+            .iter()
+            .filter(|(id, _)| {
+                !PREDEFINED_DEPLOYMENT_STRATEGIES
+                    .iter()
+                    .any(|predefined| predefined.id == id.as_str())
+            })
+            .map(|(id, strategy)| (id.as_str(), strategy))
+            .collect();
+        catalogue.extend(created.into_iter().map(|(id, strategy)| {
+            (
+                format!("{CREATED_STRATEGY_KEY_PREFIX}{id}"),
+                strategy.clone(),
+            )
+        }));
+        catalogue
+    }
+
     /// Account for `bytes` about to be stored as a hosted configuration version.
     /// Answers `false`, having changed nothing, when storing them would take this
     /// service past [`MAX_TOTAL_HOSTED_CONFIGURATION_BYTES`]; the caller then refuses
@@ -1387,6 +1457,10 @@ pub const LISTING_CONFIGURATION_PROFILES: &str = "ListConfigurationProfiles";
 /// The `kind` a `ListEnvironments` cursor is stamped with, so a token minted by another
 /// listing cannot resume this one. See [`paginate`].
 pub const LISTING_ENVIRONMENTS: &str = "ListEnvironments";
+
+/// The `kind` a `ListDeploymentStrategies` cursor is stamped with, so a token minted by
+/// another listing cannot resume this one. See [`paginate`].
+pub const LISTING_DEPLOYMENT_STRATEGIES: &str = "ListDeploymentStrategies";
 
 /// One page of a list operation: the items on it, and the token that resumes the walk
 /// after them (`None` on the last page).
