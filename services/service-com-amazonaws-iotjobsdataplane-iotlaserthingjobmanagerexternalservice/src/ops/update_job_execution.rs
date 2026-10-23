@@ -5,7 +5,9 @@
 //! Applies the device's `status` (plus `statusDetails` and the step timeout) to
 //! the persisted execution, increments `versionNumber` and stamps
 //! `lastUpdatedAt`. An `expectedVersion` that does not match the stored version
-//! is refused with 409 `InvalidStateTransitionException` and changes nothing.
+//! is refused with 400 `InvalidRequestException` and changes nothing, and a status
+//! that would carry the execution BACKWARD through its lifecycle with 409
+//! `InvalidStateTransitionException`.
 //!
 //! ## Shape of an operation
 //!
@@ -252,21 +254,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(unavailable());
         };
 
-        // A stale `expectedVersion` is refused BEFORE anything is written, so the
-        // rejected update leaves the execution exactly as it was.
+        // A mismatched `expectedVersion` is refused BEFORE anything is written, so
+        // the rejected update leaves the execution exactly as it was.
+        //
+        // It is the optimistic-concurrency guard failing and NOT an illegal
+        // transition: the request is the one at fault (it names a version the
+        // service does not hold), so it is the modelled `InvalidRequestException`
+        // (400) and not `InvalidStateTransitionException` (409), which is reserved
+        // for a status the execution's own state refuses. The guard is an EXACT
+        // match, not a floor: a version from the future is as wrong as a stale one.
         if let Some(expected) = input.expected_version {
             if expected != record.version_number {
-                return Err(
-                    UpdateJobExecutionErrorModeled::InvalidStateTransitionException(
-                        InvalidStateTransitionException {
-                            message: Some(format!(
-                                "expectedVersion {expected} does not match the job execution's current version {}",
-                                record.version_number
-                            )),
-                        },
-                    )
-                    .into(),
-                );
+                return Err(UpdateJobExecutionErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(crate::state::version_mismatch_message(
+                            expected,
+                            record.version_number,
+                        )),
+                    },
+                )
+                .into());
             }
         }
 
@@ -290,10 +297,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // A status the execution's current state refuses is the case
+        // `InvalidStateTransitionException` is for: an execution runs forward
+        // through queued -> taken up -> finished, so an update may repeat its stage
+        // or carry it forward (QUEUED straight to a terminal status included) but
+        // never back — a device that already took the work up cannot return it to
+        // the queue, and only queued work can be rejected. Checked before anything
+        // is written, so the refusal leaves status and version untouched.
+        if let Some(reason) = record.transition_refusal(&input.status) {
+            return Err(
+                UpdateJobExecutionErrorModeled::InvalidStateTransitionException(
+                    InvalidStateTransitionException {
+                        message: Some(reason),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // The details are checked and applied FIRST, so a map the record cannot
-        // hold leaves the execution untouched, exactly like a stale
-        // `expectedVersion`.
-        if let Err(reason) = record.try_merge_status_details(input.status_details.as_ref()) {
+        // hold leaves the execution untouched, exactly like a mismatched
+        // `expectedVersion`. A map the request CARRIES replaces the stored one; an
+        // absent member leaves it alone ("If not specified, the statusDetails are
+        // unchanged").
+        if let Err(reason) = record.try_replace_status_details(input.status_details.as_ref()) {
             return Err(UpdateJobExecutionErrorModeled::InvalidRequestException(
                 InvalidRequestException {
                     message: Some(reason),

@@ -17,6 +17,8 @@ mod command_execution_concurrency;
 mod command_execution_validation;
 #[path = "all/job_execution_lifecycle.rs"]
 mod job_execution_lifecycle;
+#[path = "all/job_execution_state_machine.rs"]
+mod job_execution_state_machine;
 #[path = "all/response_document_completeness.rs"]
 mod response_document_completeness;
 #[path = "all/state_roundtrip.rs"]

@@ -503,7 +503,7 @@ async fn the_execution_lifecycle_is_persisted_and_read_back_at_every_step() {
         "DescribeJobExecution must not change the execution, got {again}"
     );
 
-    // Reporting progress merges details and moves the version.
+    // Reporting progress replaces the details and moves the version.
     let (status, updated) = emulator
         .update(
             thing,
@@ -523,12 +523,10 @@ async fn the_execution_lifecycle_is_persisted_and_read_back_at_every_step() {
         "each device update increments the version, got {updated}"
     );
     assert_eq!(
-        updated["executionState"]["statusDetails"]["step"], "download",
-        "an update merges details rather than dropping the earlier ones, got {updated}"
-    );
-    assert_eq!(
-        updated["executionState"]["statusDetails"]["progress"], "50",
-        "the update's own details are applied, got {updated}"
+        updated["executionState"]["statusDetails"],
+        json!({"progress": "50"}),
+        "a supplied statusDetails replaces the stored map, dropping the names it no \
+         longer sends, got {updated}"
     );
     assert!(
         updated["jobDocument"].is_string(),
@@ -803,9 +801,9 @@ async fn each_modeled_status_lands_the_execution_in_the_right_list() {
     }
 }
 
-/// RULE: an `expectedVersion` that does not match the stored version rejects the
-/// update with 409 and leaves the execution untouched; the matching version
-/// succeeds.
+/// RULE: an `expectedVersion` that is not the stored version rejects the update 400
+/// `InvalidRequestException` and leaves the execution untouched; the matching version
+/// succeeds. (The guard's whole table lives in `job_execution_state_machine.rs`.)
 #[tokio::test]
 async fn an_unexpected_version_rejects_the_update_and_changes_nothing() {
     let emulator = Emulator::new();
@@ -822,13 +820,13 @@ async fn an_unexpected_version_rejects_the_update_and_changes_nothing() {
             )
             .await;
         assert_eq!(
-            status, 409,
-            "case expectedVersion={stale}: expected 409, got {status} {refused}"
+            status, 400,
+            "case expectedVersion={stale}: expected 400, got {status} {refused}"
         );
         assert_eq!(
             error_code(&refused),
-            "InvalidStateTransitionException",
-            "case expectedVersion={stale}: expected InvalidStateTransitionException, got {refused}"
+            "InvalidRequestException",
+            "case expectedVersion={stale}: expected InvalidRequestException, got {refused}"
         );
         let (_, described) = emulator.describe(thing, &id, "").await;
         assert_eq!(
@@ -863,7 +861,7 @@ async fn an_unexpected_version_rejects_the_update_and_changes_nothing() {
         )
         .await;
     assert_eq!(
-        status, 409,
+        status, 400,
         "replaying a consumed expectedVersion is refused, got {status} {refused}"
     );
 }
@@ -1264,10 +1262,10 @@ async fn the_step_timeout_is_honoured_inside_its_published_range_and_refused_out
 
 /// RULE: a job execution's `statusDetails` is bounded — at most
 /// `MAX_STATUS_DETAIL_PAIRS` name/value pairs, each name and value within its own
-/// maximum length — and a map that would push the record past any of those bounds
-/// is refused 400 `InvalidRequestException` with the execution left untouched, on
-/// BOTH operations that accept details. Repeated updates therefore cannot
-/// accumulate details without limit.
+/// maximum length — and a map past any of those bounds is refused 400
+/// `InvalidRequestException` with the execution left untouched, on BOTH operations
+/// that accept details. The bound is on the map the REQUEST carries, because a
+/// supplied map replaces the stored one, so repeated updates accumulate nothing.
 #[tokio::test]
 async fn status_details_are_bounded_and_an_over_bound_map_changes_nothing() {
     let emulator = Emulator::new();
@@ -1390,8 +1388,9 @@ async fn status_details_are_bounded_and_an_over_bound_map_changes_nothing() {
         );
     }
 
-    // Accumulation across updates is bounded too: distinct keys added one update
-    // at a time stop at the same maximum.
+    // Details cannot ACCUMULATE across updates at all: each supplied map replaces
+    // the stored one, so a record holds exactly what the last write sent and the
+    // bound is a bound on one request's map.
     let thing = "laser-details-accumulate";
     let id = emulator.start_on(thing).await;
     for index in 0..MAX_STATUS_DETAIL_PAIRS {
@@ -1404,48 +1403,42 @@ async fn status_details_are_bounded_and_an_over_bound_map_changes_nothing() {
             .await;
         assert_eq!(
             status, 200,
-            "case accumulated pair {index}: expected 200, got {status} {body}"
+            "case write {index}: expected 200, got {status} {body}"
+        );
+        let (_, described) = emulator.describe(thing, &id, "").await;
+        assert_eq!(
+            described["execution"]["statusDetails"],
+            json!({format!("key-{index}"): "v"}),
+            "case write {index}: the record holds exactly the map just written, got {described}"
         );
     }
+    // One map of one pair too many is still refused, and changes nothing.
+    let one_pair_too_many: Value = (0..=MAX_STATUS_DETAIL_PAIRS)
+        .map(|index| (format!("over-{index}"), json!("v")))
+        .collect::<serde_json::Map<String, Value>>()
+        .into();
     let (status, refused) = emulator
         .update(
             thing,
             &id,
-            json!({"status": "IN_PROGRESS", "statusDetails": {"one-too-many": "v"}}),
+            json!({"status": "IN_PROGRESS", "statusDetails": one_pair_too_many}),
         )
         .await;
     assert_eq!(
         status, 400,
-        "case accumulated past the bound: expected 400, got {status} {refused}"
+        "case one map past the bound: expected 400, got {status} {refused}"
     );
     assert_eq!(
         error_code(&refused),
         "InvalidRequestException",
-        "case accumulated past the bound: expected InvalidRequestException, got {refused}"
+        "case one map past the bound: expected InvalidRequestException, got {refused}"
     );
     let (_, described) = emulator.describe(thing, &id, "").await;
     assert_eq!(
         described["execution"]["statusDetails"]
             .as_object()
             .map_or(0, serde_json::Map::len),
-        MAX_STATUS_DETAIL_PAIRS,
-        "case accumulated past the bound: the record holds no more pairs than its maximum, got {described}"
-    );
-
-    // Overwriting a name the record already holds is still accepted.
-    let (status, body) = emulator
-        .update(
-            thing,
-            &id,
-            json!({"status": "IN_PROGRESS", "statusDetails": {"key-0": "replaced"}, "includeJobExecutionState": true}),
-        )
-        .await;
-    assert_eq!(
-        status, 200,
-        "case overwriting an existing pair: expected 200, got {status} {body}"
-    );
-    assert_eq!(
-        body["executionState"]["statusDetails"]["key-0"], "replaced",
-        "case overwriting an existing pair: expected the new value, got {body}"
+        1,
+        "case one map past the bound: the refused write changes nothing, got {described}"
     );
 }
