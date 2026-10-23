@@ -11,7 +11,20 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-ebs-ebs.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ebs#CompleteSnapshotRequest")]
+// `skip_validation` names the HEADER-bound `ChecksumAlgorithm`, which is where the
+// recorded refusals show the service wording them: an algorithm it does not support is
+// answered with the service's OWN modelled `ValidationException`, carrying the `Message`
+// and the `Reason` a client reads, where the boundary's synthetic envelope carries
+// neither.
+//
+// `SnapshotId` is NOT in the list: the modelled constraints it carries are the
+// boundary's. The service's ADDITIONAL rule about an id's shape
+// (`crate::state::is_well_formed_snapshot_id`, which the model does not express) is judged
+// in the handler, reached only by a value the boundary already accepted.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.ebs#CompleteSnapshotRequest",
+    skip_validation = ["ChecksumAlgorithm"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct CompleteSnapshotInput {
     pub snapshot_id: String,

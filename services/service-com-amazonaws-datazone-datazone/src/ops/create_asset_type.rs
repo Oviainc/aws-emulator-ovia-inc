@@ -19,6 +19,11 @@
 //! where a type was ORIGINALLY created, which for a type created here is this domain's
 //! own create call, so they stay absent (no cross-domain association is served).
 //!
+//! A form entry's `typeIdentifier` is resolved to the form type NAME it addresses by
+//! [`crate::state::form_type_reference_name`] — the one rule every handler that compares
+//! form type references shares, so this store and `DeleteFormType`'s in-use check cannot
+//! drift.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -286,7 +291,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     (
                         form_name,
                         AssetTypeForm {
-                            type_name: form_type_name(&entry.type_identifier).to_string(),
+                            type_name: crate::state::form_type_reference_name(
+                                &entry.type_identifier,
+                            )
+                            .to_string(),
                             type_revision: entry.type_revision,
                             required: entry.required,
                         },
@@ -338,30 +346,4 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         Ok(output)
     }
-}
-
-/// The form type NAME a form entry's `typeIdentifier` resolves to.
-///
-/// A DataZone form type is addressed by its name: `FormTypeIdentifier` (len 1..385,
-/// pattern `^(?!\.)[\w\.]*\w$`) carries that name, while `FormEntryOutput`'s `typeName`
-/// is a `FormTypeName` (len 1..128, pattern
-/// `^(amazon.datazone.)?(?![0-9_])\w+$|^_\w*[a-zA-Z0-9]\w*$`) — both from
-/// `smithy_query(query="shape",shape="FormEntryInput,FormEntryOutput")`. So an
-/// identifier that is already a well-formed name (including one in the service's own
-/// `amazon.datazone.` namespace) is reported unchanged, and a qualified identifier in any
-/// other namespace reports its unqualified last segment, which is the form type's own
-/// name.
-///
-/// Whether a form type of that name EXISTS is still not checked here: the built-in
-/// `amazon.datazone.*` types are not stored at all, and an asset type may name a form
-/// type in any namespace, so an identifier is resolved to a name rather than to a
-/// stored record. (`CreateFormType` does now persist custom form types under
-/// `Domain::form_types`, so resolving a `typeIdentifier` against them is possible —
-/// deliberately out of scope here, and the business of whichever issue makes an asset
-/// type's forms refer to stored ones.)
-fn form_type_name(identifier: &str) -> &str {
-    if crate::state::is_form_type_name(identifier) {
-        return identifier;
-    }
-    identifier.split('.').next_back().unwrap_or(identifier)
 }

@@ -192,23 +192,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key = crate::state::session_id_from_identifier(&input.session_identifier);
         let Some(session) = store.sessions.get_mut(key) else {
             return Err(CreateInvocationErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Session with identifier {} was not found.",
-                        input.session_identifier
-                    )),
-                },
+                crate::state::session_not_found(&input.session_identifier),
             )
             .into());
         };
         if session.status != crate::state::SessionStatus::Active {
-            return Err(CreateInvocationErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Session {} has status {} and can no longer be added to.",
-                    session.session_id,
-                    session.status.as_wire()
-                )),
-            })
+            return Err(CreateInvocationErrorModeled::ConflictException(
+                crate::state::session_in_terminal_state(&session.session_id),
+            )
             .into());
         }
 

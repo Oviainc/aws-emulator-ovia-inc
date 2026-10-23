@@ -106,11 +106,20 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::sync::LazyLock;
 use std::time::SystemTime;
 
+use ::aws_smithy_schema::serde::ShapeSerializer as _;
+use ::aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
+use ::aws_smithy_schema_server::constraints::{
+    LengthTrait, PatternTrait, RangeTrait, ValidatingSerializer,
+};
+
 use crate::state::{
-    blocks_in_volume, checksum_base64_sha256, BlockEntry, SnapshotStatus,
-    CHECKSUM_ALGORITHM_SHA256, MAX_STORED_BLOCKS_PER_SNAPSHOT, MAX_STORED_BLOCKS_TOTAL,
+    blocks_in_volume, checksum_base64_sha256, is_well_formed_snapshot_id,
+    malformed_snapshot_id_message, snapshot_not_found_message,
+    unsupported_checksum_algorithm_message, BlockEntry, CHECKSUM_ALGORITHM_SHA256,
+    MAX_STORED_BLOCKS_PER_SNAPSHOT, MAX_STORED_BLOCKS_TOTAL,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -187,35 +196,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // The HEADER-bound members this operation takes off the boundary are judged
+        // first, which is where the boundary would have judged them. Every refusal below
+        // is the service's own modelled `ValidationException`, so each carries the
+        // `Message` and the `Reason` a client reads — the boundary's synthetic envelope
+        // carries neither.
+        //
+        // `ChecksumAlgorithm`: an algorithm the service does not support is named,
+        // alongside the set it does support.
+        if input.checksum_algorithm != CHECKSUM_ALGORITHM_SHA256 {
+            return Err(validation(
+                "INVALID_PARAMETER_VALUE",
+                unsupported_checksum_algorithm_message(&input.checksum_algorithm),
+            ));
+        }
+        // `Checksum` and `Progress`: the constraints are the MODEL's, and so is the
+        // report — the same walk and the same sentence the boundary would have produced —
+        // but it travels in the modelled error rather than in the synthetic envelope.
+        if let Some(message) = header_constraint_refusal(&input) {
+            return Err(validation("INVALID_PARAMETER_VALUE", message));
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(no_state)?;
         let now = SystemTime::now();
         let mut store = state.lock();
-        store.expire_due_snapshots(now);
+        store.apply_due_transitions(now);
 
         let Some(snapshot) = store.snapshots.get(&input.snapshot_id) else {
-            return Err(not_found(format!(
-                "snapshot {} does not exist",
-                input.snapshot_id
-            )));
+            // A value that is not even shaped like a snapshot id is a malformed
+            // parameter, not a snapshot the service does not hold.
+            if !is_well_formed_snapshot_id(&input.snapshot_id) {
+                return Err(validation(
+                    "INVALID_SNAPSHOT_ID",
+                    malformed_snapshot_id_message("snapshotId", &input.snapshot_id),
+                ));
+            }
+            return Err(not_found(snapshot_not_found_message(&input.snapshot_id)));
         };
-        let (status, block_size, volume_size, stored_blocks, index_already_written) = (
-            snapshot.status,
-            snapshot.block_size,
-            snapshot.volume_size,
-            snapshot.blocks.len(),
-            snapshot.blocks.contains_key(&input.block_index),
-        );
-
-        // "The target snapshot must be in the pending state."
-        if status != SnapshotStatus::Pending {
-            return Err(validation(
-                "INVALID_SNAPSHOT_ID",
+        let block_size = snapshot.block_size;
+        let volume_size = snapshot.volume_size;
+        let stored_blocks = snapshot.blocks.len();
+        let index_already_written = snapshot.blocks.contains_key(&input.block_index);
+        // "The target snapshot must be in the pending state", and "You cannot write new
+        // blocks to a snapshot after it has been completed" — which includes a snapshot
+        // whose completion was accepted and whose seal is still in flight: its content is
+        // already final.
+        let write_refusal = (!snapshot.accepts_writes()).then(|| {
+            if snapshot.is_sealed() {
+                format!(
+                    "snapshot {} has been completed; blocks can only be written to a pending snapshot",
+                    input.snapshot_id
+                )
+            } else {
                 format!(
                     "snapshot {} is {}; blocks can only be written to a pending snapshot",
                     input.snapshot_id,
-                    status.as_wire()
-                ),
-            ));
+                    snapshot.status.as_wire()
+                )
+            }
+        });
+        if let Some(message) = write_refusal {
+            return Err(validation("INVALID_SNAPSHOT_ID", message));
         }
 
         // `BlockIndex` is "a logical index in units of 512 KiB blocks … (logical offset
@@ -310,12 +351,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             checksum_algorithm: CHECKSUM_ALGORITHM_SHA256.to_string(),
             block_token,
             progress: input.progress,
+            // Written to THIS snapshot, so it counts against `ChangedBlocksCount`.
+            written: true,
         };
         let Some(snapshot) = store.snapshots.get_mut(&input.snapshot_id) else {
-            return Err(not_found(format!(
-                "snapshot {} does not exist",
-                input.snapshot_id
-            )));
+            return Err(not_found(snapshot_not_found_message(&input.snapshot_id)));
         };
         snapshot.blocks.insert(input.block_index, entry);
 
@@ -330,6 +370,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             checksum_algorithm: Some(stored.checksum_algorithm.clone()),
         })
     }
+}
+
+/// The modelled constraint traits of the header members this operation judges itself:
+/// `Checksum`'s `@length` 0..64 and `@pattern` and `Progress`'s `@range` 0..100, as
+/// `smithy_query(query="shape",shape="com.amazonaws.ebs#PutSnapshotBlockRequest")`
+/// reports them.
+///
+/// Restated here because `skip_validation` takes them off the generated member schemas,
+/// so there is none left at the boundary to read them from.
+static CHECKSUM_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(PatternTrait::new("^[A-Za-z0-9+/=]+$")));
+    traits.insert(Box::new(LengthTrait::new(Some(0), Some(64))));
+    traits
+});
+
+static PROGRESS_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(RangeTrait::new(Some(0.0), Some(100.0))));
+    traits
+});
+
+/// `Checksum` and `Progress` as MEMBER schemas carrying their modelled constraints, so
+/// the check is the framework's walk and the violation it reports — its kind, its
+/// lower-camelled path and its ceiling on how much of the rejected value is echoed — is
+/// the framework's too.
+static CHECKSUM_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
+    Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.ebs#PutSnapshotBlockRequest$Checksum",
+            "com.amazonaws.ebs",
+            "Checksum",
+        ),
+        ShapeType::String,
+        "Checksum",
+        0,
+    )
+    .with_traits(&CHECKSUM_TRAITS)
+});
+
+static PROGRESS_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
+    Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.ebs#PutSnapshotBlockRequest$Progress",
+            "com.amazonaws.ebs",
+            "Progress",
+        ),
+        ShapeType::Integer,
+        "Progress",
+        0,
+    )
+    .with_traits(&PROGRESS_TRAITS)
+});
+
+/// The message refusing this request's header members, or `None` when they satisfy the
+/// constraints the model declares for them.
+///
+/// The sentence is the framework's `ValidationException` report — `N validation error(s)
+/// detected: Value '<v>' at '<member>' failed to satisfy constraint: <requirement>` — so
+/// a member the service judges is worded exactly as one the boundary judges; only the
+/// envelope it travels in differs.
+fn header_constraint_refusal(input: &PutSnapshotBlockInput) -> Option<String> {
+    let mut validator = ValidatingSerializer::new();
+    // Infallible: the validator accumulates violations instead of failing.
+    let _ = validator.write_string(&CHECKSUM_SCHEMA, &input.checksum);
+    if let Some(progress) = input.progress {
+        let _ = validator.write_integer(&PROGRESS_SCHEMA, progress);
+    }
+    ::aws_smithy_schema_server::envelope(&validator.into_violations())
 }
 
 /// The modelled server error for an engine that holds no state for this service.

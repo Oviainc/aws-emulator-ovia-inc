@@ -10,6 +10,13 @@
 //! through the ONE helper [`session_id_from_identifier`], so they all agree on what
 //! a bare UUID and a session ARN mean.
 //!
+//! The refusals that lookup and the session state machine produce are worded here too —
+//! [`session_not_found`], [`session_in_terminal_state`] and
+//! [`active_session_not_deletable`] — for the same reason: the service states one
+//! sentence per rule, not one per operation, so a client can match the rule. How a refusal
+//! the FRAMEWORK raises before a handler runs is worded (a value outside a `@pattern`, say)
+//! belongs to `crate::service`'s `override_refusal` instead.
+//!
 //! Beside the store, this module carries the one AUTHORIZATION decision every
 //! session-scoped operation makes before it answers ([`authorize`]): who the caller is,
 //! and whether that caller's identity-based permissions cover `bedrock:<Operation>` on
@@ -24,7 +31,9 @@ use ::aws_smithy_types::DateTime;
 use service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam_state;
 use service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_state;
 
-use crate::ops::types::{AccessDeniedException, InvocationStepPayload};
+use crate::ops::types::{
+    AccessDeniedException, ConflictException, InvocationStepPayload, ResourceNotFoundException,
+};
 
 /// The region an ARN carries when the request is unsigned, so no SigV4 credential
 /// scope names one. Matches the region every generated emulator defaults to (see
@@ -201,6 +210,53 @@ pub fn session_id_from_identifier(identifier: &str) -> &str {
             session_id
         }
         _ => identifier,
+    }
+}
+
+/// The modelled `ResourceNotFoundException` (HTTP 404) every session-scoped operation
+/// answers when its `sessionIdentifier` names no stored session.
+///
+/// ONE constructor for all of them: the refusal is worded from the REQUEST — the fixed
+/// template `Session with ID <sessionIdentifier> not found`, interpolating the identifier
+/// the caller submitted and nothing else — and the service states it identically whichever
+/// operation did the lookup (`GetSession`, `UpdateSession`, `EndSession`, `DeleteSession`,
+/// `CreateInvocation`, `PutInvocationStep`, `GetInvocationStep`, `ListInvocationSteps`), so
+/// a client can match one rule rather than one sentence per operation. No trailing period:
+/// the template is the sentence, not prose.
+pub fn session_not_found(identifier: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("Session with ID {identifier} not found")),
+    }
+}
+
+/// The modelled `ConflictException` (HTTP 409) a WRITE to a session answers when that
+/// session is no longer `ACTIVE`.
+///
+/// `ENDED` and `EXPIRED` are both terminal — a session in either accepts no further write
+/// (`smithy_query(query="doc",shape="EndSession")`) — and the refusal is the ONE
+/// terminal-state sentence for every write that hits one (`CreateInvocation`,
+/// `PutInvocationStep`, `UpdateSession`), interpolating the id of the session named and
+/// naming no particular status: a client matches one rule, not one sentence per operation.
+pub fn session_in_terminal_state(session_id: &str) -> ConflictException {
+    ConflictException {
+        message: Some(format!(
+            "Session with id {session_id} is in a terminal state and cannot be updated anymore."
+        )),
+    }
+}
+
+/// The refusal `DeleteSession` answers while the session it names is still `ACTIVE`: a
+/// session must be ended before it can be deleted
+/// (`smithy_query(query="doc",shape="DeleteSession")`).
+///
+/// A CONSTANT sentence, interpolating nothing — the refusal states the precondition, not
+/// which session was addressed.
+pub const ACTIVE_SESSION_NOT_DELETABLE: &str = "Cannot delete session in ACTIVE state";
+
+/// The modelled `ConflictException` (HTTP 409) carrying [`ACTIVE_SESSION_NOT_DELETABLE`].
+pub fn active_session_not_deletable() -> ConflictException {
+    ConflictException {
+        message: Some(ACTIVE_SESSION_NOT_DELETABLE.to_string()),
     }
 }
 
