@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/assistant_lifecycle.rs"]
 mod assistant_lifecycle;
+#[path = "all/shared_signing_name_routing.rs"]
+mod shared_signing_name_routing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
