@@ -152,6 +152,20 @@ impl ResourceKind {
         }
     }
 
+    /// How a message names this kind as the SCOPE another resource's name is unique in
+    /// ("Listener with name … already exists in svc-… service."): the resource type in
+    /// lower-case words, as the recorded listener-name conflict spells the owning
+    /// service.
+    pub const fn scope_name(self) -> &'static str {
+        match self {
+            Self::ServiceNetwork => "service network",
+            Self::Service => "service",
+            Self::ServiceAssociation => "association",
+            Self::Listener => "listener",
+            Self::Rule => "rule",
+        }
+    }
+
     /// AWS's `ResourceNotFoundException.message` construction:
     /// `"<ResourceType> <identifier> cannot be found."`.
     ///
@@ -264,6 +278,16 @@ pub const DEFAULT_SINGLE_TARGET_GROUP_WEIGHT: i32 = 100;
 /// Only `404` and `500` status codes are supported." The modelled `@range(100, 599)` is
 /// wider than that, so this narrower catalog is enforced in the handlers.
 pub const FIXED_RESPONSE_STATUS_CODES: &[i32] = &[404, 500];
+
+/// How the service refuses a fixed-response status code outside
+/// [`FIXED_RESPONSE_STATUS_CODES`].
+///
+/// The RULE is the member's own documentation ("Only `404` and `500` status codes are
+/// supported."); this is the sentence the service answers it with — a service-rule
+/// refusal, reported through [`service_rule_exception`] rather than as a modelled
+/// constraint report. SOURCE: recorded AWS behaviour; the wording is an example of that
+/// refusal, the member it names (`statusCode`) is the requirement.
+pub const UNSUPPORTED_STATUS_CODE_MESSAGE: &str = "Provided status code is not supported.";
 
 /// How long after its create call a resource still reports `CREATE_IN_PROGRESS`.
 ///
@@ -448,36 +472,46 @@ pub fn default_port_for(protocol: &str) -> Option<i32> {
 }
 
 /// Refuse a rule action outside a constraint its own documentation states, as the
-/// violation AWS reports it; `Ok(())` when it satisfies them.
+/// SERVICE-RULE violation AWS reports it; `Ok(())` when it satisfies them.
 ///
 /// The modelled traits the boundary already enforces (`targetGroups`' `@length(1, 10)`,
 /// `weight`'s `@range(0, 999)`, `statusCode`'s `@range(100, 599)`) are not re-checked
 /// here; what is checked is the narrower documented catalog of fixed-response status
-/// codes ([`FIXED_RESPONSE_STATUS_CODES`]), which no modelled trait carries.
+/// codes ([`FIXED_RESPONSE_STATUS_CODES`]), which no modelled trait carries — so it is
+/// reported as a service rule ([`ServiceRuleViolation`]) and not as a constraint report.
 pub fn check_rule_action(
-    member: &str,
     action: &crate::ops::types::RuleAction,
-) -> Result<(), FieldViolation> {
+) -> Result<(), ServiceRuleViolation> {
     match action {
         crate::ops::types::RuleAction::fixedResponse(fixed) => {
             if !FIXED_RESPONSE_STATUS_CODES.contains(&fixed.status_code) {
-                return Err(Violation {
-                    path: format!("{member}.fixedResponse.statusCode"),
-                    // The documented catalog is a value SET, so it is reported the way
-                    // the framework reports one.
-                    kind: ViolationKind::EnumValue(
-                        FIXED_RESPONSE_STATUS_CODES
-                            .iter()
-                            .map(i32::to_string)
-                            .collect(),
-                    ),
-                    value: Some(fixed.status_code.to_string()),
+                return Err(ServiceRuleViolation {
+                    // The member the RULE constrains, named as the model names it —
+                    // never the path it happens to sit at inside this request.
+                    member: "statusCode".to_string(),
+                    message: UNSUPPORTED_STATUS_CODE_MESSAGE.to_string(),
                 });
             }
             Ok(())
         }
         crate::ops::types::RuleAction::Forward(_) => Ok(()),
     }
+}
+
+/// Refuse a listener create that carries no `port` under a protocol the `port` member
+/// documents no default for, as the service-rule violation it is.
+///
+/// The `port` member is modelled OPTIONAL and documents a default for `HTTP` (80) and
+/// `HTTPS` (443) only ([`default_port_for`]), so under any other protocol the service's
+/// own rule makes it mandatory: no modelled trait carries that, which is why it is
+/// reported as a service rule over the bare member rather than as a missing required
+/// member.
+pub fn effective_port(protocol: &str, sent: Option<i32>) -> Result<i32, ServiceRuleViolation> {
+    sent.or_else(|| default_port_for(protocol))
+        .ok_or_else(|| ServiceRuleViolation {
+            member: "port".to_string(),
+            message: format!("Port must be specified for protocol {protocol}."),
+        })
 }
 
 /// The action as it is PERSISTED: the caller's action with every value its
@@ -652,6 +686,36 @@ impl ComAmazonawsVpclatticeMercurycontrolplaneState {
             .find(|rule| rule.listener_id == listener_id && rule.priority == priority)
     }
 
+    /// The listener of `service_id` that already binds `port`, if there is one.
+    ///
+    /// A listener's port is unique within one service: the service has one endpoint and
+    /// a listener "is a process that checks for connection requests" on its port, so two
+    /// listeners of one service cannot hold the same port and a create that would take an
+    /// occupied one is a `ConflictException`. SOURCE: recorded AWS behaviour (the model
+    /// states the uniqueness nowhere). Counted from the listener records the way
+    /// [`Self::rule_with_priority`] counts priorities, so no second index can drift out
+    /// of step with what is stored.
+    pub fn listener_with_port(&self, service_id: &str, port: i32) -> Option<&Listener> {
+        self.listeners
+            .values()
+            .find(|listener| listener.service_id == service_id && listener.port == port)
+    }
+
+    /// Drop one listener and everything that belongs to it, answering the record that was
+    /// removed (`None` when no listener is stored under `listener_id`).
+    ///
+    /// Its rules go with it (a rule is a resource OF its listener), its name leaves the
+    /// name index so the name and its port are free again, and no `clientToken` record
+    /// outlives the resource it created.
+    pub fn remove_listener(&mut self, listener_id: &str) -> Option<Listener> {
+        let removed = self.listeners.remove(listener_id)?;
+        self.remove_rules_of(&removed.id);
+        self.name_index
+            .remove(&listener_name_key(&removed.service_id, &removed.name));
+        self.idempotency_tokens.forget_resource(&removed.id);
+        Some(removed)
+    }
+
     /// Drop every rule of `listener_id`, releasing its name and token records.
     ///
     /// A rule is a resource OF its listener, so deleting the listener (or the service
@@ -678,18 +742,16 @@ impl ComAmazonawsVpclatticeMercurycontrolplaneState {
     /// related to the service, such as the resource policy, auth policy, listeners,
     /// listener rules, and access log subscriptions, are also deleted."
     pub fn remove_listeners_of(&mut self, service_id: &str) {
-        let doomed: Vec<Listener> = self
+        let doomed: Vec<String> = self
             .listeners
             .values()
             .filter(|listener| listener.service_id == service_id)
-            .cloned()
+            .map(|listener| listener.id.clone())
             .collect();
-        for listener in doomed {
-            self.remove_rules_of(&listener.id);
-            self.listeners.remove(&listener.id);
-            self.name_index
-                .remove(&listener_name_key(service_id, &listener.name));
-            self.idempotency_tokens.forget_resource(&listener.id);
+        for id in doomed {
+            // One removal path for a listener, so a listener dropped with its service
+            // releases exactly what one dropped on its own does.
+            let _ = self.remove_listener(&id);
         }
     }
 
@@ -964,6 +1026,46 @@ pub fn validation_exception(violations: &[FieldViolation]) -> ValidationExceptio
     }
 }
 
+/// One value a documented SERVICE RULE refuses — a rule the model carries no constraint
+/// trait for (the fixed-response status-code catalog, a `port` that is mandatory under a
+/// protocol with no documented default) — as this service reports one.
+///
+/// It is NOT a [`FieldViolation`]: a modelled constraint is reported by the construction
+/// the framework owns (`"<N> validation error(s) detected: Value '…' at '<path>' failed
+/// to satisfy constraint: …"`), whereas a service rule is reported with the rule's own
+/// sentence over the bare member it constrains ([`service_rule_exception`]).
+#[derive(Debug, Clone)]
+pub struct ServiceRuleViolation {
+    /// The input member the rule constrains, named as the MODEL names the member
+    /// (`statusCode`), not the dotted path it sits at inside the request.
+    pub member: String,
+    /// The rule's refusal, built from the request.
+    pub message: String,
+}
+
+/// AWS's `ValidationException` for a value a documented service RULE refuses.
+///
+/// `fieldList` carries one entry whose `name` is the bare member the rule constrains and
+/// whose `message` is the rule's sentence, and the top-level `message` IS that sentence:
+/// a service rule is not a modelled constraint, so it gets neither the
+/// `"<N> validation error(s) detected: "` envelope nor the dotted member path
+/// [`validation_exception`] builds for one.
+///
+/// SOURCE: recorded AWS behaviour for the fixed-response status-code rule (HTTP 400,
+/// `fieldList[0].name` the bare member, `fieldList[0].message` equal to the top-level
+/// message). `reason` stays the modelled [`VALIDATION_REASON_FIELD`]: the refusal is
+/// still about one input member's value.
+pub fn service_rule_exception(violation: &ServiceRuleViolation) -> ValidationException {
+    ValidationException {
+        message: violation.message.clone(),
+        reason: VALIDATION_REASON_FIELD.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: violation.member.clone(),
+            message: violation.message.clone(),
+        }]),
+    }
+}
+
 /// Refuse a resource name that `kind`'s modelled `name` pattern forbids, as the
 /// violation AWS reports: the member, the submitted name and the modelled pattern.
 ///
@@ -1063,9 +1165,9 @@ pub fn conflict(kind: ResourceKind, resource_id: &str, message: String) -> Confl
 
 /// AWS's conflict message for a create whose `name` is already taken: it names the
 /// submitted name and the scope the name has to be unique in — `account` plus the
-/// account id for an account-scoped name, and the owning resource for a name scoped to
-/// one (a listener's `name` documents "A listener name must be unique within a
-/// service").
+/// account id for an account-scoped name ([`duplicate_name_in_account_message`]). A name
+/// scoped to an owning RESOURCE reads the other way round and has its own construction,
+/// [`duplicate_name_in_resource_message`].
 ///
 /// SOURCE: recorded AWS behaviour (409 `ConflictException`, account-scoped names); the
 /// exact wording is an example of that construction, the identifiers in it are the
@@ -1078,6 +1180,37 @@ pub fn duplicate_name_message(name: &str, scope_kind: &str, scope_id: &str) -> S
 /// service network's and a service's `name`.
 pub fn duplicate_name_in_account_message(name: &str) -> String {
     duplicate_name_message(name, "account", account_id())
+}
+
+/// AWS's conflict message for a create whose `name` is already taken inside an owning
+/// RESOURCE rather than inside the account: it names the kind whose name is taken, the
+/// submitted name, and the resource the name has to be unique in (a listener's `name`
+/// documents "A listener name must be unique within a service"; a rule's, "The name must
+/// be unique within the listener").
+///
+/// SOURCE: recorded AWS behaviour — "Listener with name <name> already exists in
+/// <service id> service." The construction (the kind, the submitted name, the owning
+/// resource's id and kind) is the requirement; the exact sentence is an example of it.
+pub fn duplicate_name_in_resource_message(
+    kind: ResourceKind,
+    name: &str,
+    scope: ResourceKind,
+    scope_id: &str,
+) -> String {
+    format!(
+        "{} with name {name} already exists in {scope_id} {}.",
+        kind.message_name(),
+        scope.scope_name()
+    )
+}
+
+/// AWS's conflict message for a listener create that would bind a port another listener
+/// of the same service already holds.
+///
+/// SOURCE: recorded AWS behaviour (409 `ConflictException` over the occupied port). The
+/// port the request asked for is the requirement; the wording is an example.
+pub fn port_occupied_message(port: i32) -> String {
+    format!("Port {port} is occupied")
 }
 
 /// AWS's conflict message for a second association of a (service network, service) pair:

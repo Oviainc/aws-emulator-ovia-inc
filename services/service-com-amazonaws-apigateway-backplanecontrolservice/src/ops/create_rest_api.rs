@@ -503,6 +503,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // source's resource tree only, so a cloned API starts with neither.
             stages: BTreeMap::new(),
             deployments: BTreeMap::new(),
+            // `CreateAuthorizer` is what adds an authorizer, and a clone copies the
+            // source's resource tree only, so a created API starts with none.
+            authorizers: BTreeMap::new(),
             sequence,
         };
 
@@ -511,8 +514,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // methods carry over, the identifiers do not. Walking the snapshot in
             // creation order means a resource's parent is always remapped before the
             // resource itself. The API's other sub-resources (models, authorizers,
-            // deployments, stages) have no records yet — their operations are still
-            // stubs — so there is nothing else to copy.
+            // deployments, stages) are not part of the resource tree, so there is
+            // nothing else to copy.
             let mut remapped: BTreeMap<String, String> = BTreeMap::new();
             remapped.insert(source_root.clone(), root_resource_id.clone());
             for source_resource in &snapshot {

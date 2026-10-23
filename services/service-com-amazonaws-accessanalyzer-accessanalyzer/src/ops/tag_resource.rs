@@ -173,10 +173,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(analyzer) = state.analyzer_by_arn_mut(&input.resource_arn) else {
             crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::NotFound);
-            return Err(TagResourceErrorModeled::ResourceNotFoundException(
-                crate::state::resource_arn_not_found(&input.resource_arn),
-            )
-            .into());
+            // The tagging path's own 404 code (`NotFoundException`), not the modelled
+            // `ResourceNotFoundException` the analyzer lookup answers; see
+            // [`crate::state::tag_target_not_found`].
+            return Err(crate::state::tag_target_not_found());
         };
 
         // A key the resource already holds is overwritten rather than added, so only

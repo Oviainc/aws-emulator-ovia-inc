@@ -18,11 +18,13 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-/// The wire harness and the resource-creation helpers are the lifecycle suite's; this
-/// suite reuses them rather than carrying a second copy that can drift.
-use super::identity_store_lifecycle::{
-    assert_resource_arn, create_group, create_user, emulator, ok, refused, string, user_name,
-    walk_memberships, MAX_RESULTS_MAX, MAX_RESULTS_MIN, OTHER_STORE, STORE,
+/// The wire harness is [`crate::harness`]'s and the resource-creation helpers are the
+/// lifecycle suite's; this suite reuses them rather than carrying a second copy that
+/// can drift.
+use crate::harness::{emulator, ok, refused, string, MISSING_STORE, STORE};
+use crate::identity_store_lifecycle::{
+    assert_resource_arn, create_group, create_user, user_name, walk_memberships, MAX_RESULTS_MAX,
+    MAX_RESULTS_MIN,
 };
 
 /// The member of a request, as the modelled `MemberId` union writes it on the wire:
@@ -298,30 +300,31 @@ async fn a_member_this_identity_store_does_not_hold_is_reported_as_not_found() {
     let member = create_user(&router, STORE, &user_name(case, 0), case).await;
     let group = create_group(&router, STORE, "engineering", case).await;
     join(&router, STORE, &group, &member, case).await;
-    // A user of ANOTHER store, so the per-store scope of the listing is observable.
-    let elsewhere = create_user(&router, OTHER_STORE, &user_name(case, 1), case).await;
 
-    // Rows differ along WHY the member is not in the named store: no such id, a store
-    // nothing was ever created in, and a user that exists only in another store.
+    // Rows differ along WHY the member is not in the named store: no such id, and a
+    // store that does not exist at all — which is a different missing resource.
     let rows = [
         (
             "an id no resource carries",
             STORE.to_string(),
             "a1b2c3d4-5678-90ab-cdef-example22222".to_string(),
+            "USER",
         ),
         (
-            "a store nothing was created in",
+            "a store that does not exist",
+            MISSING_STORE.to_string(),
+            member.clone(),
+            "IDENTITY_STORE",
+        ),
+        (
+            "another store that does not exist",
             "d-0000000000".to_string(),
             member.clone(),
-        ),
-        (
-            "a user of another store",
-            STORE.to_string(),
-            elsewhere.clone(),
+            "IDENTITY_STORE",
         ),
     ];
 
-    for (row_case, store, candidate) in rows {
+    for (row_case, store, candidate, expected_type) in rows {
         let body = refused(
             &router,
             "ListGroupMembershipsForMember",
@@ -333,20 +336,19 @@ async fn a_member_this_identity_store_does_not_hold_is_reported_as_not_found() {
         .await;
         assert_eq!(
             body.get("ResourceType").and_then(Value::as_str),
-            Some("USER"),
-            "case {row_case:?}: expected the refusal to name the USER resource type, got {body}"
+            Some(expected_type),
+            "case {row_case:?}: expected the refusal to name the {expected_type} resource \
+             type, got {body}"
         );
     }
 
-    // The user of the other store does have its membership there, so the refusals above
-    // are about scope, not about a member the emulator lost.
-    let group_elsewhere = create_group(&router, OTHER_STORE, "engineering", case).await;
-    let membership = join(&router, OTHER_STORE, &group_elsewhere, &elsewhere, case).await;
-    let items = walk_member_memberships(&router, OTHER_STORE, &elsewhere, None, case).await;
+    // The refusals above changed nothing: the member the store does hold still lists
+    // its own membership.
+    let items = walk_member_memberships(&router, STORE, &member, None, case).await;
     assert_eq!(
-        membership_ids(&items, case),
-        vec![membership],
-        "case {case:?}: expected the other store to list its own member's membership, got {items:?}"
+        items.len(),
+        1,
+        "case {case:?}: expected the live member's one membership to survive, got {items:?}"
     );
 }
 

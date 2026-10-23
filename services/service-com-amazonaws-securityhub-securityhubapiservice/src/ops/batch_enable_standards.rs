@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchEnableStandards
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchEnableStandards`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchEnableStandards::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Subscribes the caller's account/Region to the standards named by
+//! `StandardsSubscriptionRequests`: each `StandardsArn` is resolved against the
+//! published standards catalog in `crate::state`, and every resolved standard gets the
+//! `StandardsSubscription` resource `GetEnabledStandards` reports, created `PENDING`
+//! with the `READY` transition this call owes. An ARN the catalog does not carry is
+//! refused with `InvalidInputException`; a standard the hub already subscribes to is
+//! the same resource, so its existing subscription is reported unchanged.
 //!
 //! ## Shape of an operation
 //!
@@ -79,6 +78,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::{BTreeSet, HashMap};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -114,6 +115,17 @@ impl From<BatchEnableStandardsErrorModeled> for BatchEnableStandardsError {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
 }
+
+/// How many `StandardsInput` parameters one subscription keeps. The model bounds
+/// neither `StandardsInputParameterMap` nor its strings, so this cap is what keeps a
+/// stored subscription from growing with whatever a caller sends; it is far above the
+/// handful of parameters a published standard defines.
+const MAX_STANDARDS_INPUT_ENTRIES: usize = 50;
+
+/// The longest `StandardsInput` key or value one subscription keeps, mirroring the cap
+/// this crate already applies to an unbounded string member
+/// ([`crate::state::MAX_ACTION_TARGET_DESCRIPTION_LEN`]).
+const MAX_STANDARDS_INPUT_LEN: usize = crate::state::MAX_ACTION_TARGET_DESCRIPTION_LEN;
 
 /// The `BatchEnableStandards` operation.
 ///
@@ -151,18 +163,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchEnableStandards` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchEnableStandardsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchEnableStandards"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchEnableStandardsError::Modeled(BatchEnableStandardsErrorModeled::InternalException(
+                InternalException {
+                    message: Some(crate::state::STATE_UNAVAILABLE_MESSAGE.to_string()),
+                    code: Some("InternalException".to_string()),
+                },
+            ))
+        })?;
+        let invalid_input = |message: String| {
+            BatchEnableStandardsError::Modeled(
+                BatchEnableStandardsErrorModeled::InvalidInputException(InvalidInputException {
+                    message: Some(message),
+                    code: Some("InvalidInputException".to_string()),
+                }),
+            )
+        };
+
+        let key = crate::state::hub_key(ctx);
+
+        // Whether the request is valid is decided before any state is read, so a
+        // `StandardsArn` no published standard carries is refused identically on
+        // every hub, subscribed or not.
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut requested: Vec<(crate::state::StandardDefinition, HashMap<String, String>)> =
+            Vec::with_capacity(input.standards_subscription_requests.len());
+        for request in &input.standards_subscription_requests {
+            let definition = crate::state::standard_by_arn(&key.1, &request.standards_arn)
+                .ok_or_else(|| {
+                    invalid_input(format!(
+                        "StandardsArn: {} is not the ARN of a standard available in Region {}",
+                        request.standards_arn, key.1
+                    ))
+                })?;
+            let standards_input = request.standards_input.clone().unwrap_or_default();
+            if standards_input.len() > MAX_STANDARDS_INPUT_ENTRIES {
+                return Err(invalid_input(format!(
+                    "StandardsInput: a standard accepts at most {MAX_STANDARDS_INPUT_ENTRIES} \
+                     input parameters, got {}",
+                    standards_input.len()
+                )));
+            }
+            if let Some((name, _)) = standards_input.iter().find(|(name, value)| {
+                name.chars().count() > MAX_STANDARDS_INPUT_LEN
+                    || value.chars().count() > MAX_STANDARDS_INPUT_LEN
+            }) {
+                return Err(invalid_input(format!(
+                    "StandardsInput: parameter {name} exceeds the {MAX_STANDARDS_INPUT_LEN}-character limit"
+                )));
+            }
+            // One subscription per standard per hub, so a batch naming the same
+            // standard twice enables — and reports — one subscription.
+            if seen.insert(request.standards_arn.clone()) {
+                requested.push((definition, standards_input));
+            }
+        }
+
+        let mut store = state.lock();
+        if !store.hubs.contains_key(&key) {
+            return Err(BatchEnableStandardsErrorModeled::InvalidAccessException(
+                InvalidAccessException {
+                    message: Some(crate::state::not_subscribed_message(&key.0, &key.1)),
+                    code: Some("InvalidAccessException".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // This call reports subscriptions, so it first materialises the status the
+        // clock already owes them: a `PENDING` subscription whose transition fell due
+        // is `READY` whether or not anybody called.
+        crate::state::settle_standards(&mut store, &key);
+
+        let mut subscriptions = Vec::with_capacity(requested.len());
+        for (definition, standards_input) in requested {
+            let (subscription_key, subscription) =
+                crate::state::new_standards_subscription(&key, &definition, standards_input);
+            // A standard this hub already subscribes to is the same resource, not a
+            // second one: its subscription is reported as it stands, so a repeated
+            // call neither restarts the `PENDING` -> `READY` transition nor replaces
+            // the input the subscription was enabled with.
+            let record = store
+                .standards
+                .entry(subscription_key.clone())
+                .or_insert(subscription);
+            subscriptions.push(crate::state::standards_subscription_view(
+                &subscription_key,
+                record,
+            ));
+        }
+
+        Ok(BatchEnableStandardsOutput {
+            standards_subscriptions: Some(subscriptions),
+        })
     }
 }

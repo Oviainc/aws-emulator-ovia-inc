@@ -18,14 +18,14 @@
 //! sub-attribute, list), the entry count of a list, the case of the path and of the
 //! members inside a value, and the form of the identifiers.
 //!
-//! The wire harness (`emulator`, `ok`, `refused`, …) is the sibling suite's, shared
+//! The wire harness (`emulator`, `ok`, `refused`, …) is [`crate::harness`]'s, shared
 //! rather than copied: every call still goes through the production
 //! [`MultiServiceRouter`] front door and nothing reaches into the state struct.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::identity_store_lifecycle::{emulator, ok, refused, string, STORE};
+use crate::harness::{emulator, ok, refused, string, STORE};
 
 /// The emulator's account id, as it appears in an identity store's ARN — the other
 /// form the modelled `IdentityStoreId` pattern admits.
@@ -41,6 +41,9 @@ const USER_NAME_MAX_LEN: usize = 128;
 /// Every attribute of a `User` an `UpdateUser` can set, as `DescribeUser` names it in
 /// its response (from the modelled `User` shape). A case that updates one of these
 /// must leave every other one absent on a user created without it.
+///
+/// `UserStatus` is deliberately NOT here: every stored user HAS a status (a created one
+/// is `ENABLED`), so it is never absent and the rows that change it assert it directly.
 const UPDATABLE_MEMBERS: &[&str] = &[
     "UserName",
     "Name",
@@ -55,7 +58,6 @@ const UPDATABLE_MEMBERS: &[&str] = &[
     "PreferredLanguage",
     "Locale",
     "Timezone",
-    "UserStatus",
     "Photos",
     "Website",
     "Birthdate",
@@ -516,13 +518,6 @@ async fn an_operation_without_a_value_removes_the_attribute() {
             "UserName",
         ),
         (
-            "user status",
-            "userStatus",
-            json!("ENABLED"),
-            Some(Value::Null),
-            "UserStatus",
-        ),
-        (
             "the whole name object",
             "name",
             json!({ "GivenName": "Ada", "FamilyName": "Lovelace" }),
@@ -877,26 +872,31 @@ async fn an_update_of_a_user_that_does_not_exist_is_not_found() {
     let case = "not found";
     let user = create_user(&router, json!({ "UserName": user_name(case, 0) }), case).await;
 
-    // (case, IdentityStoreId, UserId)
-    let rows: Vec<(&str, String, String)> = vec![
+    // (case, IdentityStoreId, UserId, the ResourceType of what is missing)
+    let rows: Vec<(&str, String, String, &str)> = vec![
         (
             "a user id the store does not hold",
             STORE.to_string(),
             "a1b2c3d4-5678-90ab-cdef-1111eeee2222".to_string(),
+            "USER",
         ),
         (
             "that user id in ARN form",
             STORE.to_string(),
             "arn:aws:identitystore:::user/a1b2c3d4-5678-90ab-cdef-1111eeee2222".to_string(),
+            "USER",
         ),
         (
-            "an identity store nothing ever created",
+            // The identity store itself is what is missing here, so THAT is the
+            // resource the refusal names.
+            "an identity store that does not exist",
             "d-0000000001".to_string(),
             user.clone(),
+            "IDENTITY_STORE",
         ),
     ];
 
-    for (row, store, identifier) in &rows {
+    for (row, store, identifier, expected_type) in &rows {
         let refusal = refused(
             &router,
             "UpdateUser",
@@ -912,7 +912,7 @@ async fn an_update_of_a_user_that_does_not_exist_is_not_found() {
         .await;
         assert_eq!(
             refusal.get("ResourceType").and_then(Value::as_str),
-            Some("USER"),
+            Some(*expected_type),
             "case {row:?}: expected the modelled ResourceType of the missing resource, \
              got {refusal}"
         );

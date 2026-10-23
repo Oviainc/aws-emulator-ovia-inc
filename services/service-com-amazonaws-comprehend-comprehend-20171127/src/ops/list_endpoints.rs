@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEndpoints
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEndpoints`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEndpoints::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Enumerates the persisted endpoints in creation order, honours the
+//! single filtering parameter the request set, truncates at `MaxResults` and hands
+//! back an opaque `NextToken` that resumes exactly after the last endpoint on the
+//! page. This is the ONLY file to touch for this operation.
+//!
+//! A pure report: it computes the page from [`crate::state`] and writes nothing a
+//! caller can tell apart from the clock's own work — the only thing it materialises
+//! is the status change each record was already owed at the instant of the call
+//! ([`crate::state::ComAmazonawsComprehendComprehend20171127State::settle_endpoints`]),
+//! so two callers an instant apart see the same list.
 //!
 //! ## Shape of an operation
 //!
@@ -77,6 +79,82 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::{datetime_parts, decode_page_cursor, encode_page_cursor, epoch_parts, Endpoint};
+
+/// The page size used when the request sets no `MaxResults`.
+///
+/// From the modelled member documentation of `ListEndpointsRequest$MaxResults`: "The
+/// maximum number of results to return in each page. The default is 100."
+const DEFAULT_MAX_RESULTS: usize = 100;
+
+/// The ceiling a page is clamped to: the modelled `MaxResults` maximum (`@range`
+/// 1..500), so one request can never render an unbounded number of records into one
+/// response even if a value reaches here outside that range.
+const MAX_RESULTS_CEILING: usize = 500;
+
+/// Does `endpoint` satisfy `filter`?
+///
+/// Each set member narrows the list the way its own documentation states: `ModelArn`
+/// and `Status` match exactly, and the creation-time bounds are read strictly — "a
+/// date before which the returned endpoint or endpoints were created" excludes an
+/// endpoint created at the bound itself, which the model leaves unstated. This
+/// mirrors `ops::list_document_classifiers::matches`, the sibling list operation's
+/// reading of the same filter form.
+fn matches(endpoint: &Endpoint, filter: &EndpointFilter) -> bool {
+    if let Some(model_arn) = filter.model_arn.as_ref() {
+        if endpoint.model_arn.as_ref() != Some(model_arn) {
+            return false;
+        }
+    }
+    if let Some(status) = filter.status.as_ref() {
+        if &endpoint.status != status {
+            return false;
+        }
+    }
+    let created = epoch_parts(endpoint.creation_time);
+    if let Some(before) = filter.creation_time_before.as_ref() {
+        if created >= datetime_parts(before) {
+            return false;
+        }
+    }
+    if let Some(after) = filter.creation_time_after.as_ref() {
+        if created <= datetime_parts(after) {
+            return false;
+        }
+    }
+    true
+}
+
+/// How many of `filter`'s members are set.
+///
+/// `EndpointFilter` documents "You can only set one filter at a time", so more than
+/// one is refused. `ListEndpoints` models no `InvalidFilterException`, so the refusal
+/// is the `InvalidRequestException` it does model.
+fn filters_set(filter: &EndpointFilter) -> usize {
+    usize::from(filter.model_arn.is_some())
+        + usize::from(filter.status.is_some())
+        + usize::from(filter.creation_time_before.is_some())
+        + usize::from(filter.creation_time_after.is_some())
+}
+
+/// Render the page cursor that resumes after the endpoint with creation sequence
+/// `seq`, through the ONE cursor codec this service's paging operations share
+/// ([`crate::state::encode_page_cursor`]). What the number MEANS is this operation's
+/// own — a `NextToken` is opaque to everything but the operation that issued it, and
+/// the sequence is checked against the endpoints this service has minted below — but
+/// the rendering is stated once, in `crate::state`.
+fn encode_token(seq: u64) -> String {
+    encode_page_cursor(seq)
+}
+
+/// Read back a cursor produced by [`encode_token`]; `None` when the string is not of
+/// that form. The caller also checks that the sequence number it carries is one this
+/// service has minted, so a well-formed string naming no page it ever issued is
+/// refused too.
+fn decode_token(token: &str) -> Option<u64> {
+    decode_page_cursor(token)
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -148,18 +226,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEndpoints` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEndpointsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEndpoints"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListEndpointsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("The service store is unavailable. Retry your request.".to_string()),
+            })
+        })?;
+
+        let filter = input.filter.unwrap_or_default();
+        if filters_set(&filter) > 1 {
+            return Err(ListEndpointsErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(
+                        "Only one filter can be set in a request. Specify a single filtering \
+                         parameter."
+                            .to_string(),
+                    ),
+                    reason: None,
+                    detail: None,
+                },
+            )
+            .into());
+        }
+
+        // The modelled `@range` of 1..500 is enforced at the boundary, so a value that
+        // reaches here is already inside it; the clamp keeps the page bounded
+        // regardless.
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(DEFAULT_MAX_RESULTS)
+            .clamp(1, MAX_RESULTS_CEILING);
+
+        let mut store = state.lock();
+        // Materialise the status changes the clock already owed, so the status this
+        // page reports — and the one `Filter.Status` selects on — is the status each
+        // endpoint already had at `now`. Reporting, not mutating: every transition
+        // applied here was due whether or not anybody called.
+        store.settle_endpoints(::std::time::SystemTime::now());
+
+        // A cursor is a creation sequence number this service has actually minted, so
+        // a well-formed string that names no page it ever issued — zero, or a sequence
+        // past the newest endpoint — is refused rather than silently read as "from the
+        // beginning".
+        let cursor = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => decode_token(token)
+                .filter(|seq| (1..=store.endpoint_seq).contains(seq))
+                .ok_or_else(|| {
+                    ListEndpointsErrorModeled::InvalidRequestException(InvalidRequestException {
+                        message: Some("NextToken is not a token this service issued.".to_string()),
+                        reason: None,
+                        detail: None,
+                    })
+                })?,
+        };
+
+        // Creation order, which is what the record's sequence number is: the model
+        // states no order for any `EndpointFilter` member, so one order serves every
+        // page and a cursor means the same thing on each of them. `sort_by_key` is
+        // load-bearing: the store is keyed by endpoint ARN, whose order is not
+        // creation order.
+        let mut selected: Vec<&Endpoint> = store
+            .endpoints
+            .values()
+            .filter(|endpoint| endpoint.seq > cursor && matches(endpoint, &filter))
+            .collect();
+        selected.sort_by_key(|endpoint| endpoint.seq);
+
+        let page: Vec<&Endpoint> = selected.iter().copied().take(page_size).collect();
+        let next_token = match page.last() {
+            Some(last) if selected.len() > page.len() => Some(encode_token(last.seq)),
+            _ => None,
+        };
+
+        Ok(ListEndpointsOutput {
+            endpoint_properties_list: Some(
+                page.iter()
+                    .map(|endpoint| endpoint.endpoint_properties())
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }

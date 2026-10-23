@@ -176,9 +176,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A read: the store is looked up rather than vivified, so resolving a user id
         // can never change what a later caller sees.
         let state = state.lock();
+        // The identity store the request names must exist; one that does not is the
+        // missing resource, reported as `IDENTITY_STORE` rather than as a missing user
+        // of a store that is not there either.
         let store = state
-            .store(&input.identity_store_id)
-            .ok_or_else(|| selector.not_found())?;
+            .resolve_store(&input.identity_store_id)
+            .map_err(GetUserIdErrorModeled::ResourceNotFoundException)?;
         let user = selector.find(store).ok_or_else(|| selector.not_found())?;
 
         Ok(GetUserIdOutput {

@@ -174,7 +174,7 @@ const CREATED_DATE_SLACK_SECONDS: f64 = 10.0;
 /// is written in the protocol's default epoch-seconds form unless its schema carries
 /// `@timestampFormat`, which the vendored schema generator does not emit. So this
 /// accepts either form and asserts the INSTANT, which is what the handler decides.
-fn assert_created_now(case: &str, body: &Value) {
+pub(crate) fn assert_created_now(case: &str, body: &Value) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|since| since.as_secs_f64())
@@ -201,7 +201,7 @@ fn assert_created_now(case: &str, body: &Value) {
                 "case {case:?}: CreatedDate must be the creation instant; got {rendered:?} against a clock reading {now}"
             );
         }
-        other => panic!("case {case:?}: CreateApi must report a CreatedDate, got {other:?}"),
+        other => panic!("case {case:?}: the response must report a CreatedDate, got {other:?}"),
     }
 }
 

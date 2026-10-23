@@ -23,8 +23,12 @@ mod get_group_id;
 mod get_user_id;
 #[path = "all/group_membership_lookup.rs"]
 mod group_membership_lookup;
+#[path = "all/harness.rs"]
+mod harness;
 #[path = "all/identity_store_lifecycle.rs"]
 mod identity_store_lifecycle;
+#[path = "all/identity_store_resolution_and_updates.rs"]
+mod identity_store_resolution_and_updates;
 #[path = "all/is_member_in_groups.rs"]
 mod is_member_in_groups;
 #[path = "all/list_group_memberships_for_member.rs"]

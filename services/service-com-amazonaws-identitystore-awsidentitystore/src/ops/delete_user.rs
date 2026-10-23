@@ -173,12 +173,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         };
 
-        // `store_mut` looks the store up and NEVER brings one into being: a delete that
-        // finds nothing to delete must not leave an identity store behind as a side
-        // effect.
+        // The identity store must EXIST: a delete addressed to one that does not is
+        // refused rather than answered as a no-op success, and naming a store never
+        // brings one into being.
         let store = state
-            .store_mut(&input.identity_store_id)
-            .ok_or_else(not_found)?;
+            .resolve_store_mut(&input.identity_store_id)
+            .map_err(DeleteUserErrorModeled::ResourceNotFoundException)?;
         // Both the bare id and the resource's ARN name the same user.
         let user_key = crate::state::resource_key(&input.user_id);
         // `Revision` is the caller's EXPECTED current revision: "the user is deleted
@@ -193,10 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let user = store.users.get(&user_key).ok_or_else(not_found)?;
             if expected.parse::<u64>().ok() != Some(user.revision) {
                 return Err(DeleteUserErrorModeled::ConflictException(
-                    crate::state::concurrent_modification(format!(
-                        "user {} is at revision {}, not the expected revision {expected}",
-                        user.user_id, user.revision
-                    )),
+                    crate::state::revision_conflict(expected, &user.revision()),
                 )
                 .into());
             }

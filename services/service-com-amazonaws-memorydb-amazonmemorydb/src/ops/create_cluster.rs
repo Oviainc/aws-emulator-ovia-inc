@@ -254,9 +254,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A cluster name is the same case-insensitive identifier a user or ACL name is,
         // bounded by the same service rule, so it is checked and folded before anything
         // is built or persisted.
-        if let Some(message) =
-            crate::state::resource_name_rejection("ClusterName", &input.cluster_name)
-        {
+        if let Some(message) = crate::state::resource_name_rejection(
+            crate::state::ResourceKind::Cluster,
+            &input.cluster_name,
+        ) {
             return Err(CreateClusterErrorModeled::InvalidParameterValueException(
                 InvalidParameterValueException {
                     message: Some(message),
@@ -268,7 +269,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ACLName` names an ACL, so it is bounded by the same name rule before it is
         // resolved: a malformed name is a VALUE the service refuses, not an ACL that
         // happens not to exist.
-        if let Some(message) = crate::state::resource_name_rejection("ACLName", &input.acl_name) {
+        if let Some(message) = crate::state::resource_name_rejection(
+            crate::state::ResourceKind::Acl,
+            &input.acl_name,
+        ) {
             return Err(CreateClusterErrorModeled::InvalidParameterValueException(
                 InvalidParameterValueException {
                     message: Some(message),
@@ -390,7 +394,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if state.clusters.contains_key(&cluster_name) {
             return Err(CreateClusterErrorModeled::ClusterAlreadyExistsFault(
                 ClusterAlreadyExistsFault {
-                    message: Some(format!("Cluster with name {cluster_name} already exists.")),
+                    message: Some(crate::state::already_exists_message(
+                        crate::state::ResourceKind::Cluster,
+                        &cluster_name,
+                    )),
                 },
             )
             .into());

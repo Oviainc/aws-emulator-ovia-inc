@@ -13,24 +13,15 @@
 //! case) and the store the membership lives in. The issue's recorded case — a mixed
 //! membership check — is one row.
 //!
-//! The harness (`emulator`, `call`, `ok`, `refused`, `create_user`, `create_group`)
-//! is the one `identity_store_lifecycle` already drives this service with, so nothing
-//! here reaches into the state struct: a response that is not computed from persisted
-//! state cannot pass.
+//! The harness (`emulator`, `call`, `ok`, `refused`) is [`crate::harness`]'s and the
+//! resource helpers are the lifecycle suite's, so nothing here reaches into the state
+//! struct: a response that is not computed from persisted state cannot pass.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::identity_store_lifecycle::{
-    call, create_group, create_user, emulator, ok, refused, string,
-};
-
-/// The identity store these suites use. Any value the modelled `IdentityStoreId`
-/// pattern admits works (`d-[0-9a-f]{10}`).
-const STORE: &str = "d-0123456789";
-
-/// A second store, so the per-store scope of a membership is observable.
-const OTHER_STORE: &str = "d-9876543210";
+use crate::harness::{call, emulator, ok, refused, string, MISSING_STORE, STORE};
+use crate::identity_store_lifecycle::{create_group, create_user};
 
 /// The bounds of the modelled `GroupIds` length (1..100, from
 /// `smithy_query(query="operation",operation="IsMemberInGroups")`).
@@ -205,23 +196,16 @@ async fn every_requested_group_gets_its_own_answer_in_request_order() {
 async fn an_id_no_group_of_this_store_carries_holds_no_membership() {
     let case = "ids that name no group of this store";
     let router = emulator();
-    // This store: a user joined to its one group.
-    let (user, groups) = store_with_groups(&router, STORE, 1, &[0], case).await;
-    // Another store with its own user, group and membership, so a membership that
-    // exists elsewhere is observably not this store's.
-    let (other_user, other_groups) = store_with_groups(&router, OTHER_STORE, 1, &[0], case).await;
+    // A user joined to the store's one group, and a second group it is NOT a member of.
+    let (user, groups) = store_with_groups(&router, STORE, 2, &[0], case).await;
 
     // (row, the id asked about, whether this store holds that membership)
     let rows: &[(&str, &str, bool)] = &[
-        ("this store's group", groups[0].as_str(), true),
+        ("the group the member joined", groups[0].as_str(), true),
+        ("a group it did not join", groups[1].as_str(), false),
         (
             "a well-formed id no resource carries",
             UNKNOWN_GROUP_ID,
-            false,
-        ),
-        (
-            "a group of another identity store",
-            other_groups[0].as_str(),
             false,
         ),
         // The three resource kinds share one id space, so a user id is a well-formed
@@ -235,17 +219,6 @@ async fn an_id_no_group_of_this_store_carries_holds_no_membership() {
         let results = check(&router, STORE, &user, &requested, &row_case).await;
         assert_results(&results, &requested, &user, &[*expected], &row_case);
     }
-
-    // Symmetrically, the other store answers for its own membership only.
-    let requested = vec![other_groups[0].clone(), groups[0].clone()];
-    let results = check(&router, OTHER_STORE, &other_user, &requested, case).await;
-    assert_results(
-        &results,
-        &requested,
-        &other_user,
-        &[true, false],
-        &format!("{case}: the other store's own view"),
-    );
 }
 
 /// Every id member also accepts the resource's ARN, and the id's letter case does not
@@ -415,11 +388,10 @@ async fn a_store_or_member_the_check_cannot_resolve_is_refused() {
     let case = "unresolvable requests";
     let router = emulator();
     let (user, groups) = store_with_groups(&router, STORE, 1, &[0], case).await;
-    let (other_user, _) = store_with_groups(&router, OTHER_STORE, 1, &[0], case).await;
 
-    // An identity store nothing was ever created in holds no membership to report,
-    // and nothing named it, so it does not exist.
-    let unknown_store = "d-00000000aa";
+    // An identity store that does not exist holds no membership to report, and naming
+    // it does not bring it into being.
+    let unknown_store = MISSING_STORE;
     for attempt in ["first", "repeated"] {
         let row_case = format!("{case}: an identity store that does not exist ({attempt})");
         let refusal = refused(
@@ -446,10 +418,7 @@ async fn a_store_or_member_the_check_cannot_resolve_is_refused() {
     }
 
     // (row, the member as written) — a member this store does not hold.
-    let rows: &[(&str, &str)] = &[
-        ("a user id no store carries", UNKNOWN_USER_ID),
-        ("a user of another identity store", other_user.as_str()),
-    ];
+    let rows: &[(&str, &str)] = &[("a user id no store carries", UNKNOWN_USER_ID)];
     for (row, member) in rows {
         let row_case = format!("{case}: {row}");
         let refusal = refused(

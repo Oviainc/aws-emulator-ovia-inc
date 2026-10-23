@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteConsumableResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteConsumableResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes the consumable resource [`crate::state`] holds, resolved by name OR ARN (the
+//! two forms `consumableResource` documents: "The name or ARN of the consumable resource
+//! that will be deleted"), and answers the modelled empty output.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteConsumableResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A consumable resource carries no status — the create hands it back ready and
+//! `DescribeConsumableResource` models no status member — so the removal is immediate
+//! rather than clock-owed: the describe that follows takes its not-found path
+//! ([`crate::state::does_not_exist_message`]).
+//!
+//! Like every removal on this surface (`DeleteComputeEnvironment`, `DeleteJobQueue`,
+//! `DeregisterJobDefinition`) it is IDEMPOTENT in its identifier: one that resolves to
+//! nothing asks for a post-state that already holds, so it answers the same empty
+//! success and stores nothing.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -136,18 +142,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteConsumableResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteConsumableResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteConsumableResource"))
+        use crate::state as batch;
+
+        let _ = ctx;
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(DeleteConsumableResourceErrorModeled::ServerException(
+                batch::unreachable_state(),
+            )
+            .into());
+        };
+        let now = batch::now_millis();
+        let mut state = state.lock();
+        state.materialize_due(now);
+
+        // Resolved by name or ARN; an identifier that resolves to nothing has already
+        // been removed, so this answers the same empty success and writes nothing.
+        if let Some(name) = state.consumable_resource_name(&input.consumable_resource) {
+            if let Some(removed) = state.consumable_resources.remove(&name) {
+                state.consumable_resources_by_arn.remove(&removed.arn);
+            }
+        }
+        Ok(DeleteConsumableResourceOutput {})
     }
 }

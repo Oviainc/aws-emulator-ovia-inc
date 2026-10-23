@@ -2,6 +2,9 @@
 
 //! @op UpdateUser
 //!
+//! Applies the request's `AttributeOperation`s to one stored user, recording the
+//! calling principal as the user's `UpdatedBy`.
+//!
 //! ## How an update is applied
 //!
 //! The request carries a list of `AttributeOperation`s, each naming one attribute of
@@ -100,6 +103,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// Every string attribute is read through the service's ONE text reader, in
+// `crate::state`, so one modelled constraint has one refusal; `optional_text` is the
+// name the decoders below call it by.
+use crate::state::attribute_text_value as optional_text;
+use crate::state::attribute_value_kind as kind;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -176,8 +185,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Who is making the change: recorded as the user's `UpdatedBy`.
+        let updated_by = crate::state::caller_principal(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateUserErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the identity store is unavailable".to_string()),
@@ -185,43 +196,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let mut state = state.lock();
-        let not_found = || {
+        // The identity store must exist, and so must the user: an update against either
+        // one that does not is refused with the modelled `ResourceNotFoundException`.
+        let store = state
+            .resolve_store_mut(&input.identity_store_id)
+            .map_err(UpdateUserErrorModeled::ResourceNotFoundException)?;
+        let user_key = crate::state::resource_key(&input.user_id);
+        let stored = store.users.get(&user_key).cloned().ok_or_else(|| {
             UpdateUserErrorModeled::ResourceNotFoundException(crate::state::not_found(
                 crate::state::ResourceKind::User,
                 &input.user_id,
             ))
-        };
-        // An update changes an EXISTING user, so it looks its store up rather than
-        // vivifying one the way a create may: a store nothing ever created holds no
-        // user to update.
-        let store = state
-            .store_mut(&input.identity_store_id)
-            .ok_or_else(not_found)?;
-        let user_key = crate::state::resource_key(&input.user_id);
-        let stored = store.users.get(&user_key).cloned().ok_or_else(not_found)?;
+        })?;
 
         // `Revision` is the caller's precondition: "the update is applied only if it
-        // matches the current revision of the user in the identity store, which
-        // prevents you from overwriting concurrent changes. If the value doesn't match,
-        // the operation fails with a ConflictException. If you don't provide this
-        // value, the update is applied unconditionally."
-        if input
-            .revision
-            .as_deref()
-            .is_some_and(|expected| expected != stored.revision())
-        {
-            return Err(UpdateUserErrorModeled::ConflictException(
-                crate::state::concurrent_modification(
-                    "the user has been modified since the revision this request expects: \
-                     read it again and retry with its current revision"
-                        .to_string(),
-                ),
-            )
-            .into());
+        // matches the current revision of the user … If the value doesn't match, the
+        // operation fails with a ConflictException."
+        if let Some(expected) = input.revision.as_deref() {
+            if expected != stored.revision() {
+                return Err(UpdateUserErrorModeled::ConflictException(
+                    crate::state::revision_conflict(expected, &stored.revision()),
+                )
+                .into());
+            }
         }
 
-        // Decode every operation onto a working copy first: a request refused half-way
-        // through its operations must leave the stored user untouched.
+        // The operations are applied to a COPY and committed only once every one of
+        // them held, so a request that names an attribute path this service does not
+        // update leaves the stored user exactly as it was.
         let mut updated = stored.clone();
         for operation in &input.operations {
             apply_attribute_operation(
@@ -229,15 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &operation.attribute_path,
                 operation.attribute_value.as_ref(),
             )
-            .map_err(|message| {
-                UpdateUserErrorModeled::ValidationException(ValidationException {
-                    message: Some(message),
-                    request_id: None,
-                    // The modelled `ValidationExceptionReason` carries only the KMS
-                    // reasons, and the member is "not included" for anything else.
-                    reason: None,
-                })
-            })?;
+            .map_err(UpdateUserErrorModeled::ValidationException)?;
         }
 
         // `UserName` is a uniqueness claim within the identity store, so an update
@@ -257,7 +251,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The update happened: a new revision, a new `UpdatedAt` and the principal that
+        // made it.
         updated.record_update(::std::time::SystemTime::now());
+        updated.updated_by = Some(updated_by);
+
         let output = UpdateUserOutput {
             identity_store_id: store.identity_store_id.clone(),
             user_id: updated.user_id.clone(),
@@ -265,18 +263,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "The revision of the user after the requested update is applied."
             revision: updated.revision(),
         };
-
         // The `UserName` index follows the name: the old claim is released and the new
         // one taken, so a later create or update can reuse the name this user dropped.
-        if let Some(previous) = stored.user_name.as_ref() {
-            if Some(previous) != updated.user_name.as_ref() {
-                store.user_name_index.remove(previous);
+        if updated.user_name != stored.user_name {
+            if let Some(released) = stored.user_name.as_deref() {
+                store.user_name_index.remove(released);
             }
-        }
-        if let Some(user_name) = updated.user_name.clone() {
-            store
-                .user_name_index
-                .insert(user_name, updated.user_id.clone());
+            if let Some(claimed) = updated.user_name.clone() {
+                store.user_name_index.insert(claimed, user_key.clone());
+            }
         }
         store.users.insert(user_key, updated);
         Ok(output)
@@ -328,29 +323,33 @@ const NAME_MEMBERS: &[&str] = &[
     "HonorificSuffix",
 ];
 
-/// The attributes of a user the service mints or an identity provider owns, which an
-/// `UpdateUser` therefore cannot set. Named here so each is refused as "cannot be
-/// changed" rather than as "not an attribute of a user".
-const READ_ONLY_PATHS: &[&str] = &[
-    "identitystoreid",
-    "userid",
-    "userarn",
-    "revision",
-    "externalids",
-    "createdat",
-    "createdby",
-    "updatedat",
-    "updatedby",
-    "extensions",
-];
-
 /// Apply one `AttributeOperation` to `user`, or say why the request is invalid.
 ///
 /// `value` is `None` for an operation that carries no `AttributeValue`, which removes
-/// the attribute; an explicit JSON `null` means the same thing. The `Err` is the
-/// message of the modelled `ValidationException` the caller gets back, so it names the
-/// path and what was wrong with it.
+/// the attribute; an explicit JSON `null` means the same thing.
+///
+/// A path this operation does not own — one the service mints or an identity provider
+/// owns (`userId`, `userArn`, `identityStoreId`, `revision`, `externalIds`, the audit
+/// members), an attribute a user does not have, or a path INTO a multi-valued attribute,
+/// which AWS resolves with JMESPath over the stored entries and this slice does not
+/// evaluate — is refused with the message AWS builds from the requested path, and
+/// nothing is applied.
 fn apply_attribute_operation(
+    user: &mut crate::state::User,
+    path: &str,
+    value: Option<&::aws_smithy_types::Document>,
+) -> Result<(), ValidationException> {
+    apply(user, path, value).map_err(|message| ValidationException {
+        message: Some(message),
+        request_id: None,
+        // The modelled `ValidationExceptionReason` carries only the KMS reasons, and
+        // the member is "not included" for anything else.
+        reason: None,
+    })
+}
+
+/// [`apply_attribute_operation`]'s body, whose `Err` is the message the caller gets.
+fn apply(
     user: &mut crate::state::User,
     path: &str,
     value: Option<&::aws_smithy_types::Document>,
@@ -412,63 +411,14 @@ fn apply_attribute_operation(
         "photos" => {
             user.photos = entries(value, path, PHOTOS_MAX, "Photo", PHOTO_MEMBERS, photo)?
         }
-        other if READ_ONLY_PATHS.contains(&other) => {
-            return Err(format!(
-                "the attribute {path} of a user is set by the identity store and \
-                 cannot be changed by UpdateUser"
-            ))
-        }
-        _ => {
-            return Err(format!(
-                "AttributePath {path} does not name an updatable attribute of a user"
-            ))
-        }
+        // Every other path is one an update does not own: the attributes the service
+        // mints or an identity provider owns, a path into a multi-valued attribute, and
+        // anything that is not an attribute of a user at all. AWS refuses each with one
+        // message built from the path it was given, which `crate::state` states once
+        // for both update operations.
+        _ => return Err(crate::state::unsupported_attribute_path_message(path)),
     }
     Ok(())
-}
-
-/// Which JSON type a document carries, for an error message that says what arrived.
-fn kind(value: &::aws_smithy_types::Document) -> &'static str {
-    use ::aws_smithy_types::Document;
-    match value {
-        Document::Object(_) => "an object",
-        Document::Array(_) => "an array",
-        Document::Number(_) => "a number",
-        Document::String(_) => "a string",
-        Document::Bool(_) => "a boolean",
-        Document::Null => "null",
-    }
-}
-
-/// One optional string attribute: the document's text when it carries one, `None` when
-/// the operation removes the attribute.
-///
-/// `max_len` is the modelled length of the member being set, and the model gives every
-/// one of them a minimum of 1, so an empty string is refused rather than quietly
-/// meaning "remove" — an operation that removes carries no value at all.
-fn optional_text(
-    value: Option<&::aws_smithy_types::Document>,
-    path: &str,
-    max_len: usize,
-) -> Result<Option<String>, String> {
-    use ::aws_smithy_types::Document;
-    match value {
-        None | Some(Document::Null) => Ok(None),
-        Some(Document::String(text)) => {
-            let length = text.chars().count();
-            if !(1..=max_len).contains(&length) {
-                return Err(format!(
-                    "the AttributeValue for {path} is {length} characters long, \
-                     outside the 1..{max_len} the model allows"
-                ));
-            }
-            Ok(Some(text.clone()))
-        }
-        Some(other) => Err(format!(
-            "the AttributeValue for {path} must be a string, got {}",
-            kind(other)
-        )),
-    }
 }
 
 /// A required string member of an entry inside a multi-valued attribute.
@@ -494,20 +444,24 @@ fn flag(value: Option<&::aws_smithy_types::Document>, path: &str) -> Result<bool
     }
 }
 
-/// `UserStatus`, which the model declares as an enum, so only its own values are
-/// accepted (`USER_STATUS_VALUES`).
+/// The `UserStatus` an operation sets: the modelled enum admits exactly
+/// `ENABLED | DISABLED` (`USER_STATUS_VALUES`), and every stored user HAS a status, so
+/// neither another value nor a removal names a status a user can be in.
 fn user_status(
     value: Option<&::aws_smithy_types::Document>,
     path: &str,
-) -> Result<Option<String>, String> {
-    let status = optional_text(value, path, TEXT_MAX_LEN)?;
-    match status {
-        Some(status) if !USER_STATUS_VALUES.contains(&status.as_str()) => Err(format!(
-            "the AttributeValue for {path} must be one of {}, got {status:?}",
+) -> Result<String, String> {
+    let expected = || {
+        format!(
+            "the AttributeValue for {path} must be one of {}",
             USER_STATUS_VALUES.join(", ")
-        )),
-        other => Ok(other),
+        )
+    };
+    let status = optional_text(value, path, TEXT_MAX_LEN)?.ok_or_else(expected)?;
+    if !USER_STATUS_VALUES.contains(&status.as_str()) {
+        return Err(expected());
     }
+    Ok(status)
 }
 
 /// The members of an object `AttributeValue`, keyed without regard to case.
