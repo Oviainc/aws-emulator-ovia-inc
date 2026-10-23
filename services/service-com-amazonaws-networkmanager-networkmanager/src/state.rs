@@ -8,10 +8,13 @@
 //! the implemented operations answer is computed from the records below — no handler
 //! echoes its input back without storing it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
-use crate::ops::types::{Bandwidth, GlobalNetwork, Link, Location, Site, Tag};
+use crate::ops::types::{
+    Bandwidth, GlobalNetwork, Link, Location, Site, Tag, ValidationException,
+    ValidationExceptionField,
+};
 
 /// Members of `GlobalNetworkState` / `SiteState` / `LinkState` this slice uses. All three
 /// enums carry the same four values (`smithy_query shape=GlobalNetworkState,SiteState,LinkState`:
@@ -51,6 +54,33 @@ pub const LIMIT_GLOBAL_NETWORKS_PER_ACCOUNT: &str = "global-networks-per-account
 pub const LIMIT_SITES_PER_GLOBAL_NETWORK: &str = "sites-per-global-network";
 /// See [`LIMIT_GLOBAL_NETWORKS_PER_ACCOUNT`].
 pub const LIMIT_LINKS_PER_SITE: &str = "links-per-site";
+/// See [`LIMIT_GLOBAL_NETWORKS_PER_ACCOUNT`]; the quota [`MAX_TAGS_PER_RESOURCE`] bounds.
+pub const LIMIT_TAGS_PER_RESOURCE: &str = "tags-per-resource";
+
+/// The tag-key prefix AWS reserves for its own tags.
+///
+/// "Do not use the `aws:` prefix in your tag names or values because it is reserved for
+/// AWS use. You can't edit or delete tag names or values with this prefix"
+/// (AWS tagging documentation), so a request that asks to SET or REMOVE such a key is
+/// refused and nothing is stored. The comparison is case-insensitive, as AWS's own
+/// reserved-prefix check is.
+pub const RESERVED_TAG_PREFIX: &str = "aws:";
+
+/// The documented maximum length of a tag key, in characters: "Constraints: Maximum
+/// length of 128 characters" on `Tag$Key`
+/// (`smithy_query query="doc" shape="Tag" member="Key"`) — a constraint the modelled
+/// `length 0..10000000` does not express, so it is checked here.
+pub const MAX_TAG_KEY_CHARS: usize = 128;
+/// The documented maximum length of a tag value, in characters: "Constraints: Maximum
+/// length of 256 characters" on `Tag$Value`
+/// (`smithy_query query="doc" shape="Tag" member="Value"`).
+pub const MAX_TAG_VALUE_CHARS: usize = 256;
+
+/// How many tags one resource may carry: AWS's published tagging limit of 50 tags per
+/// resource, which applies to every taggable resource. Asking for more is refused with
+/// the operation's modelled `ServiceQuotaExceededException` (HTTP 402) and stores
+/// nothing.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
 /// How many global networks one account may hold here, and how many sites one global
 /// network may hold.
@@ -280,6 +310,260 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
             .map(|link| link.id.clone())
             .collect()
     }
+
+    /// The stored tag list of the resource `arn` names, or `None` when this service holds
+    /// no resource under that ARN.
+    ///
+    /// Tags live on the resource record itself, so every reader of a resource
+    /// (`DescribeGlobalNetworks`, `GetSites`, `GetLinks`, `ListTagsForResource`) answers
+    /// from the one stored list.
+    pub fn tags_of(&self, arn: &str) -> Option<&Vec<Tag>> {
+        let parts = parse_resource_arn(arn)?;
+        match parts.kind {
+            GLOBAL_NETWORK_KIND => self
+                .global_networks
+                .get(parts.id)
+                .filter(|record| record.arn == arn)
+                .map(|record| &record.tags),
+            SITE_KIND => self
+                .sites
+                .get(parts.id)
+                .filter(|record| record.arn == arn)
+                .map(|record| &record.tags),
+            LINK_KIND => self
+                .links
+                .get(parts.id)
+                .filter(|record| record.arn == arn)
+                .map(|record| &record.tags),
+            _ => None,
+        }
+    }
+
+    /// The stored tag list of the resource `arn` names, for writing. See [`Self::tags_of`].
+    pub fn tags_of_mut(&mut self, arn: &str) -> Option<&mut Vec<Tag>> {
+        let parts = parse_resource_arn(arn)?;
+        match parts.kind {
+            GLOBAL_NETWORK_KIND => self
+                .global_networks
+                .get_mut(parts.id)
+                .filter(|record| record.arn == arn)
+                .map(|record| &mut record.tags),
+            SITE_KIND => self
+                .sites
+                .get_mut(parts.id)
+                .filter(|record| record.arn == arn)
+                .map(|record| &mut record.tags),
+            LINK_KIND => self
+                .links
+                .get_mut(parts.id)
+                .filter(|record| record.arn == arn)
+                .map(|record| &mut record.tags),
+            _ => None,
+        }
+    }
+}
+
+/// The resource an ARN of this service names: the ARN resource type (which is also the
+/// resource-id prefix this service mints, see [`GLOBAL_NETWORK_KIND`]) and the id.
+#[derive(Debug, Clone, Copy)]
+pub struct ArnParts<'a> {
+    /// The ARN resource type, e.g. `global-network`.
+    pub kind: &'a str,
+    /// The resource id inside that type.
+    pub id: &'a str,
+}
+
+/// Split a Network Manager resource ARN into its kind and id.
+///
+/// Every ARN this service mints reads `arn:<partition>:networkmanager::<account>:<kind>/<id>`
+/// (see [`ComAmazonawsNetworkmanagerNetworkmanagerState::resource_arn`]). Answers `None`
+/// when the string is not an ARN of this service in that `<kind>/<id>` form at all — the
+/// caller refuses that as a `ValidationException` on the ARN member, which is a different
+/// answer from a well-formed ARN naming a resource that does not exist.
+///
+/// Only the form is judged here, not which account, partition or region the ARN carries:
+/// an ARN of this service that names another account's resource, or carries a region this
+/// global service does not use, parses and then matches no stored record, so the caller
+/// answers it as NOT FOUND rather than as a malformed request.
+pub fn parse_resource_arn(arn: &str) -> Option<ArnParts<'_>> {
+    let mut fields = arn.splitn(6, ':');
+    if fields.next()? != "arn" {
+        return None;
+    }
+    // Partition and account are always present in an ARN; the region segment of this
+    // global service is empty, so it is the only one allowed to be.
+    if fields.next()?.is_empty() {
+        return None;
+    }
+    if fields.next()? != ARN_NAMESPACE {
+        return None;
+    }
+    let _region = fields.next()?;
+    if fields.next()?.is_empty() {
+        return None;
+    }
+    let (kind, id) = fields.next()?.split_once('/')?;
+    if kind.is_empty() || id.is_empty() {
+        return None;
+    }
+    Some(ArnParts { kind, id })
+}
+
+/// Why a requested tag set or key list was refused: the input member to blame and the
+/// reason, which the caller reports as a `ValidationException` (HTTP 400).
+#[derive(Debug, Clone)]
+pub struct TagRejection {
+    /// The input member the refusal names, e.g. `Tags`.
+    pub member: &'static str,
+    /// Why that member is not acceptable.
+    pub message: String,
+}
+
+impl TagRejection {
+    fn new(member: &'static str, message: String) -> Self {
+        Self { member, message }
+    }
+
+    /// The modelled `ValidationException` this rejection reports. Every caller lifts the
+    /// same exception into its own operation error enum, so the refusal reads the same
+    /// whichever operation the tags arrived on.
+    pub fn to_exception(&self) -> ValidationException {
+        ValidationException {
+            message: self.message.clone(),
+            reason: Some("FieldValidationFailed".to_string()),
+            fields: Some(vec![ValidationExceptionField {
+                name: self.member.to_string(),
+                message: self.message.clone(),
+            }]),
+        }
+    }
+}
+
+/// Why the `Tags` a request asks to store were refused.
+#[derive(Debug, Clone)]
+pub enum TagProblem {
+    /// A tag breaks a rule every tag obeys; the caller answers [`TagRejection::to_exception`].
+    Invalid(TagRejection),
+    /// The request carries more distinct keys than [`MAX_TAGS_PER_RESOURCE`] (this many),
+    /// so the caller answers its modelled `ServiceQuotaExceededException`.
+    TooMany(usize),
+}
+
+/// The checks every operation that STORES a `Tags` member runs before storing anything:
+/// the per-tag rules of [`validate_tags`], then the per-resource tag quota.
+///
+/// Shared by the creates that carry tags, so one rule change reaches all of them; the
+/// caller only lifts the problem into its own error enum.
+pub fn check_requested_tags(tags: Option<&Vec<Tag>>) -> Result<(), TagProblem> {
+    let tags = tags.map_or(&[][..], Vec::as_slice);
+    validate_tags(tags).map_err(TagProblem::Invalid)?;
+    let count = tag_count_after_merge(&[], tags);
+    if count > MAX_TAGS_PER_RESOURCE {
+        return Err(TagProblem::TooMany(count));
+    }
+    Ok(())
+}
+
+/// The message a refusal past the per-resource tag quota carries, shared by every
+/// operation that stores tags: `resulting` is how many tags the resource would carry if
+/// the request were accepted.
+pub fn too_many_tags_message(resulting: usize) -> String {
+    format!(
+        "a resource may carry at most {MAX_TAGS_PER_RESOURCE} tags, but the request would leave {resulting}"
+    )
+}
+
+/// Check a tag set a request asks to APPLY (`TagResource`, and the `Tags` of a create).
+///
+/// Refuses an empty or over-long key, an over-long value, and any key carrying the
+/// AWS-reserved prefix. A key repeated inside one request is NOT an error: tag keys are
+/// unique per resource, so the last value for a key wins (see [`merge_tags`]).
+pub fn validate_tags(tags: &[Tag]) -> Result<(), TagRejection> {
+    const MEMBER: &str = "Tags";
+    for tag in tags {
+        let key = tag.key.as_deref().unwrap_or_default();
+        check_tag_key(MEMBER, key)?;
+        let value = tag.value.as_deref().unwrap_or_default();
+        let length = value.chars().count();
+        if length > MAX_TAG_VALUE_CHARS {
+            return Err(TagRejection::new(
+                MEMBER,
+                format!(
+                    "the value of tag key {key:?} must be at most {MAX_TAG_VALUE_CHARS} characters, but is {length}"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Check a key list a request asks to REMOVE (`UntagResource`). A key the resource does
+/// not carry is not an error — removal is idempotent — but a key AWS reserves cannot be
+/// removed any more than it can be set.
+pub fn validate_tag_keys(keys: &[String]) -> Result<(), TagRejection> {
+    const MEMBER: &str = "TagKeys";
+    for key in keys {
+        check_tag_key(MEMBER, key)?;
+    }
+    Ok(())
+}
+
+/// The rules every tag key obeys, whichever member carries it.
+fn check_tag_key(member: &'static str, key: &str) -> Result<(), TagRejection> {
+    if key.is_empty() {
+        return Err(TagRejection::new(
+            member,
+            "a tag key must not be empty".to_string(),
+        ));
+    }
+    let length = key.chars().count();
+    if length > MAX_TAG_KEY_CHARS {
+        return Err(TagRejection::new(
+            member,
+            format!("a tag key must be at most {MAX_TAG_KEY_CHARS} characters, but {length} were given"),
+        ));
+    }
+    if key.to_lowercase().starts_with(RESERVED_TAG_PREFIX) {
+        return Err(TagRejection::new(
+            member,
+            format!(
+                "tag key {key:?} uses the {RESERVED_TAG_PREFIX} prefix, which is reserved for AWS"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// How many tags the resource would carry once `requested` is merged into `existing`,
+/// for the [`MAX_TAGS_PER_RESOURCE`] quota: a key already held is replaced, not added.
+pub fn tag_count_after_merge(existing: &[Tag], requested: &[Tag]) -> usize {
+    let mut keys: BTreeSet<&str> = existing.iter().filter_map(|tag| tag.key.as_deref()).collect();
+    keys.extend(requested.iter().filter_map(|tag| tag.key.as_deref()));
+    keys.len()
+}
+
+/// Merge `requested` into the resource's stored tags.
+///
+/// Tag keys are unique per resource, so a key already held keeps its position and takes
+/// the requested value and a new key is appended — which is what makes a repeated
+/// `TagResource` overwrite rather than duplicate.
+pub fn merge_tags(existing: &mut Vec<Tag>, requested: Vec<Tag>) {
+    for tag in requested {
+        match existing.iter_mut().find(|held| held.key == tag.key) {
+            Some(held) => held.value = tag.value,
+            None => existing.push(tag),
+        }
+    }
+}
+
+/// Remove every tag whose key `keys` names. A key the resource does not carry is ignored,
+/// so removing twice answers the same as removing once.
+pub fn remove_tags(existing: &mut Vec<Tag>, keys: &[String]) {
+    existing.retain(|held| {
+        held.key
+            .as_deref()
+            .is_none_or(|key| !keys.iter().any(|wanted| wanted == key))
+    });
 }
 
 /// `SystemTime` as a Smithy timestamp (epoch seconds, sub-second part kept).

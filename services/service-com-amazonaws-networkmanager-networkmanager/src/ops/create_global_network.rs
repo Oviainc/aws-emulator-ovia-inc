@@ -137,6 +137,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
 
+        // The same tag rules `TagResource` applies hold for the tags a create carries:
+        // the AWS-reserved key prefix, the documented key/value lengths and the
+        // per-resource tag quota are all refused before anything is stored.
+        if let Err(problem) = crate::state::check_requested_tags(input.tags.as_ref()) {
+            return Err(match problem {
+                crate::state::TagProblem::Invalid(rejection) => {
+                    CreateGlobalNetworkErrorModeled::ValidationException(rejection.to_exception())
+                }
+                crate::state::TagProblem::TooMany(requested) => {
+                    CreateGlobalNetworkErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: crate::state::too_many_tags_message(requested),
+                            resource_id: None,
+                            resource_type: Some(crate::state::GLOBAL_NETWORK_KIND.to_string()),
+                            limit_code: crate::state::LIMIT_TAGS_PER_RESOURCE.to_string(),
+                            service_code: crate::state::SERVICE_CODE.to_string(),
+                        },
+                    )
+                }
+            }
+            .into());
+        }
+
         // A quota bounds how much state one caller can make this service hold: at the cap
         // the create is refused with the modelled quota error and nothing is stored, so a
         // repeated call cannot grow the store without end.

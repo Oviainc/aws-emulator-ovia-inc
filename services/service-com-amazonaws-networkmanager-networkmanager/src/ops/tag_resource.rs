@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the requested tags to the resource the ARN names, which is how this service's
+//! taggable resources (global network, site, link) acquire tags after they are created.
+//! Tag keys are unique per resource, so a key already held takes the requested value and
+//! a new key is added; the stored list is what every reader of the resource answers from.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +142,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: "the networkmanager store is unavailable".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+
+        // The tag rules the model cannot express as constraints — the AWS-reserved key
+        // prefix and the documented key/value lengths — are refused here, before anything
+        // is stored, so a rejected request leaves the resource exactly as it was.
+        crate::state::validate_tags(&input.tags).map_err(|rejection| {
+            TagResourceErrorModeled::ValidationException(rejection.to_exception())
+        })?;
+
+        // A string that is not an ARN of this service names no resource at all, which is
+        // a bad request rather than a missing one.
+        let parts =
+            crate::state::parse_resource_arn(&input.resource_arn).ok_or_else(|| {
+                TagResourceErrorModeled::ValidationException(ValidationException {
+                    message: "ResourceArn is not a networkmanager resource ARN".to_string(),
+                    reason: Some("FieldValidationFailed".to_string()),
+                    fields: Some(vec![ValidationExceptionField {
+                        name: "ResourceArn".to_string(),
+                        message: "must read arn:<partition>:networkmanager::<account>:<type>/<id>"
+                            .to_string(),
+                    }]),
+                })
+            })?;
+
+        let mut store = state.lock();
+        let Some(held) = store.tags_of_mut(&input.resource_arn) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("{} {} does not exist", parts.kind, parts.id),
+                    resource_id: parts.id.to_string(),
+                    resource_type: parts.kind.to_string(),
+                    context: None,
+                },
+            )
+            .into());
+        };
+
+        // The per-resource tag quota is checked against the set the merge would leave, so
+        // re-tagging keys the resource already carries never trips it.
+        let resulting = crate::state::tag_count_after_merge(held, &input.tags);
+        if resulting > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: crate::state::too_many_tags_message(resulting),
+                    resource_id: Some(parts.id.to_string()),
+                    resource_type: Some(parts.kind.to_string()),
+                    limit_code: crate::state::LIMIT_TAGS_PER_RESOURCE.to_string(),
+                    service_code: crate::state::SERVICE_CODE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        crate::state::merge_tags(held, input.tags);
+        Ok(TagResourceOutput {})
     }
 }
