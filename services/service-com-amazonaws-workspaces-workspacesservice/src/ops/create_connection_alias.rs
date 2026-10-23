@@ -3,9 +3,10 @@
 //! @op CreateConnectionAlias
 //!
 //! Implemented: the connection string is persisted in this service's state under a
-//! freshly minted `AliasId`, which is what the response reports. The alias enters
-//! `CREATING` and the clock settles it to `CREATED`; a connection string a stored alias
-//! already holds is refused with `ResourceAlreadyExistsException`.
+//! freshly minted `AliasId`, which is what the response reports. The alias is stored
+//! settled at `CREATED` — a describe issued straight after this call reports it so — and
+//! a connection string a stored alias already holds is refused with
+//! `ResourceAlreadyExistsException`.
 //!
 //! ## Shape of an operation
 //!
