@@ -102,6 +102,27 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
         )
     }
 
+    /// Set the archive state of the named findings of the detector `region`'s
+    /// endpoint serves for `detector_id`, recording the instant of the write as the
+    /// `UpdatedAt` of each finding it moves.
+    ///
+    /// `None` means that endpoint does not hold the detector, which is the caller's
+    /// cue to refuse the request: nothing is written and the clock is not advanced,
+    /// because the detector is resolved BEFORE [`Self::tick_millis`] runs.
+    pub fn set_findings_archived_in(
+        &mut self,
+        region: &str,
+        detector_id: &str,
+        finding_ids: &[String],
+        archived: bool,
+    ) -> Option<()> {
+        self.detector_in(region, detector_id)?;
+        let now = self.tick_millis();
+        self.detector_in_mut(region, detector_id)?
+            .set_findings_archived(finding_ids, archived, now);
+        Some(())
+    }
+
     /// The ids of the detectors `region`'s endpoint serves, in a total order.
     pub fn detector_ids_in(&self, region: &str) -> Vec<String> {
         let mut ids: Vec<String> = self
@@ -778,6 +799,32 @@ impl Detector {
         }
     }
 
+    /// Put every named finding this detector holds into the `archived` state,
+    /// recording `now` as the `UpdatedAt` of each finding the call actually moves.
+    ///
+    /// Archiving and unarchiving are the two directions of ONE write over the
+    /// `FindingIds` a request names (`smithy_query(operation="ArchiveFindings")` /
+    /// `("UnarchiveFindings")`), so both go through here and the LAST call to land
+    /// decides the state. A finding already in the requested state is left
+    /// untouched — `UpdatedAt` included, which is what makes a repeated call a true
+    /// no-op — and an id this detector does not hold moves nothing, the same way a
+    /// findings read reports only the ids it holds.
+    ///
+    /// The archive state is a property of the RECORD, not an observation of the
+    /// activity, so only [`FindingRecord::updated_at_millis`] moves:
+    /// [`FindingRecord::event_last_seen_millis`] stays where the last observation
+    /// left it.
+    pub fn set_findings_archived(&mut self, finding_ids: &[String], archived: bool, now: i64) {
+        for id in finding_ids {
+            if let Some(finding) = self.findings.get_mut(id) {
+                if finding.archived != archived {
+                    finding.archived = archived;
+                    finding.updated_at_millis = now;
+                }
+            }
+        }
+    }
+
     /// The investigation a create already minted for `token`, if any — the seam
     /// that makes `CreateInvestigation` idempotent under a replayed `ClientToken`.
     pub fn investigation_for_token(&self, token: &str) -> Option<&InvestigationRecord> {
@@ -1017,6 +1064,12 @@ pub struct FindingRecord {
     pub count: i32,
     pub created_at_millis: i64,
     pub updated_at_millis: i64,
+    /// `Service.EventLastSeen`: when the ACTIVITY this finding reports was last
+    /// observed, which is a different clock from [`Self::updated_at_millis`] — the
+    /// instant the finding RECORD last changed. A recurrence of the activity moves
+    /// both; a change to the record's own metadata (its archive state, its
+    /// feedback) moves at most the record's clock, because nothing was observed.
+    pub event_last_seen_millis: i64,
     pub archived: bool,
     /// True for a finding `CreateSampleFindings` generated.
     pub sample: bool,
