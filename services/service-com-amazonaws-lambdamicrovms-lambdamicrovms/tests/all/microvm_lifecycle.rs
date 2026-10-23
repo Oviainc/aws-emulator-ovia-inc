@@ -28,8 +28,10 @@ pub(crate) const PAST_THE_SPAN: Duration = Duration::from_millis(2_500);
 /// for, for the same reason as [`PAST_THE_SPAN`].
 const PAST_THE_MAXIMUM_DURATION: Duration = Duration::from_millis(3_000);
 
-/// A base image ARN: `NonBlankString`, pattern `^[^\s]+$`.
-const BASE_IMAGE_ARN: &str = "arn:aws:lambda:us-west-2:000000000000:managed-microvm-image:al2023";
+/// The base image every create builds on: the AWS-MANAGED Amazon Linux 2023 MicroVM
+/// base image this service publishes (`state::MANAGED_BASE_IMAGE_IDS`), in the ARN form
+/// an AWS-owned resource of this service carries (`aws` in the account field).
+const BASE_IMAGE_ARN: &str = "arn:aws:lambda:us-west-2:aws:microvm-image:al2023-1";
 
 /// A build role ARN: `RoleArn`, pattern
 /// `^arn:aws[a-z\-]*:iam::[0-9]{12}:role/?[a-zA-Z_0-9+=,.@\-_/]+$`.
@@ -295,8 +297,9 @@ async fn created_images_are_persisted_and_read_back_by_name_or_arn() {
         );
         assert_eq!(
             by_name.1.get("tags"),
-            created.get("tags"),
-            "case {case:?}: the image's tags are persisted"
+            Some(&created.get("tags").cloned().unwrap_or_else(|| json!({}))),
+            "case {case:?}: the image's tags are persisted, got {:?}",
+            by_name.1.get("tags")
         );
     }
 }
@@ -360,8 +363,9 @@ async fn an_image_build_is_asynchronous_and_observable_in_both_states() {
 }
 
 /// RULE: an image `name` is unique within the account — a second create of the same
-/// name conflicts (409) — while a repeat of the SAME `clientToken` returns the
-/// already-created image instead of minting a second one.
+/// name is refused 400 `ValidationException` naming the taken name — while a repeat of
+/// the SAME `clientToken` returns the already-created image instead of minting a second
+/// one.
 #[tokio::test]
 async fn duplicate_names_conflict_and_a_client_token_replays() {
     let router = emulator();
@@ -394,12 +398,12 @@ async fn duplicate_names_conflict_and_a_client_token_replays() {
         (
             "a different token on the same name conflicts",
             image_body("dup", json!({"clientToken": "token-two"})),
-            409,
+            400,
         ),
         (
             "no token on the same name conflicts",
             image_body("dup", json!({})),
-            409,
+            400,
         ),
     ];
 
@@ -423,8 +427,14 @@ async fn duplicate_names_conflict_and_a_client_token_replays() {
         } else {
             assert_eq!(
                 response["__type"].as_str(),
-                Some("ConflictException"),
-                "case {case:?}: expected ConflictException, got {response}"
+                Some("ValidationException"),
+                "case {case:?}: expected ValidationException, got {response}"
+            );
+            assert_eq!(
+                response["message"].as_str(),
+                Some("A MicroVM image with the name 'dup' already exists in this account"),
+                "case {case:?}: the refusal must name the taken name, got {:?}",
+                response["message"]
             );
         }
     }
@@ -992,13 +1002,11 @@ async fn unknown_identifiers_answer_resource_not_found() {
     built_image(&router, "present").await;
 
     // Rows span every operation in the slice that resolves an identifier, and both
-    // identifier forms.
+    // identifier forms. An IMAGE identifier that is neither an id this account holds
+    // nor a well-formed ARN is a REFUSAL rather than a not-found (see
+    // `image_request_validation::an_image_lookup_separates_a_malformed_identifier_from_an_absent_one`),
+    // so an absent image is addressed here by the ARN form.
     let rows: Vec<(&str, &str, String)> = vec![
-        (
-            "get an absent image by name",
-            "GET",
-            "/2025-09-09/microvm-images/absent".to_string(),
-        ),
         (
             "get an absent image by ARN",
             "GET",

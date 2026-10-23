@@ -243,15 +243,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Ok(output_of(image, version));
         }
 
-        // `name` "Must be unique within the AWS account."
-        if store.images.contains_key(&input.name) {
-            return Err(CreateMicrovmImageErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "a MicroVM image named {} already exists in this account",
-                    input.name
+        // INPUT and REFERENCE validation first, and the account-level name-uniqueness
+        // check only after them: a request that is itself invalid can never succeed,
+        // whatever this account already holds, so telling such a caller its NAME is
+        // taken would send it renaming instead of fixing the request.
+        //
+        // `codeArtifact$uri` is "The URI of the code artifact in Amazon S3" and the
+        // build resolves that location before creating anything, so a URI that
+        // addresses no S3 object is refused here rather than stored on an image that
+        // could never build.
+        let CodeArtifact::Uri(code_artifact_uri) = &input.code_artifact;
+        if crate::state::s3_object_uri(code_artifact_uri).is_none() {
+            return Err(CreateMicrovmImageErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::CODE_ARTIFACT_URI_REQUIREMENT.to_string()),
+            })
+            .into());
+        }
+
+        // `baseImageArn` is "The ARN of the Lambda-managed base MicroVM image to build
+        // upon. Use ListManagedMicrovmImages to discover available base images", and
+        // the service resolves it before creating anything. Which catalogue a reference
+        // names is in the ARN's account field: `aws` is AWS's own published catalogue
+        // ([`crate::state::MANAGED_BASE_IMAGE_IDS`]), this account's id is the account's
+        // own images, and a reference into neither namespace names nothing this
+        // emulator holds and is taken as given rather than refused.
+        let base_image_resolves = match crate::state::managed_microvm_image_id(
+            &input.base_image_arn,
+        ) {
+            Some(image_id) => crate::state::is_published_managed_base_image(image_id),
+            None => {
+                !crate::state::is_own_microvm_image_arn(&input.base_image_arn)
+                    || store.image(&input.base_image_arn).is_some()
+            }
+        };
+        if !base_image_resolves {
+            return Err(CreateMicrovmImageErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::base_image_not_found_message(
+                    &input.base_image_arn,
                 )),
-                resource_id: Some(input.name.clone()),
-                resource_type: Some("MicrovmImage".to_string()),
+            })
+            .into());
+        }
+
+        // `name` "Must be unique within the AWS account." The refusal is a VALIDATION
+        // of the request's own `name`: this service answers a duplicate name with 400
+        // `ValidationException` naming the taken name (recorded AWS behaviour), not
+        // with the `ConflictException` its model also declares — and it answers it
+        // only once the request itself and the references it names have been found
+        // good, so a caller whose request is wrong is never told to rename.
+        if store.images.contains_key(&input.name) {
+            return Err(CreateMicrovmImageErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::image_name_conflict_message(&input.name)),
             })
             .into());
         }
@@ -281,13 +323,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A member the request OMITS whose value the service supplies is resolved
         // here and stored, so every projection of this image reports the same value
-        // rather than nothing:
+        // rather than nothing — the create response is the only place a client sees
+        // the configuration the service actually accepted:
         //
         // * `baseImageVersion` is "the specific version of the base MicroVM image to
-        //   use", resolved from the base image this request names; and
+        //   use", resolved from the base image this request names;
         // * `egressNetworkConnectors` are "the list of egress network connectors
         //   available to the MicroVM at runtime", which is the AWS-managed egress
-        //   connector when the caller asks for none.
+        //   connector when the caller asks for none;
+        // * `cpuConfigurations` is "the list of supported CPU configurations for the
+        //   MicroVM", normalized to the one `Architecture` the model names;
+        // * `resources` is "the resource requirements for the MicroVM", whose
+        //   `minimumMemoryInMiB` is `@required` within the structure, so an accepted
+        //   image carries the service's own memory floor; and
+        // * `logging` is "the logging configuration for build-time and runtime logs",
+        //   which is this service's own CloudWatch log group for the image when the
+        //   caller names neither arm of the union.
         let base_image_version = Some(input.base_image_version.unwrap_or_else(|| {
             store.resolve_base_image_version(&input.base_image_arn)
         }));
@@ -298,6 +349,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::DEFAULT_EGRESS_NETWORK_CONNECTOR,
             )],
         };
+        let cpu_configurations = match input.cpu_configurations {
+            Some(configurations) if !configurations.is_empty() => configurations,
+            _ => crate::state::default_cpu_configurations(),
+        };
+        let resources = match input.resources {
+            Some(resources) if !resources.is_empty() => resources,
+            _ => crate::state::default_resources(),
+        };
+        let logging = Some(
+            input
+                .logging
+                .unwrap_or_else(|| crate::state::default_logging(&input.name)),
+        );
 
         let version = MicrovmImageVersion {
             image_version: image_version.clone(),
@@ -308,10 +372,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             build_role_arn: input.build_role_arn,
             description: input.description,
             code_artifact: input.code_artifact,
-            logging: input.logging,
+            logging,
             egress_network_connectors,
-            cpu_configurations: input.cpu_configurations.unwrap_or_default(),
-            resources: input.resources.unwrap_or_default(),
+            cpu_configurations,
+            resources,
             additional_os_capabilities: input.additional_os_capabilities.unwrap_or_default(),
             hooks: input.hooks,
             environment_variables: crate::state::sorted_map(input.environment_variables),
