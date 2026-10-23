@@ -47,8 +47,9 @@ fn stored_sets(engine: &Arc<engine::InMemoryEngine>) -> usize {
         .len()
 }
 
-/// Create a SizeConstraintSet named `name` and return its `SizeConstraintSetId`.
-async fn create_size_constraint_set(router: &MultiServiceRouter, name: &str) -> String {
+/// Create a SizeConstraintSet named `name` and return its `SizeConstraintSetId`. Shared
+/// with the `UpdateSizeConstraintSet` suite, which needs a stored set to update.
+pub async fn create_size_constraint_set(router: &MultiServiceRouter, name: &str) -> String {
     let token = change_token(router).await;
     let body = ok_call(
         router,
@@ -359,10 +360,11 @@ struct ConstraintRow {
 /// constraints reads them back, in order — across a table spanning the operators,
 /// transformations and `Size` bounds the model enumerates.
 ///
-/// The constraints are written into the state entry both handlers project (the field
-/// `UpdateSizeConstraintSet`, still a scaffold stub with its own issue, will fill),
-/// which is what pins `GetSizeConstraintSet` to the record rather than to a constant
-/// empty list.
+/// The constraints are written straight into the state entry both handlers project —
+/// the field `UpdateSizeConstraintSet` fills over the wire — which is what pins
+/// `GetSizeConstraintSet` to the record rather than to a constant empty list,
+/// independently of the update path (which `size_constraint_set_updates` covers end to
+/// end).
 #[tokio::test]
 async fn get_projects_the_constraints_the_stored_record_holds() {
     let (router, engine) = router_and_engine();
@@ -446,8 +448,8 @@ async fn get_projects_the_constraints_the_stored_record_holds() {
             "Size": row.size,
         }));
 
-        // The record is the single copy both handlers project; writing it here stands
-        // in for `UpdateSizeConstraintSet`, which is not implemented yet.
+        // The record is the single copy both handlers project; writing it here keeps
+        // this assertion about the projection alone.
         {
             let state = service_state(&*engine).expect("the service store is reachable");
             let mut state = state.lock();

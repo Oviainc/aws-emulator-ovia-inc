@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeImportTasks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeImportTasks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeImportTasks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the account's import tasks from [`crate::state`]: every task matching every
+//! filter the request names, in import-id order, one `limit`-sized page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -79,6 +73,10 @@
 //! * `InvalidParameterException` (HTTP 400) — A parameter is specified incorrectly.
 //! * `ResourceNotFoundException` (HTTP 400) — The specified resource does not exist.
 //! * `ThrottlingException` (HTTP 400) — The request was throttled because of quota limits.
+//! * `ServiceUnavailableException` (HTTP 500) — The service cannot complete the request.
+//!   Widened in through `extra_errors` (see below): this SERVICE models the shape and other
+//!   operations of it declare it, so an unreachable shared store has a modelled server
+//!   failure to answer with rather than being reported as a client's mistake.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -94,7 +92,15 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatchlogs-logs-201
 // here — hence the `DescribeImportTasksError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudwatchlogs#DescribeImportTasks")]
+// `extra_errors` widens the set with `ServiceUnavailableException` — "The service cannot
+// complete the request", a shape this SERVICE models and other operations of it declare,
+// which this operation's own `errors` list omits. It is what an unreachable shared store
+// is answered with, so a store this handler cannot read is never reported as a client's
+// mistake.
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudwatchlogs#DescribeImportTasks",
+    extra_errors = ["ServiceUnavailableException"]
+)]
 #[derive(Debug)]
 pub enum DescribeImportTasksErrorModeled {
     AccessDeniedException(AccessDeniedException),
@@ -102,6 +108,7 @@ pub enum DescribeImportTasksErrorModeled {
     InvalidParameterException(InvalidParameterException),
     ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
+    ServiceUnavailableException(ServiceUnavailableException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -116,6 +123,52 @@ pub type DescribeImportTasksError = crate::scaffolded::Scaffolded<DescribeImport
 impl From<DescribeImportTasksErrorModeled> for DescribeImportTasksError {
     fn from(modeled: DescribeImportTasksErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
+    }
+}
+
+/// The kind tag this operation's pagination cursor carries, so a token minted by
+/// another paginated operation is refused rather than misread.
+const CURSOR_KIND: &str = "DescribeImportTasks";
+
+/// Where the next page resumes: the `importId` of the last task returned, plus the
+/// filters of the enumeration it belongs to. A continuation that changes a filter is
+/// refused, because the token is only a position within one filtered enumeration.
+#[derive(Debug, Clone)]
+struct Cursor {
+    import_id: Option<String>,
+    import_status: Option<String>,
+    import_source_arn: Option<String>,
+    after: String,
+}
+
+impl Cursor {
+    fn encode(&self) -> String {
+        crate::state::encode_token(&::serde_json::json!({
+            "kind": CURSOR_KIND,
+            "importId": self.import_id,
+            "importStatus": self.import_status,
+            "importSourceArn": self.import_source_arn,
+            "after": self.after,
+        }))
+    }
+
+    fn decode(token: &str) -> Option<Self> {
+        let value = crate::state::decode_token(token)?;
+        if value.get("kind")?.as_str()? != CURSOR_KIND {
+            return None;
+        }
+        let string = |name: &str| {
+            value
+                .get(name)
+                .and_then(::serde_json::Value::as_str)
+                .map(ToString::to_string)
+        };
+        Some(Self {
+            import_id: string("importId"),
+            import_status: string("importStatus"),
+            import_source_arn: string("importSourceArn"),
+            after: value.get("after")?.as_str()?.to_string(),
+        })
     }
 }
 
@@ -155,18 +208,147 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeImportTasks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeImportTasksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeImportTasks"))
+        // `ctx` carries only request metadata; this operation reports on stored tasks and
+        // needs none of it.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeImportTasksError::from(
+                DescribeImportTasksErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        let invalid = |message: &str| {
+            DescribeImportTasksError::from(
+                DescribeImportTasksErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message.to_string()),
+                    },
+                ),
+            )
+        };
+
+        // `importSourceArn` is "Optional filter to list imports from a specific source",
+        // typed `Arn`: a value that is not an ARN at all names no source and is refused
+        // the way every other ARN-typed member of this service is.
+        if let Some(source_arn) = input.import_source_arn.as_deref() {
+            if let Some(message) =
+                crate::state::unparsable_arn_message("importSourceArn", source_arn)
+            {
+                return Err(invalid(&message));
+            }
+        }
+
+        // An import runs asynchronously, so the status this call reports is the one the
+        // clock has already made due — materialised before the read, never moved on
+        // because of it.
+        store.materialize_due_import_transitions(crate::state::now_ms());
+
+        // "Optional filter to describe a specific import task by its ID": the one input
+        // that names a resource of this service rather than describing a subset, so an id
+        // no task carries is a missing resource rather than an empty page.
+        if let Some(import_id) = input.import_id.as_deref() {
+            if !store.import_tasks.contains_key(import_id) {
+                return Err(DescribeImportTasksErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::resource_not_found_message("import task")),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => {
+                let Some(cursor) = Cursor::decode(token) else {
+                    return Err(invalid("nextToken is not a valid token"));
+                };
+                if cursor.import_id != input.import_id
+                    || cursor.import_status != input.import_status
+                    || cursor.import_source_arn != input.import_source_arn
+                {
+                    return Err(invalid(
+                        "nextToken was issued for a different DescribeImportTasks request",
+                    ));
+                }
+                Some(cursor)
+            }
+            None => None,
+        };
+
+        // One enumeration, in the order the store holds it (by `importId`), of the tasks
+        // that satisfy EVERY filter the request named. `importStatus` targets the modelled
+        // `ImportStatus` enum, so the boundary validator has already refused a status
+        // outside it.
+        let matching: Vec<&crate::state::ImportTaskRecord> = store
+            .import_tasks
+            .values()
+            .filter(|task| {
+                input
+                    .import_id
+                    .as_deref()
+                    .is_none_or(|wanted| wanted == task.import_id)
+            })
+            .filter(|task| {
+                input
+                    .import_status
+                    .as_deref()
+                    .is_none_or(|wanted| wanted == task.import_status)
+            })
+            .filter(|task| {
+                input
+                    .import_source_arn
+                    .as_deref()
+                    .is_none_or(|wanted| wanted == task.import_source_arn)
+            })
+            .collect();
+
+        let first = match &cursor {
+            Some(cursor) => matching.partition_point(|task| task.import_id <= cursor.after),
+            None => 0,
+        };
+        // "The maximum number of import tasks to return in the response. Default: 50".
+        // `limit` is modelled `range 1..50`, so the boundary validator has already refused
+        // a value outside it; `max(1)` only keeps the page bounds sane.
+        let limit = usize::try_from(input.limit.unwrap_or(crate::state::DEFAULT_DESCRIBE_LIMIT))
+            .unwrap_or(0)
+            .max(1);
+        let last = first.saturating_add(limit).min(matching.len());
+        let page = &matching[first..last];
+
+        // "Not present if there are no additional results to retrieve."
+        let next_token = page.last().filter(|_| last < matching.len()).map(|task| {
+            Cursor {
+                import_id: input.import_id.clone(),
+                import_status: input.import_status.clone(),
+                import_source_arn: input.import_source_arn.clone(),
+                after: task.import_id.clone(),
+            }
+            .encode()
+        });
+
+        Ok(DescribeImportTasksOutput {
+            imports: Some(
+                page.iter()
+                    .map(|task| Import {
+                        import_id: Some(task.import_id.clone()),
+                        import_source_arn: Some(task.import_source_arn.clone()),
+                        import_status: Some(task.import_status.clone()),
+                        import_destination_arn: Some(task.import_destination_arn.clone()),
+                        import_statistics: Some(task.import_statistics()),
+                        import_filter: task.import_filter(),
+                        creation_time: Some(task.creation_time_ms),
+                        last_updated_time: Some(task.last_updated_time_ms),
+                        error_message: task.error_message.clone(),
+                    })
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }
